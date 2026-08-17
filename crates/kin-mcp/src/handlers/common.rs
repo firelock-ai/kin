@@ -5,6 +5,7 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+use kin_index::RelationResolution;
 use kin_model::change::TreeEntry;
 use kin_model::entity::{Entity, EntityKind, SourceSpan};
 use kin_model::graph::{ChangeStore, EntityFilter, GraphStore};
@@ -396,7 +397,52 @@ pub fn is_trace_function(entity: &Entity) -> bool {
     matches!(entity.kind, EntityKind::Function | EntityKind::Method)
 }
 
-pub use kin_ranking::entity_ranking::{trace_callee_score, trace_relation_rank};
+pub use kin_ranking::entity_ranking::{
+    trace_callee_score, trace_entity_is_external, trace_fanout_score, trace_relation_rank,
+};
+
+/// Serialized characters one trace response may occupy before the tool cuts its
+/// own payload.
+///
+/// Every other bound on a trace shapes the WALK, and none of them bounds the
+/// ANSWER: a walk inside all of them returned 228,413 characters over 2,453
+/// lines from a 777-entity repository and the client refused the whole result,
+/// so the caller got neither the chain nor a way to ask for less.
+///
+/// Sized against the tool-result ceilings agent clients actually apply, which
+/// are counted in tokens; at roughly 3.5 characters per token of JSON-wrapped
+/// source this leaves headroom under a 25k-token cap for the envelope the MCP
+/// path wraps around this payload.
+///
+/// Defined here rather than beside either walk because BOTH walks serve this one
+/// tool — the generic-store arm in `handlers::entities` and the body-inlining
+/// arm in `kin_cli::commands::trace_data_flow`, which reads these through this
+/// module. Two definitions would let one arm promise a bound the other does not
+/// keep.
+pub const TRACE_DEFAULT_MAX_RESPONSE_CHARS: usize = 80_000;
+
+/// Floor for a caller-supplied budget. Below this the envelope alone does not
+/// fit, so a smaller number could only be honoured by returning nothing.
+pub const TRACE_MIN_MAX_RESPONSE_CHARS: usize = 2_000;
+
+/// Ceiling for a caller-supplied budget. A caller with a larger window may raise
+/// the bound, but not to unbounded: the daemon serving this has other callers,
+/// and a response nothing can read is not worth building.
+pub const TRACE_MAX_MAX_RESPONSE_CHARS: usize = 400_000;
+
+/// Characters held back from the budget for the disclosure a cut adds.
+///
+/// A response cut to exactly its ceiling and then told to explain the cut is
+/// over its ceiling again, by the length of the explanation. Reserving the room
+/// first is what makes the bound hold for the payload that actually ships.
+pub const TRACE_DISCLOSURE_RESERVE_CHARS: usize = 1_500;
+
+/// The budget a trace request asks for, clamped to what this tool will serve.
+pub fn trace_response_budget(requested: Option<usize>) -> usize {
+    requested
+        .unwrap_or(TRACE_DEFAULT_MAX_RESPONSE_CHARS)
+        .clamp(TRACE_MIN_MAX_RESPONSE_CHARS, TRACE_MAX_MAX_RESPONSE_CHARS)
+}
 
 pub fn next_trace_step<G: GraphStore>(
     store: &G,
@@ -1011,6 +1057,14 @@ pub struct ReferenceRow {
     /// miss or for pathless/federated rows.
     pub snippet: Option<String>,
     pub relation_kinds: Vec<RelationKind>,
+    /// How strongly the strongest edge behind this row was resolved.
+    ///
+    /// A reference resolved from a bare method name is a candidate, not a fact:
+    /// a same-named method on an unrelated type or a test double matches
+    /// equally well. A row is reported when any edge reaches this entity, so
+    /// the strongest contributing edge is the row's evidence. `name_only` means
+    /// the reference is a guess and should be confirmed before being acted on.
+    pub resolution: Option<RelationResolution>,
 }
 
 pub fn collect_graph_reference_rows<G: GraphStore>(
@@ -1074,6 +1128,7 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
             // without a follow-up id→body round-trip.
             snippet,
             relation_kinds: Vec::new(),
+            resolution: None,
         });
         if entry.file_path.is_none() {
             entry.file_path = file_path;
@@ -1093,6 +1148,11 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
             .reference_lines
             .extend(relation_reference_lines(&rel, entity.file_origin.as_ref()));
         push_reference_kind(&mut entry.relation_kinds, rel.kind);
+        let resolution = RelationResolution::of(&rel);
+        entry.resolution = Some(match entry.resolution {
+            Some(current) => current.max(resolution),
+            None => resolution,
+        });
     }
 
     let mut rows = grouped.into_values().collect::<Vec<_>>();
@@ -1315,6 +1375,12 @@ pub struct ExactEntitySource {
 /// hex it stands for, and not the spelling any Kin surface parses back. This
 /// seam is per-dependency in a context pack, which is documented as fitted to a
 /// token budget, so the waste scaled with the pack.
+///
+/// For the same reason this carries no `artifact_path`. A `RepoPath` is bytes,
+/// and its wire form is a `{"bytes_hex": …}` object, so the path arrived as
+/// twice its own length in hex beside the plain `file_path` every caller of
+/// this seam already emits. Two spellings of one path, one of them unreadable,
+/// per entry, inside a budgeted pack.
 pub fn source_provenance_fields(
     source: &ExactEntitySource,
 ) -> serde_json::Map<String, serde_json::Value> {
@@ -1354,7 +1420,6 @@ pub fn source_provenance_fields(
         serde_json::json!(source.span_coherence.label()),
     );
     fields.insert("artifact_id".into(), serde_json::json!(source.artifact_id));
-    fields.insert("artifact_path".into(), serde_json::json!(source.path));
     fields.insert(
         "artifact_entry".into(),
         serde_json::json!(super::artifacts::TreeEntryWire::from(source.entry)),

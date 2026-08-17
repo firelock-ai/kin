@@ -1130,7 +1130,7 @@ mod tests {
         );
         assert!(joined.contains("--file src/nowhere.rs"), "{joined}");
         assert!(
-            joined.contains("src/a.rs:3") && joined.contains("src/b.rs:9"),
+            joined.contains("src/a.rs:4") && joined.contains("src/b.rs:10"),
             "{joined}"
         );
         assert_eq!(response.query.match_count, 0);
@@ -1141,7 +1141,7 @@ mod tests {
                 .iter()
                 .map(|candidate| candidate.location.as_str())
                 .collect::<Vec<_>>(),
-            vec!["src/a.rs:3", "src/b.rs:9"],
+            vec!["src/a.rs:4", "src/b.rs:10"],
         );
     }
 
@@ -1177,7 +1177,7 @@ mod tests {
         assert_eq!(response.resolution, "resolved");
         assert_eq!(response.query.match_count, 1);
         assert!(
-            response.lines[0].contains("src/b.rs:9"),
+            response.lines[0].contains("src/b.rs:10"),
             "{:?}",
             response.lines
         );
@@ -1249,7 +1249,7 @@ mod tests {
                 .position(|line| line.contains(needle))
                 .unwrap_or_else(|| panic!("missing '{needle}' in {lines:?}"))
         };
-        assert!(lines[0].contains("@ src/lib.rs:10"), "{lines:?}");
+        assert!(lines[0].contains("@ src/lib.rs:11"), "{lines:?}");
         assert!(
             lines
                 .iter()
@@ -1257,9 +1257,9 @@ mod tests {
             "{lines:?}"
         );
         let h1 = pos("1 hop (direct callers):");
-        let d = pos("- direct_caller (Function) @ src/direct.rs:20");
+        let d = pos("- direct_caller (Function) @ src/direct.rs:21");
         let h2 = pos("2 hops:");
-        let i = pos("- indirect_caller (Function) @ src/indirect.rs:30");
+        let i = pos("- indirect_caller (Function) @ src/indirect.rs:31");
         assert!(
             h1 < d && d < h2 && h2 < i,
             "hop groups out of order: {lines:?}"
@@ -1493,12 +1493,12 @@ mod tests {
         assert_eq!(
             response.lines,
             vec![
-                "Impact analysis for 'changed' (Function) @ src/lib.rs:10:".to_string(),
+                "Impact analysis for 'changed' (Function) @ src/lib.rs:11:".to_string(),
                 "  2 local entities impacted within 3 hops:".to_string(),
                 "  1 hop (direct callers):".to_string(),
-                "    - direct_caller (Function) @ src/direct.rs:20".to_string(),
+                "    - direct_caller (Function) @ src/direct.rs:21".to_string(),
                 "  2 hops:".to_string(),
-                "    - indirect_caller (Function) @ src/indirect.rs:30".to_string(),
+                "    - indirect_caller (Function) @ src/indirect.rs:31".to_string(),
             ]
         );
     }

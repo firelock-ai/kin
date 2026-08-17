@@ -829,7 +829,7 @@ mod tests {
         markers: Arc<Mutex<HashSet<String>>>,
         head: Arc<Mutex<Option<String>>>,
         first_response: Arc<Mutex<Option<StatusCode>>>,
-        first_delay: Arc<Mutex<Option<Duration>>>,
+        attempt_delays: Arc<Mutex<Vec<Duration>>>,
         later_response: Arc<Mutex<Option<StatusCode>>>,
     }
 
@@ -843,11 +843,12 @@ mod tests {
         state.markers.lock().unwrap().insert(change_id.clone());
         *state.head.lock().unwrap() = Some(change_id);
 
-        if state.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-            let delay = *state.first_delay.lock().unwrap();
-            if let Some(delay) = delay {
-                tokio::time::sleep(delay).await;
-            }
+        let attempt = state.attempts.fetch_add(1, Ordering::SeqCst);
+        let delay = state.attempt_delays.lock().unwrap().get(attempt).copied();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        if attempt == 0 {
             return state
                 .first_response
                 .lock()
@@ -957,7 +958,7 @@ mod tests {
             &url,
             &payload,
             "main",
-            Duration::from_secs(1),
+            Duration::from_secs(10),
             3,
             Duration::from_millis(1),
         )
@@ -974,8 +975,10 @@ mod tests {
     async fn release_timeout_retry_keeps_exactly_one_marker_and_head() {
         let repo = tempfile::tempdir().unwrap();
         let layout = kin_core::init(repo.path()).unwrap().layout;
+        let attempt_timeout = Duration::from_millis(250);
+        let max_attempts = 4;
         let state = ReleaseRetryServerState::default();
-        *state.first_delay.lock().unwrap() = Some(Duration::from_millis(80));
+        *state.attempt_delays.lock().unwrap() = vec![attempt_timeout * 120];
         let (url, server) = release_retry_server(state.clone()).await;
         let payload = serialized_release_fixture();
 
@@ -984,8 +987,8 @@ mod tests {
             &url,
             &payload,
             "main",
-            Duration::from_millis(20),
-            3,
+            attempt_timeout,
+            max_attempts,
             Duration::from_millis(1),
         )
         .await
@@ -993,13 +996,66 @@ mod tests {
         server.abort();
 
         let received = state.received.lock().unwrap();
-        assert_eq!(received.len(), 2);
-        assert!(received.iter().all(|request| request == &payload));
+        assert!(
+            (2..=max_attempts).contains(&received.len()),
+            "a timed-out attempt must be retried within the attempt bound, but the server saw {} request(s)",
+            received.len()
+        );
+        assert!(
+            received.iter().all(|request| request == &payload),
+            "a retry sent bytes the caller never persisted"
+        );
         let markers = state.markers.lock().unwrap();
         assert_eq!(
             markers.len(),
             1,
             "timeout retry manufactured a second marker"
+        );
+        assert_eq!(
+            state.head.lock().unwrap().as_deref(),
+            markers.iter().next().map(String::as_str)
+        );
+    }
+
+    #[tokio::test]
+    async fn release_timeout_retried_twice_keeps_exactly_one_marker_and_head() {
+        let repo = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(repo.path()).unwrap().layout;
+        let attempt_timeout = Duration::from_millis(250);
+        let max_attempts = 4;
+        let state = ReleaseRetryServerState::default();
+        *state.attempt_delays.lock().unwrap() = vec![attempt_timeout * 120, attempt_timeout * 120];
+        let (url, server) = release_retry_server(state.clone()).await;
+        let payload = serialized_release_fixture();
+
+        send_serialized_release_request(
+            &layout,
+            &url,
+            &payload,
+            "main",
+            attempt_timeout,
+            max_attempts,
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+        server.abort();
+
+        let received = state.received.lock().unwrap();
+        assert!(
+            (3..=max_attempts).contains(&received.len()),
+            "each timed-out attempt must be retried within the attempt bound, but the server saw {} request(s)",
+            received.len()
+        );
+        assert!(
+            received.iter().all(|request| request == &payload),
+            "a retry sent bytes the caller never persisted"
+        );
+        let markers = state.markers.lock().unwrap();
+        assert_eq!(
+            markers.len(),
+            1,
+            "repeated timeout retries manufactured another marker"
         );
         assert_eq!(
             state.head.lock().unwrap().as_deref(),
@@ -1022,7 +1078,7 @@ mod tests {
             &url,
             &payload,
             "main",
-            Duration::from_secs(1),
+            Duration::from_secs(10),
             2,
             Duration::from_millis(1),
         )

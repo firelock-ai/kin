@@ -341,7 +341,7 @@ pub async fn run(change_id: Option<String>, feature: Option<String>) -> Result<(
         .rollback(&RollbackRequest {
             change_id,
             operation_id: OperationId::new(),
-            actor: AuthorId::new(kin_core::whoami()),
+            actor: crate::commands::require_commit_author()?,
         })
         .await?;
     for line in response.lines {

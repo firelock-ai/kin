@@ -77,12 +77,26 @@ pub async fn build_xref_response(
     let query = match spine_backend {
         Some(backend) => {
             let response = backend.cross_repo_xref_response(repo_id, &target.id);
-            if response.authority_root_matches(repo_id, graph_root) {
-                ::kin_spine::SpineQuery::Found(response)
-            } else {
-                ::kin_spine::SpineQuery::Unavailable(format!(
-                    "spine root mismatch for repository {repo_id}: live/session graph root {graph_root} is not the registered spine root"
-                ))
+            // Same split the MCP surface makes, through the same shared rule: a
+            // repository the spine never registered has nothing to mismatch, and
+            // reporting it as a root mismatch describes a misconfiguration that
+            // does not exist.
+            match response.authority_root_state(repo_id, graph_root) {
+                ::kin_spine::AuthorityRootState::Matches => {
+                    ::kin_spine::SpineQuery::Found(response)
+                }
+                ::kin_spine::AuthorityRootState::Stale { registered } => {
+                    ::kin_spine::SpineQuery::Unavailable(format!(
+                        "spine root mismatch for repository {repo_id}: live/session graph root \
+                         {graph_root} has advanced past the registered spine root {registered}"
+                    ))
+                }
+                ::kin_spine::AuthorityRootState::Unregistered => {
+                    ::kin_spine::SpineQuery::Unavailable(format!(
+                        "repository {repo_id} has no registered spine root, so cross-repo \
+                         authority cannot answer for it"
+                    ))
+                }
             }
         }
         None => ::kin_spine::SpineQuery::NotConfigured,
@@ -121,9 +135,18 @@ fn spine_xref_lines(
                 response.edges.len()
             ));
             for edge in &response.edges {
+                // The resolving edge lives in the other repository's graph, so
+                // its resolution is read from the tier confidence that crossed
+                // the boundary. `name_only` means a same-name match, not a
+                // proven cross-repo dependency.
                 lines.push(format!(
-                    "    - Impact: [{}] {} depends on us ([{}] {}) (conf: {:.2})",
-                    edge.src_repo, edge.src_entity, edge.dst_repo, edge.dst_entity, edge.confidence
+                    "    - Impact: [{}] {} depends on us ([{}] {}) (conf: {:.2}, {})",
+                    edge.src_repo,
+                    edge.src_entity,
+                    edge.dst_repo,
+                    edge.dst_entity,
+                    edge.confidence,
+                    kin_index::RelationResolution::from_confidence(edge.confidence).as_str()
                 ));
             }
             if !authority_complete {

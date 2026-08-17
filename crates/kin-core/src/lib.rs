@@ -18,19 +18,23 @@ pub mod cross_file_coverage;
 pub mod dependencies;
 pub mod diff;
 pub mod disambiguation;
+pub mod entry_points;
 pub mod env_registry;
 pub mod error;
 pub mod exact_tree;
 pub mod git_init;
 pub mod hooks;
+pub mod identity;
 pub mod init;
 mod init_progress;
+pub use init_progress::report_admission_progress;
 mod init_staging;
 pub mod last_admission;
 pub mod layout;
 pub mod manifest;
 pub mod ranking;
 pub mod ref_view;
+pub mod reference_coverage;
 pub mod registry;
 pub mod repository_authority;
 pub mod resolver;
@@ -99,9 +103,13 @@ pub use workspace_carry::{
 };
 pub use workspace_semantics::diff_workspace_semantics;
 
-pub use diff::{compute_semantic_change_id, content_identity_from_deltas, whoami};
+pub use diff::{compute_semantic_change_id, content_identity_from_deltas};
 pub use disambiguation::{
     fallback_leaf_trace_matches, name_resolution_certainly_misses, query_trace_matches,
+};
+pub use identity::{
+    resolve_commit_identity, unresolved_identity_message, CommitIdentity, IdentitySource,
+    IDENTITY_REMEDIATION,
 };
 pub use ranking::{
     normalize_symbol_hint, normalize_trace_name, qualifier_hint_from_query, select_best_match,

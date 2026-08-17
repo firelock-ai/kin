@@ -81,7 +81,10 @@ pub fn inspect_support_graph(
     binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
 ) -> Result<SupportJson> {
-    let health = super::graph_health::inspect_graph(binding, graph)?;
+    let health = super::graph_health::inspect_graph(
+        &super::repository_authority::RequestRepositoryAuthority::pinned(binding.clone()),
+        graph,
+    )?;
     let stats = graph.graph_stats();
     Ok(SupportJson::from_parts(&stats, health))
 }
@@ -365,6 +368,7 @@ mod tests {
             cochange_relation_count: 0,
             semantic_relation_count: 4,
             semantic_relation_density_excluding_cochanges: 1.33,
+            reference_edge_coverage: Default::default(),
             critical_issues: Vec::new(),
             warnings: vec!["1 files are still shallow-tracked".to_string()],
             notes: Vec::new(),
@@ -460,6 +464,7 @@ mod tests {
             cochange_relation_count: 0,
             semantic_relation_count: 7,
             semantic_relation_density_excluding_cochanges: 0.78,
+            reference_edge_coverage: Default::default(),
             critical_issues: Vec::new(),
             warnings: Vec::new(),
             notes: vec![
@@ -520,6 +525,7 @@ mod tests {
                 cochange_relation_count: 0,
                 semantic_relation_count: 1,
                 semantic_relation_density_excluding_cochanges: 0.5,
+                reference_edge_coverage: Default::default(),
                 critical_issues: Vec::new(),
                 warnings: Vec::new(),
                 notes: Vec::new(),

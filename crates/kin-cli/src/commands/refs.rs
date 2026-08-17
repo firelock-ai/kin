@@ -2,6 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::{Context, Result};
+use kin_index::RelationResolution;
 use kin_model::{Entity, EntityId, EntityStore, GraphNodeId, GraphStore, RelationKind};
 use kin_ranking::entity_ranking;
 use serde::{Deserialize, Serialize};
@@ -208,13 +209,16 @@ pub fn build_refs_response(
             .as_deref()
             .map(|path| display_read_path(layout, path))
             .unwrap_or_else(|| "unknown".to_string());
-        let line = entry.start_line.unwrap_or(0);
+        let location = match entry.start_line {
+            Some(line) => format!("{file_path}:{line}"),
+            None => file_path,
+        };
         lines.push(format!(
-            "  {} @ {}:{} [{}]",
+            "  {} @ {} [{}] ({})",
             entry.name,
-            file_path,
-            line,
-            relation_kinds_label(&entry.relation_kinds)
+            location,
+            relation_kinds_label(&entry.relation_kinds),
+            entry.resolution.as_str()
         ));
     }
 
@@ -545,19 +549,25 @@ fn relation_kind_label(kind: RelationKind) -> String {
 }
 
 #[derive(Debug, Clone)]
-struct ReferenceEntry {
-    entity_id: EntityId,
-    name: String,
-    file_path: Option<String>,
+pub(crate) struct ReferenceEntry {
+    pub(crate) entity_id: EntityId,
+    pub(crate) name: String,
+    pub(crate) file_path: Option<String>,
+    /// 1-based, as every `file:line` an agent pastes into an editor is.
+    /// `None` for an entity the graph carries no span for, because reporting a
+    /// line for one would be a fabricated position.
     start_line: Option<u32>,
-    relation_kinds: Vec<RelationKind>,
+    pub(crate) relation_kinds: Vec<RelationKind>,
+    /// Strongest resolution among the edges behind this row. A `name_only` row
+    /// is a same-name match with nothing at the reference site proving it.
+    resolution: RelationResolution,
 }
 
 #[derive(Debug, Clone)]
-struct ReferenceCollection {
-    references: Vec<ReferenceEntry>,
-    missing_source_ids: Vec<EntityId>,
-    matched_kinds: Vec<RelationKind>,
+pub(crate) struct ReferenceCollection {
+    pub(crate) references: Vec<ReferenceEntry>,
+    pub(crate) missing_source_ids: Vec<EntityId>,
+    pub(crate) matched_kinds: Vec<RelationKind>,
 }
 
 /// Collect incoming references to `target` from graph-owned relation edges.
@@ -598,13 +608,21 @@ fn collect_references(
     Ok(entries)
 }
 
-fn collect_graph_references(
+/// The one collector every reference-consulting surface reads.
+///
+/// `kin refs`, `kin refs --bulk-json` and the dead-code scan all answer from
+/// this, because two lists of inbound edges are exactly what produced the
+/// FIR-2356 contradiction: `find_references` named a caller for four entities
+/// that `dead-code`, reading a different rule, called unreferenced at the same
+/// graph generation.
+pub(crate) fn collect_graph_references(
     graph: &impl GraphStore,
     entity_id: &EntityId,
     relation_kinds: &[RelationKind],
 ) -> Result<ReferenceCollection> {
     let allowed: std::collections::HashSet<_> = relation_kinds.iter().copied().collect();
     let mut grouped: HashMap<EntityId, Vec<RelationKind>> = HashMap::new();
+    let mut resolutions: HashMap<EntityId, RelationResolution> = HashMap::new();
     let mut matched_kinds = Vec::new();
 
     for rel in graph.get_all_relations_for_entity(entity_id)? {
@@ -624,6 +642,11 @@ fn collect_graph_references(
         }
         push_relation_kind(grouped.entry(src_entity_id).or_default(), rel.kind);
         push_relation_kind(&mut matched_kinds, rel.kind);
+        let resolution = RelationResolution::of(&rel);
+        resolutions
+            .entry(src_entity_id)
+            .and_modify(|current| *current = (*current).max(resolution))
+            .or_insert(resolution);
     }
 
     let mut references = Vec::with_capacity(grouped.len());
@@ -638,8 +661,12 @@ fn collect_graph_references(
             entity_id: source_id,
             name: entity.name.clone(),
             file_path: entity.file_origin.as_ref().map(|f| f.0.clone()),
-            start_line: entity.span.as_ref().map(|s| s.start_line),
+            start_line: kin_mcp::handlers::common::entity_presentation_start_line(&entity),
             relation_kinds: source_kinds,
+            resolution: resolutions
+                .get(&source_id)
+                .copied()
+                .unwrap_or(RelationResolution::NameOnly),
         });
     }
     missing_source_ids.sort();
@@ -981,7 +1008,7 @@ mod tests {
             "count line must count entities: {joined}"
         );
         assert!(
-            joined.matches("shared_caller @ callers.rs:0").count() == 2,
+            joined.matches("shared_caller @ callers.rs [").count() == 2,
             "both same-metadata entity ids must be listed separately: {joined}"
         );
 
@@ -1244,6 +1271,118 @@ mod tests {
         assert!(
             error.to_string().contains("classified_count"),
             "a version-skewed response must fail instead of recovering unsafe negatives: {error}"
+        );
+    }
+
+    /// A reference must report the line a human editor shows.
+    ///
+    /// Graph spans carry tree-sitter rows, which are 0-based, and this listing
+    /// emitted them raw. An agent that read `kin refs` and jumped to the
+    /// reported `file:line` landed one line above every reference it was given,
+    /// on every reference, while `find_references` over MCP answered the same
+    /// question one line lower.
+    ///
+    /// The fixture puts the caller on graph row 41, which is line 42 of the
+    /// file, so an off-by-one cannot pass by coincidence.
+    #[test]
+    fn a_reference_reports_the_line_a_human_editor_shows() {
+        use kin_db::InMemoryGraph;
+        use kin_model::relation::{Relation, RelationOrigin};
+        use kin_model::{
+            Entity, EntityId, EntityKind, EntityMetadata, EntityRole, EntityStore, FilePathId,
+            FingerprintAlgorithm, GraphNodeId, Hash256, LanguageId, SemanticFingerprint,
+            SourceSpan, Visibility,
+        };
+
+        fn entity(name: &str, rel_path: &str, graph_row: Option<u32>) -> Entity {
+            Entity {
+                id: EntityId::new(),
+                kind: EntityKind::Function,
+                name: name.to_string(),
+                language: LanguageId::Rust,
+                fingerprint: SemanticFingerprint {
+                    algorithm: FingerprintAlgorithm::V1TreeSitter,
+                    ast_hash: Hash256::from_bytes([0; 32]),
+                    signature_hash: Hash256::from_bytes([0; 32]),
+                    behavior_hash: Hash256::from_bytes([0; 32]),
+                    equivalence_hash: Hash256::from_bytes([0; 32]),
+                    stability_score: 1.0,
+                },
+                file_origin: Some(FilePathId::new(rel_path)),
+                span: graph_row.map(|row| SourceSpan {
+                    file: FilePathId::new(rel_path),
+                    start_byte: 0,
+                    end_byte: 1,
+                    start_line: row,
+                    start_col: 0,
+                    end_line: row + 3,
+                    end_col: 0,
+                }),
+                signature: name.to_string(),
+                visibility: Visibility::Public,
+                role: EntityRole::Source,
+                doc_summary: None,
+                metadata: EntityMetadata::default(),
+                lineage_parent: None,
+                created_in: None,
+                superseded_by: None,
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        std::fs::create_dir_all(repo.join(".kin")).unwrap();
+        let layout = kin_core::KinLayout::new(repo.join(".kin"));
+
+        let target = entity("probe_symbol", "target_mod.rs", Some(0));
+        let spanned_caller = entity("spanned_caller", "spanned.rs", Some(41));
+        let spanless_caller = entity("spanless_caller", "spanless.rs", None);
+
+        let graph = InMemoryGraph::new();
+        graph.upsert_entity(&target).unwrap();
+        for caller in [&spanned_caller, &spanless_caller] {
+            graph.upsert_entity(caller).unwrap();
+            graph
+                .upsert_relation(&Relation {
+                    id: kin_model::ids::RelationId::new(),
+                    kind: RelationKind::References,
+                    src: GraphNodeId::Entity(caller.id),
+                    dst: GraphNodeId::Entity(target.id),
+                    confidence: 1.0,
+                    origin: RelationOrigin::Parsed,
+                    created_in: None,
+                    import_source: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        }
+
+        let response = build_refs_response(
+            &layout,
+            &graph,
+            &RefsRequest {
+                entity: "probe_symbol".to_string(),
+                kind: "all".to_string(),
+            },
+        )
+        .unwrap();
+        let joined = response.lines.join("\n");
+
+        assert!(
+            joined.contains("spanned.rs:42"),
+            "graph row 41 is line 42 to a reader: {joined}"
+        );
+        assert!(
+            !joined.contains("spanned.rs:41"),
+            "the raw graph row must never reach the listing: {joined}"
+        );
+        assert!(
+            joined.contains("spanless_caller @ spanless.rs "),
+            "an entity with no span reports its path and no fabricated line: {joined}"
+        );
+        assert!(
+            !joined.contains("spanless.rs:0"),
+            "line 0 exists in no editor: {joined}"
         );
     }
 

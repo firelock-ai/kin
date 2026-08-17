@@ -1543,6 +1543,7 @@ fn timed_finalize_step<T>(step: &'static str, work: impl FnOnce() -> T) -> T {
 /// spent it instead of leaving the reply gap unexplained.
 pub(crate) fn timed_commit_phase<T>(phase: &'static str, work: impl FnOnce() -> T) -> T {
     let started = std::time::Instant::now();
+    crate::commit_liveness::enter_phase(phase);
     let outcome = work();
     let elapsed = started.elapsed();
     let elapsed_ms = elapsed.as_millis();
@@ -1568,6 +1569,7 @@ pub(crate) async fn timed_commit_phase_async<T>(
     work: impl std::future::Future<Output = T>,
 ) -> T {
     let started = std::time::Instant::now();
+    crate::commit_liveness::enter_phase(phase);
     let outcome = work.await;
     let elapsed = started.elapsed();
     let elapsed_ms = elapsed.as_millis();

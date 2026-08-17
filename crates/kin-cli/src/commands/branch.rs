@@ -95,15 +95,15 @@ pub async fn list(json: bool) -> Result<()> {
 }
 
 pub async fn create(name: RefName) -> Result<()> {
-    execute_and_print(mutation_request(name, BranchMutation::Create)).await
+    execute_and_print(mutation_request(name, BranchMutation::Create)?).await
 }
 
 pub async fn delete(name: RefName) -> Result<()> {
-    execute_and_print(mutation_request(name, BranchMutation::Delete)).await
+    execute_and_print(mutation_request(name, BranchMutation::Delete)?).await
 }
 
 pub async fn switch(name: RefName) -> Result<()> {
-    execute_and_print(mutation_request(name, BranchMutation::Switch)).await
+    execute_and_print(mutation_request(name, BranchMutation::Switch)?).await
 }
 
 pub fn parse_branch_ref(name: Option<&str>, ref_hex: Option<&str>) -> Result<RefName> {
@@ -135,10 +135,10 @@ enum BranchMutation {
     Switch,
 }
 
-fn mutation_request(name: RefName, mutation: BranchMutation) -> BranchRequest {
+fn mutation_request(name: RefName, mutation: BranchMutation) -> Result<BranchRequest> {
     let operation_id = OperationId::new();
-    let actor = AuthorId::new(kin_core::whoami());
-    match mutation {
+    let actor = crate::commands::require_commit_author()?;
+    Ok(match mutation {
         BranchMutation::Create => BranchRequest::Create {
             name,
             operation_id,
@@ -154,7 +154,7 @@ fn mutation_request(name: RefName, mutation: BranchMutation) -> BranchRequest {
             operation_id,
             actor,
         },
-    }
+    })
 }
 
 async fn execute(request: BranchRequest) -> Result<BranchResponse> {

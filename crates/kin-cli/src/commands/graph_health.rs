@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use super::repository_authority::ActiveRepositoryAuthority;
+use super::repository_authority::RequestRepositoryAuthority;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RepositoryArtifactCoverage {
@@ -74,6 +74,15 @@ pub struct GraphHealthReport {
     pub cochange_relation_count: usize,
     pub semantic_relation_count: usize,
     pub semantic_relation_density_excluding_cochanges: f64,
+    /// Reference-edge completeness per language: call sites and import
+    /// statements the parser read, against the edges the graph resolved.
+    ///
+    /// The counters beside it all describe what the graph holds. This is the one
+    /// that describes what it is missing, which is what no surface reported when
+    /// `graph validate` passed on a graph missing 16 imports and roughly 40
+    /// cross-file call edges.
+    #[serde(default)]
+    pub reference_edge_coverage: kin_core::reference_coverage::ReferenceEdgeCoverage,
     pub critical_issues: Vec<String>,
     pub warnings: Vec<String>,
     /// Observations that describe a healthy graph rather than a defect. They
@@ -98,10 +107,10 @@ struct ContaminationSummary {
 }
 
 pub(crate) fn inspect_graph(
-    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    authority: &RequestRepositoryAuthority,
     graph: &kin_db::InMemoryGraph,
 ) -> Result<GraphHealthReport> {
-    inspect_graph_with_pending_embeddings(binding, graph, None)
+    inspect_graph_with_pending_embeddings(authority, graph, None)
 }
 
 /// Build the report against a pending count the caller already sampled.
@@ -116,20 +125,42 @@ pub(crate) fn inspect_graph(
 /// both takes one sample and hands it here so the two cannot disagree. Callers
 /// that render no counter pass `None` and keep the report's own sample.
 pub(crate) fn inspect_graph_with_pending_embeddings(
-    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    authority: &RequestRepositoryAuthority,
     graph: &kin_db::InMemoryGraph,
     pending_embeddings: Option<usize>,
 ) -> Result<GraphHealthReport> {
+    let entities = graph.list_all_entities()?;
+    inspect_graph_with_entities(authority, graph, &entities, pending_embeddings)
+}
+
+/// Build the report against an entity listing the caller already took.
+///
+/// `list_all_entities` clones every entity in the graph out from under a lock,
+/// and a `graph status` response needs the same listing the report does. Taking
+/// it once and passing it here is what keeps one response from cloning the
+/// whole entity table three times: once for the renderer's counters, once for
+/// this report, and once more inside contamination collection.
+pub(crate) fn inspect_graph_with_entities(
+    authority: &RequestRepositoryAuthority,
+    graph: &kin_db::InMemoryGraph,
+    entities: &[kin_model::Entity],
+    pending_embeddings: Option<usize>,
+) -> Result<GraphHealthReport> {
     let stats = graph.graph_stats();
-    let supported_inputs = collect_supported_inputs(graph);
-    let contamination = collect_contamination(graph)?;
-    let artifact_coverage = collect_repository_artifact_coverage(binding, graph)?;
+    // One resolved-tree clone for the whole report, for the same reason.
+    let resolved_tree = graph.resolved_tree();
+    let supported_inputs = collect_supported_inputs(&resolved_tree);
+    let contamination = collect_contamination(graph, entities)?;
+    let artifact_coverage = collect_repository_artifact_coverage(authority, graph, &resolved_tree)?;
+    let reference_edge_coverage =
+        kin_core::reference_coverage::collect_reference_edge_coverage(graph)?;
     Ok(build_graph_health_report(
         &stats,
         &supported_inputs,
         &contamination,
         artifact_coverage,
         pending_embeddings,
+        reference_edge_coverage,
     ))
 }
 
@@ -147,14 +178,22 @@ struct EnrichmentFacets {
     structured: Vec<(ArtifactKind, Hash256)>,
 }
 
+/// Coverage against the authority this request reads at.
+///
+/// Takes the request's authority rather than its binding because
+/// [`ActiveRepositoryAuthority::open`] re-verifies every persisted body against
+/// its content address, so it costs whatever the whole store is worth. A server
+/// that has already paid for one open at the publication this request reads
+/// hands it over here; a one-shot caller still opens for itself.
 fn collect_repository_artifact_coverage(
-    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    authority: &RequestRepositoryAuthority,
     graph: &kin_db::InMemoryGraph,
+    graph_tree: &ResolvedTree,
 ) -> Result<RepositoryArtifactCoverage> {
-    let authority = ActiveRepositoryAuthority::open(binding)?;
+    let authority = authority.open()?;
     let workspace = authority.workspace()?;
     workspace.validate()?;
-    collect_repository_artifact_coverage_for_tree(&workspace.tree, graph, &|hash| {
+    collect_repository_artifact_coverage_for_tree(&workspace.tree, graph, graph_tree, &|hash| {
         authority.load_source_blob(hash)
     })
 }
@@ -181,14 +220,14 @@ fn structured_facet_disagrees(
 fn collect_repository_artifact_coverage_for_tree(
     authority_tree: &ResolvedTree,
     graph: &kin_db::InMemoryGraph,
+    graph_tree: &ResolvedTree,
     read_body: &dyn Fn(Hash256) -> Result<Vec<u8>>,
 ) -> Result<RepositoryArtifactCoverage> {
-    let graph_tree = graph.resolved_tree();
-    let repository_tree_in_sync = graph_tree == *authority_tree;
+    let repository_tree_in_sync = *graph_tree == *authority_tree;
 
     let mut issue_paths = BTreeSet::new();
     if !repository_tree_in_sync {
-        collect_tree_divergence_paths(authority_tree, &graph_tree, &mut issue_paths);
+        collect_tree_divergence_paths(authority_tree, graph_tree, &mut issue_paths);
     }
 
     let mut facets = BTreeMap::<String, EnrichmentFacets>::new();
@@ -327,11 +366,11 @@ fn collect_tree_divergence_paths(
     }
 }
 
-fn collect_supported_inputs(graph: &kin_db::InMemoryGraph) -> SupportedInputCounts {
+fn collect_supported_inputs(resolved_tree: &ResolvedTree) -> SupportedInputCounts {
     let mut entity_source = 0usize;
     let mut shallow_source = 0usize;
 
-    for artifact in graph.resolved_tree().artifacts_by_path() {
+    for artifact in resolved_tree.artifacts_by_path() {
         if !matches!(artifact.entry, TreeEntry::Blob { .. }) {
             continue;
         }
@@ -356,16 +395,19 @@ fn collect_supported_inputs(graph: &kin_db::InMemoryGraph) -> SupportedInputCoun
     }
 }
 
-fn collect_contamination(graph: &kin_db::InMemoryGraph) -> Result<ContaminationSummary> {
+fn collect_contamination(
+    graph: &kin_db::InMemoryGraph,
+    entities: &[kin_model::Entity],
+) -> Result<ContaminationSummary> {
     let mut path_set = BTreeSet::new();
     let mut contaminated_entity_count = 0usize;
     let mut contaminated_non_entity_count = 0usize;
 
-    for entity in graph.list_all_entities()? {
-        if let Some(file_origin) = entity.file_origin {
+    for entity in entities {
+        if let Some(file_origin) = &entity.file_origin {
             if !kin_index::should_index_repo_relative_path(Path::new(&file_origin.0)) {
                 contaminated_entity_count += 1;
-                path_set.insert(file_origin.0);
+                path_set.insert(file_origin.0.clone());
             }
         }
     }
@@ -405,6 +447,7 @@ fn build_graph_health_report(
     contamination: &ContaminationSummary,
     artifact_coverage: RepositoryArtifactCoverage,
     pending_embeddings: Option<usize>,
+    reference_edge_coverage: kin_core::reference_coverage::ReferenceEdgeCoverage,
 ) -> GraphHealthReport {
     let test_role_entity_count = stats.role_counts.get("Test").copied().unwrap_or(0);
     let cochange_relation_count = stats.relation_counts.get("CoChanges").copied().unwrap_or(0);
@@ -550,6 +593,7 @@ fn build_graph_health_report(
         cochange_relation_count,
         semantic_relation_count,
         semantic_relation_density_excluding_cochanges: semantic_density,
+        reference_edge_coverage,
         critical_issues,
         warnings,
         notes,
@@ -648,8 +692,14 @@ mod tests {
             ..complete_coverage()
         };
 
-        let report =
-            build_graph_health_report(&stats, &supported_inputs, &contamination, coverage, None);
+        let report = build_graph_health_report(
+            &stats,
+            &supported_inputs,
+            &contamination,
+            coverage,
+            None,
+            Default::default(),
+        );
 
         assert!(!report.graph_empty_for_supported_inputs);
         assert!(report.critical_issues.is_empty());
@@ -679,6 +729,7 @@ mod tests {
             },
             complete_coverage(),
             None,
+            Default::default(),
         )
     }
 
@@ -771,6 +822,7 @@ mod tests {
             },
             coverage,
             None,
+            Default::default(),
         );
 
         assert!(report.repository_artifact_coverage.complete);
@@ -817,6 +869,7 @@ mod tests {
             &no_contamination(),
             coverage,
             None,
+            Default::default(),
         );
 
         assert!(!report.repository_artifact_coverage.complete);
@@ -851,6 +904,7 @@ mod tests {
             &no_contamination(),
             coverage,
             None,
+            Default::default(),
         );
 
         assert!(report.critical_issues.is_empty());
@@ -884,6 +938,7 @@ mod tests {
             &no_contamination(),
             coverage,
             None,
+            Default::default(),
         );
 
         assert!(!report.graph_empty_for_supported_inputs);
@@ -911,6 +966,7 @@ mod tests {
             &no_contamination(),
             coverage,
             None,
+            Default::default(),
         );
 
         assert!(report.graph_empty_for_supported_inputs);
@@ -1002,9 +1058,11 @@ mod tests {
             })
             .unwrap();
 
+        let graph_tree = graph.resolved_tree();
         let coverage = collect_repository_artifact_coverage_for_tree(
             &tree,
             &graph,
+            &graph_tree,
             &staged_bodies([(compose_hash, compose_body)]),
         )
         .unwrap();
@@ -1081,8 +1139,13 @@ mod tests {
             })
             .unwrap();
 
-        let coverage =
-            collect_repository_artifact_coverage_for_tree(&tree, &graph, &no_bodies()).unwrap();
+        let coverage = collect_repository_artifact_coverage_for_tree(
+            &tree,
+            &graph,
+            &graph.resolved_tree(),
+            &no_bodies(),
+        )
+        .unwrap();
 
         assert!(!coverage.complete);
         assert_eq!(coverage.conflicting_enrichment_path_count, 1);
@@ -1159,9 +1222,13 @@ mod tests {
             TreeEntry::blob(new_hash, false),
         )])
         .unwrap();
-        let coverage =
-            collect_repository_artifact_coverage_for_tree(&authority_tree, &graph, &no_bodies())
-                .unwrap();
+        let coverage = collect_repository_artifact_coverage_for_tree(
+            &authority_tree,
+            &graph,
+            &graph.resolved_tree(),
+            &no_bodies(),
+        )
+        .unwrap();
         assert_eq!(coverage.missing_enrichment_path_count, 1);
         assert_eq!(coverage.content_mismatch_path_count, 0);
         assert_eq!(coverage.stale_enrichment_path_count, 0);
@@ -1202,8 +1269,13 @@ mod tests {
                 text_preview: None,
             })
             .unwrap();
-        collect_repository_artifact_coverage_for_tree(&tree, &graph, &staged_bodies([(hash, body)]))
-            .unwrap()
+        collect_repository_artifact_coverage_for_tree(
+            &tree,
+            &graph,
+            &graph.resolved_tree(),
+            &staged_bodies([(hash, body)]),
+        )
+        .unwrap()
     }
 
     /// An admitted workflow file whose facet is exactly what its extractor

@@ -1030,6 +1030,38 @@ pub fn remove_daemon_files_if_current_process(kin_root: &Path) {
     })
 }
 
+/// Retire an endpoint whose recorded owner this caller has proved is dead.
+///
+/// A daemon killed from outside never retires its own endpoint: retirement runs
+/// after the shutdown select returns, and a SIGKILLed process never gets there.
+/// The record then keeps naming a dead pid as the live owner of the repository,
+/// which is what left `kin doctor` reporting a STALE daemon with its endpoint
+/// record still on disk after a supervisor reap.
+///
+/// Returns whether anything was removed. Removal requires the record to still
+/// name `owner_pid` and that pid to be gone; a record naming a live process, a
+/// successor that republished, or nobody identifiable is left alone. That keeps
+/// this in the same direction the rest of this module runs in — proof authorizes
+/// destruction, absence of proof never does.
+pub fn retire_endpoint_of_dead_owner(kin_root: &Path, owner_pid: u32) -> bool {
+    without_blocking_runtime_worker(|| {
+        let Ok(_authority) = acquire_singleton_coordination_guard(kin_root) else {
+            tracing::warn!(
+                repo = %kin_root.display(),
+                "preserving daemon endpoint because lifecycle authority is unavailable"
+            );
+            return false;
+        };
+        match endpoint_ownership(kin_root) {
+            EndpointOwnership::OtherProcess { pid, live: false } if pid == owner_pid => {
+                remove_endpoint_components(kin_root);
+                true
+            }
+            _ => false,
+        }
+    })
+}
+
 /// Is the process with this PID alive?
 fn is_process_alive(pid: u32) -> bool {
     kin_cli::daemon_client::is_process_alive(pid)
@@ -4456,6 +4488,78 @@ mod tests {
 
         std::fs::write(root.join("daemon.pid"), "not-a-pid").unwrap();
         assert_eq!(endpoint_ownership(root), EndpointOwnership::Unattributed);
+    }
+
+    /// A pid the OS has finished with, obtained by starting a process and
+    /// waiting on it rather than by picking a number and hoping.
+    fn a_pid_that_is_gone() -> u32 {
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn a process to outlive");
+        let pid = child.id();
+        child.wait().expect("wait for it to exit");
+        pid
+    }
+
+    /// A daemon SIGKILLed by the supervisor's reaper retires nothing of its own:
+    /// endpoint retirement runs after the shutdown select returns and a killed
+    /// process never gets there. `kin doctor` then read STALE with the record
+    /// still on disk, which is a reading that does not match reality — the
+    /// endpoint names a live owner that is dead. The killer knows it is dead, so
+    /// the killer clears it.
+    #[test]
+    fn the_endpoint_of_a_daemon_proved_dead_is_retired_by_whoever_killed_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let dead = a_pid_that_is_gone();
+
+        std::fs::write(root.join("daemon.pid"), dead.to_string()).unwrap();
+        std::fs::write(root.join("daemon.port"), "39603").unwrap();
+        assert_eq!(
+            endpoint_ownership(root),
+            EndpointOwnership::OtherProcess {
+                pid: dead,
+                live: false
+            }
+        );
+
+        assert!(retire_endpoint_of_dead_owner(root, dead));
+        assert_eq!(
+            endpoint_ownership(root),
+            EndpointOwnership::Absent,
+            "doctor must read the same absence the killer created"
+        );
+        assert!(!root.join("daemon.port").exists());
+    }
+
+    /// The retirement is proof-gated in both directions it can be wrong: a
+    /// record naming a live daemon, and a record naming a successor rather than
+    /// the pid that was killed. Either would strand a working repository.
+    #[test]
+    fn retiring_a_dead_owners_endpoint_refuses_a_live_owner_or_a_successor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // pid 1 is always alive.
+        std::fs::write(root.join("daemon.pid"), "1").unwrap();
+        std::fs::write(root.join("daemon.port"), "39603").unwrap();
+        assert!(
+            !retire_endpoint_of_dead_owner(root, 1),
+            "a live owner's endpoint is never destroyed"
+        );
+        assert!(root.join("daemon.pid").exists());
+
+        // A successor republished under a different pid: the killed daemon's
+        // number no longer owns this endpoint and clearing it would strand the
+        // daemon that does.
+        let dead = a_pid_that_is_gone();
+        assert!(
+            !retire_endpoint_of_dead_owner(root, dead),
+            "an endpoint naming somebody else is left where it is"
+        );
+        assert!(root.join("daemon.pid").exists());
     }
 
     #[test]

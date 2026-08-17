@@ -2898,6 +2898,95 @@ mod tests {
         );
     }
 
+    /// `tokens_used` must describe the bytes the caller received.
+    ///
+    /// It described the planner's signature stubs instead, so a caller
+    /// budgeting its next request against it had already spent more than the
+    /// number said, by the whole weight of the bodies and provenance the
+    /// handler goes on to serve. The same payload also carried `artifact_path`,
+    /// a `RepoPath` whose wire form is hex bytes, beside the plain `file_path`
+    /// that already names the same file.
+    #[test]
+    fn a_context_pack_reports_what_its_own_payload_costs() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let content = "export function budgeted_probe_9f3e(value: number): boolean {\n  return value > 0;\n}\n";
+        let source = make_source_backed_entity(content);
+        let entity = &source.entity;
+
+        let mut store = EmptyStore::default();
+        store.entities_by_id.insert(entity.id, entity.clone());
+        store
+            .file_hashes
+            .insert(entity.file_origin.clone().unwrap(), source.hash);
+        install_empty_store_exact_tree(&mut store, source._dir.path());
+        let authority = test_repository_authority(source._dir.path());
+        let sessions = SessionRegistry::new();
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(entity.id.to_string()),
+        )]);
+
+        let result =
+            entities::handle_get_context_pack(&args, &store, &sessions, Some(&authority)).unwrap();
+        let crate::types::ContentBlock::Text { text } = &result.content[0];
+        let served = text.clone();
+        let value: serde_json::Value = serde_json::from_str(&served).unwrap();
+
+        let reported = value["tokens_used"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("the pack must report tokens_used: {value}"))
+            as usize;
+        let actual = kin_context::estimate_tokens(&served);
+        assert!(
+            reported.abs_diff(actual) <= actual / 100,
+            "tokens_used {reported} must be within 1% of the {actual} tokens the served payload \
+             costs"
+        );
+
+        // Positive control: the payload really does carry more than the stub
+        // accounting, so a pack that lost its body could not pass the check
+        // above by measuring nothing.
+        assert!(
+            value["focal_entity"]["body"].is_string(),
+            "the pack must serve a body for this fixture: {value}"
+        );
+
+        assert_eq!(
+            value["focal_entity"]["file_path"],
+            serde_json::json!(entity.file_origin.as_ref().unwrap().to_string()),
+            "the readable path stays: {value}"
+        );
+        let mut hex_paths = Vec::new();
+        artifact_path_fields(&value, "context_pack", &mut hex_paths);
+        assert!(
+            hex_paths.is_empty(),
+            "the pack must not restate file_path as hex bytes at {hex_paths:?}: {value}"
+        );
+    }
+
+    /// Name every `artifact_path` anywhere under `value`.
+    fn artifact_path_fields(value: &serde_json::Value, at: &str, found: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    artifact_path_fields(item, &format!("{at}[{index}]"), found);
+                }
+            }
+            serde_json::Value::Object(fields) => {
+                for (key, item) in fields {
+                    if key == "artifact_path" {
+                        found.push(format!("{at}.{key}"));
+                    }
+                    artifact_path_fields(item, &format!("{at}.{key}"), found);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Stand-in for the context builder's token-accounting projection, so the
     /// tests above assert against the exact text that used to leak into `body`.
     fn project_full_body_stub(entity: &Entity) -> String {
@@ -4803,9 +4892,13 @@ mod tests {
             renamed_source["artifact_id"],
             serde_json::to_value(source.artifact_id).unwrap()
         );
+        // The path this read resolved at is asserted on the artifact surface
+        // below, where `artifact.path` is the exact `RepoPath`. The entity
+        // surface names the same file readably and no longer restates it as
+        // hex bytes beside its own `file_path`.
         assert_eq!(
-            renamed_source["artifact_path"],
-            serde_json::to_value(&renamed_path).unwrap()
+            renamed_source["read_path"],
+            serde_json::json!(".kin/source-root/src/renamed.ts")
         );
         assert_eq!(
             renamed_source["source_excerpt"],

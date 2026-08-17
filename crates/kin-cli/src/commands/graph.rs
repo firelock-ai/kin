@@ -10,7 +10,7 @@ use kin_model::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::graph_health::{inspect_graph, inspect_graph_with_pending_embeddings};
+use super::graph_health::{inspect_graph, inspect_graph_with_entities};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
@@ -29,6 +29,15 @@ pub struct GraphCommandResponse {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<GraphSourceRecord>,
+    /// Reference-edge completeness, per language, for the status and validate
+    /// surfaces.
+    ///
+    /// Carried structurally as well as in `lines` so a consumer reads the metric
+    /// rather than parsing prose out of a terminal rendering. Optional because a
+    /// subcommand that measures nothing (inspect, source) has none to report and
+    /// an older daemon sends none at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_edge_coverage: Option<kin_core::reference_coverage::ReferenceEdgeCoverage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -216,8 +225,16 @@ fn print_graph_response(response: GraphCommandResponse) -> Result<()> {
 /// internally perfect and simply out of date, and every content check here
 /// passes on it. That is how `kin graph status` came to report no issues on a
 /// store the daemon had been failing to admit since Aug 6.
+///
+/// `authority` is how this command reaches durable repository state. It is a
+/// [`RequestRepositoryAuthority`](super::repository_authority::RequestRepositoryAuthority)
+/// rather than a binding because opening durable authority re-verifies every
+/// persisted body against its content address, and a long-lived server that has
+/// already opened at the publication this request reads should not pay for it
+/// again per request. `status` used to take a bare binding and so opened the
+/// whole store on every call, which is where most of its wall time went.
 pub fn execute_graph_command(
-    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    authority: &super::repository_authority::RequestRepositoryAuthority,
     graph: &kin_db::InMemoryGraph,
     request: &GraphCommandRequest,
     reconcile: &crate::commands::resources::ReconcileHealth,
@@ -225,15 +242,13 @@ pub fn execute_graph_command(
 ) -> Result<GraphCommandResponse> {
     match request {
         GraphCommandRequest::Status => {
-            build_graph_status_response(binding, graph, reconcile, embedding_runtime)
+            build_graph_status_response(authority, graph, reconcile, embedding_runtime)
         }
-        GraphCommandRequest::Validate => build_graph_validate_response(binding, graph),
+        GraphCommandRequest::Validate => build_graph_validate_response(authority, graph),
         GraphCommandRequest::Inspect { name } => build_graph_inspect_response(graph, name),
-        GraphCommandRequest::Source { entity } => build_graph_source_response(
-            &super::repository_authority::RequestRepositoryAuthority::pinned(binding.clone()),
-            graph,
-            entity,
-        ),
+        GraphCommandRequest::Source { entity } => {
+            build_graph_source_response(authority, graph, entity)
+        }
     }
 }
 
@@ -333,7 +348,7 @@ fn cross_file_coverage(
 }
 
 fn build_graph_status_response(
-    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    authority: &super::repository_authority::RequestRepositoryAuthority,
     graph: &kin_db::InMemoryGraph,
     reconcile: &crate::commands::resources::ReconcileHealth,
     embedding_runtime: &crate::commands::resources::EmbedRuntimeState,
@@ -345,9 +360,12 @@ fn build_graph_status_response(
     // (the v0.5.21 battery caught 1 of 12 paired readings disagreeing by 512).
     let embed_status = graph.embedding_status();
     let coverage_is_measured = embedding_coverage_is_measured(graph) || embed_status.total == 0;
-    let health = inspect_graph_with_pending_embeddings(binding, graph, Some(embed_status.pending))?;
-
+    // One listing for this whole response. It feeds both the counters below and
+    // the health report, which used to take its own and clone every entity in
+    // the graph a second time.
     let entities = graph.list_all_entities()?;
+    let health =
+        inspect_graph_with_entities(authority, graph, &entities, Some(embed_status.pending))?;
 
     // An external reference target is a node this repository references without
     // owning: no file, no span, no signature, and a uniform kind. Counting it
@@ -591,6 +609,14 @@ fn build_graph_status_response(
         ));
     }
 
+    // How much of the parsed reference surface reached the graph. Every counter
+    // above describes what the graph HOLDS; none of them could say what it is
+    // MISSING, so a graph carrying a fifth of its call edges reported density
+    // 0.38 and a clean bill while five shipped tools answered from the absent
+    // four fifths.
+    lines.push(String::new());
+    lines.extend(health.reference_edge_coverage.summary_lines());
+
     // Warnings
     let mut warnings = health.warnings.clone();
     let criticals = health.critical_issues.clone();
@@ -653,6 +679,7 @@ fn build_graph_status_response(
         error: (!criticals.is_empty())
             .then(|| format!("{} critical graph health issue(s) found", criticals.len())),
         source: None,
+        reference_edge_coverage: Some(health.reference_edge_coverage.clone()),
     })
 }
 
@@ -671,10 +698,10 @@ fn append_health_notes(lines: &mut Vec<String>, notes: &[String]) {
 }
 
 fn build_graph_validate_response(
-    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    authority: &super::repository_authority::RequestRepositoryAuthority,
     graph: &kin_db::InMemoryGraph,
 ) -> Result<GraphCommandResponse> {
-    let health = inspect_graph(binding, graph)?;
+    let health = inspect_graph(authority, graph)?;
 
     // Validation needs the complete relation table, including corrupt edges
     // whose source and destination are both absent. Entity-rooted traversal
@@ -806,11 +833,36 @@ fn build_graph_validate_response(
 
     if issues.is_empty() {
         lines.push(String::new());
-        lines.push("✓ All checks passed.".to_string());
+        lines.push("✓ All integrity checks passed.".to_string());
     } else {
         lines.push(String::new());
         for issue in &issues {
             lines.push(format!("✗ {}", issue));
+        }
+    }
+
+    // "All checks passed" was read as a clean bill on a graph holding a fifth of
+    // its relation edges, and it was defensible only because this command checks
+    // integrity: whether the edges present point at entities that exist. It
+    // cannot check whether the edges that should exist do. So it says which
+    // question it answered and prints the answer to the other one beside it,
+    // rather than leaving a reader to assume the two are the same check.
+    lines.push(String::new());
+    lines.push(
+        "Integrity only: these checks say the edges present are coherent, not that the edges a \
+         reader expects exist."
+            .to_string(),
+    );
+    lines.extend(health.reference_edge_coverage.summary_lines());
+    let unsupportable = health
+        .reference_edge_coverage
+        .unsupportable_absence_reasons();
+    if !unsupportable.is_empty() {
+        lines.push(String::new());
+        for reason in unsupportable {
+            lines.push(format!(
+                "⚠ absence is not answerable from this graph: {reason}"
+            ));
         }
     }
     append_health_notes(&mut lines, &health.notes);
@@ -819,6 +871,7 @@ fn build_graph_validate_response(
         lines,
         error: (!issues.is_empty()).then(|| format!("{} issue(s) found", issues.len())),
         source: None,
+        reference_edge_coverage: Some(health.reference_edge_coverage.clone()),
     })
 }
 
@@ -841,6 +894,7 @@ fn build_graph_inspect_response(
             lines: graph_entity_not_found_lines(name),
             error: Some(format!("no entity found matching '{}'", name)),
             source: None,
+            reference_edge_coverage: None,
         });
     }
 
@@ -887,6 +941,7 @@ fn build_graph_inspect_response(
         lines,
         error: None,
         source: None,
+        reference_edge_coverage: None,
     })
 }
 
@@ -1051,12 +1106,14 @@ pub fn build_graph_source_response(
                 lines,
                 error: None,
                 source: Some(record),
+                reference_edge_coverage: None,
             })
         }
         EntitySourceOutcome::NotFound(message) => Ok(GraphCommandResponse {
             lines: graph_entity_not_found_lines(entity_query),
             error: Some(message),
             source: None,
+            reference_edge_coverage: None,
         }),
         // A valid entity with no retrievable source is an error for the text/`?`
         // command paths (the CLI `kin graph source` and `trace_data_flow`, which
@@ -1284,6 +1341,14 @@ mod tests {
     };
     use std::fs;
 
+    /// The one-shot authority arm, which is what a test with no server around
+    /// it has. The shared arm is exercised where a daemon supplies it.
+    fn pinned(
+        binding: &kin_core::LocalRepositoryAuthorityBinding,
+    ) -> super::super::repository_authority::RequestRepositoryAuthority {
+        super::super::repository_authority::RequestRepositoryAuthority::pinned(binding.clone())
+    }
+
     mod freshness {
         use super::super::append_freshness_line;
         use chrono::TimeZone;
@@ -1423,6 +1488,7 @@ mod tests {
             file_path: "src/app.rs".to_string(),
             entities: vec![caller.clone()],
             relations: vec![kin_parser::ExtractedRelation {
+                receiver: None,
                 call_shape: None,
                 kind,
                 src_name: caller.name.clone(),
@@ -1479,9 +1545,13 @@ mod tests {
         // separates the two halves here and asserting on it would pass whatever
         // the reconcile term did. What must differ is the reconcile warning
         // itself: absent on a healthy daemon, present on this one.
-        let healthy =
-            build_graph_status_response(&binding, &graph, &Default::default(), &Default::default())
-                .unwrap();
+        let healthy = build_graph_status_response(
+            &pinned(&binding),
+            &graph,
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
         assert!(
             !healthy
                 .lines
@@ -1492,7 +1562,7 @@ mod tests {
         );
 
         let degraded = build_graph_status_response(
-            &binding,
+            &pinned(&binding),
             &graph,
             &crate::commands::resources::ReconcileHealth {
                 admission_failure_streak: 412,
@@ -1542,7 +1612,7 @@ mod tests {
         graph.upsert_entity(&entity).unwrap();
 
         let response = build_graph_status_response(
-            &binding,
+            &pinned(&binding),
             &graph,
             &crate::commands::resources::ReconcileHealth {
                 untracked_path_count: 1,
@@ -1583,7 +1653,7 @@ mod tests {
         graph.upsert_entity(&entity).unwrap();
 
         let response = build_graph_status_response(
-            &binding,
+            &pinned(&binding),
             &graph,
             &crate::commands::resources::ReconcileHealth {
                 skipped_events: 7,
@@ -1664,9 +1734,13 @@ mod tests {
             .upsert_relation(&test_relation(RelationKind::Calls, caller.id, callee.id))
             .unwrap();
 
-        let response =
-            build_graph_status_response(&binding, &graph, &Default::default(), &Default::default())
-                .unwrap();
+        let response = build_graph_status_response(
+            &pinned(&binding),
+            &graph,
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
 
         // The entity-rooted total and the whole-table total count different
         // scopes, so neither line may carry a bare "Relations" label.
@@ -1718,9 +1792,13 @@ mod tests {
             .upsert_relation(&test_relation(RelationKind::Calls, caller.id, callee.id))
             .unwrap();
 
-        let response =
-            build_graph_status_response(&binding, &graph, &Default::default(), &Default::default())
-                .unwrap();
+        let response = build_graph_status_response(
+            &pinned(&binding),
+            &graph,
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
 
         assert!(
             response
@@ -1755,9 +1833,13 @@ mod tests {
             .upsert_relation(&test_relation(RelationKind::Calls, caller.id, callee.id))
             .unwrap();
 
-        let response =
-            build_graph_status_response(&binding, &graph, &Default::default(), &Default::default())
-                .unwrap();
+        let response = build_graph_status_response(
+            &pinned(&binding),
+            &graph,
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
 
         assert!(
             response
@@ -1809,7 +1891,7 @@ mod tests {
         // no sidecar was on disk at open, while the persisted marker says this
         // store finished a fill once.
         let no_sidecar = build_graph_status_response(
-            &binding,
+            &pinned(&binding),
             &graph,
             &Default::default(),
             &crate::commands::resources::EmbedRuntimeState {
@@ -1862,9 +1944,13 @@ mod tests {
 
         // A store that has never finished a fill is in the same structural
         // state and says so, minus the marker clause it has not earned.
-        let first_fill =
-            build_graph_status_response(&binding, &graph, &Default::default(), &Default::default())
-                .unwrap();
+        let first_fill = build_graph_status_response(
+            &pinned(&binding),
+            &graph,
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
         let first_fill_line = first_fill
             .lines
             .iter()
@@ -1895,7 +1981,7 @@ mod tests {
             .unwrap();
 
         let remote = build_graph_status_response(
-            &binding,
+            &pinned(&binding),
             &graph,
             &Default::default(),
             &crate::commands::resources::EmbedRuntimeState {
@@ -1943,7 +2029,7 @@ mod tests {
         let status = graph.embedding_status();
 
         let discarded = build_graph_status_response(
-            &binding,
+            &pinned(&binding),
             &graph,
             &Default::default(),
             &crate::commands::resources::EmbedRuntimeState {
@@ -1989,7 +2075,7 @@ mod tests {
         // with nothing pending renders the plain measured line.
         let (_temp2, binding2, empty_graph) = graph_validation_fixture();
         let recovered = build_graph_status_response(
-            &binding2,
+            &pinned(&binding2),
             &empty_graph,
             &Default::default(),
             &crate::commands::resources::EmbedRuntimeState {
@@ -2032,9 +2118,13 @@ mod tests {
             ))
             .unwrap();
 
-        let response =
-            build_graph_status_response(&binding, &graph, &Default::default(), &Default::default())
-                .unwrap();
+        let response = build_graph_status_response(
+            &pinned(&binding),
+            &graph,
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
 
         assert!(response
             .lines
@@ -2061,13 +2151,30 @@ mod tests {
         graph.upsert_entity(&caller).unwrap();
         graph.upsert_relation(&relation).unwrap();
 
-        let response = build_graph_validate_response(&binding, &graph).unwrap();
+        let response = build_graph_validate_response(&pinned(&binding), &graph).unwrap();
 
         assert!(response.error.is_none(), "{:?}", response.lines);
         assert!(response
             .lines
             .iter()
-            .any(|line| line == "✓ All checks passed."));
+            .any(|line| line == "✓ All integrity checks passed."));
+        // The verdict names the question it answered, and the answer to the
+        // other one is printed beside it. A pass here was read as a clean bill
+        // on a graph missing most of its relation edges.
+        assert!(
+            response.lines.iter().any(|line| line
+                .starts_with("Integrity only: these checks say the edges present are coherent")),
+            "{:?}",
+            response.lines
+        );
+        assert!(
+            response
+                .lines
+                .iter()
+                .any(|line| line.starts_with("Reference edge coverage")),
+            "{:?}",
+            response.lines
+        );
     }
 
     #[test]
@@ -2083,7 +2190,7 @@ mod tests {
             ))
             .unwrap();
 
-        let response = build_graph_validate_response(&binding, &graph).unwrap();
+        let response = build_graph_validate_response(&pinned(&binding), &graph).unwrap();
 
         assert!(response.error.is_some(), "{:?}", response.lines);
         assert!(response
@@ -2103,7 +2210,7 @@ mod tests {
             ))
             .unwrap();
 
-        let response = build_graph_validate_response(&binding, &graph).unwrap();
+        let response = build_graph_validate_response(&pinned(&binding), &graph).unwrap();
 
         assert!(response.error.is_some(), "{:?}", response.lines);
         assert!(response
@@ -2122,7 +2229,7 @@ mod tests {
         let (_caller, relation) = external_placeholder_relation(RelationKind::References);
         graph.upsert_relation(&relation).unwrap();
 
-        let response = build_graph_validate_response(&binding, &graph).unwrap();
+        let response = build_graph_validate_response(&pinned(&binding), &graph).unwrap();
 
         assert!(response.error.is_some(), "{:?}", response.lines);
         assert!(response
@@ -2881,7 +2988,7 @@ mod tests {
         entity.file_origin = Some(FilePathId::new("src/present.rs"));
         graph.upsert_entity(&entity).unwrap();
 
-        let response = build_graph_validate_response(&binding, &graph).unwrap();
+        let response = build_graph_validate_response(&pinned(&binding), &graph).unwrap();
 
         let line = orphan_line(&response).expect("graph tree lacks the file, so it is orphaned");
         assert!(line.contains('1'), "{line}");
@@ -2931,7 +3038,7 @@ mod tests {
             .upsert_entity(&external_target_entity("info", 0x22))
             .unwrap();
 
-        let distinct = build_graph_validate_response(&binding, &graph).unwrap();
+        let distinct = build_graph_validate_response(&pinned(&binding), &graph).unwrap();
         assert!(
             duplicate_line(&distinct).is_none(),
             "distinct import sources are distinct entities: {}",
@@ -2944,7 +3051,7 @@ mod tests {
             .upsert_entity(&external_target_entity("info", 0x22))
             .unwrap();
 
-        let duplicated = build_graph_validate_response(&binding, &graph).unwrap();
+        let duplicated = build_graph_validate_response(&pinned(&binding), &graph).unwrap();
         let line = duplicate_line(&duplicated)
             .expect("two entities claiming one external target is a duplicate");
         assert!(line.contains('1'), "{line}");
@@ -2963,10 +3070,14 @@ mod tests {
         entity.file_origin = Some(FilePathId::new("src/tracked.rs"));
         graph.upsert_entity(&entity).unwrap();
 
-        let validate = build_graph_validate_response(&binding, &graph).unwrap();
-        let status =
-            build_graph_status_response(&binding, &graph, &Default::default(), &Default::default())
-                .unwrap();
+        let validate = build_graph_validate_response(&pinned(&binding), &graph).unwrap();
+        let status = build_graph_status_response(
+            &pinned(&binding),
+            &graph,
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
 
         let validate_notes = note_lines(&validate);
         assert!(
@@ -3002,7 +3113,7 @@ mod tests {
         entity.file_origin = Some(FilePathId::new("src/tracked.rs"));
         graph.upsert_entity(&entity).unwrap();
 
-        let response = build_graph_validate_response(&binding, &graph).unwrap();
+        let response = build_graph_validate_response(&pinned(&binding), &graph).unwrap();
 
         assert!(
             orphan_line(&response).is_none(),

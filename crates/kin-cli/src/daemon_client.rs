@@ -6721,6 +6721,9 @@ pub async fn ensure_supervisor_running() -> Result<String> {
             "supervisor became healthy without acknowledging the exact startup generation",
         );
     }
+    // A supervisor is the same binary under `--supervisor`, so an unreaped one
+    // prints as `[kin-daemon] <defunct>` exactly like a repo daemon does.
+    kin_daemon_spawn::adopt_detached_daemon_child(child);
     info!(supervisor = %base_url, "supervisor is up and ready");
     Ok(base_url)
 }
@@ -7112,15 +7115,23 @@ pub async fn ensure_daemon_running_with_idle_timeout(
 
     let timeout_secs = daemon_ready_timeout_secs();
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    let base_url = wait_for_daemon_ready(kin_root, &mut child, deadline, log_offset)
-        .await
-        .map_err(|error| match error {
-            DaemonReadinessError::Failed(error) => AutoStartError::spawn(format!("{error:#}")),
-            DaemonReadinessError::Timeout(detail) => AutoStartError::StartupTimeout(detail),
-        })?;
+    let readiness = wait_for_daemon_ready(kin_root, &mut child, deadline, log_offset).await;
+    // The daemon outlives this call either way, and this process may outlive the
+    // daemon: `kin mcp start` reaches here for a whole agent session. Dropping
+    // the handle waits on nothing, so hand it to the reaper before the borrow
+    // ends rather than leaving a corpse behind for the session's duration.
+    kin_daemon_spawn::adopt_detached_daemon_child(child);
+    let base_url = readiness.map_err(|error| match error {
+        DaemonReadinessError::Failed(error) => AutoStartError::spawn(format!("{error:#}")),
+        DaemonReadinessError::Timeout(detail) => AutoStartError::StartupTimeout(detail),
+    })?;
     register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url)
         .await
         .map_err(AutoStartError::spawn)?;
+    // A death note explains the outage that made this spawn necessary, and
+    // nothing after it. Left in place it would be quoted as the cause of the
+    // next unrelated transport failure.
+    kin_daemon_spawn::clear_daemon_death_note(kin_root);
     info!(daemon = %base_url, "daemon is up and ready");
     Ok(base_url)
 }
@@ -11073,14 +11084,47 @@ mod tests {
         let _ = child.wait();
     }
 
+    /// Block until `pid` has terminated, leaving it unreaped.
+    ///
+    /// `WNOWAIT` is what makes this a synchronization point rather than a
+    /// substitute for the code under test: it returns exactly when the child
+    /// becomes reapable and leaves it in that state, so the classifier's own
+    /// `try_wait` is still the call that observes the corpse and reaps it.
+    /// Anything that consumed the child here, including a plain `wait`, would
+    /// leave the classifier reading a cached status down a branch the daemon
+    /// path never takes.
+    #[cfg(unix)]
+    fn block_until_terminated_leaving_it_reapable(pid: u32) {
+        let pid = libc::pid_t::try_from(pid).expect("a pid we spawned fits pid_t");
+        loop {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let observed = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if observed == 0 {
+                return;
+            }
+            let error = std::io::Error::last_os_error();
+            assert_eq!(
+                error.raw_os_error(),
+                Some(libc::EINTR),
+                "a child we spawned must stay observable until we reap it: {error}"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn a_daemon_that_already_exited_is_reaped() {
         let mut child = std::process::Command::new("true")
             .spawn()
             .expect("spawn a child that exits immediately");
-        // Let it actually exit before classifying.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        block_until_terminated_leaving_it_reapable(child.id());
 
         let disposition = kin_daemon_spawn::startup_disposition(&mut child)
             .expect("a child we spawned is observable");

@@ -74,6 +74,92 @@ pub const PORT_FILE_NAME: &str = "daemon.port";
 /// File the daemon writes its PID into as part of endpoint publication.
 pub const PID_FILE_NAME: &str = "daemon.pid";
 
+/// File whoever ends a daemon from outside writes its reason into.
+pub const DEATH_FILE_NAME: &str = "daemon.death";
+
+/// Why a daemon stopped, recorded by the process that stopped it.
+///
+/// A daemon killed from outside cannot log its own cause: the reaper's SIGTERM
+/// grace is shorter than the daemon's own shutdown, so the SIGKILL that follows
+/// lands while the tokio arm that would print a shutdown line is still unpolled.
+/// Everything the killer knew therefore went to the killer's log, and the log an
+/// operator actually opens — `.kin/daemon.log` — simply stopped mid-line. This
+/// carries that reason back to the repository the daemon served, so both the CLI
+/// reporting a failed request and `kin doctor` can say what happened instead of
+/// quoting a transport error.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DaemonDeathNote {
+    /// The daemon that was ended.
+    pub pid: u32,
+    /// What ended it, e.g. `kin-supervisor-reaper`.
+    pub killed_by: String,
+    /// The deciding condition, in the killer's own words.
+    pub reason: String,
+    /// What the daemon was doing, when the killer could tell.
+    pub in_flight: Option<String>,
+    /// RFC 3339 timestamp of the decision.
+    pub at: String,
+}
+
+impl DaemonDeathNote {
+    /// One line an operator can read without parsing anything.
+    pub fn summary(&self) -> String {
+        match &self.in_flight {
+            Some(work) => format!(
+                "{} ended pid {} at {}: {} (in flight: {})",
+                self.killed_by, self.pid, self.at, self.reason, work
+            ),
+            None => format!(
+                "{} ended pid {} at {}: {}",
+                self.killed_by, self.pid, self.at, self.reason
+            ),
+        }
+    }
+}
+
+/// Record why a daemon was ended, in the repository it served.
+///
+/// Best effort by construction: the caller is about to signal a process, and a
+/// note it could not write must never stop that from happening.
+pub fn write_daemon_death_note(kin_root: &Path, note: &DaemonDeathNote) {
+    let Ok(body) = serde_json::to_string(note) else {
+        return;
+    };
+    let tmp = kin_root.join(format!("{DEATH_FILE_NAME}.tmp"));
+    if fs::write(&tmp, body).is_ok() && fs::rename(&tmp, kin_root.join(DEATH_FILE_NAME)).is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+}
+
+/// Read the death note left for `kin_root`, if one is there.
+pub fn read_daemon_death_note(kin_root: &Path) -> Option<DaemonDeathNote> {
+    let raw = fs::read_to_string(kin_root.join(DEATH_FILE_NAME)).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Clear a death note. A daemon that comes up successfully calls this, so a note
+/// never outlives the outage it describes and gets blamed for the next one.
+pub fn clear_daemon_death_note(kin_root: &Path) {
+    let _ = fs::remove_file(kin_root.join(DEATH_FILE_NAME));
+}
+
+/// Append a line to the repo daemon's own log.
+///
+/// The one place a killer can put its reason where the operator will look. The
+/// daemon holds this file open in append mode and is about to stop writing to
+/// it, so an extra append races nothing.
+pub fn append_to_daemon_log(kin_root: &Path, line: &str) {
+    use std::io::Write as _;
+    let Ok(mut log) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(kin_root.join("daemon.log"))
+    else {
+        return;
+    };
+    let _ = writeln!(log, "{line}");
+}
+
 /// Shared install-mutation lease for spawn paths that cannot depend on
 /// `kin-cli` (most importantly MCP daemon revival). Full uninstall takes the
 /// same `<KIN_HOME>/update.lock` exclusively before stopping processes and
@@ -3004,6 +3090,78 @@ pub fn terminate_if_proven_dead(
     true
 }
 
+/// How often the detached-daemon reaper asks whether an adopted child has
+/// exited. Cheap: `try_wait` is one `waitpid(WNOHANG)` per adopted handle.
+const DETACHED_DAEMON_REAP_POLL: Duration = Duration::from_millis(250);
+
+/// Hand a started, detached daemon to a reaper that waits on it.
+///
+/// Every spawn path here calls `setsid`, and every spawn path then relies on
+/// the launcher exiting: once it does the daemon reparents to init, and init
+/// waits on it. `setsid` starts a new session and process group and does not
+/// change the parent pid, so the arrangement only holds while the launcher is
+/// short-lived. Under a launcher that outlives the daemon it does not hold at
+/// all, and dropping a [`std::process::Child`] waits on nothing, so the daemon
+/// stays in the process table as `[kin-daemon] <defunct>` from the moment it
+/// dies until the launcher does.
+///
+/// That launcher exists: `kin mcp start` runs for a whole agent session and
+/// reaches a daemon spawn on startup binding, on every workspace rebind, and on
+/// every tool call that revives one, while the supervisor's reaper and redeploy
+/// paths end daemons underneath it. Six corpses accumulated in one brownfield
+/// session that way.
+///
+/// Adoption transfers the handle to a named background thread that polls it to
+/// completion. It never signals the child, because the caller has no evidence
+/// the daemon should stop: this collects an exit status and nothing else.
+/// Failing to start the thread is not fatal — the handle is dropped, which is
+/// exactly the behavior every caller had before.
+pub fn adopt_detached_daemon_child(child: std::process::Child) {
+    let Some(reaper) = detached_daemon_reaper() else {
+        return;
+    };
+    let _ = reaper.send(child);
+}
+
+/// The process-wide sender for [`adopt_detached_daemon_child`], started on first
+/// use. `None` once thread creation has failed, so a failed start is not retried
+/// per spawn.
+fn detached_daemon_reaper() -> Option<std::sync::mpsc::Sender<std::process::Child>> {
+    static REAPER: OnceLock<Option<std::sync::mpsc::Sender<std::process::Child>>> = OnceLock::new();
+    REAPER
+        .get_or_init(|| {
+            let (sender, receiver) = std::sync::mpsc::channel::<std::process::Child>();
+            std::thread::Builder::new()
+                .name("kin-detached-daemon-reaper".to_string())
+                .spawn(move || detached_daemon_reaper_loop(receiver))
+                .ok()
+                .map(|_handle| sender)
+        })
+        .clone()
+}
+
+/// Poll every adopted child until it is reaped.
+///
+/// A handle is retired on `Ok(Some(status))` (the child was waited on here) and
+/// on `Err(_)` (nobody can wait on it any more, most often because something
+/// else already did). `Ok(None)` means still running, which for a healthy daemon
+/// is the case for as long as it serves.
+fn detached_daemon_reaper_loop(receiver: std::sync::mpsc::Receiver<std::process::Child>) {
+    let mut adopted: Vec<std::process::Child> = Vec::new();
+    loop {
+        match receiver.recv_timeout(DETACHED_DAEMON_REAP_POLL) {
+            Ok(child) => adopted.push(child),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) if adopted.is_empty() => return,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+        }
+        while let Ok(child) = receiver.try_recv() {
+            adopted.push(child);
+        }
+        adopted.retain_mut(|child| matches!(child.try_wait(), Ok(None)));
+    }
+}
+
 /// Coarse process liveness, fail-closed on anything indeterminate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(unix), allow(dead_code))]
@@ -3194,6 +3352,102 @@ pub async fn register_started_daemon(kin_root: &Path, daemon_url: &str) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether the OS still has an entry for this pid. A zombie answers yes for
+    /// as long as its parent lives without waiting on it, so this is exactly the
+    /// observable that separates a reaped child from an unreaped corpse: an
+    /// unadopted child would answer yes here forever.
+    ///
+    /// Gated to match its only caller, which is `#[cfg(unix)]` — an ungated
+    /// helper whose callers are all gated is dead code on the other platform and
+    /// fails the `-D warnings` leg there.
+    #[cfg(unix)]
+    fn process_entry_exists(pid: u32) -> bool {
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+
+    /// Six `[kin-daemon] <defunct>` entries accumulated in one brownfield agent
+    /// session. Every spawn path calls `setsid` and then relies on the launcher
+    /// exiting so init inherits and waits on the daemon; `setsid` does not change
+    /// the parent pid, so under `kin mcp start` — which reaches a daemon spawn on
+    /// binding, on rebinding, and on every tool call that revives one — the
+    /// launcher stays the parent and dropping the handle waits on nothing.
+    ///
+    /// Falsify by replacing the `adopt_detached_daemon_child` call with `drop`:
+    /// every pid then answers `kill(pid, 0)` until this process exits and the
+    /// loop below runs to its deadline.
+    #[cfg(unix)]
+    #[test]
+    fn adopted_daemon_children_are_reaped_rather_than_left_defunct() {
+        const RESTARTS: usize = 6;
+        let mut pids = Vec::with_capacity(RESTARTS);
+        for _ in 0..RESTARTS {
+            let child = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("exit 0")
+                .spawn()
+                .expect("spawn a short-lived stand-in for a daemon");
+            pids.push(child.id());
+            adopt_detached_daemon_child(child);
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let unreaped: Vec<u32> = pids
+                .iter()
+                .copied()
+                .filter(|pid| process_entry_exists(*pid))
+                .collect();
+            if unreaped.is_empty() {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{} of {RESTARTS} adopted children were still in the process table after 10s: \
+                 {unreaped:?}",
+                unreaped.len()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn a_death_note_round_trips_and_names_the_work_that_was_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_daemon_death_note(dir.path()).is_none());
+
+        let note = DaemonDeathNote {
+            pid: 387,
+            killed_by: "kin-supervisor-reaper".to_string(),
+            reason: "reaping misbehaving repo daemon: OrphanedUnreachableStalled".to_string(),
+            in_flight: Some("commit in phase publish_workspace_admission for 86s".to_string()),
+            at: "2026-08-17T11:43:00Z".to_string(),
+        };
+        write_daemon_death_note(dir.path(), &note);
+
+        let read = read_daemon_death_note(dir.path()).expect("a written note must read back");
+        assert_eq!(read.pid, 387);
+        assert!(read.summary().contains("OrphanedUnreachableStalled"));
+        assert!(
+            read.summary().contains("publish_workspace_admission"),
+            "the note must name the work that was interrupted: {}",
+            read.summary()
+        );
+
+        clear_daemon_death_note(dir.path());
+        assert!(
+            read_daemon_death_note(dir.path()).is_none(),
+            "a cleared note must not be blamed for the next outage"
+        );
+    }
+
+    #[test]
+    fn a_supervisor_reason_reaches_the_log_an_operator_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        append_to_daemon_log(dir.path(), "kin-daemon TERMINATED BY SUPERVISOR: because");
+        let log = std::fs::read_to_string(dir.path().join("daemon.log")).unwrap();
+        assert!(log.contains("TERMINATED BY SUPERVISOR: because"), "{log}");
+    }
 
     // These are intentionally cross-platform. The permanent native-Windows
     // authority leg selects this name prefix so Windows proves the same

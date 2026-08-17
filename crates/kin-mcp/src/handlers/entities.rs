@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 
 use super::repository_authority::RequestRepositoryAuthority;
+use kin_index::RelationResolution;
 use kin_model::entity::EntityKind;
 use kin_model::graph::{EntityFilter, GraphStore};
 use kin_model::relation::RelationKind;
@@ -779,8 +780,47 @@ pub fn handle_get_context_pack<G: GraphStore>(
         result["nearby_traffic"] = serde_json::to_value(&pack.traffic).map_err(McpError::Json)?;
     }
 
-    let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
+    let json = serialize_with_measured_tokens(&mut result)?;
     Ok(ToolCallResult::text(json))
+}
+
+/// Passes allowed to settle `tokens_used` against the bytes carrying it.
+///
+/// The estimator counts a number as one token however many digits it has, so
+/// writing the measurement back changes the count only when the payload's own
+/// structure changes, which it does not. One correcting pass and one
+/// confirming pass are what this actually takes; the rest is headroom.
+const MEASURED_TOKEN_PASSES: usize = 4;
+
+/// Serialize the pack, reporting what the bytes it returns actually cost.
+///
+/// `tokens_used` is the number a caller subtracts from its own context budget
+/// before deciding what to ask for next, and it was the planner's estimate:
+/// the cost of the signature stubs admission considered, not of the bodies,
+/// provenance, and JSON structure this handler goes on to serve. A caller that
+/// trusted it spent more than it was told, on every call, and the gap grew with
+/// the pack because bodies are the part the estimate omits.
+///
+/// Measuring is self-referential, since the count is a field of the object
+/// being counted. Writing the count back and re-measuring settles that: the
+/// estimator treats a number as one token whatever its width, so the second
+/// pass confirms the first rather than chasing it.
+///
+/// What this counts is the tool's own serialized payload. The `_kin` envelope
+/// is attached after the handler returns and is not visible from here, so it
+/// remains outside the number, which is a bounded and constant understatement
+/// rather than the unbounded one this replaces.
+fn serialize_with_measured_tokens(result: &mut serde_json::Value) -> Result<String> {
+    let mut json = serde_json::to_string_pretty(result).map_err(McpError::Json)?;
+    for _ in 0..MEASURED_TOKEN_PASSES {
+        let measured = serde_json::json!(kin_context::estimate_tokens(&json));
+        if result["tokens_used"] == measured {
+            break;
+        }
+        result["tokens_used"] = measured;
+        json = serde_json::to_string_pretty(result).map_err(McpError::Json)?;
+    }
+    Ok(json)
 }
 
 pub const TRACE_COMPUTATION_DESC: &str = "\
@@ -855,7 +895,13 @@ When no references come back, the additive `negative` object's `safe_to_conclude
 flag says whether \"nothing depends on this\" is authoritative (daemon-owned graph, \
 complete coverage, no degraded signals) or merely \"not indexed yet\" — consult it \
 before treating the entity as safe to delete. An entity_id or name that resolves to nothing \
-carries the same object, naming the resolution miss rather than reporting an empty result.";
+carries the same object, naming the resolution miss rather than reporting an empty result. \
+Every row carries `resolution`: `type_resolved` (the destination is proven by a local \
+binding, a declared import, or a resolved dispatch class), `import_scoped` (the target \
+module was known and the symbol selected inside it), or `name_only` (a bare same-name \
+match across the repo, with nothing at the reference site proving it). A `name_only` row \
+is a candidate, not a fact; do not count it as use, and do not conclude something is \
+unused from the absence of anything but `name_only` rows without confirming.";
 
 fn normalize_cross_repo_repo_id(raw: Option<&str>) -> std::result::Result<String, String> {
     raw.map(str::trim)
@@ -970,6 +1016,9 @@ fn spine_reference_rows(
             // CrossRepoEdge proves a dependency but does not retain whether
             // the source relation was Calls/Imports/References.
             relation_kinds: Vec::new(),
+            // The resolving edge lives in the other repository's graph, so how
+            // it was resolved is not knowable here. Absent, not guessed.
+            resolution: None,
         });
     }
 
@@ -1000,7 +1049,60 @@ fn reference_row_json(row: ReferenceRow) -> serde_json::Value {
             .into_iter()
             .map(relation_kind_name)
             .collect::<Vec<_>>(),
+        // How strongly this reference was resolved: `type_resolved`,
+        // `import_scoped`, or `name_only`. `name_only` is a same-name match
+        // with nothing at the call site proving the destination, so it is a
+        // candidate rather than a fact. Absent only for a federated row, whose
+        // edge lives in another repository's graph.
+        "resolution": row.resolution.map(RelationResolution::as_str),
     })
+}
+
+/// Machine-readable codes a spine unavailability can carry, each the name of one
+/// computed condition. A reason is prefixed with its code so a consumer reports
+/// the condition that actually held instead of collapsing every spine gap into
+/// one label.
+///
+/// [`SPINE_REPO_UNREGISTERED`] and [`SPINE_ROOT_STALE`] were one message until
+/// FIR-2353. A repository with no spine registration at all reported "spine root
+/// mismatch", which reads as a topology misconfiguration and was quoted back as
+/// the cause of a miss that had nothing to do with another repository.
+pub const SPINE_REPO_UNREGISTERED: &str = "spine_repo_unregistered";
+/// The spine holds a root for this repository, but the live graph has advanced
+/// past it: stale cross-repo authority rather than a mismatched one.
+pub const SPINE_ROOT_STALE: &str = "spine_root_stale";
+
+/// Split a spine unavailability reason into its code and human detail, or
+/// `None` for a reason that carries no recognized code (a binding failure, say,
+/// whose message is not one of the conditions computed here).
+///
+/// Only the known codes are stripped. Treating any colon-prefixed word as a code
+/// would promote the first word of an arbitrary error message into a machine
+/// label, which is the kind of guess this module exists to avoid.
+fn split_spine_unavailable_reason(reason: &str) -> (Option<&'static str>, &str) {
+    for code in [SPINE_REPO_UNREGISTERED, SPINE_ROOT_STALE] {
+        if let Some(detail) = reason
+            .strip_prefix(code)
+            .and_then(|rest| rest.strip_prefix(": "))
+        {
+            return (Some(code), detail);
+        }
+    }
+    (None, reason)
+}
+
+/// The cross-repo object for a spine that could not answer, carrying the code of
+/// the condition that held beside its human detail.
+fn cross_repo_unavailable_json(reason: &str) -> serde_json::Value {
+    let (code, detail) = split_spine_unavailable_reason(reason);
+    let mut value = serde_json::json!({
+        "status": "unavailable",
+        "reason": detail,
+    });
+    if let Some(code) = code {
+        value["code"] = serde_json::json!(code);
+    }
+    value
 }
 
 fn daemon_spine_xref(
@@ -1011,13 +1113,31 @@ fn daemon_spine_xref(
     let query = match authority.spine {
         Some(spine) => {
             let body = spine.cross_repo_xref_response(&repo_id, target_id);
-            if body.authority_root_matches(&repo_id, authority.graph_root) {
-                kin_spine::SpineQuery::Found(body)
-            } else {
-                kin_spine::SpineQuery::Unavailable(format!(
-                    "spine root mismatch for repository {repo_id}: live/session graph root {} is not the registered spine root",
-                    authority.graph_root
-                ))
+            match body.authority_root_state(&repo_id, authority.graph_root) {
+                kin_spine::AuthorityRootState::Matches => kin_spine::SpineQuery::Found(body),
+                // The spine registered this repository at the graph it was
+                // initialized from, and graph truth has moved since. Its
+                // topology is stale, which bears on references from OTHER
+                // repositories and says nothing about the local graph that just
+                // answered.
+                kin_spine::AuthorityRootState::Stale { registered } => {
+                    kin_spine::SpineQuery::Unavailable(format!(
+                        "{SPINE_ROOT_STALE}: spine root mismatch for repository {repo_id}: \
+                         live/session graph root {} has advanced past the registered spine root \
+                         {registered}, so cross-repo authority is stale for other repositories \
+                         and says nothing about references inside this one",
+                        authority.graph_root
+                    ))
+                }
+                // No registration at all, which is the ordinary state of a
+                // single-repo install rather than a mismatch of any kind.
+                kin_spine::AuthorityRootState::Unregistered => {
+                    kin_spine::SpineQuery::Unavailable(format!(
+                        "{SPINE_REPO_UNREGISTERED}: repository {repo_id} has no registered spine \
+                         root, so cross-repo authority cannot answer for it; this is the ordinary \
+                         single-repo state and says nothing about references inside this repository"
+                    ))
+                }
             }
         }
         None => kin_spine::SpineQuery::NotConfigured,
@@ -1153,10 +1273,7 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     let cross_repo = match cross_repo_query {
         Err(reason) => {
             tracing::warn!(reason = %reason, "cross-repo repository binding unavailable for references enrichment");
-            serde_json::json!({
-                "status": "unavailable",
-                "reason": reason,
-            })
+            cross_repo_unavailable_json(&reason)
         }
         Ok((repo_id, query)) => match query {
             kin_spine::SpineQuery::Found(body) => {
@@ -1192,10 +1309,7 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
             // silently dropping cross-repo references (which would read as "none").
             kin_spine::SpineQuery::Unavailable(reason) => {
                 tracing::warn!(reason = %reason, "cross-repo spine unavailable for references enrichment");
-                serde_json::json!({
-                    "status": "unavailable",
-                    "reason": reason,
-                })
+                cross_repo_unavailable_json(&reason)
             }
             // Local-only (no spine configured): quiet — cross-repo refs don't apply.
             kin_spine::SpineQuery::NotConfigured => serde_json::json!({
@@ -1214,7 +1328,20 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     // repo-qualified paths and carry no local entity id.
     let references = rows.into_iter().map(reference_row_json).collect::<Vec<_>>();
 
-    let result = serde_json::json!({
+    // What the graph can structurally answer over the edge classes this query
+    // reads. An empty reference list is only evidence about the code when the
+    // graph demonstrably holds cross-file edges of those classes for the focal's
+    // language, and nothing else in this payload reports that.
+    //
+    // Observed only for an empty answer, which is the only answer whose trust
+    // depends on it: an answer that returned rows has proved the edges exist by
+    // returning them, and paying a language scan on the populated path would be
+    // a cost with nothing to buy.
+    let edge_coverage = references.is_empty().then(|| {
+        crate::edge_coverage::observe_cross_file_reference_coverage(store, &target, &relation_kinds)
+    });
+
+    let mut result = serde_json::json!({
         "focal_entity": {
             "id": target.id,
             "name": target.name,
@@ -1231,6 +1358,9 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
         "references": references,
         "cross_repo": cross_repo,
     });
+    if let Some(edge_coverage) = edge_coverage {
+        result[crate::edge_coverage::EDGE_COVERAGE_KEY] = edge_coverage;
+    }
 
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
@@ -1328,6 +1458,7 @@ fn handle_bulk_check_references_with_authority_source<G: GraphStore>(
     let mut cross_repo_unavailable = None;
     let mut federated_reference_count = 0usize;
     let mut saw_unknown_federated_subtype = false;
+    let mut batch_languages: Vec<kin_model::ids::LanguageId> = Vec::new();
 
     for raw_id in &entity_ids_raw {
         let entity_id = match parse_entity_id(raw_id) {
@@ -1371,6 +1502,10 @@ fn handle_bulk_check_references_with_authority_source<G: GraphStore>(
             results.push(row);
             continue;
         };
+
+        if !batch_languages.contains(&entity.language) {
+            batch_languages.push(entity.language);
+        }
 
         let mut reference_count = 0usize;
         let mut matched_kinds: Vec<RelationKind> = Vec::new();
@@ -1592,14 +1727,23 @@ fn handle_bulk_check_references_with_authority_source<G: GraphStore>(
         "results": results,
     });
 
+    // Every `has_references: false` row in this batch is read off the same
+    // cross-file edge classes a single reference query reads, so the batch
+    // publishes the same observation. It covers each language the resolved
+    // entities span, and the weakest of them governs.
+    result[crate::edge_coverage::EDGE_COVERAGE_KEY] =
+        crate::edge_coverage::observe_cross_file_reference_coverage_for_languages(
+            store,
+            &batch_languages,
+            &relation_kinds,
+        );
+
     if authority.is_some() {
         result["cross_repo"] = if let Some(reason) = cross_repo_unavailable {
-            serde_json::json!({
-                "status": "unavailable",
-                "reason": reason,
-                "checked_entities": cross_repo_checked,
-                "relation_subtype_complete": false,
-            })
+            let mut unavailable = cross_repo_unavailable_json(&reason);
+            unavailable["checked_entities"] = serde_json::json!(cross_repo_checked);
+            unavailable["relation_subtype_complete"] = serde_json::json!(false);
+            unavailable
         } else {
             serde_json::json!({
                 "status": "available",
@@ -2100,9 +2244,13 @@ reachability is read directly off the graph's relation edges, you get the answer
 call without manually cross-referencing every symbol. When you'd rather start from a \
 search concept than scan files — \"which of the entities matching X are dead?\" — \
 find_dead_code_seeded combines the search and the dead-classification in one step. \
+A runtime entry point (a `main`) is never listed: it is called by the runtime rather than \
+by any edge, so no inbound edge was ever owed. \
 The response carries an additive `negative` object whose `safe_to_conclude_absent` flag \
 says whether \"nothing dead found\" is authoritative or limited by index freshness — \
-check it before concluding everything is reachable.";
+check it before concluding everything is reachable. Absence is only as good as the \
+graph's reference-edge coverage: read that from `kin graph status` before deleting \
+anything this reports.";
 
 pub fn handle_dead_code<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
@@ -2169,11 +2317,59 @@ pub fn handle_dead_code<G: GraphStore>(
         return Ok(ToolCallResult::text(json));
     }
 
-    let dead = store.find_dead_code().map_err(McpError::graph)?;
-    let limited: Vec<_> = dead.into_iter().take(limit).collect();
+    // The candidate generator asks only whether an inbound edge crosses a FILE
+    // boundary, so an entity whose only caller sits beside it in the same file
+    // arrives here as a candidate while `find_references` reports that caller.
+    // This tool's own contract is "no incoming relations at all", so it keeps
+    // only the candidates that have none, read through the same reference kinds
+    // `find_references` defaults to. An entry point is referenced by the runtime
+    // rather than by an edge, so it is not a candidate either.
+    let incoming_kinds = default_reference_kinds();
+    let mut dead = Vec::new();
+    for entity in store.find_dead_code().map_err(McpError::graph)? {
+        if dead.len() >= limit {
+            break;
+        }
+        if kin_core::entry_points::is_conventional_entry_point(&entity) {
+            continue;
+        }
+        if has_incoming_reference_edge(store, &entity.id, &incoming_kinds)? {
+            continue;
+        }
+        dead.push(entity);
+    }
 
-    let json = serde_json::to_string_pretty(&limited).map_err(McpError::Json)?;
+    let json = serde_json::to_string_pretty(&dead).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
+}
+
+/// Whether any other entity references this one, by the same rule `kin refs`,
+/// `bulk_check_references` and `find_references` apply: an inbound edge of a
+/// reference kind, from an entity that is not this one.
+///
+/// A self-recursive function references nothing but itself, so its own edge
+/// never makes it reachable.
+fn has_incoming_reference_edge<G: GraphStore>(
+    store: &G,
+    entity_id: &kin_model::EntityId,
+    kinds: &[RelationKind],
+) -> Result<bool> {
+    for relation in store
+        .get_all_relations_for_entity(entity_id)
+        .map_err(McpError::graph)?
+    {
+        let Some(source) = relation.src.as_entity() else {
+            continue;
+        };
+        if relation.dst != kin_model::GraphNodeId::Entity(*entity_id)
+            || !kinds.contains(&relation.kind)
+            || source == *entity_id
+        {
+            continue;
+        }
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 pub const FIND_DEAD_CODE_SEEDED_DESC: &str = "\
@@ -2302,15 +2498,244 @@ by entity_id or by exact name. Reach for it when you need to follow a path \"wha
 this call, and what do those call?\" or \"trace this value back to its source\" and want \
 the chain in traversal order, not a bag of neighbors. Its value is that the whole walk \
 happens substrate-side and comes back as one structured response, so you don't loop \
-get_entity_source per hop and exhaust your tool-call budget. Tune depth and \
-limit_per_step to control breadth; results flag when they were truncated. \
+get_entity_source per hop and exhaust your tool-call budget. Ask for the chain's SHAPE with \
+include_body=false (names, kinds, roles, spans, edges, no source) — that is the cheap call, and \
+the one to reach for unless you mean to read the code. The response bounds its own size \
+(max_response_chars) and cuts bodies before edges, so it is never refused for being too large; \
+any cut is reported in `degradations` with the numbers. Tune depth and limit_per_step to control \
+breadth: the per-step cap keeps the most relevant neighbors (located over file-less, source over \
+test, Calls over Imports over References, the expanded node's own file first) rather than \
+whatever order the relation table returned, and any node whose fan-out was cut carries \
+`fanout_truncated` with `fanout_dropped`, listed together under `clipped_steps`, so you can \
+re-query exactly that node with a wider limit_per_step. Every step reports the same keys: a \
+symbol the graph owns no file for carries explicit nulls plus `external: true` rather than a \
+shorter record, and one symbol never appears both located and file-less in one response. \
 When the chain comes back empty, the additive `negative` object's `safe_to_conclude_absent` \
 flag says whether \"no flow from here\" is authoritative or merely \"not indexed yet\", and its \
 `subject` scopes the absence to the direction that was walked, so an empty 'callers' result is \
 never read as \"this calls nothing\". A focal name the graph holds more than once, and a method \
 whose incoming calls may not have been linked, each downgrade that flag rather than certifying \
 absence. A focal that resolves to no entity at all carries the same object, naming the \
-resolution miss rather than reporting an empty chain.";
+resolution miss rather than reporting an empty chain. \
+Each step carries `resolution` for the edge that reached it: `type_resolved`, \
+`import_scoped`, or `name_only`. A chain is only as trustworthy as its weakest hop, so a \
+`name_only` step means the flow it claims may not exist at all.";
+
+/// One node of a trace walk, carrying the file and directory its fan-out is
+/// scored against.
+///
+/// Relevance is measured against the node being EXPANDED rather than the focal:
+/// at depth 3 the focal's directory says nothing about which of a distant node's
+/// callees continue the chain.
+struct TraceFrontierNode {
+    /// Step index of this node; `0` is the focal.
+    step: usize,
+    id: kin_model::ids::EntityId,
+    depth: usize,
+    file: Option<String>,
+    dir: Option<String>,
+}
+
+impl TraceFrontierNode {
+    fn at(step: usize, depth: usize, entity: &kin_model::entity::Entity) -> Self {
+        Self {
+            step,
+            id: entity.id,
+            depth,
+            file: entity.file_origin.as_ref().map(|path| path.0.clone()),
+            dir: kin_ranking::entity_ranking::entity_directory(entity),
+        }
+    }
+
+    fn rooted(entity: &kin_model::entity::Entity) -> Self {
+        Self::at(0, 0, entity)
+    }
+}
+
+/// One neighbor a node offers, before the per-step cap decides whether it is
+/// kept.
+struct TraceFanoutCandidate {
+    entity: kin_model::entity::Entity,
+    role: &'static str,
+    relation_kind: RelationKind,
+    confidence: f32,
+    /// Classification of the edge this candidate is currently described by.
+    /// It moves with `relation_kind` and `confidence` when a stronger edge to
+    /// the same neighbor replaces them, so the step reports what the edge it
+    /// names actually proved.
+    resolution: RelationResolution,
+}
+
+/// Order one side of a node's fan-out by relevance, most relevant first, with
+/// name and id tiebreaks so the same store returns the same chain every run.
+fn sort_trace_candidates(candidates: &mut [TraceFanoutCandidate], node: &TraceFrontierNode) {
+    candidates.sort_by(|left, right| {
+        let left_score = trace_fanout_score(
+            &left.entity,
+            left.relation_kind,
+            node.file.as_deref(),
+            node.dir.as_deref(),
+            left.confidence,
+        );
+        let right_score = trace_fanout_score(
+            &right.entity,
+            right.relation_kind,
+            node.file.as_deref(),
+            node.dir.as_deref(),
+            right.confidence,
+        );
+        right_score
+            .cmp(&left_score)
+            .then_with(|| left.entity.name.cmp(&right.entity.name))
+            .then_with(|| left.entity.id.0.cmp(&right.entity.id.0))
+    });
+}
+
+/// The one record shape every entity in a trace is reported in: the same keys
+/// whether the graph owns a location for the symbol or holds it only as a
+/// reference target, with explicit nulls and an `external` marker instead of a
+/// shorter object.
+///
+/// This arm serves no bodies — it answers from a generic graph store with no
+/// repository authority to project source through — so `body` is null on every
+/// record here and `bodies_included` on the response says so.
+fn trace_entity_value(entity: &kin_model::entity::Entity) -> serde_json::Value {
+    let (start_line, end_line) = match entity.span.as_ref() {
+        Some(span) => {
+            let (start, end) = presentation_span_lines(span);
+            (Some(start), Some(end))
+        }
+        None => (None, None),
+    };
+    serde_json::json!({
+        "entity_id": entity.id.to_string(),
+        "entity_name": entity.name.clone(),
+        "entity_kind": format!("{:?}", entity.kind),
+        "entity_role": format!("{:?}", entity.role).to_lowercase(),
+        "entity_file": entity.file_origin.as_ref().map(|path| path.to_string()),
+        "external": trace_entity_is_external(entity),
+        "start_line": start_line,
+        "end_line": end_line,
+        "signature": (!entity.signature.is_empty()).then(|| entity.signature.clone()),
+        "body": serde_json::Value::Null,
+        "span_coherence": serde_json::Value::Null,
+    })
+}
+
+/// One chain step: its edge, its depth, its entity record, and its own fan-out
+/// truncation, flat so every step carries one key set.
+fn trace_step_value(
+    step: usize,
+    role: &str,
+    relation_kind: &str,
+    resolution: &str,
+    parent_step: usize,
+    depth: usize,
+    entity: &kin_model::entity::Entity,
+) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "step": step,
+        "role": role,
+        "relation_kind": relation_kind,
+        // How the edge INTO this step was resolved. A chain is only as
+        // trustworthy as its weakest hop, and a `name_only` hop means the flow
+        // may not exist at all.
+        "resolution": resolution,
+        "parent_step": parent_step,
+        "depth": depth,
+        "fanout_truncated": false,
+        "fanout_dropped": 0,
+    });
+    let record = trace_entity_value(entity);
+    if let (Some(target), Some(source)) = (value.as_object_mut(), record.as_object()) {
+        for (key, entry) in source {
+            target.insert(key.clone(), entry.clone());
+        }
+    }
+    value
+}
+
+/// Bound this arm's payload, dropping steps from the TAIL of the chain until it
+/// fits, and disclosing the cut.
+///
+/// This arm serves no bodies, so it has none to cut first: what it can shed is
+/// steps. It still needs the bound, because 200 steps of identity, span, and
+/// signature is a six-figure character count on their own, and a response the
+/// client refuses is worse than a short one — the caller gets neither the chain
+/// nor a way to ask for less.
+///
+/// A suffix is what makes the cut safe: the chain is discovery-ordered, so
+/// children always sit after their parents and removing the end never orphans a
+/// surviving step's `parent_step`.
+fn bound_trace_payload(result: &mut serde_json::Value, max_chars: usize) {
+    fn measure(value: &serde_json::Value) -> usize {
+        serde_json::to_string_pretty(value).map_or(usize::MAX, |json| json.len())
+    }
+    if measure(result) <= max_chars {
+        return;
+    }
+    let target = max_chars.saturating_sub(TRACE_DISCLOSURE_RESERVE_CHARS);
+    let full: Vec<serde_json::Value> = result["chain"].as_array().cloned().unwrap_or_default();
+
+    // Bisected rather than popped one step at a time: the same answer, in a
+    // handful of serializations instead of one per dropped step.
+    let mut kept = 0usize;
+    let mut low = 0usize;
+    let mut high = full.len();
+    while low <= high {
+        let mid = (low + high) / 2;
+        result["chain"] = serde_json::Value::Array(full[..mid].to_vec());
+        result["total_steps"] = serde_json::Value::from(mid);
+        if measure(result) <= target {
+            kept = mid;
+            low = mid + 1;
+        } else if mid == 0 {
+            break;
+        } else {
+            high = mid - 1;
+        }
+    }
+    result["chain"] = serde_json::Value::Array(full[..kept].to_vec());
+    result["total_steps"] = serde_json::Value::from(kept);
+
+    let omitted = full.len() - kept;
+    if omitted == 0 {
+        return;
+    }
+    result["steps_omitted"] = serde_json::Value::from(omitted);
+    // Dropped steps are edges the caller did not receive, which is what this flag
+    // has always meant.
+    result["truncated"] = serde_json::Value::Bool(true);
+    // A clip naming a step the response no longer carries would send a caller
+    // re-querying a node it cannot see.
+    if let Some(clips) = result
+        .get_mut("clipped_steps")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        clips.retain(|clip| clip["step"].as_u64().unwrap_or(0) as usize <= kept);
+    }
+    let disclosure = serde_json::json!({
+        "component": "response_budget",
+        "reason": "steps_omitted",
+        "detail": format!(
+            "the response exceeded its {max_chars}-character budget, so {omitted} steps were \
+             dropped from the end of the chain; this arm inlines no bodies, so steps are all it \
+             can shed"
+        ),
+        "remediation": "narrow the walk with a smaller depth or limit_per_step, or raise \
+                        max_response_chars if the caller's own result limit accepts a larger \
+                        payload",
+    });
+    // Appended rather than assigned: another producer may already have disclosed
+    // something about this same answer.
+    match result
+        .get_mut("degradations")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        Some(existing) => existing.push(disclosure),
+        None => result["degradations"] = serde_json::Value::Array(vec![disclosure]),
+    }
+}
 
 /// Trace the actual call/data-flow chain rooted at a focal entity.
 ///
@@ -2386,23 +2811,39 @@ pub fn handle_trace_data_flow<G: GraphStore>(
     let mut visited: std::collections::HashSet<kin_model::ids::EntityId> =
         std::collections::HashSet::new();
     visited.insert(focal_entity.id);
+    // Which step already stands for a symbol NAME, so an import alias and the
+    // function it aliases never arrive as two identities for one symbol. Seeded
+    // with the focal only when the graph owns a file for it.
+    let mut name_index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    if focal_entity.file_origin.is_some() {
+        name_index.insert(focal_entity.name.clone(), 0);
+    }
+    let mut external_identities_merged = 0usize;
+    let mut clipped_steps: Vec<serde_json::Value> = Vec::new();
     let mut truncated = false;
 
-    let mut frontier: Vec<(usize, kin_model::ids::EntityId, usize)> = vec![(0, focal_entity.id, 0)];
+    // Frontier: (step, entity, depth, file, dir) — the expanded node's own
+    // location travels with it, because relevance is scored against the node
+    // being expanded rather than against the focal.
+    let mut frontier: Vec<TraceFrontierNode> = vec![TraceFrontierNode::rooted(&focal_entity)];
 
     while !frontier.is_empty() {
-        let mut next_frontier: Vec<(usize, kin_model::ids::EntityId, usize)> = Vec::new();
-        for (parent_step, parent_id, parent_depth) in frontier.drain(..) {
-            if parent_depth >= depth {
+        let mut next_frontier: Vec<TraceFrontierNode> = Vec::new();
+        for node in frontier.drain(..) {
+            if node.depth >= depth {
                 continue;
             }
             let relations = store
-                .get_all_relations_for_entity(&parent_id)
+                .get_all_relations_for_entity(&node.id)
                 .map_err(McpError::graph)?;
-            // Independent per-direction budgets so `direction=both` doesn't
-            // starve one side when relations are emitted in either order.
-            let mut callee_count = 0usize;
-            let mut caller_count = 0usize;
+            // Every neighbor is collected before any is kept: a per-step cap is
+            // a choice between candidates, and a loop that admits as it reads
+            // keeps whatever the relation table listed first.
+            let mut candidates: Vec<TraceFanoutCandidate> = Vec::new();
+            let mut candidate_index: std::collections::HashMap<
+                (kin_model::ids::EntityId, &'static str),
+                usize,
+            > = std::collections::HashMap::new();
             for rel in &relations {
                 if !allowed.contains(&rel.kind) {
                     continue;
@@ -2413,62 +2854,162 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                     _ => None,
                 };
                 let (next_id, role) = if want_callees
-                    && src_entity == Some(parent_id)
+                    && src_entity == Some(node.id)
                     && dst_entity.is_some()
-                    && dst_entity != Some(parent_id)
+                    && dst_entity != Some(node.id)
                 {
                     (dst_entity.unwrap(), "callee")
                 } else if want_callers
-                    && dst_entity == Some(parent_id)
+                    && dst_entity == Some(node.id)
                     && src_entity.is_some()
-                    && src_entity != Some(parent_id)
+                    && src_entity != Some(node.id)
                 {
                     (src_entity.unwrap(), "caller")
                 } else {
                     continue;
                 };
 
-                if role == "callee" && callee_count >= limit_per_step {
-                    truncated = true;
-                    continue;
-                }
-                if role == "caller" && caller_count >= limit_per_step {
-                    truncated = true;
+                // Already in the chain by another edge: not a candidate, and not
+                // a drop either.
+                if visited.contains(&next_id) {
                     continue;
                 }
 
-                if !visited.insert(next_id) {
-                    continue;
+                match candidate_index.get(&(next_id, role)) {
+                    Some(&existing) => {
+                        let candidate: &mut TraceFanoutCandidate = &mut candidates[existing];
+                        let stronger = trace_relation_rank(rel.kind)
+                            > trace_relation_rank(candidate.relation_kind)
+                            || (rel.kind == candidate.relation_kind
+                                && rel.confidence > candidate.confidence);
+                        if stronger {
+                            candidate.relation_kind = rel.kind;
+                            candidate.confidence = rel.confidence;
+                            candidate.resolution = RelationResolution::of(rel);
+                        }
+                    }
+                    None => {
+                        let Some(entity) = store.get_entity(&next_id).map_err(McpError::graph)?
+                        else {
+                            continue;
+                        };
+                        candidate_index.insert((next_id, role), candidates.len());
+                        candidates.push(TraceFanoutCandidate {
+                            entity,
+                            role,
+                            relation_kind: rel.kind,
+                            confidence: rel.confidence,
+                            resolution: RelationResolution::of(rel),
+                        });
+                    }
                 }
-                if role == "callee" {
-                    callee_count += 1;
+            }
+
+            // Independent per-direction budgets so `direction=both` doesn't
+            // starve one side when relations are emitted in either order.
+            let (mut callees, mut callers): (Vec<TraceFanoutCandidate>, Vec<TraceFanoutCandidate>) =
+                candidates.into_iter().partition(|c| c.role == "callee");
+            sort_trace_candidates(&mut callees, &node);
+            sort_trace_candidates(&mut callers, &node);
+            let dropped_callees = callees.len().saturating_sub(limit_per_step);
+            let dropped_callers = callers.len().saturating_sub(limit_per_step);
+            callees.truncate(limit_per_step);
+            callers.truncate(limit_per_step);
+
+            if dropped_callees + dropped_callers > 0 {
+                truncated = true;
+                let dropped = dropped_callees + dropped_callers;
+                let (entity_id, entity_name) = if node.step == 0 {
+                    (focal_entity.id.to_string(), focal_entity.name.clone())
                 } else {
-                    caller_count += 1;
-                }
+                    let step = &mut chain[node.step - 1];
+                    step["fanout_truncated"] = serde_json::Value::Bool(true);
+                    let already = step["fanout_dropped"].as_u64().unwrap_or(0);
+                    step["fanout_dropped"] =
+                        serde_json::Value::from(already.saturating_add(dropped as u64));
+                    (
+                        step["entity_id"].as_str().unwrap_or_default().to_string(),
+                        step["entity_name"].as_str().unwrap_or_default().to_string(),
+                    )
+                };
+                clipped_steps.push(serde_json::json!({
+                    "step": node.step,
+                    "entity_id": entity_id,
+                    "entity_name": entity_name,
+                    "dropped_callees": dropped_callees,
+                    "dropped_callers": dropped_callers,
+                    "limit_per_step": limit_per_step,
+                }));
+            }
+
+            for candidate in callees.into_iter().chain(callers) {
                 if chain.len() >= MAX_TOTAL_STEPS {
                     truncated = true;
                     break;
                 }
-                let next_entity = match store.get_entity(&next_id).map_err(McpError::graph)? {
-                    Some(entity) => entity,
-                    None => continue,
-                };
-                let next_depth = parent_depth + 1;
+                let candidate_external = trace_entity_is_external(&candidate.entity);
+                if let Some(&existing) = name_index.get(candidate.entity.name.as_str()) {
+                    let existing_external =
+                        existing > 0 && chain[existing - 1]["external"].as_bool().unwrap_or(false);
+                    if candidate_external {
+                        visited.insert(candidate.entity.id);
+                        external_identities_merged += 1;
+                        continue;
+                    }
+                    if existing_external {
+                        // Fill the placeholder in with the record the graph owns,
+                        // rather than admitting one symbol under two identities.
+                        let promoted_depth =
+                            chain[existing - 1]["depth"].as_u64().unwrap_or(0) as usize;
+                        let promoted = trace_step_value(
+                            existing,
+                            chain[existing - 1]["role"].as_str().unwrap_or("callee"),
+                            chain[existing - 1]["relation_kind"]
+                                .as_str()
+                                .unwrap_or("Calls"),
+                            chain[existing - 1]["resolution"]
+                                .as_str()
+                                .unwrap_or_else(|| RelationResolution::NameOnly.as_str()),
+                            chain[existing - 1]["parent_step"].as_u64().unwrap_or(0) as usize,
+                            promoted_depth,
+                            &candidate.entity,
+                        );
+                        chain[existing - 1] = promoted;
+                        visited.insert(candidate.entity.id);
+                        external_identities_merged += 1;
+                        if promoted_depth < depth {
+                            next_frontier.push(TraceFrontierNode::at(
+                                existing,
+                                promoted_depth,
+                                &candidate.entity,
+                            ));
+                        }
+                        continue;
+                    }
+                }
+                if !visited.insert(candidate.entity.id) {
+                    continue;
+                }
+                let next_depth = node.depth + 1;
                 let step_index = chain.len() + 1;
-                chain.push(serde_json::json!({
-                    "step": step_index,
-                    "role": role,
-                    "relation_kind": format!("{:?}", rel.kind),
-                    "parent_step": parent_step,
-                    "depth": next_depth,
-                    "entity_id": next_entity.id.to_string(),
-                    "entity_name": next_entity.name,
-                    "entity_kind": format!("{:?}", next_entity.kind),
-                    "entity_file": next_entity.file_origin.as_ref().map(|p| p.to_string()),
-                    "signature": (!next_entity.signature.is_empty()).then_some(next_entity.signature),
-                }));
+                name_index
+                    .entry(candidate.entity.name.clone())
+                    .or_insert(step_index);
+                chain.push(trace_step_value(
+                    step_index,
+                    candidate.role,
+                    &format!("{:?}", candidate.relation_kind),
+                    candidate.resolution.as_str(),
+                    node.step,
+                    next_depth,
+                    &candidate.entity,
+                ));
                 if next_depth < depth {
-                    next_frontier.push((step_index, next_id, next_depth));
+                    next_frontier.push(TraceFrontierNode::at(
+                        step_index,
+                        next_depth,
+                        &candidate.entity,
+                    ));
                 }
             }
             if chain.len() >= MAX_TOTAL_STEPS {
@@ -2484,13 +3025,30 @@ pub fn handle_trace_data_flow<G: GraphStore>(
     }
 
     let total_steps = chain.len();
-    let result = serde_json::json!({
+    // The walk expands exactly the reference kinds above, so an empty chain is
+    // only evidence about the focal when the graph holds cross-file edges of
+    // those kinds for its language. A walk that returned steps needs no such
+    // evidence and pays no scan for it.
+    let edge_coverage = chain.is_empty().then(|| {
+        crate::edge_coverage::observe_cross_file_reference_coverage(
+            store,
+            &focal_entity,
+            &reference_kinds,
+        )
+    });
+    let mut result = serde_json::json!({
         "focal_id": focal_entity.id.to_string(),
-        "focal_name": focal_entity.name,
+        "focal_name": focal_entity.name.clone(),
         "focal_kind": format!("{:?}", focal_entity.kind),
         "focal_file": focal_entity.file_origin.as_ref().map(|p| p.to_string()),
+        "focal_entity": trace_entity_value(&focal_entity),
         "direction": direction,
         "depth": depth,
+        "limit_per_step": limit_per_step,
+        // This arm reads no bodies at all: it answers from a generic graph store,
+        // with no repository authority to project source through. Stating it
+        // keeps `include_body` from reading as honoured here.
+        "bodies_included": false,
         "chain": chain,
         "total_steps": total_steps,
         "truncated": truncated,
@@ -2499,6 +3057,22 @@ pub fn handle_trace_data_flow<G: GraphStore>(
             "same_name_candidates": same_name_candidates,
         },
     });
+    if let Some(edge_coverage) = edge_coverage {
+        result[crate::edge_coverage::EDGE_COVERAGE_KEY] = edge_coverage;
+    }
+    if !clipped_steps.is_empty() {
+        result["clipped_steps"] = serde_json::Value::Array(clipped_steps);
+    }
+    if external_identities_merged > 0 {
+        result["external_identities_merged"] = serde_json::Value::from(external_identities_merged);
+    }
+    let max_response_chars = trace_response_budget(
+        args.get("max_response_chars")
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| value as usize),
+    );
+    result["max_response_chars"] = serde_json::Value::from(max_response_chars);
+    bound_trace_payload(&mut result, max_response_chars);
 
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
@@ -2548,7 +3122,10 @@ When no neighbors come back, the additive `negative` object's `safe_to_conclude_
 flag says whether that absence is authoritative or merely \"not indexed yet\", and its \
 `subject` scopes the absence to the side that was walked, so an empty 'in' result is never \
 read as \"no dependencies\". A focal that is not in the graph is reported as that gap \
-rather than as an isolated entity.";
+rather than as an isolated entity. Every edge also carries `resolution` \
+(`type_resolved`, `import_scoped`, `name_only`) saying how strongly its destination was \
+proven; a `name_only` edge was matched by bare name and is a candidate, not structure you \
+can rely on.";
 
 /// Traverse the neighborhood around a focal entity in the requested direction.
 ///
@@ -2644,6 +3221,10 @@ pub fn handle_graph_neighborhood<G: GraphStore>(
                         "kind": format!("{:?}", rel.kind),
                         "direction": edge_direction,
                         "from": current.to_string(),
+                        // A `name_only` edge was matched by name alone and is a
+                        // candidate, not a fact. Neighborhoods are read as
+                        // structure, so an unmarked guess spreads furthest here.
+                        "resolution": RelationResolution::of(&rel).as_str(),
                     }));
                 }
 
@@ -3655,6 +4236,9 @@ mod tests {
         let graph = InMemoryGraph::new();
         let target = make_entity("target", "src/lib.rs");
         graph.upsert_entity(&target).unwrap();
+        // The graph has to be able to hold a cross-file reference before an empty
+        // one is evidence about the target rather than about the graph.
+        seed_cross_file_call_witness(&graph);
         let registered_root = graph_root(&graph);
 
         let spine = kin_spine::InMemorySpineBackend::new();
@@ -3717,8 +4301,211 @@ mod tests {
         assert!(mismatched["cross_repo"]["reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("root mismatch")));
+        // A registered root the live graph has advanced past is stale authority,
+        // and the code says which condition held rather than leaving every spine
+        // gap wearing one label.
+        assert_eq!(mismatched["cross_repo"]["code"], SPINE_ROOT_STALE);
+        assert!(mismatched["negative"]["trust_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.starts_with(SPINE_ROOT_STALE)));
         assert_eq!(mismatched["negative"]["safe_to_conclude_absent"], false);
         assert!(mismatched["references"].as_array().unwrap().is_empty());
+    }
+
+    /// FIR-2353, second observation: a single-repo install whose repository the
+    /// spine never registered reported "spine root mismatch" as the reason a
+    /// local miss could not be trusted. Nothing had mismatched and nothing was
+    /// cross-repo, so the answer taught its reader to discount reason text. The
+    /// condition that actually held now names itself, and the word mismatch does
+    /// not appear.
+    #[tokio::test]
+    async fn an_unregistered_repository_reports_itself_rather_than_a_root_mismatch() {
+        let graph = InMemoryGraph::new();
+        let target = make_entity("parse_note", "nk/parsing.rs");
+        graph.upsert_entity(&target).unwrap();
+        seed_cross_file_call_witness(&graph);
+        let live_root = graph_root(&graph);
+
+        // A spine that exists and has never been told about this repository,
+        // which is the ordinary state of a fresh single-repo install.
+        let spine = kin_spine::InMemorySpineBackend::new();
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let response = handle_find_references_with_authority(
+            &args,
+            &graph,
+            FindReferencesAuthority {
+                repo_id: "nk",
+                graph_root: &live_root,
+                spine: Some(&spine),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let response = parsed_response(&crate::finalize_with_envelope(
+            response,
+            structurally_ready_envelope(),
+            "find_references",
+        ));
+
+        assert_eq!(response["cross_repo"]["status"], "unavailable");
+        assert_eq!(response["cross_repo"]["code"], SPINE_REPO_UNREGISTERED);
+        let reason = response["cross_repo"]["reason"].as_str().unwrap();
+        assert!(
+            !reason.contains("mismatch"),
+            "an unregistered repository has nothing to mismatch: {reason}"
+        );
+        let trust_reason = response["negative"]["trust_reason"].as_str().unwrap();
+        assert!(
+            trust_reason.starts_with(SPINE_REPO_UNREGISTERED),
+            "the reason names the condition that held: {trust_reason}"
+        );
+        assert!(
+            !trust_reason.contains("mismatch"),
+            "and never the one that did not: {trust_reason}"
+        );
+    }
+
+    /// The FIR-2353 headline, end to end through the handler: a graph holding
+    /// entities and one intra-file call edge, healthy by every freshness signal,
+    /// answering for a symbol a sibling file calls. The answer is empty because
+    /// the graph holds no cross-file edge that could have carried the reference,
+    /// and the envelope has to say so rather than certify the symbol as unused.
+    #[tokio::test]
+    async fn find_references_on_an_intra_file_only_graph_refuses_to_certify_absence() {
+        let store = InMemoryGraph::new();
+        let target = make_entity("parse_note", "nk/parsing.rs");
+        let caller = make_entity("save_note", "nk/storage.rs");
+        let sibling = make_entity("write_bytes", "nk/storage.rs");
+        store.upsert_entity(&target).unwrap();
+        store.upsert_entity(&caller).unwrap();
+        store.upsert_entity(&sibling).unwrap();
+        // The extractor linked what it could see inside one file and nothing
+        // across files, which is the exact shape the isolated-install repro hit.
+        store
+            .upsert_relation(&make_relation(caller.id, sibling.id, RelationKind::Calls))
+            .unwrap();
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let response = parsed_response(&crate::finalize_with_envelope(
+            handle_find_references(&args, &store, None).await.unwrap(),
+            structurally_ready_envelope(),
+            "find_references",
+        ));
+
+        assert!(response["references"].as_array().unwrap().is_empty());
+        assert_eq!(
+            response["edge_coverage"]["cross_file_classes"],
+            serde_json::json!([]),
+            "the observation is what makes the gap visible: {}",
+            response["edge_coverage"]
+        );
+        assert_eq!(
+            response["negative"]["safe_to_conclude_absent"], false,
+            "an agent acting on a true verdict here deletes live code: {}",
+            response["negative"]
+        );
+        assert_eq!(response["negative"]["trust"], "inconclusive");
+        // And the edge gap LEADS, ahead of the ambient path's own cross-repo
+        // binding gap, because it is the factor that limited this answer.
+        assert!(
+            trust_reason(&response).starts_with("cross_file_edges_absent"),
+            "{}",
+            trust_reason(&response)
+        );
+    }
+
+    /// An answer that returned rows proved the edges exist by returning them, so
+    /// it pays no language scan and carries no observation. Stating it as a test
+    /// keeps the populated path from silently acquiring one.
+    #[tokio::test]
+    async fn a_populated_reference_answer_carries_no_edge_observation() {
+        let store = InMemoryGraph::new();
+        let caller = make_entity("caller", "src/a.rs");
+        let target = make_entity("target", "src/b.rs");
+        store.upsert_entity(&caller).unwrap();
+        store.upsert_entity(&target).unwrap();
+        store
+            .upsert_relation(&make_relation(caller.id, target.id, RelationKind::Calls))
+            .unwrap();
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let response = parsed_response(&crate::finalize_with_envelope(
+            handle_find_references(&args, &store, None).await.unwrap(),
+            structurally_ready_envelope(),
+            "find_references",
+        ));
+        assert_eq!(response["total_upstream"], 1);
+        assert!(
+            response
+                .get(crate::edge_coverage::EDGE_COVERAGE_KEY)
+                .is_none(),
+            "a populated answer needs no coverage observation: {response}"
+        );
+        assert!(
+            response.get("negative").is_none(),
+            "and carries no negative to consume one"
+        );
+    }
+
+    /// The other half of the same claim, on the daemon authority path so nothing
+    /// but the edge coverage differs: one cross-file call edge and the identical
+    /// empty answer is certified again. A fix that made every absence
+    /// inconclusive would pass the test above and fail this one.
+    #[tokio::test]
+    async fn find_references_certifies_absence_once_the_graph_links_calls_across_files() {
+        let graph = InMemoryGraph::new();
+        let target = make_entity("parse_note", "nk/parsing.rs");
+        graph.upsert_entity(&target).unwrap();
+        seed_cross_file_call_witness(&graph);
+        let registered_root = graph_root(&graph);
+
+        let spine = kin_spine::InMemorySpineBackend::new();
+        spine.register_repo("nk", vec![spine_entry("nk", &target)], &registered_root);
+        spine.refresh_cross_repo_edges("nk", &[], &[], &["nk".to_string()]);
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let response = parsed_response(&crate::finalize_with_envelope(
+            handle_find_references_with_authority(
+                &args,
+                &graph,
+                FindReferencesAuthority {
+                    repo_id: "nk",
+                    graph_root: &registered_root,
+                    spine: Some(&spine),
+                },
+                None,
+            )
+            .await
+            .unwrap(),
+            structurally_ready_envelope(),
+            "find_references",
+        ));
+
+        assert!(response["references"].as_array().unwrap().is_empty());
+        assert_eq!(
+            response["edge_coverage"]["cross_file_classes"],
+            serde_json::json!(["calls"])
+        );
+        assert_eq!(
+            response["negative"]["safe_to_conclude_absent"], true,
+            "a graph that links calls across files still earns absence: {}",
+            response["negative"]
+        );
+        assert_eq!(response["negative"]["trust"], "authoritative");
     }
 
     #[tokio::test]
@@ -3810,6 +4597,7 @@ mod tests {
         let graph = InMemoryGraph::new();
         let target = make_entity("target", "src/lib.rs");
         graph.upsert_entity(&target).unwrap();
+        seed_cross_file_call_witness(&graph);
         let provider_root = graph_root(&graph);
 
         let spine = kin_spine::InMemorySpineBackend::new();
@@ -3858,6 +4646,7 @@ mod tests {
         let target = make_entity("target", "src/lib.rs");
         let source = make_entity("caller", "src/app.rs");
         graph.upsert_entity(&target).unwrap();
+        seed_cross_file_call_witness(&graph);
         let provider_root = graph_root(&graph);
 
         let spine = kin_spine::InMemorySpineBackend::new();
@@ -4342,16 +5131,249 @@ mod tests {
             .to_string()
     }
 
+    /// A pair of entities in different files joined by a `Calls` edge: the
+    /// witness that this graph does link references across files for the
+    /// language, without which an empty walk is a fact about the graph rather
+    /// than about the focal.
+    fn seed_cross_file_call_witness(store: &InMemoryGraph) {
+        let caller = make_entity("witness_caller", "src/witness_caller.rs");
+        let callee = make_entity("witness_callee", "src/witness_callee.rs");
+        store.upsert_entity(&caller).unwrap();
+        store.upsert_entity(&callee).unwrap();
+        store
+            .upsert_relation(&make_relation(caller.id, callee.id, RelationKind::Calls))
+            .unwrap();
+    }
+
+    /// `trace_data_flow` on this arm, with whatever arguments a test needs, and
+    /// no envelope: these assert on the handler's own payload.
+    fn traced_payload(
+        store: &InMemoryGraph,
+        args: &[(&str, serde_json::Value)],
+    ) -> serde_json::Value {
+        let mut arguments = HashMap::new();
+        for (key, value) in args {
+            arguments.insert((*key).to_string(), value.clone());
+        }
+        parsed_response(&handle_trace_data_flow(&arguments, store).unwrap())
+    }
+
+    /// The measured fan-out inversion on this arm: a node whose callees include
+    /// two in its own file, a distant method, a test double, and a file-less
+    /// import placeholder.
+    fn trace_fanout_store() -> (InMemoryGraph, EntityId) {
+        let store = InMemoryGraph::new();
+        let focal = make_entity("resolve_redirects", "src/requests/sessions.py");
+        let focal_id = focal.id;
+        store.upsert_entity(&focal).unwrap();
+
+        let mut candidates = vec![
+            make_entity("get_redirect_target", "src/requests/sessions.py"),
+            make_entity("rebuild_method", "src/requests/sessions.py"),
+            make_entity("HTTPAdapter.close", "src/requests/adapters.py"),
+        ];
+        let mut harness = make_entity("RedirectSession.send", "tests/test_requests.py");
+        harness.role = EntityRole::Test;
+        candidates.push(harness);
+        let mut placeholder = make_entity("urljoin", "unused");
+        placeholder.kind = EntityKind::Module;
+        placeholder.file_origin = None;
+        candidates.push(placeholder);
+
+        for candidate in &candidates {
+            store.upsert_entity(candidate).unwrap();
+            store
+                .upsert_relation(&make_relation(focal_id, candidate.id, RelationKind::Calls))
+                .unwrap();
+        }
+        (store, focal_id)
+    }
+
+    /// This arm serves the tool whenever the MCP server answers from an
+    /// in-process store rather than delegating to the daemon, so it owes the same
+    /// per-step cap behavior. A cap that kept whatever the relation table listed
+    /// first dropped the two callees that decide the redirect.
+    #[test]
+    fn trace_data_flow_offline_cap_keeps_the_callees_that_continue_the_chain() {
+        let (store, focal_id) = trace_fanout_store();
+        let response = traced_payload(
+            &store,
+            &[
+                ("focal", serde_json::json!(focal_id.to_string())),
+                ("direction", serde_json::json!("calls")),
+                ("depth", serde_json::json!(1)),
+                ("limit_per_step", serde_json::json!(2)),
+            ],
+        );
+
+        let mut kept: Vec<String> = response["chain"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| step["entity_name"].as_str().unwrap().to_string())
+            .collect();
+        kept.sort();
+        assert_eq!(
+            kept,
+            vec![
+                "get_redirect_target".to_string(),
+                "rebuild_method".to_string()
+            ],
+            "the located source callees in the expanded node's own file must win the two slots"
+        );
+        assert_eq!(response["truncated"], serde_json::json!(true));
+        let clip = &response["clipped_steps"][0];
+        assert_eq!(clip["step"], serde_json::json!(0), "the focal is step 0");
+        assert_eq!(clip["dropped_callees"], serde_json::json!(3));
+        assert_eq!(clip["limit_per_step"], serde_json::json!(2));
+    }
+
+    /// One array, one key set, and one identity per symbol — on this arm too.
+    #[test]
+    fn trace_data_flow_offline_reports_one_shape_and_one_identity() {
+        let store = InMemoryGraph::new();
+        let focal = make_entity("Session.prepare_request", "src/requests/sessions.py");
+        let admitted = make_entity("cookiejar_from_dict", "src/requests/cookies.py");
+        let mut alias = make_entity("cookiejar_from_dict", "unused");
+        alias.kind = EntityKind::Module;
+        alias.file_origin = None;
+        let mut placeholder = make_entity("urlparse", "unused");
+        placeholder.kind = EntityKind::Module;
+        placeholder.file_origin = None;
+        let focal_id = focal.id;
+        let admitted_id = admitted.id;
+
+        for entity in [&focal, &admitted, &alias, &placeholder] {
+            store.upsert_entity(entity).unwrap();
+        }
+        for target in [admitted.id, alias.id, placeholder.id] {
+            store
+                .upsert_relation(&make_relation(focal_id, target, RelationKind::Calls))
+                .unwrap();
+        }
+
+        let response = traced_payload(
+            &store,
+            &[
+                ("focal", serde_json::json!(focal_id.to_string())),
+                ("direction", serde_json::json!("calls")),
+                ("depth", serde_json::json!(1)),
+                ("limit_per_step", serde_json::json!(25)),
+            ],
+        );
+
+        let steps = response["chain"].as_array().unwrap();
+        let cookiejar: Vec<&serde_json::Value> = steps
+            .iter()
+            .filter(|step| step["entity_name"] == serde_json::json!("cookiejar_from_dict"))
+            .collect();
+        assert_eq!(cookiejar.len(), 1, "one symbol, one step: {response}");
+        assert_eq!(
+            cookiejar[0]["entity_id"],
+            serde_json::json!(admitted_id.to_string()),
+            "the located record wins over the placeholder"
+        );
+        assert_eq!(response["external_identities_merged"], serde_json::json!(1));
+
+        // The file-less import is kept, because nothing located stands for it,
+        // and it carries the same keys with explicit nulls.
+        let external = steps
+            .iter()
+            .find(|step| step["external"] == serde_json::json!(true))
+            .expect("the file-less import must still be reported");
+        assert!(external["entity_file"].is_null() && external["start_line"].is_null());
+        let expected: Vec<String> = steps[0].as_object().unwrap().keys().cloned().collect();
+        for step in steps {
+            let keys: Vec<String> = step.as_object().unwrap().keys().cloned().collect();
+            assert_eq!(keys, expected, "every step carries the same keys: {step}");
+        }
+    }
+
+    /// This arm inlines no bodies, so what it can shed is steps — and it must,
+    /// because 200 steps of identity and signature is a six-figure character
+    /// count on its own.
+    #[test]
+    fn trace_data_flow_offline_bounds_its_own_payload() {
+        const BUDGET: usize = 4_000;
+        let store = InMemoryGraph::new();
+        let focal = make_entity("hub", "src/hub.rs");
+        let focal_id = focal.id;
+        store.upsert_entity(&focal).unwrap();
+        for index in 0..25 {
+            let callee = make_entity(&format!("callee_{index}"), &format!("src/c{index}.rs"));
+            store.upsert_entity(&callee).unwrap();
+            store
+                .upsert_relation(&make_relation(focal_id, callee.id, RelationKind::Calls))
+                .unwrap();
+        }
+
+        let unbounded = traced_payload(
+            &store,
+            &[
+                ("focal", serde_json::json!(focal_id.to_string())),
+                ("direction", serde_json::json!("calls")),
+                ("depth", serde_json::json!(1)),
+                ("limit_per_step", serde_json::json!(25)),
+            ],
+        );
+        assert_eq!(unbounded["total_steps"], serde_json::json!(25));
+        let unbounded_chars = serde_json::to_string_pretty(&unbounded).unwrap().len();
+        assert!(
+            unbounded_chars > BUDGET,
+            "the fixture must exceed the budget under test: {unbounded_chars} chars"
+        );
+
+        let bounded = traced_payload(
+            &store,
+            &[
+                ("focal", serde_json::json!(focal_id.to_string())),
+                ("direction", serde_json::json!("calls")),
+                ("depth", serde_json::json!(1)),
+                ("limit_per_step", serde_json::json!(25)),
+                ("max_response_chars", serde_json::json!(BUDGET)),
+            ],
+        );
+        let bounded_chars = serde_json::to_string_pretty(&bounded).unwrap().len();
+        assert!(
+            bounded_chars <= BUDGET,
+            "the tool must return what it promised to fit: {bounded_chars} chars against {BUDGET}"
+        );
+        let kept = bounded["total_steps"].as_u64().unwrap() as usize;
+        assert!(kept > 0, "a bound is not a refusal: {bounded}");
+        assert_eq!(
+            bounded["steps_omitted"].as_u64().unwrap() as usize + kept,
+            25
+        );
+        assert_eq!(
+            bounded["truncated"],
+            serde_json::json!(true),
+            "dropped steps are edges the caller did not receive"
+        );
+        // A prefix, so no surviving step points at a parent that was dropped.
+        for step in bounded["chain"].as_array().unwrap() {
+            assert!(step["parent_step"].as_u64().unwrap() as usize <= kept);
+        }
+        let disclosure = bounded["degradations"]
+            .as_array()
+            .expect("a cut must be disclosed")
+            .iter()
+            .find(|entry| entry["component"] == serde_json::json!("response_budget"))
+            .expect("the cut must name itself");
+        assert_eq!(disclosure["reason"], serde_json::json!("steps_omitted"));
+    }
+
     /// The authoritative side of the trace absence: a focal that is in the
     /// graph, carries a name nothing else shares, is not a method, and has no
-    /// edges at all. That is a real absence, and the qualifier must still be
-    /// willing to say so. A gate that never certifies anything is as useless
-    /// as one that certifies everything.
+    /// edges at all, on a graph that demonstrably links calls across files.
+    /// That is a real absence, and the qualifier must still be willing to say
+    /// so. A gate that never certifies anything is as useless as one that
+    /// certifies everything.
     #[test]
     fn trace_data_flow_isolated_focal_is_authoritative_on_a_ready_graph() {
         let store = InMemoryGraph::new();
         let lonely = make_entity("lonely", "src/lonely.rs");
         store.upsert_entity(&lonely).unwrap();
+        seed_cross_file_call_witness(&store);
 
         let response = traced_response(
             &store,
