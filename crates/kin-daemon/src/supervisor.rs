@@ -28,7 +28,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+#[cfg(unix)]
+use tracing::error;
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::state::DaemonState;
