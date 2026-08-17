@@ -48,8 +48,9 @@ pub use history::{
     derive_historical_semantic_deltas, is_external_reference_target, HistoricalSemanticDelta,
 };
 pub use linker::{
-    build_projection_derived_relations_for_file, build_projection_derived_relations_from_markers,
-    extract_projection_source_markers, link_cross_file, link_cross_file_against_entities,
+    bare_entity_name, build_projection_derived_relations_for_file,
+    build_projection_derived_relations_from_markers, extract_projection_source_markers,
+    link_cross_file, link_cross_file_against_entities,
     link_cross_file_against_entities_with_completeness, link_cross_file_borrowed_with_completeness,
     link_cross_file_incremental, link_cross_file_incremental_with_completeness,
     link_cross_file_with_completeness, CrossFileLinker, FileParseCompletenessMap, FileParseData,

@@ -12,7 +12,7 @@ use kin_model::preset::{BrokenAstBehavior, ReconcilePolicy, ValidationLevel};
 use kin_model::{
     ConflictId, ConflictKind, ConflictObject, Entity, EntityDelta, EntityId, EntityKind,
     FilePathId, GraphNodeId, GraphStore, IntentScope, IntentSummary, ParseState, Relation,
-    RelationDelta, RelationKind, SessionId, SourceRegion, TransactionDelta,
+    RelationDelta, RelationId, RelationKind, SessionId, SourceRegion, TransactionDelta,
 };
 use kin_projection::{project_entity_mutations_with_policy, ProjectionState};
 
@@ -20,6 +20,7 @@ use crate::collision::{
     check_signature_change, check_visibility_change, CollisionCheck, MergeConflict,
     MergeConflictKind, TrafficChecker,
 };
+use crate::cross_file::LiveCrossFileLinker;
 use crate::error::{ReconcileError, Result};
 use crate::lkg::LkgStore;
 
@@ -102,6 +103,9 @@ pub struct Reconciler {
     policy: ReconcilePolicy,
     /// Cache of tree-sitter Trees keyed by file path, used for incremental parsing.
     tree_cache: HashMap<FilePathId, tree_sitter::Tree>,
+    /// Cross-file relation resolution for the live path. Seeded from graph
+    /// truth once, then kept current as files arrive.
+    cross_file: LiveCrossFileLinker,
 }
 
 impl Reconciler {
@@ -123,6 +127,7 @@ impl Reconciler {
             session_id: None,
             policy,
             tree_cache: HashMap::new(),
+            cross_file: LiveCrossFileLinker::new(),
         }
     }
 
@@ -162,6 +167,24 @@ impl Reconciler {
                 "seeded LKG entity baseline from graph snapshot"
             );
         }
+    }
+
+    /// Index the cross-file linker's entity universe from an existing graph.
+    ///
+    /// Without this the live path resolves every file against an empty
+    /// universe, reports every destination missing, and falls back to the
+    /// intra-file-only behavior this seam exists to end. One pass over graph
+    /// entities per process, the same shape and place as
+    /// [`Reconciler::seed_lkg_entities_from_graph`]; every write after it is
+    /// bounded by the edited file and the files waiting on the names it
+    /// defines, never by repository size.
+    pub fn seed_cross_file_linker_from_graph<G: GraphStore>(&mut self, graph: &G) {
+        self.cross_file.seed_from_graph(graph);
+    }
+
+    /// Access the cross-file linker (for inspection/testing).
+    pub fn cross_file_linker(&self) -> &LiveCrossFileLinker {
+        &self.cross_file
     }
 
     /// Set the traffic checker for pre-mutation collision detection.
@@ -734,20 +757,59 @@ impl Reconciler {
 
         // Process relations: diff existing relations against newly parsed ones.
         //
-        // Origin-filtered stale removal: a single-file reconcile is only
-        // authoritative for relations it could have re-derived from this file's index
-        // pass — those where the origin is parser-derived (Parsed or Inferred) AND both
-        // endpoints belong to entities of the file being reconciled.  Cross-file linker
-        // edges (e.g. init-time Calls whose dst lives in another file), LSP-enrichment
-        // edges, and agent-created Manual edges are never re-derived by a single-file
-        // reconcile and must be preserved.  We therefore track origin alongside the
-        // relation ID so the removal loop can apply the combined filter.
+        // Origin-filtered stale removal: a single-file reconcile is authoritative
+        // for relations it could have re-derived on this pass. Two classes qualify.
+        // Parser-derived edges with both endpoints inside this file have always
+        // qualified. Cross-file edges this file sources now qualify too, because the
+        // incremental cross-file linker below re-derives them, but only on the
+        // evidence this pass actually holds: the file's own text. LSP-enrichment
+        // edges, agent-created Manual edges, and edges this file merely receives are
+        // still never re-derived here and must be preserved. We therefore track
+        // origin alongside the relation ID so the removal loop can apply the
+        // combined filter.
         let file_entity_node_ids: HashSet<GraphNodeId> = existing
             .iter()
             .map(|entity| GraphNodeId::Entity(entity.id))
             .chain(stable_entity_ids.values().copied().map(GraphNodeId::Entity))
             .collect();
         let removed_entity_ids: HashSet<EntityId> = removed.iter().copied().collect();
+
+        // Resolve this file's cross-file relations, and re-bind the files that
+        // were waiting on a name it defines.
+        //
+        // `IndexPipeline` matches every extracted relation against the parsed
+        // file's own entities and defers the rest to a linker the live path
+        // never ran, so before this a file written after `kin init` kept
+        // intra-file edges forever. The linker is handed the identities this
+        // transaction will actually commit rather than the raw parse
+        // identities: a modified entity keeps the id already in the graph, and
+        // resolving against the parse identity would mint edges into entities
+        // the delta is about to discard.
+        let stable_entities: Vec<Entity> = indexed
+            .entities
+            .iter()
+            .filter_map(|entity| {
+                let id = stable_entity_ids.get(&entity.id).copied()?;
+                let mut stable = entity.clone();
+                stable.id = id;
+                Some(stable)
+            })
+            .collect();
+        // A graph that gained files through a path that does not run reconcile
+        // (`kin init` over an existing git history) leaves the universe behind.
+        // A file the graph already has entities for that the linker never heard
+        // of is the tell, and it re-indexes once.
+        if !existing.is_empty() {
+            self.cross_file.refresh_if_behind(graph, &file_id.0);
+        }
+        let cross_file = self.cross_file.resolve_after_edit(
+            graph,
+            &file_id.0,
+            &stable_entities,
+            &indexed.extracted_relations,
+            &indexed.imports,
+            kin_model::ParseCompleteness::from_parse_state(&indexed.parse_state),
+        );
 
         // Collect existing relations for all entities in this file.
         type RelationKey = (GraphNodeId, GraphNodeId, RelationKind);
@@ -818,12 +880,60 @@ impl Reconciler {
             }
         }
 
+        // Cross-file relations the incremental linker resolved, for this file
+        // and for any file it just unblocked. Same identity and matching rules
+        // as the parsed set above, with one difference: a key the parsed set
+        // already carries is skipped rather than rejected, because a same-file
+        // relation reaching both resolvers is agreement rather than a parser
+        // fault.
+        for relation in &cross_file.resolved {
+            let key = (relation.src, relation.dst, relation.kind);
+            if !new_relation_keys.insert(key) {
+                continue;
+            }
+            let mut linked = relation.clone();
+            if let Some(old) = existing_relations
+                .get(&key)
+                .and_then(|relations| relations.first())
+            {
+                matched_relation_ids.insert(old.id);
+                linked.id = old.id;
+                linked.created_in = old.created_in;
+                if linked != *old {
+                    delta.relation_deltas.push(RelationDelta::Modified {
+                        old: old.clone(),
+                        new: linked,
+                    });
+                }
+            } else {
+                delta
+                    .relation_deltas
+                    .push(RelationDelta::Added { new: linked });
+            }
+        }
+
         // Remove stale relations that no longer exist in the file.
-        // Only remove a relation when this reconcile pass could have re-derived it:
-        //   1. origin is parser-derived (Parsed or Inferred), AND
-        //   2. both src and dst are entities of the file being reconciled.
-        // This preserves cross-file linker edges, LSP-enrichment edges, and
-        // agent-created Manual edges that a single-file re-parse cannot recreate.
+        // Only remove a relation when this reconcile pass could have re-derived it.
+        // Three cases now qualify, and each covers a distinct failure the others do
+        // not:
+        //   1. `parser_authoritative` — parser-derived, both endpoints inside this
+        //      file, and this pass produced no such edge. The intra-file case:
+        //      deleting a call between two functions in one file retires its edge.
+        //   2. `duplicate_parser_relation` — same, but this pass DID produce that
+        //      key. Retires the surplus copies so one logical edge keeps one
+        //      identity after a resolver or id-derivation change.
+        //   3. `cross_file_source_authoritative` — parser-derived, sourced by an
+        //      entity of this file, destination outside it, the cross-file pass ran,
+        //      and this file's freshly parsed text no longer names that destination
+        //      under any spelling. The case this file's edges could not reach before,
+        //      and the one that keeps a deleted cross-file call site from leaving a
+        //      permanent edge. It deliberately does NOT fire merely because the pass
+        //      failed to re-derive the edge: an init-time batch-linked edge resolved
+        //      at a tier the incremental universe cannot reach is still named by the
+        //      source, so it survives. Nor does it fire on a recovered parse, where
+        //      an absent name proves nothing.
+        // Everything else is preserved: LSP-enrichment edges, agent-created Manual
+        // edges, and any edge this file merely receives rather than sources.
         for ((src, dst, kind), relations) in &existing_relations {
             for relation in relations {
                 if matched_relation_ids.contains(&relation.id) {
@@ -845,7 +955,22 @@ impl Reconciler {
                 let duplicate_parser_relation = parser_derived
                     && both_in_file
                     && new_relation_keys.contains(&(*src, *dst, *kind));
-                if touches_removed_entity || parser_authoritative || duplicate_parser_relation {
+                let cross_file_source_authoritative = parser_derived
+                    && !both_in_file
+                    && cross_file.ran
+                    && file_entity_node_ids.contains(src)
+                    && !new_relation_keys.contains(&(*src, *dst, *kind))
+                    && dst
+                        .as_entity()
+                        .and_then(|id| graph.get_entity(&id).ok().flatten())
+                        .is_some_and(|entity| {
+                            cross_file.referenced.can_retire(*kind, &entity.name)
+                        });
+                if touches_removed_entity
+                    || parser_authoritative
+                    || duplicate_parser_relation
+                    || cross_file_source_authoritative
+                {
                     delta.relation_deltas.push(RelationDelta::Removed {
                         old: relation.clone(),
                     });
@@ -856,6 +981,95 @@ impl Reconciler {
                         "stale relation removed"
                     );
                 }
+            }
+        }
+
+        // Artifact-level import and include edges. These never reach
+        // `existing_relations` — that set is gathered per entity, and an
+        // artifact edge has no entity endpoint — so the loop above cannot see
+        // them at all. Reconcile them against graph truth: the pass re-derived
+        // the complete import set of every file it resolved, from those files'
+        // own declarations.
+        let mut claimed_relation_ids: HashSet<RelationId> = delta
+            .relation_deltas
+            .iter()
+            .map(RelationDelta::target_id)
+            .collect();
+        if cross_file.ran {
+            let produced_by_id: HashMap<RelationId, &Relation> = cross_file
+                .artifact_imports
+                .iter()
+                .map(|relation| (relation.id, relation))
+                .collect();
+            let mut stored_ids: HashSet<RelationId> = HashSet::new();
+
+            for artifact_id in &cross_file.source_artifacts {
+                let node = GraphNodeId::Artifact(*artifact_id);
+                let stored = graph
+                    .traverse(
+                        &node,
+                        &[RelationKind::Imports, RelationKind::Includes],
+                        1,
+                    )
+                    .map(|sub| sub.relations)
+                    .unwrap_or_default();
+                for relation in stored {
+                    if relation.src != node {
+                        continue;
+                    }
+                    if !stored_ids.insert(relation.id) {
+                        continue;
+                    }
+                    match produced_by_id.get(&relation.id) {
+                        Some(current) if **current == relation => {}
+                        Some(current) => {
+                            if claimed_relation_ids.insert(relation.id) {
+                                delta.relation_deltas.push(RelationDelta::Modified {
+                                    old: relation.clone(),
+                                    new: (*current).clone(),
+                                });
+                            }
+                        }
+                        None => {
+                            // Retire only what this pass could have re-derived:
+                            // a complete parse, and a destination the linker
+                            // knows. A destination it has never heard of is one
+                            // module resolution could not have reached, so the
+                            // edge's absence here says nothing about the source.
+                            let destination_known = match relation.dst {
+                                GraphNodeId::Artifact(id) => {
+                                    self.cross_file.knows_artifact(&id)
+                                }
+                                _ => false,
+                            };
+                            if cross_file.referenced.is_complete()
+                                && destination_known
+                                && claimed_relation_ids.insert(relation.id)
+                            {
+                                delta.relation_deltas.push(RelationDelta::Removed {
+                                    old: relation.clone(),
+                                });
+                                debug!(
+                                    relation_id = %relation.id,
+                                    kind = ?relation.kind,
+                                    "artifact import edge retired: the source no longer declares it"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            for relation in &cross_file.artifact_imports {
+                if stored_ids.contains(&relation.id) {
+                    continue;
+                }
+                if !claimed_relation_ids.insert(relation.id) {
+                    continue;
+                }
+                delta.relation_deltas.push(RelationDelta::Added {
+                    new: relation.clone(),
+                });
             }
         }
 
@@ -935,6 +1149,11 @@ impl Reconciler {
 
         let mut removed = Vec::new();
         let mut relations = HashMap::new();
+
+        // Drop the file from the cross-file universe and the waiting index
+        // before deriving the removal, so a later file defining one of its
+        // names does not try to re-bind a file that no longer exists.
+        self.cross_file.forget_file(&file_id.0);
 
         for entity in &existing {
             for relation in graph
