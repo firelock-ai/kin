@@ -16,4 +16,4 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-    uses: firelock-ai/kin-actions/.github/workflows/approve-to-merge.yml@v0.1.29
+    uses: firelock-ai/kin-actions/.github/workflows/approve-to-merge.yml@v0.1.30
