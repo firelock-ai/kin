@@ -23,7 +23,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: ./.github/actions/rust-toolchain
       - run: cargo test
 
   release:
