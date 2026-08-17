@@ -144,6 +144,7 @@ fn extract_cpp_node(
 
                 if let Some(cls) = class_ctx {
                     relations.push(ExtractedRelation {
+                        receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::Contains,
                         src_name: cls.to_string(),
@@ -172,6 +173,7 @@ fn extract_cpp_node(
                         span: span_from_node(node, file_id),
                     });
                     relations.push(ExtractedRelation {
+                        receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::Contains,
                         src_name: cls.to_string(),
@@ -289,6 +291,7 @@ fn extract_cpp_node(
                     .unwrap_or_else(|| alias_name.clone());
                 for referenced_type in referenced_types {
                     relations.push(ExtractedRelation {
+                        receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::References,
                         src_name: src_name.clone(),
@@ -372,6 +375,7 @@ fn extract_cpp_node(
                                 && seen.insert(token.to_string())
                             {
                                 relations.push(ExtractedRelation {
+                                    receiver: None,
                                     call_shape: None,
                                     kind: kin_model::RelationKind::UsesMacro,
                                     src_name: name.clone(),
@@ -474,6 +478,7 @@ fn extract_base_classes(
                 let base_name = child.utf8_text(source).unwrap_or("").to_string();
                 if !base_name.is_empty() {
                     relations.push(ExtractedRelation {
+                        receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::Extends,
                         src_name: class_name.to_string(),
@@ -903,6 +908,7 @@ fn collect_scoped_calls(
                 };
                 if is_valid_callee(&dst_name) {
                     relations.push(ExtractedRelation {
+                        receiver: None,
                         kind: kin_model::RelationKind::Calls,
                         src_name: context_name.to_string(),
                         dst_name,
@@ -1177,6 +1183,7 @@ fn extract_includes_and_macros_recursive(
                 if let Some(src_name) = find_enclosing_entity(node, source) {
                     if src_name != name && !src_name.ends_with(&format!("::{}", name)) {
                         relations.push(ExtractedRelation {
+                            receiver: None,
                             call_shape: None,
                             kind: kin_model::RelationKind::UsesMacro,
                             src_name,

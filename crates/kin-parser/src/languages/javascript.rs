@@ -164,6 +164,7 @@ fn extract_js_node(
                                         hchild.utf8_text(source).unwrap_or("").to_string();
                                     if !parent_name.is_empty() {
                                         relations.push(ExtractedRelation {
+                                            receiver: None,
                                             call_shape: None,
                                             kind: kin_model::RelationKind::Extends,
                                             src_name: name.clone(),
@@ -197,6 +198,7 @@ fn extract_js_node(
                                     span: span_from_node(&member, file_id),
                                 });
                                 relations.push(ExtractedRelation {
+                                    receiver: None,
                                     call_shape: None,
                                     kind: kin_model::RelationKind::Contains,
                                     src_name: name.clone(),
@@ -578,6 +580,7 @@ fn extract_calls_from_context(
                 };
                 if is_valid_callee_name(&callee_name) {
                     relations.push(ExtractedRelation {
+                        receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::Calls,
                         src_name: context_name.to_string(),
