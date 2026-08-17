@@ -1828,9 +1828,13 @@ mod tests {
             .upsert_entity(&external_target_entity("urllib3.poolmanager", 2))
             .unwrap();
 
-        let response =
-            build_graph_status_response(&binding, &graph, &Default::default(), &Default::default())
-                .unwrap();
+        let response = build_graph_status_response(
+            &pinned(&binding),
+            &graph,
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
 
         let entity_line = response
             .lines
@@ -1884,9 +1888,13 @@ mod tests {
         graph.upsert_entity(&documented).unwrap();
         graph.upsert_entity(&test_entity("undocumented")).unwrap();
 
-        let response =
-            build_graph_status_response(&binding, &graph, &Default::default(), &Default::default())
-                .unwrap();
+        let response = build_graph_status_response(
+            &pinned(&binding),
+            &graph,
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
 
         let line = response
             .lines
