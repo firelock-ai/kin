@@ -906,12 +906,13 @@ impl Reconciler {
                 || matches!(graph.get_entity(&id), Ok(Some(_)))
         };
         for relation in &cross_file.resolved {
-            let endpoints_admitted = [relation.src, relation.dst].into_iter().all(|node| {
-                match node {
-                    GraphNodeId::Entity(id) => admits_entity(id),
-                    _ => false,
-                }
-            });
+            let endpoints_admitted =
+                [relation.src, relation.dst]
+                    .into_iter()
+                    .all(|node| match node {
+                        GraphNodeId::Entity(id) => admits_entity(id),
+                        _ => false,
+                    });
             if !endpoints_admitted {
                 debug!(
                     src = %relation.src,
@@ -1040,11 +1041,7 @@ impl Reconciler {
             for artifact_id in &cross_file.source_artifacts {
                 let node = GraphNodeId::Artifact(*artifact_id);
                 let stored = graph
-                    .traverse(
-                        &node,
-                        &[RelationKind::Imports, RelationKind::Includes],
-                        1,
-                    )
+                    .traverse(&node, &[RelationKind::Imports, RelationKind::Includes], 1)
                     .map(|sub| sub.relations)
                     .unwrap_or_default();
                 for relation in stored {
@@ -1071,9 +1068,7 @@ impl Reconciler {
                             // module resolution could not have reached, so the
                             // edge's absence here says nothing about the source.
                             let destination_known = match relation.dst {
-                                GraphNodeId::Artifact(id) => {
-                                    self.cross_file.knows_artifact(&id)
-                                }
+                                GraphNodeId::Artifact(id) => self.cross_file.knows_artifact(&id),
                                 _ => false,
                             };
                             if cross_file.referenced.is_complete()
@@ -1098,17 +1093,19 @@ impl Reconciler {
                 if stored_ids.contains(&relation.id) {
                     continue;
                 }
-                let endpoints_admitted = [relation.src, relation.dst].into_iter().all(|node| {
-                    match node {
-                        GraphNodeId::Artifact(id) => self
-                            .cross_file
-                            .path_of_artifact(&id)
-                            .and_then(|path| kin_model::RepoPath::from_utf8(path).ok())
-                            .and_then(|path| graph.artifact_id_at_path(&path))
-                            == Some(id),
-                        _ => false,
-                    }
-                });
+                let endpoints_admitted =
+                    [relation.src, relation.dst]
+                        .into_iter()
+                        .all(|node| match node {
+                            GraphNodeId::Artifact(id) => {
+                                self.cross_file
+                                    .path_of_artifact(&id)
+                                    .and_then(|path| kin_model::RepoPath::from_utf8(path).ok())
+                                    .and_then(|path| graph.artifact_id_at_path(&path))
+                                    == Some(id)
+                            }
+                            _ => false,
+                        });
                 if !endpoints_admitted {
                     continue;
                 }

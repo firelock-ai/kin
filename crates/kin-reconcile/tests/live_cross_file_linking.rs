@@ -527,7 +527,8 @@ fn resolving_one_file_does_not_touch_the_repository() {
 
     repo.commit("parsing.py", PARSING);
     assert_eq!(
-        repo.last_files_resolved, 2,
+        repo.last_files_resolved,
+        2,
         "the arrival that unblocks storage.py resolves itself plus that one file, \
          not the {} files in the repository",
         FILLER + 2

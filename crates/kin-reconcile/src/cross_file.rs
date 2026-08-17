@@ -399,26 +399,27 @@ impl LiveCrossFileLinker {
 
         let files_resolved = batch.len();
         self.last_files_resolved = files_resolved;
-        let relations =
-            match link_cross_file_incremental_with_completeness(&batch, &self.linker, &completeness_map)
-            {
-                Ok(relations) => relations,
-                Err(error) => {
-                    warn!(
-                        file = %file_path,
-                        error = %error,
-                        "cross-file resolution failed; keeping intra-file edges only"
-                    );
-                    return CrossFilePass {
-                        referenced,
-                        files_resolved,
-                        ..CrossFilePass::default()
-                    };
-                }
-            };
+        let relations = match link_cross_file_incremental_with_completeness(
+            &batch,
+            &self.linker,
+            &completeness_map,
+        ) {
+            Ok(relations) => relations,
+            Err(error) => {
+                warn!(
+                    file = %file_path,
+                    error = %error,
+                    "cross-file resolution failed; keeping intra-file edges only"
+                );
+                return CrossFilePass {
+                    referenced,
+                    files_resolved,
+                    ..CrossFilePass::default()
+                };
+            }
+        };
 
-        let batched_paths: HashSet<String> =
-            batch.iter().map(|f| f.file_path.clone()).collect();
+        let batched_paths: HashSet<String> = batch.iter().map(|f| f.file_path.clone()).collect();
 
         let mut resolved = Vec::new();
         let mut artifact_imports: Vec<Relation> = Vec::new();
@@ -452,7 +453,10 @@ impl LiveCrossFileLinker {
                     resolved.push(relation);
                 }
                 (GraphNodeId::Artifact(src), GraphNodeId::Artifact(_)) => {
-                    if !matches!(relation.kind, RelationKind::Imports | RelationKind::Includes) {
+                    if !matches!(
+                        relation.kind,
+                        RelationKind::Imports | RelationKind::Includes
+                    ) {
                         continue;
                     }
                     let Some(path) = self.file_by_artifact_id.get(&src) else {
@@ -658,7 +662,6 @@ impl LiveCrossFileLinker {
                 .entity_by_bare_name
                 .contains_key(bare_entity_name(name))
     }
-
 }
 
 fn admitted_artifact_id<G: GraphStore>(graph: &G, path: &str) -> Option<ArtifactId> {
