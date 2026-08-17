@@ -341,6 +341,44 @@ fn isolated_runtime_lifecycle_does_not_claim_product_control_state() {
     );
 }
 
+/// A runtime-bound command carries the operator's background-embedding opt-out,
+/// and still drops a name it does not know.
+///
+/// The launch binding scrubs every inherited `KIN_*` value and then replays only
+/// the allowlisted overrides, so a variable missing from that list is dropped
+/// with no error and no output. A test that sets the opt-out and watches the
+/// child embed anyway would read that as the product ignoring an operator, which
+/// is exactly how this toggle was first reported dead on the CLI spawn path. The
+/// fabricated name is the control: if it survived, this assertion would be
+/// measuring nothing.
+#[test]
+#[serial]
+fn runtime_command_carries_the_background_embed_opt_out_and_still_drops_an_unknown_name() {
+    let root = tempdir().expect("temp root");
+    let repository = root.path().join("repository");
+    std::fs::create_dir_all(repository.join(".kin")).expect("create Kin control dir");
+    let runtime = common::IsolatedDaemonRuntime::new(&repository);
+
+    let mut command = runtime.kin_command();
+    command
+        .arg("--version")
+        .env("KIN_DAEMON_AUTO_EMBED", "0")
+        .env("KIN_DAEMON_NOT_A_REAL_KNOB", "0");
+    command.prepare_for_launch_for_test();
+
+    assert_eq!(
+        command.configured_env_for_test(std::ffi::OsStr::new("KIN_DAEMON_AUTO_EMBED")),
+        Some(Some(OsString::from("0"))),
+        "the launch binding dropped the operator's background-embedding opt-out, so any test \
+         asserting the daemon honours it would prove the opposite"
+    );
+    assert_eq!(
+        command.configured_env_for_test(std::ffi::OsStr::new("KIN_DAEMON_NOT_A_REAL_KNOB")),
+        Some(None),
+        "a fabricated Kin variable survived the launch binding, so surviving proves nothing"
+    );
+}
+
 #[test]
 #[serial]
 fn runtime_command_rebinds_git_and_kin_authority_at_launch() {
