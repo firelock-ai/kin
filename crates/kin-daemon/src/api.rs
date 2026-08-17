@@ -28878,6 +28878,259 @@ mod tests {
         );
     }
 
+    /// The raw text of a tool result, for the assertions that are about SIZE.
+    ///
+    /// `call_mcp_tool` hands back parsed JSON, and a parse discards the only
+    /// number a token-overflow defect is measured in. This is the payload the
+    /// client would have refused.
+    async fn call_mcp_tool_text(
+        app: Router,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> String {
+        let response = app
+            .oneshot(
+                Request::post("/mcp/tools/call")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "name": name, "arguments": arguments }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        let result: kin_mcp::ToolCallResult = serde_json::from_slice(&body).unwrap();
+        assert_ne!(result.is_error, Some(true), "{name} errored: {result:?}");
+        mcp_result_text(&result)
+    }
+
+    /// A trace fixture whose bodies are real: `steps` source entities with
+    /// projectable spans, chained focal -> next -> next, each body wide enough
+    /// that inlining it is measurable.
+    ///
+    /// The defect this supports is about size, so a fixture of one-line bodies
+    /// would make every size assertion vacuous.
+    fn install_trace_chain(state: &Arc<DaemonState>, steps: usize) -> Vec<EntityId> {
+        let ids: Vec<EntityId> = (0..steps)
+            .map(|index| {
+                let path = format!("src/hop{index}.py");
+                let filler = "    # a line of body that costs real characters\n".repeat(30);
+                let source = format!("def hop{index}(request):\n{filler}    return {index}\n");
+                install_source_entity(state, &format!("hop{index}"), &path, &source)
+            })
+            .collect();
+        for window in ids.windows(2) {
+            state
+                .graph
+                .upsert_relation(&kin_model::relation::Relation {
+                    id: kin_model::RelationId::new(),
+                    kind: RelationKind::Calls,
+                    src: GraphNodeId::Entity(window[0]),
+                    dst: GraphNodeId::Entity(window[1]),
+                    confidence: 1.0,
+                    origin: kin_model::relation::RelationOrigin::Parsed,
+                    created_in: None,
+                    import_source: None,
+                    evidence: vec![],
+                })
+                .unwrap();
+        }
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        ids
+    }
+
+    /// A shape query is the cheap call, and it is cheap because it carries no
+    /// source — not because it walks less.
+    ///
+    /// The measured defect: `depth: 4, limit_per_step: 8` returned 228,413
+    /// characters and the client refused the whole result, because every one of
+    /// 106 steps inlined a full body and the tool had no way to be asked for the
+    /// chain's shape. This asserts on real projected bodies, so a regression that
+    /// re-inlines them fails on the character count rather than passing a chain
+    /// comparison that cannot see source at all.
+    #[tokio::test]
+    async fn a_trace_shape_query_keeps_every_edge_and_carries_no_body() {
+        let state = test_state();
+        let ids = install_trace_chain(&state, 5);
+        let app = router(Arc::clone(&state));
+
+        let with_bodies = call_mcp_tool_text(
+            app.clone(),
+            "trace_data_flow",
+            json!({ "focal": ids[0].to_string(), "depth": 4, "direction": "calls" }),
+        )
+        .await;
+        let compact = call_mcp_tool_text(
+            app.clone(),
+            "trace_data_flow",
+            json!({
+                "focal": ids[0].to_string(),
+                "depth": 4,
+                "direction": "calls",
+                "include_body": false,
+            }),
+        )
+        .await;
+
+        let full: serde_json::Value = serde_json::from_str(&with_bodies).unwrap();
+        let shape: serde_json::Value = serde_json::from_str(&compact).unwrap();
+
+        // Non-vacuity: the default call must actually have inlined graph-owned
+        // source, or "no bodies" below is a fact about the fixture.
+        assert_eq!(full["bodies_included"], json!(true));
+        assert!(
+            full["chain"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|step| step["body"].as_str().is_some_and(|body| body.len() > 500)),
+            "the default call must inline a real body per step: {with_bodies}"
+        );
+
+        assert_eq!(
+            shape["total_steps"], full["total_steps"],
+            "asking for the shape must not change which edges are walked"
+        );
+        assert_eq!(shape["bodies_included"], json!(false));
+        assert!(
+            shape["chain"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|step| step["body"].is_null()
+                    && step["entity_file"].as_str().is_some()
+                    && step["start_line"].as_u64().is_some()),
+            "a shape query keeps names, spans, and edges and drops only source: {compact}"
+        );
+        assert!(
+            shape["focal"].is_null() && shape["focal_entity"]["start_line"].as_u64().is_some(),
+            "the focal is a body too, and its span outlives it: {compact}"
+        );
+        assert!(
+            compact.len() * 3 < with_bodies.len(),
+            "a shape query must be a fraction of the size: {} vs {} chars",
+            compact.len(),
+            with_bodies.len()
+        );
+    }
+
+    /// `compact: true` is the same request as `include_body: false`.
+    ///
+    /// An agent that learned the spelling from another tool on this surface must
+    /// not be handed a 228k-character response for using it.
+    #[tokio::test]
+    async fn compact_is_the_same_request_as_include_body_false() {
+        let state = test_state();
+        let ids = install_trace_chain(&state, 4);
+        let app = router(Arc::clone(&state));
+
+        let by_compact = call_mcp_tool(
+            app.clone(),
+            "trace_data_flow",
+            json!({ "focal": ids[0].to_string(), "depth": 3, "compact": true }),
+        )
+        .await;
+        let by_include_body = call_mcp_tool(
+            app.clone(),
+            "trace_data_flow",
+            json!({ "focal": ids[0].to_string(), "depth": 3, "include_body": false }),
+        )
+        .await;
+        assert_eq!(by_compact, by_include_body);
+        assert_eq!(by_compact["bodies_included"], json!(false));
+
+        // An explicit include_body wins over the alias, so the two can never
+        // disagree silently.
+        let conflicting = call_mcp_tool(
+            app,
+            "trace_data_flow",
+            json!({
+                "focal": ids[0].to_string(),
+                "depth": 3,
+                "compact": true,
+                "include_body": true,
+            }),
+        )
+        .await;
+        assert_eq!(conflicting["bodies_included"], json!(true));
+    }
+
+    /// The tool bounds its own payload, and cuts bodies before edges.
+    ///
+    /// This is the defect end to end: a walk inside every work bound whose
+    /// RESULT does not fit. The response now measures itself and returns a
+    /// complete chain without source rather than a full chain the caller never
+    /// receives.
+    #[tokio::test]
+    async fn a_trace_over_its_budget_drops_bodies_and_keeps_every_edge() {
+        const BUDGET: usize = 6_000;
+        let state = test_state();
+        let ids = install_trace_chain(&state, 6);
+        let app = router(Arc::clone(&state));
+
+        let unbounded = call_mcp_tool_text(
+            app.clone(),
+            "trace_data_flow",
+            json!({ "focal": ids[0].to_string(), "depth": 5, "direction": "calls" }),
+        )
+        .await;
+        assert!(
+            unbounded.len() > BUDGET,
+            "the fixture must exceed the budget under test or this proves nothing: {} chars",
+            unbounded.len()
+        );
+        let full: serde_json::Value = serde_json::from_str(&unbounded).unwrap();
+
+        let bounded = call_mcp_tool_text(
+            app,
+            "trace_data_flow",
+            json!({
+                "focal": ids[0].to_string(),
+                "depth": 5,
+                "direction": "calls",
+                "max_response_chars": BUDGET,
+            }),
+        )
+        .await;
+        let cut: serde_json::Value = serde_json::from_str(&bounded).unwrap();
+
+        assert!(
+            bounded.len() <= BUDGET,
+            "the tool must return what it promised to fit: {} chars against {BUDGET}",
+            bounded.len()
+        );
+        assert_eq!(
+            cut["total_steps"], full["total_steps"],
+            "bodies are cut before edges, so the chain survives a cut its source does not"
+        );
+        assert_eq!(cut["bodies_included"], json!(false));
+        assert!(cut["bodies_omitted"].as_u64().unwrap_or(0) > 0);
+        assert_eq!(
+            cut["truncated"], json!(false),
+            "a chain that lost only bodies is not a truncated chain"
+        );
+        let disclosure = cut["degradations"]
+            .as_array()
+            .expect("a cut must be disclosed")
+            .iter()
+            .find(|entry| entry["component"] == json!("response_budget"))
+            .expect("the cut must name itself");
+        assert_eq!(disclosure["reason"], json!("bodies_omitted"));
+        assert!(
+            disclosure["remediation"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("include_body"),
+            "the remediation must name the parameter that avoids the cut: {disclosure}"
+        );
+    }
+
     /// A publication boundary forces a fresh, fully validating load on this
     /// wrapper too.
     ///
