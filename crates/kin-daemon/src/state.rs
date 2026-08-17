@@ -2205,6 +2205,14 @@ impl DaemonState {
         phases.record("lkg_seed", || {
             reconciler.seed_lkg_entities_from_graph(graph.as_ref())
         });
+        // Index the cross-file linker's entity universe from the same snapshot.
+        // Without it every live reconcile resolves against an empty universe,
+        // reports every destination missing, and the graph keeps intra-file
+        // edges only. One pass here; every write after it is bounded by the
+        // edited file rather than by repository size.
+        phases.record("cross_file_seed", || {
+            reconciler.seed_cross_file_linker_from_graph(graph.as_ref())
+        });
 
         // Wire the traffic checker so reconcile mutations are gated by active
         // intents/leases. Without this, check_scopes() in the reconciler
@@ -2429,6 +2437,7 @@ impl DaemonState {
         let vector_index_discarded = Self::load_validated_vector_index(&layout, graph.as_ref());
         let mut reconciler = Reconciler::new(layout.working_dir().to_path_buf());
         reconciler.seed_lkg_entities_from_graph(graph.as_ref());
+        reconciler.seed_cross_file_linker_from_graph(graph.as_ref());
 
         let traffic_checker =
             crate::traffic_adapter::CoordinatorTrafficChecker::new(Arc::clone(&graph));

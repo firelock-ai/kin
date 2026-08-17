@@ -120,7 +120,7 @@ pub struct UnresolvedRelation {
 }
 
 /// Data for a single parsed file, used for cross-file linking.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FileParseData {
     /// Relative file path (e.g., "src/app/api/chat/route.ts").
     pub file_path: String,
@@ -282,11 +282,13 @@ fn entity_link_order(a: &Entity, b: &Entity) -> std::cmp::Ordering {
 /// The bare (unqualified) leaf of an entity name: the part after the final
 /// `::` or `.` separator, or the whole name when it carries no qualifier.
 ///
-/// Shared by the batch [`link_cross_file`] entity index and the
-/// [`IncrementalLinker`] bare-name index so both derive receiver-method leaf
-/// names identically — a divergence here would resolve the same call to
-/// different entities across the two linkers.
-fn bare_entity_name(name: &str) -> &str {
+/// Shared by the batch [`link_cross_file`] entity index, the
+/// [`IncrementalLinker`] bare-name index, and the live reconcile path's
+/// destination-name evidence so all three derive receiver-method leaf names
+/// identically — a divergence here would resolve the same call to different
+/// entities across the two linkers, or let a reconcile retire an edge whose
+/// destination the file still names under its qualified spelling.
+pub fn bare_entity_name(name: &str) -> &str {
     match name.rfind("::") {
         Some(idx) => &name[idx + 2..],
         None => match name.rfind('.') {
@@ -3605,6 +3607,7 @@ fn resolve_default_export(target_file: &str, universe_entities: &[&Entity]) -> O
 ///
 /// Keeps entity indices in-memory to avoid O(N) universe cloning and map rebuilding
 /// per commit during history hydration.
+#[derive(Debug)]
 pub struct IncrementalLinker {
     /// Graph-assigned artifact identity for every known repository path.
     artifact_ids: ArtifactIdentityMap,
