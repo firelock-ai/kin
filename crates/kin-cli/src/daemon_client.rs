@@ -6721,6 +6721,9 @@ pub async fn ensure_supervisor_running() -> Result<String> {
             "supervisor became healthy without acknowledging the exact startup generation",
         );
     }
+    // A supervisor is the same binary under `--supervisor`, so an unreaped one
+    // prints as `[kin-daemon] <defunct>` exactly like a repo daemon does.
+    kin_daemon_spawn::adopt_detached_daemon_child(child);
     info!(supervisor = %base_url, "supervisor is up and ready");
     Ok(base_url)
 }
@@ -7112,12 +7115,16 @@ pub async fn ensure_daemon_running_with_idle_timeout(
 
     let timeout_secs = daemon_ready_timeout_secs();
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    let base_url = wait_for_daemon_ready(kin_root, &mut child, deadline, log_offset)
-        .await
-        .map_err(|error| match error {
-            DaemonReadinessError::Failed(error) => AutoStartError::spawn(format!("{error:#}")),
-            DaemonReadinessError::Timeout(detail) => AutoStartError::StartupTimeout(detail),
-        })?;
+    let readiness = wait_for_daemon_ready(kin_root, &mut child, deadline, log_offset).await;
+    // The daemon outlives this call either way, and this process may outlive the
+    // daemon: `kin mcp start` reaches here for a whole agent session. Dropping
+    // the handle waits on nothing, so hand it to the reaper before the borrow
+    // ends rather than leaving a corpse behind for the session's duration.
+    kin_daemon_spawn::adopt_detached_daemon_child(child);
+    let base_url = readiness.map_err(|error| match error {
+        DaemonReadinessError::Failed(error) => AutoStartError::spawn(format!("{error:#}")),
+        DaemonReadinessError::Timeout(detail) => AutoStartError::StartupTimeout(detail),
+    })?;
     register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url)
         .await
         .map_err(AutoStartError::spawn)?;

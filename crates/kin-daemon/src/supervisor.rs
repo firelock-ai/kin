@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::state::DaemonState;
@@ -1731,6 +1731,10 @@ struct DaemonObservation {
     /// The deployed binary was rebuilt after this process started — it is running
     /// stale code and is a redeploy candidate.
     stale_binary: bool,
+    /// What this daemon publishes about a write transaction it has open. Read
+    /// from disk rather than from `/health`, because the state this protects is
+    /// exactly the state in which `/health` cannot be answered.
+    transaction: crate::commit_liveness::TransactionLiveness,
 }
 
 /// Decide what to do with a discovered daemon: reap a demonstrably-misbehaving
@@ -1769,6 +1773,22 @@ fn classify_daemon(obs: &DaemonObservation, policy: &ReapPolicy) -> DaemonDecisi
         &obs.health,
         DaemonHealth::Healthy(activity) if activity.has_clients || activity.reconciling
     );
+
+    // Absolute guard, second half: a daemon that has published a beating write
+    // transaction is doing real work whether or not it can say so over HTTP.
+    // The guard above reads `has_clients` off a `/health` body, so it can only
+    // fire for a daemon with a runtime worker free to produce one — and a commit
+    // is synchronous work on a runtime worker holding the coordination gate. The
+    // one state the busy guard exists to protect was therefore the one state it
+    // could not observe, which is how a 172-second commit was SIGKILLed with its
+    // client still waiting. This reads the daemon's own on-disk claim instead,
+    // and never adopts a stale one (see `Stale` below).
+    if matches!(
+        obs.transaction,
+        crate::commit_liveness::TransactionLiveness::Open(_)
+    ) {
+        return DaemonDecision::Keep;
+    }
 
     if !active {
         // (a) Safe criterion, always on: orphaned and the daemon ANSWERED its
@@ -2035,6 +2055,10 @@ async fn reaper_sweep(
                 .unwrap_or(0),
             registry: registry_relation,
             stale_binary,
+            transaction: crate::commit_liveness::transaction_liveness(
+                Path::new(&daemon.repo_root),
+                daemon.pid,
+            ),
         };
         match classify_daemon(&observation, &policy) {
             DaemonDecision::Reap(reason) => {
@@ -2272,10 +2296,35 @@ async fn graceful_terminate(pid: u32, repo_root: &str, action: &str, reason: &st
         reason,
         "{action} (SIGTERM)"
     );
+    // Say it in the victim's own log before signalling, because everything below
+    // this line is written to the supervisor's log and the operator opens
+    // `.kin/daemon.log`. Without this the daemon's log just stops: a SIGKILL
+    // prints nothing, and the daemon's own SIGTERM handler is a tokio arm a
+    // saturated runtime never polls, so neither signal leaves a trace there.
+    let kin_root = Path::new(repo_root).join(".kin");
+    let in_flight = match crate::commit_liveness::transaction_liveness(Path::new(repo_root), pid) {
+        crate::commit_liveness::TransactionLiveness::Open(summary)
+        | crate::commit_liveness::TransactionLiveness::Stale(summary) => Some(summary.to_string()),
+        crate::commit_liveness::TransactionLiveness::None => None,
+    };
+    let note = kin_daemon_spawn::DaemonDeathNote {
+        pid,
+        killed_by: "kin-supervisor-reaper".to_string(),
+        reason: format!("{action}: {reason}"),
+        in_flight,
+        at: chrono::Utc::now().to_rfc3339(),
+    };
+    kin_daemon_spawn::append_to_daemon_log(
+        &kin_root,
+        &format!("kin-daemon TERMINATED BY SUPERVISOR: {}", note.summary()),
+    );
+    kin_daemon_spawn::write_daemon_death_note(&kin_root, &note);
+
     unsafe {
         libc::kill(pid as libc::pid_t, libc::SIGTERM);
     }
     let start = Instant::now();
+    let mut killed = false;
     while start.elapsed() < REAPER_SIGTERM_GRACE {
         if !is_process_alive(pid) {
             info!(
@@ -2283,6 +2332,7 @@ async fn graceful_terminate(pid: u32, repo_root: &str, action: &str, reason: &st
                 repo = %repo_root,
                 "daemon exited gracefully after SIGTERM"
             );
+            retire_endpoint_of_terminated_daemon(&kin_root, pid);
             return;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -2297,6 +2347,43 @@ async fn graceful_terminate(pid: u32, repo_root: &str, action: &str, reason: &st
         unsafe {
             libc::kill(pid as libc::pid_t, libc::SIGKILL);
         }
+        killed = true;
+    }
+    if killed {
+        // A SIGKILLed daemon retires nothing: endpoint retirement runs after the
+        // shutdown select returns, which it never does. Left alone, `daemon.pid`
+        // keeps naming a dead daemon as the live owner of this repo, which is
+        // what `kin doctor` reported as STALE with the record still on disk. The
+        // killer knows the daemon is gone, so the killer clears it.
+        let settled = Instant::now();
+        while settled.elapsed() < REAPER_SIGTERM_GRACE && is_process_alive(pid) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        retire_endpoint_of_terminated_daemon(&kin_root, pid);
+    }
+}
+
+/// Clear the endpoint record of a daemon this supervisor just ended.
+///
+/// Refuses on anything short of proof: the record must still name that exact
+/// pid, and that pid must be gone. A record naming a live process, a successor,
+/// or nobody identifiable is left exactly where it is.
+#[cfg(unix)]
+fn retire_endpoint_of_terminated_daemon(kin_root: &Path, pid: u32) {
+    if is_process_alive(pid) {
+        return;
+    }
+    match crate::lifecycle::retire_endpoint_of_dead_owner(kin_root, pid) {
+        true => info!(
+            pid,
+            kin_root = %kin_root.display(),
+            "retired the endpoint record of a terminated daemon"
+        ),
+        false => warn!(
+            pid,
+            kin_root = %kin_root.display(),
+            "left the endpoint record in place: it no longer names the terminated daemon"
+        ),
     }
 }
 
@@ -2312,10 +2399,26 @@ async fn reap_daemon(observation: &DaemonObservation, reason: ReapReason) {
         DaemonHealth::Unreachable => "unreachable",
         DaemonHealth::Unknown => "unknown",
     };
-    let context = format!(
+    let mut context = format!(
         "{reason:?} (probe={probe}, cpu_pinned_sweeps={}, stall_sweeps={})",
         observation.cpu_pinned_sweeps, observation.stall_sweeps
     );
+    // A daemon that opened a write transaction and then stopped beating it is
+    // wedged rather than busy, and ending it may cost a caller its commit. That
+    // is a decision worth taking, not one worth taking quietly: it is the only
+    // reap that names an interrupted transaction, and it says so at error level
+    // with the phase the daemon died in.
+    if let crate::commit_liveness::TransactionLiveness::Stale(summary) = &observation.transaction {
+        context = format!("{context} (abandoned transaction: {summary})");
+        error!(
+            pid = observation.pid,
+            repo = %observation.repo_root,
+            transaction = %summary,
+            reason = ?reason,
+            "reaping a daemon that has a write transaction open; its beat went stale, so it is \
+             wedged rather than busy — the caller waiting on this transaction will lose it"
+        );
+    }
     graceful_terminate(
         observation.pid,
         &observation.repo_root,
@@ -2712,6 +2815,17 @@ mod tests {
             stall_sweeps: 0,
             registry: RegistryRelation::RegisteredSelf,
             stale_binary: false,
+            transaction: crate::commit_liveness::TransactionLiveness::None,
+        }
+    }
+
+    /// A daemon mid-commit, as its own on-disk marker reports it.
+    fn committing(beat_age_secs: u64) -> crate::commit_liveness::OpenTransactionSummary {
+        crate::commit_liveness::OpenTransactionSummary {
+            operation: "commit".to_string(),
+            phase: "publish_workspace_admission".to_string(),
+            elapsed_secs: 86,
+            beat_age_secs,
         }
     }
 
@@ -2720,6 +2834,80 @@ mod tests {
             has_clients,
             reconciling,
         })
+    }
+
+    /// The regression this whole marker exists for.
+    ///
+    /// A one-file docstring commit on a converted psf/requests store was
+    /// SIGKILLed 172 seconds in, with the client still waiting on the request.
+    /// Every gate the reaper checked was satisfied by a HEALTHY commit: the
+    /// daemon is orphaned because `setsid` reparents every detached daemon to
+    /// init, it is unreachable because the commit is synchronous work on a
+    /// runtime worker so `/health` misses its 2s deadline, and it is stalled
+    /// because a commit phase logs only when it finishes and one phase ran 85.8s
+    /// against a 60s stall window. The `has_clients` guard that should have
+    /// stopped this reads a `/health` body, which by construction does not exist
+    /// for an unreachable daemon.
+    ///
+    /// So the decision is made against the daemon's own published claim instead,
+    /// and this asserts across every reap criterion at once — including the
+    /// duplicate-twin path, which carries no stall grace and fires on the very
+    /// first sweep.
+    #[test]
+    fn reaper_never_reaps_a_daemon_that_is_beating_an_open_transaction() {
+        for (health, registry) in [
+            (DaemonHealth::Unreachable, RegistryRelation::RegisteredSelf),
+            (DaemonHealth::Unhealthy, RegistryRelation::RegisteredSelf),
+            (DaemonHealth::Unreachable, RegistryRelation::LiveTwin),
+            (DaemonHealth::Unknown, RegistryRelation::LiveTwin),
+        ] {
+            let mut obs = observation(health.clone(), true);
+            obs.registry = registry;
+            obs.stall_sweeps = REAPER_STALL_SWEEPS * 10;
+            obs.cpu_pinned_sweeps = 100;
+            obs.stale_binary = true;
+            obs.transaction =
+                crate::commit_liveness::TransactionLiveness::Open(Box::new(committing(0)));
+            assert_eq!(
+                classify_daemon(&obs, &ReapPolicy::default()),
+                DaemonDecision::Keep,
+                "a daemon beating an open transaction must survive {health:?}/{registry:?}"
+            );
+        }
+    }
+
+    /// The marker must not become permanent immunity.
+    ///
+    /// A daemon that opened a transaction and then stopped beating it is wedged
+    /// rather than busy: the beat runs on a dedicated OS thread precisely so
+    /// runtime saturation cannot silence it, so a minute of silence is evidence
+    /// about the process, not about the workload. Reaping resumes, and
+    /// `reap_daemon` says at error level that it is ending a transaction.
+    #[test]
+    fn a_transaction_whose_beat_went_stale_stops_shielding_the_daemon() {
+        let mut obs = observation(DaemonHealth::Unreachable, true);
+        obs.stall_sweeps = REAPER_STALL_SWEEPS;
+        obs.transaction = crate::commit_liveness::TransactionLiveness::Stale(Box::new(committing(
+            crate::commit_liveness::BEAT_STALE_AFTER.as_secs() + 30,
+        )));
+        assert_eq!(
+            classify_daemon(&obs, &ReapPolicy::default()),
+            DaemonDecision::Reap(ReapReason::OrphanedUnreachableStalled)
+        );
+    }
+
+    /// A marker left by some earlier daemon shields nobody: `transaction_liveness`
+    /// only reports `Open` for the pid being judged, so a leftover file cannot
+    /// make a repository permanently unreapable.
+    #[test]
+    fn an_absent_transaction_marker_leaves_every_reap_criterion_as_it_was() {
+        let mut obs = observation(DaemonHealth::Unreachable, true);
+        obs.stall_sweeps = REAPER_STALL_SWEEPS;
+        assert_eq!(
+            classify_daemon(&obs, &ReapPolicy::default()),
+            DaemonDecision::Reap(ReapReason::OrphanedUnreachableStalled),
+            "without a marker the pre-existing criteria must be untouched"
+        );
     }
 
     #[test]

@@ -3257,6 +3257,8 @@ dependencies = [
  "fs2",
  "libc",
  "pretty_assertions",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",

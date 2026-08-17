@@ -1030,6 +1030,38 @@ pub fn remove_daemon_files_if_current_process(kin_root: &Path) {
     })
 }
 
+/// Retire an endpoint whose recorded owner this caller has proved is dead.
+///
+/// A daemon killed from outside never retires its own endpoint: retirement runs
+/// after the shutdown select returns, and a SIGKILLed process never gets there.
+/// The record then keeps naming a dead pid as the live owner of the repository,
+/// which is what left `kin doctor` reporting a STALE daemon with its endpoint
+/// record still on disk after a supervisor reap.
+///
+/// Returns whether anything was removed. Removal requires the record to still
+/// name `owner_pid` and that pid to be gone; a record naming a live process, a
+/// successor that republished, or nobody identifiable is left alone. That keeps
+/// this in the same direction the rest of this module runs in — proof authorizes
+/// destruction, absence of proof never does.
+pub fn retire_endpoint_of_dead_owner(kin_root: &Path, owner_pid: u32) -> bool {
+    without_blocking_runtime_worker(|| {
+        let Ok(_authority) = acquire_singleton_coordination_guard(kin_root) else {
+            tracing::warn!(
+                repo = %kin_root.display(),
+                "preserving daemon endpoint because lifecycle authority is unavailable"
+            );
+            return false;
+        };
+        match endpoint_ownership(kin_root) {
+            EndpointOwnership::OtherProcess { pid, live: false } if pid == owner_pid => {
+                remove_endpoint_components(kin_root);
+                true
+            }
+            _ => false,
+        }
+    })
+}
+
 /// Is the process with this PID alive?
 fn is_process_alive(pid: u32) -> bool {
     kin_cli::daemon_client::is_process_alive(pid)

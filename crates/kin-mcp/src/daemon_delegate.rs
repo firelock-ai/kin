@@ -1184,12 +1184,32 @@ async fn revive_mcp_daemon() -> Result<String, String> {
         .spawn()
         .map_err(|e| format!("MCP revival: spawn kin-daemon failed: {e}"))?;
 
+    let revived = await_revived_daemon(&kin_dir, &mut child).await;
+    // This process is an MCP server: it runs for the whole agent session and
+    // reaches this path on every tool call that finds a dead daemon. `setsid`
+    // does not change the parent pid, so a daemon started here stays this
+    // process's child, and dropping the handle would leave it `<defunct>` from
+    // the moment it dies until the session ends. Adopt it on every outcome —
+    // the startup failures below leave a daemon running on purpose too.
+    kin_daemon_spawn::adopt_detached_daemon_child(child);
+    revived
+}
+
+/// Wait for a just-started MCP daemon to report its port and serve health.
+///
+/// Split from the spawn so the child handle outlives every exit this can take
+/// and reaches the reaper once, rather than being dropped down one of five
+/// returns.
+async fn await_revived_daemon(
+    kin_dir: &std::path::Path,
+    child: &mut std::process::Child,
+) -> Result<String, String> {
     // The daemon binds :0 and publishes the port it actually got. There is no
     // fallback: a revival that cannot learn the real port has no daemon to
     // talk to, and addressing a default port would reach whatever else is
     // listening there.
     let port_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    let port = kin_daemon_spawn::await_reported_port(&kin_dir, &mut child, port_deadline)
+    let port = kin_daemon_spawn::await_reported_port(kin_dir, child, port_deadline)
         .await
         .map_err(|e| format!("MCP revival: {e}"))?;
 
@@ -1207,7 +1227,7 @@ async fn revive_mcp_daemon() -> Result<String, String> {
                 // A daemon the supervisor does not know about is unroutable to
                 // every other client, so registration is part of starting one.
                 if let Err(error) =
-                    kin_daemon_spawn::register_started_daemon(&kin_dir, &new_base).await
+                    kin_daemon_spawn::register_started_daemon(kin_dir, &new_base).await
                 {
                     tracing::warn!(
                         url = %new_base,
@@ -1226,7 +1246,7 @@ async fn revive_mcp_daemon() -> Result<String, String> {
 
         // The child reporting a port then failing to serve is still a startup
         // in progress; only its death is evidence against it.
-        if let Ok(disposition) = kin_daemon_spawn::startup_disposition(&mut child) {
+        if let Ok(disposition) = kin_daemon_spawn::startup_disposition(child) {
             if let kin_daemon_spawn::StartupDisposition::Exited(status) = disposition {
                 return Err(format!(
                     "MCP revival: daemon exited during startup with status {status} (port {port})"
