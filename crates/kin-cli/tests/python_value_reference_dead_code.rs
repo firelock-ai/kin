@@ -138,6 +138,20 @@ def main():
     return args.func(args)
 "#;
 
+/// The pytest suite. `main` is imported here and read as a value, never
+/// called, so before this edge class existed the entry point itself was on the
+/// delete list.
+const TEST_CLI_PY: &str = r#"from cli import main
+
+
+def test_ingest_then_backlinks():
+    assert main is not None
+
+
+def test_search_and_tags():
+    assert main is not None
+"#;
+
 /// The five subcommand handlers, wired only by `set_defaults(func=NAME)`.
 const WIRED_BY_VALUE: [&str; 5] = [
     "cmd_backlinks",
@@ -180,6 +194,7 @@ fn notes_project() -> (InMemoryGraph, Vec<FileParseData>) {
         parse_py("parsing.py", PARSING_PY),
         parse_py("storage.py", STORAGE_PY),
         parse_py("linkgraph.py", LINKGRAPH_PY),
+        parse_py("tests/test_cli.py", TEST_CLI_PY),
     ];
     let artifact_ids = files
         .iter()
