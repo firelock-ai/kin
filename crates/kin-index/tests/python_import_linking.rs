@@ -14,7 +14,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use kin_index::{link_cross_file as link_cross_file_with_identities, FileParseData};
+use kin_index::{
+    link_cross_file as link_cross_file_with_identities, link_cross_file_incremental, FileParseData,
+    IncrementalLinker,
+};
 use kin_model::{ArtifactId, Entity, EntityId, FilePathId, GraphNodeId, Relation, RelationKind};
 use kin_parser::{JavaScriptAdapter, LanguageAdapter, PythonAdapter};
 
@@ -368,4 +371,175 @@ fn javascript_same_named_twin_does_not_steal_an_imported_call() {
         call_confidence(&relations, caller, twin).is_none(),
         "the unimported twin must not be linked"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The same resolutions through the incremental linker, one file at a time.
+//
+// The live reconcile path never sees a whole repository at once: it gets one
+// file, then another. `IncrementalLinker` mirrors the batch linker's resolution
+// tiers, and these pin that the mirror holds in both write orders. Asserting
+// the confidence, not merely the edge, is what makes the claim meaningful: an
+// incrementally linked edge has to be indistinguishable in kind from a
+// batch-linked one, and the blind name fallback reaches the same entity at 0.7.
+//
+// What these do NOT cover is the reconcile path's bounded re-binding, where an
+// earlier file's unresolved reference is re-resolved from a retained fragment
+// rather than by re-linking everything seen so far. That lives in
+// `kin-reconcile/tests/live_cross_file_linking.rs`, against a real graph.
+// ---------------------------------------------------------------------------
+
+/// Walk files into an `IncrementalLinker` in `order`, one at a time, and return
+/// what is resolved once the last one has arrived.
+fn link_incrementally(files: &[FileParseData], order: &[usize]) -> (Vec<Relation>, ArtifactIds) {
+    let artifact_ids: ArtifactIds = files
+        .iter()
+        .map(|file| (file.file_path.clone(), ArtifactId::new()))
+        .collect();
+    let mut linker = IncrementalLinker::new();
+    let mut arrived: Vec<FileParseData> = Vec::new();
+    let mut relations = Vec::new();
+    for &index in order {
+        let file = files[index].clone();
+        let artifact_id = artifact_ids[&file.file_path];
+        linker.add_file(&file.file_path, artifact_id, &file.entities);
+        arrived.push(file);
+        linker.record_file_includes(&arrived);
+        linker.record_class_bases(&arrived);
+        relations = link_cross_file_incremental(&arrived, &linker)
+            .expect("every arrived file carries an explicitly assigned artifact identity");
+    }
+    (relations, artifact_ids)
+}
+
+fn python_import_chain() -> Vec<FileParseData> {
+    vec![
+        parse_with(
+            &PythonAdapter,
+            "storage.py",
+            "from parsing import parse_note\n\ndef save_note(p):\n    return parse_note(p)\n",
+        ),
+        parsing_module("parsing.py"),
+    ]
+}
+
+#[test]
+fn the_incremental_linker_binds_a_python_import_when_the_callee_arrives_first() {
+    let files = python_import_chain();
+    let (relations, artifact_ids) = link_incrementally(&files, &[1, 0]);
+
+    assert!(
+        artifact_import_paths(&relations, &artifact_ids)
+            .contains(&("storage.py".to_string(), "parsing.py".to_string())),
+        "the incremental linker must produce the same artifact Imports edge as the batch one"
+    );
+    let caller = entity_id_in(&files, "storage.py", "save_note");
+    let callee = entity_id_in(&files, "parsing.py", "parse_note");
+    assert_eq!(
+        call_confidence(&relations, caller, callee),
+        Some(IMPORT_RESOLVED_CONFIDENCE),
+        "an incrementally linked import-bound call must carry the import tier"
+    );
+}
+
+#[test]
+fn the_incremental_linker_binds_a_python_import_when_the_caller_arrives_first() {
+    // The order the live path actually meets: the importing file is indexed
+    // while its destination does not exist yet.
+    let files = python_import_chain();
+    let (relations, artifact_ids) = link_incrementally(&files, &[0, 1]);
+
+    assert!(
+        artifact_import_paths(&relations, &artifact_ids)
+            .contains(&("storage.py".to_string(), "parsing.py".to_string())),
+        "arrival order must not change which artifact Imports edges exist"
+    );
+    let caller = entity_id_in(&files, "storage.py", "save_note");
+    let callee = entity_id_in(&files, "parsing.py", "parse_note");
+    assert_eq!(
+        call_confidence(&relations, caller, callee),
+        Some(IMPORT_RESOLVED_CONFIDENCE),
+        "arrival order must not change the confidence tier either"
+    );
+}
+
+#[test]
+fn an_incrementally_linked_call_still_ignores_the_same_named_twin() {
+    let files = vec![
+        parse_with(
+            &PythonAdapter,
+            "storage.py",
+            "from parsing import parse_note\n\ndef save_note(p):\n    return parse_note(p)\n",
+        ),
+        parsing_module("parsing.py"),
+        parse_with(
+            &PythonAdapter,
+            "legacy.py",
+            "def parse_note(path):\n    return None\n",
+        ),
+    ];
+    // Worst order for the ambiguity: the twin is known before the real target.
+    let (relations, _) = link_incrementally(&files, &[0, 2, 1]);
+
+    let caller = entity_id_in(&files, "storage.py", "save_note");
+    let imported = entity_id_in(&files, "parsing.py", "parse_note");
+    let twin = entity_id_in(&files, "legacy.py", "parse_note");
+    assert_eq!(
+        call_confidence(&relations, caller, imported),
+        Some(IMPORT_RESOLVED_CONFIDENCE)
+    );
+    assert_eq!(
+        call_confidence(&relations, caller, twin),
+        None,
+        "an unimported twin must not be linked, whatever order it arrived in"
+    );
+}
+
+#[test]
+fn an_incrementally_linked_third_party_import_resolves_to_nothing_local() {
+    let files = vec![
+        parse_with(
+            &PythonAdapter,
+            "client.py",
+            "from requests import get\n\ndef fetch(url):\n    return get(url)\n",
+        ),
+        parsing_module("parsing.py"),
+    ];
+    let (relations, artifact_ids) = link_incrementally(&files, &[0, 1]);
+
+    assert!(
+        artifact_import_paths(&relations, &artifact_ids).is_empty(),
+        "a module path no repository file provides must resolve to nothing"
+    );
+}
+
+#[test]
+fn the_incremental_linker_binds_a_javascript_import_in_either_order() {
+    let files = vec![
+        parse_with(
+            &JavaScriptAdapter,
+            "storage.js",
+            "import { parseNote } from './parsing.js';\nexport function ingestNote(p) { return parseNote(p); }\n",
+        ),
+        parse_with(
+            &JavaScriptAdapter,
+            "parsing.js",
+            "export function parseNote(p) { return {}; }\n",
+        ),
+    ];
+    let caller = entity_id_in(&files, "storage.js", "ingestNote");
+    let callee = entity_id_in(&files, "parsing.js", "parseNote");
+
+    for order in [[0usize, 1usize], [1, 0]] {
+        let (relations, artifact_ids) = link_incrementally(&files, &order);
+        assert!(
+            artifact_import_paths(&relations, &artifact_ids)
+                .contains(&("storage.js".to_string(), "parsing.js".to_string())),
+            "JavaScript import edge missing for arrival order {order:?}"
+        );
+        assert!(
+            call_confidence(&relations, caller, callee).is_some(),
+            "JavaScript imported call unbound for arrival order {order:?}"
+        );
+    }
 }
