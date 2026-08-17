@@ -34,31 +34,16 @@ const DEFAULT_LIMIT_PER_STEP: usize = 5;
 const MAX_LIMIT_PER_STEP: usize = 25;
 const MAX_TOTAL_STEPS: usize = 200;
 
-/// Serialized characters one response may occupy before the tool cuts its own
-/// payload.
+/// Serialized characters one response may occupy before this walk cuts its own
+/// payload, and the floor and ceiling a caller may move it to.
 ///
-/// Every other bound here shapes the WALK, and none of them bounds the ANSWER: a
-/// walk inside all of them returned 228,413 characters over 2,453 lines from a
-/// 777-entity repository, because 106 steps each inlined a full body, and the
-/// client refused the result outright. A refused result is worse than a
-/// truncated one, since a caller gets neither the chain nor a way to ask for
-/// less, so the tool now measures what it is about to return and cuts bodies
-/// before edges to fit.
-///
-/// Sized against the tool-result ceilings agent clients actually apply, which
-/// are counted in tokens; at roughly 3.5 characters per token of JSON-wrapped
-/// source this leaves headroom under a 25k-token cap for the envelope a caller
-/// wraps around it.
-pub const DEFAULT_MAX_RESPONSE_CHARS: usize = 80_000;
-
-/// Floor for a caller-supplied budget. Below this the envelope alone does not
-/// fit, so a smaller number could only be honoured by returning nothing.
-const MIN_MAX_RESPONSE_CHARS: usize = 2_000;
-
-/// Ceiling for a caller-supplied budget. A caller with a larger window may raise
-/// the bound, but not to unbounded: the daemon serving this has other callers,
-/// and a response nothing can read is not worth building.
-const MAX_MAX_RESPONSE_CHARS: usize = 400_000;
+/// Read from `kin_mcp` rather than restated here: both arms of this one tool have
+/// to promise the same bound, and the arm that serves a generic graph store lives
+/// there. A refused result is worse than a truncated one, since a caller gets
+/// neither the chain nor a way to ask for less, which is why the number exists at
+/// all — see the definition for what it was measured against.
+pub use kin_mcp::handlers::common::TRACE_DEFAULT_MAX_RESPONSE_CHARS as DEFAULT_MAX_RESPONSE_CHARS;
+use kin_mcp::handlers::common::{trace_response_budget, TRACE_DISCLOSURE_RESERVE_CHARS};
 
 /// Wall-clock ceiling for one trace walk.
 ///
@@ -332,9 +317,7 @@ impl TraceDataFlowRequest {
     }
 
     fn budget_chars(&self) -> usize {
-        self.max_response_chars
-            .unwrap_or(DEFAULT_MAX_RESPONSE_CHARS)
-            .clamp(MIN_MAX_RESPONSE_CHARS, MAX_MAX_RESPONSE_CHARS)
+        trace_response_budget(self.max_response_chars)
     }
 }
 
@@ -1052,13 +1035,6 @@ fn entity_record(entity: &Entity, source: Option<&GraphSourceRecord>) -> TraceEn
     }
 }
 
-/// Characters held back from the budget for the disclosure a cut adds.
-///
-/// A response cut to exactly its ceiling and then told to explain the cut is
-/// over its ceiling again, by the length of the explanation. Reserving the room
-/// first is what makes the bound hold for the payload that actually ships.
-const DISCLOSURE_RESERVE_CHARS: usize = 1_500;
-
 /// Serialized size of a response, measured the way it will be sent.
 ///
 /// Both surfaces that return this — the CLI's `println!` and the daemon's MCP
@@ -1087,7 +1063,7 @@ fn enforce_response_budget(response: &mut TraceDataFlowResponse) {
     if measure_response(response) <= ceiling {
         return;
     }
-    let target = ceiling.saturating_sub(DISCLOSURE_RESERVE_CHARS);
+    let target = ceiling.saturating_sub(TRACE_DISCLOSURE_RESERVE_CHARS);
 
     let mut bodies_omitted = 0usize;
     for step in &mut response.chain {
@@ -2084,6 +2060,7 @@ mod tests {
                 step: index,
                 role: "callee".to_string(),
                 relation_kind: "Calls".to_string(),
+                resolution: RelationResolution::TypeResolved.as_str().to_string(),
                 parent_step: index.saturating_sub(1),
                 depth: 1,
                 entity: record,

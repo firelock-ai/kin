@@ -2603,6 +2603,88 @@ fn trace_step_value(
     value
 }
 
+/// Bound this arm's payload, dropping steps from the TAIL of the chain until it
+/// fits, and disclosing the cut.
+///
+/// This arm serves no bodies, so it has none to cut first: what it can shed is
+/// steps. It still needs the bound, because 200 steps of identity, span, and
+/// signature is a six-figure character count on their own, and a response the
+/// client refuses is worse than a short one — the caller gets neither the chain
+/// nor a way to ask for less.
+///
+/// A suffix is what makes the cut safe: the chain is discovery-ordered, so
+/// children always sit after their parents and removing the end never orphans a
+/// surviving step's `parent_step`.
+fn bound_trace_payload(result: &mut serde_json::Value, max_chars: usize) {
+    fn measure(value: &serde_json::Value) -> usize {
+        serde_json::to_string_pretty(value).map_or(usize::MAX, |json| json.len())
+    }
+    if measure(result) <= max_chars {
+        return;
+    }
+    let target = max_chars.saturating_sub(TRACE_DISCLOSURE_RESERVE_CHARS);
+    let full: Vec<serde_json::Value> = result["chain"].as_array().cloned().unwrap_or_default();
+
+    // Bisected rather than popped one step at a time: the same answer, in a
+    // handful of serializations instead of one per dropped step.
+    let mut kept = 0usize;
+    let mut low = 0usize;
+    let mut high = full.len();
+    while low <= high {
+        let mid = (low + high) / 2;
+        result["chain"] = serde_json::Value::Array(full[..mid].to_vec());
+        result["total_steps"] = serde_json::Value::from(mid);
+        if measure(result) <= target {
+            kept = mid;
+            low = mid + 1;
+        } else if mid == 0 {
+            break;
+        } else {
+            high = mid - 1;
+        }
+    }
+    result["chain"] = serde_json::Value::Array(full[..kept].to_vec());
+    result["total_steps"] = serde_json::Value::from(kept);
+
+    let omitted = full.len() - kept;
+    if omitted == 0 {
+        return;
+    }
+    result["steps_omitted"] = serde_json::Value::from(omitted);
+    // Dropped steps are edges the caller did not receive, which is what this flag
+    // has always meant.
+    result["truncated"] = serde_json::Value::Bool(true);
+    // A clip naming a step the response no longer carries would send a caller
+    // re-querying a node it cannot see.
+    if let Some(clips) = result
+        .get_mut("clipped_steps")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        clips.retain(|clip| clip["step"].as_u64().unwrap_or(0) as usize <= kept);
+    }
+    let disclosure = serde_json::json!({
+        "component": "response_budget",
+        "reason": "steps_omitted",
+        "detail": format!(
+            "the response exceeded its {max_chars}-character budget, so {omitted} steps were \
+             dropped from the end of the chain; this arm inlines no bodies, so steps are all it \
+             can shed"
+        ),
+        "remediation": "narrow the walk with a smaller depth or limit_per_step, or raise \
+                        max_response_chars if the caller's own result limit accepts a larger \
+                        payload",
+    });
+    // Appended rather than assigned: another producer may already have disclosed
+    // something about this same answer.
+    match result
+        .get_mut("degradations")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        Some(existing) => existing.push(disclosure),
+        None => result["degradations"] = serde_json::Value::Array(vec![disclosure]),
+    }
+}
+
 /// Trace the actual call/data-flow chain rooted at a focal entity.
 ///
 /// Walks Calls/Imports/References relations from the focal in the requested
@@ -2932,6 +3014,13 @@ pub fn handle_trace_data_flow<G: GraphStore>(
     if external_identities_merged > 0 {
         result["external_identities_merged"] = serde_json::Value::from(external_identities_merged);
     }
+    let max_response_chars = trace_response_budget(
+        args.get("max_response_chars")
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| value as usize),
+    );
+    result["max_response_chars"] = serde_json::Value::from(max_response_chars);
+    bound_trace_payload(&mut result, max_response_chars);
 
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
@@ -5002,6 +5091,223 @@ mod tests {
         store
             .upsert_relation(&make_relation(caller.id, callee.id, RelationKind::Calls))
             .unwrap();
+    }
+
+    /// `trace_data_flow` on this arm, with whatever arguments a test needs, and
+    /// no envelope: these assert on the handler's own payload.
+    fn traced_payload(
+        store: &InMemoryGraph,
+        args: &[(&str, serde_json::Value)],
+    ) -> serde_json::Value {
+        let mut arguments = HashMap::new();
+        for (key, value) in args {
+            arguments.insert((*key).to_string(), value.clone());
+        }
+        parsed_response(&handle_trace_data_flow(&arguments, store).unwrap())
+    }
+
+    /// The measured fan-out inversion on this arm: a node whose callees include
+    /// two in its own file, a distant method, a test double, and a file-less
+    /// import placeholder.
+    fn trace_fanout_store() -> (InMemoryGraph, EntityId) {
+        let store = InMemoryGraph::new();
+        let focal = make_entity("resolve_redirects", "src/requests/sessions.py");
+        let focal_id = focal.id;
+        store.upsert_entity(&focal).unwrap();
+
+        let mut candidates = vec![
+            make_entity("get_redirect_target", "src/requests/sessions.py"),
+            make_entity("rebuild_method", "src/requests/sessions.py"),
+            make_entity("HTTPAdapter.close", "src/requests/adapters.py"),
+        ];
+        let mut harness = make_entity("RedirectSession.send", "tests/test_requests.py");
+        harness.role = EntityRole::Test;
+        candidates.push(harness);
+        let mut placeholder = make_entity("urljoin", "unused");
+        placeholder.kind = EntityKind::Module;
+        placeholder.file_origin = None;
+        candidates.push(placeholder);
+
+        for candidate in &candidates {
+            store.upsert_entity(candidate).unwrap();
+            store
+                .upsert_relation(&make_relation(focal_id, candidate.id, RelationKind::Calls))
+                .unwrap();
+        }
+        (store, focal_id)
+    }
+
+    /// This arm serves the tool whenever the MCP server answers from an
+    /// in-process store rather than delegating to the daemon, so it owes the same
+    /// per-step cap behavior. A cap that kept whatever the relation table listed
+    /// first dropped the two callees that decide the redirect.
+    #[test]
+    fn trace_data_flow_offline_cap_keeps_the_callees_that_continue_the_chain() {
+        let (store, focal_id) = trace_fanout_store();
+        let response = traced_payload(
+            &store,
+            &[
+                ("focal", serde_json::json!(focal_id.to_string())),
+                ("direction", serde_json::json!("calls")),
+                ("depth", serde_json::json!(1)),
+                ("limit_per_step", serde_json::json!(2)),
+            ],
+        );
+
+        let mut kept: Vec<String> = response["chain"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| step["entity_name"].as_str().unwrap().to_string())
+            .collect();
+        kept.sort();
+        assert_eq!(
+            kept,
+            vec![
+                "get_redirect_target".to_string(),
+                "rebuild_method".to_string()
+            ],
+            "the located source callees in the expanded node's own file must win the two slots"
+        );
+        assert_eq!(response["truncated"], serde_json::json!(true));
+        let clip = &response["clipped_steps"][0];
+        assert_eq!(clip["step"], serde_json::json!(0), "the focal is step 0");
+        assert_eq!(clip["dropped_callees"], serde_json::json!(3));
+        assert_eq!(clip["limit_per_step"], serde_json::json!(2));
+    }
+
+    /// One array, one key set, and one identity per symbol — on this arm too.
+    #[test]
+    fn trace_data_flow_offline_reports_one_shape_and_one_identity() {
+        let store = InMemoryGraph::new();
+        let focal = make_entity("Session.prepare_request", "src/requests/sessions.py");
+        let admitted = make_entity("cookiejar_from_dict", "src/requests/cookies.py");
+        let mut alias = make_entity("cookiejar_from_dict", "unused");
+        alias.kind = EntityKind::Module;
+        alias.file_origin = None;
+        let mut placeholder = make_entity("urlparse", "unused");
+        placeholder.kind = EntityKind::Module;
+        placeholder.file_origin = None;
+        let focal_id = focal.id;
+        let admitted_id = admitted.id;
+
+        for entity in [&focal, &admitted, &alias, &placeholder] {
+            store.upsert_entity(entity).unwrap();
+        }
+        for target in [admitted.id, alias.id, placeholder.id] {
+            store
+                .upsert_relation(&make_relation(focal_id, target, RelationKind::Calls))
+                .unwrap();
+        }
+
+        let response = traced_payload(
+            &store,
+            &[
+                ("focal", serde_json::json!(focal_id.to_string())),
+                ("direction", serde_json::json!("calls")),
+                ("depth", serde_json::json!(1)),
+                ("limit_per_step", serde_json::json!(25)),
+            ],
+        );
+
+        let steps = response["chain"].as_array().unwrap();
+        let cookiejar: Vec<&serde_json::Value> = steps
+            .iter()
+            .filter(|step| step["entity_name"] == serde_json::json!("cookiejar_from_dict"))
+            .collect();
+        assert_eq!(cookiejar.len(), 1, "one symbol, one step: {response}");
+        assert_eq!(
+            cookiejar[0]["entity_id"],
+            serde_json::json!(admitted_id.to_string()),
+            "the located record wins over the placeholder"
+        );
+        assert_eq!(response["external_identities_merged"], serde_json::json!(1));
+
+        // The file-less import is kept, because nothing located stands for it,
+        // and it carries the same keys with explicit nulls.
+        let external = steps
+            .iter()
+            .find(|step| step["external"] == serde_json::json!(true))
+            .expect("the file-less import must still be reported");
+        assert!(external["entity_file"].is_null() && external["start_line"].is_null());
+        let expected: Vec<String> = steps[0].as_object().unwrap().keys().cloned().collect();
+        for step in steps {
+            let keys: Vec<String> = step.as_object().unwrap().keys().cloned().collect();
+            assert_eq!(keys, expected, "every step carries the same keys: {step}");
+        }
+    }
+
+    /// This arm inlines no bodies, so what it can shed is steps — and it must,
+    /// because 200 steps of identity and signature is a six-figure character
+    /// count on its own.
+    #[test]
+    fn trace_data_flow_offline_bounds_its_own_payload() {
+        const BUDGET: usize = 4_000;
+        let store = InMemoryGraph::new();
+        let focal = make_entity("hub", "src/hub.rs");
+        let focal_id = focal.id;
+        store.upsert_entity(&focal).unwrap();
+        for index in 0..25 {
+            let callee = make_entity(&format!("callee_{index}"), &format!("src/c{index}.rs"));
+            store.upsert_entity(&callee).unwrap();
+            store
+                .upsert_relation(&make_relation(focal_id, callee.id, RelationKind::Calls))
+                .unwrap();
+        }
+
+        let unbounded = traced_payload(
+            &store,
+            &[
+                ("focal", serde_json::json!(focal_id.to_string())),
+                ("direction", serde_json::json!("calls")),
+                ("depth", serde_json::json!(1)),
+                ("limit_per_step", serde_json::json!(25)),
+            ],
+        );
+        assert_eq!(unbounded["total_steps"], serde_json::json!(25));
+        let unbounded_chars = serde_json::to_string_pretty(&unbounded).unwrap().len();
+        assert!(
+            unbounded_chars > BUDGET,
+            "the fixture must exceed the budget under test: {unbounded_chars} chars"
+        );
+
+        let bounded = traced_payload(
+            &store,
+            &[
+                ("focal", serde_json::json!(focal_id.to_string())),
+                ("direction", serde_json::json!("calls")),
+                ("depth", serde_json::json!(1)),
+                ("limit_per_step", serde_json::json!(25)),
+                ("max_response_chars", serde_json::json!(BUDGET)),
+            ],
+        );
+        let bounded_chars = serde_json::to_string_pretty(&bounded).unwrap().len();
+        assert!(
+            bounded_chars <= BUDGET,
+            "the tool must return what it promised to fit: {bounded_chars} chars against {BUDGET}"
+        );
+        let kept = bounded["total_steps"].as_u64().unwrap() as usize;
+        assert!(kept > 0, "a bound is not a refusal: {bounded}");
+        assert_eq!(
+            bounded["steps_omitted"].as_u64().unwrap() as usize + kept,
+            25
+        );
+        assert_eq!(
+            bounded["truncated"],
+            serde_json::json!(true),
+            "dropped steps are edges the caller did not receive"
+        );
+        // A prefix, so no surviving step points at a parent that was dropped.
+        for step in bounded["chain"].as_array().unwrap() {
+            assert!(step["parent_step"].as_u64().unwrap() as usize <= kept);
+        }
+        let disclosure = bounded["degradations"]
+            .as_array()
+            .expect("a cut must be disclosed")
+            .iter()
+            .find(|entry| entry["component"] == serde_json::json!("response_budget"))
+            .expect("the cut must name itself");
+        assert_eq!(disclosure["reason"], serde_json::json!("steps_omitted"));
     }
 
     /// The authoritative side of the trace absence: a focal that is in the
