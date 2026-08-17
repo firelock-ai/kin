@@ -262,6 +262,11 @@ impl LiveCrossFileLinker {
         self.linker.known_files.contains(file_path)
     }
 
+    /// The path the universe believes this artifact identity names.
+    pub fn path_of_artifact(&self, artifact_id: &ArtifactId) -> Option<String> {
+        self.file_by_artifact_id.get(artifact_id).cloned()
+    }
+
     /// Whether the universe already holds the file behind this artifact.
     ///
     /// Retiring an import edge requires this: a destination the linker has

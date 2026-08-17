@@ -540,9 +540,14 @@ impl Reconciler {
 
         let result = self.reconcile_file_edit_inner(&indexed, &file_id, path, blob_store, graph);
 
-        // On error, restore LKG to its pre-reconcile state.
+        // On error, restore LKG to its pre-reconcile state and drop this file
+        // from the cross-file universe. Cloning the universe per write to undo
+        // it would cost what this whole seam exists to avoid; forgetting the
+        // one file it touched leaves the universe missing an entry rather than
+        // holding a wrong one, and the next successful reconcile reinstalls it.
         if result.is_err() {
             self.lkg = lkg_snapshot;
+            self.cross_file.forget_file(&file_id.0);
         }
 
         result
@@ -568,6 +573,7 @@ impl Reconciler {
             self.reconcile_file_edit_inner(indexed, &file_id, &display_path, blob_store, graph);
         if result.is_err() {
             self.lkg = lkg_snapshot;
+            self.cross_file.forget_file(&file_id.0);
         }
         result
     }
@@ -886,7 +892,35 @@ impl Reconciler {
         // already carries is skipped rather than rejected, because a same-file
         // relation reaching both resolvers is agreement rather than a parser
         // fault.
+        //
+        // Every endpoint is checked against graph truth first. The linker's
+        // universe is in-memory and the graph is the authority, and the two can
+        // drift: a caller that fails to apply a delta keeps its reconciler, so
+        // the universe would hold entities the graph never admitted. Minting an
+        // edge into one of those is not a wrong edge, it is a transaction the
+        // store rejects outright, which would take the whole reconcile of an
+        // unrelated file down with it. An endpoint this delta itself adds
+        // counts as admitted; anything else must already be in the graph.
+        let admits_entity = |id: EntityId| -> bool {
+            stable_entity_ids.values().any(|stable| *stable == id)
+                || matches!(graph.get_entity(&id), Ok(Some(_)))
+        };
         for relation in &cross_file.resolved {
+            let endpoints_admitted = [relation.src, relation.dst].into_iter().all(|node| {
+                match node {
+                    GraphNodeId::Entity(id) => admits_entity(id),
+                    _ => false,
+                }
+            });
+            if !endpoints_admitted {
+                debug!(
+                    src = %relation.src,
+                    dst = %relation.dst,
+                    kind = ?relation.kind,
+                    "cross-file edge skipped: an endpoint is not admitted graph truth"
+                );
+                continue;
+            }
             let key = (relation.src, relation.dst, relation.kind);
             if !new_relation_keys.insert(key) {
                 continue;
@@ -1062,6 +1096,20 @@ impl Reconciler {
 
             for relation in &cross_file.artifact_imports {
                 if stored_ids.contains(&relation.id) {
+                    continue;
+                }
+                let endpoints_admitted = [relation.src, relation.dst].into_iter().all(|node| {
+                    match node {
+                        GraphNodeId::Artifact(id) => self
+                            .cross_file
+                            .path_of_artifact(&id)
+                            .and_then(|path| kin_model::RepoPath::from_utf8(path).ok())
+                            .and_then(|path| graph.artifact_id_at_path(&path))
+                            == Some(id),
+                        _ => false,
+                    }
+                });
+                if !endpoints_admitted {
                     continue;
                 }
                 if !claimed_relation_ids.insert(relation.id) {
