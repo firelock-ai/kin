@@ -45,6 +45,7 @@ pub const BEHAVIOR_ENV_VARS: &[&str] = &[
     "KIN_EMBED_BACKEND",
     "KIN_DAEMON_DISABLE_FILESYSTEM_RECONCILE",
     "KIN_DAEMON_LOCATE_ONLY",
+    "KIN_DAEMON_AUTO_EMBED",
     "KIN_COCHANGE_MAX_FAN_OUT",
     "EMBED_MAX_SEQ_LEN",
 ];
@@ -170,6 +171,18 @@ mod tests {
         let snap = snapshot_with(|_| None);
         assert_eq!(snap.len(), BEHAVIOR_ENV_VARS.len());
         assert!(snap.values().all(|v| v.is_none()));
+    }
+
+    #[test]
+    fn the_background_embedding_opt_out_is_reported() {
+        // An operator who sets this and still watches the accelerator run has
+        // no way to tell a rejected opt-out from an ignored one. The daemon
+        // fixed the value when it started; a command that reaches an existing
+        // daemon cannot change it, so the mismatch has to be reportable.
+        assert!(
+            BEHAVIOR_ENV_VARS.contains(&"KIN_DAEMON_AUTO_EMBED"),
+            "daemon health must report the background-embedding opt-out it is running under"
+        );
     }
 
     #[test]
