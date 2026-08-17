@@ -17,6 +17,7 @@
 //! until the next valid parse.
 
 pub mod collision;
+pub mod cross_file;
 pub mod error;
 pub mod lkg;
 pub mod reconciler;
@@ -25,6 +26,7 @@ pub use collision::{
     check_entity_collision, check_file_collision, check_signature_change, check_visibility_change,
     group_conflicts_by_file, CollisionCheck, MergeConflict, MergeConflictKind, TrafficChecker,
 };
+pub use cross_file::{CrossFilePass, LiveCrossFileLinker, ReferencedDestinations};
 pub use error::{ReconcileError, Result};
 pub use lkg::LkgStore;
 pub use reconciler::{
