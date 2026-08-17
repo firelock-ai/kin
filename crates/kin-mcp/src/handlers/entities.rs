@@ -779,8 +779,47 @@ pub fn handle_get_context_pack<G: GraphStore>(
         result["nearby_traffic"] = serde_json::to_value(&pack.traffic).map_err(McpError::Json)?;
     }
 
-    let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
+    let json = serialize_with_measured_tokens(&mut result)?;
     Ok(ToolCallResult::text(json))
+}
+
+/// Passes allowed to settle `tokens_used` against the bytes carrying it.
+///
+/// The estimator counts a number as one token however many digits it has, so
+/// writing the measurement back changes the count only when the payload's own
+/// structure changes, which it does not. One correcting pass and one
+/// confirming pass are what this actually takes; the rest is headroom.
+const MEASURED_TOKEN_PASSES: usize = 4;
+
+/// Serialize the pack, reporting what the bytes it returns actually cost.
+///
+/// `tokens_used` is the number a caller subtracts from its own context budget
+/// before deciding what to ask for next, and it was the planner's estimate:
+/// the cost of the signature stubs admission considered, not of the bodies,
+/// provenance, and JSON structure this handler goes on to serve. A caller that
+/// trusted it spent more than it was told, on every call, and the gap grew with
+/// the pack because bodies are the part the estimate omits.
+///
+/// Measuring is self-referential, since the count is a field of the object
+/// being counted. Writing the count back and re-measuring settles that: the
+/// estimator treats a number as one token whatever its width, so the second
+/// pass confirms the first rather than chasing it.
+///
+/// What this counts is the tool's own serialized payload. The `_kin` envelope
+/// is attached after the handler returns and is not visible from here, so it
+/// remains outside the number, which is a bounded and constant understatement
+/// rather than the unbounded one this replaces.
+fn serialize_with_measured_tokens(result: &mut serde_json::Value) -> Result<String> {
+    let mut json = serde_json::to_string_pretty(result).map_err(McpError::Json)?;
+    for _ in 0..MEASURED_TOKEN_PASSES {
+        let measured = serde_json::json!(kin_context::estimate_tokens(&json));
+        if result["tokens_used"] == measured {
+            break;
+        }
+        result["tokens_used"] = measured;
+        json = serde_json::to_string_pretty(result).map_err(McpError::Json)?;
+    }
+    Ok(json)
 }
 
 pub const TRACE_COMPUTATION_DESC: &str = "\

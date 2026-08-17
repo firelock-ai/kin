@@ -208,12 +208,14 @@ pub fn build_refs_response(
             .as_deref()
             .map(|path| display_read_path(layout, path))
             .unwrap_or_else(|| "unknown".to_string());
-        let line = entry.start_line.unwrap_or(0);
+        let location = match entry.start_line {
+            Some(line) => format!("{file_path}:{line}"),
+            None => file_path,
+        };
         lines.push(format!(
-            "  {} @ {}:{} [{}]",
+            "  {} @ {} [{}]",
             entry.name,
-            file_path,
-            line,
+            location,
             relation_kinds_label(&entry.relation_kinds)
         ));
     }
@@ -549,6 +551,9 @@ struct ReferenceEntry {
     entity_id: EntityId,
     name: String,
     file_path: Option<String>,
+    /// 1-based, as every `file:line` an agent pastes into an editor is.
+    /// `None` for an entity the graph carries no span for, because reporting a
+    /// line for one would be a fabricated position.
     start_line: Option<u32>,
     relation_kinds: Vec<RelationKind>,
 }
@@ -638,7 +643,7 @@ fn collect_graph_references(
             entity_id: source_id,
             name: entity.name.clone(),
             file_path: entity.file_origin.as_ref().map(|f| f.0.clone()),
-            start_line: entity.span.as_ref().map(|s| s.start_line),
+            start_line: kin_mcp::handlers::common::entity_presentation_start_line(&entity),
             relation_kinds: source_kinds,
         });
     }
@@ -981,7 +986,7 @@ mod tests {
             "count line must count entities: {joined}"
         );
         assert!(
-            joined.matches("shared_caller @ callers.rs:0").count() == 2,
+            joined.matches("shared_caller @ callers.rs [").count() == 2,
             "both same-metadata entity ids must be listed separately: {joined}"
         );
 
@@ -1244,6 +1249,118 @@ mod tests {
         assert!(
             error.to_string().contains("classified_count"),
             "a version-skewed response must fail instead of recovering unsafe negatives: {error}"
+        );
+    }
+
+    /// A reference must report the line a human editor shows.
+    ///
+    /// Graph spans carry tree-sitter rows, which are 0-based, and this listing
+    /// emitted them raw. An agent that read `kin refs` and jumped to the
+    /// reported `file:line` landed one line above every reference it was given,
+    /// on every reference, while `find_references` over MCP answered the same
+    /// question one line lower.
+    ///
+    /// The fixture puts the caller on graph row 41, which is line 42 of the
+    /// file, so an off-by-one cannot pass by coincidence.
+    #[test]
+    fn a_reference_reports_the_line_a_human_editor_shows() {
+        use kin_db::InMemoryGraph;
+        use kin_model::relation::{Relation, RelationOrigin};
+        use kin_model::{
+            Entity, EntityId, EntityKind, EntityMetadata, EntityRole, EntityStore, FilePathId,
+            FingerprintAlgorithm, GraphNodeId, Hash256, LanguageId, SemanticFingerprint,
+            SourceSpan, Visibility,
+        };
+
+        fn entity(name: &str, rel_path: &str, graph_row: Option<u32>) -> Entity {
+            Entity {
+                id: EntityId::new(),
+                kind: EntityKind::Function,
+                name: name.to_string(),
+                language: LanguageId::Rust,
+                fingerprint: SemanticFingerprint {
+                    algorithm: FingerprintAlgorithm::V1TreeSitter,
+                    ast_hash: Hash256::from_bytes([0; 32]),
+                    signature_hash: Hash256::from_bytes([0; 32]),
+                    behavior_hash: Hash256::from_bytes([0; 32]),
+                    equivalence_hash: Hash256::from_bytes([0; 32]),
+                    stability_score: 1.0,
+                },
+                file_origin: Some(FilePathId::new(rel_path)),
+                span: graph_row.map(|row| SourceSpan {
+                    file: FilePathId::new(rel_path),
+                    start_byte: 0,
+                    end_byte: 1,
+                    start_line: row,
+                    start_col: 0,
+                    end_line: row + 3,
+                    end_col: 0,
+                }),
+                signature: name.to_string(),
+                visibility: Visibility::Public,
+                role: EntityRole::Source,
+                doc_summary: None,
+                metadata: EntityMetadata::default(),
+                lineage_parent: None,
+                created_in: None,
+                superseded_by: None,
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        std::fs::create_dir_all(repo.join(".kin")).unwrap();
+        let layout = kin_core::KinLayout::new(repo.join(".kin"));
+
+        let target = entity("probe_symbol", "target_mod.rs", Some(0));
+        let spanned_caller = entity("spanned_caller", "spanned.rs", Some(41));
+        let spanless_caller = entity("spanless_caller", "spanless.rs", None);
+
+        let graph = InMemoryGraph::new();
+        graph.upsert_entity(&target).unwrap();
+        for caller in [&spanned_caller, &spanless_caller] {
+            graph.upsert_entity(caller).unwrap();
+            graph
+                .upsert_relation(&Relation {
+                    id: kin_model::ids::RelationId::new(),
+                    kind: RelationKind::References,
+                    src: GraphNodeId::Entity(caller.id),
+                    dst: GraphNodeId::Entity(target.id),
+                    confidence: 1.0,
+                    origin: RelationOrigin::Parsed,
+                    created_in: None,
+                    import_source: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        }
+
+        let response = build_refs_response(
+            &layout,
+            &graph,
+            &RefsRequest {
+                entity: "probe_symbol".to_string(),
+                kind: "all".to_string(),
+            },
+        )
+        .unwrap();
+        let joined = response.lines.join("\n");
+
+        assert!(
+            joined.contains("spanned.rs:42"),
+            "graph row 41 is line 42 to a reader: {joined}"
+        );
+        assert!(
+            !joined.contains("spanned.rs:41"),
+            "the raw graph row must never reach the listing: {joined}"
+        );
+        assert!(
+            joined.contains("spanless_caller @ spanless.rs "),
+            "an entity with no span reports its path and no fabricated line: {joined}"
+        );
+        assert!(
+            !joined.contains("spanless.rs:0"),
+            "line 0 exists in no editor: {joined}"
         );
     }
 

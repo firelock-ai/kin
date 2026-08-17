@@ -1315,6 +1315,12 @@ pub struct ExactEntitySource {
 /// hex it stands for, and not the spelling any Kin surface parses back. This
 /// seam is per-dependency in a context pack, which is documented as fitted to a
 /// token budget, so the waste scaled with the pack.
+///
+/// For the same reason this carries no `artifact_path`. A `RepoPath` is bytes,
+/// and its wire form is a `{"bytes_hex": …}` object, so the path arrived as
+/// twice its own length in hex beside the plain `file_path` every caller of
+/// this seam already emits. Two spellings of one path, one of them unreadable,
+/// per entry, inside a budgeted pack.
 pub fn source_provenance_fields(
     source: &ExactEntitySource,
 ) -> serde_json::Map<String, serde_json::Value> {
@@ -1354,7 +1360,6 @@ pub fn source_provenance_fields(
         serde_json::json!(source.span_coherence.label()),
     );
     fields.insert("artifact_id".into(), serde_json::json!(source.artifact_id));
-    fields.insert("artifact_path".into(), serde_json::json!(source.path));
     fields.insert(
         "artifact_entry".into(),
         serde_json::json!(super::artifacts::TreeEntryWire::from(source.entry)),

@@ -84,12 +84,18 @@ impl DeclarationNeighbors {
 ///
 /// Location is projection metadata for the human reading the listing; the
 /// analysis itself is keyed on graph identity, never on paths.
+///
+/// The line is 1-based, through the same seam every other presentation surface
+/// converts at. A `path:line` string is read straight into an editor, so the
+/// raw graph row this used to emit put the reader one line above the entity.
 pub fn entity_location(entity: &Entity) -> Option<String> {
     let path = entity.file_origin.as_ref().map(|f| f.0.clone())?;
-    Some(match entity.span.as_ref().map(|s| s.start_line) {
-        Some(line) => format!("{path}:{line}"),
-        None => path,
-    })
+    Some(
+        match kin_mcp::handlers::common::entity_presentation_start_line(entity) {
+            Some(line) => format!("{path}:{line}"),
+            None => path,
+        },
+    )
 }
 
 fn entity_kind_label(entity: &Entity) -> String {
