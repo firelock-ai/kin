@@ -1254,7 +1254,18 @@ mod tests {
                 stability_score: 1.0,
             },
             file_origin: Some(FilePathId::new(file)),
-            span: None,
+            // A span, because a shape query's whole value is names plus
+            // locations: a fixture with none cannot tell a compact response that
+            // kept its spans from one that dropped them.
+            span: Some(kin_model::entity::SourceSpan {
+                file: FilePathId::new(file),
+                start_byte: 0,
+                end_byte: 32,
+                start_line: 9,
+                start_col: 0,
+                end_line: 19,
+                end_col: 1,
+            }),
             signature: format!("fn {name}()"),
             visibility: Visibility::Public,
             role: EntityRole::Source,
@@ -1264,6 +1275,40 @@ mod tests {
             created_in: None,
             superseded_by: None,
         }
+    }
+
+    /// The shape a symbol the graph owns no file for actually has: identity, no
+    /// location, no span, and (in the measured repository) `Module` kind.
+    fn make_external_entity(name: &str) -> Entity {
+        let mut entity = make_entity(name, "unused");
+        entity.kind = EntityKind::Module;
+        entity.file_origin = None;
+        entity.span = None;
+        entity
+    }
+
+    fn trace_request(
+        focal: &EntityId,
+        depth: usize,
+        direction: TraceDirection,
+        limit_per_step: usize,
+    ) -> TraceDataFlowRequest {
+        TraceDataFlowRequest {
+            focal: focal.to_string(),
+            depth: Some(depth),
+            direction: Some(direction),
+            limit_per_step: Some(limit_per_step),
+            include_body: None,
+            max_response_chars: None,
+        }
+    }
+
+    fn step_names(response: &TraceDataFlowResponse) -> Vec<String> {
+        response
+            .chain
+            .iter()
+            .map(|step| step.entity.entity_name.clone())
+            .collect()
     }
 
     fn make_relation(src: EntityId, dst: EntityId, kind: RelationKind) -> Relation {
@@ -1742,6 +1787,607 @@ mod tests {
             cancelled.total_steps,
             uncancelled.total_steps
         );
+    }
+
+    /// The measured inversion, as a fixture: `resolve_redirects` fanning out
+    /// wider than its cap, where which callees matter is knowable from the graph
+    /// alone.
+    ///
+    /// Two of its callees sit in its own file and decide the redirect (the two
+    /// the shipped cap dropped); the others are a distant adapter method, a test
+    /// helper, and a file-less import placeholder (three the shipped cap kept).
+    fn redirect_graph() -> (InMemoryGraph, EntityId) {
+        let graph = InMemoryGraph::new();
+        let focal = make_entity("resolve_redirects", "src/requests/sessions.py");
+        let focal_id = focal.id;
+        graph.upsert_entity(&focal).unwrap();
+
+        let mut callees = vec![
+            make_entity("get_redirect_target", "src/requests/sessions.py"),
+            make_entity("rebuild_method", "src/requests/sessions.py"),
+            make_entity("HTTPAdapter.close", "src/requests/adapters.py"),
+        ];
+        let mut harness = make_entity("RedirectSession.send", "tests/test_requests.py");
+        harness.role = EntityRole::Test;
+        callees.push(harness);
+        callees.push(make_external_entity("urljoin"));
+
+        for callee in &callees {
+            graph.upsert_entity(callee).unwrap();
+            graph
+                .upsert_relation(&make_relation(focal_id, callee.id, RelationKind::Calls))
+                .unwrap();
+        }
+        (graph, focal_id)
+    }
+
+    #[test]
+    fn the_per_step_cap_keeps_the_callees_that_continue_the_chain() {
+        let (graph, focal_id) = redirect_graph();
+        let (_t, binding) = empty_binding();
+
+        let response = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding.clone()),
+            &graph,
+            &trace_request(&focal_id, 1, TraceDirection::Calls, 2),
+        )
+        .unwrap();
+
+        let mut kept = step_names(&response);
+        kept.sort();
+        assert_eq!(
+            kept,
+            vec![
+                "get_redirect_target".to_string(),
+                "rebuild_method".to_string()
+            ],
+            "a two-wide cap must keep the two located source callees in the expanded node's own \
+             file, not a distant method, a test double, or a file-less placeholder"
+        );
+    }
+
+    #[test]
+    fn a_clipped_fan_out_says_which_node_was_clipped_and_how_much_it_dropped() {
+        let (graph, focal_id) = redirect_graph();
+        let (_t, binding) = empty_binding();
+
+        let response = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding.clone()),
+            &graph,
+            &trace_request(&focal_id, 1, TraceDirection::Calls, 2),
+        )
+        .unwrap();
+
+        assert!(response.truncated);
+        assert_eq!(
+            response.clipped_steps.len(),
+            1,
+            "exactly one node fanned out here: {:?}",
+            response.clipped_steps
+        );
+        let clip = &response.clipped_steps[0];
+        assert_eq!(clip.step, 0, "the focal is step 0");
+        assert_eq!(clip.entity_name, "resolve_redirects");
+        assert_eq!(
+            clip.dropped_callees, 3,
+            "five candidates minus a two-wide cap is three dropped"
+        );
+        assert_eq!(clip.dropped_callers, 0);
+        assert_eq!(
+            clip.limit_per_step, 2,
+            "the clip names the cap a caller would raise"
+        );
+    }
+
+    /// The repair path the top-level flag could not support: a clipped node that
+    /// is not the focal has to carry its own truncation, or a caller cannot tell
+    /// which of 106 steps to re-query.
+    #[test]
+    fn a_clipped_step_carries_its_own_truncation_flag_and_count() {
+        let graph = InMemoryGraph::new();
+        let (_t, binding) = empty_binding();
+
+        let focal = make_entity("Session.send", "src/requests/sessions.py");
+        let mid = make_entity("resolve_redirects", "src/requests/sessions.py");
+        let focal_id = focal.id;
+        let mid_id = mid.id;
+        graph.upsert_entity(&focal).unwrap();
+        graph.upsert_entity(&mid).unwrap();
+        graph
+            .upsert_relation(&make_relation(focal_id, mid_id, RelationKind::Calls))
+            .unwrap();
+        for index in 0..3 {
+            let leaf = make_entity(&format!("rebuild_{index}"), "src/requests/sessions.py");
+            graph.upsert_entity(&leaf).unwrap();
+            graph
+                .upsert_relation(&make_relation(mid_id, leaf.id, RelationKind::Calls))
+                .unwrap();
+        }
+
+        let response = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding.clone()),
+            &graph,
+            &trace_request(&focal_id, 2, TraceDirection::Calls, 1),
+        )
+        .unwrap();
+
+        let mid_step = response
+            .chain
+            .iter()
+            .find(|step| step.entity.entity_name == "resolve_redirects")
+            .expect("the mid node must be in the chain");
+        assert!(
+            mid_step.fanout_truncated,
+            "the node whose fan-out was cut must say so on itself"
+        );
+        assert_eq!(
+            mid_step.fanout_dropped, 2,
+            "three callees under a one-wide cap drops two"
+        );
+        let unclipped = response
+            .chain
+            .iter()
+            .find(|step| step.entity.entity_name.starts_with("rebuild_"))
+            .expect("the kept leaf must be in the chain");
+        assert!(
+            !unclipped.fanout_truncated && unclipped.fanout_dropped == 0,
+            "a step whose fan-out was complete must be distinguishable from a clipped one"
+        );
+        assert!(
+            response
+                .clipped_steps
+                .iter()
+                .any(|clip| clip.step == mid_step.step && clip.dropped_callees == 2),
+            "the clip list must name the step: {:?}",
+            response.clipped_steps
+        );
+    }
+
+    /// A walk that expands every neighbor it reaches must be byte-identical to
+    /// the one before per-step clip reporting existed.
+    #[test]
+    fn an_unclipped_walk_reports_no_clip_at_all() {
+        let (graph, focal_id) = hub_graph(3);
+        let (_t, binding) = empty_binding();
+
+        let response = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding.clone()),
+            &graph,
+            &trace_request(&focal_id, 2, TraceDirection::Calls, 5),
+        )
+        .unwrap();
+
+        assert!(!response.truncated);
+        assert!(response.clipped_steps.is_empty());
+        assert!(response.chain.iter().all(|step| !step.fanout_truncated));
+        let json = serde_json::to_value(&response).unwrap();
+        assert!(
+            json.get("clipped_steps").is_none(),
+            "an unaffected walk must not carry the field at all"
+        );
+    }
+
+    #[test]
+    fn compact_mode_keeps_every_edge_and_span_while_inlining_no_body() {
+        let (graph, focal_id) = redirect_graph();
+        let (_t, binding) = empty_binding();
+
+        let mut request = trace_request(&focal_id, 1, TraceDirection::Calls, 25);
+        let with_bodies = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding.clone()),
+            &graph,
+            &request,
+        )
+        .unwrap();
+        request.include_body = Some(false);
+        let compact = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding.clone()),
+            &graph,
+            &request,
+        )
+        .unwrap();
+
+        assert_eq!(
+            compact.total_steps, with_bodies.total_steps,
+            "asking for the shape must not change which edges are walked"
+        );
+        assert_eq!(step_names(&compact), step_names(&with_bodies));
+        assert!(!compact.bodies_included);
+        assert!(compact.focal.is_none());
+        assert!(compact.chain.iter().all(|step| step.entity.body.is_none()));
+        // The point of the mode: shape, not silence. Every located step still
+        // reports where it is.
+        assert!(compact
+            .chain
+            .iter()
+            .filter(|step| !step.entity.external)
+            .all(|step| step.entity.entity_file.is_some()
+                && step.entity.start_line == Some(10)
+                && step.entity.end_line == Some(20)
+                && step.entity.signature.is_some()));
+        assert_eq!(
+            compact.focal_entity.start_line,
+            Some(10),
+            "the focal keeps its span in a shape query too"
+        );
+    }
+
+    /// The regression a character count is the only guard against: a change that
+    /// re-inlines bodies on a shape query is invisible to every assertion about
+    /// chain contents.
+    #[test]
+    fn a_compact_trace_stays_far_under_its_budget() {
+        let (graph, focal_id) = hub_graph(120);
+        let (_t, binding) = empty_binding();
+
+        let mut request = trace_request(&focal_id, 1, TraceDirection::Calls, 25);
+        request.include_body = Some(false);
+        let response = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding.clone()),
+            &graph,
+            &request,
+        )
+        .unwrap();
+
+        assert_eq!(response.total_steps, 25, "the fixture must produce a chain");
+        let json = serde_json::to_string_pretty(&response).unwrap();
+        assert!(
+            json.len() <= response.max_response_chars,
+            "a response must fit the budget it reports: {} chars against {}",
+            json.len(),
+            response.max_response_chars
+        );
+        assert!(
+            !json.contains("\"body\": \""),
+            "a shape query must carry no inlined body"
+        );
+        assert!(
+            json.len() < 20_000,
+            "25 steps of shape are small; {} chars means bodies or per-step bloat crept back in",
+            json.len()
+        );
+    }
+
+    /// A response is refused whole or not at all, so the tool bounds its own
+    /// payload rather than discovering the ceiling at the client.
+    fn fat_response(steps: usize, body_chars: usize) -> TraceDataFlowResponse {
+        let entity = make_entity("focal", "src/focal.rs");
+        let mut chain = Vec::new();
+        for index in 1..=steps {
+            let step_entity = make_entity(&format!("step_{index}"), "src/step.rs");
+            let mut record = entity_record(&step_entity, None);
+            record.body = Some("x".repeat(body_chars));
+            record.span_coherence = Some("verified".to_string());
+            chain.push(TraceStep {
+                step: index,
+                role: "callee".to_string(),
+                relation_kind: "Calls".to_string(),
+                parent_step: index.saturating_sub(1),
+                depth: 1,
+                entity: record,
+                fanout_truncated: false,
+                fanout_dropped: 0,
+            });
+        }
+        TraceDataFlowResponse {
+            focal: None,
+            focal_id: entity.id.to_string(),
+            focal_name: entity.name.clone(),
+            focal_kind: "Function".to_string(),
+            focal_file: Some("src/focal.rs".to_string()),
+            focal_entity: entity_record(&entity, None),
+            direction: "calls".to_string(),
+            depth: 1,
+            limit_per_step: 25,
+            bodies_included: true,
+            total_steps: chain.len(),
+            chain,
+            truncated: false,
+            clipped_steps: Vec::new(),
+            bodies_omitted: 0,
+            steps_omitted: 0,
+            external_identities_merged: 0,
+            max_response_chars: DEFAULT_MAX_RESPONSE_CHARS,
+            degradations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_response_budget_cuts_bodies_before_it_cuts_edges() {
+        let mut response = fat_response(40, 4_000);
+        assert!(
+            serde_json::to_string_pretty(&response).unwrap().len() > response.max_response_chars,
+            "the fixture must start over budget or this proves nothing"
+        );
+
+        enforce_response_budget(&mut response);
+
+        assert_eq!(
+            response.total_steps, 40,
+            "every edge survives a cut that bodies can absorb"
+        );
+        assert_eq!(response.bodies_omitted, 40);
+        assert_eq!(response.steps_omitted, 0);
+        assert!(!response.bodies_included);
+        assert!(
+            !response.truncated,
+            "dropping bodies leaves the chain complete, so the chain-truncation flag must stay off"
+        );
+        assert!(response.chain.iter().all(|step| step.entity.body.is_none()
+            && step.entity.span_coherence.is_none()
+            && step.entity.entity_file.is_some()));
+        let cut = response
+            .degradations
+            .iter()
+            .find(|d| d.component == "response_budget")
+            .expect("a cut must be disclosed, not silently applied");
+        assert_eq!(cut.reason, "bodies_omitted");
+        assert!(cut.detail.contains("40"), "the cut states its own numbers");
+        assert!(!cut.remediation.is_empty());
+        assert!(
+            serde_json::to_string_pretty(&response).unwrap().len() <= response.max_response_chars,
+            "the payload must end up inside the budget it reports"
+        );
+    }
+
+    #[test]
+    fn the_response_budget_drops_steps_only_after_every_body_and_says_so() {
+        let mut response = fat_response(200, 2_000);
+        response.max_response_chars = 8_000;
+        response.clipped_steps.push(TraceFanoutClip {
+            step: 199,
+            entity_id: "late".to_string(),
+            entity_name: "step_199".to_string(),
+            dropped_callees: 4,
+            dropped_callers: 0,
+            limit_per_step: 25,
+        });
+
+        enforce_response_budget(&mut response);
+
+        assert_eq!(response.bodies_omitted, 200, "bodies go first, all of them");
+        assert!(
+            response.steps_omitted > 0,
+            "a budget no body-free chain can meet must drop steps too"
+        );
+        assert_eq!(response.total_steps, response.chain.len());
+        assert_eq!(response.total_steps + response.steps_omitted, 200);
+        assert!(
+            response.truncated,
+            "dropped steps are edges the caller did not receive"
+        );
+        // The chain that survives is a prefix, so no surviving step points at a
+        // parent the response no longer contains.
+        let kept = response.chain.len();
+        assert!(response
+            .chain
+            .iter()
+            .all(|step| step.step <= kept && step.parent_step <= kept));
+        assert!(
+            response
+                .clipped_steps
+                .iter()
+                .all(|clip| clip.step <= kept),
+            "a clip must not name a step the response dropped"
+        );
+        let cut = response
+            .degradations
+            .iter()
+            .find(|d| d.component == "response_budget")
+            .expect("the cut must be disclosed");
+        assert_eq!(cut.reason, "steps_omitted");
+        assert!(
+            serde_json::to_string_pretty(&response).unwrap().len() <= response.max_response_chars,
+            "the payload must end up inside the budget it reports"
+        );
+    }
+
+    #[test]
+    fn a_response_that_fits_is_left_exactly_as_built() {
+        let mut response = fat_response(2, 100);
+        let before = serde_json::to_string_pretty(&response).unwrap();
+
+        enforce_response_budget(&mut response);
+
+        assert_eq!(
+            serde_json::to_string_pretty(&response).unwrap(),
+            before,
+            "a response inside its budget must be byte-identical after enforcement"
+        );
+        assert!(response.bodies_included);
+        assert_eq!(response.bodies_omitted, 0);
+        assert_eq!(response.steps_omitted, 0);
+    }
+
+    /// One symbol, two entities: the located definition and a file-less alias of
+    /// the same name. The measured response admitted both, so
+    /// `cookiejar_from_dict` was simultaneously a real entity in cookies.py and
+    /// an external Module, depending on which edge reached it.
+    #[test]
+    fn a_name_the_graph_holds_both_ways_yields_one_identity() {
+        let graph = InMemoryGraph::new();
+        let (_t, binding) = empty_binding();
+
+        let focal = make_entity("Session.prepare_request", "src/requests/sessions.py");
+        let admitted = make_entity("cookiejar_from_dict", "src/requests/cookies.py");
+        let alias = make_external_entity("cookiejar_from_dict");
+        let focal_id = focal.id;
+        let admitted_id = admitted.id;
+        let alias_id = alias.id;
+        assert_ne!(admitted_id, alias_id, "the graph holds two entities here");
+
+        for entity in [&focal, &admitted, &alias] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        graph
+            .upsert_relation(&make_relation(focal_id, admitted_id, RelationKind::Calls))
+            .unwrap();
+        graph
+            .upsert_relation(&make_relation(focal_id, alias_id, RelationKind::Calls))
+            .unwrap();
+
+        let response = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding.clone()),
+            &graph,
+            &trace_request(&focal_id, 1, TraceDirection::Calls, 25),
+        )
+        .unwrap();
+
+        let carrying: Vec<&TraceStep> = response
+            .chain
+            .iter()
+            .filter(|step| step.entity.entity_name == "cookiejar_from_dict")
+            .collect();
+        assert_eq!(
+            carrying.len(),
+            1,
+            "one symbol, one step: {:?}",
+            step_names(&response)
+        );
+        assert_eq!(
+            carrying[0].entity.entity_id,
+            admitted_id.to_string(),
+            "the located record wins over the placeholder"
+        );
+        assert!(!carrying[0].entity.external);
+        assert_eq!(response.external_identities_merged, 1);
+    }
+
+    /// The same rule when the placeholder is reached FIRST, by a different edge:
+    /// the located record fills it in rather than adding a second identity.
+    #[test]
+    fn a_placeholder_reached_first_is_filled_in_by_the_located_record() {
+        let graph = InMemoryGraph::new();
+        let (_t, binding) = empty_binding();
+
+        let focal = make_entity("Session.request", "src/requests/sessions.py");
+        let mid = make_entity("Session.prepare_request", "src/requests/sessions.py");
+        let alias = make_external_entity("cookiejar_from_dict");
+        let admitted = make_entity("cookiejar_from_dict", "src/requests/cookies.py");
+        let focal_id = focal.id;
+        let mid_id = mid.id;
+        let alias_id = alias.id;
+        let admitted_id = admitted.id;
+
+        for entity in [&focal, &mid, &alias, &admitted] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        // depth 1: the placeholder and the mid node. depth 2: the located record,
+        // reached through the mid node.
+        graph
+            .upsert_relation(&make_relation(focal_id, alias_id, RelationKind::Calls))
+            .unwrap();
+        graph
+            .upsert_relation(&make_relation(focal_id, mid_id, RelationKind::Calls))
+            .unwrap();
+        graph
+            .upsert_relation(&make_relation(mid_id, admitted_id, RelationKind::Calls))
+            .unwrap();
+
+        let response = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding.clone()),
+            &graph,
+            &trace_request(&focal_id, 3, TraceDirection::Calls, 25),
+        )
+        .unwrap();
+
+        let carrying: Vec<&TraceStep> = response
+            .chain
+            .iter()
+            .filter(|step| step.entity.entity_name == "cookiejar_from_dict")
+            .collect();
+        assert_eq!(
+            carrying.len(),
+            1,
+            "the placeholder must be filled in, not doubled: {:?}",
+            step_names(&response)
+        );
+        assert_eq!(carrying[0].entity.entity_id, admitted_id.to_string());
+        assert!(!carrying[0].entity.external);
+        assert_eq!(
+            carrying[0].entity.entity_file.as_deref(),
+            Some("src/requests/cookies.py")
+        );
+        assert_eq!(response.external_identities_merged, 1);
+        assert_ne!(
+            alias_id.to_string(),
+            carrying[0].entity.entity_id,
+            "the placeholder's id must not be what the response reports"
+        );
+    }
+
+    /// The parser break, asserted structurally: one array, one key set, whatever
+    /// the graph knows about each symbol.
+    #[test]
+    fn every_step_carries_the_same_keys_admitted_or_external() {
+        let (graph, focal_id) = redirect_graph();
+        let (_t, binding) = empty_binding();
+
+        let response = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding.clone()),
+            &graph,
+            &trace_request(&focal_id, 1, TraceDirection::Calls, 25),
+        )
+        .unwrap();
+        assert!(
+            response.chain.iter().any(|step| step.entity.external),
+            "the fixture must include a file-less symbol or this proves nothing"
+        );
+        assert!(
+            response.chain.iter().any(|step| !step.entity.external),
+            "and a located one"
+        );
+
+        let json = serde_json::to_value(&response).unwrap();
+        let steps = json["chain"].as_array().unwrap();
+        let expected: Vec<String> = steps[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in [
+            "step",
+            "role",
+            "relation_kind",
+            "parent_step",
+            "depth",
+            "entity_id",
+            "entity_name",
+            "entity_kind",
+            "entity_role",
+            "entity_file",
+            "external",
+            "start_line",
+            "end_line",
+            "signature",
+            "body",
+            "span_coherence",
+            "fanout_truncated",
+            "fanout_dropped",
+        ] {
+            assert!(
+                expected.contains(&key.to_string()),
+                "a step must carry '{key}': {expected:?}"
+            );
+        }
+        for step in steps {
+            let keys: Vec<String> = step.as_object().unwrap().keys().cloned().collect();
+            assert_eq!(
+                keys, expected,
+                "every step must carry the same keys; this one differs: {step}"
+            );
+        }
+        // Not inventing data is the other half: the placeholder's location fields
+        // are present and null rather than absent.
+        let external = steps
+            .iter()
+            .find(|step| step["external"] == serde_json::Value::Bool(true))
+            .unwrap();
+        assert!(external["entity_file"].is_null());
+        assert!(external["start_line"].is_null());
+        assert!(external["end_line"].is_null());
+        assert!(external["entity_name"].is_string());
     }
 
     #[test]
