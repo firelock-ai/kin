@@ -9618,11 +9618,10 @@ void f();
                 file_path: "pkg/app.py".to_string(),
                 entities: vec![caller.clone()],
                 relations: vec![py_receiver_call("run", "Store", "save")],
-                // Written in the resolvable relative form. Python's own
-                // `from .store import Store` spelling does not resolve to a
-                // repo file yet; that gap is FIR-2354's cross-file work, and
-                // the receiver rule this test pins is independent of it.
-                imports: vec![import_of("./store", "Store")],
+                // Python's own relative spelling. One leading dot names a
+                // sibling module inside the importer's package, which the
+                // module resolver binds to `pkg/store.py`.
+                imports: vec![import_of(".store", "Store")],
             },
         ];
 
