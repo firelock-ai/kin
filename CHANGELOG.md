@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.38] - 2026-08-17
+
+### Changed
+
+- Stand the ambient reconcile tick down for a commit already inside the daemon (#860)
+- Install Rust toolchains from the runner's rustup instead of a downloaded action (#881)
+
+
 ## [0.5.37] - 2026-08-17
 
 ### Changed
