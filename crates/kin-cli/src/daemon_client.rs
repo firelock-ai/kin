@@ -6982,6 +6982,21 @@ impl kin_daemon_spawn::DaemonSpawnRegistrar for CliSpawnRegistrar {
                 .map_err(|error| format!("{error:#}"))
         })
     }
+
+    /// The route `kin doctor`'s `daemon_running` check reports from, verbatim.
+    ///
+    /// Sharing the function rather than reimplementing the lookup is the whole
+    /// point: MCP and `kin doctor` can no longer answer opposite things about
+    /// the same repository at the same instant, because there is only one
+    /// answer to give.
+    fn route_if_running(
+        &self,
+        kin_root: PathBuf,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>> {
+        Box::pin(
+            async move { resolve_daemon_url_if_running_async(&KinLayout::new(kin_root)).await },
+        )
+    }
 }
 
 /// Publish this crate's supervisor access to every daemon spawn in this

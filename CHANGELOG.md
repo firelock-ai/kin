@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.37] - 2026-08-17
+
+### Changed
+
+- Deliver and account for the background-embedding opt-out on every daemon spawn (#858)
+- Name the wedged commit deferral on every status surface (#859)
+
+
 ## [0.5.36] - 2026-08-16
 
 ### Changed

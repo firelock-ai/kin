@@ -73,7 +73,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@191af2e1955bbe165f9bbacff2d2438002dff4d4 # branch 1.96.0, 2026-07-16
+        uses: ./.github/actions/rust-toolchain
 
       - name: Verify kin cargo registry config
         # cargo-deny resolves the full dependency graph via `cargo metadata`.

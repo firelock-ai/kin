@@ -445,7 +445,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@191af2e1955bbe165f9bbacff2d2438002dff4d4 # branch 1.96.0, 2026-07-16
+        uses: ./.github/actions/rust-toolchain
         with:
           # On the Linux legs the core (kin, kin-daemon) targets musl and the VFS
           # leg targets gnu (vfs_target), so both targets must be installed.

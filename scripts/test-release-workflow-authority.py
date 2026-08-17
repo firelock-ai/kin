@@ -98,10 +98,11 @@ STEP_ENV_TOKEN_BINDING = re.compile(r"(?m)^\s+GH_TOKEN:\s*(?P<token>\S.*?)\s*$")
 # contexts. A required context is release evidence, so whatever can write into it
 # is release supply chain and has to be pinned to an immutable object rather than
 # a tag anyone upstream can move. `actions/*` are first-party and governed
-# separately; these are the ones outside that trust boundary.
+# separately, and `./`-prefixed actions are this repository's own tree, which
+# moves only through a reviewed pull request here; these are the ones outside
+# that trust boundary.
 EXPECTED_REQUIRED_CONTEXT_ACTION_PINS = {
     ".github/workflows/sast.yml": {
-        "dtolnay/rust-toolchain": "191af2e1955bbe165f9bbacff2d2438002dff4d4",
         "taiki-e/install-action": "6a1bd70eaac3c8bdf093356838d7ee09fda951cf",
     },
 }
@@ -5205,6 +5206,12 @@ def assert_required_context_action_pins(workflows: dict[Path, str]) -> None:
         observed: dict[str, set[str]] = {}
         for reference in re.findall(r"uses:\s*(\S+)", content):
             if reference.startswith("actions/"):
+                continue
+            # A `./` reference resolves inside the checkout this workflow already
+            # made, so it carries no upstream that could move under the pin and
+            # has no immutable object to name. It changes only by a reviewed pull
+            # request to this repository, which is the same control the pin buys.
+            if reference.startswith("./"):
                 continue
             action, _, version = reference.partition("@")
             observed.setdefault(action, set()).add(version)

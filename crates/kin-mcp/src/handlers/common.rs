@@ -1308,6 +1308,13 @@ pub struct ExactEntitySource {
 /// Every body-serving surface routes through this, so the shape cannot drift
 /// between `get_entity_source`, `get_entity`, and the context pack the way the
 /// snippet field name did between the two `semantic_locate` arms.
+///
+/// Every content-addressed id here is hex, never the model's own byte-array
+/// serialization. A `Hash256` derives `Serialize` over `[u8; 32]`, so a change
+/// id reached an agent as 32 decimal numbers: about four times the bytes of the
+/// hex it stands for, and not the spelling any Kin surface parses back. This
+/// seam is per-dependency in a context pack, which is documented as fitted to a
+/// token budget, so the waste scaled with the pack.
 pub fn source_provenance_fields(
     source: &ExactEntitySource,
 ) -> serde_json::Map<String, serde_json::Value> {
@@ -1318,7 +1325,10 @@ pub fn source_provenance_fields(
     );
     match &source.provenance {
         SourceProvenance::Committed { change_id } => {
-            fields.insert("source_change_id".into(), serde_json::json!(change_id));
+            fields.insert(
+                "source_change_id".into(),
+                serde_json::json!(change_id.to_string()),
+            );
         }
         SourceProvenance::Workspace {
             tree_hash,
@@ -1333,7 +1343,10 @@ pub fn source_provenance_fields(
                 serde_json::json!(tree_hash.to_string()),
             );
             fields.insert("workspace_generation".into(), serde_json::json!(generation));
-            fields.insert("base_change_id".into(), serde_json::json!(base_change_id));
+            fields.insert(
+                "base_change_id".into(),
+                serde_json::json!(base_change_id.to_string()),
+            );
         }
     }
     fields.insert(
@@ -1342,7 +1355,10 @@ pub fn source_provenance_fields(
     );
     fields.insert("artifact_id".into(), serde_json::json!(source.artifact_id));
     fields.insert("artifact_path".into(), serde_json::json!(source.path));
-    fields.insert("artifact_entry".into(), serde_json::json!(source.entry));
+    fields.insert(
+        "artifact_entry".into(),
+        serde_json::json!(super::artifacts::TreeEntryWire::from(source.entry)),
+    );
     fields
 }
 

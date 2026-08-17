@@ -71,7 +71,7 @@ pub use repository::{
     should_track_host_relative_path, tracked_paths_covered_by_ignore,
     tracked_paths_retracted_by_ignore, CompleteRepositoryScan, CompleteScanToken,
     IgnoredTrackedPaths, IncompleteRepositoryScan, RepositoryIgnore, RepositoryScanDiagnostics,
-    ScannedEntryKind, ScannedRepositoryEntry, DEFAULT_IGNORED_NAMES,
+    ScannedEntryKind, ScannedRepositoryEntry, DEFAULT_IGNORED_NAMES, PYTHON_VIRTUALENV_MARKER,
 };
 pub use support::{compute_coverage_report, CoverageReport};
 pub use watcher::{FileEvent, FileWatcher};
