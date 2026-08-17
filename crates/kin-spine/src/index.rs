@@ -100,6 +100,22 @@ pub struct SpineXrefResponse {
     pub authority_roots: BTreeMap<RepoId, String>,
 }
 
+/// How a spine response's watermark for one repository relates to the caller's
+/// live graph root.
+///
+/// The three cases are separate because they are separate facts about the
+/// deployment, and only one of them is a mismatch of anything: an unregistered
+/// repository is the ordinary state of a single-repo install.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthorityRootState<'a> {
+    /// The registered root is exactly the caller's live graph root.
+    Matches,
+    /// The repository is registered at a root the live graph has advanced past.
+    Stale { registered: &'a str },
+    /// The spine holds no root for the repository at all.
+    Unregistered,
+}
+
 impl SpineXrefResponse {
     /// Construct an unwatermarked response.
     ///
@@ -197,10 +213,37 @@ impl SpineXrefResponse {
     /// Whether the response's primary-repo watermark is the exact graph root
     /// held by the caller. A complete spine rooted at an older live/session
     /// graph is stale authority, including for positive rows.
+    ///
+    /// True only for [`AuthorityRootState::Matches`]. A caller that reports WHY
+    /// the spine cannot answer must use [`Self::authority_root_state`] instead:
+    /// this boolean collapses "registered at an older root" and "never
+    /// registered" into one false, and a caller that then invents a message for
+    /// it describes a root mismatch on a repository that has no root to
+    /// mismatch.
     pub fn authority_root_matches(&self, repo_id: &str, expected_root: &str) -> bool {
-        self.authority_roots
-            .get(repo_id)
-            .is_some_and(|root| root == expected_root)
+        matches!(
+            self.authority_root_state(repo_id, expected_root),
+            AuthorityRootState::Matches
+        )
+    }
+
+    /// How the response's watermark for `repo_id` relates to the caller's live
+    /// graph root: the same root, an older one, or no registration at all.
+    ///
+    /// One implementation of the rule, because two callers (`find_references` on
+    /// the MCP surface and `kin xref` on the CLI) each report it to a user, and
+    /// two hand-rolled copies of a three-way distinction drift into disagreeing
+    /// about what a single-repo install is.
+    pub fn authority_root_state<'a>(
+        &'a self,
+        repo_id: &str,
+        expected_root: &str,
+    ) -> AuthorityRootState<'a> {
+        match self.authority_roots.get(repo_id) {
+            Some(root) if root == expected_root => AuthorityRootState::Matches,
+            Some(registered) => AuthorityRootState::Stale { registered },
+            None => AuthorityRootState::Unregistered,
+        }
     }
 
     /// Decode and version-check an xref response as one shared contract.
@@ -1072,6 +1115,47 @@ mod tests {
     use std::sync::{mpsc, Arc};
     use std::thread;
     use std::time::Duration;
+
+    /// The watermark rule separates three deployments that a boolean collapsed
+    /// into two: same root, older root, and no registration. The third is the
+    /// ordinary state of a single-repo install, and reporting it as a mismatch
+    /// described a misconfiguration that did not exist.
+    #[test]
+    fn the_watermark_rule_separates_a_stale_root_from_no_registration() {
+        let mut response = SpineXrefResponse::new(Vec::new(), Vec::new());
+        assert_eq!(
+            response.authority_root_state("nk", "live"),
+            AuthorityRootState::Unregistered
+        );
+        assert!(!response.authority_root_matches("nk", "live"));
+
+        response
+            .authority_roots
+            .insert("nk".to_string(), "older".to_string());
+        assert_eq!(
+            response.authority_root_state("nk", "live"),
+            AuthorityRootState::Stale {
+                registered: "older"
+            }
+        );
+        assert!(!response.authority_root_matches("nk", "live"));
+
+        response
+            .authority_roots
+            .insert("nk".to_string(), "live".to_string());
+        assert_eq!(
+            response.authority_root_state("nk", "live"),
+            AuthorityRootState::Matches
+        );
+        assert!(response.authority_root_matches("nk", "live"));
+
+        // And the state is per repository: another repo's registration answers
+        // nothing about this one.
+        assert_eq!(
+            response.authority_root_state("other", "live"),
+            AuthorityRootState::Unregistered
+        );
+    }
 
     fn test_fp() -> SemanticFingerprint {
         SemanticFingerprint {

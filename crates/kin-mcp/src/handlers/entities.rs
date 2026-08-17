@@ -1042,6 +1042,53 @@ fn reference_row_json(row: ReferenceRow) -> serde_json::Value {
     })
 }
 
+/// Machine-readable codes a spine unavailability can carry, each the name of one
+/// computed condition. A reason is prefixed with its code so a consumer reports
+/// the condition that actually held instead of collapsing every spine gap into
+/// one label.
+///
+/// [`SPINE_REPO_UNREGISTERED`] and [`SPINE_ROOT_STALE`] were one message until
+/// FIR-2353. A repository with no spine registration at all reported "spine root
+/// mismatch", which reads as a topology misconfiguration and was quoted back as
+/// the cause of a miss that had nothing to do with another repository.
+pub const SPINE_REPO_UNREGISTERED: &str = "spine_repo_unregistered";
+/// The spine holds a root for this repository, but the live graph has advanced
+/// past it: stale cross-repo authority rather than a mismatched one.
+pub const SPINE_ROOT_STALE: &str = "spine_root_stale";
+
+/// Split a spine unavailability reason into its code and human detail, or
+/// `None` for a reason that carries no recognized code (a binding failure, say,
+/// whose message is not one of the conditions computed here).
+///
+/// Only the known codes are stripped. Treating any colon-prefixed word as a code
+/// would promote the first word of an arbitrary error message into a machine
+/// label, which is the kind of guess this module exists to avoid.
+fn split_spine_unavailable_reason(reason: &str) -> (Option<&'static str>, &str) {
+    for code in [SPINE_REPO_UNREGISTERED, SPINE_ROOT_STALE] {
+        if let Some(detail) = reason
+            .strip_prefix(code)
+            .and_then(|rest| rest.strip_prefix(": "))
+        {
+            return (Some(code), detail);
+        }
+    }
+    (None, reason)
+}
+
+/// The cross-repo object for a spine that could not answer, carrying the code of
+/// the condition that held beside its human detail.
+fn cross_repo_unavailable_json(reason: &str) -> serde_json::Value {
+    let (code, detail) = split_spine_unavailable_reason(reason);
+    let mut value = serde_json::json!({
+        "status": "unavailable",
+        "reason": detail,
+    });
+    if let Some(code) = code {
+        value["code"] = serde_json::json!(code);
+    }
+    value
+}
+
 fn daemon_spine_xref(
     authority: FindReferencesAuthority<'_>,
     target_id: &kin_model::EntityId,
@@ -1050,13 +1097,31 @@ fn daemon_spine_xref(
     let query = match authority.spine {
         Some(spine) => {
             let body = spine.cross_repo_xref_response(&repo_id, target_id);
-            if body.authority_root_matches(&repo_id, authority.graph_root) {
-                kin_spine::SpineQuery::Found(body)
-            } else {
-                kin_spine::SpineQuery::Unavailable(format!(
-                    "spine root mismatch for repository {repo_id}: live/session graph root {} is not the registered spine root",
-                    authority.graph_root
-                ))
+            match body.authority_root_state(&repo_id, authority.graph_root) {
+                kin_spine::AuthorityRootState::Matches => kin_spine::SpineQuery::Found(body),
+                // The spine registered this repository at the graph it was
+                // initialized from, and graph truth has moved since. Its
+                // topology is stale, which bears on references from OTHER
+                // repositories and says nothing about the local graph that just
+                // answered.
+                kin_spine::AuthorityRootState::Stale { registered } => {
+                    kin_spine::SpineQuery::Unavailable(format!(
+                        "{SPINE_ROOT_STALE}: spine root mismatch for repository {repo_id}: \
+                         live/session graph root {} has advanced past the registered spine root \
+                         {registered}, so cross-repo authority is stale for other repositories \
+                         and says nothing about references inside this one",
+                        authority.graph_root
+                    ))
+                }
+                // No registration at all, which is the ordinary state of a
+                // single-repo install rather than a mismatch of any kind.
+                kin_spine::AuthorityRootState::Unregistered => {
+                    kin_spine::SpineQuery::Unavailable(format!(
+                        "{SPINE_REPO_UNREGISTERED}: repository {repo_id} has no registered spine \
+                         root, so cross-repo authority cannot answer for it; this is the ordinary \
+                         single-repo state and says nothing about references inside this repository"
+                    ))
+                }
             }
         }
         None => kin_spine::SpineQuery::NotConfigured,
@@ -1192,10 +1257,7 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     let cross_repo = match cross_repo_query {
         Err(reason) => {
             tracing::warn!(reason = %reason, "cross-repo repository binding unavailable for references enrichment");
-            serde_json::json!({
-                "status": "unavailable",
-                "reason": reason,
-            })
+            cross_repo_unavailable_json(&reason)
         }
         Ok((repo_id, query)) => match query {
             kin_spine::SpineQuery::Found(body) => {
@@ -1231,10 +1293,7 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
             // silently dropping cross-repo references (which would read as "none").
             kin_spine::SpineQuery::Unavailable(reason) => {
                 tracing::warn!(reason = %reason, "cross-repo spine unavailable for references enrichment");
-                serde_json::json!({
-                    "status": "unavailable",
-                    "reason": reason,
-                })
+                cross_repo_unavailable_json(&reason)
             }
             // Local-only (no spine configured): quiet — cross-repo refs don't apply.
             kin_spine::SpineQuery::NotConfigured => serde_json::json!({
@@ -1253,7 +1312,20 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     // repo-qualified paths and carry no local entity id.
     let references = rows.into_iter().map(reference_row_json).collect::<Vec<_>>();
 
-    let result = serde_json::json!({
+    // What the graph can structurally answer over the edge classes this query
+    // reads. An empty reference list is only evidence about the code when the
+    // graph demonstrably holds cross-file edges of those classes for the focal's
+    // language, and nothing else in this payload reports that.
+    //
+    // Observed only for an empty answer, which is the only answer whose trust
+    // depends on it: an answer that returned rows has proved the edges exist by
+    // returning them, and paying a language scan on the populated path would be
+    // a cost with nothing to buy.
+    let edge_coverage = references.is_empty().then(|| {
+        crate::edge_coverage::observe_cross_file_reference_coverage(store, &target, &relation_kinds)
+    });
+
+    let mut result = serde_json::json!({
         "focal_entity": {
             "id": target.id,
             "name": target.name,
@@ -1270,6 +1342,9 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
         "references": references,
         "cross_repo": cross_repo,
     });
+    if let Some(edge_coverage) = edge_coverage {
+        result[crate::edge_coverage::EDGE_COVERAGE_KEY] = edge_coverage;
+    }
 
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
@@ -1367,6 +1442,7 @@ fn handle_bulk_check_references_with_authority_source<G: GraphStore>(
     let mut cross_repo_unavailable = None;
     let mut federated_reference_count = 0usize;
     let mut saw_unknown_federated_subtype = false;
+    let mut batch_languages: Vec<kin_model::ids::LanguageId> = Vec::new();
 
     for raw_id in &entity_ids_raw {
         let entity_id = match parse_entity_id(raw_id) {
@@ -1410,6 +1486,10 @@ fn handle_bulk_check_references_with_authority_source<G: GraphStore>(
             results.push(row);
             continue;
         };
+
+        if !batch_languages.contains(&entity.language) {
+            batch_languages.push(entity.language);
+        }
 
         let mut reference_count = 0usize;
         let mut matched_kinds: Vec<RelationKind> = Vec::new();
@@ -1631,14 +1711,23 @@ fn handle_bulk_check_references_with_authority_source<G: GraphStore>(
         "results": results,
     });
 
+    // Every `has_references: false` row in this batch is read off the same
+    // cross-file edge classes a single reference query reads, so the batch
+    // publishes the same observation. It covers each language the resolved
+    // entities span, and the weakest of them governs.
+    result[crate::edge_coverage::EDGE_COVERAGE_KEY] =
+        crate::edge_coverage::observe_cross_file_reference_coverage_for_languages(
+            store,
+            &batch_languages,
+            &relation_kinds,
+        );
+
     if authority.is_some() {
         result["cross_repo"] = if let Some(reason) = cross_repo_unavailable {
-            serde_json::json!({
-                "status": "unavailable",
-                "reason": reason,
-                "checked_entities": cross_repo_checked,
-                "relation_subtype_complete": false,
-            })
+            let mut unavailable = cross_repo_unavailable_json(&reason);
+            unavailable["checked_entities"] = serde_json::json!(cross_repo_checked);
+            unavailable["relation_subtype_complete"] = serde_json::json!(false);
+            unavailable
         } else {
             serde_json::json!({
                 "status": "available",
@@ -2523,7 +2612,18 @@ pub fn handle_trace_data_flow<G: GraphStore>(
     }
 
     let total_steps = chain.len();
-    let result = serde_json::json!({
+    // The walk expands exactly the reference kinds above, so an empty chain is
+    // only evidence about the focal when the graph holds cross-file edges of
+    // those kinds for its language. A walk that returned steps needs no such
+    // evidence and pays no scan for it.
+    let edge_coverage = chain.is_empty().then(|| {
+        crate::edge_coverage::observe_cross_file_reference_coverage(
+            store,
+            &focal_entity,
+            &reference_kinds,
+        )
+    });
+    let mut result = serde_json::json!({
         "focal_id": focal_entity.id.to_string(),
         "focal_name": focal_entity.name,
         "focal_kind": format!("{:?}", focal_entity.kind),
@@ -2538,6 +2638,9 @@ pub fn handle_trace_data_flow<G: GraphStore>(
             "same_name_candidates": same_name_candidates,
         },
     });
+    if let Some(edge_coverage) = edge_coverage {
+        result[crate::edge_coverage::EDGE_COVERAGE_KEY] = edge_coverage;
+    }
 
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
@@ -3694,6 +3797,9 @@ mod tests {
         let graph = InMemoryGraph::new();
         let target = make_entity("target", "src/lib.rs");
         graph.upsert_entity(&target).unwrap();
+        // The graph has to be able to hold a cross-file reference before an empty
+        // one is evidence about the target rather than about the graph.
+        seed_cross_file_call_witness(&graph);
         let registered_root = graph_root(&graph);
 
         let spine = kin_spine::InMemorySpineBackend::new();
@@ -3756,8 +3862,211 @@ mod tests {
         assert!(mismatched["cross_repo"]["reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("root mismatch")));
+        // A registered root the live graph has advanced past is stale authority,
+        // and the code says which condition held rather than leaving every spine
+        // gap wearing one label.
+        assert_eq!(mismatched["cross_repo"]["code"], SPINE_ROOT_STALE);
+        assert!(mismatched["negative"]["trust_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.starts_with(SPINE_ROOT_STALE)));
         assert_eq!(mismatched["negative"]["safe_to_conclude_absent"], false);
         assert!(mismatched["references"].as_array().unwrap().is_empty());
+    }
+
+    /// FIR-2353, second observation: a single-repo install whose repository the
+    /// spine never registered reported "spine root mismatch" as the reason a
+    /// local miss could not be trusted. Nothing had mismatched and nothing was
+    /// cross-repo, so the answer taught its reader to discount reason text. The
+    /// condition that actually held now names itself, and the word mismatch does
+    /// not appear.
+    #[tokio::test]
+    async fn an_unregistered_repository_reports_itself_rather_than_a_root_mismatch() {
+        let graph = InMemoryGraph::new();
+        let target = make_entity("parse_note", "nk/parsing.rs");
+        graph.upsert_entity(&target).unwrap();
+        seed_cross_file_call_witness(&graph);
+        let live_root = graph_root(&graph);
+
+        // A spine that exists and has never been told about this repository,
+        // which is the ordinary state of a fresh single-repo install.
+        let spine = kin_spine::InMemorySpineBackend::new();
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let response = handle_find_references_with_authority(
+            &args,
+            &graph,
+            FindReferencesAuthority {
+                repo_id: "nk",
+                graph_root: &live_root,
+                spine: Some(&spine),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let response = parsed_response(&crate::finalize_with_envelope(
+            response,
+            structurally_ready_envelope(),
+            "find_references",
+        ));
+
+        assert_eq!(response["cross_repo"]["status"], "unavailable");
+        assert_eq!(response["cross_repo"]["code"], SPINE_REPO_UNREGISTERED);
+        let reason = response["cross_repo"]["reason"].as_str().unwrap();
+        assert!(
+            !reason.contains("mismatch"),
+            "an unregistered repository has nothing to mismatch: {reason}"
+        );
+        let trust_reason = response["negative"]["trust_reason"].as_str().unwrap();
+        assert!(
+            trust_reason.starts_with(SPINE_REPO_UNREGISTERED),
+            "the reason names the condition that held: {trust_reason}"
+        );
+        assert!(
+            !trust_reason.contains("mismatch"),
+            "and never the one that did not: {trust_reason}"
+        );
+    }
+
+    /// The FIR-2353 headline, end to end through the handler: a graph holding
+    /// entities and one intra-file call edge, healthy by every freshness signal,
+    /// answering for a symbol a sibling file calls. The answer is empty because
+    /// the graph holds no cross-file edge that could have carried the reference,
+    /// and the envelope has to say so rather than certify the symbol as unused.
+    #[tokio::test]
+    async fn find_references_on_an_intra_file_only_graph_refuses_to_certify_absence() {
+        let store = InMemoryGraph::new();
+        let target = make_entity("parse_note", "nk/parsing.rs");
+        let caller = make_entity("save_note", "nk/storage.rs");
+        let sibling = make_entity("write_bytes", "nk/storage.rs");
+        store.upsert_entity(&target).unwrap();
+        store.upsert_entity(&caller).unwrap();
+        store.upsert_entity(&sibling).unwrap();
+        // The extractor linked what it could see inside one file and nothing
+        // across files, which is the exact shape the isolated-install repro hit.
+        store
+            .upsert_relation(&make_relation(caller.id, sibling.id, RelationKind::Calls))
+            .unwrap();
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let response = parsed_response(&crate::finalize_with_envelope(
+            handle_find_references(&args, &store, None).await.unwrap(),
+            structurally_ready_envelope(),
+            "find_references",
+        ));
+
+        assert!(response["references"].as_array().unwrap().is_empty());
+        assert_eq!(
+            response["edge_coverage"]["cross_file_classes"],
+            serde_json::json!([]),
+            "the observation is what makes the gap visible: {}",
+            response["edge_coverage"]
+        );
+        assert_eq!(
+            response["negative"]["safe_to_conclude_absent"], false,
+            "an agent acting on a true verdict here deletes live code: {}",
+            response["negative"]
+        );
+        assert_eq!(response["negative"]["trust"], "inconclusive");
+        // And the edge gap LEADS, ahead of the ambient path's own cross-repo
+        // binding gap, because it is the factor that limited this answer.
+        assert!(
+            trust_reason(&response).starts_with("cross_file_edges_absent"),
+            "{}",
+            trust_reason(&response)
+        );
+    }
+
+    /// An answer that returned rows proved the edges exist by returning them, so
+    /// it pays no language scan and carries no observation. Stating it as a test
+    /// keeps the populated path from silently acquiring one.
+    #[tokio::test]
+    async fn a_populated_reference_answer_carries_no_edge_observation() {
+        let store = InMemoryGraph::new();
+        let caller = make_entity("caller", "src/a.rs");
+        let target = make_entity("target", "src/b.rs");
+        store.upsert_entity(&caller).unwrap();
+        store.upsert_entity(&target).unwrap();
+        store
+            .upsert_relation(&make_relation(caller.id, target.id, RelationKind::Calls))
+            .unwrap();
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let response = parsed_response(&crate::finalize_with_envelope(
+            handle_find_references(&args, &store, None).await.unwrap(),
+            structurally_ready_envelope(),
+            "find_references",
+        ));
+        assert_eq!(response["total_upstream"], 1);
+        assert!(
+            response
+                .get(crate::edge_coverage::EDGE_COVERAGE_KEY)
+                .is_none(),
+            "a populated answer needs no coverage observation: {response}"
+        );
+        assert!(
+            response.get("negative").is_none(),
+            "and carries no negative to consume one"
+        );
+    }
+
+    /// The other half of the same claim, on the daemon authority path so nothing
+    /// but the edge coverage differs: one cross-file call edge and the identical
+    /// empty answer is certified again. A fix that made every absence
+    /// inconclusive would pass the test above and fail this one.
+    #[tokio::test]
+    async fn find_references_certifies_absence_once_the_graph_links_calls_across_files() {
+        let graph = InMemoryGraph::new();
+        let target = make_entity("parse_note", "nk/parsing.rs");
+        graph.upsert_entity(&target).unwrap();
+        seed_cross_file_call_witness(&graph);
+        let registered_root = graph_root(&graph);
+
+        let spine = kin_spine::InMemorySpineBackend::new();
+        spine.register_repo("nk", vec![spine_entry("nk", &target)], &registered_root);
+        spine.refresh_cross_repo_edges("nk", &[], &[], &["nk".to_string()]);
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let response = parsed_response(&crate::finalize_with_envelope(
+            handle_find_references_with_authority(
+                &args,
+                &graph,
+                FindReferencesAuthority {
+                    repo_id: "nk",
+                    graph_root: &registered_root,
+                    spine: Some(&spine),
+                },
+                None,
+            )
+            .await
+            .unwrap(),
+            structurally_ready_envelope(),
+            "find_references",
+        ));
+
+        assert!(response["references"].as_array().unwrap().is_empty());
+        assert_eq!(
+            response["edge_coverage"]["cross_file_classes"],
+            serde_json::json!(["calls"])
+        );
+        assert_eq!(
+            response["negative"]["safe_to_conclude_absent"], true,
+            "a graph that links calls across files still earns absence: {}",
+            response["negative"]
+        );
+        assert_eq!(response["negative"]["trust"], "authoritative");
     }
 
     #[tokio::test]
@@ -3849,6 +4158,7 @@ mod tests {
         let graph = InMemoryGraph::new();
         let target = make_entity("target", "src/lib.rs");
         graph.upsert_entity(&target).unwrap();
+        seed_cross_file_call_witness(&graph);
         let provider_root = graph_root(&graph);
 
         let spine = kin_spine::InMemorySpineBackend::new();
@@ -3897,6 +4207,7 @@ mod tests {
         let target = make_entity("target", "src/lib.rs");
         let source = make_entity("caller", "src/app.rs");
         graph.upsert_entity(&target).unwrap();
+        seed_cross_file_call_witness(&graph);
         let provider_root = graph_root(&graph);
 
         let spine = kin_spine::InMemorySpineBackend::new();
@@ -4381,16 +4692,32 @@ mod tests {
             .to_string()
     }
 
+    /// A pair of entities in different files joined by a `Calls` edge: the
+    /// witness that this graph does link references across files for the
+    /// language, without which an empty walk is a fact about the graph rather
+    /// than about the focal.
+    fn seed_cross_file_call_witness(store: &InMemoryGraph) {
+        let caller = make_entity("witness_caller", "src/witness_caller.rs");
+        let callee = make_entity("witness_callee", "src/witness_callee.rs");
+        store.upsert_entity(&caller).unwrap();
+        store.upsert_entity(&callee).unwrap();
+        store
+            .upsert_relation(&make_relation(caller.id, callee.id, RelationKind::Calls))
+            .unwrap();
+    }
+
     /// The authoritative side of the trace absence: a focal that is in the
     /// graph, carries a name nothing else shares, is not a method, and has no
-    /// edges at all. That is a real absence, and the qualifier must still be
-    /// willing to say so. A gate that never certifies anything is as useless
-    /// as one that certifies everything.
+    /// edges at all, on a graph that demonstrably links calls across files.
+    /// That is a real absence, and the qualifier must still be willing to say
+    /// so. A gate that never certifies anything is as useless as one that
+    /// certifies everything.
     #[test]
     fn trace_data_flow_isolated_focal_is_authoritative_on_a_ready_graph() {
         let store = InMemoryGraph::new();
         let lonely = make_entity("lonely", "src/lonely.rs");
         store.upsert_entity(&lonely).unwrap();
+        seed_cross_file_call_witness(&store);
 
         let response = traced_response(
             &store,

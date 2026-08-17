@@ -15671,6 +15671,31 @@ mod tests {
         }
     }
 
+    /// Two entities in different files joined by a `Calls` edge: the evidence
+    /// that this graph links references across files for the language, which is
+    /// what an absence claim over reference edges depends on. Without it an empty
+    /// reference answer is a fact about the graph rather than about the target.
+    fn seed_cross_file_call_witness(state: &Arc<DaemonState>) {
+        let caller = test_entity("witness_caller", "src/witness_caller.py");
+        let callee = test_entity("witness_callee", "src/witness_callee.py");
+        state.graph.upsert_entity(&caller).unwrap();
+        state.graph.upsert_entity(&callee).unwrap();
+        state
+            .graph
+            .upsert_relation(&kin_model::relation::Relation {
+                id: kin_model::ids::RelationId::new(),
+                kind: kin_model::relation::RelationKind::Calls,
+                src: kin_model::relation::GraphNodeId::Entity(caller.id),
+                dst: kin_model::relation::GraphNodeId::Entity(callee.id),
+                confidence: 1.0,
+                origin: kin_model::relation::RelationOrigin::Parsed,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+    }
+
     fn install_repository_file(
         state: &Arc<DaemonState>,
         rel_path: &str,
@@ -26754,6 +26779,7 @@ mod tests {
         let target = test_entity("target", "src/lib.rs");
         let source = test_entity("caller", "src/app.rs");
         state.graph.upsert_entity(&target).unwrap();
+        seed_cross_file_call_witness(&state);
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
