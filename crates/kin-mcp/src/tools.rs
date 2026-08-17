@@ -364,7 +364,24 @@ fn registered_tools() -> ToolsListResult {
                             "description": "Direction of traversal: 'calls' walks outgoing edges (focal -> callees), 'callers' walks incoming edges (callers -> focal), 'both' merges. Default 'both'.",
                             "default": "both"
                         },
-                        "limit_per_step": { "type": "integer", "description": "Max relations expanded per step (default 5, capped at 25)", "default": 5, "minimum": 1, "maximum": 25 }
+                        "limit_per_step": { "type": "integer", "description": "Max relations expanded per step (default 5, capped at 25). Kept by relevance, not by relation order; a step whose fan-out was cut says so with the count it dropped.", "default": 5, "minimum": 1, "maximum": 25 },
+                        "include_body": {
+                            "type": "boolean",
+                            "description": "Inline each step's source body (default true). Pass false to ask for the SHAPE of the chain — names, kinds, roles, spans, edges — which is a fraction of the size and is what you want unless you intend to read the code.",
+                            "default": true
+                        },
+                        "compact": {
+                            "type": "boolean",
+                            "description": "Alias for include_body: false. Ignored when include_body is given explicitly.",
+                            "default": false
+                        },
+                        "max_response_chars": {
+                            "type": "integer",
+                            "description": "Serialized characters this response may occupy (default 80000). The tool enforces it itself, dropping bodies before edges and reporting the cut in degradations, so a result is never refused for size.",
+                            "default": 80000,
+                            "minimum": 2000,
+                            "maximum": 400000
+                        }
                     },
                     "required": ["focal"]
                 }),

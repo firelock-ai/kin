@@ -396,7 +396,9 @@ pub fn is_trace_function(entity: &Entity) -> bool {
     matches!(entity.kind, EntityKind::Function | EntityKind::Method)
 }
 
-pub use kin_ranking::entity_ranking::{trace_callee_score, trace_relation_rank};
+pub use kin_ranking::entity_ranking::{
+    trace_callee_score, trace_entity_is_external, trace_fanout_score, trace_relation_rank,
+};
 
 pub fn next_trace_step<G: GraphStore>(
     store: &G,
