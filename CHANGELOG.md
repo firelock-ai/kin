@@ -23,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Resolve a real commit identity or refuse, instead of stamping "Author: unknown" (#876)
 - Resolve call edges by receiver scope and role, and mark what each edge proved (#868)
 - Synchronise the exited-child reaper test on the exit itself (#884)
+- Read one reference collector for dead code and gate the delete list on measured edge coverage (#866)
+- Bound trace_data_flow's own response, order its fan-out by relevance, and give every step one shape (#867)
 
 
 ## [0.5.37] - 2026-08-17
