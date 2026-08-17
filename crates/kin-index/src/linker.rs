@@ -3170,6 +3170,19 @@ fn resolve_module_path<S>(
 where
     S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
 {
+    // Python module paths are dotted, not path-shaped, in both directions:
+    // `app.parsing` names `app/parsing.py` and `.parsing` names a sibling
+    // module inside the importer's own package. Neither shape survives the
+    // generic branches below — the relative branch would join `.parsing` onto
+    // the importer's directory as a literal path segment, and the non-relative
+    // branch only knows header, JS package, Java, and Go layouts. So every
+    // Python import fell through unresolved, which cost the graph its
+    // artifact-level `Imports` edges and left every imported call to the blind
+    // name fallback.
+    if is_python_source_path(importer_path) {
+        return resolve_python_module_import(importer_path, module_path, known_files);
+    }
+
     if module_path.starts_with('.') {
         // Relative import resolution
         let importer = Path::new(importer_path);
@@ -3211,6 +3224,108 @@ where
             // Go module resolution: github.com/org/repo/v2/pkg/foo → pkg/foo/*.go
             .or_else(|| resolve_go_module_import(module_path, known_files))
     }
+}
+
+/// Source extensions a Python module name can materialize as.
+const PYTHON_MODULE_EXTENSIONS: &[&str] = &["py", "pyi"];
+
+/// Source roots an absolute Python import is resolved against, in the order a
+/// repository normally puts them on `sys.path`.
+///
+/// Deliberately short. A repo-wide suffix search would find a same-named module
+/// anywhere in the tree and bind the import to it, which is a guess wearing the
+/// costume of a resolution; an import that names no module at one of these roots
+/// stays unresolved instead.
+const PYTHON_SOURCE_ROOTS: &[&str] = &["", "src"];
+
+fn is_python_source_path(path: &str) -> bool {
+    matches!(path.rsplit('.').next(), Some("py" | "pyi"))
+}
+
+/// Resolve a Python import to the repo-local file that defines it.
+///
+/// Handles the two shapes the adapter emits: an absolute dotted path
+/// (`app.parsing`) resolved against the repository's source roots, and a
+/// relative one (`.parsing`, `..util.text`) resolved against the importer's own
+/// package, where each leading dot beyond the first climbs one package.
+///
+/// Both shapes only ever name files the caller already knows about, so an
+/// import of a third-party or standard-library module resolves to nothing and
+/// is left to the external-reference tier. When more than one source root
+/// answers the same module the import is ambiguous and stays unresolved: a
+/// fabricated edge is worse than a missing one.
+fn resolve_python_module_import<S>(
+    importer_path: &str,
+    module_path: &str,
+    known_files: &HashSet<S>,
+) -> Option<String>
+where
+    S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
+{
+    let level = module_path.chars().take_while(|c| *c == '.').count();
+    let segments: Vec<&str> = module_path[level..]
+        .split('.')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+
+    if level > 0 {
+        let mut base = parent_dir(importer_path).to_string();
+        for _ in 1..level {
+            if base.is_empty() {
+                // More leading dots than there are packages above the importer.
+                return None;
+            }
+            base = parent_dir(&base).to_string();
+        }
+        return python_module_file(&base, &segments, known_files);
+    }
+
+    let mut hit: Option<String> = None;
+    for root in PYTHON_SOURCE_ROOTS {
+        let Some(candidate) = python_module_file(root, &segments, known_files) else {
+            continue;
+        };
+        match &hit {
+            Some(existing) if *existing != candidate => return None,
+            Some(_) => {}
+            None => hit = Some(candidate),
+        }
+    }
+    hit
+}
+
+/// The file a dotted module name resolves to under one source root, preferring
+/// a module (`pkg/mod.py`) over a package (`pkg/mod/__init__.py`).
+///
+/// An empty segment list names the base package itself (`from . import sibling`),
+/// which can only be that package's `__init__`.
+fn python_module_file<S>(base: &str, segments: &[&str], known_files: &HashSet<S>) -> Option<String>
+where
+    S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
+{
+    let joined = segments.join("/");
+    let prefix = match (base.is_empty(), joined.is_empty()) {
+        (true, true) => return None,
+        (true, false) => joined,
+        (false, true) => base.to_string(),
+        (false, false) => format!("{base}/{joined}"),
+    };
+
+    if !segments.is_empty() {
+        for ext in PYTHON_MODULE_EXTENSIONS {
+            let candidate = format!("{prefix}.{ext}");
+            if known_files.contains(candidate.as_str()) {
+                return Some(candidate);
+            }
+        }
+    }
+    for ext in PYTHON_MODULE_EXTENSIONS {
+        let candidate = format!("{prefix}/__init__.{ext}");
+        if known_files.contains(candidate.as_str()) {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 fn resolve_repo_local_header<S>(module_path: &str, known_files: &HashSet<S>) -> Option<String>
