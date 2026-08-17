@@ -332,6 +332,7 @@ impl PreparedRepositoryInit {
             }
             slot @ None => {
                 {
+                    crate::report_admission_progress("validating transaction");
                     let _span = info_span!("kin.init.commit.validate_bootstrap").entered();
                     validate_bootstrap_transaction(
                         &transaction,
@@ -1438,7 +1439,17 @@ where
             Some(RefTarget::Change { change_id }) => Some(change_id),
             _ => None,
         });
+    // Coarse ticks across the four sub-steps of the commit, because this is
+    // the longest phase in the ladder and none of it is reachable from the
+    // phase reporter: `commit_repository_transaction` takes no progress
+    // callback, so between entering this phase and leaving it the line would
+    // otherwise sit unchanged for minutes, which reads as a hang. What kin-db
+    // reports from inside its own replay arrives through the same sink.
     let receipt = {
+        crate::report_admission_progress(&format!(
+            "committing {} changes to authority",
+            transaction.changes.len()
+        ));
         let _span = info_span!(
             "kin.init.commit.authority_commit",
             external_objects = transaction.external_objects.len(),
@@ -1450,6 +1461,7 @@ where
             .map_err(graph_error)?
     };
     let workspace = {
+        crate::report_admission_progress("binding workspace to committed roots");
         let _span = info_span!("kin.init.commit.workspace_binding").entered();
         authority
             .workspace_snapshot_binding(repository_id, &workspace_id)
@@ -1469,6 +1481,7 @@ where
         .validate()
         .map_err(|error| KinError::Other(error.to_string()))?;
     let semantic_enrichment = {
+        crate::report_admission_progress("summarizing semantic enrichment");
         let _span = info_span!("kin.init.commit.enrichment_summary").entered();
         let lease = authority.read_authority();
         if lease.roots() != &receipt.roots_after {
