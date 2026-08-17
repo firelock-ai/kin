@@ -428,7 +428,7 @@ fn kotlin_signature_should_exclude_body() {
 // ---------------------------------------------------------------------------
 // JavaScript / TypeScript relational shape.
 //
-// A `kin init` of express on 0.5.36 produced 613 entities and 211 relations —
+// A `kin init` of express on 0.5.36 produced 613 entities and 211 relations:
 // 0.34 per entity, no Contains, no Extends, no Method or Class kind, and 451 of
 // the 613 entities Constants. Python on a comparable repo produced 2.64
 // relations per entity. The two fixtures below carry every JavaScript shape
@@ -507,8 +507,8 @@ fn assert_relational_shape(out: &ParseOutput, lang: &str) {
         .map(|e| (e.kind, e.name.as_str()))
         .collect();
     let expected = [
-        // ES class, its methods, and the constructor-plus-prototype form —
-        // both are classes with methods, and the graph must not tell them apart.
+        // ES class, its methods, and the constructor-plus-prototype form.
+        // Both are classes with methods, and the graph must not tell them apart.
         (EntityKind::Class, "Service"),
         (EntityKind::Method, "Service.run"),
         (EntityKind::Method, "Service.stop"),
