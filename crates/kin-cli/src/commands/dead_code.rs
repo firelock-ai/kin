@@ -211,43 +211,65 @@ fn build_dead_code_report(
     // claim may still answer, but it may not answer confidently. Both halves of
     // the evidence are checked, the reference edges the verdict rests on and the
     // manifests the entry-point exclusion rests on.
-    let mut unverified_reasons = coverage.unsupportable_absence_reasons();
-    if !entry_points.manifests_unreadable.is_empty() {
-        unverified_reasons.push(format!(
+    //
+    // Reference-edge gaps are per language, and a row is labelled on the state of
+    // ITS OWN language: a Rust repository carrying two unresolved TypeScript files
+    // would otherwise have every Rust row labelled, which teaches a reader to skip
+    // the label. An unread manifest has no language and covers every row, because
+    // the entry point it hides could be in any of them.
+    let manifest_gap = (!entry_points.manifests_unreadable.is_empty()).then(|| {
+        format!(
             "declared entry points could not be read from graph truth for {}, so an entry point \
              may be listed below",
             entry_points.manifests_unreadable.join(", ")
-        ));
-    }
-    let verified = unverified_reasons.is_empty();
+        )
+    });
+    let unsupportable: std::collections::BTreeMap<String, String> = coverage
+        .languages
+        .iter()
+        .filter_map(|language| {
+            language
+                .unsupportable_reason()
+                .map(|reason| (language.language.clone(), reason))
+        })
+        .collect();
+    let row_is_unverified = |entity: &kin_model::Entity| {
+        manifest_gap.is_some() || unsupportable.contains_key(&entity.language.to_string())
+    };
+    let unverified_rows = unreferenced.iter().filter(|e| row_is_unverified(e)).count();
+    let mut unverified_reasons: Vec<String> = unsupportable.values().cloned().collect();
+    unverified_reasons.extend(manifest_gap.clone());
+    // The verdict is about the rows this run printed. A gap in a language nothing
+    // was listed for is still disclosed below, but it does not make the listed
+    // rows unverified: missing edges make this scan over-report, never
+    // under-report, so a row whose own language resolved is unaffected by it.
+    let verified = unverified_rows == 0;
 
     if unreferenced.is_empty() {
-        if verified {
-            lines.push("No dead code found.".to_string());
-        } else {
-            lines.push(
-                "No unreferenced entities found, and this scan could not have found one:"
-                    .to_string(),
-            );
-        }
+        lines.push("No dead code found.".to_string());
     } else if verified {
         lines.push(format!(
             "Found {} unreferenced entities:",
             unreferenced.len()
         ));
-    } else {
+    } else if unverified_rows == unreferenced.len() {
         lines.push(format!(
             "UNVERIFIED: {} candidates. This graph cannot support a delete list:",
+            unreferenced.len()
+        ));
+    } else {
+        lines.push(format!(
+            "Found {} unreferenced entities, {unverified_rows} of them UNVERIFIED:",
             unreferenced.len()
         ));
     }
     for reason in &unverified_reasons {
         lines.push(format!("  incomplete: {reason}"));
     }
-    if !verified && !unreferenced.is_empty() {
+    if unverified_rows > 0 {
         lines.push(
-            "  Every row below is UNVERIFIED: an entity with no edge in this graph may still be \
-             used. Do not delete on this evidence."
+            "  An UNVERIFIED row is a candidate this graph cannot stand behind: an entity with no \
+             edge here may still be used. Do not delete on this evidence."
                 .to_string(),
         );
     }
@@ -269,8 +291,12 @@ fn build_dead_code_report(
             entry_points.manifests_read.join(", ")
         ));
     }
-    let prefix = if verified { "  " } else { "  [unverified] " };
     for e in &unreferenced {
+        let prefix = if row_is_unverified(e) {
+            "  [unverified] "
+        } else {
+            "  "
+        };
         lines.push(format!(
             "{prefix}{} ({:?}, {}) - {}",
             e.name,
@@ -900,7 +926,11 @@ mod tests {
         let extract_tags = measured(make_entity("extract_tags", "nk/parsing.py"), 4, 1);
         let ingest_dir = measured(make_entity("Database.ingest_dir", "nk/storage.py"), 2, 2);
         let ingest_note = measured(make_entity("Database.ingest_note", "nk/storage.py"), 2, 2);
-        let mut suite = measured(make_entity("test_parse_note", "tests/test_parsing.py"), 6, 3);
+        let mut suite = measured(
+            make_entity("test_parse_note", "tests/test_parsing.py"),
+            6,
+            3,
+        );
         suite.role = EntityRole::Test;
 
         for entity in [
@@ -994,6 +1024,59 @@ mod tests {
         assert!(
             repaired_joined.contains("No dead code found."),
             "every entity in the fixture is reachable once the edges resolve: {repaired_joined}"
+        );
+    }
+
+    /// A row is labelled on the state of its OWN language. A repository whose
+    /// Rust edges resolved would otherwise have every Rust row labelled because
+    /// two unresolved TypeScript files sit beside them, which teaches a reader to
+    /// skip the label on the rows where it means something.
+    #[test]
+    fn a_gap_in_one_language_does_not_label_another_languages_rows() {
+        let graph = InMemoryGraph::new();
+
+        let caller = measured(make_entity("run_task", "src/tasks.rs"), 2, 1);
+        let called = measured(make_entity("spawn_task", "src/spawn.rs"), 2, 1);
+        let rust_orphan = measured(make_entity("retired_task", "src/retired.rs"), 1, 1);
+
+        let mut python_orphan = measured(make_entity("legacy_import", "tools/legacy.py"), 2, 2);
+        python_orphan.language = LanguageId::Python;
+        let mut python_other = measured(make_entity("legacy_helper", "tools/helper.py"), 2, 2);
+        python_other.language = LanguageId::Python;
+
+        for entity in [
+            &caller,
+            &called,
+            &rust_orphan,
+            &python_orphan,
+            &python_other,
+        ] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        // Rust resolves a cross-file call; python resolves nothing.
+        graph
+            .upsert_relation(&make_relation(caller.id, called.id, RelationKind::Calls))
+            .unwrap();
+
+        let response = scan(&graph);
+        let joined = response.lines.join("\n");
+
+        assert!(
+            !response.verified,
+            "python cannot support an absence claim: {joined}"
+        );
+        assert!(
+            joined.contains("  retired_task ("),
+            "the rust row prints plainly, because rust cross-file edges resolved: {joined}"
+        );
+        assert!(
+            joined.contains("[unverified] legacy_helper (")
+                && joined.contains("[unverified] legacy_import ("),
+            "the python rows carry the label: {joined}"
+        );
+        assert!(
+            joined.contains("4 unreferenced entities, 2 of them UNVERIFIED"),
+            "the header counts both, because a mixed answer is what this is: {joined}"
         );
     }
 
