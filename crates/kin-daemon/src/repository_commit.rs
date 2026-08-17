@@ -2288,16 +2288,25 @@ mod tests {
         assert_eq!(lease.snapshot().changes.len(), 1);
     }
 
+    /// An exclusion rule takes effect from the generation AFTER the one that
+    /// publishes it, so the transaction introducing a rule is judged by the
+    /// policy already in force rather than by the one it is about to install.
+    /// The contract is stated on kin-db's `judging_shared_policy`; this is its
+    /// kin-side half, and it is deliberately the inverse of what this test
+    /// asserted before kin-db 0.7.30. Judging a transaction by its own new rule
+    /// livelocked: the rule file could never land, because landing it required
+    /// admitting content the unlanded rule already excluded, and every retry
+    /// failed identically.
     #[test]
-    fn ignored_new_artifact_is_rejected_without_partial_authority() {
+    fn a_rule_and_the_content_it_will_exclude_land_together_then_the_rule_bites() {
         let root = tempfile::tempdir().unwrap();
         let init = kin_core::init(root.path()).unwrap();
         let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
         let graph = kin_db::InMemoryGraph::new();
-        add_artifact(&graph, &blobs, b".gitignore", b"secret.txt\n", |hash| {
+        add_artifact(&graph, &blobs, b".gitignore", b"*.secret\n", |hash| {
             TreeEntry::blob(hash, false)
         });
-        add_artifact(&graph, &blobs, b"secret.txt", b"not admitted\n", |hash| {
+        add_artifact(&graph, &blobs, b"one.secret", b"not admitted\n", |hash| {
             TreeEntry::blob(hash, false)
         });
         let plan = plan_native_commit(
@@ -2307,26 +2316,52 @@ mod tests {
             OperationId::new(),
             fixed_timestamp(),
             AuthorId::new("dogfood"),
-            "must fail admission".to_string(),
+            "publish the rule beside the content it will exclude".to_string(),
         )
         .unwrap();
-        let error = commit_native_plan(&init.layout, &blobs, plan).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("excluded by the exact graph-owned admission policy"));
+        commit_native_plan(&init.layout, &blobs, plan).unwrap();
 
         let authority = reopen(&init);
         let lease = authority.read_authority();
-        assert_eq!(lease.roots().generation, 1);
-        assert!(lease.snapshot().changes.is_empty());
+        assert_eq!(lease.roots().generation, 2);
+        assert_eq!(lease.snapshot().changes.len(), 1);
         let workspace = lease
             .metadata()
             .workspaces
             .iter()
             .find(|workspace| workspace.workspace_id == init.workspace_id)
             .unwrap();
-        assert!(workspace.tree.is_empty());
-        assert!(lease.metadata().ref_state.refs.is_empty());
+        assert_eq!(workspace.tree.len(), 2);
+        drop(lease);
+        drop(authority);
+
+        // The rule is in force from here, so the next new path under it is
+        // refused, and refused without moving authority.
+        add_artifact(&graph, &blobs, b"two.secret", b"also secret\n", |hash| {
+            TreeEntry::blob(hash, false)
+        });
+        let plan = plan_native_commit(
+            &init.layout,
+            &graph,
+            &blobs,
+            OperationId::new(),
+            fixed_timestamp(),
+            AuthorId::new("dogfood"),
+            "must fail admission under the rule now in force".to_string(),
+        )
+        .unwrap();
+        let error = commit_native_plan(&init.layout, &blobs, plan).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("excluded by the exact graph-owned admission policy"),
+            "unexpected error: {error}"
+        );
+
+        let authority = reopen(&init);
+        let lease = authority.read_authority();
+        assert_eq!(lease.roots().generation, 2);
+        assert_eq!(lease.snapshot().changes.len(), 1);
     }
 
     #[test]
