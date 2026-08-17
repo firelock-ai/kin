@@ -46,6 +46,7 @@ impl LanguageAdapter for JavaScriptAdapter {
         let mut relations = Vec::new();
         let mut imports = Vec::new();
         let mut tests = Vec::new();
+        let mut owners = JsOwners::default();
         let root = tree.root_node();
         let mut cursor = root.walk();
 
@@ -67,19 +68,24 @@ impl LanguageAdapter for JavaScriptAdapter {
         }
 
         for child in root.children(&mut cursor) {
-            extract_js_node(&child, source, file_id, &mut entities, &mut relations);
+            extract_js_node(
+                &child,
+                source,
+                file_id,
+                &mut entities,
+                &mut relations,
+                &mut owners,
+            );
             if let Some(import_like) = extract_js_import_like(&child, source) {
                 imports.push(import_like);
             }
             // Extract CommonJS require() calls as imports
-            if child.kind() == "lexical_declaration" || child.kind() == "variable_declaration" {
-                if let Some(import) = extract_require_import(&child, source) {
-                    imports.push(import);
-                }
-            }
+            collect_js_require_imports(&child, source, &mut imports);
             // Detect describe/it/test calls (Jest/Vitest/Mocha)
             extract_js_tests_from_node(&child, source, &mut tests);
         }
+
+        owners.finish(&mut entities);
 
         // Build import lookup: local_name -> module_path
         let import_map: std::collections::HashMap<&str, &str> = imports
@@ -113,12 +119,67 @@ impl LanguageAdapter for JavaScriptAdapter {
     }
 }
 
+/// Receivers that own member-assigned methods: `View.prototype.lookup = ...`,
+/// `res.status = ...`, `const utils = { parse() {} }`.
+///
+/// Such a receiver is a class in all but syntax — a constructor function
+/// carrying `prototype` members, or a prototype object built by
+/// `Object.create` — so it is kinded [`EntityKind::Class`] once extraction
+/// finishes. That kind is also what puts an `Owner.method` call on the linker's
+/// receiver-method and inheritance tiers, which only fire for a class-like
+/// owner.
+#[derive(Default)]
+pub(super) struct JsOwners {
+    names: std::collections::BTreeSet<String>,
+    /// A stand-in binding for a receiver that never declared one in this file
+    /// (`app.foo = ...` where `app` came from elsewhere). Only pushed when no
+    /// real entity claims the name, so every `Contains` edge keeps a resolvable
+    /// source.
+    synthesized: Vec<ExtractedEntity>,
+}
+
+impl JsOwners {
+    pub(super) fn record(
+        &mut self,
+        name: &str,
+        site: &tree_sitter::Node,
+        source: &[u8],
+        file_id: &FilePathId,
+    ) {
+        if self.names.insert(name.to_string()) {
+            self.synthesized.push(ExtractedEntity {
+                kind: EntityKind::Class,
+                name: name.to_string(),
+                signature: format!("object {name}"),
+                visibility: Visibility::Public,
+                doc_summary: None,
+                fingerprint: compute_fingerprint(site, source),
+                span: span_from_node(site, file_id),
+            });
+        }
+    }
+
+    pub(super) fn finish(self, entities: &mut Vec<ExtractedEntity>) {
+        for name in &self.names {
+            if let Some(existing) = entities.iter_mut().find(|entity| &entity.name == name) {
+                existing.kind = EntityKind::Class;
+            }
+        }
+        for candidate in self.synthesized {
+            if !entities.iter().any(|entity| entity.name == candidate.name) {
+                entities.push(candidate);
+            }
+        }
+    }
+}
+
 fn extract_js_node(
     node: &tree_sitter::Node,
     source: &[u8],
     file_id: &FilePathId,
     entities: &mut Vec<ExtractedEntity>,
     relations: &mut Vec<ExtractedRelation>,
+    owners: &mut JsOwners,
 ) {
     match node.kind() {
         "function_declaration" | "function" => {
@@ -140,83 +201,13 @@ fn extract_js_node(
         "class_declaration" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = name_node.utf8_text(source).unwrap_or("").to_string();
-                entities.push(ExtractedEntity {
-                    kind: EntityKind::Class,
-                    name: name.clone(),
-                    signature: node_signature(node, source),
-                    visibility: detect_js_visibility(node),
-                    doc_summary: extract_preceding_comment(node, source),
-                    fingerprint: compute_fingerprint(node, source),
-                    span: span_from_node(node, file_id),
-                });
-
-                // Extract Extends relation for class inheritance.
-                // tree-sitter-javascript: class_declaration → class_heritage → identifier
-                {
-                    let mut heritage_cursor = node.walk();
-                    for child in node.children(&mut heritage_cursor) {
-                        if child.kind() == "class_heritage" {
-                            // Inside class_heritage, find the named identifier (skip "extends" keyword)
-                            let mut hc = child.walk();
-                            for hchild in child.children(&mut hc) {
-                                if hchild.is_named() && hchild.kind() == "identifier" {
-                                    let parent_name =
-                                        hchild.utf8_text(source).unwrap_or("").to_string();
-                                    if !parent_name.is_empty() {
-                                        relations.push(ExtractedRelation {
-                                            receiver: None,
-                                            call_shape: None,
-                                            kind: kin_model::RelationKind::Extends,
-                                            src_name: name.clone(),
-                                            dst_name: parent_name,
-                                            import_source: None,
-                                        });
-                                    }
-                                    break;
-                                }
-                            }
-                            break;
-                        }
-                    }
-                }
-
-                // Recurse into class body
-                if let Some(body) = node.child_by_field_name("body") {
-                    let mut body_cursor = body.walk();
-                    for member in body.children(&mut body_cursor) {
-                        if member.kind() == "method_definition" {
-                            if let Some(mn) = member.child_by_field_name("name") {
-                                let method_name = mn.utf8_text(source).unwrap_or("").to_string();
-                                let qualified = format!("{}.{}", name, method_name);
-                                entities.push(ExtractedEntity {
-                                    kind: EntityKind::Method,
-                                    name: qualified.clone(),
-                                    signature: node_signature(&member, source),
-                                    visibility: Visibility::Public,
-                                    doc_summary: extract_preceding_comment(&member, source),
-                                    fingerprint: compute_fingerprint(&member, source),
-                                    span: span_from_node(&member, file_id),
-                                });
-                                relations.push(ExtractedRelation {
-                                    receiver: None,
-                                    call_shape: None,
-                                    kind: kin_model::RelationKind::Contains,
-                                    src_name: name.clone(),
-                                    dst_name: qualified.clone(),
-                                    import_source: None,
-                                });
-                                // Extract calls within method body
-                                extract_calls_from_context(&member, source, &qualified, relations);
-                            }
-                        }
-                    }
-                }
+                extract_js_class_like(node, &name, source, file_id, entities, relations);
             }
         }
         "expression_statement" => {
             // Handle prototype method assignments: obj.method = function() {}
             // and module.exports = function name() {}
-            extract_js_assignment_function(node, source, file_id, entities, relations);
+            extract_js_assignment_function(node, source, file_id, entities, relations, owners);
         }
         "lexical_declaration" | "variable_declaration" => {
             let mut decl_cursor = node.walk();
@@ -232,6 +223,35 @@ fn extract_js_node(
                 };
                 let name = name_node.utf8_text(source).unwrap_or("").to_string();
                 let value_node = declarator.child_by_field_name("value");
+
+                // A `require(...)` binding is a dependency line, not a constant.
+                // It is already carried as a `FileImport` with its specifiers,
+                // and emitting a Constant beside it doubled every dependency
+                // into the entity set: on express those bindings were the bulk
+                // of the 451 constants that buried 133 functions.
+                if value_node
+                    .as_ref()
+                    .is_some_and(|value| js_require_target(value, source).is_some())
+                {
+                    continue;
+                }
+
+                // `const Foo = class extends Bar {}` is a class declaration
+                // wearing a binding; model it as the class it is.
+                if let Some(class_value) = value_node.filter(|value| value.kind() == "class") {
+                    if !name.is_empty() {
+                        extract_js_class_like(
+                            &class_value,
+                            &name,
+                            source,
+                            file_id,
+                            entities,
+                            relations,
+                        );
+                    }
+                    continue;
+                }
+
                 let is_function_like = value_node.as_ref().is_some_and(is_js_function_like_node);
                 let kind = if is_function_like {
                     EntityKind::Function
@@ -258,7 +278,7 @@ fn extract_js_node(
                 }
                 entities.push(ExtractedEntity {
                     kind,
-                    name,
+                    name: name.clone(),
                     signature: node_signature(&declarator, source),
                     visibility: detect_js_visibility(node),
                     doc_summary: extract_preceding_comment(node, source),
@@ -268,6 +288,13 @@ fn extract_js_node(
                 if let Some(value_node) = value_node.filter(is_js_function_like_node) {
                     let context_name = name_node.utf8_text(source).unwrap_or("");
                     extract_calls_from_context(&value_node, source, context_name, relations);
+                }
+                // `const utils = { parse() {}, print: () => {} }` is a namespace
+                // object whose function properties are the methods it owns.
+                if let Some(object) = value_node.filter(|value| value.kind() == "object") {
+                    extract_js_object_methods(
+                        &object, &name, source, file_id, entities, relations, owners,
+                    );
                 }
             }
         }
@@ -279,7 +306,7 @@ fn extract_js_node(
                 if child.kind() == "default" || child.utf8_text(source).unwrap_or("") == "default" {
                     has_default = true;
                 }
-                extract_js_node(&child, source, file_id, entities, relations);
+                extract_js_node(&child, source, file_id, entities, relations, owners);
             }
             // If this is a default export and recursion didn't create any entities,
             // create a synthetic "default" entity so the linker can resolve
@@ -450,13 +477,55 @@ fn extract_assignment_lhs_name(lhs: &tree_sitter::Node, source: &[u8]) -> String
     }
 }
 
-/// Extract function entities from assignment expressions like `app.init = function() {}`.
-fn extract_js_assignment_function(
+/// Split a `member_expression` assignment target into its receiver path and the
+/// property being assigned: `res.status` -> (`res`, `status`),
+/// `View.prototype.lookup` -> (`View.prototype`, `lookup`).
+fn split_member_lhs(lhs: &tree_sitter::Node, source: &[u8]) -> Option<(String, String)> {
+    let object = lhs.child_by_field_name("object")?;
+    let property = lhs.child_by_field_name("property")?;
+    Some((
+        object.utf8_text(source).ok()?.to_string(),
+        property.utf8_text(source).ok()?.to_string(),
+    ))
+}
+
+/// The entity that owns a member assignment, or `None` when the receiver is a
+/// module-export namespace, a runtime global, or a path this adapter does not
+/// model.
+///
+/// `Foo.prototype` and `Foo` name the same owner: `Foo.prototype.bar` and
+/// `Foo.bar` are both reached as `bar` on a `Foo`, and collapsing them yields
+/// the `Owner.method` key the linker already resolves for Python and C++.
+/// `module.exports` and `exports` are the module's public surface rather than an
+/// object with methods, so their members stay module-level functions.
+pub(super) fn js_method_owner(receiver_path: &str) -> Option<&str> {
+    let base = receiver_path
+        .strip_suffix(".prototype")
+        .unwrap_or(receiver_path);
+    if base.is_empty()
+        || base.contains('.')
+        || matches!(
+            base,
+            "module" | "exports" | "this" | "window" | "global" | "globalThis" | "self"
+        )
+    {
+        return None;
+    }
+    base.chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+        .then_some(base)
+}
+
+/// Extract entities from a top-level assignment statement:
+/// `res.status = function status() {}`, `res.set = res.header = function() {}`,
+/// `View.prototype.lookup = function() {}`, `module.exports = { a() {} }`.
+pub(super) fn extract_js_assignment_function(
     node: &tree_sitter::Node,
     source: &[u8],
     file_id: &FilePathId,
     entities: &mut Vec<ExtractedEntity>,
     relations: &mut Vec<ExtractedRelation>,
+    owners: &mut JsOwners,
 ) {
     // Find the assignment_expression child
     let assign = {
@@ -470,51 +539,335 @@ fn extract_js_assignment_function(
         }
         found
     };
-    let assign = match assign {
-        Some(a) => a,
-        None => return,
+    let Some(assign) = assign else {
+        return;
     };
-    let lhs = match assign.child_by_field_name("left") {
-        Some(l) => l,
-        None => return,
+
+    // Unwrap a chained assignment so every target on the chain is modeled.
+    // `res.contentType = res.type = function contentType(t) {}` defines both
+    // names; reading only the outermost right-hand side sees another assignment
+    // and records neither.
+    let mut targets = Vec::new();
+    let mut current = assign;
+    let value = loop {
+        let (Some(lhs), Some(rhs)) = (
+            current.child_by_field_name("left"),
+            current.child_by_field_name("right"),
+        ) else {
+            return;
+        };
+        targets.push(lhs);
+        if rhs.kind() == "assignment_expression" {
+            current = rhs;
+        } else {
+            break rhs;
+        }
     };
-    let rhs = match assign.child_by_field_name("right") {
-        Some(r) => r,
-        None => return,
-    };
-    let rhs_kind = rhs.kind();
-    let is_function_rhs = matches!(
-        rhs_kind,
-        "function_expression" | "function" | "arrow_function" | "generator_function"
-    );
-    if !is_function_rhs {
+
+    for lhs in targets {
+        extract_js_assignment_target(
+            node, &lhs, &value, source, file_id, entities, relations, owners,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn extract_js_assignment_target(
+    stmt: &tree_sitter::Node,
+    lhs: &tree_sitter::Node,
+    value: &tree_sitter::Node,
+    source: &[u8],
+    file_id: &FilePathId,
+    entities: &mut Vec<ExtractedEntity>,
+    relations: &mut Vec<ExtractedRelation>,
+    owners: &mut JsOwners,
+) {
+    let member = (lhs.kind() == "member_expression")
+        .then(|| split_member_lhs(lhs, source))
+        .flatten();
+
+    // A receiver that is not the module-export namespace owns what is assigned
+    // to it: `res.status = function () {}` is a method on `res`, the shape
+    // express-era JavaScript uses instead of an ES class.
+    if let Some((receiver_path, property)) = &member {
+        if let Some(owner) = js_method_owner(receiver_path) {
+            if is_js_function_like_node(value) && !property.is_empty() {
+                let qualified = format!("{owner}.{property}");
+                owners.record(owner, lhs, source, file_id);
+                entities.push(ExtractedEntity {
+                    kind: EntityKind::Method,
+                    name: qualified.clone(),
+                    signature: node_signature(stmt, source),
+                    visibility: Visibility::Public,
+                    doc_summary: extract_preceding_comment(stmt, source),
+                    fingerprint: compute_fingerprint(stmt, source),
+                    span: span_from_node(stmt, file_id),
+                });
+                relations.push(ExtractedRelation {
+                    receiver: None,
+                    call_shape: None,
+                    kind: kin_model::RelationKind::Contains,
+                    src_name: owner.to_string(),
+                    dst_name: qualified.clone(),
+                    import_source: None,
+                });
+                extract_calls_from_context(value, source, &qualified, relations);
+            }
+            return;
+        }
+
+        // `module.exports = { parse() {}, print() {} }` is the CommonJS way of
+        // exporting a set of functions. Give each property its own entity so
+        // `require('./m').parse` has something to bind to.
+        if value.kind() == "object" && matches!(receiver_path.as_str(), "module" | "exports") {
+            for (property_name, function_node) in js_object_literal_methods(value, source) {
+                entities.push(ExtractedEntity {
+                    kind: EntityKind::Function,
+                    name: property_name.clone(),
+                    signature: node_signature(&function_node, source),
+                    visibility: Visibility::Public,
+                    doc_summary: extract_preceding_comment(&function_node, source),
+                    fingerprint: compute_fingerprint(&function_node, source),
+                    span: span_from_node(&function_node, file_id),
+                });
+                extract_calls_from_context(&function_node, source, &property_name, relations);
+            }
+            return;
+        }
+    }
+
+    if !is_js_function_like_node(value) {
         return;
     }
     // Determine the entity name: prefer the function's own name, fall back to LHS property
-    let name = if matches!(
-        rhs_kind,
+    let name = matches!(
+        value.kind(),
         "function_expression" | "function" | "generator_function"
-    ) {
-        rhs.child_by_field_name("name")
+    )
+    .then(|| {
+        value
+            .child_by_field_name("name")
             .and_then(|n| n.utf8_text(source).ok())
             .map(|s| s.to_string())
-    } else {
-        None
-    };
-    let name = name.unwrap_or_else(|| extract_assignment_lhs_name(&lhs, source));
+    })
+    .flatten()
+    .unwrap_or_else(|| extract_assignment_lhs_name(lhs, source));
     if name.is_empty() {
         return;
     }
     entities.push(ExtractedEntity {
         kind: EntityKind::Function,
         name: name.clone(),
-        signature: node_signature(node, source),
+        signature: node_signature(stmt, source),
         visibility: Visibility::Public,
+        doc_summary: extract_preceding_comment(stmt, source),
+        fingerprint: compute_fingerprint(stmt, source),
+        span: span_from_node(stmt, file_id),
+    });
+    extract_calls_from_context(value, source, &name, relations);
+}
+
+/// The function-valued properties of an object literal, as
+/// (property name, function node) pairs. Covers shorthand methods (`a() {}`),
+/// function-expression properties (`a: function () {}`) and arrow properties
+/// (`a: () => {}`).
+pub(super) fn js_object_literal_methods<'a>(
+    object: &tree_sitter::Node<'a>,
+    source: &[u8],
+) -> Vec<(String, tree_sitter::Node<'a>)> {
+    let mut found = Vec::new();
+    let mut cursor = object.walk();
+    for child in object.children(&mut cursor) {
+        match child.kind() {
+            "method_definition" => {
+                if let Some(name) = child
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                {
+                    if !name.is_empty() {
+                        found.push((name.to_string(), child));
+                    }
+                }
+            }
+            "pair" => {
+                let (Some(key), Some(value)) = (
+                    child.child_by_field_name("key"),
+                    child.child_by_field_name("value"),
+                ) else {
+                    continue;
+                };
+                if !is_js_function_like_node(&value) {
+                    continue;
+                }
+                let name = key
+                    .utf8_text(source)
+                    .unwrap_or("")
+                    .trim_matches(|c| c == '"' || c == '\'' || c == '`')
+                    .to_string();
+                if !name.is_empty() {
+                    found.push((name, value));
+                }
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
+/// Emit `Method` entities and `Contains` edges for the function properties of a
+/// named object literal (`const utils = { parse() {} }` -> `utils.parse`).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn extract_js_object_methods(
+    object: &tree_sitter::Node,
+    owner: &str,
+    source: &[u8],
+    file_id: &FilePathId,
+    entities: &mut Vec<ExtractedEntity>,
+    relations: &mut Vec<ExtractedRelation>,
+    owners: &mut JsOwners,
+) {
+    if js_method_owner(owner).is_none() {
+        return;
+    }
+    for (property_name, function_node) in js_object_literal_methods(object, source) {
+        let qualified = format!("{owner}.{property_name}");
+        owners.record(owner, object, source, file_id);
+        entities.push(ExtractedEntity {
+            kind: EntityKind::Method,
+            name: qualified.clone(),
+            signature: node_signature(&function_node, source),
+            visibility: Visibility::Public,
+            doc_summary: extract_preceding_comment(&function_node, source),
+            fingerprint: compute_fingerprint(&function_node, source),
+            span: span_from_node(&function_node, file_id),
+        });
+        relations.push(ExtractedRelation {
+            receiver: None,
+            call_shape: None,
+            kind: kin_model::RelationKind::Contains,
+            src_name: owner.to_string(),
+            dst_name: qualified.clone(),
+            import_source: None,
+        });
+        extract_calls_from_context(&function_node, source, &qualified, relations);
+    }
+}
+
+/// Extract a class entity, its `Extends` edge, and its members. Shared by
+/// `class Foo {}` and `const Foo = class {}`, which differ only in where the
+/// name comes from.
+fn extract_js_class_like(
+    node: &tree_sitter::Node,
+    name: &str,
+    source: &[u8],
+    file_id: &FilePathId,
+    entities: &mut Vec<ExtractedEntity>,
+    relations: &mut Vec<ExtractedRelation>,
+) {
+    entities.push(ExtractedEntity {
+        kind: EntityKind::Class,
+        name: name.to_string(),
+        signature: node_signature(node, source),
+        visibility: detect_js_visibility(node),
         doc_summary: extract_preceding_comment(node, source),
         fingerprint: compute_fingerprint(node, source),
         span: span_from_node(node, file_id),
     });
-    extract_calls_from_context(&rhs, source, &name, relations);
+
+    // Extract Extends relation for class inheritance.
+    // tree-sitter-javascript: class_declaration → class_heritage → <expression>.
+    // The base may be a bare identifier (`extends Animal`), a namespace member
+    // (`extends React.Component`) or a mixin call (`extends mixin(Base)`); each
+    // reduces to the rightmost identifier, which is the name the linker resolves.
+    let mut heritage_cursor = node.walk();
+    for child in node.children(&mut heritage_cursor) {
+        if child.kind() != "class_heritage" {
+            continue;
+        }
+        let mut hc = child.walk();
+        for hchild in child.children(&mut hc) {
+            let Some(parent_name) = js_heritage_name(&hchild, source) else {
+                continue;
+            };
+            relations.push(ExtractedRelation {
+                receiver: None,
+                call_shape: None,
+                kind: kin_model::RelationKind::Extends,
+                src_name: name.to_string(),
+                dst_name: parent_name,
+                import_source: None,
+            });
+            break;
+        }
+        break;
+    }
+
+    let Some(body) = node.child_by_field_name("body") else {
+        return;
+    };
+    let mut body_cursor = body.walk();
+    for member in body.children(&mut body_cursor) {
+        // `method_definition` covers methods, getters, setters and static
+        // members. `field_definition` is a method only when its value is a
+        // function (`handleClick = () => {}`, the React class-property form);
+        // a data field is not a callable and stays out of the graph.
+        let is_callable_field = member.kind() == "field_definition"
+            && member
+                .child_by_field_name("value")
+                .as_ref()
+                .is_some_and(is_js_function_like_node);
+        if member.kind() != "method_definition" && !is_callable_field {
+            continue;
+        }
+        let Some(method_name) = member
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(source).ok())
+            .filter(|n| !n.is_empty())
+        else {
+            continue;
+        };
+        let qualified = format!("{name}.{method_name}");
+        entities.push(ExtractedEntity {
+            kind: EntityKind::Method,
+            name: qualified.clone(),
+            signature: node_signature(&member, source),
+            visibility: Visibility::Public,
+            doc_summary: extract_preceding_comment(&member, source),
+            fingerprint: compute_fingerprint(&member, source),
+            span: span_from_node(&member, file_id),
+        });
+        relations.push(ExtractedRelation {
+            receiver: None,
+            call_shape: None,
+            kind: kin_model::RelationKind::Contains,
+            src_name: name.to_string(),
+            dst_name: qualified.clone(),
+            import_source: None,
+        });
+        // Extract calls within method body
+        extract_calls_from_context(&member, source, &qualified, relations);
+    }
+}
+
+/// The name a `class_heritage` child contributes to an `Extends` edge: the
+/// rightmost identifier of the base expression, or `None` for the `extends`
+/// keyword and other unnamed nodes.
+pub(super) fn js_heritage_name(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+    if !node.is_named() {
+        return None;
+    }
+    match node.kind() {
+        "identifier" => Some(node.utf8_text(source).ok()?.to_string()),
+        "member_expression" => Some(
+            node.child_by_field_name("property")?
+                .utf8_text(source)
+                .ok()?
+                .to_string(),
+        ),
+        "call_expression" => js_heritage_name(&node.child_by_field_name("function")?, source),
+        _ => None,
+    }
+    .filter(|name| !name.is_empty())
 }
 
 fn detect_js_visibility(node: &tree_sitter::Node) -> Visibility {
@@ -784,55 +1137,191 @@ fn extract_single_import_name(node: &tree_sitter::Node, source: &[u8]) -> Option
     })
 }
 
-/// Extract CommonJS require() call as a FileImport.
-/// Handles patterns like `const foo = require('./bar')`.
-fn extract_require_import(node: &tree_sitter::Node, source: &[u8]) -> Option<FileImport> {
-    // Walk into variable_declarator children
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == "variable_declarator" {
-            let var_name = child
-                .child_by_field_name("name")
-                .and_then(|n| n.utf8_text(source).ok())
-                .unwrap_or("")
+/// The module a `require(...)` expression names, plus the member picked off it.
+///
+/// Covers the three shapes a CommonJS dependency line actually takes:
+/// `require('m')`, `require('m').x` (a named export bound directly) and
+/// `require('m')(args)` (a module that is itself a factory). Anything else is
+/// not a require expression.
+pub(super) fn js_require_target(
+    node: &tree_sitter::Node,
+    source: &[u8],
+) -> Option<(String, Option<String>)> {
+    match node.kind() {
+        "call_expression" => {
+            let function = node.child_by_field_name("function")?;
+            if function.kind() == "identifier" && function.utf8_text(source).ok()? == "require" {
+                let arguments = node.child_by_field_name("arguments")?;
+                let mut cursor = arguments.walk();
+                let literal = arguments
+                    .children(&mut cursor)
+                    .find(|arg| arg.kind() == "string")?;
+                let module_path = literal
+                    .utf8_text(source)
+                    .ok()?
+                    .trim_matches(|c| c == '\'' || c == '"' || c == '`')
+                    .to_string();
+                return (!module_path.is_empty()).then_some((module_path, None));
+            }
+            // `require('depd')('express')` still binds that module to the name.
+            js_require_target(&function, source).map(|(module_path, _)| (module_path, None))
+        }
+        "member_expression" => {
+            let object = node.child_by_field_name("object")?;
+            let (module_path, _) = js_require_target(&object, source)?;
+            let member = node
+                .child_by_field_name("property")?
+                .utf8_text(source)
+                .ok()?
                 .to_string();
+            Some((module_path, (!member.is_empty()).then_some(member)))
+        }
+        _ => None,
+    }
+}
 
-            // Check if the value is a call_expression with callee "require"
-            if let Some(value) = child.child_by_field_name("value") {
-                if value.kind() == "call_expression" {
-                    if let Some(callee) = value.child(0) {
-                        let callee_text = callee.utf8_text(source).unwrap_or("");
-                        if callee_text == "require" {
-                            // Extract the argument (module path)
-                            if let Some(args) = value.child_by_field_name("arguments") {
-                                let mut args_cursor = args.walk();
-                                for arg in args.children(&mut args_cursor) {
-                                    if arg.kind() == "string" {
-                                        let module_path = arg
-                                            .utf8_text(source)
-                                            .unwrap_or("")
-                                            .trim_matches(|c| c == '\'' || c == '"')
-                                            .to_string();
-                                        if !module_path.is_empty() && !var_name.is_empty() {
-                                            return Some(FileImport {
-                                                module_path,
-                                                specifiers: vec![ImportedName {
-                                                    local_name: var_name,
-                                                    original_name: None,
-                                                    is_default: true,
-                                                }],
-                                            });
-                                        }
-                                    }
-                                }
-                            }
+/// The specifiers a require binding contributes: one for an identifier target,
+/// one per destructured key for `const { a, b: c } = require('m')`.
+fn js_require_specifiers(
+    name: &tree_sitter::Node,
+    member: Option<&str>,
+    source: &[u8],
+) -> Vec<ImportedName> {
+    match name.kind() {
+        "identifier" => {
+            let local_name = name.utf8_text(source).unwrap_or("").to_string();
+            if local_name.is_empty() {
+                return Vec::new();
+            }
+            vec![ImportedName {
+                local_name,
+                original_name: member.map(str::to_string),
+                is_default: member.is_none(),
+            }]
+        }
+        "object_pattern" => {
+            let mut specifiers = Vec::new();
+            let mut cursor = name.walk();
+            for child in name.children(&mut cursor) {
+                match child.kind() {
+                    "shorthand_property_identifier_pattern" => {
+                        let local_name = child.utf8_text(source).unwrap_or("").to_string();
+                        if !local_name.is_empty() {
+                            specifiers.push(ImportedName {
+                                local_name,
+                                original_name: None,
+                                is_default: false,
+                            });
                         }
                     }
+                    "pair_pattern" => {
+                        let original_name = child
+                            .child_by_field_name("key")
+                            .and_then(|n| n.utf8_text(source).ok())
+                            .unwrap_or("")
+                            .to_string();
+                        let local_name = child
+                            .child_by_field_name("value")
+                            .and_then(|n| n.utf8_text(source).ok())
+                            .unwrap_or("")
+                            .to_string();
+                        if !original_name.is_empty() && !local_name.is_empty() {
+                            specifiers.push(ImportedName {
+                                local_name,
+                                original_name: Some(original_name),
+                                is_default: false,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            specifiers
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Record every CommonJS `require(...)` in a top-level statement as a
+/// [`FileImport`].
+///
+/// ESM `import` is handled by `extract_js_import`; this is the half of the
+/// import surface express-era JavaScript actually uses, and cross-file
+/// resolution has no binding to work with without it.
+pub(super) fn collect_js_require_imports(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    imports: &mut Vec<FileImport>,
+) {
+    match node.kind() {
+        "lexical_declaration" | "variable_declaration" => {
+            let mut cursor = node.walk();
+            for declarator in node.children(&mut cursor) {
+                if declarator.kind() != "variable_declarator" {
+                    continue;
+                }
+                let (Some(name), Some(value)) = (
+                    declarator.child_by_field_name("name"),
+                    declarator.child_by_field_name("value"),
+                ) else {
+                    continue;
+                };
+                let Some((module_path, member)) = js_require_target(&value, source) else {
+                    continue;
+                };
+                let specifiers = js_require_specifiers(&name, member.as_deref(), source);
+                if !specifiers.is_empty() {
+                    imports.push(FileImport {
+                        module_path,
+                        specifiers,
+                    });
                 }
             }
         }
+        "expression_statement" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                match child.kind() {
+                    // `exports.static = require('serve-static')` re-exports a dependency.
+                    "assignment_expression" => {
+                        let (Some(lhs), Some(rhs)) = (
+                            child.child_by_field_name("left"),
+                            child.child_by_field_name("right"),
+                        ) else {
+                            continue;
+                        };
+                        let Some((module_path, member)) = js_require_target(&rhs, source) else {
+                            continue;
+                        };
+                        let local_name = extract_assignment_lhs_name(&lhs, source);
+                        if local_name.is_empty() {
+                            continue;
+                        }
+                        imports.push(FileImport {
+                            module_path,
+                            specifiers: vec![ImportedName {
+                                local_name,
+                                is_default: member.is_none(),
+                                original_name: member,
+                            }],
+                        });
+                    }
+                    // A bare `require('./polyfill')` is a side-effect dependency:
+                    // it binds no name, but the file still depends on that module.
+                    "call_expression" => {
+                        if let Some((module_path, _)) = js_require_target(&child, source) {
+                            imports.push(FileImport {
+                                module_path,
+                                specifiers: Vec::new(),
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
     }
-    None
 }
 
 /// Detect Jest/Vitest/Mocha test calls in JS: `test(...)`, `it(...)`, `describe(...)`.
@@ -1029,18 +1518,41 @@ mod tests {
     #[test]
     fn parse_js_prototype_method_named() {
         // app.init = function init() { ... }
+        //
+        // Contract: a function assigned to a receiver is that receiver's
+        // METHOD, named `receiver.property` and contained by the receiver —
+        // not a free function named after the right-hand side. The right-hand
+        // name is an internal recursion label; `app.init` is how the method is
+        // reached, and it is the key the linker resolves an `Owner.method`
+        // call against.
         let adapter = JavaScriptAdapter;
         let source = b"app.init = function init() { console.log('starting'); };";
         let tree = adapter.parse(source).unwrap();
         let file_id = FilePathId::new("test.js");
         let output = adapter.extract(&tree, source, &file_id).unwrap();
-        let funcs: Vec<_> = output
+        let methods: Vec<_> = output
             .entities
             .iter()
-            .filter(|e| e.kind == EntityKind::Function)
+            .filter(|e| e.kind == EntityKind::Method)
             .collect();
-        assert_eq!(funcs.len(), 1, "expected 1 function, got {:?}", funcs);
-        assert_eq!(funcs[0].name, "init");
+        assert_eq!(methods.len(), 1, "expected 1 method, got {:?}", methods);
+        assert_eq!(methods[0].name, "app.init");
+        // The receiver becomes the class-like owner that holds the method.
+        let owners: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Class)
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(owners, vec!["app"]);
+        let contains: Vec<_> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Contains)
+            .collect();
+        assert_eq!(contains.len(), 1);
+        assert_eq!(contains[0].src_name, "app");
+        assert_eq!(contains[0].dst_name, "app.init");
     }
 
     #[test]
@@ -1051,13 +1563,156 @@ mod tests {
         let tree = adapter.parse(source).unwrap();
         let file_id = FilePathId::new("test.js");
         let output = adapter.extract(&tree, source, &file_id).unwrap();
-        let funcs: Vec<_> = output
+        let methods: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Method)
+            .collect();
+        assert_eq!(methods.len(), 1, "expected 1 method, got {:?}", methods);
+        assert_eq!(methods[0].name, "res.status");
+    }
+
+    #[test]
+    fn parse_js_prototype_assignment_owns_the_constructor() {
+        // `View.prototype.lookup = ...` is a method on `View`, not on a
+        // separate `View.prototype` object: `Foo.prototype.bar` and `Foo.bar`
+        // are both reached as `bar` on a `Foo`, so both collapse to the same
+        // `Owner.method` key.
+        let adapter = JavaScriptAdapter;
+        let source = b"function View(name) { this.name = name; }\nView.prototype.lookup = function lookup(n) { return n; };";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let named: Vec<(EntityKind, &str)> = output
+            .entities
+            .iter()
+            .map(|e| (e.kind, e.name.as_str()))
+            .collect();
+        assert!(
+            named.contains(&(EntityKind::Class, "View")),
+            "a constructor carrying prototype methods is class-like, got {named:?}"
+        );
+        assert!(
+            named.contains(&(EntityKind::Method, "View.lookup")),
+            "expected View.lookup method, got {named:?}"
+        );
+        let contains: Vec<_> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Contains)
+            .map(|r| (r.src_name.as_str(), r.dst_name.as_str()))
+            .collect();
+        assert_eq!(contains, vec![("View", "View.lookup")]);
+    }
+
+    #[test]
+    fn parse_js_chained_member_assignment_defines_every_target() {
+        // `res.set = res.header = function header() {}` defines BOTH names.
+        // Reading only the outermost right-hand side sees another assignment
+        // and records neither.
+        let adapter = JavaScriptAdapter;
+        let source = b"res.set =\nres.header = function header(field, val) { return this; };";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let mut methods: Vec<&str> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Method)
+            .map(|e| e.name.as_str())
+            .collect();
+        methods.sort_unstable();
+        assert_eq!(methods, vec!["res.header", "res.set"]);
+    }
+
+    #[test]
+    fn parse_js_module_exports_object_yields_one_function_per_property() {
+        // `module.exports = { parse() {}, print: () => {} }` is the CommonJS
+        // way of exporting a set of functions. `module.exports` is the module's
+        // public surface rather than an object with methods, so its properties
+        // stay module-level functions that `require('./m').parse` can bind to.
+        let adapter = JavaScriptAdapter;
+        let source =
+            b"module.exports = { parse(input) { return scan(input); }, print: (x) => emit(x) };";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let mut funcs: Vec<&str> = output
             .entities
             .iter()
             .filter(|e| e.kind == EntityKind::Function)
+            .map(|e| e.name.as_str())
             .collect();
-        assert_eq!(funcs.len(), 1, "expected 1 function, got {:?}", funcs);
-        assert_eq!(funcs[0].name, "status");
+        funcs.sort_unstable();
+        assert_eq!(funcs, vec!["parse", "print"]);
+        let calls: Vec<(&str, &str)> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Calls)
+            .map(|r| (r.src_name.as_str(), r.dst_name.as_str()))
+            .collect();
+        assert!(calls.contains(&("parse", "scan")), "got {calls:?}");
+        assert!(calls.contains(&("print", "emit")), "got {calls:?}");
+    }
+
+    #[test]
+    fn parse_js_require_binding_is_an_import_not_a_constant() {
+        // A `require(...)` binding is a dependency line, already carried as a
+        // FileImport. Emitting a Constant beside it doubled every dependency
+        // into the entity set: on express those bindings were the bulk of the
+        // 451 constants that buried 133 functions.
+        let adapter = JavaScriptAdapter;
+        let source = br#"
+var contentDisposition = require('content-disposition');
+var { METHODS } = require('node:http');
+var isAbsolute = require('node:path').isAbsolute;
+var deprecate = require('depd')('express');
+require('./polyfill');
+exports.static = require('serve-static');
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        assert!(
+            output.entities.is_empty(),
+            "require bindings must not produce entities, got {:?}",
+            output
+                .entities
+                .iter()
+                .map(|e| (e.kind, e.name.as_str()))
+                .collect::<Vec<_>>()
+        );
+
+        let by_module: Vec<(&str, Vec<&str>)> = output
+            .imports
+            .iter()
+            .map(|imp| {
+                (
+                    imp.module_path.as_str(),
+                    imp.specifiers
+                        .iter()
+                        .map(|s| s.local_name.as_str())
+                        .collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            by_module,
+            vec![
+                ("content-disposition", vec!["contentDisposition"]),
+                ("node:http", vec!["METHODS"]),
+                ("node:path", vec!["isAbsolute"]),
+                ("depd", vec!["deprecate"]),
+                ("./polyfill", Vec::new()),
+                ("serve-static", vec!["static"]),
+            ]
+        );
+        // `require('m').x` binds the named export `x`, not the module default.
+        let member = &output.imports[2].specifiers[0];
+        assert_eq!(member.original_name.as_deref(), Some("isAbsolute"));
+        assert!(!member.is_default);
     }
 
     #[test]
@@ -1118,19 +1773,27 @@ mod tests {
 
     #[test]
     fn parse_js_arrow_function_assignment() {
-        // app.handler = (req, res) => { ... }
+        // app.handler = (req, res) => { ... } — an arrow assigned to a receiver
+        // is that receiver's method, same as a function expression.
         let adapter = JavaScriptAdapter;
         let source = b"app.handler = (req, res) => { res.send('ok'); };";
         let tree = adapter.parse(source).unwrap();
         let file_id = FilePathId::new("test.js");
         let output = adapter.extract(&tree, source, &file_id).unwrap();
-        let funcs: Vec<_> = output
+        let methods: Vec<_> = output
             .entities
             .iter()
-            .filter(|e| e.kind == EntityKind::Function)
+            .filter(|e| e.kind == EntityKind::Method)
             .collect();
-        assert_eq!(funcs.len(), 1, "expected 1 function, got {:?}", funcs);
-        assert_eq!(funcs[0].name, "handler");
+        assert_eq!(methods.len(), 1, "expected 1 method, got {:?}", methods);
+        assert_eq!(methods[0].name, "app.handler");
+        let calls: Vec<(&str, &str)> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Calls)
+            .map(|r| (r.src_name.as_str(), r.dst_name.as_str()))
+            .collect();
+        assert_eq!(calls, vec![("app.handler", "send")]);
     }
 
     #[test]
@@ -1319,22 +1982,35 @@ mod tests {
     #[test]
     fn parse_js_exported_object_with_callback_kept() {
         let adapter = JavaScriptAdapter;
-        // Object literals with function-like children are meaningful code
+        // Object literals with function-like children are meaningful code.
+        //
+        // Contract: such a literal is a namespace object, so it is kinded
+        // Class and each function property becomes a Method it contains. That
+        // is the kind the linker's receiver-method tier requires; a Constant
+        // owner would leave `handlers.onClick` unreachable as a call target.
         let source = b"export const handlers = { onClick: () => console.log('click') };";
         let tree = adapter.parse(source).unwrap();
         let file_id = FilePathId::new("test.js");
         let output = adapter.extract(&tree, source, &file_id).unwrap();
-        let constants: Vec<_> = output
+        let named: Vec<(EntityKind, &str)> = output
             .entities
             .iter()
-            .filter(|e| e.kind == EntityKind::Constant)
+            .map(|e| (e.kind, e.name.as_str()))
             .collect();
         assert_eq!(
-            constants.len(),
-            1,
-            "object literals with callbacks should be kept"
+            named,
+            vec![
+                (EntityKind::Class, "handlers"),
+                (EntityKind::Method, "handlers.onClick"),
+            ]
         );
-        assert_eq!(constants[0].name, "handlers");
+        let contains: Vec<_> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Contains)
+            .map(|r| (r.src_name.as_str(), r.dst_name.as_str()))
+            .collect();
+        assert_eq!(contains, vec![("handlers", "handlers.onClick")]);
     }
 
     #[test]
