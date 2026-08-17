@@ -54,6 +54,66 @@ fn kin_init(repo: &Path, home: &Path, extra: &[&str]) -> std::process::Output {
         .expect("run kin init")
 }
 
+fn git_stdout(path: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", kin_git::empty_global_git_config())
+        .current_dir(path)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("utf8 git stdout")
+}
+
+/// A converted repository's `git status` must not name the store.
+///
+/// `.kin/` runs from hundreds of megabytes to over a gigabyte, and Kin authors
+/// no ignore rules of its own, so the store stood in `git status` as untracked
+/// for the life of the checkout and one careless `git add -A` staged all of it.
+/// The exclusion belongs to this checkout, so it goes in `.git/info/exclude` and
+/// never in the tracked `.gitignore`, where it would enter the user's diff.
+///
+/// Driven through the binary, because the exclusion writer being correct and
+/// `kin init` never calling it look identical from a unit test.
+#[test]
+fn git_init_keeps_the_store_out_of_git_status() {
+    let root = tempdir().expect("temp root");
+    let home = root.path().join("home");
+    let repo = root.path().join("excluded");
+    fs::create_dir_all(&home).expect("create home");
+    seed_git_repo(&repo);
+
+    let output = kin_init(&repo, &home, &[]);
+    assert!(
+        output.status.success(),
+        "init failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(repo.join(".kin").is_dir(), "init published no store");
+
+    let status = git_stdout(&repo, &["status", "--porcelain"]);
+    assert!(
+        !status.contains(".kin"),
+        "git status must not name the store after init: {status}"
+    );
+    assert!(
+        !repo.join(".gitignore").exists(),
+        "the exclusion must stay local rather than entering the tracked ignore file"
+    );
+    let exclude = fs::read_to_string(repo.join(".git/info/exclude")).expect("read local exclude");
+    assert!(
+        exclude.lines().any(|line| line.trim() == "/.kin/"),
+        "the local exclude must carry the anchored store pattern: {exclude}"
+    );
+}
+
 #[test]
 fn fresh_native_init_creates_unborn_repository_authority() {
     let root = tempdir().expect("temp root");
