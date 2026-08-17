@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Stand the ambient reconcile tick down for a commit already inside the daemon (#860)
 - Install Rust toolchains from the runner's rustup instead of a downloaded action (#881)
+- Reuse the first Git source proof, draw admission progress on the phase line, and serve graph status from the daemon's cached authority (#873)
+- Exclude the store at init, report 1-based lines from kin refs, and make the context pack's cost honest (#874)
+- Re-resolve the spine's repository root on demand instead of once at startup (#880)
+- Gate absence authority on the cross-file edge classes a query reads (#872)
 
 
 ## [0.5.37] - 2026-08-17
