@@ -376,7 +376,9 @@ nk = "nk.cli:main"
             manifests_unreadable: Vec::new(),
         };
 
-        assert!(declared.declaration_for(&entity("main", "nk/cli.py")).is_some());
+        assert!(declared
+            .declaration_for(&entity("main", "nk/cli.py"))
+            .is_some());
         assert!(declared
             .declaration_for(&entity("main", "src/nk/cli.py"))
             .is_some());
@@ -387,7 +389,9 @@ nk = "nk.cli:main"
             "the declaration names main, not every function in the file"
         );
         assert!(
-            declared.declaration_for(&entity("main", "nk/other.py")).is_none(),
+            declared
+                .declaration_for(&entity("main", "nk/other.py"))
+                .is_none(),
             "the declaration names nk.cli, not every module"
         );
     }
@@ -407,8 +411,12 @@ nkp = "nk.legacy:run"
             manifests_read: vec!["pyproject.toml".to_string()],
             manifests_unreadable: Vec::new(),
         };
-        assert!(declared.declaration_for(&entity("launch", "nk/gui.py")).is_some());
-        assert!(declared.declaration_for(&entity("run", "nk/legacy.py")).is_some());
+        assert!(declared
+            .declaration_for(&entity("launch", "nk/gui.py"))
+            .is_some());
+        assert!(declared
+            .declaration_for(&entity("run", "nk/legacy.py"))
+            .is_some());
     }
 
     #[test]
@@ -420,9 +428,13 @@ nkp = "nk.legacy:run"
             manifests_read: vec!["package.json".to_string()],
             manifests_unreadable: Vec::new(),
         };
-        assert!(declared.declaration_for(&entity("main", "bin/cli.js")).is_some());
+        assert!(declared
+            .declaration_for(&entity("main", "bin/cli.js"))
+            .is_some());
         assert!(
-            declared.declaration_for(&entity("helper", "bin/cli.js")).is_none(),
+            declared
+                .declaration_for(&entity("helper", "bin/cli.js"))
+                .is_none(),
             "a bin path names the file, so only its runtime entry is claimed"
         );
     }
@@ -443,8 +455,12 @@ path = "src/cli.rs"
             manifests_read: vec!["Cargo.toml".to_string()],
             manifests_unreadable: Vec::new(),
         };
-        assert!(declared.declaration_for(&entity("main", "src/cli.rs")).is_some());
-        assert!(declared.declaration_for(&entity("main", "src/main.rs")).is_some());
+        assert!(declared
+            .declaration_for(&entity("main", "src/cli.rs"))
+            .is_some());
+        assert!(declared
+            .declaration_for(&entity("main", "src/main.rs"))
+            .is_some());
     }
 
     #[test]
@@ -456,10 +472,7 @@ path = "src/cli.rs"
             "maintain",
             "nk/cli.py"
         )));
-        assert!(!is_conventional_entry_point(&entity(
-            "domain",
-            "nk/cli.py"
-        )));
+        assert!(!is_conventional_entry_point(&entity("domain", "nk/cli.py")));
     }
 
     #[test]

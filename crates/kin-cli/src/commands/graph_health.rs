@@ -662,8 +662,14 @@ mod tests {
             ..complete_coverage()
         };
 
-        let report =
-            build_graph_health_report(&stats, &supported_inputs, &contamination, coverage, None, Default::default());
+        let report = build_graph_health_report(
+            &stats,
+            &supported_inputs,
+            &contamination,
+            coverage,
+            None,
+            Default::default(),
+        );
 
         assert!(!report.graph_empty_for_supported_inputs);
         assert!(report.critical_issues.is_empty());
@@ -692,7 +698,9 @@ mod tests {
                 path_samples: vec!["out/generated.rs".to_string()],
             },
             complete_coverage(),
-            None, Default::default())
+            None,
+            Default::default(),
+        )
     }
 
     #[test]
@@ -783,7 +791,9 @@ mod tests {
                 path_samples: Vec::new(),
             },
             coverage,
-            None, Default::default());
+            None,
+            Default::default(),
+        );
 
         assert!(report.repository_artifact_coverage.complete);
         assert!(report.critical_issues.is_empty());
@@ -828,7 +838,9 @@ mod tests {
             &empty_supported_inputs(),
             &no_contamination(),
             coverage,
-            None, Default::default());
+            None,
+            Default::default(),
+        );
 
         assert!(!report.repository_artifact_coverage.complete);
         assert!(report
@@ -861,7 +873,9 @@ mod tests {
             },
             &no_contamination(),
             coverage,
-            None, Default::default());
+            None,
+            Default::default(),
+        );
 
         assert!(report.critical_issues.is_empty());
         assert!(report
@@ -893,7 +907,9 @@ mod tests {
             },
             &no_contamination(),
             coverage,
-            None, Default::default());
+            None,
+            Default::default(),
+        );
 
         assert!(!report.graph_empty_for_supported_inputs);
         assert!(report.critical_issues.is_empty());
@@ -919,7 +935,9 @@ mod tests {
             },
             &no_contamination(),
             coverage,
-            None, Default::default());
+            None,
+            Default::default(),
+        );
 
         assert!(report.graph_empty_for_supported_inputs);
     }

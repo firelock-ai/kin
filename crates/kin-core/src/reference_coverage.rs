@@ -223,7 +223,10 @@ fn language_summary(coverage: &LanguageReferenceCoverage) -> String {
             coverage.resolved_call_edges
         ),
         (Some(parsed), None) => format!("calls {}/{parsed}", coverage.resolved_call_edges),
-        (None, _) => format!("calls {} resolved, parse side unmeasured", coverage.resolved_call_edges),
+        (None, _) => format!(
+            "calls {} resolved, parse side unmeasured",
+            coverage.resolved_call_edges
+        ),
     };
     let imports = match (coverage.parsed_import_statements, coverage.import_percent()) {
         (Some(parsed), Some(percent)) => format!(
@@ -337,8 +340,7 @@ where
             if !allowed.contains(&relation.kind) || !seen_relations.insert(relation.id) {
                 continue;
             }
-            let (GraphNodeId::Entity(src), GraphNodeId::Entity(dst)) =
-                (relation.src, relation.dst)
+            let (GraphNodeId::Entity(src), GraphNodeId::Entity(dst)) = (relation.src, relation.dst)
             else {
                 continue;
             };
@@ -416,7 +418,11 @@ fn classify(
 }
 
 fn read_count(entity: &Entity, key: &str) -> Option<u64> {
-    entity.metadata.extra.get(key).and_then(|value| value.as_u64())
+    entity
+        .metadata
+        .extra
+        .get(key)
+        .and_then(|value| value.as_u64())
 }
 
 #[cfg(test)]

@@ -722,7 +722,9 @@ fn build_graph_validate_response(
             .to_string(),
     );
     lines.extend(health.reference_edge_coverage.summary_lines());
-    let unsupportable = health.reference_edge_coverage.unsupportable_absence_reasons();
+    let unsupportable = health
+        .reference_edge_coverage
+        .unsupportable_absence_reasons();
     if !unsupportable.is_empty() {
         lines.push(String::new());
         for reason in unsupportable {
@@ -1914,9 +1916,8 @@ mod tests {
         // other one is printed beside it. A pass here was read as a clean bill
         // on a graph missing most of its relation edges.
         assert!(
-            response.lines.iter().any(|line| line.starts_with(
-                "Integrity only: these checks say the edges present are coherent"
-            )),
+            response.lines.iter().any(|line| line
+                .starts_with("Integrity only: these checks say the edges present are coherent")),
             "{:?}",
             response.lines
         );

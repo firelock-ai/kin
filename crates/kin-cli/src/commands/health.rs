@@ -1943,8 +1943,7 @@ async fn check_reference_edge_coverage() -> HealthCheck {
             "n/a — not in a Kin repository",
         );
     };
-    let Some(daemon_url) =
-        crate::daemon_client::resolve_daemon_url_if_running_async(&layout).await
+    let Some(daemon_url) = crate::daemon_client::resolve_daemon_url_if_running_async(&layout).await
     else {
         return HealthCheck::new(
             ID,
