@@ -1275,11 +1275,14 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     // reads. An empty reference list is only evidence about the code when the
     // graph demonstrably holds cross-file edges of those classes for the focal's
     // language, and nothing else in this payload reports that.
-    let edge_coverage = crate::edge_coverage::observe_cross_file_reference_coverage(
-        store,
-        &target,
-        &relation_kinds,
-    );
+    //
+    // Observed only for an empty answer, which is the only answer whose trust
+    // depends on it: an answer that returned rows has proved the edges exist by
+    // returning them, and paying a language scan on the populated path would be
+    // a cost with nothing to buy.
+    let edge_coverage = references.is_empty().then(|| {
+        crate::edge_coverage::observe_cross_file_reference_coverage(store, &target, &relation_kinds)
+    });
 
     let mut result = serde_json::json!({
         "focal_entity": {
@@ -1298,7 +1301,9 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
         "references": references,
         "cross_repo": cross_repo,
     });
-    result[crate::edge_coverage::EDGE_COVERAGE_KEY] = edge_coverage;
+    if let Some(edge_coverage) = edge_coverage {
+        result[crate::edge_coverage::EDGE_COVERAGE_KEY] = edge_coverage;
+    }
 
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
@@ -2568,12 +2573,15 @@ pub fn handle_trace_data_flow<G: GraphStore>(
     let total_steps = chain.len();
     // The walk expands exactly the reference kinds above, so an empty chain is
     // only evidence about the focal when the graph holds cross-file edges of
-    // those kinds for its language.
-    let edge_coverage = crate::edge_coverage::observe_cross_file_reference_coverage(
-        store,
-        &focal_entity,
-        &reference_kinds,
-    );
+    // those kinds for its language. A walk that returned steps needs no such
+    // evidence and pays no scan for it.
+    let edge_coverage = chain.is_empty().then(|| {
+        crate::edge_coverage::observe_cross_file_reference_coverage(
+            store,
+            &focal_entity,
+            &reference_kinds,
+        )
+    });
     let mut result = serde_json::json!({
         "focal_id": focal_entity.id.to_string(),
         "focal_name": focal_entity.name,
@@ -2589,7 +2597,9 @@ pub fn handle_trace_data_flow<G: GraphStore>(
             "same_name_candidates": same_name_candidates,
         },
     });
-    result[crate::edge_coverage::EDGE_COVERAGE_KEY] = edge_coverage;
+    if let Some(edge_coverage) = edge_coverage {
+        result[crate::edge_coverage::EDGE_COVERAGE_KEY] = edge_coverage;
+    }
 
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
@@ -3929,6 +3939,42 @@ mod tests {
             trust_reason(&response).starts_with("cross_file_edges_absent"),
             "{}",
             trust_reason(&response)
+        );
+    }
+
+    /// An answer that returned rows proved the edges exist by returning them, so
+    /// it pays no language scan and carries no observation. Stating it as a test
+    /// keeps the populated path from silently acquiring one.
+    #[tokio::test]
+    async fn a_populated_reference_answer_carries_no_edge_observation() {
+        let store = InMemoryGraph::new();
+        let caller = make_entity("caller", "src/a.rs");
+        let target = make_entity("target", "src/b.rs");
+        store.upsert_entity(&caller).unwrap();
+        store.upsert_entity(&target).unwrap();
+        store
+            .upsert_relation(&make_relation(caller.id, target.id, RelationKind::Calls))
+            .unwrap();
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let response = parsed_response(&crate::finalize_with_envelope(
+            handle_find_references(&args, &store, None).await.unwrap(),
+            structurally_ready_envelope(),
+            "find_references",
+        ));
+        assert_eq!(response["total_upstream"], 1);
+        assert!(
+            response
+                .get(crate::edge_coverage::EDGE_COVERAGE_KEY)
+                .is_none(),
+            "a populated answer needs no coverage observation: {response}"
+        );
+        assert!(
+            response.get("negative").is_none(),
+            "and carries no negative to consume one"
         );
     }
 

@@ -39,6 +39,12 @@
 //! completed and found none, `unknown` means the scan stopped on its budget
 //! before it could say. A consumer that cannot find this object must treat
 //! coverage as unknown rather than assuming either verdict.
+//!
+//! The single-focal tools attach it to an EMPTY answer only, since that is the
+//! only answer whose trust depends on it: one that returned rows proved the
+//! edges exist by returning them. The batch tool attaches it always, because its
+//! per-entity `has_references: false` rows are absences inside a populated
+//! response.
 
 use serde_json::{json, Map, Value};
 
@@ -169,13 +175,22 @@ pub fn observe_cross_file_reference_coverage_for_languages<S: EntityStore>(
         .map(|(kind, _)| class_name(*kind))
         .collect();
 
-    json!({
-        "scope": "language",
-        "language": observed_languages
+    // A batch that resolved no entity has no language to scope an observation to,
+    // and an empty string would read as one. Naming the absence keeps the reason
+    // it produces readable.
+    let language = if observed_languages.is_empty() {
+        "no resolved language".to_string()
+    } else {
+        observed_languages
             .iter()
             .map(|language| format!("{language:?}"))
             .collect::<Vec<_>>()
-            .join(", "),
+            .join(", ")
+    };
+
+    json!({
+        "scope": "language",
+        "language": language,
         "requested_classes": merged
             .iter()
             .map(|(kind, _)| class_name(*kind))

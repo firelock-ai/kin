@@ -269,6 +269,7 @@ fn edge_coverage_gap(tool: &str, payload: &Value) -> Option<String> {
     let language = coverage
         .get("language")
         .and_then(Value::as_str)
+        .filter(|language| !language.trim().is_empty())
         .unwrap_or("an unreported language");
     let states = coverage.get("classes").and_then(Value::as_object);
     let state_for = |class: &str| -> &str {
@@ -675,18 +676,42 @@ fn build_advice(
 }
 
 /// The consequence sentence for a retrieval tool that ran and came back empty.
+///
+/// The untrustworthy arms prescribe nothing specific, because the advice is
+/// finished by naming the gap that actually held (see
+/// [`absence_advice_consequence`]). They
+/// used to end with "re-check after embedding is complete", which is the wrong
+/// instruction for every structural gap: a missing cross-file call edge is not
+/// waiting on an embedding, and a reader who follows that advice re-runs the
+/// query unchanged and gets the identical unusable answer.
 fn absence_consequence(always: bool, trustworthy: bool) -> &'static str {
     match (always, trustworthy) {
         (true, true) => {
             "A `has_references: false` row here is an authoritative negative — safe to treat that entity as unreferenced."
         }
         (true, false) => {
-            "Do NOT treat a `has_references: false` row as proof of disuse: the index is not authoritative yet, so a false verdict may simply mean 'not indexed'. Re-check once trust is authoritative."
+            "Do NOT treat a `has_references: false` row as proof of disuse: a false verdict here may mean the batch could not observe what it was asked about."
         }
         (false, true) => "Absence is authoritative: safe to treat the target as genuinely absent/unused.",
         (false, false) => {
-            "Absence is NOT authoritative: do not conclude the target is unused or deletable — an empty result may mean 'not indexed'. Re-check after embedding is complete and the daemon is healthy."
+            "Absence is NOT authoritative: do not conclude the target is unused or deletable, because an empty result here may mean the query could not observe what it was asked about."
         }
+    }
+}
+
+/// The consequence an absence carries, with the limiting factor named when there
+/// is one.
+///
+/// A verdict and its cause belong in the same sentence a reader acts on. The
+/// isolated-install report quoted the advice line verbatim as the thing it
+/// believed, so an advice line that states the consequence and leaves the cause
+/// in a neighbouring field is one field away from being acted on blind.
+fn absence_advice_consequence(always: bool, trustworthy: bool, trust_reason: &str) -> String {
+    let consequence = absence_consequence(always, trustworthy);
+    if trustworthy {
+        consequence.to_string()
+    } else {
+        format!("{consequence} Limiting factor: {trust_reason}")
     }
 }
 
@@ -1078,9 +1103,9 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
         "absent_as_indexed"
     };
     let consequence = if ranking_names_nothing {
-        unnamed_ranking_consequence()
+        unnamed_ranking_consequence().to_string()
     } else {
-        absence_consequence(spec.always, trustworthy)
+        absence_advice_consequence(spec.always, trustworthy, &trust_reason)
     };
 
     let degraded_signals = degraded_signals(payload, envelope);
@@ -1109,7 +1134,7 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
         "advice".to_string(),
         json!(build_advice(
             subject,
-            consequence,
+            &consequence,
             envelope,
             &degraded_signals
         )),
@@ -1204,9 +1229,12 @@ pub fn resolution_miss_for(tool: &str, message: &str, envelope: &Envelope) -> Op
     }
 
     let consequence = if trustworthy {
-        "The name is authoritatively absent from this graph: no entity carries it. That is a fact about the name and not about the symbol's usage, because nothing was looked up."
+        "The name is authoritatively absent from this graph: no entity carries it. That is a fact about the name and not about the symbol's usage, because nothing was looked up.".to_string()
     } else {
-        "Absence is NOT authoritative: the name may simply not be indexed yet, so do not conclude the symbol does not exist. Re-check once the graph is complete and the daemon is healthy."
+        format!(
+            "Absence is NOT authoritative: the name may simply not be indexed yet, so do not \
+             conclude the symbol does not exist. Limiting factor: {trust_reason}"
+        )
     };
 
     // A miss carries no payload, so the daemon's own flags are the whole
@@ -1242,7 +1270,7 @@ pub fn resolution_miss_for(tool: &str, message: &str, envelope: &Envelope) -> Op
         "advice".to_string(),
         json!(build_advice(
             subject,
-            consequence,
+            &consequence,
             envelope,
             &degraded_signals
         )),
@@ -1608,10 +1636,19 @@ mod tests {
         );
         // The advice an agent acts on has to agree with the verdict, or the
         // envelope contradicts itself one field apart.
-        assert!(negative["advice"]
-            .as_str()
-            .unwrap()
-            .contains("NOT authoritative"));
+        let advice = negative["advice"].as_str().unwrap();
+        assert!(advice.contains("NOT authoritative"));
+        // And it has to name the gap rather than prescribe an unrelated remedy.
+        // The old wording told the reader to re-check after embedding was
+        // complete, which no amount of embedding would ever satisfy here.
+        assert!(
+            advice.contains("Limiting factor: cross_file_edges_absent"),
+            "the advice names the gap it is about: {advice}"
+        );
+        assert!(
+            !advice.contains("after embedding is complete"),
+            "embedding completeness is not the remedy for a missing edge class: {advice}"
+        );
     }
 
     /// A payload that reports no observation at all is the unknown case. This is
@@ -1803,6 +1840,25 @@ mod tests {
             negative_for("find_references", &payload, &structural_ready_envelope()).unwrap();
         assert_eq!(negative["safe_to_conclude_absent"], json!(true));
         assert_eq!(negative["trust"], json!("authoritative"));
+    }
+
+    /// The one substrate reason the suite could not produce before: a daemon
+    /// that finished first reconciliation and reports no graph loaded. An
+    /// unreachable reason is indistinguishable from a wrong one, since nothing
+    /// shows it follows from the condition it names.
+    #[test]
+    fn find_references_on_an_unloaded_graph_names_the_load_gate() {
+        let env = Envelope::daemon().with_health(&json!({
+            "initialized": true,
+            "graph_loaded": false,
+        }));
+        let payload = authoritative_empty_references("function");
+        let negative = negative_for("find_references", &payload, &env).unwrap();
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert!(negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("graph_not_loaded"));
     }
 
     #[test]
