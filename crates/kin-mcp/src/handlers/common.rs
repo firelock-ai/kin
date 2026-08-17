@@ -400,6 +400,49 @@ pub use kin_ranking::entity_ranking::{
     trace_callee_score, trace_entity_is_external, trace_fanout_score, trace_relation_rank,
 };
 
+/// Serialized characters one trace response may occupy before the tool cuts its
+/// own payload.
+///
+/// Every other bound on a trace shapes the WALK, and none of them bounds the
+/// ANSWER: a walk inside all of them returned 228,413 characters over 2,453
+/// lines from a 777-entity repository and the client refused the whole result,
+/// so the caller got neither the chain nor a way to ask for less.
+///
+/// Sized against the tool-result ceilings agent clients actually apply, which
+/// are counted in tokens; at roughly 3.5 characters per token of JSON-wrapped
+/// source this leaves headroom under a 25k-token cap for the envelope the MCP
+/// path wraps around this payload.
+///
+/// Defined here rather than beside either walk because BOTH walks serve this one
+/// tool — the generic-store arm in `handlers::entities` and the body-inlining
+/// arm in `kin_cli::commands::trace_data_flow`, which reads these through this
+/// module. Two definitions would let one arm promise a bound the other does not
+/// keep.
+pub const TRACE_DEFAULT_MAX_RESPONSE_CHARS: usize = 80_000;
+
+/// Floor for a caller-supplied budget. Below this the envelope alone does not
+/// fit, so a smaller number could only be honoured by returning nothing.
+pub const TRACE_MIN_MAX_RESPONSE_CHARS: usize = 2_000;
+
+/// Ceiling for a caller-supplied budget. A caller with a larger window may raise
+/// the bound, but not to unbounded: the daemon serving this has other callers,
+/// and a response nothing can read is not worth building.
+pub const TRACE_MAX_MAX_RESPONSE_CHARS: usize = 400_000;
+
+/// Characters held back from the budget for the disclosure a cut adds.
+///
+/// A response cut to exactly its ceiling and then told to explain the cut is
+/// over its ceiling again, by the length of the explanation. Reserving the room
+/// first is what makes the bound hold for the payload that actually ships.
+pub const TRACE_DISCLOSURE_RESERVE_CHARS: usize = 1_500;
+
+/// The budget a trace request asks for, clamped to what this tool will serve.
+pub fn trace_response_budget(requested: Option<usize>) -> usize {
+    requested
+        .unwrap_or(TRACE_DEFAULT_MAX_RESPONSE_CHARS)
+        .clamp(TRACE_MIN_MAX_RESPONSE_CHARS, TRACE_MAX_MAX_RESPONSE_CHARS)
+}
+
 pub fn next_trace_step<G: GraphStore>(
     store: &G,
     current: &Entity,
