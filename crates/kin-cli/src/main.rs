@@ -8,9 +8,9 @@ use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{self, Shell};
 use kin_cli::commands;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use tracing::Instrument;
-use std::io::IsTerminal;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
@@ -3580,7 +3580,11 @@ impl tracing::field::Visit for AdmissionProgressFields {
 }
 
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AdmissionProgressLayer {
-    fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
         if !is_periodic_admission_progress(event.metadata().target()) {
             return;
         }

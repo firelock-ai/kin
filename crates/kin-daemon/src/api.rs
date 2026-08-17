@@ -3449,17 +3449,29 @@ async fn command_graph(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    // Through the cache rather than the bare binding. Every graph command here
-    // reads durable repository state, and an open re-verifies every persisted
-    // body against its content address, so opening per request made `kin graph
-    // status` cost the whole store each time it printed counters. The cache is
-    // keyed on the durable publication identity read before the load it labels,
-    // so a reused authority is one this daemon confirmed is still current.
+    // Through the cache rather than the bare binding. `graph status` reads
+    // durable repository state, and an open re-verifies every persisted body
+    // against its content address, so opening per request made it cost the
+    // whole store every time it printed counters. The cache is keyed on the
+    // durable publication identity read before the load it labels, so a reused
+    // authority is one this daemon confirmed is still current.
+    //
+    // Resolved lazily rather than eagerly, because `graph inspect` answers from
+    // the live graph alone. Eager resolution would make it start requiring a
+    // storage capability it has never needed and pay for an open it never
+    // reads.
     let binding = state
         .local_repository_authority_binding()
         .map_err(repository_authority_error)?;
+    let resolver_state = Arc::clone(&state);
     let repository_authority =
-        shared_command_authority(binding, command_repository_authority(&state)?);
+        kin_cli::commands::repository_authority::RequestRepositoryAuthority::shared(
+            binding,
+            Arc::new(move || {
+                command_repository_authority(&resolver_state)
+                    .map_err(|(_, message)| anyhow::anyhow!(message))
+            }),
+        );
     let embedding_runtime = graph_status_embedding_runtime(&state, &graph);
     let response = kin_cli::commands::graph::execute_graph_command(
         &repository_authority,
