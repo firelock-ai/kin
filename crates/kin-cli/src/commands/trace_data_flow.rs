@@ -815,7 +815,10 @@ pub fn build_trace_data_flow_response_within(
                     (focal_entity.id.to_string(), focal_entity.name.clone())
                 } else {
                     let step = &chain[node.step - 1];
-                    (step.entity.entity_id.clone(), step.entity.entity_name.clone())
+                    (
+                        step.entity.entity_id.clone(),
+                        step.entity.entity_name.clone(),
+                    )
                 };
                 clipped_steps.push(TraceFanoutClip {
                     step: node.step,
@@ -835,8 +838,7 @@ pub fn build_trace_data_flow_response_within(
                 let candidate_external =
                     kin_ranking::entity_ranking::trace_entity_is_external(&candidate.entity);
                 if let Some(&existing) = name_index.get(candidate.entity.name.as_str()) {
-                    let existing_external =
-                        existing > 0 && chain[existing - 1].entity.external;
+                    let existing_external = existing > 0 && chain[existing - 1].entity.external;
                     if candidate_external {
                         // A record for this name is already in the response.
                         // A second, location-less one adds no information and
@@ -850,9 +852,7 @@ pub fn build_trace_data_flow_response_within(
                         // Fill it in with the record the graph does own rather
                         // than admitting one symbol twice.
                         let source = bodies_included
-                            .then(|| {
-                                source_record_or_none(projection.as_ref(), &candidate.entity)
-                            })
+                            .then(|| source_record_or_none(projection.as_ref(), &candidate.entity))
                             .flatten();
                         let promoted = &mut chain[existing - 1];
                         promoted.entity = entity_record(&candidate.entity, source.as_ref());
@@ -862,8 +862,11 @@ pub fn build_trace_data_flow_response_within(
                         // replaced it does, so it re-enters the frontier at the
                         // depth it already sits at.
                         if promoted.depth < depth {
-                            next_frontier
-                                .push(FrontierNode::at(existing, promoted.depth, &candidate.entity));
+                            next_frontier.push(FrontierNode::at(
+                                existing,
+                                promoted.depth,
+                                &candidate.entity,
+                            ));
                         }
                         continue;
                     }
@@ -1152,7 +1155,10 @@ fn enforce_response_budget(response: &mut TraceDataFlowResponse) {
     } else {
         "bodies_omitted"
     };
-    let cut = match (bodies_omitted + usize::from(focal_body_omitted), steps_omitted) {
+    let cut = match (
+        bodies_omitted + usize::from(focal_body_omitted),
+        steps_omitted,
+    ) {
         (bodies, 0) => format!("{bodies} inlined bodies were dropped"),
         (0, steps) => format!("{steps} steps were dropped from the end of the chain"),
         (bodies, steps) => format!(
@@ -2180,10 +2186,7 @@ mod tests {
             .iter()
             .all(|step| step.step <= kept && step.parent_step <= kept));
         assert!(
-            response
-                .clipped_steps
-                .iter()
-                .all(|clip| clip.step <= kept),
+            response.clipped_steps.iter().all(|clip| clip.step <= kept),
             "a clip must not name a step the response dropped"
         );
         let cut = response
