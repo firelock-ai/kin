@@ -1113,14 +1113,13 @@ mod tests {
             })
             .unwrap();
 
-        let coverage =
-            collect_repository_artifact_coverage_for_tree(
-                &tree,
-                &graph,
-                &graph.resolved_tree(),
-                &no_bodies(),
-            )
-            .unwrap();
+        let coverage = collect_repository_artifact_coverage_for_tree(
+            &tree,
+            &graph,
+            &graph.resolved_tree(),
+            &no_bodies(),
+        )
+        .unwrap();
 
         assert!(!coverage.complete);
         assert_eq!(coverage.conflicting_enrichment_path_count, 1);
@@ -1197,14 +1196,13 @@ mod tests {
             TreeEntry::blob(new_hash, false),
         )])
         .unwrap();
-        let coverage =
-            collect_repository_artifact_coverage_for_tree(
-                &authority_tree,
-                &graph,
-                &graph.resolved_tree(),
-                &no_bodies(),
-            )
-                .unwrap();
+        let coverage = collect_repository_artifact_coverage_for_tree(
+            &authority_tree,
+            &graph,
+            &graph.resolved_tree(),
+            &no_bodies(),
+        )
+        .unwrap();
         assert_eq!(coverage.missing_enrichment_path_count, 1);
         assert_eq!(coverage.content_mismatch_path_count, 0);
         assert_eq!(coverage.stale_enrichment_path_count, 0);
@@ -1251,7 +1249,7 @@ mod tests {
             &graph.resolved_tree(),
             &staged_bodies([(hash, body)]),
         )
-            .unwrap()
+        .unwrap()
     }
 
     /// An admitted workflow file whose facet is exactly what its extractor
