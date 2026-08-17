@@ -29716,4 +29716,111 @@ mod tests {
             );
         }
     }
+
+    /// The write-then-commit cadence pays for one repository-authority
+    /// successor, not two.
+    ///
+    /// An agent writes a file and commits it immediately. The watcher
+    /// notification reaches the reconcile loop first, so an ambient tick admits
+    /// the file and publishes a successor for it, and the commit that arrives a
+    /// moment later admits the same working copy and publishes a second one.
+    /// Both are O(store): on the store this was measured against, the tick's
+    /// publication was 11.7 seconds and a second ~189MB snapshot write for a
+    /// one-line change.
+    ///
+    /// The race is composed here rather than hoped for. The tick's admission
+    /// runs while a commit is inside the daemon, which is exactly what the
+    /// daemon's own ordering produces: the commit announces itself at the top of
+    /// its handler and then waits on the coordination gate the tick is holding.
+    /// One generation for the pair is the whole acceptance, and the graph-owned
+    /// assertion is what stops a tick that published nothing AND admitted
+    /// nothing from passing it.
+    #[cfg(unix)]
+    #[tokio::test]
+    // Commit phases are emitted at debug level when they are fast, and the
+    // level a `tracing` event is filtered by is a process-global hint. A test
+    // that captures those events therefore cannot run beside one that emits
+    // them, so every test on either side of that shares this group.
+    #[serial_test::serial(commit_phase_capture)]
+    async fn a_tick_racing_a_commit_publishes_one_authority_successor_between_them() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        std::fs::write(
+            repo.path().join("raced.rs"),
+            b"pub fn raced() -> u32 { 1 }\n",
+        )
+        .unwrap();
+        let repo_path = kin_model::RepoPath::from_utf8("raced.rs").unwrap();
+
+        let before = crate::loop_runner::current_authority_admission(&state)
+            .unwrap()
+            .0
+            .generation;
+
+        // The tick, with the commit already inside the daemon.
+        let observation =
+            std::iter::once(repo_path.clone()).collect::<std::collections::BTreeSet<_>>();
+        let pending = state.pending_commits.announce();
+        let yielded = crate::loop_runner::ambient_admission_for_test(&state, &observation).unwrap();
+        assert!(
+            yielded,
+            "the tick must stand its publication down for the commit that is waiting on the gate"
+        );
+        drop(pending);
+
+        // The commit, which admits the working copy itself and carries the tree
+        // in the transaction that publishes its change.
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/commands/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "operation_id": kin_model::OperationId::new(),
+                            "timestamp": kin_model::Timestamp::now(),
+                            "message": "publish the raced file through one successor"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "commit must succeed: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["file_count"].as_u64().unwrap() >= 1,
+            "the commit must carry the file the tick declined to publish: {json}"
+        );
+
+        let after = crate::loop_runner::current_authority_admission(&state)
+            .unwrap()
+            .0
+            .generation;
+        assert_eq!(
+            after - before,
+            1,
+            "one edit committed once must prepare and persist exactly one \
+             repository-authority successor, whichever pass observed it first"
+        );
+        assert!(
+            state
+                .graph
+                .resolved_tree()
+                .artifact_at_path(&repo_path)
+                .is_some(),
+            "the committed file must be graph-owned after the single successor"
+        );
+    }
+
 }
