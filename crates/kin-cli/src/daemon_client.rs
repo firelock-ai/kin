@@ -33,6 +33,7 @@ use uuid::Uuid;
 pub(crate) mod probe_process;
 
 static BUILD_MISMATCH_REPORTED: AtomicBool = AtomicBool::new(false);
+static BEHAVIOR_ENV_DIVERGENCE_REPORTED: AtomicBool = AtomicBool::new(false);
 const DAEMON_BINARY_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Stable failure contract for callers that delegate repository-daemon
@@ -53,6 +54,14 @@ pub enum AutoStartError {
     /// consequence and buries the reason.
     #[error("{0}")]
     IncompatibleStore(String),
+    /// This command carries behavior levers the daemon it attached to fixed at
+    /// its own start, and `KIN_STRICT_BEHAVIOR_ENV` asked for that to be fatal.
+    ///
+    /// Its own text is the whole answer, as with an incompatible store: nothing
+    /// about starting a daemon failed, so framing it as a startup failure would
+    /// name the wrong thing.
+    #[error("{0}")]
+    BehaviorEnvIgnored(String),
     #[error("daemon startup failed: {0}")]
     SpawnFailed(String),
     #[error("daemon failed to become ready before the startup deadline: {0}")]
@@ -1883,6 +1892,13 @@ fn report_behavior_env_divergence(
     let message = behavior_env_divergence_message(divergences);
     if strict {
         bail!("{message}");
+    }
+    // One process holds one environment and talks to one daemon, so a second
+    // telling repeats the first exactly. The suppression covers the warning
+    // only: strict mode above refuses every time, because a refusal that fires
+    // once and then passes is not a refusal.
+    if BEHAVIOR_ENV_DIVERGENCE_REPORTED.swap(true, Ordering::Relaxed) {
+        return Ok(());
     }
     warn!("{message}");
     Ok(())
@@ -4204,6 +4220,89 @@ fn idle_timeout_to_carry(caller_override: Option<&str>, user_env_is_set: bool) -
         .parse::<u64>()
         .ok()
         .filter(|secs| *secs > 0)
+}
+
+/// Attach this command to a daemon it did not start.
+///
+/// Two things are true at exactly this moment and nowhere else: the daemon's
+/// idle window was chosen without this session's needs in mind, and every
+/// behavior lever this command carries was already decided by whichever command
+/// started that daemon. Both are stated here so no caller can take the endpoint
+/// and skip one.
+async fn attach_to_existing_daemon(
+    base_url: &str,
+    idle_timeout_override: Option<&'static str>,
+) -> std::result::Result<(), AutoStartError> {
+    carry_idle_timeout_to_existing_daemon(base_url, idle_timeout_override).await;
+    report_behavior_env_ignored_by_existing_daemon(base_url).await
+}
+
+/// Say so when this command sets behavior levers the attached daemon cannot
+/// honor, instead of letting them be dropped in silence.
+///
+/// `KIN_DAEMON_AUTO_EMBED` is the case this exists for. An operator sets the
+/// opt-out, the store opens against a daemon that started without it, the
+/// background embedding pass runs anyway, and the only evidence is the machine
+/// getting busy — a rejected opt-out and an honored one look identical from
+/// outside. The daemon reports what it is running under, so the mismatch is
+/// observable, and attaching is the moment it becomes true.
+///
+/// Free on the ordinary path: a command that set no behavior variable sends no
+/// request. That guard also scopes this to levers *this* command stated; the
+/// reverse direction (a daemon carrying a lever this command did not set) stays
+/// with the per-command checks, which are already paying for a health read.
+///
+/// Best-effort otherwise: an unreachable daemon or one predating the surface is
+/// silence here, because the command's own request will report a genuine
+/// connectivity failure and reporting it twice names one fault as two.
+async fn report_behavior_env_ignored_by_existing_daemon(
+    base_url: &str,
+) -> std::result::Result<(), AutoStartError> {
+    let cli = kin_core::behavior_env::snapshot_from_process();
+    if !states_a_behavior_lever(&cli) {
+        return Ok(());
+    }
+    let Some(daemon) = fetch_daemon_behavior_env(base_url).await else {
+        return Ok(());
+    };
+    let divergences = kin_core::behavior_env::compare(&cli, &daemon);
+    report_behavior_env_divergence(
+        &divergences,
+        is_transient_bool_env("KIN_STRICT_BEHAVIOR_ENV"),
+    )
+    .map_err(|error| AutoStartError::BehaviorEnvIgnored(format!("{error}")))
+}
+
+/// Whether this command stated a behavior lever at all, which is what decides
+/// if the attach check is worth a request.
+///
+/// A value that is empty after trimming states nothing: the read sites treat it
+/// as unset, so asking the daemon about it could only ever produce agreement.
+fn states_a_behavior_lever(cli: &kin_core::behavior_env::BehaviorEnv) -> bool {
+    cli.values()
+        .any(|value| !value.as_deref().unwrap_or_default().trim().is_empty())
+}
+
+/// Read the behavior-env surface an already-running daemon reports, or `None`
+/// when it cannot be read at all. A daemon predating the surface answers with an
+/// empty map, which yields no divergence rather than a false one.
+async fn fetch_daemon_behavior_env(
+    base_url: &str,
+) -> Option<kin_core::behavior_env::BehaviorEnv> {
+    let mut request =
+        daemon_health_client().get(format!("{}/health", base_url.trim_end_matches('/')));
+    if let Some(token) = resolve_daemon_auth_token() {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    response
+        .json::<HealthResponse>()
+        .await
+        .ok()
+        .map(|health| health.behavior_env)
 }
 
 /// Tell a daemon this process did not start what idle window its session needs.
@@ -6916,7 +7015,7 @@ pub async fn ensure_daemon_running_with_idle_timeout(
         .await
         .map_err(map_supervisor_auto_start_error)?;
     if let Some(base_url) = supervisor_route_for_repo(kin_root, &supervisor_url).await {
-        carry_idle_timeout_to_existing_daemon(&base_url, idle_timeout_override).await;
+        attach_to_existing_daemon(&base_url, idle_timeout_override).await?;
         return Ok(base_url);
     }
 
@@ -6925,7 +7024,7 @@ pub async fn ensure_daemon_running_with_idle_timeout(
             register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url)
                 .await
                 .map_err(AutoStartError::spawn)?;
-            carry_idle_timeout_to_existing_daemon(&base_url, idle_timeout_override).await;
+            attach_to_existing_daemon(&base_url, idle_timeout_override).await?;
             return Ok(base_url);
         }
         ExistingDaemon::Starting(message) | ExistingDaemon::LiveNotReady(message) => {
@@ -6938,7 +7037,7 @@ pub async fn ensure_daemon_running_with_idle_timeout(
         .await
         .map_err(AutoStartError::spawn)?;
     if let Some(base_url) = supervisor_route_for_repo(kin_root, &supervisor_url).await {
-        carry_idle_timeout_to_existing_daemon(&base_url, idle_timeout_override).await;
+        attach_to_existing_daemon(&base_url, idle_timeout_override).await?;
         return Ok(base_url);
     }
     match wait_for_existing_daemon(kin_root).await {
@@ -6946,7 +7045,7 @@ pub async fn ensure_daemon_running_with_idle_timeout(
             register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url)
                 .await
                 .map_err(AutoStartError::spawn)?;
-            carry_idle_timeout_to_existing_daemon(&base_url, idle_timeout_override).await;
+            attach_to_existing_daemon(&base_url, idle_timeout_override).await?;
             return Ok(base_url);
         }
         ExistingDaemon::Starting(message) | ExistingDaemon::LiveNotReady(message) => {
@@ -7133,10 +7232,13 @@ async fn resolve_daemon_url_inner(
 
     match ensure_daemon_running_with_idle_timeout(layout.root(), idle_timeout_override).await {
         Ok(url) => Ok(Some(url)),
-        // A store this build cannot open is the whole answer. Adding the daemon
-        // framing over it would promote the consequence to the headline and
-        // demote the reason to a nested cause.
-        Err(err @ AutoStartError::IncompatibleStore(_)) => Err(anyhow::Error::new(err)),
+        // A store this build cannot open is the whole answer, and so is a
+        // strict-mode environment divergence: neither is a daemon that failed
+        // to start. Adding the daemon framing over either would promote the
+        // consequence to the headline and demote the reason to a nested cause.
+        Err(
+            err @ (AutoStartError::IncompatibleStore(_) | AutoStartError::BehaviorEnvIgnored(_)),
+        ) => Err(anyhow::Error::new(err)),
         Err(err) => Err(anyhow::Error::new(err).context("kin daemon is required")),
     }
 }
@@ -10803,6 +10905,56 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("KIN_EMBED_HYBRID"));
         assert!(text.contains("restart the daemon"));
+    }
+
+    #[test]
+    fn strict_mode_refuses_every_time_the_warning_is_said_once() {
+        // The warning is suppressed after the first telling because it would
+        // repeat itself exactly. A refusal must not be: a strict run that fails
+        // the first command and passes the next has stopped being strict.
+        assert!(report_behavior_env_divergence(&one_divergence(), false).is_ok());
+        assert!(report_behavior_env_divergence(&one_divergence(), false).is_ok());
+        assert!(report_behavior_env_divergence(&one_divergence(), true).is_err());
+        assert!(report_behavior_env_divergence(&one_divergence(), true).is_err());
+    }
+
+    #[test]
+    fn attaching_asks_the_daemon_only_when_this_command_stated_a_lever() {
+        // The attach check costs a health read, so it must not run for the
+        // ordinary command that set nothing. An empty value states nothing
+        // either: the read sites treat it as unset, so it can only agree.
+        let stated_nothing = kin_core::behavior_env::snapshot_with(|_| None);
+        assert!(!states_a_behavior_lever(&stated_nothing));
+
+        let stated_blanks = kin_core::behavior_env::snapshot_with(|_| Some("  ".to_string()));
+        assert!(!states_a_behavior_lever(&stated_blanks));
+
+        let stated_the_opt_out = kin_core::behavior_env::snapshot_with(|name| {
+            (name == "KIN_DAEMON_AUTO_EMBED").then(|| "0".to_string())
+        });
+        assert!(
+            states_a_behavior_lever(&stated_the_opt_out),
+            "a command that set the background-embedding opt-out must reach the attach check"
+        );
+    }
+
+    #[test]
+    fn an_ignored_opt_out_is_named_without_a_daemon_startup_framing() {
+        // Nothing failed to start here, so the message is the whole answer, the
+        // same way an incompatible store is.
+        let error = AutoStartError::BehaviorEnvIgnored(behavior_env_divergence_message(&[
+            kin_core::behavior_env::Divergence {
+                var: "KIN_DAEMON_AUTO_EMBED".to_string(),
+                cli: Some("0".to_string()),
+                daemon: None,
+            },
+        ]));
+        let text = error.to_string();
+        assert!(text.contains("KIN_DAEMON_AUTO_EMBED: cli=\"0\" daemon=(unset)"));
+        assert!(
+            !text.contains("daemon startup failed"),
+            "an ignored lever was reported as a failed daemon start: {text}"
+        );
     }
 
     #[test]
