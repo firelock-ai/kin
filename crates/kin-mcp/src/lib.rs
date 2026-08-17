@@ -2,6 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 pub mod daemon_delegate;
+pub mod edge_coverage;
 pub mod envelope;
 pub mod error;
 pub mod handlers;
@@ -17,6 +18,7 @@ pub use envelope::{
     annotate as annotate_with_envelope, finalize as finalize_with_envelope, Envelope, ENVELOPE_KEY,
     ENVELOPE_VERSION,
 };
+pub use edge_coverage::EDGE_COVERAGE_KEY;
 pub use error::{McpError, Result};
 pub use handlers::LocalRepositoryAuthorityBinding;
 pub use negative::NEGATIVE_KEY;
