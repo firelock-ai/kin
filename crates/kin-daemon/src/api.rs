@@ -29952,6 +29952,7 @@ mod tests {
                         json!({
                             "operation_id": kin_model::OperationId::new(),
                             "timestamp": kin_model::Timestamp::now(),
+                            "author": "Test Author <test@example.invalid>",
                             "message": "publish the raced file through one successor"
                         })
                         .to_string(),
