@@ -94,7 +94,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | Variable | Kind | Default | Sensitivity | Description |
 | --- | --- | --- | --- | --- |
 | `KIN_DAEMON_AUTH_TOKEN` | secret | *(unset)* | secret | bearer token for authenticated daemon requests |
-| `KIN_DAEMON_AUTO_EMBED` | bool | true | operational | let the daemon start background embedding on its own; set falsy to defer until an explicit embed request |
+| `KIN_DAEMON_AUTO_EMBED` | bool | true | operational | let the daemon start background embedding on its own; set falsy to defer until an explicit embed request. Read by the daemon at process start, so it takes effect on the command that starts one; a command reaching an already-running daemon cannot change it and is warned that it diverged |
 | `KIN_DAEMON_BIN` | path | *(unset)* | operational | override path to the kin-daemon binary |
 | `KIN_DAEMON_BIND_HOST` | string | *(unset)* | operational | host/interface the daemon binds its HTTP endpoint to |
 | `KIN_DAEMON_BOOTSTRAP_EXPORT_CONCURRENCY` | usize | *(unset)* | operational | concurrency for the daemon bootstrap export |
