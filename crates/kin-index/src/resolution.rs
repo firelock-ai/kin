@@ -82,14 +82,23 @@ impl RelationResolution {
         ) {
             return Self::TypeResolved;
         }
-        for &(confidence, resolution) in RESOLUTION_TIER_LADDER {
-            if relation.confidence.to_bits() == confidence.to_bits() {
+        Self::from_confidence(relation.confidence)
+    }
+
+    /// Classify from a persisted tier confidence alone.
+    ///
+    /// Used where only the confidence survived the boundary — a cross-repo
+    /// spine edge carries its confidence but not the relation record the other
+    /// repository resolved.
+    pub fn from_confidence(confidence: f32) -> Self {
+        for &(tier, resolution) in RESOLUTION_TIER_LADDER {
+            if confidence.to_bits() == tier.to_bits() {
                 return resolution;
             }
         }
-        if relation.confidence >= 0.95 {
+        if confidence >= 0.95 {
             Self::TypeResolved
-        } else if relation.confidence >= 0.8 {
+        } else if confidence >= 0.8 {
             Self::ImportScoped
         } else {
             Self::NameOnly
