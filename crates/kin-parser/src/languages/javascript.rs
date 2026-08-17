@@ -161,7 +161,16 @@ impl JsOwners {
 
     pub(super) fn finish(self, entities: &mut Vec<ExtractedEntity>) {
         for name in &self.names {
-            if let Some(existing) = entities.iter_mut().find(|entity| &entity.name == name) {
+            // The file's `Module` node can carry the receiver's name when an
+            // `index.js` sits in a directory of that name. Leave it as a module
+            // and let it hold the `Contains` edge: rekinding it would claim the
+            // file is a class, and pushing a second entity beside it would give
+            // one file two entities under one name, which the linker's
+            // (file, name) index cannot tell apart.
+            if let Some(existing) = entities
+                .iter_mut()
+                .find(|entity| &entity.name == name && entity.kind != EntityKind::Module)
+            {
                 existing.kind = EntityKind::Class;
             }
         }
@@ -2144,6 +2153,41 @@ exports.static = require('serve-static');
             1,
             "export default <identifier> should create a 'default' entity"
         );
+    }
+
+    #[test]
+    fn receiver_named_like_the_index_module_keeps_one_entity() {
+        // `router/index.js` assigning to a receiver called `router` collides
+        // with the directory-named Module entity. One file must not hold two
+        // entities under one name: the linker indexes on (file, name) and
+        // cannot tell them apart.
+        let adapter = JavaScriptAdapter;
+        let source = b"router.handle = function handle(req) { return req; };";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib/router/index.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let named: Vec<(EntityKind, &str)> = output
+            .entities
+            .iter()
+            .map(|e| (e.kind, e.name.as_str()))
+            .collect();
+        assert_eq!(
+            named,
+            vec![
+                (EntityKind::Module, "router"),
+                (EntityKind::Method, "router.handle"),
+            ],
+            "the module keeps its kind and no second `router` is added"
+        );
+        // The Contains edge still resolves, against the module node.
+        let contains: Vec<(&str, &str)> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Contains)
+            .map(|r| (r.src_name.as_str(), r.dst_name.as_str()))
+            .collect();
+        assert_eq!(contains, vec![("router", "router.handle")]);
     }
 
     #[test]
