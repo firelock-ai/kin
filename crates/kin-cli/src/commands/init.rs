@@ -131,6 +131,14 @@ pub async fn run(path: Option<String>, json: bool) -> Result<()> {
         }
     };
 
+    if let Err(error) = exclude_store_from_git(result.layout.working_dir()) {
+        eprintln!(
+            "warning: the Kin store at {} was not added to this repository's local Git excludes, \
+             so `git status` will list it as untracked: {error:#}",
+            result.layout.root().display()
+        );
+    }
+
     let enrichment =
         SemanticEnrichmentStatus::from_durable_summary(&result.authority.semantic_enrichment);
     if json {
@@ -207,6 +215,163 @@ fn git_prerequisite_note(git_on_path: bool) -> &'static str {
         ""
     } else {
         " Git is not installed on this host, so committing to Git needs `git` installed first."
+    }
+}
+
+/// The rule `kin init` adds so the store stays out of `git status`.
+///
+/// Anchored and directory-scoped so it names the store this command just wrote
+/// and nothing else. An unanchored `.kin/` would also hide a nested directory
+/// of that name anywhere in the tree, which is not this command's to decide.
+const STORE_EXCLUDE_RULE: &str = "/.kin/";
+
+/// Spellings of a rule that already keeps the store out of `git status`.
+///
+/// A repository converted before this command excluded anything, or one whose
+/// author added the rule by hand, is already correct. Re-stating it would leave
+/// a duplicate line behind on every re-init.
+const STORE_EXCLUDE_EQUIVALENTS: &[&str] = &[".kin", ".kin/", "/.kin", "/.kin/"];
+
+/// Keep the store out of the converted repository's `git status`.
+///
+/// Admission writes a `.kin` directory that is routinely a gigabyte, and Git
+/// has no reason to know it is Kin's. Without a rule it is reported as
+/// untracked forever, on every `git status` the author runs, which is a
+/// permanent cost paid for a one-time conversion.
+///
+/// The rule goes in `.git/info/exclude` rather than the repository's tracked
+/// `.gitignore`, because whether a peer's checkout carries a Kin store is that
+/// peer's business. Excluding it locally costs the author nothing and changing
+/// a tracked file would put Kin in their next diff.
+///
+/// Every refusal here is reported and none of them fail the command: the store
+/// is durable before this runs, and an admission that succeeded must not be
+/// turned into a failure by a convenience.
+fn exclude_store_from_git(working_dir: &Path) -> Result<Option<PathBuf>> {
+    let Some(common_dir) = git_common_dir(working_dir)? else {
+        return Ok(None);
+    };
+    if store_already_excluded(working_dir, &common_dir)? {
+        return Ok(None);
+    }
+
+    let info_dir = common_dir.join("info");
+    std::fs::create_dir_all(&info_dir)
+        .with_context(|| format!("create Git info directory {}", info_dir.display()))?;
+    let exclude = info_dir.join("exclude");
+    if let Ok(metadata) = std::fs::symlink_metadata(&exclude) {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            anyhow::bail!(
+                "Git exclude authority must be a regular non-symlink file: {}",
+                exclude.display()
+            );
+        }
+    }
+
+    let mut body = read_optional_text(&exclude)?.unwrap_or_default();
+    if !body.is_empty() && !body.ends_with('\n') {
+        body.push('\n');
+    }
+    body.push_str(STORE_EXCLUDE_RULE);
+    body.push('\n');
+    std::fs::write(&exclude, body)
+        .with_context(|| format!("write Git exclude {}", exclude.display()))?;
+    Ok(Some(exclude))
+}
+
+/// The directory holding the shared `info/exclude` for this worktree.
+///
+/// A `.git` directory is its own common directory. A linked worktree or a
+/// submodule instead carries a `gitdir:` pointer file, and a linked worktree's
+/// excludes live with the repository it was added from, which its `commondir`
+/// names. Following the pointer is what makes this work in the worktrees Kin's
+/// own fleet runs in.
+fn git_common_dir(working_dir: &Path) -> Result<Option<PathBuf>> {
+    let dot_git = working_dir.join(".git");
+    let metadata = match std::fs::symlink_metadata(&dot_git) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", dot_git.display())),
+    };
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!(
+            "repository Git authority must not be a symlink: {}",
+            dot_git.display()
+        );
+    }
+    if metadata.is_dir() {
+        return Ok(Some(dot_git));
+    }
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+
+    let pointer = std::fs::read_to_string(&dot_git)
+        .with_context(|| format!("read Git pointer file {}", dot_git.display()))?;
+    let Some(target) = pointer
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("gitdir:"))
+    else {
+        anyhow::bail!("Git pointer file names no gitdir: {}", dot_git.display());
+    };
+    let git_dir = resolve_against(working_dir, target.trim());
+    match read_optional_text(&git_dir.join("commondir"))? {
+        Some(common) => match common
+            .lines()
+            .next()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+        {
+            Some(common) => Ok(Some(resolve_against(&git_dir, common))),
+            None => Ok(Some(git_dir)),
+        },
+        None => Ok(Some(git_dir)),
+    }
+}
+
+fn resolve_against(base: &Path, target: &str) -> PathBuf {
+    let target = Path::new(target);
+    if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        base.join(target)
+    }
+}
+
+/// Whether some rule Git already reads keeps the store out of `git status`.
+///
+/// Checked against both places a rule can already live for this repository:
+/// the local excludes this command writes, and the tracked `.gitignore` a
+/// project may have adopted on its own. Either one makes writing a second rule
+/// pure noise.
+fn store_already_excluded(working_dir: &Path, common_dir: &Path) -> Result<bool> {
+    for candidate in [
+        common_dir.join("info").join("exclude"),
+        working_dir.join(".gitignore"),
+    ] {
+        let Some(body) = read_optional_text(&candidate)? else {
+            continue;
+        };
+        if body
+            .lines()
+            .map(str::trim)
+            .any(|line| STORE_EXCLUDE_EQUIVALENTS.contains(&line))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn read_optional_text(path: &Path) -> Result<Option<String>> {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            Ok(Some(String::from_utf8(bytes).with_context(|| {
+                format!("{} is not UTF-8", path.display())
+            })?))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
     }
 }
 
@@ -722,5 +887,184 @@ mod tests {
         assert!(
             uncommitted_worktree_payload(&kin_git::GitWorkspaceDivergenceFacts::none()).is_none()
         );
+    }
+
+    fn git(repository: &Path, args: &[&str]) {
+        let output = crate::commands::test_subprocess::fixture_git(repository)
+            .args(args)
+            .output()
+            .expect("run fixture git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_status(repository: &Path) -> String {
+        let output = crate::commands::test_subprocess::fixture_git(repository)
+            .args(["status", "--porcelain"])
+            .output()
+            .expect("run fixture git status");
+        assert!(output.status.success());
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    fn write_store(working_dir: &Path) {
+        let store = working_dir.join(".kin");
+        std::fs::create_dir_all(store.join("objects")).unwrap();
+        std::fs::write(store.join("objects").join("pack"), b"store bytes").unwrap();
+    }
+
+    /// The whole point, asked of Git itself rather than of a string.
+    ///
+    /// A converted repository leaves a store that is routinely a gigabyte, and
+    /// before this the author saw it as untracked on every `git status` they
+    /// ever ran again. The assertion is on the porcelain, because a rule that
+    /// parses correctly and does not actually exclude the store reads exactly
+    /// like one that works.
+    #[test]
+    fn an_excluded_store_is_absent_from_git_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        git(repo, &["init", "-q"]);
+        write_store(repo);
+
+        let before = git_status(repo);
+        assert!(
+            before.contains(".kin"),
+            "the fixture must start with a visible store, or this test proves nothing: {before:?}"
+        );
+
+        exclude_store_from_git(repo).unwrap().expect("a rule");
+
+        let after = git_status(repo);
+        assert!(
+            !after.contains(".kin"),
+            "the store must be absent from git status: {after:?}"
+        );
+    }
+
+    /// Re-running init must not stack duplicate rules.
+    #[test]
+    fn excluding_the_store_twice_writes_one_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        std::fs::create_dir_all(repo.join(".git").join("info")).unwrap();
+
+        let exclude = exclude_store_from_git(repo).unwrap().expect("a rule");
+        assert!(
+            exclude_store_from_git(repo).unwrap().is_none(),
+            "the second pass must find the rule already present"
+        );
+
+        let body = std::fs::read_to_string(&exclude).unwrap();
+        assert_eq!(
+            body.lines()
+                .filter(|line| line.trim() == STORE_EXCLUDE_RULE)
+                .count(),
+            1,
+            "exactly one rule survives a re-init: {body:?}"
+        );
+    }
+
+    /// A repository whose `.git` carries no `info` directory yet.
+    #[test]
+    fn a_missing_info_directory_is_created_rather_than_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        assert!(!repo.join(".git").join("info").exists());
+
+        let exclude = exclude_store_from_git(repo).unwrap().expect("a rule");
+        assert_eq!(exclude, repo.join(".git").join("info").join("exclude"));
+        assert!(std::fs::read_to_string(&exclude)
+            .unwrap()
+            .contains(STORE_EXCLUDE_RULE));
+    }
+
+    /// A rule that already excludes the store, in either place Git reads one.
+    #[test]
+    fn an_existing_rule_is_left_alone() {
+        for (name, seed) in [
+            (".git/info/exclude", ".kin\n"),
+            (".gitignore", "target\n.kin/\n"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = dir.path();
+            std::fs::create_dir_all(repo.join(".git").join("info")).unwrap();
+            let seeded = repo.join(name);
+            std::fs::write(&seeded, seed).unwrap();
+
+            assert!(
+                exclude_store_from_git(repo).unwrap().is_none(),
+                "{name} already excludes the store"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&seeded).unwrap(),
+                seed,
+                "{name} must be untouched"
+            );
+        }
+    }
+
+    /// A directory Git does not own is not this command's to write into.
+    #[test]
+    fn a_directory_without_git_gets_no_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(exclude_store_from_git(dir.path()).unwrap().is_none());
+        assert!(!dir.path().join(".git").exists());
+    }
+
+    /// A linked worktree's excludes live with the repository it came from.
+    ///
+    /// Kin's own fleet runs almost entirely in linked worktrees, where `.git`
+    /// is a pointer file and `info/exclude` is shared through `commondir`. A
+    /// resolver that stopped at the pointer would write a rule into the
+    /// worktree's private gitdir, where Git never reads one for excludes.
+    #[test]
+    fn a_linked_worktree_is_followed_to_its_common_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main");
+        let linked = dir.path().join("linked");
+        std::fs::create_dir_all(&main).unwrap();
+        git(&main, &["init", "-q"]);
+        git(&main, &["config", "user.email", "kin-test@example.invalid"]);
+        git(&main, &["config", "user.name", "Kin Test"]);
+        std::fs::write(main.join("seed"), b"seed").unwrap();
+        git(&main, &["add", "seed"]);
+        git(&main, &["commit", "-qm", "seed"]);
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                linked.to_str().unwrap(),
+                "-b",
+                "linked",
+            ],
+        );
+        write_store(&linked);
+
+        let before = git_status(&linked);
+        assert!(
+            before.contains(".kin"),
+            "fixture must start visible: {before:?}"
+        );
+
+        let exclude = exclude_store_from_git(&linked).unwrap().expect("a rule");
+        assert_eq!(
+            exclude.canonicalize().unwrap(),
+            main.join(".git")
+                .join("info")
+                .join("exclude")
+                .canonicalize()
+                .unwrap(),
+            "a linked worktree writes to the shared exclude, not its private gitdir"
+        );
+
+        let after = git_status(&linked);
+        assert!(!after.contains(".kin"), "store must be excluded: {after:?}");
     }
 }
