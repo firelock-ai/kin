@@ -1299,6 +1299,7 @@ mod tests {
             pending: 0,
             complete: true,
             note: None,
+            graph_body_gap_paths: None,
         });
         env.graph_as_of = Some(json!("change:deadbeef"));
         env
@@ -1423,6 +1424,7 @@ mod tests {
             pending: 60,
             complete: false,
             note: Some("indexing".to_string()),
+            graph_body_gap_paths: None,
         });
         let payload = json!({ "query": "auth", "results": [], "total_ranked": 0 });
         let negative = negative_for("semantic_locate", &payload, &env).unwrap();
@@ -1432,6 +1434,41 @@ mod tests {
             .unwrap()
             .contains("coverage_partial"));
         assert_eq!(negative["semantic_coverage"]["percent"], json!(40.0));
+    }
+
+    /// A body gap is not an embedding shortfall, and the reason must say so.
+    ///
+    /// This is the state the ticket reported: 1644/1644 embedded, so every
+    /// embedding-derived number reads healthy, while the paths retrieval needs
+    /// carry no graph-owned body. Sending that caller to `kin embed` would be
+    /// advice against a counter that is already whole, so the limiting factor is
+    /// named separately from the embedding one.
+    #[test]
+    fn a_fully_embedded_store_with_a_body_gap_names_the_body_gap_not_the_index() {
+        let mut env = Envelope::daemon();
+        env.semantic_coverage = Some(SemanticCoverage {
+            indexed: 1644,
+            total: 1644,
+            pending: 0,
+            complete: false,
+            note: Some("graph body gap: 111 of 777 …".to_string()),
+            graph_body_gap_paths: Some(111),
+        });
+        env.graph_as_of = Some(json!("change:deadbeef"));
+
+        let payload = json!({ "query": "Session", "results": [], "total_ranked": 0 });
+        let negative = negative_for("semantic_locate", &payload, &env).unwrap();
+
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            reason.contains("coverage_graph_body_gap"),
+            "the limiting factor must be the body gap: {reason}"
+        );
+        assert!(
+            !reason.contains("coverage_partial"),
+            "a whole embedding index must not be reported as incomplete: {reason}"
+        );
     }
 
     #[test]

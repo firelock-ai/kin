@@ -25781,6 +25781,63 @@ mod tests {
         assert!(hits.contains_key("src/main.c"));
     }
 
+    /// The observation is wired to the real path, not only to its helper.
+    ///
+    /// A path the graph owns as source but holds no body for is exactly the
+    /// state behind the 111 `kin.locate.graph_gap` warnings: the term loops skip
+    /// it, so entities in it can rank on nothing but a name match. This asserts
+    /// the source-text phase reports that as a number, and that a store with
+    /// every body present reports a clean scan rather than silence.
+    #[test]
+    fn source_text_signals_report_the_body_gap_they_ranked_around() {
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .upsert_entity(&test_entity("Session", "src/requests/sessions.py", 1, 20))
+            .unwrap();
+        graph
+            .upsert_entity(&test_entity("request", "src/requests/api.py", 1, 20))
+            .unwrap();
+        // Only one of the two source paths carries a graph-owned body.
+        graph
+            .put_opaque(&OpaqueArtifact {
+                file_id: FilePathId::new("src/requests/api.py"),
+                content_hash: Hash256::from_bytes([9; 32]),
+                mime_type: Some("text/x-source".into()),
+                text_preview: Some("def request(method, url): return Session().request()".into()),
+            })
+            .unwrap();
+        graph.flush_text_index().unwrap();
+
+        let bodies = extract_source_text_signals("where is the Session request path", &graph)
+            .unwrap()
+            .graph_bodies
+            .expect("the source-text phase observed the store and owes a number");
+        assert_eq!(bodies.source_paths, 2);
+        assert_eq!(bodies.with_body, 1);
+        assert_eq!(bodies.gap_paths, 1);
+        assert_eq!(bodies.sample, vec!["src/requests/sessions.py".to_string()]);
+
+        // Same store, gap closed: the scan must now report clean, or the number
+        // says nothing a caller can act on.
+        graph
+            .put_opaque(&OpaqueArtifact {
+                file_id: FilePathId::new("src/requests/sessions.py"),
+                content_hash: Hash256::from_bytes([10; 32]),
+                mime_type: Some("text/x-source".into()),
+                text_preview: Some("class Session: def request(self, method, url): pass".into()),
+            })
+            .unwrap();
+        graph.flush_text_index().unwrap();
+
+        let healed = extract_source_text_signals("where is the Session request path", &graph)
+            .unwrap()
+            .graph_bodies
+            .expect("observed");
+        assert_eq!(healed.gap_paths, 0);
+        assert_eq!(healed.with_body, 2);
+        assert!(healed.sample.is_empty());
+    }
+
     #[test]
     fn extract_source_text_signals_filters_symbolic_partial_matches_when_full_source_is_available()
     {
@@ -27135,6 +27192,153 @@ mod tests {
         assert!(
             synth.contains("6 pending"),
             "synthesized banner cites pending"
+        );
+    }
+
+    fn fully_embedded_coverage() -> SemanticCoverage {
+        SemanticCoverage {
+            supported: true,
+            indexed: 1644,
+            total: 1644,
+            pending: 0,
+            complete: true,
+            note: None,
+            graph_bodies: None,
+        }
+    }
+
+    /// The graph gap becomes a number a caller can read.
+    ///
+    /// It was a `kin.locate.graph_gap` tracing warning and a process-global
+    /// counter behind a `#[cfg(test)]` accessor, so the only way to learn that
+    /// 111 authority paths carried no graph body was to have daemon logs open.
+    #[test]
+    fn graph_body_coverage_counts_and_samples_the_paths_with_no_body() {
+        let paths: Vec<String> = [
+            "src/requests/sessions.py",
+            "src/requests/utils.py",
+            "src/requests/cookies.py",
+            "src/requests/api.py",
+        ]
+        .iter()
+        .map(|path| (*path).to_string())
+        .collect();
+        let bodies = GraphBodyCoverage::observe(paths.iter(), |path| path.ends_with("api.py"));
+
+        assert_eq!(bodies.source_paths, 4);
+        assert_eq!(bodies.with_body, 1);
+        assert_eq!(bodies.gap_paths, 3);
+        assert!(bodies.has_gap());
+        // Sorted, so two reads of an unchanged store name the same paths.
+        assert_eq!(
+            bodies.sample,
+            vec![
+                "src/requests/cookies.py".to_string(),
+                "src/requests/sessions.py".to_string(),
+                "src/requests/utils.py".to_string(),
+            ]
+        );
+    }
+
+    /// The sample is bounded; the count never is.
+    #[test]
+    fn graph_body_coverage_bounds_its_sample_without_capping_the_count() {
+        let paths: Vec<String> = (0..40).map(|index| format!("src/mod{index:02}.py")).collect();
+        let bodies = GraphBodyCoverage::observe(paths.iter(), |_| false);
+
+        assert_eq!(bodies.gap_paths, 40, "the count must be the whole truth");
+        assert_eq!(
+            bodies.sample.len(),
+            GRAPH_BODY_GAP_SAMPLE,
+            "the sample must stay bounded"
+        );
+    }
+
+    /// A completeness signal must not read `complete` while ranking is degraded.
+    ///
+    /// This is the ticket's acceptance line. With embeddings at 1644/1644 the
+    /// payload said `semantic_coverage: complete` while every entity hit came
+    /// back `match_kind: "text_fallback"`, because `complete` was computed from
+    /// the embedding counter and ranking needs a graph-owned body. Reverting the
+    /// conjunction in `with_graph_bodies` fails here.
+    #[test]
+    fn a_body_gap_clears_complete_on_a_fully_embedded_store() {
+        let coverage = fully_embedded_coverage().with_graph_bodies(GraphBodyCoverage::observe(
+            [
+                "src/requests/sessions.py".to_string(),
+                "src/requests/utils.py".to_string(),
+            ]
+            .iter(),
+            |_| false,
+        ));
+
+        assert!(
+            !coverage.complete,
+            "every embedding indexed is not a complete signal while ranking runs on text fallback"
+        );
+        assert_eq!(coverage.indexed, 1644, "the embedding counts stay exact");
+        assert_eq!(coverage.pending, 0);
+        let note = coverage.note.as_deref().expect("a cleared flag owes a reason");
+        assert!(
+            note.contains("graph body gap") && note.contains("2 of 2"),
+            "the note must name the cause and its size: {note}"
+        );
+        assert_eq!(
+            coverage.graph_bodies.expect("the number rides along").gap_paths,
+            2
+        );
+    }
+
+    /// Absence of evidence is not evidence of a gap.
+    ///
+    /// A surface that ran no retrieval observed no bodies, and reporting that
+    /// silence as a gap would mark every such payload degraded. The caller tells
+    /// the two apart by reading `graph_bodies`, which stays absent.
+    #[test]
+    fn full_body_coverage_and_an_unobserved_one_both_leave_complete_alone() {
+        let observed = fully_embedded_coverage()
+            .with_graph_bodies(GraphBodyCoverage::observe(
+                ["src/requests/api.py".to_string()].iter(),
+                |_| true,
+            ));
+        assert!(observed.complete, "no gap, so nothing to clear");
+        assert!(observed.note.is_none(), "no gap, so no note");
+        assert_eq!(observed.graph_bodies.expect("observed").gap_paths, 0);
+
+        let unobserved = fully_embedded_coverage();
+        assert!(unobserved.complete);
+        assert!(
+            unobserved.graph_bodies.is_none(),
+            "absent means not observed, and a caller must be able to tell that from a clean scan"
+        );
+    }
+
+    /// An embedding shortfall and a body gap are different remediations, so a
+    /// payload carrying both must state both.
+    #[test]
+    fn a_body_gap_note_is_appended_to_an_embedding_note_rather_than_replacing_it() {
+        let partial = SemanticCoverage {
+            supported: true,
+            indexed: 4,
+            total: 10,
+            pending: 6,
+            complete: false,
+            note: Some("semantic signal partial: 4/10 embedded.".to_string()),
+            graph_bodies: None,
+        };
+        let coverage = partial.with_graph_bodies(GraphBodyCoverage::observe(
+            ["src/requests/sessions.py".to_string()].iter(),
+            |_| false,
+        ));
+
+        let note = coverage.note.as_deref().expect("both causes owe a reason");
+        assert!(
+            note.contains("4/10 embedded"),
+            "the embedding cause must survive: {note}"
+        );
+        assert!(
+            note.contains("graph body gap"),
+            "the body cause must be stated too: {note}"
         );
     }
 
