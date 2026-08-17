@@ -2523,8 +2523,7 @@ pub fn handle_trace_data_flow<G: GraphStore>(
     // Which step already stands for a symbol NAME, so an import alias and the
     // function it aliases never arrive as two identities for one symbol. Seeded
     // with the focal only when the graph owns a file for it.
-    let mut name_index: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
+    let mut name_index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     if focal_entity.file_origin.is_some() {
         name_index.insert(focal_entity.name.clone(), 0);
     }
@@ -2615,10 +2614,8 @@ pub fn handle_trace_data_flow<G: GraphStore>(
 
             // Independent per-direction budgets so `direction=both` doesn't
             // starve one side when relations are emitted in either order.
-            let (mut callees, mut callers): (
-                Vec<TraceFanoutCandidate>,
-                Vec<TraceFanoutCandidate>,
-            ) = candidates.into_iter().partition(|c| c.role == "callee");
+            let (mut callees, mut callers): (Vec<TraceFanoutCandidate>, Vec<TraceFanoutCandidate>) =
+                candidates.into_iter().partition(|c| c.role == "callee");
             sort_trace_candidates(&mut callees, &node);
             sort_trace_candidates(&mut callers, &node);
             let dropped_callees = callees.len().saturating_sub(limit_per_step);
@@ -2659,8 +2656,8 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                 }
                 let candidate_external = trace_entity_is_external(&candidate.entity);
                 if let Some(&existing) = name_index.get(candidate.entity.name.as_str()) {
-                    let existing_external = existing > 0
-                        && chain[existing - 1]["external"].as_bool().unwrap_or(false);
+                    let existing_external =
+                        existing > 0 && chain[existing - 1]["external"].as_bool().unwrap_or(false);
                     if candidate_external {
                         visited.insert(candidate.entity.id);
                         external_identities_merged += 1;

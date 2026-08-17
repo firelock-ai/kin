@@ -28883,11 +28883,7 @@ mod tests {
     /// `call_mcp_tool` hands back parsed JSON, and a parse discards the only
     /// number a token-overflow defect is measured in. This is the payload the
     /// client would have refused.
-    async fn call_mcp_tool_text(
-        app: Router,
-        name: &str,
-        arguments: serde_json::Value,
-    ) -> String {
+    async fn call_mcp_tool_text(app: Router, name: &str, arguments: serde_json::Value) -> String {
         let response = app
             .oneshot(
                 Request::post("/mcp/tools/call")
@@ -29112,7 +29108,8 @@ mod tests {
         assert_eq!(cut["bodies_included"], json!(false));
         assert!(cut["bodies_omitted"].as_u64().unwrap_or(0) > 0);
         assert_eq!(
-            cut["truncated"], json!(false),
+            cut["truncated"],
+            json!(false),
             "a chain that lost only bodies is not a truncated chain"
         );
         let disclosure = cut["degradations"]
