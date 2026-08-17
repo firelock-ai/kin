@@ -4630,16 +4630,51 @@ async fn command_commit(
         state.coordination_gate.lock(),
     )
     .await;
-    crate::mcp_commit::timed_commit_phase_async(
+    // The admission derives the exact tree from the working copy but does not
+    // publish it. This commit's own transaction carries that tree transition
+    // beside the semantic change, so one repository-authority successor is
+    // prepared and one store snapshot persisted for the whole commit instead
+    // of two. Nothing observes the interval: the coordination gate above spans
+    // the admission and the publication, and a commit that does not reach
+    // authority publishes the deferred tree on its way out, leaving exactly
+    // the state a failed commit leaves today.
+    //
+    // The phase keeps its name. What the span measures is unchanged, one
+    // complete host walk and the graph work behind it, and the proof parser
+    // reads that name off the phase table.
+    let deferred_tree = crate::mcp_commit::timed_commit_phase_async(
         "forced_filesystem_admission",
-        crate::loop_runner::sync_filesystem_with_graph_under_coordination(&state),
+        crate::loop_runner::sync_filesystem_with_graph_deferring_tree_publication(&state),
     )
     .await
     .map_err(internal_error)?;
 
+    match command_commit_after_admission(&state, request, deferred_tree.as_ref()) {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            if let Some(admitted) = deferred_tree {
+                crate::loop_runner::publish_deferred_tree_after_failure(&state, &admitted);
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Plan and publish the commit for a working copy this caller has already
+/// admitted.
+///
+/// `observed` is present when the admission left its tree transition for this
+/// transaction to carry. It is the completed walk's own proof rather than a
+/// flag, so the collapsed path cannot be entered without one, and the tree it
+/// proved is checked against the tree the plan publishes.
+fn command_commit_after_admission(
+    state: &Arc<DaemonState>,
+    request: CommandCommitRequest,
+    observed: Option<&crate::repository_commit::AdmittedWorkspaceTree>,
+) -> Result<Json<CommandCommitResponse>, (StatusCode, String)> {
     let graph = &*state.graph;
     let authority_context =
-        crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
+        crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)
             .map_err(repository_commit_error)?;
     let plan = crate::mcp_commit::timed_commit_phase("plan_transaction", || {
         crate::repository_commit::plan_native_commit(
@@ -4716,12 +4751,22 @@ async fn command_commit(
         }
     }
 
-    let committed = crate::repository_commit::commit_native_plan_with_projection(
-        &state.layout,
-        state.blobs.as_ref(),
-        &authority_context,
-        plan,
-    )
+    let committed = if let Some(observed) = observed {
+        crate::repository_commit::commit_native_plan_with_observed_target_tree(
+            &state.layout,
+            state.blobs.as_ref(),
+            &authority_context,
+            plan,
+            observed,
+        )
+    } else {
+        crate::repository_commit::commit_native_plan_with_projection(
+            &state.layout,
+            state.blobs.as_ref(),
+            &authority_context,
+            plan,
+        )
+    }
     .map_err(repository_commit_error)?;
     state
         .record_repository_authority_commit(committed.receipt.generation)
@@ -19044,6 +19089,94 @@ mod tests {
         );
     }
 
+    /// One commit pays for exactly one repository-authority successor.
+    ///
+    /// The handler used to force a filesystem admission that published the
+    /// observed working tree as its own successor, then publish the semantic
+    /// change moments later as a second one, on a tree nothing had moved in
+    /// between. Preparing a successor and persisting the store are both
+    /// O(store), so a one-line change paid the whole cost twice and the commit
+    /// wall was two complete publications.
+    ///
+    /// A committed repository transaction advances the authority generation by
+    /// exactly one, so the generation delta counts successors directly rather
+    /// than standing in for them. The assertions below also prove the commit
+    /// did real work, since a commit that published nothing would satisfy a
+    /// bare delta check by advancing the generation zero times.
+    #[cfg(unix)]
+    #[tokio::test]
+    // Commit phases are emitted at debug level when they are fast, and the
+    // level a `tracing` event is filtered by is a process-global hint. A test
+    // that captures those events therefore cannot run beside one that emits
+    // them, so every test on either side of that shares this group.
+    #[serial_test::serial(commit_phase_capture)]
+    async fn one_commit_publishes_exactly_one_authority_successor() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        std::fs::write(
+            repo.path().join("collapsed.rs"),
+            b"pub fn collapsed() -> u32 { 1 }\n",
+        )
+        .unwrap();
+
+        let before = crate::loop_runner::current_authority_admission(&state)
+            .unwrap()
+            .0
+            .generation;
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/commands/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "operation_id": kin_model::OperationId::new(),
+                            "timestamp": kin_model::Timestamp::now(),
+                            "message": "publish one file through one successor"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "commit must succeed: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["file_count"].as_u64().unwrap() >= 1,
+            "the commit must carry the admitted file: {json}"
+        );
+
+        let after = crate::loop_runner::current_authority_admission(&state)
+            .unwrap()
+            .0
+            .generation;
+        assert_eq!(
+            after - before,
+            1,
+            "one commit must prepare and persist exactly one repository-authority successor"
+        );
+
+        let repo_path = kin_model::RepoPath::from_utf8("collapsed.rs").unwrap();
+        assert!(
+            state
+                .graph
+                .resolved_tree()
+                .artifact_at_path(&repo_path)
+                .is_some(),
+            "the committed file must be graph-owned after the single successor"
+        );
+    }
+
     #[tokio::test]
     async fn graph_only_command_commit_fails_before_filesystem_delta_computation() {
         let state = test_state();
@@ -19113,6 +19246,11 @@ mod tests {
     /// name is checked too: without it a capture that silently collected nothing
     /// would satisfy every membership assertion it was given.
     #[tokio::test]
+    // Commit phases are emitted at debug level when they are fast, and the
+    // level a `tracing` event is filtered by is a process-global hint. A test
+    // that captures those events therefore cannot run beside one that emits
+    // them, so every test on either side of that shares this group.
+    #[serial_test::serial(commit_phase_capture)]
     async fn the_cli_commit_path_names_every_phase_it_spends() {
         use tracing_subscriber::layer::SubscriberExt as _;
 
@@ -19214,7 +19352,6 @@ mod tests {
             "forced_filesystem_admission",
             "scan_working_copy",
             "observe_tree_and_stage_blobs",
-            "publish_workspace_admission",
             "plan_transaction",
             "plan_snapshot_clone",
             "plan_diff_semantics",
@@ -19228,14 +19365,30 @@ mod tests {
                 captured.phases
             );
         }
-        assert!(
-            !captured
-                .phases
-                .iter()
-                .any(|phase| phase == "phase_this_commit_never_spends"),
-            "a phase the path never runs must not be reported; captured {:?}",
-            captured.phases
-        );
+        for phase in [
+            // A phase the path never runs must not be reported. The fabricated
+            // name is the control: it can never appear, so it proves the
+            // assertion is looking at something.
+            "phase_this_commit_never_spends",
+            // The commit no longer publishes the admitted tree in a successor
+            // of its own. The admission derives the tree and hands it to the
+            // commit's transaction, which carries the tree transition beside
+            // the semantic change, so one repository-authority successor is
+            // prepared and one store snapshot persisted for the whole commit.
+            // Publishing the tree separately is what this phase timed, and a
+            // commit that spends it again has gone back to paying for two.
+            //
+            // The phase itself is still live and still timed on the standalone
+            // admission path, which is where the ambient watcher tick and every
+            // explicit `kin admit` publish from.
+            "publish_workspace_admission",
+        ] {
+            assert!(
+                !captured.phases.iter().any(|captured| captured == phase),
+                "the commit path must not name the {phase} phase; captured {:?}",
+                captured.phases
+            );
+        }
     }
 
     #[cfg(unix)]
