@@ -122,9 +122,9 @@ impl LanguageAdapter for JavaScriptAdapter {
 /// Receivers that own member-assigned methods: `View.prototype.lookup = ...`,
 /// `res.status = ...`, `const utils = { parse() {} }`.
 ///
-/// Such a receiver is a class in all but syntax — a constructor function
-/// carrying `prototype` members, or a prototype object built by
-/// `Object.create` — so it is kinded [`EntityKind::Class`] once extraction
+/// Such a receiver is a class in all but syntax. It is either a constructor
+/// function carrying `prototype` members or a prototype object built by
+/// `Object.create`, so it is kinded [`EntityKind::Class`] once extraction
 /// finishes. That kind is also what puts an `Owner.method` call on the linker's
 /// receiver-method and inheritance tiers, which only fire for a class-like
 /// owner.
@@ -1523,11 +1523,11 @@ mod tests {
         // app.init = function init() { ... }
         //
         // Contract: a function assigned to a receiver is that receiver's
-        // METHOD, named `receiver.property` and contained by the receiver —
-        // not a free function named after the right-hand side. The right-hand
-        // name is an internal recursion label; `app.init` is how the method is
-        // reached, and it is the key the linker resolves an `Owner.method`
-        // call against.
+        // METHOD, named `receiver.property` and contained by the receiver,
+        // rather than a free function named after the right-hand side. The
+        // right-hand name is an internal recursion label. `app.init` is how the
+        // method is reached, and it is the key the linker resolves an
+        // `Owner.method` call against.
         let adapter = JavaScriptAdapter;
         let source = b"app.init = function init() { console.log('starting'); };";
         let tree = adapter.parse(source).unwrap();
@@ -1776,8 +1776,9 @@ exports.static = require('serve-static');
 
     #[test]
     fn parse_js_arrow_function_assignment() {
-        // app.handler = (req, res) => { ... } — an arrow assigned to a receiver
-        // is that receiver's method, same as a function expression.
+        // app.handler = (req, res) => { ... }
+        // An arrow assigned to a receiver is that receiver's method, same as a
+        // function expression.
         let adapter = JavaScriptAdapter;
         let source = b"app.handler = (req, res) => { res.send('ok'); };";
         let tree = adapter.parse(source).unwrap();
