@@ -1743,9 +1743,13 @@ mod tests {
             .upsert_relation(&test_relation(RelationKind::Calls, caller.id, callee.id))
             .unwrap();
 
-        let response =
-            build_graph_status_response(&binding, &graph, &Default::default(), &Default::default())
-                .unwrap();
+        let response = build_graph_status_response(
+            &pinned(&binding),
+            &graph,
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
 
         assert!(
             response
@@ -1780,9 +1784,13 @@ mod tests {
             .upsert_relation(&test_relation(RelationKind::Calls, caller.id, callee.id))
             .unwrap();
 
-        let response =
-            build_graph_status_response(&binding, &graph, &Default::default(), &Default::default())
-                .unwrap();
+        let response = build_graph_status_response(
+            &pinned(&binding),
+            &graph,
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
 
         assert!(
             response
