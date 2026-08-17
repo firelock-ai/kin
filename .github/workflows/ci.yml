@@ -206,7 +206,7 @@ jobs:
           node --check ./scripts/prove-windows-npm-first-run.mjs
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@191af2e1955bbe165f9bbacff2d2438002dff4d4 # branch 1.96.0, 2026-07-16
+        uses: ./.github/actions/rust-toolchain
         with:
           targets: x86_64-pc-windows-msvc
 
@@ -368,7 +368,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@191af2e1955bbe165f9bbacff2d2438002dff4d4 # branch 1.96.0, 2026-07-16
+        uses: ./.github/actions/rust-toolchain
         with:
           targets: x86_64-pc-windows-msvc
 
@@ -434,7 +434,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@191af2e1955bbe165f9bbacff2d2438002dff4d4 # branch 1.96.0, 2026-07-16
+        uses: ./.github/actions/rust-toolchain
         with:
           targets: x86_64-pc-windows-msvc
 
@@ -537,7 +537,7 @@ jobs:
         run: ./scripts/test-install-checksum.ps1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@191af2e1955bbe165f9bbacff2d2438002dff4d4 # branch 1.96.0, 2026-07-16
+        uses: ./.github/actions/rust-toolchain
         with:
           targets: x86_64-pc-windows-msvc
 
@@ -953,7 +953,7 @@ jobs:
         run: node scripts/check-kin-vfs-compat.mjs
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@191af2e1955bbe165f9bbacff2d2438002dff4d4 # branch 1.96.0, 2026-07-16
+        uses: ./.github/actions/rust-toolchain
         with:
           components: clippy, rustfmt
 
@@ -1117,7 +1117,7 @@ jobs:
       # TEMPORARY debt allow-list; burn entries down and delete each allow once its
       # lint is clean. No additions without lead sign-off.
       # Enumerated from `cargo clippy --all-targets --all-features` on main against
-      # the CI toolchain (rustc/clippy 1.96.0, dtolnay rust-toolchain@stable):
+      # the CI toolchain (rustc/clippy 1.96.0, the channel in rust-toolchain.toml):
       # 45 distinct clippy lints (the 1.96 bump from 1.94 added collapsible_match,
       # manual_checked_ops, useless_conversion). The `--` keeps these allows AFTER the
       # RUSTFLAGS=-Dwarnings group so each specific lint overrides it. (The ArtifactId
@@ -1324,7 +1324,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@191af2e1955bbe165f9bbacff2d2438002dff4d4 # branch 1.96.0, 2026-07-16
+        uses: ./.github/actions/rust-toolchain
 
       - name: Verify kin cargo registry config
         # Same tracked config the check job verifies.

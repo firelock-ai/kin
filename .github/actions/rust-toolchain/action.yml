@@ -1,0 +1,151 @@
+name: rustup toolchain install
+description: >
+  Install a Rust toolchain using the rustup that every GitHub-hosted runner
+  image already ships, so starting a Rust job needs no action tarball from
+  codeload. Toolchain artifacts come from static.rust-lang.org instead, which
+  carries no per-repository download limit.
+
+inputs:
+  toolchain:
+    description: >
+      Toolchain to install. Defaults to the channel in rust-toolchain.toml so
+      the version has one source of truth rather than one per workflow.
+    required: false
+    default: ""
+  targets:
+    description: Target triples to add, separated by commas or spaces.
+    required: false
+    default: ""
+  components:
+    description: Components to add, separated by commas or spaces.
+    required: false
+    default: ""
+
+outputs:
+  toolchain:
+    description: The resolved toolchain name, suitable for `cargo +<name>`.
+    value: ${{ steps.resolve.outputs.toolchain }}
+
+runs:
+  using: composite
+  steps:
+    # Inputs reach the shell through the environment rather than through
+    # `${{ }}` interpolation, so a value can never close the quoting and run as
+    # script text.
+    - name: Resolve the toolchain
+      id: resolve
+      shell: bash
+      env:
+        INPUT_TOOLCHAIN: ${{ inputs.toolchain }}
+      run: |
+        set -euo pipefail
+        toolchain="$INPUT_TOOLCHAIN"
+        if [ -z "$toolchain" ]; then
+          pin="$GITHUB_WORKSPACE/rust-toolchain.toml"
+          if [ -f "$pin" ]; then
+            toolchain=$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p;' "$pin" | sed -n '1p')
+          fi
+        fi
+        # Refuse rather than default. A wrong toolchain installed quietly is a
+        # compile error attributed to the code under test.
+        if [ -z "$toolchain" ]; then
+          echo "no toolchain resolved: pass the 'toolchain' input, or keep a [toolchain] channel in rust-toolchain.toml" >&2
+          exit 1
+        fi
+        echo "toolchain=$toolchain" >> "$GITHUB_OUTPUT"
+        echo "resolved toolchain: $toolchain"
+
+    - name: Pin CARGO_HOME for later steps
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ -z "${CARGO_HOME:-}" ]; then
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            echo "CARGO_HOME=$USERPROFILE\\.cargo" >> "$GITHUB_ENV"
+          else
+            echo "CARGO_HOME=$HOME/.cargo" >> "$GITHUB_ENV"
+          fi
+        fi
+
+    # Every current GitHub-hosted image ships rustup, so this is a no-op there.
+    # It stays because a self-hosted or future image that drops rustup would
+    # otherwise fail at the install step with a bare "command not found".
+    - name: Install rustup if the runner image lacks it
+      if: runner.os != 'Windows'
+      shell: bash
+      run: |
+        set -euo pipefail
+        if ! command -v rustup >/dev/null 2>&1; then
+          curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused \
+            --location --silent --show-error --fail https://sh.rustup.rs \
+            | sh -s -- --default-toolchain none -y
+          echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
+        fi
+
+    - name: Install rustup if the runner image lacks it
+      if: runner.os == 'Windows'
+      shell: bash
+      run: |
+        set -euo pipefail
+        if ! command -v rustup >/dev/null 2>&1; then
+          curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused \
+            --location --silent --show-error --fail \
+            "https://win.rustup.rs/${{ runner.arch == 'ARM64' && 'aarch64' || 'x86_64' }}" \
+            --output "$RUNNER_TEMP/rustup-init.exe"
+          "$RUNNER_TEMP/rustup-init.exe" --default-toolchain none --no-modify-path -y
+          echo "${CARGO_HOME:-$USERPROFILE\\.cargo}\\bin" >> "$GITHUB_PATH"
+        fi
+
+    # The flag lists are built as strings and expanded unquoted on purpose:
+    # that is the word split that turns "clippy, rustfmt" into two --component
+    # flags. An empty string expands to no argument at all, which is why this
+    # does not use an array; `"${arr[@]}"` on an empty array is an unbound
+    # variable error under `set -u` in the bash 3.2 that macOS runners ship.
+    - name: Install the toolchain
+      shell: bash
+      env:
+        TOOLCHAIN: ${{ steps.resolve.outputs.toolchain }}
+        TARGETS: ${{ inputs.targets }}
+        COMPONENTS: ${{ inputs.components }}
+        RUSTUP_PERMIT_COPY_RENAME: 1
+      run: |
+        set -euo pipefail
+        target_flags=""
+        for t in ${TARGETS//,/ }; do target_flags="$target_flags --target $t"; done
+        component_flags=""
+        for c in ${COMPONENTS//,/ }; do component_flags="$component_flags --component $c"; done
+        downgrade=""
+        if [ "$TOOLCHAIN" = "nightly" ] && [ -n "$COMPONENTS" ]; then
+          downgrade=" --allow-downgrade"
+        fi
+        rustup toolchain install "$TOOLCHAIN" $target_flags $component_flags \
+          --profile minimal$downgrade --no-self-update
+
+    # Non-fatal for the same reason it is upstream: on a runner whose rustup
+    # already has a default, re-defaulting can fail while the toolchain is
+    # installed and usable, and rust-toolchain.toml selects it regardless.
+    - name: Make it the default toolchain
+      shell: bash
+      continue-on-error: true
+      env:
+        TOOLCHAIN: ${{ steps.resolve.outputs.toolchain }}
+      run: rustup default "$TOOLCHAIN"
+
+    - name: Set the Cargo defaults CI expects
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ -z "${CARGO_INCREMENTAL+set}" ]; then
+          echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
+        fi
+        if [ -z "${CARGO_TERM_COLOR+set}" ]; then
+          echo "CARGO_TERM_COLOR=always" >> "$GITHUB_ENV"
+        fi
+
+    - name: Report the installed toolchain
+      shell: bash
+      run: |
+        set -euo pipefail
+        rustup show active-toolchain || true
+        rustc --version --verbose
+        cargo --version
