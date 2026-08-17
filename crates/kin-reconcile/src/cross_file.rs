@@ -15,10 +15,10 @@
 //! [`LiveCrossFileLinker`] keeps a [`kin_index::IncrementalLinker`] current as
 //! files arrive and binds in both directions:
 //!
-//! * **forward** — the file being reconciled resolves its destinations against
+//! * **forward.** The file being reconciled resolves its destinations against
 //!   every entity already in the graph, so a file written against modules that
-//!   already exist connects on arrival;
-//! * **backward** — a reference a file indexed earlier left unbound binds the
+//!   already exist connects on arrival.
+//! * **backward.** A reference a file indexed earlier left unbound binds the
 //!   moment its destination arrives. This is the half that makes "write module
 //!   A, then write module B" connect A to B, and a forward-only fix passes a
 //!   naive test while failing a real build.
@@ -280,8 +280,8 @@ impl LiveCrossFileLinker {
     ///
     /// A file the graph already holds entities for, that this linker has never
     /// heard of, means the graph gained files through a path that does not run
-    /// reconcile — `kin init` importing an existing git history is the one that
-    /// matters. Resolving against that stale universe would silently miss every
+    /// reconcile, and `kin init` importing an existing git history is the one
+    /// that matters. Resolving against that stale universe would silently miss every
     /// destination those files declare. Re-indexing is capped at once per
     /// process so a file the seed legitimately skips, such as one with no
     /// admitted artifact identity, cannot make every write pay for a rescan.

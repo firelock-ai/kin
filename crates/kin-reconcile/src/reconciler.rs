@@ -951,13 +951,14 @@ impl Reconciler {
         // Only remove a relation when this reconcile pass could have re-derived it.
         // Three cases now qualify, and each covers a distinct failure the others do
         // not:
-        //   1. `parser_authoritative` — parser-derived, both endpoints inside this
-        //      file, and this pass produced no such edge. The intra-file case:
-        //      deleting a call between two functions in one file retires its edge.
-        //   2. `duplicate_parser_relation` — same, but this pass DID produce that
-        //      key. Retires the surplus copies so one logical edge keeps one
+        //   1. `parser_authoritative`. Parser-derived, both endpoints inside this
+        //      file, and the key is absent from what this pass produced. The
+        //      intra-file case: deleting a call between two functions in one file
+        //      retires its edge.
+        //   2. `duplicate_parser_relation`. The same, except this pass DID produce
+        //      that key. Retires the surplus copies so one logical edge keeps one
         //      identity after a resolver or id-derivation change.
-        //   3. `cross_file_source_authoritative` — parser-derived, sourced by an
+        //   3. `cross_file_source_authoritative`. Parser-derived, sourced by an
         //      entity of this file, destination outside it, the cross-file pass ran,
         //      and this file's freshly parsed text no longer names that destination
         //      under any spelling. The case this file's edges could not reach before,
@@ -1020,8 +1021,8 @@ impl Reconciler {
         }
 
         // Artifact-level import and include edges. These never reach
-        // `existing_relations` — that set is gathered per entity, and an
-        // artifact edge has no entity endpoint — so the loop above cannot see
+        // `existing_relations`, because that set is gathered per entity and an
+        // artifact edge has no entity endpoint, so the loop above cannot see
         // them at all. Reconcile them against graph truth: the pass re-derived
         // the complete import set of every file it resolved, from those files'
         // own declarations.

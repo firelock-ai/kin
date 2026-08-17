@@ -286,7 +286,7 @@ fn entity_link_order(a: &Entity, b: &Entity) -> std::cmp::Ordering {
 /// Shared by the batch [`link_cross_file`] entity index, the
 /// [`IncrementalLinker`] bare-name index, and the live reconcile path's
 /// destination-name evidence so all three derive receiver-method leaf names
-/// identically — a divergence here would resolve the same call to different
+/// identically. A divergence here would resolve the same call to different
 /// entities across the two linkers, or let a reconcile retire an edge whose
 /// destination the file still names under its qualified spelling.
 pub fn bare_entity_name(name: &str) -> &str {
