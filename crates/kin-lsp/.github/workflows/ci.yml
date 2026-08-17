@@ -40,7 +40,7 @@ jobs:
       # Toolchain channel is pinned by rust-toolchain.toml (1.96.0); the action
       # honours that file. Bump both together, never via @stable drift.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: ./.github/actions/rust-toolchain
         with:
           components: clippy, rustfmt
 
