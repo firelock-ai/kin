@@ -2675,6 +2675,57 @@ enum ReceiverScope {
     Object,
 }
 
+/// Package-index filenames a bare module name may resolve through when the
+/// language writes a directory module rather than a file. Kept beside the
+/// receiver resolver rather than folded into [`INDEX_FILENAMES`], which is the
+/// import-path resolver's own list.
+const PACKAGE_INDEX_FILENAMES: &[&str] = &["__init__.py", "index.ts", "index.js", "mod.rs"];
+
+/// Locate the repository file a receiver's imported module names, if any.
+///
+/// Falls back to a bare dotted module name (`mathlib`, `pkg.mathlib`) read as a
+/// repo path, tried from the caller's own directory first — a sibling module
+/// imported by bare name is the common Python shape and the import-path
+/// resolver does not cover it. Returning `None` is the positive finding that no
+/// file in this repository can be that module, which is what separates a stdlib
+/// receiver from a repo-local one.
+fn resolve_receiver_module_file<S>(
+    caller_file: &str,
+    module_path: &str,
+    known_files: &HashSet<S>,
+) -> Option<String>
+where
+    S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
+{
+    if let Some(target_file) = resolve_module_path(caller_file, module_path, known_files) {
+        return Some(target_file);
+    }
+    if module_path.is_empty() || !module_path.split('.').all(is_path_identifier) {
+        return None;
+    }
+    let relative = module_path.replace('.', "/");
+    let caller_dir = parent_dir(caller_file);
+    let bases = [format!("{caller_dir}/{relative}"), relative.clone()];
+    for base in bases.iter().map(|base| base.trim_start_matches('/')) {
+        if base.is_empty() {
+            continue;
+        }
+        for ext in MODULE_EXTENSIONS {
+            let candidate = format!("{base}.{ext}");
+            if known_files.contains(candidate.as_str()) {
+                return Some(candidate);
+            }
+        }
+        for index in PACKAGE_INDEX_FILENAMES {
+            let candidate = format!("{base}/{index}");
+            if known_files.contains(candidate.as_str()) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
 /// Classify an attribute call's receiver against the calling file's imports.
 ///
 /// Only the receiver's root segment is consulted: `os.environ.get(...)` is a
@@ -2696,7 +2747,7 @@ where
     let Some(&(module_path, _)) = file_imports.and_then(|imports| imports.get(root)) else {
         return ReceiverScope::Object;
     };
-    match resolve_module_path(caller_file, module_path, known_files) {
+    match resolve_receiver_module_file(caller_file, module_path, known_files) {
         Some(target_file) => ReceiverScope::Module(target_file),
         None => ReceiverScope::ExternalModule,
     }
