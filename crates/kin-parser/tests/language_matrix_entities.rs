@@ -425,6 +425,193 @@ fn kotlin_signature_should_exclude_body() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// JavaScript / TypeScript relational shape.
+//
+// A `kin init` of express on 0.5.36 produced 613 entities and 211 relations —
+// 0.34 per entity, no Contains, no Extends, no Method or Class kind, and 451 of
+// the 613 entities Constants. Python on a comparable repo produced 2.64
+// relations per entity. The two fixtures below carry every JavaScript shape
+// that gap came from, and assert edge DENSITY as well as presence so a
+// regression that halves the relational graph fails rather than passing on a
+// surviving sample.
+// ---------------------------------------------------------------------------
+
+/// Every relational JavaScript shape in one file: an ES class with methods and
+/// a base, a constructor with a prototype method, a receiver-object method, a
+/// namespace object literal, a const-bound arrow, a CommonJS export and an ESM
+/// export.
+const RELATIONAL_JS: &str = r#"
+import { helper } from './helper';
+const format = require('./format');
+
+export class Service extends Base {
+  run() { return format(helper(this.id)); }
+  stop() { return format(helper(this.id)); }
+}
+
+function View(name) { this.name = normalize(trim(name)); }
+View.prototype.lookup = function lookup(n) { return format(helper(n)); };
+
+res.status = function status(code) { return format(validate(code)); };
+res.set = res.header = function header(field) { return format(trim(field)); };
+
+const utils = {
+  parse(input) { return format(helper(input)); },
+  print: (x) => format(trim(x)),
+};
+
+const build = (spec) => format(normalize(spec));
+
+module.exports = { boot() { return format(helper(0)); } };
+
+export const NAME = 'service';
+"#;
+
+/// The TypeScript mirror of [`RELATIONAL_JS`]. The two adapters share the
+/// CommonJS import surface, the receiver-assignment forms and the
+/// object-literal method extraction, so a divergence here means one adapter
+/// answers a question about the same source differently from the other.
+const RELATIONAL_TS: &str = r#"
+import { helper } from './helper';
+const format = require('./format');
+
+export class Service extends Base {
+  run(): number { return format(helper(this.id)); }
+  stop(): number { return format(helper(this.id)); }
+}
+
+function View(name: string) { this.name = normalize(trim(name)); }
+View.prototype.lookup = function lookup(n: string) { return format(helper(n)); };
+
+res.status = function status(code: number) { return format(validate(code)); };
+res.set = res.header = function header(field: string) { return format(trim(field)); };
+
+const utils = {
+  parse(input: string) { return format(helper(input)); },
+  print: (x: string) => format(trim(x)),
+};
+
+const build = (spec: string) => format(normalize(spec));
+
+module.exports = { boot() { return format(helper(0)); } };
+
+export const NAME = 'service';
+"#;
+
+/// Assert the relational contract both adapters must satisfy on their fixture.
+fn assert_relational_shape(out: &ParseOutput, lang: &str) {
+    let named: Vec<(EntityKind, &str)> = out
+        .entities
+        .iter()
+        .map(|e| (e.kind, e.name.as_str()))
+        .collect();
+    let expected = [
+        // ES class, its methods, and the constructor-plus-prototype form —
+        // both are classes with methods, and the graph must not tell them apart.
+        (EntityKind::Class, "Service"),
+        (EntityKind::Method, "Service.run"),
+        (EntityKind::Method, "Service.stop"),
+        (EntityKind::Class, "View"),
+        (EntityKind::Method, "View.lookup"),
+        // A receiver object owns what is assigned to it, and a chained
+        // assignment defines every target on the chain.
+        (EntityKind::Class, "res"),
+        (EntityKind::Method, "res.status"),
+        (EntityKind::Method, "res.set"),
+        (EntityKind::Method, "res.header"),
+        // A namespace object literal owns its function properties.
+        (EntityKind::Class, "utils"),
+        (EntityKind::Method, "utils.parse"),
+        (EntityKind::Method, "utils.print"),
+        // A const-bound arrow is a Function, never a Constant.
+        (EntityKind::Function, "build"),
+        // `module.exports = { ... }` exports one function per property.
+        (EntityKind::Function, "boot"),
+        // A scalar named export stays a Constant.
+        (EntityKind::Constant, "NAME"),
+    ];
+    for want in expected {
+        assert!(
+            named.contains(&want),
+            "{lang}: missing {want:?}; have {named:?}"
+        );
+    }
+
+    let contains: std::collections::BTreeSet<(&str, &str)> = out
+        .relations
+        .iter()
+        .filter(|r| r.kind == kin_model::RelationKind::Contains)
+        .map(|r| (r.src_name.as_str(), r.dst_name.as_str()))
+        .collect();
+    for want in [
+        ("Service", "Service.run"),
+        ("Service", "Service.stop"),
+        ("View", "View.lookup"),
+        ("res", "res.status"),
+        ("res", "res.set"),
+        ("res", "res.header"),
+        ("utils", "utils.parse"),
+        ("utils", "utils.print"),
+    ] {
+        assert!(
+            contains.contains(&want),
+            "{lang}: missing Contains {want:?}; have {contains:?}"
+        );
+    }
+
+    let extends: Vec<(&str, &str)> = out
+        .relations
+        .iter()
+        .filter(|r| r.kind == kin_model::RelationKind::Extends)
+        .map(|r| (r.src_name.as_str(), r.dst_name.as_str()))
+        .collect();
+    assert_eq!(extends, vec![("Service", "Base")], "{lang}: Extends");
+
+    // Both the ESM `import` and the CommonJS `require` reach the import
+    // surface; cross-file resolution has no binding to work with otherwise.
+    let modules: std::collections::BTreeSet<&str> =
+        out.imports.iter().map(|i| i.module_path.as_str()).collect();
+    assert!(
+        modules.contains("./helper") && modules.contains("./format"),
+        "{lang}: expected both ESM and CommonJS imports, got {modules:?}"
+    );
+    // A require binding is a dependency line, not an entity.
+    assert!(
+        !named.iter().any(|(_, n)| *n == "format"),
+        "{lang}: require binding must not become an entity; have {named:?}"
+    );
+
+    // Density, not just presence: express measured 0.34 relations per entity
+    // against Python's 2.64. Asserting the ratio is what makes a regression
+    // that halves the edge count fail on a fixture that still contains every
+    // expected name.
+    let density = out.relations.len() as f64 / out.entities.len() as f64;
+    assert!(
+        density >= 2.0,
+        "{lang}: {} relations over {} entities is {density:.2} per entity, \
+         below the 2.0 floor this fixture must clear",
+        out.relations.len(),
+        out.entities.len()
+    );
+}
+
+#[test]
+fn javascript_relational_shape() {
+    assert_relational_shape(
+        &extract(&JavaScriptAdapter, "service.js", RELATIONAL_JS),
+        "javascript",
+    );
+}
+
+#[test]
+fn typescript_relational_shape() {
+    assert_relational_shape(
+        &extract(&TypeScriptAdapter, "service.ts", RELATIONAL_TS),
+        "typescript",
+    );
+}
+
 #[test]
 #[ignore = "YELLOW: Ruby empty-body method keeps a trailing `end` in the signature (`def helper end`) because there is no `body` field to cut before"]
 fn ruby_empty_body_method_signature_should_exclude_end() {

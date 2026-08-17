@@ -12,6 +12,14 @@ use crate::extract::{
     ExtractedEntity, ExtractedRelation, ExtractedTest, ExtractedTestKind, FileImport, ImportedName,
     ParseOutput,
 };
+// TypeScript is a superset of JavaScript, so the CommonJS import surface,
+// receiver-method assignment forms and object-literal methods parse to the same
+// nodes in both grammars. Sharing them keeps the two adapters from drifting into
+// different answers for the same source.
+use super::javascript::{
+    collect_js_require_imports, extract_js_assignment_function, extract_js_object_methods,
+    js_heritage_name, js_require_target, JsOwners,
+};
 
 pub struct TypeScriptAdapter;
 
@@ -46,6 +54,7 @@ impl LanguageAdapter for TypeScriptAdapter {
         let mut relations = Vec::new();
         let mut imports = Vec::new();
         let mut tests = Vec::new();
+        let mut owners = JsOwners::default();
         let root = tree.root_node();
         let mut cursor = root.walk();
 
@@ -67,13 +76,24 @@ impl LanguageAdapter for TypeScriptAdapter {
         }
 
         for child in root.children(&mut cursor) {
-            extract_ts_node(&child, source, file_id, &mut entities, &mut relations);
+            extract_ts_node(
+                &child,
+                source,
+                file_id,
+                &mut entities,
+                &mut relations,
+                &mut owners,
+            );
             if let Some(import_like) = extract_ts_import_like(&child, source) {
                 imports.push(import_like);
             }
+            // Extract CommonJS require() calls as imports
+            collect_js_require_imports(&child, source, &mut imports);
             // Detect describe/it/test calls (Jest/Vitest/Mocha)
             extract_js_tests(&child, source, &mut tests);
         }
+
+        owners.finish(&mut entities);
 
         // Build import lookup: local_name -> module_path
         let import_map: std::collections::HashMap<&str, &str> = imports
@@ -113,6 +133,7 @@ fn extract_ts_node(
     file_id: &FilePathId,
     entities: &mut Vec<ExtractedEntity>,
     relations: &mut Vec<ExtractedRelation>,
+    owners: &mut JsOwners,
 ) {
     match node.kind() {
         "function_declaration" | "function" => {
@@ -136,29 +157,7 @@ fn extract_ts_node(
         "class_declaration" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = name_node.utf8_text(source).unwrap_or("").to_string();
-                let sig = node_signature(node, source);
-                entities.push(ExtractedEntity {
-                    kind: EntityKind::Class,
-                    name: name.clone(),
-                    signature: sig,
-                    visibility: detect_ts_visibility(node, source),
-                    doc_summary: extract_preceding_comment(node, source),
-                    fingerprint: compute_fingerprint(node, source),
-                    span: span_from_node(node, file_id),
-                });
-
-                // Extract heritage (extends/implements)
-                extract_ts_heritage(node, source, &name, relations);
-
-                // Recurse into class body for methods
-                if let Some(body) = node.child_by_field_name("body") {
-                    let mut cursor = body.walk();
-                    for member in body.children(&mut cursor) {
-                        extract_ts_class_member(
-                            &member, source, file_id, &name, entities, relations,
-                        );
-                    }
-                }
+                extract_ts_class_like(node, &name, source, file_id, entities, relations);
             }
         }
         "interface_declaration" => {
@@ -239,6 +238,12 @@ fn extract_ts_node(
                 }
             }
         }
+        "expression_statement" => {
+            // Prototype and receiver method assignments (`Foo.prototype.bar =
+            // function () {}`) plus `module.exports = ...`. TypeScript files in
+            // Node packages still carry these CommonJS shapes.
+            extract_js_assignment_function(node, source, file_id, entities, relations, owners);
+        }
         "lexical_declaration" | "variable_declaration" => {
             let mut decl_cursor = node.walk();
             for declarator in node.children(&mut decl_cursor) {
@@ -246,6 +251,34 @@ fn extract_ts_node(
                     if let Some(name_node) = declarator.child_by_field_name("name") {
                         let name = name_node.utf8_text(source).unwrap_or("").to_string();
                         let value_node = declarator.child_by_field_name("value");
+
+                        // A `require(...)` binding is a dependency line, not a
+                        // constant; it is already carried as a `FileImport`.
+                        if value_node
+                            .as_ref()
+                            .is_some_and(|value| js_require_target(value, source).is_some())
+                        {
+                            continue;
+                        }
+
+                        // `const Foo = class extends Bar {}` is a class
+                        // declaration wearing a binding.
+                        if let Some(class_value) =
+                            value_node.filter(|value| value.kind() == "class")
+                        {
+                            if !name.is_empty() {
+                                extract_ts_class_like(
+                                    &class_value,
+                                    &name,
+                                    source,
+                                    file_id,
+                                    entities,
+                                    relations,
+                                );
+                            }
+                            continue;
+                        }
+
                         let kind = if value_node.as_ref().is_some_and(is_ts_function_like_node) {
                             EntityKind::Function
                         } else {
@@ -266,7 +299,7 @@ fn extract_ts_node(
                         }
                         entities.push(ExtractedEntity {
                             kind,
-                            name,
+                            name: name.clone(),
                             signature: node_signature(&declarator, source),
                             visibility: detect_ts_visibility(node, source),
                             doc_summary: extract_preceding_comment(node, source),
@@ -282,6 +315,13 @@ fn extract_ts_node(
                                 relations,
                             );
                         }
+                        // `const utils = { parse() {} }` is a namespace object
+                        // whose function properties are the methods it owns.
+                        if let Some(object) = value_node.filter(|value| value.kind() == "object") {
+                            extract_js_object_methods(
+                                &object, &name, source, file_id, entities, relations, owners,
+                            );
+                        }
                     }
                 }
             }
@@ -295,7 +335,7 @@ fn extract_ts_node(
                 if child.kind() == "default" || child.utf8_text(source).unwrap_or("") == "default" {
                     has_default = true;
                 }
-                extract_ts_node(&child, source, file_id, entities, relations);
+                extract_ts_node(&child, source, file_id, entities, relations, owners);
             }
             // If this is a default export and recursion didn't create any entities,
             // create a synthetic "default" entity so the linker can resolve
@@ -333,6 +373,39 @@ fn extract_ts_node(
         }
         "import_statement" => {}
         _ => {}
+    }
+}
+
+/// Extract a class entity, its heritage edges, and its members. Shared by
+/// `class Foo {}` and `const Foo = class {}`, which differ only in where the
+/// name comes from.
+fn extract_ts_class_like(
+    node: &tree_sitter::Node,
+    name: &str,
+    source: &[u8],
+    file_id: &FilePathId,
+    entities: &mut Vec<ExtractedEntity>,
+    relations: &mut Vec<ExtractedRelation>,
+) {
+    entities.push(ExtractedEntity {
+        kind: EntityKind::Class,
+        name: name.to_string(),
+        signature: node_signature(node, source),
+        visibility: detect_ts_visibility(node, source),
+        doc_summary: extract_preceding_comment(node, source),
+        fingerprint: compute_fingerprint(node, source),
+        span: span_from_node(node, file_id),
+    });
+
+    // Extract heritage (extends/implements)
+    extract_ts_heritage(node, source, name, relations);
+
+    // Recurse into class body for methods
+    if let Some(body) = node.child_by_field_name("body") {
+        let mut cursor = body.walk();
+        for member in body.children(&mut cursor) {
+            extract_ts_class_member(&member, source, file_id, name, entities, relations);
+        }
     }
 }
 
@@ -521,17 +594,22 @@ fn extract_ts_heritage(
             for clause in child.children(&mut heritage_cursor) {
                 match clause.kind() {
                     "extends_clause" => {
-                        if let Some(value) = clause.child(1) {
-                            let parent = value.utf8_text(source).unwrap_or("").to_string();
-                            if !parent.is_empty() {
-                                relations.push(ExtractedRelation {
-                                    call_shape: None,
-                                    kind: kin_model::RelationKind::Extends,
-                                    src_name: class_name.to_string(),
-                                    dst_name: parent,
-                                    import_source: None,
-                                });
-                            }
+                        // The base may be a bare identifier, a namespace member
+                        // (`extends React.Component`) or a mixin call; each
+                        // reduces to the rightmost identifier, which is the name
+                        // the linker resolves. A generic base
+                        // (`extends Base<T>`) keeps only `Base`.
+                        if let Some(parent) = clause
+                            .child(1)
+                            .and_then(|value| js_heritage_name(&value, source))
+                        {
+                            relations.push(ExtractedRelation {
+                                call_shape: None,
+                                kind: kin_model::RelationKind::Extends,
+                                src_name: class_name.to_string(),
+                                dst_name: parent,
+                                import_source: None,
+                            });
                         }
                     }
                     "implements_clause" => {
@@ -1151,23 +1229,28 @@ export class Dog extends Animal implements Pet {
     #[test]
     fn keep_object_literal_with_callbacks() {
         let adapter = TypeScriptAdapter;
-        // Object literals containing function-like nodes are meaningful code
+        // Object literals containing function-like nodes are meaningful code.
+        //
+        // Contract (shared with the JavaScript adapter): such a literal is a
+        // namespace object, so it is kinded Class and each function property
+        // becomes a Method it contains.
         let source = b"export const handlers = { onClick: () => console.log('click') };";
         let tree = adapter.parse(source).unwrap();
         let file_id = FilePathId::new("test.ts");
         let output = adapter.extract(&tree, source, &file_id).unwrap();
 
-        let constants: Vec<_> = output
+        let named: Vec<(EntityKind, &str)> = output
             .entities
             .iter()
-            .filter(|e| e.kind == EntityKind::Constant)
+            .map(|e| (e.kind, e.name.as_str()))
             .collect();
         assert_eq!(
-            constants.len(),
-            1,
-            "object literals with callbacks should be kept"
+            named,
+            vec![
+                (EntityKind::Class, "handlers"),
+                (EntityKind::Method, "handlers.onClick"),
+            ]
         );
-        assert_eq!(constants[0].name, "handlers");
     }
 
     #[test]
