@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Exclude the store at init, report 1-based lines from kin refs, and make the context pack's cost honest (#874)
 - Re-resolve the spine's repository root on demand instead of once at startup (#880)
 - Gate absence authority on the cross-file edge classes a query reads (#872)
+- Pin kin-db 0.7.31 (#863)
+- Bind the release retry timeout test to its invariant, not an attempt count (#883)
+- Stop the supervisor reaping a daemon that has a commit in flight (#871)
+- Resolve a real commit identity or refuse, instead of stamping "Author: unknown" (#876)
 
 
 ## [0.5.37] - 2026-08-17
