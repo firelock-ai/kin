@@ -415,7 +415,9 @@ mod tests {
         fixture.init_git();
         fixture.set_repo_identity("unknown", "unknown");
 
-        fixture.resolve().expect_err("refuse a placeholder identity");
+        fixture
+            .resolve()
+            .expect_err("refuse a placeholder identity");
     }
 
     /// Git's own synthesized address is the same defect wearing a different

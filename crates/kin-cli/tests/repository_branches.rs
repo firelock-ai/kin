@@ -76,6 +76,22 @@ fn initialize_kin_repo(
     kin_core::KinLayout::discover(repo).expect("discover exact layout")
 }
 
+/// Give a repository a Kin-native author, for fixtures that then hide `.git`.
+///
+/// Hiding `.git` is how these tests prove branch answers never fall back to Git,
+/// and it takes the Git identity with it, so a repository command that stamps an
+/// actor would have nobody to name. `default_author` is the setting that exists
+/// for exactly that repository shape: native, with no Git configuration to read.
+fn pin_native_identity(layout: &kin_core::KinLayout) {
+    let path = layout.config_path();
+    let existing = fs::read_to_string(&path).expect("read kin config");
+    fs::write(
+        &path,
+        format!("default_author = \"Kin Fixture <fixture@example.invalid>\"\n{existing}"),
+    )
+    .expect("write kin config");
+}
+
 fn open_authority(
     layout: &kin_core::KinLayout,
 ) -> (RepositoryId, RepositoryAuthorityManager<LocalFileBackend>) {
@@ -402,6 +418,7 @@ fn branch_list_preserves_byte_refs_and_ignores_checkout_git_state() {
     assert!(human.status.success());
     assert!(String::from_utf8_lossy(&human.stdout).contains("refs/heads/raw-\\xff"));
 
+    pin_native_identity(&layout);
     fs::rename(repo.join(".git"), repo.join("git-authority-disabled"))
         .expect("hide admitted Git metadata");
     fs::create_dir_all(repo.join(".git/refs/heads")).expect("create misleading Git refs");
@@ -713,6 +730,7 @@ fn branch_create_uses_detached_workspace_target_without_git_fallback() {
     run_git(&repo, &["checkout", "--detach"]);
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
     let layout = initialize_kin_repo(&runtime, &repo);
+    pin_native_identity(&layout);
     fs::rename(repo.join(".git"), repo.join("git-authority-disabled"))
         .expect("hide admitted Git metadata");
 
@@ -809,6 +827,7 @@ fn branch_switch_projects_complete_polyglot_and_non_code_tree_from_repository_ca
             "install byte-exact switch target",
         ))
         .expect("commit byte-exact branch");
+    pin_native_identity(&layout);
     fs::rename(repo.join(".git"), repo.join("git-authority-disabled"))
         .expect("hide admitted Git metadata");
 
@@ -1390,6 +1409,7 @@ fn branch_switch_preserves_graph_only_gitlinks_without_traversing_nested_checkou
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
     let layout = initialize_kin_repo(&runtime, &repo);
     let (repository_id, _) = open_authority(&layout);
+    pin_native_identity(&layout);
     fs::rename(repo.join(".git"), repo.join("git-authority-disabled"))
         .expect("hide admitted Git metadata");
 
@@ -1501,6 +1521,7 @@ fn branch_switch_retains_host_unrepresentable_byte_path_in_graph_authority() {
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
     let layout = initialize_kin_repo(&runtime, &repo);
     let (repository_id, _) = open_authority(&layout);
+    pin_native_identity(&layout);
     fs::rename(repo.join(".git"), repo.join("git-authority-disabled"))
         .expect("hide admitted Git metadata");
 

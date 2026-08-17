@@ -75,11 +75,7 @@ fn require_kin(
     output
 }
 
-fn require_kin_json(
-    runtime: &common::IsolatedDaemonRuntime,
-    repo: &Path,
-    args: &[&str],
-) -> Value {
+fn require_kin_json(runtime: &common::IsolatedDaemonRuntime, repo: &Path, args: &[&str]) -> Value {
     let output = require_kin(runtime, repo, args);
     serde_json::from_slice(&output.stdout).expect("kin should emit JSON")
 }
@@ -150,11 +146,7 @@ fn a_native_commit_records_the_configured_git_identity() {
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
     initialize(&runtime, &repo);
 
-    fs::write(
-        repo.join("src/added.rs"),
-        b"pub fn added() -> u8 { 3 }\n",
-    )
-    .expect("add source");
+    fs::write(repo.join("src/added.rs"), b"pub fn added() -> u8 { 3 }\n").expect("add source");
     require_kin(&runtime, &repo, &["commit", "-m", "publish added source"]);
 
     let entries = log_entries(&runtime, &repo);
@@ -186,11 +178,15 @@ fn an_imported_git_history_keeps_its_original_per_commit_authors() {
     let imported = authors(&log_entries(&runtime, &repo));
 
     assert!(
-        imported.iter().any(|author| author.contains("Ada Lovelace")),
+        imported
+            .iter()
+            .any(|author| author.contains("Ada Lovelace")),
         "the first commit's author was lost: {imported:?}"
     );
     assert!(
-        imported.iter().any(|author| author.contains("Grace Hopper")),
+        imported
+            .iter()
+            .any(|author| author.contains("Grace Hopper")),
         "the second commit's author was lost: {imported:?}"
     );
     assert!(
@@ -213,11 +209,7 @@ fn a_commit_with_no_resolvable_identity_is_refused_with_its_remedy() {
     require_git(&repo, &["config", "--unset", "user.name"]);
     require_git(&repo, &["config", "--unset", "user.email"]);
 
-    fs::write(
-        repo.join("src/orphan.rs"),
-        b"pub fn orphan() -> u8 { 4 }\n",
-    )
-    .expect("add source");
+    fs::write(repo.join("src/orphan.rs"), b"pub fn orphan() -> u8 { 4 }\n").expect("add source");
     let refused = run_kin(&runtime, &repo, &["commit", "-m", "nobody authored this"]);
 
     assert!(
@@ -269,7 +261,11 @@ fn a_kin_specific_author_outranks_the_git_identity() {
         b"pub fn preferred() -> u8 { 5 }\n",
     )
     .expect("add source");
-    require_kin(&runtime, &repo, &["commit", "-m", "publish preferred source"]);
+    require_kin(
+        &runtime,
+        &repo,
+        &["commit", "-m", "publish preferred source"],
+    );
 
     let entries = log_entries(&runtime, &repo);
     let newest = entries.first().expect("the native commit");
