@@ -242,8 +242,10 @@ fn an_unimported_same_named_entity_still_reaches_the_name_fallback() {
         Some(1.0),
         "the same-file definition wins outright"
     );
-    assert!(
-        NAME_ONLY_CONFIDENCE < IMPORT_RESOLVED_CONFIDENCE,
-        "the tier ladder this file asserts against must stay ordered"
+    let unrelated = entity_id_in(&files, "other.py", "unrelated");
+    assert_eq!(
+        reference_confidence(&relations, caller, unrelated),
+        None,
+        "and nothing else in the repository is reached"
     );
 }

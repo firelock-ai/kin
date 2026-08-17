@@ -227,7 +227,11 @@ fn entity_id(files: &[FileParseData], name: &str) -> String {
 /// through `kin refs --bulk` over the Calls + Imports + References triple. That
 /// is the same collector, over the same kinds, that the dead-code scan consults
 /// before it puts a row on a delete list.
-fn names_with_references(graph: &InMemoryGraph, files: &[FileParseData], names: &[&str]) -> Vec<String> {
+fn names_with_references(
+    graph: &InMemoryGraph,
+    files: &[FileParseData],
+    names: &[&str],
+) -> Vec<String> {
     let request = BulkRefsRequest {
         entity_ids: names.iter().map(|name| entity_id(files, name)).collect(),
         kind: "all".to_string(),
