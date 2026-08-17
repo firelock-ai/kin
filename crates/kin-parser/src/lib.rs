@@ -49,10 +49,11 @@ pub use kin_model::FilePathId;
 pub use adapter::{EditHint, LanguageAdapter};
 pub use error::{ParseError, Result};
 pub use extract::{
-    attach_file_context_metadata, call_extraction_incomplete_marker,
-    is_call_extraction_incomplete_marker, CallArgShape, ExtractedEntity, ExtractedRelation,
-    ExtractedTest, ExtractedTestKind, FileImport, ImportedName, ParseOutput,
-    CALL_EXTRACTION_INCOMPLETE_MARKER_V1, COMMAND_EFFECT_CONTRACT_KEY, FILE_IMPORT_CONTEXT_KEY,
+    attach_file_context_metadata, attach_file_reference_parse_counts,
+    call_extraction_incomplete_marker, is_call_extraction_incomplete_marker, CallArgShape,
+    ExtractedEntity, ExtractedRelation, ExtractedTest, ExtractedTestKind, FileImport, ImportedName,
+    ParseOutput, CALL_EXTRACTION_INCOMPLETE_MARKER_V1, COMMAND_EFFECT_CONTRACT_KEY,
+    FILE_IMPORT_CONTEXT_KEY, FILE_PARSED_CALL_SITES_KEY, FILE_PARSED_IMPORT_STATEMENTS_KEY,
     FILE_SURFACE_CONTEXT_KEY,
 };
 pub use languages::{

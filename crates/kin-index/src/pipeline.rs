@@ -11,7 +11,10 @@ use kin_model::{
     Entity, EntityRole, FileLayout, FilePathId, GraphStore, Hash256, LanguageId, OpaqueArtifact,
     ParseCompleteness, ParseState, Relation, RelationId, RelationOrigin, StructuredArtifact,
 };
-use kin_parser::{attach_file_context_metadata, parse_shallow_file, AdapterRegistry, ShallowFile};
+use kin_parser::{
+    attach_file_context_metadata, attach_file_reference_parse_counts, parse_shallow_file,
+    AdapterRegistry, ShallowFile,
+};
 use kin_projection::build_layout;
 
 use tree_sitter::Tree;
@@ -167,6 +170,7 @@ impl IndexPipeline {
             })
             .collect();
         attach_file_context_metadata(&mut entities, file_id, &imports);
+        attach_file_reference_parse_counts(&mut entities, &extracted_relations, &imports);
         attach_equivalence_class(&mut entities, &tree, source, language);
         if language == LanguageId::Go {
             kin_parser::attach_go_command_effect_contract_metadata(&tree, source, &mut entities);
@@ -303,6 +307,7 @@ impl IndexPipeline {
             })
             .collect();
         attach_file_context_metadata(&mut entities, file_id, &imports);
+        attach_file_reference_parse_counts(&mut entities, &extracted_relations, &imports);
         attach_equivalence_class(&mut entities, &tree, &source, language);
         if language == LanguageId::Go {
             kin_parser::attach_go_command_effect_contract_metadata(&tree, &source, &mut entities);

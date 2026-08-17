@@ -168,6 +168,7 @@ pub async fn run_health_checks() -> HealthReport {
     checks.push(check_editor());
     checks.push(check_kinlab_connect());
     checks.push(check_semantic_query_readiness().await);
+    checks.push(check_reference_edge_coverage().await);
     checks.push(check_background_work().await);
     checks.push(check_retrieval_profile());
     checks.push(check_cross_file_enrichment());
@@ -1922,6 +1923,139 @@ async fn check_background_work() -> HealthCheck {
     }
 }
 
+/// Report whether the relation graph can answer a question about absence.
+///
+/// Five shipped surfaces (`find_references`, `trace_data_flow`, impact, xref,
+/// dead-code) answer from reference edges, and until this row existed no doctor
+/// surface said how many of those edges the graph holds: `graph validate` passed
+/// on a graph missing 16 imports and roughly 40 cross-file call edges, and
+/// `kin languages` listed the language as fully extracted, so every readiness
+/// signal pointed away from the gap.
+async fn check_reference_edge_coverage() -> HealthCheck {
+    const ID: &str = "reference_edge_coverage";
+    const LABEL: &str = "Reference edge coverage";
+
+    let cwd = env::current_dir().unwrap_or_default();
+    let Some(layout) = kin_core::KinLayout::discover(&cwd) else {
+        return HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Unsupported,
+            "n/a — not in a Kin repository",
+        );
+    };
+    let Some(daemon_url) = crate::daemon_client::resolve_daemon_url_if_running_async(&layout).await
+    else {
+        return HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Unsupported,
+            "n/a — no daemon running for this repository, so relation-graph completeness cannot \
+             be read; a daemon starts on first use",
+        )
+        .with_manual_fix("run any `kin` command in the repo to auto-start the daemon");
+    };
+    let client = match crate::daemon_client::DaemonClient::from_base_url_for_layout(
+        daemon_url.clone(),
+        &layout,
+    ) {
+        Ok(client) => client,
+        Err(error) => {
+            return HealthCheck::new(
+                ID,
+                LABEL,
+                HealthStatus::Stale,
+                format!("daemon reachable ({daemon_url}), but its URL is invalid: {error}"),
+            );
+        }
+    };
+    let response = match client
+        .graph_command(&crate::commands::graph::GraphCommandRequest::Status)
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return HealthCheck::new(
+                ID,
+                LABEL,
+                HealthStatus::Stale,
+                format!(
+                    "daemon reachable ({daemon_url}), but relation-graph completeness is \
+                     unavailable: {error}"
+                ),
+            )
+            .with_manual_fix("run `kin graph status` and resolve the reported daemon error");
+        }
+    };
+    let Some(coverage) = response.reference_edge_coverage else {
+        return HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Stale,
+            "the daemon serving this repository does not report relation-graph completeness; it \
+             predates the measurement",
+        )
+        .with_manual_fix("restart the daemon with `kin daemon restart` to pick up this build");
+    };
+    reference_edge_coverage_health(&coverage)
+}
+
+/// Turn the measurement into a verdict, split from its fetch so the rule is
+/// testable without a daemon.
+pub(crate) fn reference_edge_coverage_health(
+    coverage: &kin_core::reference_coverage::ReferenceEdgeCoverage,
+) -> HealthCheck {
+    const ID: &str = "reference_edge_coverage";
+    const LABEL: &str = "Reference edge coverage";
+
+    if coverage.languages.is_empty() {
+        return HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Healthy,
+            "no language entities in the graph yet, so there are no reference edges to resolve",
+        );
+    }
+
+    let summary = coverage
+        .languages
+        .iter()
+        .map(|language| {
+            format!(
+                "{} {}/{} calls resolved, {} cross-file",
+                language.language,
+                language.resolved_call_edges,
+                language
+                    .parsed_call_sites
+                    .map(|parsed| parsed.to_string())
+                    .unwrap_or_else(|| "?".to_string()),
+                language.cross_file_reference_edges
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    let gaps = coverage.unsupportable_absence_reasons();
+    if gaps.is_empty() {
+        return HealthCheck::new(ID, LABEL, HealthStatus::Healthy, summary);
+    }
+
+    // Pending rather than Missing: the graph is answering, and every reference
+    // query it answers is still true about the edges it holds. What it cannot do
+    // is support a claim that something is unused, so this needs attention
+    // without failing readiness.
+    HealthCheck::new(
+        ID,
+        LABEL,
+        HealthStatus::Pending,
+        format!("{}; {}", gaps.join("; "), summary),
+    )
+    .with_manual_fix(
+        "re-admit the repository so relation extraction runs again (`kin reconcile --admit`), and \
+         treat any \"unused\" answer as unverified until cross-file edges resolve",
+    )
+}
+
 /// Semantic readiness when no daemon is running to ask.
 ///
 /// This is where every repository sits until its first command needs a daemon,
@@ -2921,6 +3055,75 @@ mod tests {
             "daemon reachable, but graph embedding status is unavailable",
         );
         assert!(blocks_readiness(&unreadable));
+    }
+
+    /// FIR-2358. A graph whose reference edges did not resolve must say so on
+    /// the doctor surface, because every other readiness signal points away from
+    /// the gap: `kin languages` lists the language as fully extracted and
+    /// `graph validate` passes on its integrity.
+    #[test]
+    fn reference_edge_coverage_needs_attention_when_absence_is_unanswerable() {
+        use kin_core::reference_coverage::{
+            LanguageReferenceCoverage, ReferenceEdgeCoverage, ReferenceResolution,
+        };
+
+        fn python(cross_file: u64, resolved_calls: u64) -> ReferenceEdgeCoverage {
+            ReferenceEdgeCoverage {
+                languages: vec![LanguageReferenceCoverage {
+                    language: "python".to_string(),
+                    files: 12,
+                    files_measured: 12,
+                    entities: 46,
+                    parsed_call_sites: Some(78),
+                    parsed_import_statements: Some(16),
+                    resolved_call_edges: resolved_calls,
+                    resolved_import_edges: 0,
+                    cross_file_reference_edges: cross_file,
+                    intra_file_reference_edges: 16,
+                    external_reference_edges: 0,
+                    resolution: ReferenceResolution::PartiallyResolved,
+                }],
+            }
+        }
+
+        let gap = reference_edge_coverage_health(&python(0, 16));
+        assert!(
+            matches!(gap.status, HealthStatus::Pending),
+            "{:?}: {}",
+            gap.status,
+            gap.detail
+        );
+        assert!(
+            gap.detail.contains("no cross-file reference edge"),
+            "the row names the measured gap: {}",
+            gap.detail
+        );
+        assert!(
+            !blocks_readiness(&gap),
+            "the graph still answers about the edges it holds, so this needs attention without \
+             failing readiness"
+        );
+
+        let resolved = reference_edge_coverage_health(&python(41, 57));
+        assert!(
+            matches!(resolved.status, HealthStatus::Healthy),
+            "{:?}: {}",
+            resolved.status,
+            resolved.detail
+        );
+        assert!(
+            resolved.detail.contains("41 cross-file"),
+            "the healthy row still reports the numbers it passed on: {}",
+            resolved.detail
+        );
+
+        let empty = reference_edge_coverage_health(&ReferenceEdgeCoverage::default());
+        assert!(
+            matches!(empty.status, HealthStatus::Healthy),
+            "{:?}: {}",
+            empty.status,
+            empty.detail
+        );
     }
 
     /// The headline: a fresh install that did everything right ends green.
