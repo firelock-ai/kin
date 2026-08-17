@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 
+use kin_index::RelationResolution;
 use kin_model::entity::{Entity, EntityRole};
 use kin_model::graph::GraphStore;
 use kin_model::ids::{EntityId, RepoPath, SemanticChangeId};
@@ -253,6 +254,15 @@ pub struct EntityImpact {
     /// [`STRONG_CONSUMER_CONFIDENCE`] — the count verdict gates key on.
     #[serde(default)]
     pub strong_consumer_count: usize,
+    /// Subset of `consumer_count` whose inbound edge was resolved above
+    /// `name_only` — a proven consumer rather than a same-name candidate.
+    ///
+    /// `consumer_count` counts every inbound edge, and a call edge matched by
+    /// bare method name is a candidate: a same-named method on an unrelated
+    /// type or a test double matches equally well. Any claim that an entity is
+    /// used, or unused, must be read against this count rather than the total.
+    #[serde(default)]
+    pub proven_consumer_count: usize,
     /// Distinct non-test entities consuming this entity as a contract.
     pub contract_consumer_count: usize,
     /// Sorted distinct source files of the non-test consumers above.
@@ -405,6 +415,7 @@ pub fn analyze_impact_at<I: ImpactGraph>(
         // ordering, so iteration order cannot leak into the report.
         let mut ent_consumers: HashSet<EntityId> = HashSet::new();
         let mut ent_strong_consumers: HashSet<EntityId> = HashSet::new();
+        let mut ent_proven_consumers: HashSet<EntityId> = HashSet::new();
         let mut ent_contract_consumers: HashSet<EntityId> = HashSet::new();
         let mut ent_tests: HashSet<EntityId> = HashSet::new();
         // Non-test, non-derived consumers that were themselves modified in the
@@ -492,6 +503,9 @@ pub fn analyze_impact_at<I: ImpactGraph>(
                 ent_consumers.insert(affected_id);
                 if rel.confidence >= STRONG_CONSUMER_CONFIDENCE {
                     ent_strong_consumers.insert(affected_id);
+                }
+                if RelationResolution::of(&rel).is_proven() {
+                    ent_proven_consumers.insert(affected_id);
                 }
                 if rel.kind == RelationKind::ConsumesContract {
                     ent_contract_consumers.insert(affected_id);
@@ -588,6 +602,7 @@ pub fn analyze_impact_at<I: ImpactGraph>(
             entity_id,
             consumer_count: ent_consumers.len(),
             strong_consumer_count: ent_strong_consumers.len(),
+            proven_consumer_count: ent_proven_consumers.len(),
             contract_consumer_count: ent_contract_consumers.len(),
             consumer_files: ent_consumer_files.into_iter().collect(),
             covering_tests: ent_tests.len(),

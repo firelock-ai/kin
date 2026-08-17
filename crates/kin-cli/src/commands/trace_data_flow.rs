@@ -16,6 +16,7 @@
 //! model can read the chain without further tool calls.
 
 use anyhow::{Context, Result};
+use kin_index::RelationResolution;
 use kin_model::{Entity, EntityId, EntityStore, GraphNodeId, RelationKind};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -300,6 +301,13 @@ pub struct TraceStep {
     /// Relation kind that linked this step to its parent (e.g., `Calls`,
     /// `Imports`, `References`).
     pub relation_kind: String,
+    /// How the edge INTO this step was resolved: `type_resolved`,
+    /// `import_scoped`, or `name_only`. A chain is only as trustworthy as its
+    /// weakest hop; a `name_only` hop was matched by name alone, so the flow it
+    /// claims may not exist. Defaulted on read so a payload recorded before the
+    /// marker existed still deserializes.
+    #[serde(default)]
+    pub resolution: String,
     /// Step index of the parent that introduced this step into the chain.
     /// `0` means "directly attached to the focal entity".
     pub parent_step: usize,
@@ -601,6 +609,7 @@ pub fn build_trace_data_flow_response_within(
                     step: step_index,
                     role: role.to_string(),
                     relation_kind: format!("{:?}", rel.kind),
+                    resolution: RelationResolution::of(&rel).as_str().to_string(),
                     parent_step,
                     depth: next_depth,
                     entity: next_record,

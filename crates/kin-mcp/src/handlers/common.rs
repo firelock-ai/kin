@@ -5,6 +5,7 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+use kin_index::RelationResolution;
 use kin_model::change::TreeEntry;
 use kin_model::entity::{Entity, EntityKind, SourceSpan};
 use kin_model::graph::{ChangeStore, EntityFilter, GraphStore};
@@ -1011,6 +1012,14 @@ pub struct ReferenceRow {
     /// miss or for pathless/federated rows.
     pub snippet: Option<String>,
     pub relation_kinds: Vec<RelationKind>,
+    /// How strongly the strongest edge behind this row was resolved.
+    ///
+    /// A reference resolved from a bare method name is a candidate, not a fact:
+    /// a same-named method on an unrelated type or a test double matches
+    /// equally well. A row is reported when any edge reaches this entity, so
+    /// the strongest contributing edge is the row's evidence. `name_only` means
+    /// the reference is a guess and should be confirmed before being acted on.
+    pub resolution: Option<RelationResolution>,
 }
 
 pub fn collect_graph_reference_rows<G: GraphStore>(
@@ -1074,6 +1083,7 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
             // without a follow-up id→body round-trip.
             snippet,
             relation_kinds: Vec::new(),
+            resolution: None,
         });
         if entry.file_path.is_none() {
             entry.file_path = file_path;
@@ -1093,6 +1103,11 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
             .reference_lines
             .extend(relation_reference_lines(&rel, entity.file_origin.as_ref()));
         push_reference_kind(&mut entry.relation_kinds, rel.kind);
+        let resolution = RelationResolution::of(&rel);
+        entry.resolution = Some(match entry.resolution {
+            Some(current) => current.max(resolution),
+            None => resolution,
+        });
     }
 
     let mut rows = grouped.into_values().collect::<Vec<_>>();

@@ -41,7 +41,11 @@ combine. Optionally include active agent traffic on the impacted entities so you
 who else is working nearby. Reach for it before merging or refactoring to gauge blast \
 radius — \"if I change this, what else might break?\" — answered from the graph in one \
 call instead of hand-tracing callers. Pair it with semantic_diff (what changed) or use \
-semantic_review when you want diff + impact + risk together in a single report.";
+semantic_review when you want diff + impact + risk together in a single report. \
+Per-entity counts separate `consumer_count` (every inbound edge) from \
+`proven_consumer_count` (only edges resolved above `name_only`), and each ranked path \
+step carries its own `resolution`. Read a used/unused claim against the proven count: a \
+call edge matched by bare method name is a candidate, not a fact.";
 
 /// The blast-radius buckets of an [`kin_review::ImpactReport`] that serialize as
 /// arrays of raw entities, paired with their key in the response object.
