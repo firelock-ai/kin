@@ -85,6 +85,401 @@ fn daemon_base_url() -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
+// ── On-demand delegate re-resolution ────────────────────────────────────
+//
+// The delegate endpoint used to be resolved exactly once, by the launcher,
+// before the first tool call could arrive. A server started before `kin init`
+// created the repository therefore bound nothing, and nothing ever asked
+// again: every tool call for the rest of that session reported the daemon
+// unavailable while `kin doctor`, run in the same directory at the same
+// instant, reported it reachable with every embedding indexed. An agent whose
+// only interface is MCP cannot restart its own server, so that state was
+// terminal by construction, and no part of the response said what had happened.
+//
+// Resolution is now a question this process re-asks, through the same probe
+// `kin doctor` reports from, and it is bounded twice so a directory that never
+// becomes a Kin repository cannot turn every call into a stall:
+//
+//   1. At most one probe per cooldown window. The window starts at
+//      RERESOLVE_MIN_BACKOFF and doubles to RERESOLVE_MAX_BACKOFF, so a session
+//      that keeps calling into a repository-less directory costs one loopback
+//      probe every 30 s rather than one per call. A success resets it.
+//   2. Each probe is capped at RERESOLVE_PROBE_BUDGET, so a call that does
+//      probe waits seconds at most, never the delegate's request budget.
+
+/// First cooldown between on-demand probes.
+const RERESOLVE_MIN_BACKOFF: Duration = Duration::from_secs(1);
+
+/// Ceiling the cooldown doubles to. Chosen well under a cold `kin init` on a
+/// large repository, so a session that starts before one finishes still
+/// re-resolves several times while it runs rather than settling into a wait
+/// longer than the event it is waiting for.
+const RERESOLVE_MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// How long one probe may take before it is abandoned for this round.
+const RERESOLVE_PROBE_BUDGET: Duration = Duration::from_secs(3);
+
+/// Whether this process has ever held a daemon delegate.
+///
+/// Distinguishes a server that started before its repository existed (and so
+/// has never had one) from a server whose daemon went away after it bound one.
+/// The two need different remedies and used to share one message.
+static DELEGATE_EVER_RESOLVED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a Kin repository existed when this server started, as reported by
+/// the launcher's startup binding.
+///
+/// Absent means nobody reported, which reads as unknown and never as "no": a
+/// process that never ran a startup binding must not have its silence turned
+/// into a claim about what the disk looked like before it began.
+static STARTUP_REPOSITORY_PRESENT: OnceLock<bool> = OnceLock::new();
+
+/// Record whether a Kin repository existed at this server's launch directory
+/// when it started.
+///
+/// Called by the launcher once its startup binding knows. First report wins:
+/// the fact is about a single instant that has already passed.
+pub fn note_startup_repository(present: bool) {
+    let _ = STARTUP_REPOSITORY_PRESENT.set(present);
+}
+
+/// What stands between this process and a daemon delegate.
+///
+/// Three situations that one string used to cover. Each names a different
+/// state of the world and a different action a *caller* can take: an agent
+/// cannot restart its own MCP server, so a message that tells it to has told
+/// it nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DelegateGap {
+    /// Nothing at or above this server's working directory is a Kin
+    /// repository.
+    NoRepository { working_dir: std::path::PathBuf },
+    /// A repository is here and no daemon is serving it.
+    DaemonNotRunning {
+        repo: std::path::PathBuf,
+        retry_in: Duration,
+    },
+    /// This server started before the repository existed, so it bound no
+    /// delegate then and has never held one since; the repository exists now.
+    StartupPredatesRepository {
+        repo: std::path::PathBuf,
+        retry_in: Duration,
+    },
+}
+
+impl DelegateGap {
+    /// The same gap with a different wait until the next probe, for a call
+    /// answered from the cooldown rather than from a fresh probe.
+    fn with_retry_in(&self, retry_in: Duration) -> Self {
+        match self {
+            Self::NoRepository { working_dir } => Self::NoRepository {
+                working_dir: working_dir.clone(),
+            },
+            Self::DaemonNotRunning { repo, .. } => Self::DaemonNotRunning {
+                repo: repo.clone(),
+                retry_in,
+            },
+            Self::StartupPredatesRepository { repo, .. } => Self::StartupPredatesRepository {
+                repo: repo.clone(),
+                retry_in,
+            },
+        }
+    }
+
+    /// What a caller is told, and what it can do about it.
+    fn message(&self, tool: &str) -> String {
+        match self {
+            Self::NoRepository { working_dir } => format!(
+                "kin-mcp cannot answer '{tool}': {} is not a Kin repository, and neither is any \
+                 directory above it, so there is no graph to answer from. Run `kin init .` in the \
+                 repository you want served, or point this client's workspace roots at one. This \
+                 server re-resolves its repository and daemon on every tool call, so the first \
+                 call after `kin init` finishes is answered; you do not need to restart the MCP \
+                 server, and a caller could not.",
+                working_dir.display()
+            ),
+            Self::DaemonNotRunning { repo, retry_in } => format!(
+                "kin-mcp cannot answer '{tool}': {} is a Kin repository, but no daemon is serving \
+                 it right now. That is the same probe `kin doctor` reports its daemon-reachability \
+                 verdict from, and it starts nothing. Run any `kin` command in that repository, \
+                 `kin status` for instance, to start a daemon. This server re-resolves its \
+                 delegate on the next tool call (at most {}s from now), so retry once a daemon is \
+                 up; restarting the MCP server is not required.",
+                repo.display(),
+                retry_in.as_secs()
+            ),
+            Self::StartupPredatesRepository { repo, retry_in } => format!(
+                "kin-mcp cannot answer '{tool}': this server started before {} was a Kin \
+                 repository, so it bound no daemon at startup, and no daemon is serving that \
+                 repository yet. The binding is not one-shot: this server re-resolves it on the \
+                 next tool call (at most {}s from now), so retry once a daemon is up, which any \
+                 `kin` command in that repository starts. Do not restart the MCP server; a caller \
+                 cannot, and it is not what is wrong.",
+                repo.display(),
+                retry_in.as_secs()
+            ),
+        }
+    }
+}
+
+/// The outcome of asking, right now, whether this process has a delegate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DelegateResolution {
+    /// A daemon endpoint this process may forward to.
+    Resolved(String),
+    /// No endpoint, and why.
+    Gap(DelegateGap),
+}
+
+/// How the re-resolution path reaches the world.
+///
+/// A seam rather than free functions so the bound, the backoff, and the three
+/// classified gaps are assertable without a repository, a daemon, or a clock
+/// on disk. `RealDelegateProbe` is the only production implementation.
+pub(crate) trait DelegateProbe: Sync {
+    /// The working directory the repository is looked for from.
+    fn working_dir(&self) -> std::path::PathBuf;
+
+    /// The `.kin` directory of the repository this server stands in, or `None`
+    /// when there is none.
+    fn repository(&self) -> Option<std::path::PathBuf>;
+
+    /// The endpoint of a daemon **already** serving `kin_root`. Starts nothing.
+    async fn running_route(&self, kin_root: &Path) -> Option<String>;
+}
+
+/// Production probe: the same two steps, in the same order, that `kin doctor`
+/// answers its daemon-reachability check with.
+///
+/// Doctor discovers the repository from the working directory with
+/// `KinLayout::discover` and then asks for the route of a daemon already
+/// serving it. Doing anything else here is what let the two surfaces disagree:
+/// MCP was reading a URL resolved once at startup, so it reported the daemon
+/// unavailable while doctor, resolving at call time, reported it healthy.
+pub(crate) struct RealDelegateProbe;
+
+impl DelegateProbe for RealDelegateProbe {
+    fn working_dir(&self) -> std::path::PathBuf {
+        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+    }
+
+    fn repository(&self) -> Option<std::path::PathBuf> {
+        kin_core::KinLayout::discover(&self.working_dir()).map(|layout| layout.root().to_path_buf())
+    }
+
+    async fn running_route(&self, kin_root: &Path) -> Option<String> {
+        kin_daemon_spawn::running_daemon_route(kin_root).await
+    }
+}
+
+/// Cooldown state for on-demand re-resolution.
+///
+/// The cooldown covers the route probe only, and it is keyed to the repository
+/// it was measured for. Which repository this server stands in is answered
+/// locally and costs no daemon traffic, so there is nothing to save by
+/// remembering a stale answer to it, and a great deal to lose: a cooldown
+/// installed while nothing was a Kin repository would otherwise outlive the
+/// `kin init` that made one, and the first call after init is exactly the call
+/// that must be answered.
+#[derive(Debug, Default)]
+struct ReresolveGate {
+    /// The repository the fields below were measured for.
+    repository: Option<std::path::PathBuf>,
+    /// Earliest instant another route probe is allowed. `None` before the
+    /// first one.
+    next_attempt_at: Option<tokio::time::Instant>,
+    /// Current cooldown window.
+    backoff: Option<Duration>,
+    /// What the last route probe concluded, replayed while cooling down.
+    last_gap: Option<DelegateGap>,
+}
+
+impl ReresolveGate {
+    /// Widen the cooldown after a route probe that found no daemon and report
+    /// the window installed.
+    fn back_off(&mut self, now: tokio::time::Instant) -> Duration {
+        let backoff = match self.backoff {
+            None => RERESOLVE_MIN_BACKOFF,
+            Some(previous) => (previous * 2).min(RERESOLVE_MAX_BACKOFF),
+        };
+        self.backoff = Some(backoff);
+        self.next_attempt_at = Some(now + backoff);
+        backoff
+    }
+
+    /// Forget the cooldown and record which repository the next one is about.
+    /// A delegate that resolved once, and a repository that has just appeared
+    /// or changed, must not leave a widened window behind.
+    fn reset_for(&mut self, repository: Option<std::path::PathBuf>) {
+        self.repository = repository;
+        self.next_attempt_at = None;
+        self.backoff = None;
+        self.last_gap = None;
+    }
+}
+
+static RERESOLVE_GATE: tokio::sync::Mutex<ReresolveGate> =
+    tokio::sync::Mutex::const_new(ReresolveGate {
+        repository: None,
+        next_attempt_at: None,
+        backoff: None,
+        last_gap: None,
+    });
+
+/// What this process has already been through, which decides which of the two
+/// repository-present gaps a missing daemon is.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DelegateHistory {
+    /// Whether this process has ever held a delegate.
+    ever_resolved: bool,
+    /// Whether a repository existed at launch, or `None` when unreported.
+    startup_repository_present: Option<bool>,
+}
+
+/// Ask whether this process has a delegate, re-resolving on demand.
+///
+/// The process-wide effects of an answer live here rather than in the core
+/// below: routing later calls at a newly resolved daemon, and remembering that
+/// this process has held one. Keeping them out of the core is what lets a test
+/// drive resolution without a scripted daemon URL leaking into every other
+/// call in the binary.
+async fn resolve_delegate() -> DelegateResolution {
+    let history = DelegateHistory {
+        ever_resolved: DELEGATE_EVER_RESOLVED.load(std::sync::atomic::Ordering::Acquire),
+        startup_repository_present: STARTUP_REPOSITORY_PRESENT.get().copied(),
+    };
+    let outcome = resolve_delegate_within(
+        &RealDelegateProbe,
+        &RERESOLVE_GATE,
+        RERESOLVE_PROBE_BUDGET,
+        history,
+    )
+    .await;
+    if let DelegateResolution::Resolved(url) = &outcome {
+        DELEGATE_EVER_RESOLVED.store(true, std::sync::atomic::Ordering::Release);
+        install_daemon_url_override(url);
+        tracing::info!(
+            url = %url,
+            "kin-mcp: re-resolved the repo daemon delegate on demand"
+        );
+    }
+    outcome
+}
+
+/// [`resolve_delegate`] with its probe, gate, budget, and history supplied.
+///
+/// The gate is held across the probe, which serializes re-resolution the way
+/// [`REVIVAL_LOCK`] serializes revival: several tool calls can observe a
+/// missing delegate at once, and each running its own probe would multiply the
+/// very work the cooldown exists to bound.
+async fn resolve_delegate_within(
+    probe: &impl DelegateProbe,
+    gate: &tokio::sync::Mutex<ReresolveGate>,
+    probe_budget: Duration,
+    history: DelegateHistory,
+) -> DelegateResolution {
+    let mut gate = gate.lock().await;
+    let now = tokio::time::Instant::now();
+
+    // Which repository this server stands in is asked every time. It is a
+    // local lookup, and a repository appearing under a server that started
+    // without one is precisely the event the cooldown must not survive.
+    let repository = probe.repository();
+    if gate.repository != repository {
+        gate.reset_for(repository.clone());
+    }
+
+    let Some(kin_root) = repository else {
+        // No cooldown: this answer cost no daemon traffic to reach, so there
+        // is nothing to rate-limit, and the next call re-asks from scratch.
+        return DelegateResolution::Gap(DelegateGap::NoRepository {
+            working_dir: probe.working_dir(),
+        });
+    };
+
+    if let (Some(next_attempt_at), Some(last_gap)) = (gate.next_attempt_at, gate.last_gap.as_ref())
+    {
+        if now < next_attempt_at {
+            return DelegateResolution::Gap(
+                last_gap.with_retry_in(next_attempt_at.saturating_duration_since(now)),
+            );
+        }
+    }
+
+    // A probe that never answers must not become a stall every caller pays,
+    // so it is abandoned for this round rather than awaited.
+    let route = tokio::time::timeout(probe_budget, probe.running_route(&kin_root))
+        .await
+        .ok()
+        .flatten();
+
+    match route {
+        Some(url) => {
+            gate.reset_for(Some(kin_root));
+            DelegateResolution::Resolved(url)
+        }
+        None => {
+            let retry_in = gate.back_off(now);
+            let repo = kin_root
+                .parent()
+                .unwrap_or(kin_root.as_path())
+                .to_path_buf();
+            let gap = classify_daemon_absent(
+                repo,
+                retry_in,
+                history.ever_resolved,
+                history.startup_repository_present,
+            );
+            gate.last_gap = Some(gap.clone());
+            DelegateResolution::Gap(gap)
+        }
+    }
+}
+
+/// Which of the two repository-present gaps this is.
+///
+/// Only a server that has never held a delegate *and* whose launcher reported
+/// no repository at startup is the startup-ordering case. An unknown startup
+/// report (nobody called [`note_startup_repository`]) reads as the ordinary
+/// daemon-absent case, because claiming the stronger diagnosis without the
+/// evidence for it would be a guess wearing a fact's clothes.
+fn classify_daemon_absent(
+    repo: std::path::PathBuf,
+    retry_in: Duration,
+    ever_resolved: bool,
+    startup_repository_present: Option<bool>,
+) -> DelegateGap {
+    if !ever_resolved && startup_repository_present == Some(false) {
+        DelegateGap::StartupPredatesRepository { repo, retry_in }
+    } else {
+        DelegateGap::DaemonNotRunning { repo, retry_in }
+    }
+}
+
+/// Route every later delegate call at `url` without waiting for another probe.
+fn install_daemon_url_override(url: &str) {
+    if let Ok(mut guard) = DAEMON_URL_OVERRIDE.lock() {
+        *guard = Some(url.to_string());
+    }
+}
+
+/// The delegate endpoint for this call, re-resolving when startup left none.
+///
+/// Every forwarded request goes through this rather than through
+/// [`daemon_base_url`] directly, so recovery is a property of the delegate and
+/// not of the one code path somebody remembered to add it to.
+async fn resolved_daemon_base_url() -> Option<String> {
+    if let Some(base) = daemon_base_url() {
+        DELEGATE_EVER_RESOLVED.store(true, std::sync::atomic::Ordering::Release);
+        return Some(base);
+    }
+    match resolve_delegate().await {
+        DelegateResolution::Resolved(url) => Some(url),
+        DelegateResolution::Gap(_) => None,
+    }
+}
+
 // ── MCP-path idle timeout ───────────────────────────────────────────────
 
 /// Idle timeout injected into daemons started by the MCP revival path.
@@ -234,12 +629,6 @@ fn with_session_header(
         }
     }
     request
-}
-
-fn daemon_required_unavailable(operation: &str) -> ToolCallResult {
-    ToolCallResult::error(format!(
-        "Kin daemon is required for {operation}, but the daemon delegate is unavailable"
-    ))
 }
 
 fn text_result_from_value(value: serde_json::Value) -> Result<ToolCallResult, String> {
@@ -1170,7 +1559,7 @@ async fn forward_mcp_tool_call(
     name: &str,
     arguments: &HashMap<String, serde_json::Value>,
 ) -> Result<Option<ToolCallResult>, String> {
-    let Some(base) = daemon_base_url() else {
+    let Some(base) = resolved_daemon_base_url().await else {
         return Ok(None);
     };
     forward_mcp_with_seam(name, arguments, &RealDaemonSeam, &base).await
@@ -1486,29 +1875,27 @@ pub(crate) fn parse_graph_status_report(
         .map_err(|error| format!("daemon kin_graph_status contract validation failed: {error}"))
 }
 
-pub fn daemon_unavailable_tool_result(name: &str) -> ToolCallResult {
-    unavailable_tool_result_for(name, discover_kin_dir().as_deref())
-}
-
-/// Pure core of [`daemon_unavailable_tool_result`]: given the `.kin/`
-/// directory (if any) discovered from the server's working directory, decide
-/// whether the tool call failed because no repository is bound at all, versus
-/// a repository being bound but its daemon being unreachable. The two cases
-/// get distinct, actionable messages so an agent session that never bound a
-/// repository (e.g. a global MCP entry launched outside any Kin repo) is told
-/// how to bind one, rather than being handed a generic daemon-availability
-/// error. Factored out with an explicit `kin_dir` parameter so the branch is
-/// unit-testable without mutating the process working directory.
-fn unavailable_tool_result_for(name: &str, kin_dir: Option<&Path>) -> ToolCallResult {
-    if kin_dir.is_none() {
-        return ToolCallResult::error(format!(
-            "kin-mcp has no Kin repository bound for '{name}': not inside a kin repository (no \
-             .kin/ found from the server's working directory). Run `kin init .` in the target \
-             repository and restart this MCP server from there, or relaunch `kin mcp start` with \
-             --repo <path> (or KIN_MCP_REPO=<path>) to bind one explicitly."
-        ));
+/// The answer a `tools/call` gets when this process has no daemon delegate.
+///
+/// Asks the resolver rather than inspecting the filesystem itself, so the
+/// message describes the state the forwarding attempt actually found, and
+/// names which of the three gaps it is. Within one tool call this costs no
+/// second probe: the forwarding attempt already ran one, and the resolver's
+/// cooldown replays that verdict.
+pub async fn daemon_unavailable_tool_result(name: &str) -> ToolCallResult {
+    match resolve_delegate().await {
+        DelegateResolution::Gap(gap) => ToolCallResult::error(gap.message(name)),
+        // A delegate resolved between the forwarding attempt and this message,
+        // or the attempt failed for a reason that is not endpoint resolution
+        // (no HTTP client could be built at all). Neither is something the
+        // caller can act on, and neither is any of the three gaps, so it is
+        // reported as itself rather than dressed as one of them.
+        DelegateResolution::Resolved(url) => ToolCallResult::error(format!(
+            "kin-mcp could not issue '{name}' to the repo daemon at {url}, though the delegate \
+             resolves there now. Retry the call; if it keeps failing, capture `kin doctor` output, \
+             which probes that same endpoint."
+        )),
     }
-    daemon_required_unavailable(name)
 }
 
 /// Best-effort fetch of the daemon `/health` body for response-envelope
@@ -1601,7 +1988,7 @@ pub async fn forward_session_start(
     cwd: &str,
     capabilities: Option<&SessionCapabilities>,
 ) -> Result<Option<serde_json::Value>, String> {
-    let Some(base) = daemon_base_url() else {
+    let Some(base) = resolved_daemon_base_url().await else {
         return Ok(None);
     };
     let mut body = serde_json::json!({
@@ -1629,7 +2016,7 @@ pub async fn forward_session_start(
 pub async fn forward_session_heartbeat(
     session_id: &str,
 ) -> Result<Option<serde_json::Value>, String> {
-    let Some(base) = daemon_base_url() else {
+    let Some(base) = resolved_daemon_base_url().await else {
         return Ok(None);
     };
     session_heartbeat_request(&base, session_id).await.map(Some)
@@ -1648,7 +2035,7 @@ async fn session_heartbeat_request(
 
 /// Forward a session end to the daemon.
 pub async fn forward_session_end(session_id: &str) -> Result<Option<serde_json::Value>, String> {
-    let Some(base) = daemon_base_url() else {
+    let Some(base) = resolved_daemon_base_url().await else {
         return Ok(None);
     };
     let value = daemon_json_request("session end", &base, |client, base| {
@@ -1666,7 +2053,7 @@ pub async fn forward_register_intent(
     task_description: &str,
     expires_at: Option<&str>,
 ) -> Result<Option<serde_json::Value>, String> {
-    let Some(base) = daemon_base_url() else {
+    let Some(base) = resolved_daemon_base_url().await else {
         return Ok(None);
     };
     let body = serde_json::json!({
@@ -1697,7 +2084,7 @@ pub async fn forward_release_intent(
     session_id: &str,
     intent_id: &str,
 ) -> Result<Option<serde_json::Value>, String> {
-    let Some(base) = daemon_base_url() else {
+    let Some(base) = resolved_daemon_base_url().await else {
         return Ok(None);
     };
     // The 204 body is empty, so the shared request helper yields `Null` here.
@@ -1720,7 +2107,7 @@ pub async fn forward_release_intent(
 pub async fn forward_check_traffic(
     scope_strings: &[String],
 ) -> Result<Option<serde_json::Value>, String> {
-    if daemon_base_url().is_none() {
+    if resolved_daemon_base_url().await.is_none() {
         return Ok(None);
     }
     let mut reports = Vec::new();
@@ -1728,7 +2115,7 @@ pub async fn forward_check_traffic(
         // Re-resolve per scope: if an earlier scope revived the daemon, the
         // remaining ones must address the new URL directly instead of each
         // rediscovering the dead one through the whole retry-then-revive path.
-        let Some(base) = daemon_base_url() else {
+        let Some(base) = resolved_daemon_base_url().await else {
             return Ok(None);
         };
         let encoded = scope.replace(':', "%3A");
@@ -2895,33 +3282,479 @@ mod tests {
         assert_eq!(session_key(&args), "explicit-session");
     }
 
-    #[test]
-    fn unavailable_result_reports_missing_repo_when_no_kin_dir() {
-        let result = unavailable_tool_result_for("semantic_search", None);
-        assert_eq!(result.is_error, Some(true));
-        let ContentBlock::Text { text } = result.content.first().unwrap();
+    // ── On-demand delegate re-resolution ──────────────────────────────────
+    //
+    // The reported failure: an MCP server started before `kin init` created the
+    // repository resolved no delegate, never asked again, and answered every
+    // tool call for the rest of the session with one degraded string, while
+    // `kin doctor` in the same directory at the same instant reported the
+    // daemon reachable with every embedding indexed. These pin the three parts
+    // of that: the recovery happens, it is bounded, and each of the three
+    // situations the one string covered now says which it is and what a caller
+    // can do about it.
+
+    /// A scripted stand-in for the repository and the daemon route, counting
+    /// every probe so the bound is assertable. Nothing here touches a
+    /// filesystem, a daemon, or the wall clock.
+    struct ScriptedProbe {
+        working_dir: std::path::PathBuf,
+        repository: std::sync::Mutex<Option<std::path::PathBuf>>,
+        route: std::sync::Mutex<Option<String>>,
+        route_probes: std::sync::atomic::AtomicUsize,
+        repository_probes: std::sync::atomic::AtomicUsize,
+        /// How long `running_route` takes to answer, for the probe-budget case.
+        route_delay: Duration,
+    }
+
+    impl ScriptedProbe {
+        fn empty_directory() -> Self {
+            Self {
+                working_dir: std::path::PathBuf::from("/work/express"),
+                repository: std::sync::Mutex::new(None),
+                route: std::sync::Mutex::new(None),
+                route_probes: std::sync::atomic::AtomicUsize::new(0),
+                repository_probes: std::sync::atomic::AtomicUsize::new(0),
+                route_delay: Duration::ZERO,
+            }
+        }
+
+        fn repository_without_daemon() -> Self {
+            let probe = Self::empty_directory();
+            probe.kin_init();
+            probe
+        }
+
+        /// What `kin init` does to the world this probe reports.
+        fn kin_init(&self) {
+            *self.repository.lock().unwrap() = Some(std::path::PathBuf::from("/work/express/.kin"));
+        }
+
+        /// What starting a daemon does to it.
+        fn daemon_starts(&self, url: &str) {
+            *self.route.lock().unwrap() = Some(url.to_string());
+        }
+
+        fn route_probes(&self) -> usize {
+            self.route_probes.load(std::sync::atomic::Ordering::Acquire)
+        }
+
+        fn repository_probes(&self) -> usize {
+            self.repository_probes
+                .load(std::sync::atomic::Ordering::Acquire)
+        }
+    }
+
+    impl DelegateProbe for ScriptedProbe {
+        fn working_dir(&self) -> std::path::PathBuf {
+            self.working_dir.clone()
+        }
+
+        fn repository(&self) -> Option<std::path::PathBuf> {
+            self.repository_probes
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            self.repository.lock().unwrap().clone()
+        }
+
+        async fn running_route(&self, _kin_root: &Path) -> Option<String> {
+            self.route_probes
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            if !self.route_delay.is_zero() {
+                tokio::time::sleep(self.route_delay).await;
+            }
+            self.route.lock().unwrap().clone()
+        }
+    }
+
+    fn fresh_gate() -> tokio::sync::Mutex<ReresolveGate> {
+        tokio::sync::Mutex::new(ReresolveGate::default())
+    }
+
+    /// The whole reported failure, end to end at the resolver: a server that
+    /// started with no repository under it answers the next call after `kin
+    /// init` and a daemon, with no restart anywhere in between.
+    #[tokio::test(start_paused = true)]
+    async fn a_server_started_before_kin_init_resolves_once_the_repository_and_daemon_exist() {
+        let probe = ScriptedProbe::empty_directory();
+        let gate = fresh_gate();
+
+        let first = resolve_delegate_within(
+            &probe,
+            &gate,
+            RERESOLVE_PROBE_BUDGET,
+            DelegateHistory::default(),
+        )
+        .await;
         assert!(
-            text.contains("not inside a kin repository"),
-            "expected no-repo-bound message, got: {text}"
+            matches!(
+                first,
+                DelegateResolution::Gap(DelegateGap::NoRepository { .. })
+            ),
+            "a directory with no repository must report exactly that: {first:?}"
+        );
+
+        probe.kin_init();
+        probe.daemon_starts("http://127.0.0.1:37589");
+        // No restart, no new process, and no waiting out a cooldown either:
+        // the repository appearing is the world changing under the verdict, so
+        // the very next call re-asks. The clock deliberately does not move.
+
+        let second = resolve_delegate_within(
+            &probe,
+            &gate,
+            RERESOLVE_PROBE_BUDGET,
+            DelegateHistory::default(),
+        )
+        .await;
+        assert_eq!(
+            second,
+            DelegateResolution::Resolved("http://127.0.0.1:37589".to_string()),
+            "once the repository and its daemon exist the next call must resolve"
+        );
+    }
+
+    /// The bound: a genuinely absent daemon must not turn every tool call into
+    /// a probe, and must never turn one into a stall.
+    #[tokio::test(start_paused = true)]
+    async fn re_resolution_probes_once_per_cooldown_rather_than_once_per_call() {
+        let probe = ScriptedProbe::repository_without_daemon();
+        let gate = fresh_gate();
+
+        for _ in 0..50 {
+            let outcome = resolve_delegate_within(
+                &probe,
+                &gate,
+                RERESOLVE_PROBE_BUDGET,
+                DelegateHistory::default(),
+            )
+            .await;
+            assert!(
+                matches!(outcome, DelegateResolution::Gap(_)),
+                "no daemon exists in this fixture, so nothing may resolve: {outcome:?}"
+            );
+        }
+        assert_eq!(
+            probe.route_probes(),
+            1,
+            "fifty calls inside one cooldown window must cost one probe, not fifty"
+        );
+
+        // Each elapsed window buys exactly one more probe, and the window
+        // widens rather than staying at its first value.
+        tokio::time::advance(RERESOLVE_MIN_BACKOFF).await;
+        let _ = resolve_delegate_within(
+            &probe,
+            &gate,
+            RERESOLVE_PROBE_BUDGET,
+            DelegateHistory::default(),
+        )
+        .await;
+        assert_eq!(probe.route_probes(), 2, "the elapsed window allows a probe");
+        let _ = resolve_delegate_within(
+            &probe,
+            &gate,
+            RERESOLVE_PROBE_BUDGET,
+            DelegateHistory::default(),
+        )
+        .await;
+        assert_eq!(
+            probe.route_probes(),
+            2,
+            "the widened window must hold the next call off"
+        );
+        tokio::time::advance(RERESOLVE_MIN_BACKOFF * 2).await;
+        let _ = resolve_delegate_within(
+            &probe,
+            &gate,
+            RERESOLVE_PROBE_BUDGET,
+            DelegateHistory::default(),
+        )
+        .await;
+        assert_eq!(probe.route_probes(), 3, "the widened window elapses too");
+    }
+
+    /// The cooldown ceiling holds however long the daemon stays absent, so a
+    /// long session never stops re-resolving and never starts spinning.
+    #[tokio::test(start_paused = true)]
+    async fn the_cooldown_widens_to_a_ceiling_and_stops_there() {
+        let probe = ScriptedProbe::repository_without_daemon();
+        let gate = fresh_gate();
+
+        for _ in 0..12 {
+            let _ = resolve_delegate_within(
+                &probe,
+                &gate,
+                RERESOLVE_PROBE_BUDGET,
+                DelegateHistory::default(),
+            )
+            .await;
+            tokio::time::advance(RERESOLVE_MAX_BACKOFF).await;
+        }
+        assert_eq!(
+            gate.lock().await.backoff,
+            Some(RERESOLVE_MAX_BACKOFF),
+            "the window must stop widening at its ceiling rather than growing without bound"
+        );
+    }
+
+    /// A probe that never answers is abandoned for the round. The alternative
+    /// is the failure this whole change exists to remove: a tool call that
+    /// waits on daemon resolution instead of answering.
+    #[tokio::test(start_paused = true)]
+    async fn a_probe_that_hangs_is_abandoned_rather_than_awaited() {
+        let mut probe = ScriptedProbe::repository_without_daemon();
+        probe.route_delay = Duration::from_secs(600);
+        let gate = fresh_gate();
+
+        let began = tokio::time::Instant::now();
+        let outcome = resolve_delegate_within(
+            &probe,
+            &gate,
+            Duration::from_secs(3),
+            DelegateHistory::default(),
+        )
+        .await;
+        assert!(
+            matches!(outcome, DelegateResolution::Gap(_)),
+            "an abandoned probe resolves nothing: {outcome:?}"
         );
         assert!(
-            text.contains("--repo") && text.contains("KIN_MCP_REPO"),
-            "expected message to tell the caller how to bind a repo, got: {text}"
+            began.elapsed() < Duration::from_secs(4),
+            "the call must not wait out a probe that never answers: {:?}",
+            began.elapsed()
+        );
+        assert_eq!(
+            probe.repository_probes(),
+            1,
+            "the abandoned round still counts as this window's attempt"
+        );
+    }
+
+    /// A resolution clears the cooldown, so the next outage starts from the
+    /// short window rather than from whatever the last one widened to.
+    #[tokio::test(start_paused = true)]
+    async fn resolving_resets_the_cooldown() {
+        let probe = ScriptedProbe::repository_without_daemon();
+        let gate = fresh_gate();
+
+        let _ = resolve_delegate_within(
+            &probe,
+            &gate,
+            RERESOLVE_PROBE_BUDGET,
+            DelegateHistory::default(),
+        )
+        .await;
+        tokio::time::advance(RERESOLVE_MAX_BACKOFF).await;
+        let _ = resolve_delegate_within(
+            &probe,
+            &gate,
+            RERESOLVE_PROBE_BUDGET,
+            DelegateHistory::default(),
+        )
+        .await;
+        assert!(gate.lock().await.backoff.is_some());
+
+        probe.daemon_starts("http://127.0.0.1:41000");
+        tokio::time::advance(RERESOLVE_MAX_BACKOFF).await;
+        let _ = resolve_delegate_within(
+            &probe,
+            &gate,
+            RERESOLVE_PROBE_BUDGET,
+            DelegateHistory::default(),
+        )
+        .await;
+
+        let gate = gate.lock().await;
+        assert_eq!(gate.backoff, None, "a resolution must clear the window");
+        assert_eq!(gate.next_attempt_at, None);
+        assert_eq!(
+            gate.last_gap, None,
+            "a stale gap must not outlive its cause"
+        );
+    }
+
+    /// A cooldown installed while a repository existed must not be replayed
+    /// after the client's repository changes underneath it: the verdict it
+    /// carries was about a different repository.
+    #[tokio::test(start_paused = true)]
+    async fn a_changed_repository_clears_a_cooldown_measured_for_another_one() {
+        let probe = ScriptedProbe::repository_without_daemon();
+        let gate = fresh_gate();
+
+        let _ = resolve_delegate_within(
+            &probe,
+            &gate,
+            RERESOLVE_PROBE_BUDGET,
+            DelegateHistory::default(),
+        )
+        .await;
+        assert_eq!(probe.route_probes(), 1);
+        let _ = resolve_delegate_within(
+            &probe,
+            &gate,
+            RERESOLVE_PROBE_BUDGET,
+            DelegateHistory::default(),
+        )
+        .await;
+        assert_eq!(
+            probe.route_probes(),
+            1,
+            "the cooldown holds within one repo"
+        );
+
+        *probe.repository.lock().unwrap() = Some(std::path::PathBuf::from("/work/requests/.kin"));
+        let _ = resolve_delegate_within(
+            &probe,
+            &gate,
+            RERESOLVE_PROBE_BUDGET,
+            DelegateHistory::default(),
+        )
+        .await;
+        assert_eq!(
+            probe.route_probes(),
+            2,
+            "another repository is another question, so it is asked rather than replayed"
+        );
+    }
+
+    // ── The three situations one string used to cover ─────────────────────
+
+    fn gap_text(gap: &DelegateGap) -> String {
+        gap.message("semantic_locate")
+    }
+
+    #[test]
+    fn the_no_repository_message_names_the_path_and_a_caller_action() {
+        let text = gap_text(&DelegateGap::NoRepository {
+            working_dir: std::path::PathBuf::from("/work/express"),
+        });
+        assert!(
+            text.contains("/work/express") && text.contains("is not a Kin repository"),
+            "the message must name the path and what is wrong with it: {text}"
+        );
+        assert!(
+            text.contains("kin init ."),
+            "the caller's action is creating the repository: {text}"
+        );
+        assert!(
+            text.contains("do not need to restart"),
+            "an agent cannot restart its own MCP server, so the message must not ask it to: {text}"
         );
     }
 
     #[test]
-    fn unavailable_result_reports_daemon_unreachable_when_repo_is_bound() {
-        let tmp = tempfile::tempdir().unwrap();
-        let result = unavailable_tool_result_for("semantic_search", Some(tmp.path()));
-        let ContentBlock::Text { text } = result.content.first().unwrap();
+    fn the_daemon_absent_message_names_the_repository_and_the_shared_probe() {
+        let text = gap_text(&DelegateGap::DaemonNotRunning {
+            repo: std::path::PathBuf::from("/work/express"),
+            retry_in: Duration::from_secs(4),
+        });
         assert!(
-            text.contains("Kin daemon is required"),
-            "expected daemon-unreachable message, got: {text}"
+            text.contains("/work/express") && text.contains("no daemon is serving it"),
+            "the message must separate a present repository from an absent daemon: {text}"
         );
         assert!(
-            !text.contains("not inside a kin repository"),
-            "a bound repo must not report itself as unbound, got: {text}"
+            text.contains("kin doctor"),
+            "the message must name the probe it shares with doctor, which is why the two cannot \
+             disagree: {text}"
+        );
+        assert!(
+            text.contains("at most 4s"),
+            "the message must say when the delegate is re-resolved: {text}"
+        );
+        assert!(
+            !text.contains("started before"),
+            "a daemon that went away is not a startup-ordering failure: {text}"
+        );
+    }
+
+    #[test]
+    fn the_startup_ordering_message_says_the_server_predates_the_repository() {
+        let text = gap_text(&DelegateGap::StartupPredatesRepository {
+            repo: std::path::PathBuf::from("/work/express"),
+            retry_in: Duration::from_secs(8),
+        });
+        assert!(
+            text.contains("started before /work/express was a Kin repository"),
+            "the message must name the ordering that caused this: {text}"
+        );
+        assert!(
+            text.contains("not one-shot") && text.contains("at most 8s"),
+            "the message must say the binding is retried and when: {text}"
+        );
+        assert!(
+            text.contains("Do not restart the MCP server"),
+            "the recovery a caller cannot perform must be ruled out explicitly: {text}"
+        );
+    }
+
+    /// The startup-ordering diagnosis is claimed only on the evidence for it.
+    #[test]
+    fn only_a_never_bound_server_that_launched_without_a_repository_reports_the_ordering_case() {
+        let repo = std::path::PathBuf::from("/work/express");
+        let retry = Duration::from_secs(1);
+
+        assert!(
+            matches!(
+                classify_daemon_absent(repo.clone(), retry, false, Some(false)),
+                DelegateGap::StartupPredatesRepository { .. }
+            ),
+            "never bound, and no repository existed at launch: the reported failure"
+        );
+        assert!(
+            matches!(
+                classify_daemon_absent(repo.clone(), retry, false, Some(true)),
+                DelegateGap::DaemonNotRunning { .. }
+            ),
+            "a repository that existed at launch makes this an ordinary absent daemon"
+        );
+        assert!(
+            matches!(
+                classify_daemon_absent(repo.clone(), retry, true, Some(false)),
+                DelegateGap::DaemonNotRunning { .. }
+            ),
+            "a server that held a delegate once is past the startup-ordering case"
+        );
+        assert!(
+            matches!(
+                classify_daemon_absent(repo, retry, false, None),
+                DelegateGap::DaemonNotRunning { .. }
+            ),
+            "an unreported startup must not be read as a claim that no repository existed"
+        );
+    }
+
+    /// A call answered from the cooldown reports the wait that is actually
+    /// left, not the window that was installed when the probe ran.
+    #[tokio::test(start_paused = true)]
+    async fn a_cooling_down_call_reports_the_remaining_wait() {
+        let probe = ScriptedProbe::repository_without_daemon();
+        let gate = fresh_gate();
+
+        let _ = resolve_delegate_within(
+            &probe,
+            &gate,
+            RERESOLVE_PROBE_BUDGET,
+            DelegateHistory::default(),
+        )
+        .await;
+        tokio::time::advance(RERESOLVE_MIN_BACKOFF / 2).await;
+        let DelegateResolution::Gap(gap) = resolve_delegate_within(
+            &probe,
+            &gate,
+            RERESOLVE_PROBE_BUDGET,
+            DelegateHistory::default(),
+        )
+        .await
+        else {
+            panic!("no daemon exists in this fixture");
+        };
+        let retry_in = match gap {
+            DelegateGap::DaemonNotRunning { retry_in, .. }
+            | DelegateGap::StartupPredatesRepository { retry_in, .. } => retry_in,
+            DelegateGap::NoRepository { .. } => panic!("the fixture has a repository"),
+        };
+        assert!(
+            retry_in <= RERESOLVE_MIN_BACKOFF / 2 && !retry_in.is_zero(),
+            "the wait reported must be what is left of the window: {retry_in:?}"
         );
     }
 

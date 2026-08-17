@@ -3093,12 +3093,38 @@ pub trait DaemonSpawnRegistrar: Send + Sync {
         kin_root: PathBuf,
         daemon_url: String,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>;
+
+    /// The endpoint of a daemon that is **already** serving `kin_root`, or
+    /// `None` when none is. Starts nothing.
+    ///
+    /// This is the same resolution `kin doctor` reports its daemon-reachability
+    /// verdict from, exposed here so a process that cannot depend on the CLI
+    /// asks the identical question. Two surfaces answering "is the daemon
+    /// reachable" from two different resolutions is how `kin doctor` came to
+    /// report a healthy daemon at the same instant every MCP tool call reported
+    /// it unavailable: the CLI resolved the route at call time while MCP read a
+    /// URL resolved once at startup.
+    fn route_if_running(
+        &self,
+        kin_root: PathBuf,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>;
 }
 
 /// Resolve the supervisor endpoint through the installed seam, if there is one.
 pub async fn supervisor_url_for_spawn() -> Option<String> {
     let registrar = registrar()?;
     registrar.supervisor_url().await
+}
+
+/// The endpoint of a daemon already serving `kin_root`, resolved through the
+/// installed seam without starting anything.
+///
+/// `None` covers both "no daemon serves this repository" and "no seam is
+/// installed in this process", which are the same thing to a caller: it has no
+/// route to a daemon and must not invent one.
+pub async fn running_daemon_route(kin_root: &Path) -> Option<String> {
+    let registrar = registrar()?;
+    registrar.route_if_running(kin_root.to_path_buf()).await
 }
 
 static REGISTRAR: OnceLock<Arc<dyn DaemonSpawnRegistrar>> = OnceLock::new();
