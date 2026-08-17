@@ -39,6 +39,13 @@ async fn run_daemon_commit(
     layout: &kin_core::KinLayout,
     message: &str,
 ) -> Result<DaemonCommitResult> {
+    // Resolved here, in the caller's own environment and working directory,
+    // rather than inside the daemon. The daemon is spawned with every `GIT_*`
+    // variable scrubbed and does not share the caller's shell, so an identity it
+    // resolved for itself would answer a different question than "who is running
+    // this command". Resolution also comes before the daemon is contacted: a
+    // commit that cannot be attributed must not reach the authority path at all.
+    let author = crate::commands::require_commit_author_for(layout)?;
     let daemon_url = crate::daemon_client::resolve_daemon_url(layout)
         .await?
         .ok_or_else(|| crate::daemon_client::daemon_required_error("commit", layout))?;
@@ -60,6 +67,7 @@ async fn run_daemon_commit(
             "operation_id": operation_id,
             "timestamp": timestamp,
             "message": message,
+            "author": author,
         }));
     if let Some(token) = crate::daemon_client::resolve_daemon_auth_token() {
         request = request.bearer_auth(token);

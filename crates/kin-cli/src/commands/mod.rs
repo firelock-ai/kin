@@ -114,6 +114,31 @@ pub(crate) fn require_repository_layout_at(
     kin_core::KinLayout::discover(start).ok_or_else(not_a_kin_repository)
 }
 
+/// Who this invocation is allowed to attribute new authority to, or a refusal.
+///
+/// Every command that stamps an author refuses through here so the refusal
+/// cannot drift per command, and so no command can quietly acquire a fallback of
+/// its own. There is deliberately no infallible variant: an author a caller
+/// could obtain without checking is exactly how the placeholder this replaces
+/// reached permanent history in the first place.
+pub(crate) fn require_commit_author() -> anyhow::Result<kin_model::AuthorId> {
+    let layout = require_repository_layout()?;
+    require_commit_author_for(&layout)
+}
+
+/// The same refusal for a caller that already holds the repository layout.
+pub(crate) fn require_commit_author_for(
+    layout: &kin_core::KinLayout,
+) -> anyhow::Result<kin_model::AuthorId> {
+    let identity = kin_core::resolve_commit_identity(layout)?;
+    tracing::debug!(
+        author = %identity.author,
+        source = identity.source.id(),
+        "resolved commit identity"
+    );
+    Ok(kin_model::AuthorId::new(identity.author))
+}
+
 /// The one wording every "you are not in a Kin repository" refusal is raised
 /// with, so a command whose condition is its own still states the same remedy.
 ///

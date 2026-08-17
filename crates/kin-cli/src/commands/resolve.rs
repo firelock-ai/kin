@@ -135,7 +135,7 @@ pub async fn run(
     };
     let response = execute(ResolveRequest {
         operation_id: OperationId::new(),
-        actor: AuthorId::new(kin_core::whoami()),
+        actor: crate::commands::require_commit_author()?,
         action,
         expected_record,
     })

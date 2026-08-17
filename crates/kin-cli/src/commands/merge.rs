@@ -124,7 +124,7 @@ pub async fn run(source: String, json: bool) -> Result<()> {
     let response = execute(MergeRequest {
         source,
         operation_id: OperationId::new(),
-        actor: AuthorId::new(kin_core::whoami()),
+        actor: crate::commands::require_commit_author()?,
     })
     .await?;
     if json {

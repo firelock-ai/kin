@@ -4612,12 +4612,20 @@ fn session_reconcile_error(error: impl std::fmt::Display) -> (StatusCode, String
 /// The daemon first admits pending filesystem input into graph state, then
 /// publishes one repository-v6 transaction containing the semantic change,
 /// exact tree, workspace base, and named-ref compare-and-swap.
+///
+/// `author` is required and carries no default. The daemon runs with every
+/// `GIT_*` variable scrubbed and does not share the caller's working directory,
+/// so it cannot resolve who is committing, and a defaulted field here is exactly
+/// how the placeholder author this endpoint used to stamp reached permanent
+/// history. A request that names nobody is refused by deserialization rather
+/// than completed by the daemon.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CommandCommitRequest {
     operation_id: kin_model::OperationId,
     timestamp: kin_model::Timestamp,
     message: String,
+    author: kin_model::AuthorId,
     #[serde(default)]
     session_id: Option<String>,
 }
@@ -4723,7 +4731,7 @@ fn command_commit_after_admission(
             &authority_context,
             request.operation_id,
             request.timestamp,
-            kin_model::AuthorId::new(kin_core::whoami()),
+            request.author,
             request.message,
         )
     })

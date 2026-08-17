@@ -58,7 +58,7 @@ pub async fn run(
         path_hex,
         change_id,
         operation_id: OperationId::new(),
-        actor: AuthorId::new(kin_core::whoami()),
+        actor: crate::commands::require_commit_author()?,
     };
     let daemon = crate::daemon_client::DaemonClient::from_base_url_for_layout(daemon_url, &layout)?;
     let response = daemon.checkout(&request).await?;
