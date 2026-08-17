@@ -56,6 +56,11 @@ or content-addressed blob is missing. It never reads the working directory.";
 /// wants to correlate against `kin log`, a formula, or another tool's input has
 /// to be reassembled by hand first.
 ///
+/// Shared with the provenance seam in `common`, so the one encoding covers
+/// every agent-facing payload that carries a tree entry rather than only this
+/// tool's. `get_context_pack` is fitted to a token budget and was spending it
+/// on one such array per dependency.
+///
 /// The tag and field names mirror [`TreeEntry`] exactly, so only the encoding of
 /// the ids changes. Rendering is `Display`, which is lowercase hex and the same
 /// spelling `Hash256::from_hex` parses, so what this prints round-trips.
@@ -69,7 +74,7 @@ or content-addressed blob is missing. It never reads the working directory.";
 /// being thrown away.
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum TreeEntryWire {
+pub(crate) enum TreeEntryWire {
     Blob {
         hash: String,
         executable: bool,

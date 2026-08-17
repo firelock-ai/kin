@@ -280,6 +280,13 @@ where
                 client_supports_roots = value.pointer("/params/capabilities/roots").is_some();
             }
 
+            // Whether `--repo`/`KIN_MCP_REPO` pinned this server's repository.
+            // Read per message rather than once: the startup binding settles
+            // behind this loop, so the pin is not knowable when it starts.
+            let repo_pinned = startup
+                .as_ref()
+                .is_some_and(|startup| startup.pinned_by_operator());
+
             // A `tools/call` racing the launcher's startup binding gets a
             // bounded moment for a warm daemon to bind, then an honest
             // still-starting answer: never minutes of silence, and never a
@@ -306,15 +313,34 @@ where
             }
 
             // The client moved to a workspace we could not bind. Refuse every
-            // tool call until a later roots change lands on a Kin repository:
-            // answering from the repository the client left would return a
-            // confident, well-formed result about the wrong codebase.
+            // tool call until the root becomes bindable: answering from the
+            // repository the client left would return a confident, well-formed
+            // result about the wrong codebase.
+            //
+            // The verdict is re-derived here rather than read out of the state
+            // it was recorded in. It was computed once, when the roots changed,
+            // and nothing about the announced root is fixed: `kin init` can run
+            // there, a mount can appear, a container path can be made to exist.
+            // A cached refusal outlives every one of those, so a server that
+            // was right at roots-change time keeps refusing a workspace it
+            // could now serve, and the only recovery is restarting the process.
+            // Re-binding costs nothing that matters, because every call in this
+            // state is being refused anyway.
             if method == Some("tools/call") && binding.is_mismatched() {
-                if let Some(response) = binding.repo_mismatch_response(&value) {
-                    let response_json = serde_json::to_string(&response).map_err(McpError::Json)?;
-                    write_stdio_message(&mut *writer, &response_json, framed).await?;
+                if let Some(binder) = repo_binder.as_ref() {
+                    let roots = binding.mismatched_roots();
+                    if !roots.is_empty() {
+                        apply_workspace_roots(binder, roots, &mut binding, repo_pinned).await;
+                    }
                 }
-                continue;
+                if binding.is_mismatched() {
+                    if let Some(response) = binding.repo_mismatch_response(&value) {
+                        let response_json =
+                            serde_json::to_string(&response).map_err(McpError::Json)?;
+                        write_stdio_message(&mut *writer, &response_json, framed).await?;
+                    }
+                    continue;
+                }
             }
 
             // Our own `roots/list` response returning from the client: bind the
@@ -324,8 +350,13 @@ where
             {
                 roots_request_state.complete();
                 if let Some(binder) = repo_binder.as_ref() {
-                    apply_workspace_roots(binder, parse_workspace_roots(&value), &mut binding)
-                        .await;
+                    apply_workspace_roots(
+                        binder,
+                        parse_workspace_roots(&value),
+                        &mut binding,
+                        repo_pinned,
+                    )
+                    .await;
                 }
                 continue;
             }
@@ -371,6 +402,7 @@ async fn apply_workspace_roots(
     binder: &RepoBinder,
     roots: Vec<PathBuf>,
     binding: &mut RepoBindingState,
+    repo_pinned: bool,
 ) {
     if roots.is_empty() {
         // No open folder is not the same as a different folder: there is no
@@ -402,7 +434,7 @@ async fn apply_workspace_roots(
                 "kin-mcp: the client's workspace roots changed to a workspace with no bindable Kin \
                  repository; refusing tool calls instead of answering from the previous repository"
             );
-            binding.mark_mismatch(roots);
+            binding.mark_mismatch(roots, repo_pinned);
         }
         None => {
             tracing::info!("kin-mcp: no Kin repository among the client's workspace roots");
@@ -438,6 +470,9 @@ struct RepoBindingState {
 struct WorkspaceMismatch {
     bound_repo: Option<PathBuf>,
     requested_roots: Vec<PathBuf>,
+    /// Whether `--repo`/`KIN_MCP_REPO` pinned this server's repository, which
+    /// decides which remedies the refusal is allowed to offer.
+    repo_pinned: bool,
 }
 
 impl RepoBindingState {
@@ -471,11 +506,24 @@ impl RepoBindingState {
         self.mismatch = None;
     }
 
-    fn mark_mismatch(&mut self, requested_roots: Vec<PathBuf>) {
+    fn mark_mismatch(&mut self, requested_roots: Vec<PathBuf>, repo_pinned: bool) {
         self.mismatch = Some(WorkspaceMismatch {
             bound_repo: self.repo_root.clone(),
             requested_roots,
+            repo_pinned,
         });
+    }
+
+    /// The roots the client announced that this server could not bind.
+    ///
+    /// Empty when nothing is mismatched. Handed back so a later call can put
+    /// the same roots through the binder again instead of trusting a verdict
+    /// reached before anything on the host had a chance to change.
+    fn mismatched_roots(&self) -> Vec<PathBuf> {
+        self.mismatch
+            .as_ref()
+            .map(|mismatch| mismatch.requested_roots.clone())
+            .unwrap_or_default()
     }
 
     /// Structured refusal for a `tools/call` that arrived while the client's
@@ -514,9 +562,30 @@ impl WorkspaceMismatch {
             "kin-mcp refuses '{tool}': the MCP client's workspace roots changed to [{requested}], \
              and none of them is a Kin repository this server can bind, so Kin is still bound to \
              {bound}. Answering would return a confident result about a repository you are no \
-             longer looking at. Run `kin init .` in the new workspace, or restart the MCP server \
-             from it (or with --repo <path> / KIN_MCP_REPO=<path>)."
+             longer looking at. {}",
+            self.remedy()
         )
+    }
+
+    /// The fixes that actually apply to this server.
+    ///
+    /// A repo-bound server is not offered `kin init .`, and the omission is the
+    /// point rather than brevity. `--repo`/`KIN_MCP_REPO` is how a server is
+    /// registered against a repository it reaches over a boundary the client
+    /// does not share: a docker-exec registration, a remote checkout. The path
+    /// the client announces is then a HOST path this process may never be able
+    /// to see, so running `kin init` there does not repair the mismatch. It
+    /// creates a second, empty repository beside the real one and leaves the
+    /// refusal exactly where it was.
+    fn remedy(&self) -> &'static str {
+        if self.repo_pinned {
+            "This server is pinned by --repo / KIN_MCP_REPO, so point the pin at the repository \
+             you are working in and restart the MCP server, or open that repository's own path \
+             in your client."
+        } else {
+            "Run `kin init .` in the new workspace, or restart the MCP server from it (or with \
+             --repo <path> / KIN_MCP_REPO=<path>)."
+        }
     }
 }
 
@@ -1944,7 +2013,7 @@ mod tests {
             "a settled binding must not re-ask on every trigger"
         );
 
-        binding.mark_mismatch(vec![PathBuf::from("/elsewhere")]);
+        binding.mark_mismatch(vec![PathBuf::from("/elsewhere")], false);
         assert!(
             binding.wants_workspace_roots(),
             "bound to a repository the client left is no better than unbound"
@@ -2185,8 +2254,12 @@ mod tests {
     #[tokio::test]
     async fn tool_calls_fail_loud_when_the_new_workspace_cannot_be_bound() {
         // Bind repo A, then switch to a workspace with no bindable Kin repo.
-        let (binder, _calls) = ScriptedBinder::install(vec![
+        // The third outcome is the tool call's own re-check, which must find
+        // the root still unbindable and leave the refusal exactly as it was:
+        // re-checking changes when the verdict is taken, never what it is.
+        let (binder, calls) = ScriptedBinder::install(vec![
             Some(bound_repo("/repo/a", "http://127.0.0.1:4111")),
+            None,
             None,
         ]);
 
@@ -2216,6 +2289,127 @@ mod tests {
         assert!(
             text.contains("/repo/a"),
             "refusal must name the repository still bound: {text}"
+        );
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            3,
+            "the tool call must re-check the root before refusing"
+        );
+    }
+
+    /// The refusal was computed when the roots changed and then cached, so a
+    /// root that became bindable afterwards kept being refused for the life of
+    /// the process. The reported shape: a container registration whose
+    /// announced host path was made to exist, with no way to restart the
+    /// client's MCP server.
+    #[tokio::test]
+    async fn a_root_that_becomes_bindable_self_heals_on_the_next_tool_call() {
+        let (binder, calls) = ScriptedBinder::install(vec![
+            Some(bound_repo("/repo/a", "http://127.0.0.1:4111")),
+            None,
+            Some(bound_repo("/host/path", "http://127.0.0.1:4222")),
+        ]);
+
+        let responses = drive_daemon_loop(
+            &[
+                initialize_with_roots_capability(),
+                serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+                roots_response(&["/repo/a"]),
+                serde_json::json!({"jsonrpc": "2.0", "method": "notifications/roots/list_changed"}),
+                roots_response(&["/host/path"]),
+                // No roots change and no restart in between: only the host
+                // changed under a root the client already announced.
+                tool_call(21, "semantic_locate"),
+            ],
+            Some(binder),
+            None,
+        )
+        .await;
+
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(
+            calls.len(),
+            3,
+            "the tool call must put the recorded roots through the binder again: {calls:?}"
+        );
+        assert_eq!(
+            calls[2],
+            vec![PathBuf::from("/host/path")],
+            "the re-check must use the roots the client announced, not invent new ones"
+        );
+
+        let answer = responses
+            .iter()
+            .find(|value| value.get("id").and_then(|id| id.as_u64()) == Some(21))
+            .expect("the tool call must be answered");
+        let text = tool_error_text(answer);
+        assert!(
+            text.contains("not enabled in this MCP profile"),
+            "a root that became bindable must clear the refusal without a restart: {text}"
+        );
+    }
+
+    /// Drive the loop with an operator pin that bound at startup, then move the
+    /// client to a root this server cannot bind, and return the refusal text.
+    async fn pinned_workspace_refusal(repo_pinned: bool) -> String {
+        let startup = StartupDaemonBinding::new();
+        startup.resolve_bound(
+            bound_repo("/repo/pinned", "http://127.0.0.1:4111"),
+            repo_pinned,
+        );
+        // Two `None`s: the roots change that records the mismatch, and the
+        // tool call's own re-check.
+        let (binder, _calls) = ScriptedBinder::install(vec![None, None]);
+
+        let responses = drive_daemon_loop_with_startup(
+            &[
+                initialize_with_roots_capability(),
+                serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+                roots_response(&["/host/only/path"]),
+                tool_call(31, "semantic_locate"),
+            ],
+            Some(binder),
+            None,
+            Some(startup),
+        )
+        .await;
+
+        let answer = responses
+            .iter()
+            .find(|value| value.get("id").and_then(|id| id.as_u64()) == Some(31))
+            .expect("the tool call must be answered");
+        tool_error_text(answer)
+    }
+
+    /// `kin init .` is wrong advice for a repo-bound server, and wrong in the
+    /// expensive direction: the announced root is a host path a docker-exec or
+    /// remote registration may never be able to see, so following the hint
+    /// creates a second empty repository beside the real one and leaves the
+    /// refusal in place.
+    #[tokio::test]
+    async fn a_repo_bound_refusal_does_not_suggest_kin_init() {
+        let pinned = pinned_workspace_refusal(true).await;
+        assert!(
+            !pinned.contains("kin init"),
+            "a repo-bound server must not send the user to create a second repository: {pinned}"
+        );
+        assert!(
+            pinned.contains("--repo") && pinned.contains("KIN_MCP_REPO"),
+            "the remedy that does apply must survive: {pinned}"
+        );
+        assert!(
+            pinned.contains("semantic_locate") && pinned.contains("/host/only/path"),
+            "the refusal must still name the tool and the workspace: {pinned}"
+        );
+
+        // Falsification: an unpinned server reaches the same refusal by the
+        // same path and still gets the suggestion, so the assertion above
+        // describes the pin rather than a message that lost the text for
+        // everyone.
+        let unpinned = pinned_workspace_refusal(false).await;
+        assert!(
+            unpinned.contains("kin init"),
+            "an unpinned server can genuinely init the workspace it is looking at: {unpinned}"
         );
     }
 

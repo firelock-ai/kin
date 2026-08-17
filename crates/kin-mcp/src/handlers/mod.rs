@@ -2819,6 +2819,85 @@ mod tests {
         );
     }
 
+    /// Name every array of 20 or more numbers under `value`.
+    ///
+    /// That is the shape a `Hash256` (32) or a sha1 `GitObjectId` (20) takes
+    /// when it reaches an agent through the model's derived `Serialize`. No
+    /// legitimate field in a retrieval payload is a long run of bare integers,
+    /// so the shape itself is the defect and no field name has to be enumerated
+    /// for a new one to be caught.
+    fn decimal_byte_arrays(value: &serde_json::Value, at: &str, found: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Array(items) => {
+                if items.len() >= 20 && items.iter().all(serde_json::Value::is_number) {
+                    found.push(format!("{at} ({} numbers)", items.len()));
+                }
+                for (index, item) in items.iter().enumerate() {
+                    decimal_byte_arrays(item, &format!("{at}[{index}]"), found);
+                }
+            }
+            serde_json::Value::Object(fields) => {
+                for (key, item) in fields {
+                    decimal_byte_arrays(item, &format!("{at}.{key}"), found);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `get_context_pack` is documented as fitted to a token budget, and it was
+    /// spending that budget on `artifact_entry.hash` and `base_change_id`
+    /// serialized as 32-element decimal arrays, one number per line when the
+    /// response is pretty-printed. Hex costs a quarter of that and is the only
+    /// spelling Kin's own inputs parse back.
+    #[test]
+    fn a_context_pack_never_spends_its_budget_on_decimal_byte_arrays() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let content = "export function budgeted_probe_5c1a(value: number): boolean {\n  return value > 0;\n}\n";
+        let source = make_source_backed_entity(content);
+        let entity = &source.entity;
+
+        let mut store = EmptyStore::default();
+        store.entities_by_id.insert(entity.id, entity.clone());
+        store
+            .file_hashes
+            .insert(entity.file_origin.clone().unwrap(), source.hash);
+        install_empty_store_exact_tree(&mut store, source._dir.path());
+        let authority = test_repository_authority(source._dir.path());
+        let sessions = SessionRegistry::new();
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(entity.id.to_string()),
+        )]);
+
+        let value = tool_result_json(
+            entities::handle_get_context_pack(&args, &store, &sessions, Some(&authority)).unwrap(),
+        );
+
+        // Positive control first: the pack really does carry the fields this
+        // test is about, so a payload that simply lost them cannot pass.
+        // Dependencies render through the same seam as the focal, so covering
+        // the focal covers every entry the pack can hold.
+        let hash = value["focal_entity"]["artifact_entry"]["hash"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the pack must carry the focal artifact entry: {value}"));
+        assert_eq!(hash.len(), 64, "a blob hash is 64 hex characters: {hash}");
+        assert!(
+            hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "the blob hash must be hex: {hash}"
+        );
+
+        let mut found = Vec::new();
+        decimal_byte_arrays(&value, "context_pack", &mut found);
+        assert!(
+            found.is_empty(),
+            "the pack spends its token budget on decimal byte arrays at {found:?}: {value}"
+        );
+    }
+
     /// Stand-in for the context builder's token-accounting projection, so the
     /// tests above assert against the exact text that used to leak into `body`.
     fn project_full_body_stub(entity: &Entity) -> String {
