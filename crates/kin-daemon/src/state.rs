@@ -2594,6 +2594,10 @@ impl DaemonState {
     /// Lazily initialize the spine and return a reference to it.
     /// Returns `None` if spine is disabled or if the mutable primary graph could
     /// not be captured stably yet; the latter leaves OnceLock empty for retry.
+    ///
+    /// Registration is published once, but the graph it describes keeps moving.
+    /// Every caller therefore re-resolves the primary watermark here rather than
+    /// reading whatever root the daemon happened to start with.
     pub fn ensure_spine(&self) -> Option<&dyn kin_spine::SpineBackend> {
         if Self::spine_disabled() {
             return None;
@@ -2613,7 +2617,81 @@ impl DaemonState {
                 }
             });
         }
-        self.spine.get().map(|s| s.as_ref())
+        let spine = self.spine.get()?;
+        self.reregister_primary_at_current_root(spine.as_ref());
+        Some(spine.as_ref())
+    }
+
+    /// Whether the spine's registered primary watermark is the live graph root.
+    fn primary_spine_registration_is_current(&self, spine: &dyn kin_spine::SpineBackend) -> bool {
+        let live_root = hex::encode(self.graph.compute_root_hash());
+        spine.root_hash(&self.cached_repo_id).as_deref() == Some(live_root.as_str())
+    }
+
+    /// Re-capture and re-register the primary repository once graph authority
+    /// has moved past the spine's registered watermark.
+    ///
+    /// The registered root and the registered entity metadata are one fact. A
+    /// watermark advanced on its own would certify a cross-repo answer that was
+    /// read out of the pre-mutation index, so the whole capture is replaced and
+    /// this repo's outgoing edges are re-resolved against it. A capture that
+    /// cannot stabilize leaves the repo explicitly dirty for the next caller
+    /// instead of publishing a root its entity set does not back.
+    fn reregister_primary_at_current_root(&self, spine: &dyn kin_spine::SpineBackend) {
+        if self.primary_spine_registration_is_current(spine) {
+            return;
+        }
+        without_blocking_runtime_worker(|| {
+            let _initialization = self
+                .spine_initialization
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if self.primary_spine_registration_is_current(spine) {
+                return;
+            }
+            let primary_repo_id = self.cached_repo_id.as_str();
+            let mut capture =
+                match self.capture_spine_repo(primary_repo_id, Arc::clone(&self.graph)) {
+                    Ok(capture) => capture,
+                    Err(capture_error) => {
+                        spine.invalidate_cross_repo_edges(primary_repo_id);
+                        warn!(
+                            repo_id = primary_repo_id,
+                            error = %capture_error,
+                            "spine re-registration deferred until primary graph authority is stable"
+                        );
+                        return;
+                    }
+                };
+            let entity_count = capture.entries.len();
+            spine.register_repo(
+                primary_repo_id,
+                std::mem::take(&mut capture.entries),
+                &capture.root_hash,
+            );
+            let registry_ids = spine.registered_repo_ids().into_iter().collect::<Vec<_>>();
+            spine.refresh_cross_repo_edges(
+                primary_repo_id,
+                &capture.entities,
+                &capture.relations,
+                &registry_ids,
+            );
+            if !self.spine_capture_is_current(&capture) {
+                spine.invalidate_cross_repo_edges(primary_repo_id);
+                warn!(
+                    repo_id = primary_repo_id,
+                    "primary graph authority advanced during spine re-registration; retry"
+                );
+                return;
+            }
+            info!(
+                repo_id = primary_repo_id,
+                entities = entity_count,
+                root_hash = %capture.root_hash,
+                cross_repo_edges = spine.edge_count(),
+                "re-registered primary graph authority in spine"
+            );
+        });
     }
 
     fn spine_capture_is_current(&self, capture: &SpineGraphCapture) -> bool {
@@ -6409,6 +6487,75 @@ mod tests {
         assert!(
             raced_entity,
             "the rebuilt backend must include raced authority"
+        );
+    }
+
+    // ── Cross-repo authority must follow graph truth for a daemon's whole life ──
+    //
+    // Registration happens once behind a OnceLock, so a watermark that is not
+    // re-resolved after a mutation leaves every later `find_references` reading
+    // its own repository as stale authority until the daemon is restarted.
+
+    #[test]
+    #[serial_test::serial]
+    fn spine_registration_follows_graph_authority_after_a_mutation() {
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.toml");
+        kin_core::registry::KinRegistry { repos: Vec::new() }
+            .save_to(&registry_path)
+            .unwrap();
+        let _spine_env = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path)
+            .without("KIN_DISABLE_SPINE");
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = Arc::new(test_state(init.layout, repo_dir.path()));
+        let primary_repo_id = state.cached_repo_id.clone();
+
+        let before = test_entity("before_mutation", "src/before.rs");
+        state.graph.upsert_entity(&before).unwrap();
+        let root_at_registration = hex::encode(state.graph.compute_root_hash());
+        let registered_at_startup = state
+            .ensure_spine()
+            .expect("the fixture must publish a spine")
+            .root_hash(&primary_repo_id);
+        assert_eq!(
+            registered_at_startup.as_deref(),
+            Some(root_at_registration.as_str()),
+            "the first registration must record the live graph root"
+        );
+
+        let after = test_entity("after_mutation", "src/after.rs");
+        let mutation = state.begin_graph_authority_mutation();
+        state.graph.upsert_entity(&after).unwrap();
+        drop(mutation);
+        let live_root = hex::encode(state.graph.compute_root_hash());
+        assert_ne!(
+            live_root, root_at_registration,
+            "the fixture mutation must actually move the graph root"
+        );
+
+        let spine = state
+            .ensure_spine()
+            .expect("a mutation must not cost the daemon its spine");
+        assert_eq!(
+            spine.root_hash(&primary_repo_id).as_deref(),
+            Some(live_root.as_str()),
+            "registered cross-repo authority must follow the mutated graph root"
+        );
+        assert!(
+            spine.lookup_by_id(&primary_repo_id, &after.id).is_some(),
+            "the re-registered watermark must describe the entity set it was captured with"
+        );
+
+        let response = spine.cross_repo_xref_response(&primary_repo_id, &after.id);
+        assert!(
+            response.authority_root_matches(&primary_repo_id, &live_root),
+            "find_references must not read its own repository as stale after a mutation"
+        );
+        assert!(
+            response.authority_complete_for(&primary_repo_id, &after.id),
+            "a single-repo daemon must still certify its own absence after a mutation"
         );
     }
 
