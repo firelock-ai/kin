@@ -27243,7 +27243,9 @@ mod tests {
     /// The sample is bounded; the count never is.
     #[test]
     fn graph_body_coverage_bounds_its_sample_without_capping_the_count() {
-        let paths: Vec<String> = (0..40).map(|index| format!("src/mod{index:02}.py")).collect();
+        let paths: Vec<String> = (0..40)
+            .map(|index| format!("src/mod{index:02}.py"))
+            .collect();
         let bodies = GraphBodyCoverage::observe(paths.iter(), |_| false);
 
         assert_eq!(bodies.gap_paths, 40, "the count must be the whole truth");
@@ -27278,13 +27280,19 @@ mod tests {
         );
         assert_eq!(coverage.indexed, 1644, "the embedding counts stay exact");
         assert_eq!(coverage.pending, 0);
-        let note = coverage.note.as_deref().expect("a cleared flag owes a reason");
+        let note = coverage
+            .note
+            .as_deref()
+            .expect("a cleared flag owes a reason");
         assert!(
             note.contains("graph body gap") && note.contains("2 of 2"),
             "the note must name the cause and its size: {note}"
         );
         assert_eq!(
-            coverage.graph_bodies.expect("the number rides along").gap_paths,
+            coverage
+                .graph_bodies
+                .expect("the number rides along")
+                .gap_paths,
             2
         );
     }
@@ -27296,11 +27304,10 @@ mod tests {
     /// the two apart by reading `graph_bodies`, which stays absent.
     #[test]
     fn full_body_coverage_and_an_unobserved_one_both_leave_complete_alone() {
-        let observed = fully_embedded_coverage()
-            .with_graph_bodies(GraphBodyCoverage::observe(
-                ["src/requests/api.py".to_string()].iter(),
-                |_| true,
-            ));
+        let observed = fully_embedded_coverage().with_graph_bodies(GraphBodyCoverage::observe(
+            ["src/requests/api.py".to_string()].iter(),
+            |_| true,
+        ));
         assert!(observed.complete, "no gap, so nothing to clear");
         assert!(observed.note.is_none(), "no gap, so no note");
         assert_eq!(observed.graph_bodies.expect("observed").gap_paths, 0);
