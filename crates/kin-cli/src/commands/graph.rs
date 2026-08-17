@@ -29,6 +29,15 @@ pub struct GraphCommandResponse {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<GraphSourceRecord>,
+    /// Reference-edge completeness, per language, for the status and validate
+    /// surfaces.
+    ///
+    /// Carried structurally as well as in `lines` so a consumer reads the metric
+    /// rather than parsing prose out of a terminal rendering. Optional because a
+    /// subcommand that measures nothing (inspect, source) has none to report and
+    /// an older daemon sends none at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_edge_coverage: Option<kin_core::reference_coverage::ReferenceEdgeCoverage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -538,6 +547,7 @@ fn build_graph_status_response(
         error: (!criticals.is_empty())
             .then(|| format!("{} critical graph health issue(s) found", criticals.len())),
         source: None,
+        reference_edge_coverage: Some(health.reference_edge_coverage.clone()),
     })
 }
 
@@ -727,6 +737,7 @@ fn build_graph_validate_response(
         lines,
         error: (!issues.is_empty()).then(|| format!("{} issue(s) found", issues.len())),
         source: None,
+        reference_edge_coverage: Some(health.reference_edge_coverage.clone()),
     })
 }
 
@@ -749,6 +760,7 @@ fn build_graph_inspect_response(
             lines: graph_entity_not_found_lines(name),
             error: Some(format!("no entity found matching '{}'", name)),
             source: None,
+            reference_edge_coverage: None,
         });
     }
 
@@ -795,6 +807,7 @@ fn build_graph_inspect_response(
         lines,
         error: None,
         source: None,
+        reference_edge_coverage: None,
     })
 }
 
@@ -959,12 +972,14 @@ pub fn build_graph_source_response(
                 lines,
                 error: None,
                 source: Some(record),
+                reference_edge_coverage: None,
             })
         }
         EntitySourceOutcome::NotFound(message) => Ok(GraphCommandResponse {
             lines: graph_entity_not_found_lines(entity_query),
             error: Some(message),
             source: None,
+            reference_edge_coverage: None,
         }),
         // A valid entity with no retrievable source is an error for the text/`?`
         // command paths (the CLI `kin graph source` and `trace_data_flow`, which
