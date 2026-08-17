@@ -2,6 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::{Context, Result};
+use kin_index::RelationResolution;
 use kin_model::{Entity, EntityId, EntityStore, GraphNodeId, GraphStore, RelationKind};
 use kin_ranking::entity_ranking;
 use serde::{Deserialize, Serialize};
@@ -213,10 +214,11 @@ pub fn build_refs_response(
             None => file_path,
         };
         lines.push(format!(
-            "  {} @ {} [{}]",
+            "  {} @ {} [{}] ({})",
             entry.name,
             location,
-            relation_kinds_label(&entry.relation_kinds)
+            relation_kinds_label(&entry.relation_kinds),
+            entry.resolution.as_str()
         ));
     }
 
@@ -556,6 +558,9 @@ struct ReferenceEntry {
     /// line for one would be a fabricated position.
     start_line: Option<u32>,
     relation_kinds: Vec<RelationKind>,
+    /// Strongest resolution among the edges behind this row. A `name_only` row
+    /// is a same-name match with nothing at the reference site proving it.
+    resolution: RelationResolution,
 }
 
 #[derive(Debug, Clone)]
@@ -610,6 +615,7 @@ fn collect_graph_references(
 ) -> Result<ReferenceCollection> {
     let allowed: std::collections::HashSet<_> = relation_kinds.iter().copied().collect();
     let mut grouped: HashMap<EntityId, Vec<RelationKind>> = HashMap::new();
+    let mut resolutions: HashMap<EntityId, RelationResolution> = HashMap::new();
     let mut matched_kinds = Vec::new();
 
     for rel in graph.get_all_relations_for_entity(entity_id)? {
@@ -629,6 +635,11 @@ fn collect_graph_references(
         }
         push_relation_kind(grouped.entry(src_entity_id).or_default(), rel.kind);
         push_relation_kind(&mut matched_kinds, rel.kind);
+        let resolution = RelationResolution::of(&rel);
+        resolutions
+            .entry(src_entity_id)
+            .and_modify(|current| *current = (*current).max(resolution))
+            .or_insert(resolution);
     }
 
     let mut references = Vec::with_capacity(grouped.len());
@@ -645,6 +656,10 @@ fn collect_graph_references(
             file_path: entity.file_origin.as_ref().map(|f| f.0.clone()),
             start_line: kin_mcp::handlers::common::entity_presentation_start_line(&entity),
             relation_kinds: source_kinds,
+            resolution: resolutions
+                .get(&source_id)
+                .copied()
+                .unwrap_or(RelationResolution::NameOnly),
         });
     }
     missing_source_ids.sort();

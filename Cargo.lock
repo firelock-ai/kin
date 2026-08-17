@@ -3435,6 +3435,7 @@ dependencies = [
  "kin-daemon-spawn",
  "kin-db",
  "kin-git",
+ "kin-index",
  "kin-model",
  "kin-parser",
  "kin-ranking",

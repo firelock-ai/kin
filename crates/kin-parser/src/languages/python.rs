@@ -95,8 +95,16 @@ impl LanguageAdapter for PythonAdapter {
             })
             .collect();
 
-        // Annotate Calls/References relations with import_source
+        // Annotate Calls/References relations with import_source.
+        //
+        // A receiver-bearing call is skipped: its `dst_name` is an attribute
+        // read off some object, not the local binding an import introduced, so
+        // matching it against the import map pins `obj.get(...)` to whatever
+        // module happened to export a name called `get`.
         for rel in &mut relations {
+            if rel.receiver.is_some() {
+                continue;
+            }
             if matches!(
                 rel.kind,
                 kin_model::RelationKind::Calls | kin_model::RelationKind::References
@@ -207,6 +215,7 @@ fn extract_py_node(
                 extract_calls_from_context(node, source, &name, class_ctx, relations, call_audit);
                 if let Some(cls) = class_ctx {
                     relations.push(ExtractedRelation {
+                        receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::Contains,
                         src_name: cls.to_string(),
@@ -257,6 +266,7 @@ fn extract_py_node(
                                     is_enum = true;
                                 }
                                 relations.push(ExtractedRelation {
+                                    receiver: None,
                                     call_shape: None,
                                     kind: kin_model::RelationKind::Extends,
                                     src_name: name.clone(),
@@ -316,6 +326,7 @@ fn extract_py_node(
                             for dec in &decorators {
                                 if is_valid_callee_name(dec) {
                                     relations.push(ExtractedRelation {
+                                        receiver: None,
                                         call_shape: None,
                                         kind: kin_model::RelationKind::Calls,
                                         src_name: src_name.clone(),
@@ -507,6 +518,10 @@ fn has_unobserved_call(
 struct PythonNamedCallee {
     name: String,
     resolution_proven: bool,
+    /// Receiver expression as written, for an attribute call whose owning type
+    /// the parser could not pin. `None` for a bare call and for a `self`/`cls`
+    /// call, whose owner is already folded into `name`.
+    receiver: Option<String>,
 }
 
 /// Resolve the statically named portion of a Python callee. Parentheses are a
@@ -516,7 +531,9 @@ struct PythonNamedCallee {
 /// leaf for recall, but cannot prove which class owns that method: the linker
 /// may otherwise bind a same-file free-function decoy or drop an over-cap
 /// method fanout. Callers must therefore preserve the edge while downgrading
-/// file-level call coverage. Other expression forms (conditional, subscript,
+/// file-level call coverage. Those callees also carry the receiver expression
+/// as written, which is what lets the linker separate a call through an object
+/// from a call through an imported module. Other expression forms (conditional, subscript,
 /// returned callable, lambda, and so on) do not prove one destination either.
 fn extract_named_callee(
     function: &tree_sitter::Node,
@@ -538,6 +555,10 @@ fn extract_named_callee(
                 .child_by_field_name("attribute")?
                 .utf8_text(source)
                 .ok()?;
+            let receiver_text = function
+                .child_by_field_name("object")
+                .and_then(|obj| obj.utf8_text(source).ok())
+                .map(str::to_string);
             let self_or_cls_receiver = function
                 .child_by_field_name("object")
                 .filter(|obj| obj.kind() == "identifier")
@@ -547,16 +568,19 @@ fn extract_named_callee(
                 Some(cls) if self_or_cls_receiver => PythonNamedCallee {
                     name: format!("{cls}.{attr}"),
                     resolution_proven: true,
+                    receiver: None,
                 },
                 _ => PythonNamedCallee {
                     name: attr.to_string(),
                     resolution_proven: false,
+                    receiver: receiver_text,
                 },
             }
         }
         "identifier" => PythonNamedCallee {
             name: function.utf8_text(source).ok()?.to_string(),
             resolution_proven: true,
+            receiver: None,
         },
         _ => return None,
     };
@@ -583,6 +607,7 @@ fn extract_calls_from_context(
                 .and_then(|function| extract_named_callee(&function, source, class_ctx));
             if let Some(callee) = callee {
                 relations.push(ExtractedRelation {
+                    receiver: callee.receiver,
                     call_shape: Some(extract_call_arg_shape(&child, source)),
                     kind: kin_model::RelationKind::Calls,
                     src_name: context_name.to_string(),
