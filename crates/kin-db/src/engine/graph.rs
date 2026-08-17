@@ -1328,6 +1328,35 @@ impl PendingGraphDelta {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PersistenceEpoch(u64);
 
+/// Whole-millisecond lap timer for one decomposed phase summary.
+///
+/// Each lap returns the milliseconds since the previous lap, so a summary event
+/// carries one field per phase and the fields sum to the wall clock within
+/// rounding.
+struct PublicationPhaseTimer {
+    last: std::time::Instant,
+}
+
+impl PublicationPhaseTimer {
+    fn start() -> Self {
+        Self {
+            last: std::time::Instant::now(),
+        }
+    }
+
+    fn lap_ms(&mut self) -> u128 {
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.last).as_millis();
+        self.last = now;
+        elapsed
+    }
+}
+
+/// Installing one immutable change into the live graph is O(change) work behind
+/// three lock acquisitions. Past this bound the cost is not the change, so the
+/// event names which term paid it.
+const SLOW_CHANGE_INSTALL: std::time::Duration = std::time::Duration::from_millis(250);
+
 fn delta_map_upsert<K, V>(delta: &mut CollectionDelta<K, V>, key: K, value: V)
 where
     K: Eq + Clone,
@@ -2071,6 +2100,36 @@ fn run_create_change_after_revision_hook() {
 
 #[cfg(not(test))]
 fn run_create_change_after_revision_hook() {}
+
+#[cfg(all(test, feature = "vector"))]
+thread_local! {
+    static SAVE_VECTOR_INDEX_AFTER_DETACH_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce(&InMemoryGraph)>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(all(test, feature = "vector"))]
+fn set_save_vector_index_after_detach_hook(hook: impl FnOnce(&InMemoryGraph) + 'static) {
+    SAVE_VECTOR_INDEX_AFTER_DETACH_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+/// Observation point between detaching the index handle and saving it.
+///
+/// The save is the longest single operation the vector index has, so the
+/// question a test must be able to ask is whether the `vector_index` slot is
+/// still reachable while it runs. The hook runs on the saving thread, and
+/// `parking_lot::Mutex` is not reentrant, so a `try_lock` inside it fails
+/// exactly when the guard is still held.
+#[cfg(all(test, feature = "vector"))]
+fn run_save_vector_index_after_detach_hook(graph: &InMemoryGraph) {
+    let hook = SAVE_VECTOR_INDEX_AFTER_DETACH_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(graph);
+    }
+}
+
+#[cfg(all(not(test), feature = "vector"))]
+fn run_save_vector_index_after_detach_hook(_graph: &InMemoryGraph) {}
 
 impl InMemoryGraph {
     /// Create a new empty in-memory graph (RAM-only text index).
@@ -4347,7 +4406,20 @@ impl InMemoryGraph {
         // on stamp drift, refused with its failing comparison named otherwise)
         // and rebuilt from the embedding queue, never by a destructive write
         // here.
-        if let Some(ref index) = *self.vector_index.lock() {
+        //
+        // Detach the index handle before saving. `self.vector_index` guards the
+        // slot — which index this graph serves — not the content of the index,
+        // which kin-vector synchronizes itself; every other reader here already
+        // clones the handle out and works outside the guard, including the
+        // mutating prune and carry-forward paths. Holding it across the save is
+        // what made an unrelated one-entity `create_change` wait: the save
+        // performs the index's deferred HNSW insertion for every unindexed
+        // vector before it writes, which is O(index), and
+        // `admit_minted_revision_vectors` needs the same slot to decide whether
+        // the new revision key owes a vector.
+        let index = self.vector_index.lock().clone();
+        run_save_vector_index_after_detach_hook(self);
+        if let Some(index) = index {
             index.save(path)?;
         }
 
@@ -8327,10 +8399,15 @@ impl ChangeStore for InMemoryGraph {
     }
 
     fn create_change(&self, change: &SemanticChange) -> Result<(), KinDbError> {
+        let started = std::time::Instant::now();
+        let mut timer = PublicationPhaseTimer::start();
         let payload = semantic_change_payload(change)?;
         validate_semantic_change(change)?;
+        let payload_ms = timer.lap_ms();
         let mut ent = self.entities.write();
+        let entities_lock_ms = timer.lap_ms();
         let mut chg = self.changes.write();
+        let changes_lock_ms = timer.lap_ms();
         if let Some(existing) = chg.changes.get(&change.id) {
             if semantic_change_payload(existing)? == payload {
                 return Ok(());
@@ -8343,11 +8420,13 @@ impl ChangeStore for InMemoryGraph {
         // transition so a concurrent persistence detach cannot split them
         // across generations.
         let mut pending = self.pending_delta.lock();
+        let pending_lock_ms = timer.lap_ms();
         let advances = append_entity_revisions(&mut ent, change);
         let superseded_revisions = superseded_revision_ids(&advances);
         #[cfg(feature = "vector")]
         let minted_revisions = plan_minted_revision_vectors(&ent, &advances);
         run_create_change_after_revision_hook();
+        let revisions_ms = timer.lap_ms();
         let revision_updates: Vec<(EntityId, Vec<EntityRevision>)> = change
             .entity_deltas
             .iter()
@@ -8380,10 +8459,15 @@ impl ChangeStore for InMemoryGraph {
 
         chg.changes.insert(change.id, change.clone());
         delta_map_upsert(&mut pending.delta.changes, change.id, change.clone());
+        let pending_entity_revisions = pending.delta.entity_revisions.added.len()
+            + pending.delta.entity_revisions.modified.len();
+        let pending_changes =
+            pending.delta.changes.added.len() + pending.delta.changes.modified.len();
         drop(pending);
+        let pending_delta_ms = timer.lap_ms();
 
         #[cfg(feature = "vector")]
-        {
+        let (admit_vectors_ms, note_vectors_ms) = {
             // Both guards go before the vector index is touched. The rest of the
             // engine reaches the index only after releasing the entity lock, and
             // the carry-forward reads a vector under the index lock.
@@ -8392,10 +8476,36 @@ impl ChangeStore for InMemoryGraph {
             // Admit before noting: the carry-forward source is the very key the
             // prune is about to evict.
             self.admit_minted_revision_vectors(&minted_revisions);
+            let admit_ms = timer.lap_ms();
             self.note_superseded_vectors(&superseded_revisions);
-        }
+            (admit_ms, timer.lap_ms())
+        };
         #[cfg(not(feature = "vector"))]
-        let _ = superseded_revisions;
+        let (admit_vectors_ms, note_vectors_ms) = {
+            let _ = superseded_revisions;
+            (timer.lap_ms(), 0)
+        };
+        let elapsed = started.elapsed();
+        if elapsed >= SLOW_CHANGE_INSTALL {
+            let elapsed_ms = elapsed.as_millis();
+            tracing::info!(
+                elapsed_ms,
+                payload_ms,
+                entities_lock_ms,
+                changes_lock_ms,
+                pending_lock_ms,
+                revisions_ms,
+                pending_delta_ms,
+                admit_vectors_ms,
+                note_vectors_ms,
+                entity_deltas = change.entity_deltas.len(),
+                relation_deltas = change.relation_deltas.len(),
+                tree_deltas = change.tree_deltas.len(),
+                pending_entity_revisions,
+                pending_changes,
+                "slow live graph change install"
+            );
+        }
         Ok(())
     }
 
@@ -13333,6 +13443,327 @@ mod tests {
         assert_eq!(revisions[1].ended_by, None);
     }
 
+    /// Every domain of two graph snapshots, compared by value.
+    ///
+    /// Destructured on purpose: adding a domain to `GraphSnapshot` breaks this
+    /// function until somebody decides whether the new domain is part of what
+    /// "the served graph equals a fresh build" means. A field list that only
+    /// grew by hand would silently stop covering the thing it names.
+    fn assert_graph_snapshots_identical(served: &GraphSnapshot, fresh: &GraphSnapshot) {
+        let GraphSnapshot {
+            version,
+            entities,
+            relations,
+            outgoing,
+            incoming,
+            changes,
+            change_children,
+            work_items,
+            annotations,
+            work_links,
+            reviews,
+            review_decisions,
+            review_notes,
+            review_discussions,
+            review_assignments,
+            test_cases,
+            assertions,
+            verification_runs,
+            mock_hints,
+            contracts,
+            actors,
+            delegations,
+            approvals,
+            audit_events,
+            shallow_files,
+            file_layouts,
+            structured_artifacts,
+            opaque_artifacts,
+            resolved_tree,
+            sessions,
+            intents,
+            downstream_warnings,
+            entity_revisions,
+            repository_authority,
+            external_references,
+        } = served;
+        assert_eq!(*version, fresh.version, "version");
+        assert_eq!(*entities, fresh.entities, "entities");
+        assert_eq!(*relations, fresh.relations, "relations");
+        assert_eq!(*outgoing, fresh.outgoing, "outgoing");
+        assert_eq!(*incoming, fresh.incoming, "incoming");
+        assert_eq!(*changes, fresh.changes, "changes");
+        assert_eq!(*change_children, fresh.change_children, "change_children");
+        assert_eq!(*resolved_tree, fresh.resolved_tree, "resolved_tree");
+        assert_eq!(
+            *entity_revisions, fresh.entity_revisions,
+            "entity_revisions"
+        );
+        assert_eq!(
+            *external_references, fresh.external_references,
+            "external_references"
+        );
+        assert_eq!(
+            repository_authority.is_none(),
+            fresh.repository_authority.is_none(),
+            "repository_authority presence"
+        );
+        // The remaining domains carry kin-model types with no `PartialEq`, so
+        // they are compared as canonically ordered encodings instead. Maps are
+        // sorted by encoded key so only the order two `HashMap`s happen to
+        // iterate in is removed, never a real difference.
+        assert_eq!(
+            snapshot_domain_map(work_items.iter()),
+            snapshot_domain_map(fresh.work_items.iter()),
+            "work_items"
+        );
+        assert_eq!(
+            snapshot_domain_map(annotations.iter()),
+            snapshot_domain_map(fresh.annotations.iter()),
+            "annotations"
+        );
+        assert_eq!(
+            snapshot_domain_value(work_links),
+            snapshot_domain_value(&fresh.work_links),
+            "work_links"
+        );
+        assert_eq!(
+            snapshot_domain_map(reviews.iter()),
+            snapshot_domain_map(fresh.reviews.iter()),
+            "reviews"
+        );
+        assert_eq!(
+            snapshot_domain_map(review_decisions.iter()),
+            snapshot_domain_map(fresh.review_decisions.iter()),
+            "review_decisions"
+        );
+        assert_eq!(
+            snapshot_domain_value(review_notes),
+            snapshot_domain_value(&fresh.review_notes),
+            "review_notes"
+        );
+        assert_eq!(
+            snapshot_domain_value(review_discussions),
+            snapshot_domain_value(&fresh.review_discussions),
+            "review_discussions"
+        );
+        assert_eq!(
+            snapshot_domain_map(review_assignments.iter()),
+            snapshot_domain_map(fresh.review_assignments.iter()),
+            "review_assignments"
+        );
+        assert_eq!(
+            snapshot_domain_map(test_cases.iter()),
+            snapshot_domain_map(fresh.test_cases.iter()),
+            "test_cases"
+        );
+        assert_eq!(
+            snapshot_domain_map(assertions.iter()),
+            snapshot_domain_map(fresh.assertions.iter()),
+            "assertions"
+        );
+        assert_eq!(
+            snapshot_domain_map(verification_runs.iter()),
+            snapshot_domain_map(fresh.verification_runs.iter()),
+            "verification_runs"
+        );
+        assert_eq!(
+            snapshot_domain_value(mock_hints),
+            snapshot_domain_value(&fresh.mock_hints),
+            "mock_hints"
+        );
+        assert_eq!(
+            snapshot_domain_map(contracts.iter()),
+            snapshot_domain_map(fresh.contracts.iter()),
+            "contracts"
+        );
+        assert_eq!(
+            snapshot_domain_map(actors.iter()),
+            snapshot_domain_map(fresh.actors.iter()),
+            "actors"
+        );
+        assert_eq!(
+            snapshot_domain_value(delegations),
+            snapshot_domain_value(&fresh.delegations),
+            "delegations"
+        );
+        assert_eq!(
+            snapshot_domain_value(approvals),
+            snapshot_domain_value(&fresh.approvals),
+            "approvals"
+        );
+        assert_eq!(
+            snapshot_domain_value(audit_events),
+            snapshot_domain_value(&fresh.audit_events),
+            "audit_events"
+        );
+        assert_eq!(
+            snapshot_domain_value(shallow_files),
+            snapshot_domain_value(&fresh.shallow_files),
+            "shallow_files"
+        );
+        assert_eq!(
+            snapshot_domain_value(file_layouts),
+            snapshot_domain_value(&fresh.file_layouts),
+            "file_layouts"
+        );
+        assert_eq!(
+            snapshot_domain_value(structured_artifacts),
+            snapshot_domain_value(&fresh.structured_artifacts),
+            "structured_artifacts"
+        );
+        assert_eq!(
+            snapshot_domain_value(opaque_artifacts),
+            snapshot_domain_value(&fresh.opaque_artifacts),
+            "opaque_artifacts"
+        );
+        assert_eq!(
+            snapshot_domain_map(sessions.iter()),
+            snapshot_domain_map(fresh.sessions.iter()),
+            "sessions"
+        );
+        assert_eq!(
+            snapshot_domain_map(intents.iter()),
+            snapshot_domain_map(fresh.intents.iter()),
+            "intents"
+        );
+        assert_eq!(
+            snapshot_domain_value(downstream_warnings),
+            snapshot_domain_value(&fresh.downstream_warnings),
+            "downstream_warnings"
+        );
+    }
+
+    fn snapshot_domain_value<T: serde::Serialize>(value: &T) -> Vec<u8> {
+        rmp_serde::to_vec(value).expect("a snapshot domain encodes")
+    }
+
+    fn snapshot_domain_map<'a, K: serde::Serialize + 'a, V: serde::Serialize + 'a>(
+        map: impl IntoIterator<Item = (&'a K, &'a V)>,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut entries: Vec<_> = map
+            .into_iter()
+            .map(|(key, value)| (snapshot_domain_value(key), snapshot_domain_value(value)))
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    /// A base graph with entities, relations, a tree and a genesis change: the
+    /// shape a commit lands on, not an empty store.
+    fn install_identity_base_graph() -> (InMemoryGraph, SemanticChangeId, Entity) {
+        let graph = InMemoryGraph::new();
+        let anchor = test_entity("existing_anchor", "src/anchor.rs");
+        let neighbor = test_entity("existing_neighbor", "src/anchor.rs");
+        graph.upsert_entity(&anchor).unwrap();
+        graph.upsert_entity(&neighbor).unwrap();
+        graph
+            .upsert_relation(&test_relation(anchor.id, neighbor.id, RelationKind::Calls))
+            .unwrap();
+        let genesis = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x01; 32])),
+                parents: vec![],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "genesis".to_string(),
+                entity_deltas: vec![EntityDelta::Added {
+                    new: anchor.clone(),
+                }],
+                relation_deltas: vec![],
+                tree_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
+            },
+        );
+        (graph, genesis, anchor)
+    }
+
+    fn install_identity_one_entity_change(
+        parent: SemanticChangeId,
+        entity: &Entity,
+    ) -> SemanticChange {
+        seal_change(SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x02; 32])),
+            parents: vec![parent],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "install one entity".to_string(),
+            entity_deltas: vec![EntityDelta::Added {
+                new: entity.clone(),
+            }],
+            relation_deltas: vec![],
+            tree_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
+        })
+    }
+
+    /// Installing a commit's own delta into the graph the daemon already holds
+    /// must leave exactly the state a cold process would rebuild from the
+    /// durable bytes.
+    ///
+    /// This is the invariant the commit path's `install_live_graph` phase rests
+    /// on: it applies the change to the live query graph instead of rebuilding
+    /// one, and every read served afterwards comes from that graph rather than
+    /// from a reopen. Counting entities would not catch a delta that landed in
+    /// the live maps but not in the derived adjacency or revision lineage, so
+    /// the comparison is by value across every snapshot domain.
+    #[test]
+    fn live_change_install_is_value_identical_to_a_rebuild_from_durable_bytes() {
+        let (graph, genesis, anchor) = install_identity_base_graph();
+        let added = test_entity("freshly_committed", "src/committed.rs");
+        let change = install_identity_one_entity_change(genesis, &added);
+        let _ = anchor;
+
+        graph.create_change(&change).unwrap();
+        let served = graph.to_snapshot();
+
+        let bytes = served.to_bytes().unwrap();
+        let reopened = InMemoryGraph::from_snapshot(GraphSnapshot::from_bytes(&bytes).unwrap())
+            .unwrap()
+            .to_snapshot();
+
+        assert_graph_snapshots_identical(&served, &reopened);
+        assert!(
+            served.changes.contains_key(&change.id),
+            "the served graph must carry the installed change"
+        );
+        assert!(
+            served.entity_revisions.contains_key(&added.id),
+            "the served graph must carry the installed entity's revision chain"
+        );
+    }
+
+    /// The control for the test above: a real difference in one domain must
+    /// make the comparison fail. Without this, a comparison that silently
+    /// stopped looking at anything would keep passing.
+    #[test]
+    #[should_panic(expected = "entity_revisions")]
+    fn live_change_install_identity_fails_on_a_real_difference() {
+        let (graph, genesis, _anchor) = install_identity_base_graph();
+        let added = test_entity("freshly_committed", "src/committed.rs");
+        let change = install_identity_one_entity_change(genesis, &added);
+        graph.create_change(&change).unwrap();
+        let served = graph.to_snapshot();
+
+        let mut perturbed = served.clone();
+        perturbed.entity_revisions.remove(&added.id);
+
+        assert_graph_snapshots_identical(&served, &perturbed);
+    }
+
     #[test]
     fn create_change_persists_entity_revision_lineage_in_snapshots() {
         let graph = InMemoryGraph::new();
@@ -16385,6 +16816,63 @@ mod tests {
     /// for an entity must leave exactly ONE vector for that entity — the new
     /// revision's. The superseded generation is still referenced by the entity's
     /// revision history, so before the fix `prune_orphaned_vectors` (whose truth
+    /// Saving the vector sidecar must not hold the slot that a commit's own
+    /// change install needs.
+    ///
+    /// `save` performs the index's deferred HNSW insertion for every unindexed
+    /// vector before it writes, which is O(index); `create_change` reaches the
+    /// same slot in `admit_minted_revision_vectors` to decide whether the new
+    /// revision key owes a vector. Holding the slot across the save is what put
+    /// an 11.1 s wait inside a one-entity commit's `install_live_graph` phase on
+    /// a 26.7k-entity store, with no work of its own to show for it.
+    ///
+    /// The hook runs on the saving thread and `parking_lot::Mutex` is not
+    /// reentrant, so `try_lock` succeeding is exactly the proof that the guard
+    /// is gone. Restoring the guard around the save fails this test.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn save_vector_index_releases_the_index_slot_before_saving() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("graph.kvec");
+        let graph = InMemoryGraph::new();
+        let entity = test_entity("saved_owner", "src/saved.rs");
+        let vi = VectorIndex::new(2).unwrap();
+        vi.upsert(entity.id, &[1.0f32, 0.0]).unwrap();
+        vi.set_descriptor(crate::vector::IndexDescriptor {
+            model_id: Some("test-model".to_string()),
+            graph_root: Some("test-root".to_string()),
+        });
+        *graph.vector_index.lock() = Some(Arc::new(vi));
+
+        let observed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let free = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed_hook = Arc::clone(&observed);
+        let free_hook = Arc::clone(&free);
+        set_save_vector_index_after_detach_hook(move |graph| {
+            observed_hook.store(1, Ordering::SeqCst);
+            free_hook.store(graph.vector_index.try_lock().is_some(), Ordering::SeqCst);
+        });
+
+        graph.save_vector_index(&path).unwrap();
+
+        assert_eq!(
+            observed.load(Ordering::SeqCst),
+            1,
+            "the observation point must run, or this test proves nothing"
+        );
+        assert!(
+            free.load(Ordering::SeqCst),
+            "the vector index slot must be reachable while the sidecar saves"
+        );
+        assert!(path.exists(), "the sidecar must still be written");
+        let reloaded = VectorIndex::load_from_disk(&path).unwrap();
+        assert_eq!(
+            reloaded.get(&entity.id),
+            Some(vec![1.0f32, 0.0]),
+            "detaching the handle must not change what the save persists"
+        );
+    }
+
     /// admitted every generation) kept BOTH vectors and `semantic_locate`
     /// returned the entity twice with two distinct cosine scores. Discriminating:
     /// FAILS on the old all-revisions truth (evicts 0), PASSES on head-only truth.
