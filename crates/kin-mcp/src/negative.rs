@@ -29,6 +29,25 @@
 //! observed. Unknown freshness/coverage is `null` and forces
 //! `safe_to_conclude_absent = false` — absence is never certified on data the
 //! envelope did not see.
+//!
+//! ## What an absence claim depends on
+//!
+//! Freshness and degraded signals describe the daemon, not the substrate a
+//! particular query reads. A graph can be initialized, loaded, fully embedded and
+//! undegraded while holding no cross-file `calls`/`imports`/`references` edges at
+//! all, and every reference query against it returns an empty array for reasons
+//! that have nothing to do with the code. [`absence_cross_file_classes`] is the
+//! per-tool map of which edge classes each tool's absence claim depends on, and
+//! [`edge_coverage_gap`] is the gate that reads the observation
+//! [`crate::edge_coverage`] publishes into the payload. A tool that declares a
+//! dependency and publishes no observation is inconclusive by construction, so
+//! authority cannot be inherited by a tool that has not earned it.
+//!
+//! Gaps accumulate through [`push_gap`] in limiting-factor-first order rather
+//! than overwriting one another. Order matters as much as the verdict: a correct
+//! `inconclusive` beside an unrelated reason teaches readers to skip the reason,
+//! which is how a missing-cross-file-edge absence came back explained as a
+//! cross-repo spine mismatch.
 
 use serde_json::{json, Map, Value};
 
@@ -153,6 +172,153 @@ fn spec_for(tool: &str) -> Option<RetrievalSpec> {
         _ => return None,
     };
     Some(spec)
+}
+
+/// The cross-file edge classes each tool's ABSENCE claim depends on — the
+/// per-tool dependency map, in code, so authority can only be granted for a
+/// substrate the tool actually reads.
+///
+/// A tool's absence is a claim about edges, and the only edges that can carry a
+/// reference from one file to another are cross-file `calls`/`imports`/
+/// `references`. A graph that holds none of them for the focal's language
+/// answers every reference query with an empty array no matter how healthy it
+/// is, which is why membership in this map, and not the freshness signals,
+/// decides whether an absence can be certified.
+///
+/// | tool | classes an absence depends on | why |
+/// |---|---|---|
+/// | `find_references` | the query's own `relation_kinds` (default calls, imports, references) | its rows ARE those edges |
+/// | `bulk_check_references` | the query's own `relation_kinds` | one `has_references: false` row per entity, read off the same edges |
+/// | `trace_data_flow` | calls, imports, references | the walk expands exactly those kinds |
+/// | `impact_analysis` | calls, imports, references | downstream impact is those edges transitively; it has no absence spec today, and this entry is what stops one inheriting authority if it gains one |
+/// | `graph_neighborhood` | none | the merged walk includes containment edges, which are intra-file by construction, so an empty neighborhood is not evidence about cross-file coverage; its absence is gated instead by focal-not-in-graph and depth-zero |
+/// | `semantic_locate` | none | ranks entities from embeddings and never traverses an edge |
+/// | `semantic_search` | none | filters declarations by name/kind/language and never traverses an edge |
+/// | `dead_code`, `find_dead_code_seeded` | none | their empty result is the INVERSE claim ("nothing unreachable"), and missing edges produce more candidates rather than fewer, so absence there is not endangered by a coverage gap |
+/// | `entity_history` | none | reads change history, not relations |
+///
+/// A tool absent from the map contributes no classes, so a new retrieval tool
+/// starts with no edge-derived authority to inherit and has to declare what it
+/// reads to earn one.
+fn absence_cross_file_classes(tool: &str, payload: &Value) -> Vec<String> {
+    match tool {
+        "find_references" | "bulk_check_references" => payload
+            .get("relation_kinds")
+            .and_then(Value::as_array)
+            .map(|kinds| {
+                kinds
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_ascii_lowercase)
+                    .filter(|kind| {
+                        matches!(kind.as_str(), "calls" | "imports" | "references")
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(reference_classes),
+        "trace_data_flow" | "impact_analysis" => reference_classes(),
+        _ => Vec::new(),
+    }
+}
+
+/// The default reference edge classes, matching `default_reference_kinds` on the
+/// handler side. Kept as the fallback for a payload that does not report the
+/// scope it ran with, because assuming a narrower scope than the query used
+/// would let an unreported union query pass a gate only its narrowest arm earned.
+fn reference_classes() -> Vec<String> {
+    vec![
+        "calls".to_string(),
+        "imports".to_string(),
+        "references".to_string(),
+    ]
+}
+
+/// Why the graph cannot certify this absence over the edge classes the query
+/// reads, or `None` when at least one requested class is demonstrably present.
+///
+/// One observed cross-file edge of a requested class is the bar. It is
+/// deliberately not "every requested class is present": `references` edges are
+/// legitimately rare, so demanding all of them would report every absence on
+/// every real graph as inconclusive, which is the failure mode opposite to
+/// FIR-2353 and just as useless. One witness proves the extractor and linker do
+/// produce cross-file edges of that class for this language, which is the fact
+/// an absence claim was silently assuming.
+///
+/// A payload carrying no observation at all is the unknown case, not the healthy
+/// one. That is the reading the module's honesty contract already takes for
+/// unknown coverage, and it is the reading that makes a tool declare its
+/// dependency in [`absence_cross_file_classes`] and publish the observation
+/// before it can certify anything.
+fn edge_coverage_gap(tool: &str, payload: &Value) -> Option<String> {
+    let requested = absence_cross_file_classes(tool, payload);
+    if requested.is_empty() {
+        return None;
+    }
+    let named = requested.join(", ");
+
+    let Some(coverage) = payload
+        .get(crate::edge_coverage::EDGE_COVERAGE_KEY)
+        .and_then(Value::as_object)
+    else {
+        return Some(format!(
+            "edge_coverage_unreported: this answer did not report whether the graph holds \
+             cross-file {named} edges, so an empty result cannot be distinguished from a graph \
+             that could not have found a reference in the first place"
+        ));
+    };
+    let language = coverage
+        .get("language")
+        .and_then(Value::as_str)
+        .unwrap_or("an unreported language");
+    let states = coverage.get("classes").and_then(Value::as_object);
+    let state_for = |class: &str| -> &str {
+        states
+            .and_then(|states| states.get(class))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+    };
+
+    if requested
+        .iter()
+        .any(|class| state_for(class) == "present")
+    {
+        return None;
+    }
+    if requested
+        .iter()
+        .any(|class| state_for(class) == "unknown")
+        || coverage.get("budget_exhausted").and_then(Value::as_bool) == Some(true)
+    {
+        return Some(format!(
+            "edge_coverage_unknown: whether the graph holds cross-file {named} edges for \
+             {language} could not be established, so an empty result may mean the query had no \
+             edges to answer from rather than that the target is unused"
+        ));
+    }
+    Some(format!(
+        "cross_file_edges_absent: the graph holds no cross-file {named} edges for {language}, so \
+         no reference from another file could have been found and an empty result says nothing \
+         about whether the target is used; the gap is in extraction/enrichment for that language, \
+         not in the code"
+    ))
+}
+
+/// Add one gap to the running verdict: the reason a gap names replaces a
+/// substrate reason that certified authority, and follows one that already
+/// reported a gap, so the composed reason reads limiting-factor-first and never
+/// drops a fact that was already true.
+///
+/// Every gate in [`negative_for`] goes through this rather than assigning
+/// `trust_reason` directly. Direct assignment is how a cross-repo topology note
+/// came to overwrite the reason an absence was actually limited by, leaving a
+/// correct verdict beside an unrelated explanation.
+fn push_gap(trustworthy: &mut bool, trust_reason: &mut String, gap: String) {
+    *trust_reason = if *trustworthy {
+        gap
+    } else {
+        format!("{trust_reason}; {gap}")
+    };
+    *trustworthy = false;
 }
 
 /// Number of items in the tool's result collection within `payload`, or `None`
@@ -554,6 +720,24 @@ fn focal_is_method(payload: &Value) -> bool {
     focal_kind(payload).is_some_and(|kind| kind.eq_ignore_ascii_case("method"))
 }
 
+/// The label an unavailable cross-repo answer reports, and its detail.
+///
+/// The producer names the condition that held under `code`, so the label is that
+/// name rather than one catch-all. `cross_repo_unavailable` remains the label for
+/// an answer carrying no code, because a reason with no computed condition behind
+/// it must not be dressed up as one.
+fn cross_repo_unavailable_gap(cross_repo: &Value) -> String {
+    let code = cross_repo
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or("cross_repo_unavailable");
+    let reason = cross_repo
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("the cross-repo spine could not answer");
+    format!("{code}: {reason}")
+}
+
 fn cross_repo_references_gap(payload: &Value) -> Option<String> {
     let Some(cross_repo) = payload.get("cross_repo") else {
         return Some(
@@ -562,13 +746,7 @@ fn cross_repo_references_gap(payload: &Value) -> Option<String> {
         );
     };
     match cross_repo.get("status").and_then(Value::as_str) {
-        Some("unavailable") => {
-            let reason = cross_repo
-                .get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or("the cross-repo spine could not answer");
-            Some(format!("cross_repo_unavailable: {reason}"))
-        }
+        Some("unavailable") => Some(cross_repo_unavailable_gap(cross_repo)),
         Some("available") => {
             let authority_complete = cross_repo
                 .get("authority_complete")
@@ -634,13 +812,7 @@ fn cross_repo_bulk_gap(payload: &Value) -> Option<String> {
         );
     };
     match cross_repo.get("status").and_then(Value::as_str) {
-        Some("unavailable") => Some(format!(
-            "cross_repo_unavailable: {}",
-            cross_repo
-                .get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or("the cross-repo spine could not answer")
-        )),
+        Some("unavailable") => Some(cross_repo_unavailable_gap(cross_repo)),
         Some("available") => {
             let authority_complete = cross_repo
                 .get("authority_complete")
@@ -712,6 +884,16 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
     let (mut trustworthy, trust_reason) = envelope.negative_trust(spec.class);
     let mut trust_reason = trust_reason.to_string();
 
+    // The edge-class gate leads every other gap because it is the one that can
+    // make the query structurally unable to answer. A graph holding no
+    // cross-file edges of the class a reference query reads returns an empty
+    // array for every symbol in it, healthy or not, so no later gap is the
+    // limiting factor when this one applies and none of them may be reported as
+    // if it were.
+    if let Some(gap) = edge_coverage_gap(tool, payload) {
+        push_gap(&mut trustworthy, &mut trust_reason, gap);
+    }
+
     // Receiver-method calls (`x.method()`) are resolved by bare name in
     // the linker while method entities are keyed by their qualified name, so a
     // method's incoming `Calls` edges are frequently dropped. An empty
@@ -720,28 +902,35 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
     // read "safe to delete" off an incomplete call graph: downgrade to
     // inconclusive so the absence is flagged as possibly-unresolved, not certain.
     if tool == "find_references" && focal_is_method(payload) {
-        trustworthy = false;
-        trust_reason = "method_call_resolution_incomplete: receiver-method calls are \
+        push_gap(
+            &mut trustworthy,
+            &mut trust_reason,
+            "method_call_resolution_incomplete: receiver-method calls are \
              linked by bare name and may be unresolved, so an empty result is not an \
              authoritative absence for a method"
-            .to_string();
+                .to_string(),
+        );
     }
 
     // A healthy local graph is not enough to certify "no references" when the
     // configured cross-repo authority failed or returned an invalid payload.
     // Keep the local rows, but make the negative verdict explicitly
     // inconclusive so agents cannot read the gap as safe-to-delete proof.
+    //
+    // It follows the gates above rather than replacing them. A spine that cannot
+    // answer for a repository is a real gap, but it is a gap about OTHER
+    // repositories, so it is never the reason a local absence could not be
+    // certified. Reporting it as that reason is how a miss inside one file came
+    // back explained as a cross-repo root mismatch.
     if tool == "find_references" {
         if let Some(reason) = cross_repo_references_gap(payload) {
-            trustworthy = false;
-            trust_reason = reason;
+            push_gap(&mut trustworthy, &mut trust_reason, reason);
         }
     }
 
     if tool == "bulk_check_references" {
         if let Some(reason) = cross_repo_bulk_gap(payload) {
-            trustworthy = false;
-            trust_reason = reason;
+            push_gap(&mut trustworthy, &mut trust_reason, reason);
         }
     }
 
@@ -830,12 +1019,7 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
         // absent, so it leads and the specific gap follows rather than being
         // overwritten by it.
         if let Some(gap) = neighborhood_gap {
-            trust_reason = if trustworthy {
-                gap.to_string()
-            } else {
-                format!("{trust_reason}; {gap}")
-            };
-            trustworthy = false;
+            push_gap(&mut trustworthy, &mut trust_reason, gap.to_string());
         }
     }
 
@@ -848,13 +1032,7 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
         }
         let gaps = trace_flow_gaps(payload);
         if !gaps.is_empty() {
-            let gaps = gaps.join("; ");
-            trust_reason = if trustworthy {
-                gaps
-            } else {
-                format!("{trust_reason}; {gaps}")
-            };
-            trustworthy = false;
+            push_gap(&mut trustworthy, &mut trust_reason, gaps.join("; "));
         }
     }
 
@@ -866,17 +1044,15 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
     // is not saying it better.
     let degradations = payload_degradation_labels(payload);
     if !degradations.is_empty() && tool != "trace_data_flow" {
-        let gap = format!(
-            "retrieval_degraded: this query reported degradations [{}], so it did not run at \
-             full capability",
-            degradations.join(", ")
+        push_gap(
+            &mut trustworthy,
+            &mut trust_reason,
+            format!(
+                "retrieval_degraded: this query reported degradations [{}], so it did not run at \
+                 full capability",
+                degradations.join(", ")
+            ),
         );
-        trust_reason = if trustworthy {
-            gap
-        } else {
-            format!("{trust_reason}; {gap}")
-        };
-        trustworthy = false;
     }
 
     // A graph holding no entities answers every query identically, so an empty
@@ -885,14 +1061,13 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
     // ways of reporting "nothing" have to agree about an empty graph, or an
     // agent learns which phrasing to trust rather than which answer.
     if envelope.graph_state.entity_count == Some(0) {
-        let gap = "graph_empty: the graph holds no entities at all, so an empty result says \
-                   nothing about whether the target exists";
-        trust_reason = if trustworthy {
-            gap.to_string()
-        } else {
-            format!("{trust_reason}; {gap}")
-        };
-        trustworthy = false;
+        push_gap(
+            &mut trustworthy,
+            &mut trust_reason,
+            "graph_empty: the graph holds no entities at all, so an empty result says \
+             nothing about whether the target exists"
+                .to_string(),
+        );
     }
 
     let interpretation = if ranking_names_nothing {
@@ -1019,14 +1194,13 @@ pub fn resolution_miss_for(tool: &str, message: &str, envelope: &Envelope) -> Op
     // bare "not found" dangerous: an agent reads it as proof the symbol does not
     // exist and acts on it.
     if envelope.graph_state.entity_count == Some(0) {
-        let gap = "graph_empty: the graph holds no entities at all, so a name that resolves to \
-                   nothing says nothing about whether the symbol exists";
-        trust_reason = if trustworthy {
-            gap.to_string()
-        } else {
-            format!("{trust_reason}; {gap}")
-        };
-        trustworthy = false;
+        push_gap(
+            &mut trustworthy,
+            &mut trust_reason,
+            "graph_empty: the graph holds no entities at all, so a name that resolves to \
+             nothing says nothing about whether the symbol exists"
+                .to_string(),
+        );
     }
 
     let consequence = if trustworthy {
@@ -1110,6 +1284,24 @@ mod tests {
         }))
     }
 
+    /// A graph that demonstrably links references across files for the focal's
+    /// language: one observed cross-file `calls` witness, the rest scanned and
+    /// reported absent. Without this object in the payload an absence claim has
+    /// no evidence that the query could have found anything, which is the whole
+    /// FIR-2353 failure, so every fixture asserting authoritative absence carries
+    /// it.
+    fn cross_file_edges_observed() -> Value {
+        json!({
+            "scope": "language",
+            "language": "Rust",
+            "requested_classes": ["calls", "imports", "references"],
+            "classes": { "calls": "present", "imports": "absent", "references": "absent" },
+            "cross_file_classes": ["calls"],
+            "budget_exhausted": false,
+            "entities_examined": 2,
+        })
+    }
+
     fn authoritative_empty_references(kind: &str) -> Value {
         json!({
             "focal_entity": {
@@ -1129,6 +1321,7 @@ mod tests {
                 "authority_revision": "sha256:complete",
                 "authority_roots": { "provider": "provider-root" },
             },
+            "edge_coverage": cross_file_edges_observed(),
         })
     }
 
@@ -1383,6 +1576,207 @@ mod tests {
             .contains("authoritative"));
     }
 
+    /// FIR-2353, the reproduction: a graph the daemon reports as initialized,
+    /// loaded and undegraded, holding entities and intra-file edges only. Every
+    /// freshness signal is green and the answer is still worthless, because no
+    /// cross-file reference edge exists for the language to be found. The verdict
+    /// must be inconclusive and the reason must name the edge gap.
+    #[test]
+    fn find_references_absence_is_inconclusive_when_no_cross_file_edges_exist() {
+        let mut payload = authoritative_empty_references("function");
+        payload["edge_coverage"] = json!({
+            "scope": "language",
+            "language": "Python",
+            "requested_classes": ["calls", "imports", "references"],
+            "classes": { "calls": "absent", "imports": "absent", "references": "absent" },
+            "cross_file_classes": [],
+            "budget_exhausted": false,
+            "entities_examined": 26,
+        });
+        let negative = negative_for("find_references", &payload, &structural_ready_envelope())
+            .expect("empty references yields a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert_eq!(negative["trust"], json!("inconclusive"));
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            reason.starts_with("cross_file_edges_absent"),
+            "the limiting factor must lead the reason: {reason}"
+        );
+        assert!(
+            reason.contains("Python"),
+            "the reason names the language whose edges are missing: {reason}"
+        );
+        // The advice an agent acts on has to agree with the verdict, or the
+        // envelope contradicts itself one field apart.
+        assert!(negative["advice"]
+            .as_str()
+            .unwrap()
+            .contains("NOT authoritative"));
+    }
+
+    /// A payload that reports no observation at all is the unknown case. This is
+    /// the shape every retrieval tool had before FIR-2353, and reading it as
+    /// healthy is precisely how absence was certified on a graph that could not
+    /// answer.
+    #[test]
+    fn find_references_absence_is_inconclusive_when_coverage_is_unreported() {
+        let mut payload = authoritative_empty_references("function");
+        payload
+            .as_object_mut()
+            .unwrap()
+            .remove("edge_coverage")
+            .expect("the fixture carries an observation to remove");
+        let negative =
+            negative_for("find_references", &payload, &structural_ready_envelope()).unwrap();
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert!(negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("edge_coverage_unreported"));
+    }
+
+    /// A scan that stopped on its budget knows nothing, and "nothing" is not
+    /// "absent". Reporting the truncated scan as a completed one would hand back
+    /// the same false authority through a different door.
+    #[test]
+    fn find_references_absence_is_inconclusive_when_the_scan_was_truncated() {
+        let mut payload = authoritative_empty_references("function");
+        payload["edge_coverage"] = json!({
+            "scope": "language",
+            "language": "Rust",
+            "requested_classes": ["calls"],
+            "classes": { "calls": "unknown" },
+            "cross_file_classes": [],
+            "budget_exhausted": true,
+            "entities_examined": 4096,
+        });
+        let negative =
+            negative_for("find_references", &payload, &structural_ready_envelope()).unwrap();
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert!(negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("edge_coverage_unknown"));
+    }
+
+    /// The gate is scoped to the classes the QUERY asked for. A calls-only query
+    /// against a graph whose only cross-file edges are imports has no coverage
+    /// for what it read, and borrowing the sibling class's witness would certify
+    /// an absence over edges that were never produced.
+    #[test]
+    fn the_edge_gate_reads_the_classes_the_query_asked_for() {
+        let mut payload = authoritative_empty_references("function");
+        payload["relation_kinds"] = json!(["calls"]);
+        payload["edge_coverage"] = json!({
+            "scope": "language",
+            "language": "Python",
+            "requested_classes": ["calls", "imports"],
+            "classes": { "calls": "absent", "imports": "present" },
+            "cross_file_classes": ["imports"],
+            "budget_exhausted": false,
+            "entities_examined": 12,
+        });
+        let negative =
+            negative_for("find_references", &payload, &structural_ready_envelope()).unwrap();
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(reason.starts_with("cross_file_edges_absent"), "{reason}");
+        assert!(
+            reason.contains("calls") && !reason.contains("imports"),
+            "the reason names the class the query read, not the one it did not: {reason}"
+        );
+
+        // The same graph answering the imports arm keeps its authority, so the
+        // gate narrows the claim rather than blanket-denying it.
+        payload["relation_kinds"] = json!(["imports"]);
+        let negative =
+            negative_for("find_references", &payload, &structural_ready_envelope()).unwrap();
+        assert_eq!(negative["safe_to_conclude_absent"], json!(true));
+    }
+
+    /// The regression the fix must not become: making every absence inconclusive
+    /// would satisfy FIR-2353 and destroy the tool. A graph that demonstrably
+    /// links references across files still certifies a genuinely unused symbol.
+    #[test]
+    fn a_graph_with_cross_file_edges_still_certifies_a_genuinely_unused_symbol() {
+        let payload = authoritative_empty_references("function");
+        let negative =
+            negative_for("find_references", &payload, &structural_ready_envelope()).unwrap();
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(true),
+            "one observed cross-file witness is enough to earn authority"
+        );
+        assert_eq!(negative["trust"], json!("authoritative"));
+        assert!(negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .contains("structural_authoritative"));
+    }
+
+    /// Tools that read no edges must not be gated by an edge observation they
+    /// have no way to publish. `semantic_locate` ranks embeddings and
+    /// `semantic_search` filters declarations, so their absences answer to their
+    /// own substrates and stay reachable.
+    #[test]
+    fn tools_that_traverse_no_edges_are_not_gated_by_edge_coverage() {
+        assert!(edge_coverage_gap("semantic_locate", &json!({ "results": [] })).is_none());
+        assert!(edge_coverage_gap("semantic_search", &json!({ "results": [] })).is_none());
+        assert!(edge_coverage_gap("graph_neighborhood", &json!({ "relations": [] })).is_none());
+        assert!(edge_coverage_gap("entity_history", &json!([])).is_none());
+        assert!(edge_coverage_gap("dead_code", &json!([])).is_none());
+        // And an unknown tool inherits nothing: it declares no dependency, so it
+        // is neither gated nor granted authority by this map.
+        assert!(edge_coverage_gap("some_future_tool", &json!({})).is_none());
+    }
+
+    /// The map is the contract, so it is asserted directly rather than only
+    /// through the tools that happen to consume it today. `impact_analysis` has
+    /// no absence spec yet; its entry is what stops one inheriting authority.
+    #[test]
+    fn the_per_tool_dependency_map_names_what_each_absence_reads() {
+        let all = vec![
+            "calls".to_string(),
+            "imports".to_string(),
+            "references".to_string(),
+        ];
+        assert_eq!(
+            absence_cross_file_classes("find_references", &json!({})),
+            all
+        );
+        assert_eq!(
+            absence_cross_file_classes("bulk_check_references", &json!({})),
+            all
+        );
+        assert_eq!(absence_cross_file_classes("trace_data_flow", &json!({})), all);
+        assert_eq!(
+            absence_cross_file_classes("impact_analysis", &json!({})),
+            all,
+            "an absence spec added to impact_analysis must arrive already gated"
+        );
+        assert_eq!(
+            absence_cross_file_classes(
+                "find_references",
+                &json!({ "relation_kinds": ["Calls", "other"] })
+            ),
+            vec!["calls".to_string()],
+            "the query's own scope narrows the dependency, case-insensitively"
+        );
+        for tool in [
+            "semantic_locate",
+            "semantic_search",
+            "graph_neighborhood",
+            "dead_code",
+            "find_dead_code_seeded",
+            "entity_history",
+        ] {
+            assert!(
+                absence_cross_file_classes(tool, &json!({})).is_empty(),
+                "{tool} traverses no cross-file reference edge for its absence claim"
+            );
+        }
+    }
+
     #[test]
     fn find_references_on_method_is_inconclusive_despite_loaded_graph() {
         // Receiver-method call edges are under-resolved by the linker
@@ -1527,6 +1921,105 @@ mod tests {
             .expect("empty references yields a negative");
         assert_eq!(negative["safe_to_conclude_absent"], json!(true));
         assert_eq!(negative["trust"], json!("authoritative"));
+    }
+
+    /// FIR-2353, generation 7: the same miss came back inconclusive with
+    /// "cross_repo_unavailable: spine root mismatch" as the reason. The verdict
+    /// was right and the explanation belonged to another repository, which trains
+    /// a reader to ignore the reason text. The edge gap is the limiting factor and
+    /// has to lead; the spine note may follow but must never stand in for it.
+    #[test]
+    fn a_spine_gap_never_stands_in_for_the_edge_gap_that_actually_limited_the_answer() {
+        let mut payload = authoritative_empty_references("function");
+        payload["edge_coverage"] = json!({
+            "scope": "language",
+            "language": "Python",
+            "requested_classes": ["calls", "imports", "references"],
+            "classes": { "calls": "absent", "imports": "absent", "references": "absent" },
+            "cross_file_classes": [],
+            "budget_exhausted": false,
+            "entities_examined": 26,
+        });
+        payload["cross_repo"] = json!({
+            "status": "unavailable",
+            "code": "spine_root_stale",
+            "reason": "spine root mismatch for repository nk: live/session graph root b2 has \
+                       advanced past the registered spine root a1",
+        });
+        let negative =
+            negative_for("find_references", &payload, &structural_ready_envelope()).unwrap();
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            reason.starts_with("cross_file_edges_absent"),
+            "the edge gap is the limiting factor and leads: {reason}"
+        );
+        let edge_position = reason.find("cross_file_edges_absent").unwrap();
+        let spine_position = reason.find("spine_root_stale").unwrap();
+        assert!(
+            edge_position < spine_position,
+            "a cross-repo note must follow the local limiting factor, not precede it: {reason}"
+        );
+    }
+
+    /// The spine reason survives where it IS the limiting factor: cross-file
+    /// coverage present, local graph healthy, and only the cross-repo watermark
+    /// stale. A fix that simply suppressed the spine gap would lose a real one.
+    #[test]
+    fn the_spine_reason_leads_when_the_spine_is_the_only_gap() {
+        let mut payload = authoritative_empty_references("function");
+        payload["cross_repo"] = json!({
+            "status": "unavailable",
+            "code": "spine_root_stale",
+            "reason": "spine root mismatch for repository nk: live/session graph root b2 has \
+                       advanced past the registered spine root a1",
+        });
+        let negative =
+            negative_for("find_references", &payload, &structural_ready_envelope()).unwrap();
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert!(negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("spine_root_stale"));
+    }
+
+    /// An unregistered repository is the ordinary single-repo state, and it must
+    /// not be reported as a mismatch of anything. The old wording made a healthy
+    /// local install look misconfigured.
+    #[test]
+    fn an_unregistered_repository_is_not_reported_as_a_root_mismatch() {
+        let mut payload = authoritative_empty_references("function");
+        payload["cross_repo"] = json!({
+            "status": "unavailable",
+            "code": "spine_repo_unregistered",
+            "reason": "repository nk has no registered spine root, so cross-repo authority \
+                       cannot answer for it",
+        });
+        let negative =
+            negative_for("find_references", &payload, &structural_ready_envelope()).unwrap();
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(reason.starts_with("spine_repo_unregistered"), "{reason}");
+        assert!(
+            !reason.contains("mismatch"),
+            "nothing mismatched: {reason}"
+        );
+    }
+
+    /// A reason with no computed code behind it keeps the catch-all label rather
+    /// than being promoted into a condition the producer never named.
+    #[test]
+    fn an_uncoded_cross_repo_reason_keeps_the_generic_label() {
+        let mut payload = authoritative_empty_references("function");
+        payload["cross_repo"] = json!({
+            "status": "unavailable",
+            "reason": "KIN_REPO_ID is empty",
+        });
+        let negative =
+            negative_for("find_references", &payload, &structural_ready_envelope()).unwrap();
+        assert!(negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("cross_repo_unavailable: KIN_REPO_ID is empty"));
     }
 
     #[test]
@@ -1797,6 +2290,7 @@ mod tests {
                 "addressed_by": "name",
                 "same_name_candidates": 1,
             },
+            "edge_coverage": cross_file_edges_observed(),
         })
     }
 
