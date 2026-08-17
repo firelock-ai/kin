@@ -12,9 +12,7 @@
 //! moves underneath it.
 
 use anyhow::{bail, Context, Result};
-use kin_model::{
-    AuthorId, OperationId, RepoPath, RepositoryId, RootBundle, WorkspaceHead, WorkspaceId,
-};
+use kin_model::{OperationId, RepoPath, RepositoryId, RootBundle, WorkspaceHead, WorkspaceId};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -143,7 +141,7 @@ pub async fn heal(json: bool) -> Result<()> {
             path_hex: Some(hex::encode(selected.as_bytes())),
             change_id: None,
             operation_id: OperationId::new(),
-            actor: AuthorId::new(kin_core::whoami()),
+            actor: crate::commands::require_commit_author()?,
         };
         daemon.checkout(&request).await.with_context(|| {
             format!("restore {selected} from repository authority while healing the projection")

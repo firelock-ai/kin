@@ -461,6 +461,10 @@ Each failing/incomplete check prints its own `fix:` line. The most common ones:
 - **`repo_init` MISSING** → run `kin init .` to initialize a repository here.
 - **`vfs_projection` MISSING** → run `kin setup` to (re)install the shim into `~/.kin/lib`.
 - **`kin_daemon_binary` MISSING** → reinstall Kin so `kin-daemon` lands beside `kin`.
+- **`commit_identity` MISCONFIGURED** → set `git config --global user.name` and
+  `git config --global user.email`, or put `default_author = "Your Name <you@example.com>"`
+  in `.kin/config.toml`. Kin refuses to commit rather than attribute a change to nobody,
+  because a change record is permanent and its author cannot be corrected afterwards.
 
 `kin doctor` (or `kin setup doctor`) runs the same checklist; add `--fix` to apply the
 safe repairs (shell hook, MCP configs, config dirs, stale-daemon cleanup) and then re-run

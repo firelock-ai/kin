@@ -450,6 +450,14 @@ fn is_within_graph_only_member(state: &DaemonState, path: &RepoPath) -> Result<b
     Ok(false)
 }
 
+/// Who a workspace admission the daemon performed on its own is attributed to.
+///
+/// Not a person, and deliberately not resolved from one. This actor appears only
+/// on tree admissions the watch loop and the purge path publish without a
+/// caller, so attributing them to whoever last configured a Git identity would
+/// name someone who did not perform them.
+pub(crate) const DAEMON_ADMISSION_ACTOR: &str = "kin-daemon-admission";
+
 /// Returns the authority generation this admission published, or `None` when
 /// the desired tree already matched authority and nothing moved.
 pub(crate) fn publish_exact_workspace_tree(
@@ -464,7 +472,14 @@ pub(crate) fn publish_exact_workspace_tree(
         &authority_context,
         admitted,
         kin_model::OperationId::new(),
-        kin_model::AuthorId::new(kin_core::whoami()),
+        // The daemon's own loop is the actor here, and naming it is a statement
+        // rather than a stand-in: nobody typed a command, this publishes no
+        // history node and advances no ref, and the workspace transition it
+        // records was observed by the watcher. A person's identity would be the
+        // fabrication on this path, not the honest answer. Every path that mints
+        // a change a person authored takes that person's resolved identity from
+        // the caller instead.
+        kin_model::AuthorId::new(DAEMON_ADMISSION_ACTOR),
     )?
     else {
         return Ok(None);

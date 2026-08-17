@@ -117,7 +117,7 @@ pub async fn run(
         column,
         json,
         operation_id: OperationId::new(),
-        actor: AuthorId::new(kin_core::whoami()),
+        actor: crate::commands::require_commit_author()?,
     };
     let daemon = crate::daemon_client::DaemonClient::from_base_url_for_layout(daemon_url, &layout)?;
     let response = daemon.rename(&request).await?;
