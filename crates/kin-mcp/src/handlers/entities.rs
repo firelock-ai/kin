@@ -1058,29 +1058,31 @@ fn daemon_spine_xref(
     let query = match authority.spine {
         Some(spine) => {
             let body = spine.cross_repo_xref_response(&repo_id, target_id);
-            match body.authority_roots.get(&repo_id) {
-                Some(registered) if registered == authority.graph_root => {
-                    kin_spine::SpineQuery::Found(body)
-                }
+            match body.authority_root_state(&repo_id, authority.graph_root) {
+                kin_spine::AuthorityRootState::Matches => kin_spine::SpineQuery::Found(body),
                 // The spine registered this repository at the graph it was
                 // initialized from, and graph truth has moved since. Its
                 // topology is stale, which bears on references from OTHER
                 // repositories and says nothing about the local graph that just
                 // answered.
-                Some(registered) => kin_spine::SpineQuery::Unavailable(format!(
-                    "{SPINE_ROOT_STALE}: spine root mismatch for repository {repo_id}: \
-                     live/session graph root {} has advanced past the registered spine root \
-                     {registered}, so cross-repo authority is stale for other repositories \
-                     and says nothing about references inside this one",
-                    authority.graph_root
-                )),
+                kin_spine::AuthorityRootState::Stale { registered } => {
+                    kin_spine::SpineQuery::Unavailable(format!(
+                        "{SPINE_ROOT_STALE}: spine root mismatch for repository {repo_id}: \
+                         live/session graph root {} has advanced past the registered spine root \
+                         {registered}, so cross-repo authority is stale for other repositories \
+                         and says nothing about references inside this one",
+                        authority.graph_root
+                    ))
+                }
                 // No registration at all, which is the ordinary state of a
                 // single-repo install rather than a mismatch of any kind.
-                None => kin_spine::SpineQuery::Unavailable(format!(
-                    "{SPINE_REPO_UNREGISTERED}: repository {repo_id} has no registered spine \
-                     root, so cross-repo authority cannot answer for it; this is the ordinary \
-                     single-repo state and says nothing about references inside this repository"
-                )),
+                kin_spine::AuthorityRootState::Unregistered => {
+                    kin_spine::SpineQuery::Unavailable(format!(
+                        "{SPINE_REPO_UNREGISTERED}: repository {repo_id} has no registered spine \
+                         root, so cross-repo authority cannot answer for it; this is the ordinary \
+                         single-repo state and says nothing about references inside this repository"
+                    ))
+                }
             }
         }
         None => kin_spine::SpineQuery::NotConfigured,

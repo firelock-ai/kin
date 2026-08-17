@@ -174,7 +174,7 @@ fn spec_for(tool: &str) -> Option<RetrievalSpec> {
     Some(spec)
 }
 
-/// The cross-file edge classes each tool's ABSENCE claim depends on — the
+/// The cross-file edge classes each tool's ABSENCE claim depends on: the
 /// per-tool dependency map, in code, so authority can only be granted for a
 /// substrate the tool actually reads.
 ///
@@ -249,6 +249,17 @@ fn reference_classes() -> Vec<String> {
 /// unknown coverage, and it is the reading that makes a tool declare its
 /// dependency in [`absence_cross_file_classes`] and publish the observation
 /// before it can certify anything.
+///
+/// The extraction side grew a richer statement of the same fact under FIR-2354:
+/// `kin_core::cross_file_coverage::CrossFileCoverage`, whole-graph counts plus a
+/// per-language entry carrying `reference_enrichment`, which knows something this
+/// gate cannot observe from the graph alone (a language whose server is not
+/// installed). It reaches the CLI surfaces rather than any retrieval payload
+/// today. When a payload carries it, this gate should prefer it, mapping zero
+/// cross-file entity relations to `absent` for every class, a language's zero to
+/// `absent` for that language, and an unavailable `reference_enrichment` to
+/// `unknown`; [`crate::edge_coverage`] can then be retired, since it is called
+/// from exactly three payload builders.
 fn edge_coverage_gap(tool: &str, payload: &Value) -> Option<String> {
     let requested = absence_cross_file_classes(tool, payload);
     if requested.is_empty() {

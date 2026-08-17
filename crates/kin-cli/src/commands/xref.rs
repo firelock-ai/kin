@@ -77,21 +77,26 @@ pub async fn build_xref_response(
     let query = match spine_backend {
         Some(backend) => {
             let response = backend.cross_repo_xref_response(repo_id, &target.id);
-            // Same split the MCP surface makes: a repository the spine never
-            // registered has nothing to mismatch, and reporting it as a root
-            // mismatch describes a misconfiguration that does not exist.
-            match response.authority_roots.get(repo_id) {
-                Some(registered) if registered == graph_root => {
+            // Same split the MCP surface makes, through the same shared rule: a
+            // repository the spine never registered has nothing to mismatch, and
+            // reporting it as a root mismatch describes a misconfiguration that
+            // does not exist.
+            match response.authority_root_state(repo_id, graph_root) {
+                ::kin_spine::AuthorityRootState::Matches => {
                     ::kin_spine::SpineQuery::Found(response)
                 }
-                Some(registered) => ::kin_spine::SpineQuery::Unavailable(format!(
-                    "spine root mismatch for repository {repo_id}: live/session graph root \
-                     {graph_root} has advanced past the registered spine root {registered}"
-                )),
-                None => ::kin_spine::SpineQuery::Unavailable(format!(
-                    "repository {repo_id} has no registered spine root, so cross-repo authority \
-                     cannot answer for it"
-                )),
+                ::kin_spine::AuthorityRootState::Stale { registered } => {
+                    ::kin_spine::SpineQuery::Unavailable(format!(
+                        "spine root mismatch for repository {repo_id}: live/session graph root \
+                         {graph_root} has advanced past the registered spine root {registered}"
+                    ))
+                }
+                ::kin_spine::AuthorityRootState::Unregistered => {
+                    ::kin_spine::SpineQuery::Unavailable(format!(
+                        "repository {repo_id} has no registered spine root, so cross-repo \
+                         authority cannot answer for it"
+                    ))
+                }
             }
         }
         None => ::kin_spine::SpineQuery::NotConfigured,

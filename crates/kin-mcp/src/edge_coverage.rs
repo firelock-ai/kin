@@ -61,8 +61,8 @@ pub const EDGE_COVERAGE_KEY: &str = "edge_coverage";
 /// How many entities may have their relations read while looking for a witness.
 ///
 /// A healthy graph answers in single digits, so this bound is only reached on a
-/// graph that holds no cross-file edges of the requested classes at all — the
-/// case this module exists to detect. Reaching it reports `unknown` rather than
+/// graph that holds no cross-file edges of the requested classes at all, which is
+/// the case this module exists to detect. Reaching it reports `unknown` rather than
 /// `absent`, so a truncated scan is never published as a verdict.
 const WITNESS_BUDGET: usize = 4096;
 
