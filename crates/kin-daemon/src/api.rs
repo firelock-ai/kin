@@ -3449,9 +3449,17 @@ async fn command_graph(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let repository_authority = state
+    // Through the cache rather than the bare binding. Every graph command here
+    // reads durable repository state, and an open re-verifies every persisted
+    // body against its content address, so opening per request made `kin graph
+    // status` cost the whole store each time it printed counters. The cache is
+    // keyed on the durable publication identity read before the load it labels,
+    // so a reused authority is one this daemon confirmed is still current.
+    let binding = state
         .local_repository_authority_binding()
         .map_err(repository_authority_error)?;
+    let repository_authority =
+        shared_command_authority(binding, command_repository_authority(&state)?);
     let embedding_runtime = graph_status_embedding_runtime(&state, &graph);
     let response = kin_cli::commands::graph::execute_graph_command(
         &repository_authority,
@@ -13402,7 +13410,9 @@ mod tests {
 
         let runtime = graph_status_embedding_runtime(&state, &state.graph);
         let response = kin_cli::commands::graph::execute_graph_command(
-            &state.local_repository_authority_binding().unwrap(),
+            &kin_cli::commands::repository_authority::RequestRepositoryAuthority::pinned(
+                state.local_repository_authority_binding().unwrap(),
+            ),
             state.graph.as_ref(),
             &kin_cli::commands::graph::GraphCommandRequest::Status,
             &Default::default(),
