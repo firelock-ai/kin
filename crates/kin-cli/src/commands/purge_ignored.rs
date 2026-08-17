@@ -160,7 +160,7 @@ pub async fn run(confirm: bool, confirm_mass_deletion: bool) -> Result<()> {
             confirm,
             confirm_mass_deletion,
             operation_id: OperationId::new(),
-            actor: AuthorId::new(kin_core::whoami()),
+            actor: crate::commands::require_commit_author()?,
         })
         .await?;
     for line in &response.lines {

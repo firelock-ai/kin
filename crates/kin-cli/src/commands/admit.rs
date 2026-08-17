@@ -368,7 +368,7 @@ pub async fn run() -> Result<()> {
     // rather than asking for another.
     let request = AdmitRequest {
         operation_id: OperationId::new(),
-        actor: AuthorId::new(kin_core::whoami()),
+        actor: crate::commands::require_commit_author()?,
     };
     let outcome = wait_for_admission(&client, &request).await;
 

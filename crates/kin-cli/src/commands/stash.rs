@@ -144,7 +144,7 @@ pub async fn push(message: Option<String>, yes: bool) -> Result<()> {
         message,
         operation_id: OperationId::new(),
         timestamp: Timestamp::now(),
-        actor: AuthorId::new(kin_core::whoami()),
+        actor: crate::commands::require_commit_author()?,
     })
     .await?;
     print_lines(response);
@@ -155,7 +155,7 @@ pub async fn pop() -> Result<()> {
     super::capabilities::require_ready("stash")?;
     let response = execute(StashRequest::Pop {
         operation_id: OperationId::new(),
-        actor: AuthorId::new(kin_core::whoami()),
+        actor: crate::commands::require_commit_author()?,
     })
     .await?;
     print_lines(response);

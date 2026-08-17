@@ -39,15 +39,6 @@ pub fn content_identity_from_deltas(delta: &TransactionDelta) -> Result<[u8; 32]
         .map_err(|error| KinError::Other(error.to_string()))
 }
 
-/// Get a human-readable author name from environment variables.
-///
-/// Checks `USER` (Unix) then `USERNAME` (Windows), falls back to `"unknown"`.
-pub fn whoami() -> String {
-    std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "unknown".to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,11 +351,5 @@ mod tests {
         })
         .unwrap_err();
         assert!(error.to_string().contains("invalid confidence score"));
-    }
-
-    #[test]
-    fn whoami_returns_nonempty_string() {
-        let name = whoami();
-        assert!(!name.is_empty());
     }
 }

@@ -23,6 +23,7 @@ pub mod error;
 pub mod exact_tree;
 pub mod git_init;
 pub mod hooks;
+pub mod identity;
 pub mod init;
 mod init_progress;
 pub use init_progress::report_admission_progress;
@@ -100,9 +101,13 @@ pub use workspace_carry::{
 };
 pub use workspace_semantics::diff_workspace_semantics;
 
-pub use diff::{compute_semantic_change_id, content_identity_from_deltas, whoami};
+pub use diff::{compute_semantic_change_id, content_identity_from_deltas};
 pub use disambiguation::{
     fallback_leaf_trace_matches, name_resolution_certainly_misses, query_trace_matches,
+};
+pub use identity::{
+    resolve_commit_identity, unresolved_identity_message, CommitIdentity, IdentitySource,
+    IDENTITY_REMEDIATION,
 };
 pub use ranking::{
     normalize_symbol_hint, normalize_trace_name, qualifier_hint_from_query, select_best_match,

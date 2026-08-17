@@ -3257,6 +3257,8 @@ dependencies = [
  "fs2",
  "libc",
  "pretty_assertions",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",
@@ -3265,9 +3267,9 @@ dependencies = [
 
 [[package]]
 name = "kin-db"
-version = "0.7.29"
+version = "0.7.31"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "89bd923bb4da06c47e57e457e48de765d019d17ffd613ef719344d7e9519bab7"
+checksum = "67d0045bdd2c3aa4f3fb0acbc055bb0a7df5e02a17cb12eb49c107d02a54bc6c"
 dependencies = [
  "bincode",
  "bstr",
@@ -6625,7 +6627,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
