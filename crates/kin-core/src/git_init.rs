@@ -16,9 +16,10 @@ use kin_db::{LocalFileBackend, RepositoryAuthorityManager};
 use kin_git::{
     admit_semantic_git_import, build_git_external_authority, capture_lossless_git_repository,
     check_git_admission_blockers, plan_semantic_git_import, preflight_git_migration,
-    preflight_git_migration_after_publication, seal_all_content_observation_observed,
-    AdmittedContentClosure, GitLocalIgnoreSourceKind, GitMigrationPreflightProof,
-    LosslessGitRepository, SealedContentObservation, SealedContentSource,
+    reprove_git_migration, reprove_git_migration_after_publication,
+    seal_all_content_observation_observed, AdmittedContentClosure, GitLocalIgnoreSourceKind,
+    GitMigrationPreflightProof, LosslessGitRepository, SealedContentObservation,
+    SealedContentSource,
 };
 use kin_model::{
     compute_resolved_tree_hash, AdmissionCase, AuthorId, ChangeStore,
@@ -275,6 +276,17 @@ fn init_from_git_with_hooks(
         })?
     };
 
+    // PROOF 1 of 3. Guards: the mutable Git boundary this admission is about to
+    // build a repository from is exactly the committed state the capture was
+    // taken from, and the import plan is a deterministic function of those raw
+    // objects rather than something enriched beyond them.
+    //
+    // It is first because everything after it consumes it: the remote mapping
+    // becomes the repository's Git config, the ignored-local inputs are copied
+    // as authority, the workspace binding is sealed from it, and the divergence
+    // it observed is what init reports to the operator. It is also the only one
+    // of the three that revalidates the plan structurally, which is what the
+    // other two reuse rather than repeat.
     progress.begin("prove Git source");
     let source_proof = {
         let _span = info_span!("kin.init.source_proof_staged").entered();
@@ -364,43 +376,60 @@ fn init_from_git_with_hooks(
 
     let mut result = publish_repository_layout_linearized(prepared, |publication| {
         before_final_source_proof();
+        // PROOF 2 of 3. Guards: nothing moved the source during the minutes
+        // between proof 1 and this instant. Everything expensive in the ladder
+        // sits in that window, so it is the window a source can actually drift
+        // in, and this is the last point at which drift can still be prevented
+        // rather than merely reported: the rename below is the linearization
+        // point, and a refusal here leaves `.kin` absent.
+        //
+        // Distinct from proof 1 by WHEN it runs, not by what it looks at, which
+        // is why it observes once against proof 1 rather than twice against
+        // itself.
         progress.begin("re-prove Git source");
-        let final_proof = {
+        {
             let _span = info_span!("kin.init.source_proof_final").entered();
-            preflight_git_migration(&source, &snapshot, &semantic_plan, &capture_store)
-                .map_err(|error| git_boundary_error("repeat final Git source proof", error))?
+            reprove_git_migration(
+                &source,
+                &source_proof,
+                &snapshot,
+                &semantic_plan,
+                &capture_store,
+            )
+            .map_err(|error| git_boundary_error("repeat final Git source proof", error))?
         };
-        if final_proof != source_proof {
-            return Err(KinError::Other(
-                "Git source proof changed before repository publication; retry from a fresh capture"
-                    .to_string(),
-            ));
-        }
         progress.begin("publish repository");
         let published = {
             let _span = info_span!("kin.init.publish_repository").entered();
             publication.publish()?
         };
         after_repository_publication();
+        // PROOF 3 of 3. Guards: publication put `.kin` in the worktree and did
+        // nothing else to it. Proof 2 cannot cover this, because it necessarily
+        // ran before the rename; this is the only proof taken on a source that
+        // Kin has written into, and the only one that has to be told which
+        // directory is legitimately new.
+        //
+        // Its power is different from proof 2's rather than additional. Past
+        // the linearization point a refusal cannot unpublish, so this detects
+        // and reports as `RepositoryPublishedButUncertain` where proof 2
+        // prevents. That is what makes it worth keeping and what bounds it:
+        // publication is one no-replace rename, so an honest re-proof here
+        // needs one observation measured against proof 1, not a fresh
+        // self-contained double proof.
         progress.begin("prove Git source after publication");
-        let published_proof = {
+        {
             let _span = info_span!("kin.init.source_proof_published").entered();
-            preflight_git_migration_after_publication(
+            reprove_git_migration_after_publication(
                 &source,
                 published.path(),
+                &source_proof,
                 &snapshot,
                 &semantic_plan,
                 &capture_store,
             )
             .map_err(|error| git_boundary_error("prove Git source after publication", error))?
         };
-        if published_proof != source_proof {
-            return Err(KinError::Other(
-                "Git source proof changed across repository publication; published authority is \
-                 not safe to use without recovery"
-                    .to_string(),
-            ));
-        }
         // Re-seal the published repository, deriving the closure from the exact
         // import plan rather than its admitted form. Requiring both derivations
         // to fingerprint identically proves publication preserved graph-owned
