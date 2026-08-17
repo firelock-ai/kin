@@ -3616,6 +3616,23 @@ mod tests {
         );
     }
 
+    /// Re-resolution asks a seam and never starts anything. The revival path
+    /// is the only place in this module allowed to spawn a daemon, and it is
+    /// reached from a failed *request* rather than from a probe; a probe that
+    /// could spawn would put a daemon start behind every tool call made in a
+    /// directory that has none, which is the boot-time spawn storm the
+    /// no-spawn contract exists to prevent.
+    #[tokio::test]
+    async fn the_production_probe_reports_no_route_rather_than_starting_a_daemon() {
+        let route = RealDelegateProbe
+            .running_route(Path::new("/nonexistent/repository/.kin"))
+            .await;
+        assert!(
+            route.is_none(),
+            "with no route seam installed the probe must answer that it has none: {route:?}"
+        );
+    }
+
     // ── The three situations one string used to cover ─────────────────────
 
     fn gap_text(gap: &DelegateGap) -> String {
