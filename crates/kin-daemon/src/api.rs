@@ -2574,7 +2574,7 @@ async fn health(
     let sampled_at = std::time::Instant::now();
     let background_passes = state.background_work.reports(sampled_at);
     let background_pass_stopped = state.background_work.any_stopped();
-    let reconcile = state.background_work.reconcile().report(sampled_at);
+    let reconcile = state.background_work.reconcile_report(sampled_at);
     let reconcile_degraded = reconcile.degraded();
     // Surface graph-safety + derived-index health in the top-level status so an
     // operator or client polling /health sees a non-"ok" signal when the daemon
@@ -3459,8 +3459,7 @@ async fn command_graph(
         &request,
         &state
             .background_work
-            .reconcile()
-            .report(std::time::Instant::now()),
+            .reconcile_report(std::time::Instant::now()),
         &embedding_runtime,
     )
     .map_err(internal_error)?;
@@ -4626,24 +4625,68 @@ async fn command_commit(
     // Hold one uninterrupted graph-authority gate across forced filesystem
     // admission, change construction, and branch publication. The sync helper
     // deliberately does not re-lock this non-reentrant mutex.
-    let _coordination = state.coordination_gate.lock().await;
-    crate::loop_runner::sync_filesystem_with_graph_under_coordination(&state)
-        .await
-        .map_err(internal_error)?;
+    let _coordination = crate::mcp_commit::timed_commit_phase_async(
+        "coordination_gate_wait",
+        state.coordination_gate.lock(),
+    )
+    .await;
+    // The admission derives the exact tree from the working copy but does not
+    // publish it. This commit's own transaction carries that tree transition
+    // beside the semantic change, so one repository-authority successor is
+    // prepared and one store snapshot persisted for the whole commit instead
+    // of two. Nothing observes the interval: the coordination gate above spans
+    // the admission and the publication, and a commit that does not reach
+    // authority publishes the deferred tree on its way out, leaving exactly
+    // the state a failed commit leaves today.
+    //
+    // The phase keeps its name. What the span measures is unchanged, one
+    // complete host walk and the graph work behind it, and the proof parser
+    // reads that name off the phase table.
+    let deferred_tree = crate::mcp_commit::timed_commit_phase_async(
+        "forced_filesystem_admission",
+        crate::loop_runner::sync_filesystem_with_graph_deferring_tree_publication(&state),
+    )
+    .await
+    .map_err(internal_error)?;
 
+    match command_commit_after_admission(&state, request, deferred_tree.as_ref()) {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            if let Some(admitted) = deferred_tree {
+                crate::loop_runner::publish_deferred_tree_after_failure(&state, &admitted);
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Plan and publish the commit for a working copy this caller has already
+/// admitted.
+///
+/// `observed` is present when the admission left its tree transition for this
+/// transaction to carry. It is the completed walk's own proof rather than a
+/// flag, so the collapsed path cannot be entered without one, and the tree it
+/// proved is checked against the tree the plan publishes.
+fn command_commit_after_admission(
+    state: &Arc<DaemonState>,
+    request: CommandCommitRequest,
+    observed: Option<&crate::repository_commit::AdmittedWorkspaceTree>,
+) -> Result<Json<CommandCommitResponse>, (StatusCode, String)> {
     let graph = &*state.graph;
     let authority_context =
-        crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
+        crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)
             .map_err(repository_commit_error)?;
-    let plan = crate::repository_commit::plan_native_commit(
-        graph,
-        state.blobs.as_ref(),
-        &authority_context,
-        request.operation_id,
-        request.timestamp,
-        kin_model::AuthorId::new(kin_core::whoami()),
-        request.message,
-    )
+    let plan = crate::mcp_commit::timed_commit_phase("plan_transaction", || {
+        crate::repository_commit::plan_native_commit(
+            graph,
+            state.blobs.as_ref(),
+            &authority_context,
+            request.operation_id,
+            request.timestamp,
+            kin_model::AuthorId::new(kin_core::whoami()),
+            request.message,
+        )
+    })
     .map_err(repository_commit_error)?;
     let change_id = plan.change.id;
     let branch_name = plan.branch.clone();
@@ -4708,12 +4751,22 @@ async fn command_commit(
         }
     }
 
-    let committed = crate::repository_commit::commit_native_plan_with_projection(
-        &state.layout,
-        state.blobs.as_ref(),
-        &authority_context,
-        plan,
-    )
+    let committed = if let Some(observed) = observed {
+        crate::repository_commit::commit_native_plan_with_observed_target_tree(
+            &state.layout,
+            state.blobs.as_ref(),
+            &authority_context,
+            plan,
+            observed,
+        )
+    } else {
+        crate::repository_commit::commit_native_plan_with_projection(
+            &state.layout,
+            state.blobs.as_ref(),
+            &authority_context,
+            plan,
+        )
+    }
     .map_err(repository_commit_error)?;
     state
         .record_repository_authority_commit(committed.receipt.generation)
@@ -4721,9 +4774,10 @@ async fn command_commit(
     // The repository transaction is durable authority. The in-process graph is
     // a derived query view; install the exact immutable change only after the
     // authority CAS succeeds.
-    graph
-        .create_change(&committed.change)
-        .map_err(internal_error)?;
+    crate::mcp_commit::timed_commit_phase("install_live_graph", || {
+        graph.create_change(&committed.change)
+    })
+    .map_err(internal_error)?;
     state.bump_version();
     state.emit_event(DaemonEvent::GraphRootChanged {
         old_root_hash: None,
@@ -19035,6 +19089,94 @@ mod tests {
         );
     }
 
+    /// One commit pays for exactly one repository-authority successor.
+    ///
+    /// The handler used to force a filesystem admission that published the
+    /// observed working tree as its own successor, then publish the semantic
+    /// change moments later as a second one, on a tree nothing had moved in
+    /// between. Preparing a successor and persisting the store are both
+    /// O(store), so a one-line change paid the whole cost twice and the commit
+    /// wall was two complete publications.
+    ///
+    /// A committed repository transaction advances the authority generation by
+    /// exactly one, so the generation delta counts successors directly rather
+    /// than standing in for them. The assertions below also prove the commit
+    /// did real work, since a commit that published nothing would satisfy a
+    /// bare delta check by advancing the generation zero times.
+    #[cfg(unix)]
+    #[tokio::test]
+    // Commit phases are emitted at debug level when they are fast, and the
+    // level a `tracing` event is filtered by is a process-global hint. A test
+    // that captures those events therefore cannot run beside one that emits
+    // them, so every test on either side of that shares this group.
+    #[serial_test::serial(commit_phase_capture)]
+    async fn one_commit_publishes_exactly_one_authority_successor() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        std::fs::write(
+            repo.path().join("collapsed.rs"),
+            b"pub fn collapsed() -> u32 { 1 }\n",
+        )
+        .unwrap();
+
+        let before = crate::loop_runner::current_authority_admission(&state)
+            .unwrap()
+            .0
+            .generation;
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/commands/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "operation_id": kin_model::OperationId::new(),
+                            "timestamp": kin_model::Timestamp::now(),
+                            "message": "publish one file through one successor"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "commit must succeed: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["file_count"].as_u64().unwrap() >= 1,
+            "the commit must carry the admitted file: {json}"
+        );
+
+        let after = crate::loop_runner::current_authority_admission(&state)
+            .unwrap()
+            .0
+            .generation;
+        assert_eq!(
+            after - before,
+            1,
+            "one commit must prepare and persist exactly one repository-authority successor"
+        );
+
+        let repo_path = kin_model::RepoPath::from_utf8("collapsed.rs").unwrap();
+        assert!(
+            state
+                .graph
+                .resolved_tree()
+                .artifact_at_path(&repo_path)
+                .is_some(),
+            "the committed file must be graph-owned after the single successor"
+        );
+    }
+
     #[tokio::test]
     async fn graph_only_command_commit_fails_before_filesystem_delta_computation() {
         let state = test_state();
@@ -19086,6 +19228,167 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             generation_before
         );
+    }
+
+    /// Every span the CLI commit path spends before durable publication names
+    /// itself in the log.
+    ///
+    /// The finalize after publication already reported its steps, so the wall a
+    /// user waits was attributable only from its tail backwards. Everything in
+    /// front of it, the coordination gate, the forced filesystem admission it
+    /// guards, transaction planning, and the live-graph install, ran silent,
+    /// which left a slow commit blamable on any of them and disprovable against
+    /// none. This drives one real commit through the router under a capture
+    /// subscriber and reads the phase lines back, so a span that stops
+    /// reporting fails here rather than reappearing as an unexplained gap.
+    ///
+    /// The names are asserted because the proof parser keys on them. A fabricated
+    /// name is checked too: without it a capture that silently collected nothing
+    /// would satisfy every membership assertion it was given.
+    #[tokio::test]
+    // Commit phases are emitted at debug level when they are fast, and the
+    // level a `tracing` event is filtered by is a process-global hint. A test
+    // that captures those events therefore cannot run beside one that emits
+    // them, so every test on either side of that shares this group.
+    #[serial_test::serial(commit_phase_capture)]
+    async fn the_cli_commit_path_names_every_phase_it_spends() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        #[derive(Default)]
+        struct Captured {
+            phases: Vec<String>,
+            malformed: Vec<String>,
+        }
+
+        struct CaptureLayer(Arc<std::sync::Mutex<Captured>>);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                #[derive(Default)]
+                struct Read {
+                    phase: Option<String>,
+                    message: Option<String>,
+                    elapsed_ms: bool,
+                }
+                impl tracing::field::Visit for Read {
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        if field.name() == "phase" {
+                            self.phase = Some(value.to_string());
+                        }
+                    }
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        match field.name() {
+                            "message" => self.message = Some(format!("{value:?}")),
+                            "elapsed_ms" => self.elapsed_ms = true,
+                            _ => {}
+                        }
+                    }
+                }
+
+                let mut read = Read::default();
+                event.record(&mut read);
+                let message = read.message.unwrap_or_default();
+                if message != "commit phase" && message != "slow commit phase" {
+                    return;
+                }
+                let mut captured = self.0.lock().unwrap();
+                match read.phase {
+                    // The proof parser reads `phase=` and `elapsed_ms=` off these
+                    // two needles, so a line carrying one without the other is a
+                    // parse failure and is collected as such rather than dropped.
+                    Some(phase) if read.elapsed_ms => captured.phases.push(phase),
+                    other => captured.malformed.push(format!("{message}: {other:?}")),
+                }
+            }
+        }
+
+        let state = test_state();
+        let root = state.layout.working_dir();
+        std::fs::write(root.join("attributable.rs"), b"pub fn attributable() {}\n").unwrap();
+        let app = router(Arc::clone(&state));
+
+        let captured = Arc::new(std::sync::Mutex::new(Captured::default()));
+        let subscriber = tracing_subscriber::registry().with(CaptureLayer(Arc::clone(&captured)));
+        let response = {
+            let _default = tracing::subscriber::set_default(subscriber);
+            app.oneshot(
+                Request::post("/commands/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "operation_id": kin_model::OperationId::new(),
+                            "timestamp": kin_model::Timestamp::now(),
+                            "message": "attribute the commit wall"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        };
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+        let captured = std::mem::take(&mut *captured.lock().unwrap());
+        assert!(
+            captured.malformed.is_empty(),
+            "every commit phase line must carry both phase and elapsed_ms: {:?}",
+            captured.malformed
+        );
+        for phase in [
+            "coordination_gate_wait",
+            "forced_filesystem_admission",
+            "scan_working_copy",
+            "observe_tree_and_stage_blobs",
+            "plan_transaction",
+            "plan_snapshot_clone",
+            "plan_diff_semantics",
+            "plan_compute_deltas",
+            "plan_derive_admission_policy",
+            "install_live_graph",
+        ] {
+            assert!(
+                captured.phases.iter().any(|captured| captured == phase),
+                "the commit path must name the {phase} phase; captured {:?}",
+                captured.phases
+            );
+        }
+        for phase in [
+            // A phase the path never runs must not be reported. The fabricated
+            // name is the control: it can never appear, so it proves the
+            // assertion is looking at something.
+            "phase_this_commit_never_spends",
+            // The commit no longer publishes the admitted tree in a successor
+            // of its own. The admission derives the tree and hands it to the
+            // commit's transaction, which carries the tree transition beside
+            // the semantic change, so one repository-authority successor is
+            // prepared and one store snapshot persisted for the whole commit.
+            // Publishing the tree separately is what this phase timed, and a
+            // commit that spends it again has gone back to paying for two.
+            //
+            // The phase itself is still live and still timed on the standalone
+            // admission path, which is where the ambient watcher tick and every
+            // explicit `kin admit` publish from.
+            "publish_workspace_admission",
+        ] {
+            assert!(
+                !captured.phases.iter().any(|captured| captured == phase),
+                "the commit path must not name the {phase} phase; captured {:?}",
+                captured.phases
+            );
+        }
     }
 
     #[cfg(unix)]

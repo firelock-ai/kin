@@ -96,6 +96,7 @@ pub struct WorkspaceAdmissionResult {
 /// authority roots and the workspace tree the transition was planned against,
 /// which is what lets publication refuse a stale desired tree instead of
 /// silently replanning it against newer authority.
+#[derive(Debug)]
 pub(crate) struct AdmittedWorkspaceTree {
     previous_tree: kin_model::ResolvedTree,
     desired_tree: kin_model::ResolvedTree,
@@ -773,36 +774,46 @@ fn plan_native_commit_inner(
                     "repository authority has no graph snapshot for workspace {workspace_id}"
                 ))
             })?;
-    let desired_workspace_graph = graph.to_snapshot();
-    let workspace_semantic_delta = kin_core::diff_workspace_semantics(
-        &authority_workspace_graph.entities,
-        &authority_workspace_graph.relations,
-        &desired_workspace_graph.entities,
-        &desired_workspace_graph.relations,
-    )?;
-    let deltas = compute_deltas_vs_repository_authority(graph, lease.snapshot(), parent.as_ref())?;
+    let desired_workspace_graph =
+        crate::mcp_commit::timed_commit_phase("plan_snapshot_clone", || graph.to_snapshot());
+    let workspace_semantic_delta =
+        crate::mcp_commit::timed_commit_phase("plan_diff_semantics", || {
+            kin_core::diff_workspace_semantics(
+                &authority_workspace_graph.entities,
+                &authority_workspace_graph.relations,
+                &desired_workspace_graph.entities,
+                &desired_workspace_graph.relations,
+            )
+        })?;
+    let deltas = crate::mcp_commit::timed_commit_phase("plan_compute_deltas", || {
+        compute_deltas_vs_repository_authority(graph, lease.snapshot(), parent.as_ref())
+    })?;
     let mut source_lengths = std::collections::BTreeMap::new();
-    let (shared_policy, admission_policy_delta) = SharedAdmissionPolicy::derive_from_tree(
-        parent_policy.as_ref(),
-        &deltas.expected_tree,
-        |hash| {
-            if let Some(length) = source_lengths.get(&hash) {
-                return Ok(*length);
-            }
-            let source = read_publishable_source(blobs, &authority, hash).map_err(|error| {
-                ModelError::InvalidOperation(format!(
-                    "{error}, while deriving the graph-owned admission policy"
-                ))
-            })?;
-            let length = u64::try_from(source.body().len()).map_err(|_| {
-                ModelError::InvalidOperation(format!(
-                    "graph-owned admission source {hash} exceeds u64"
-                ))
-            })?;
-            source_lengths.insert(hash, length);
-            Ok(length)
-        },
-    )?;
+    let (shared_policy, admission_policy_delta) =
+        crate::mcp_commit::timed_commit_phase("plan_derive_admission_policy", || {
+            SharedAdmissionPolicy::derive_from_tree(
+                parent_policy.as_ref(),
+                &deltas.expected_tree,
+                |hash| {
+                    if let Some(length) = source_lengths.get(&hash) {
+                        return Ok(*length);
+                    }
+                    let source =
+                        read_publishable_source(blobs, &authority, hash).map_err(|error| {
+                            ModelError::InvalidOperation(format!(
+                                "{error}, while deriving the graph-owned admission policy"
+                            ))
+                        })?;
+                    let length = u64::try_from(source.body().len()).map_err(|_| {
+                        ModelError::InvalidOperation(format!(
+                            "graph-owned admission source {hash} exceeds u64"
+                        ))
+                    })?;
+                    source_lengths.insert(hash, length);
+                    Ok(length)
+                },
+            )
+        })?;
 
     // Settled here, not before planning: the message may have to name what this
     // change carried in, and that set is not known until the published tree
@@ -1095,6 +1106,86 @@ pub(crate) fn commit_native_plan_with_projection(
     authority_context: &LocalRepositoryAuthorityContext,
     plan: NativeCommitPlan,
 ) -> Result<NativeCommitResult> {
+    commit_native_plan_with_working_copy_proof(
+        layout,
+        blobs,
+        authority_context,
+        plan,
+        WorkingCopyProof::MatchesPreviousTree,
+    )
+}
+
+/// Publish one native repository transaction that also carries the exact tree
+/// transition a completed host walk observed.
+///
+/// The commit seam derives its target tree from a complete filesystem scan
+/// taken moments earlier under the same coordination gate, so the tree
+/// transition it carries is a statement about bytes that are already on disk.
+/// Saying so here lets one repository-authority successor carry both that tree
+/// transition and the semantic change, instead of publishing the tree in its
+/// own successor first and paying a second O(store) preparation and snapshot
+/// for the change.
+///
+/// `observed` is that walk's proof, and it is a parameter rather than a flag
+/// for the reason [`AdmittedWorkspaceTree`] exists at all: it cannot be
+/// constructed without a [`kin_index::CompleteScanToken`], so a collapsed
+/// commit cannot be assembled from a partial walk. Standalone publication has
+/// required that proof since it was introduced, and folding the tree into this
+/// transaction moves where the tree crosses authority without moving what has
+/// to be true before it does.
+///
+/// The proof is checked against the plan rather than merely accompanying it.
+/// A token proves some walk completed; it does not say which tree that walk
+/// proved, and a plan built against a different pair of trees would publish a
+/// transition nobody observed while carrying a genuine token for a different
+/// one.
+pub(crate) fn commit_native_plan_with_observed_target_tree(
+    layout: &kin_core::KinLayout,
+    blobs: &kin_blobs::BlobStore,
+    authority_context: &LocalRepositoryAuthorityContext,
+    plan: NativeCommitPlan,
+    observed: &AdmittedWorkspaceTree,
+) -> Result<NativeCommitResult> {
+    if observed.previous_tree != plan.previous_tree {
+        return Err(invalid(
+            "the completed host walk was planned out of a different workspace tree than this \
+             commit publishes from; a collapsed commit may not carry a tree transition no walk \
+             observed",
+        ));
+    }
+    if observed.desired_tree != plan.target_tree {
+        return Err(invalid(
+            "the completed host walk observed a different working tree than this commit \
+             publishes; a collapsed commit may not carry a tree transition no walk observed",
+        ));
+    }
+    commit_native_plan_with_working_copy_proof(
+        layout,
+        blobs,
+        authority_context,
+        plan,
+        WorkingCopyProof::ObservedTargetTree,
+    )
+}
+
+/// What the caller knows about the working copy the transaction publishes over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkingCopyProof {
+    /// The working copy still holds the plan's previous tree. A tree
+    /// transition is a namespace mutation and is journalled as one.
+    MatchesPreviousTree,
+    /// A complete scan observed the working copy already holding the plan's
+    /// target tree. A tree transition is verified rather than written.
+    ObservedTargetTree,
+}
+
+fn commit_native_plan_with_working_copy_proof(
+    layout: &kin_core::KinLayout,
+    blobs: &kin_blobs::BlobStore,
+    authority_context: &LocalRepositoryAuthorityContext,
+    plan: NativeCommitPlan,
+    working_copy: WorkingCopyProof,
+) -> Result<NativeCommitResult> {
     let repository_id = authority_context.repository_id().clone();
     if plan.transaction.repository_id != repository_id {
         return Err(invalid(format!(
@@ -1137,21 +1228,44 @@ pub(crate) fn commit_native_plan_with_projection(
             crate::mcp_commit::timed_commit_phase("load_previous_projection_entries", || {
                 load_projection_entries(&authority, &plan.previous_tree, &mut body_cache)
             })?;
-        crate::mcp_commit::timed_commit_phase("reconcile_workspace_and_commit_authority", || {
-            kin_core::reconcile_source_tree_and_commit_repository_transaction(
-                layout.working_dir(),
-                &plan.previous_tree,
-                &plan.target_tree,
-                previous_entries
-                    .iter()
-                    .map(|(path, entry, body)| (path, *entry, body.as_ref())),
-                target_entries
-                    .iter()
-                    .map(|(path, entry, body)| (path, *entry, body.as_ref())),
-                &authority,
-                plan.transaction,
-            )
-        })?
+        match working_copy {
+            WorkingCopyProof::ObservedTargetTree => crate::mcp_commit::timed_commit_phase(
+                "reconcile_workspace_and_commit_authority",
+                || {
+                    kin_core::verify_observed_target_tree_and_commit_repository_transaction(
+                        layout.working_dir(),
+                        &plan.previous_tree,
+                        &plan.target_tree,
+                        previous_entries
+                            .iter()
+                            .map(|(path, entry, body)| (path, *entry, body.as_ref())),
+                        target_entries
+                            .iter()
+                            .map(|(path, entry, body)| (path, *entry, body.as_ref())),
+                        &authority,
+                        plan.transaction,
+                    )
+                },
+            )?,
+            WorkingCopyProof::MatchesPreviousTree => crate::mcp_commit::timed_commit_phase(
+                "reconcile_workspace_and_commit_authority",
+                || {
+                    kin_core::reconcile_source_tree_and_commit_repository_transaction(
+                        layout.working_dir(),
+                        &plan.previous_tree,
+                        &plan.target_tree,
+                        previous_entries
+                            .iter()
+                            .map(|(path, entry, body)| (path, *entry, body.as_ref())),
+                        target_entries
+                            .iter()
+                            .map(|(path, entry, body)| (path, *entry, body.as_ref())),
+                        &authority,
+                        plan.transaction,
+                    )
+                },
+            )?,
+        }
     };
     let materializable = materializable_artifact_count(&plan.target_tree)?;
     if projected != materializable {

@@ -232,7 +232,11 @@ async fn run_pass(state: &DaemonState) -> Result<AdmitResponse> {
         entities_after: after.entities,
         embeddings_indexed: embeddings.indexed,
         embeddings_total: embeddings.total,
-        reconcile: probes.report(now),
+        // Read through the supervisor rather than off the probes, so an
+        // explicit admission run against a store whose ambient loop is parked
+        // says so. The probes alone report a quiet loop and a parked one
+        // identically.
+        reconcile: state.background_work.reconcile_report(now),
         admitted: failure.is_none(),
         failure,
     };

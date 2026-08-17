@@ -1206,6 +1206,77 @@ pub fn verify_unchanged_source_tree_and_commit_repository_transaction<'a>(
     }
 }
 
+/// Verify that the working copy already holds one exact target tree, then
+/// publish the transaction that moves the workspace onto it.
+///
+/// This is the boundary for a caller that derived `target_tree` from the
+/// working copy itself. A complete filesystem scan produced the target, so the
+/// bytes on disk are what proves it, and the same transaction can carry both
+/// that tree transition and the caller's semantic change instead of paying for
+/// two repository-authority successors moments apart.
+///
+/// It differs from [`verify_unchanged_source_tree_and_commit_repository_transaction`]
+/// in exactly one way: the workspace mutation is allowed to move the tree. The
+/// proof is taken against the target rather than the prior tree, because the
+/// prior tree is by construction the one the working copy no longer holds. It
+/// differs from [`reconcile_source_tree_and_commit_repository_transaction`] in
+/// that nothing is written: there is no namespace transition to journal, no
+/// rollback, and no window in which the working copy holds bytes that no tree
+/// describes.
+///
+/// Crash consistency is therefore the same as the unchanged-verification seam
+/// above. The only durable mutation is the repository transaction, which is
+/// atomic and compare-and-swapped on the workspace generation the caller
+/// planned against. A process that dies at any point before that CAS leaves
+/// authority exactly where it was and leaves the working copy exactly as its
+/// author wrote it, which is the state the next complete scan re-derives the
+/// same target tree from.
+///
+/// Graph-only repository members must be identical in both trees, as they must
+/// be for every exact-source projection: moving one is a dedicated graph-native
+/// operation, not something a source commit may carry.
+pub fn verify_observed_target_tree_and_commit_repository_transaction<'a, 'b>(
+    root: &Path,
+    previous_tree: &ResolvedTree,
+    target_tree: &ResolvedTree,
+    previous_entries: impl IntoIterator<Item = (&'b RepoPath, TreeEntry, &'b [u8])>,
+    entries: impl IntoIterator<Item = (&'a RepoPath, TreeEntry, &'a [u8])>,
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    transaction: RepositoryTransaction,
+) -> Result<(usize, RepositoryCommitReceipt)> {
+    let entries = validated_projection_proof_entries(entries)?;
+    let previous_entries = validated_projection_proof_entries(previous_entries)?;
+    validate_repository_projection_transaction(
+        previous_tree,
+        target_tree,
+        &previous_entries,
+        &entries,
+        &transaction,
+        GraphOnlyTransitionPolicy::RequireUnchanged,
+    )?;
+
+    #[cfg(any(unix, windows))]
+    {
+        let freeze = ExactProjectionFreeze::acquire_existing(root)?;
+        let entry_refs = entries.iter().collect::<Vec<_>>();
+        let identities = freeze
+            .projection
+            .validate_frozen_entries_unchanged(&entry_refs)?;
+        freeze
+            .projection
+            .revalidate_frozen_entries_unchanged(&entry_refs, &identities)?;
+        freeze.revalidate_namespace()?;
+        let receipt = commit_repository_transaction_exact(authority, transaction).into_result()?;
+        Ok((entries.len(), receipt))
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (root, authority, transaction);
+        Err(unsupported_safe_projection_error())
+    }
+}
+
 fn validate_repository_projection_transaction(
     previous_tree: &ResolvedTree,
     target_tree: &ResolvedTree,

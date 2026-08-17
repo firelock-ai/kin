@@ -156,6 +156,32 @@ struct ExactTreeAdmission {
     deltas: Vec<TreeDelta>,
     changed_paths: BTreeSet<RepoPath>,
     semantic_events: Vec<FileEvent>,
+    /// The exact admission policy this pass planned against.
+    ///
+    /// Carried back so the reconcile loop can drop host events for paths the
+    /// policy excludes without paying a second authority load per tick. The
+    /// loop's copy is therefore one pass old, which is the right staleness for
+    /// what it decides: dropping an event is advisory, admission still enforces
+    /// the policy exactly, and a rule written this tick takes effect on the
+    /// next one instead of on the one that wrote it.
+    policy: Option<kin_index::ResolvedAdmissionMatcher>,
+    /// The tree transition this admission derived but did not publish, present
+    /// only when the caller asked to carry it in its own transaction. Held so
+    /// the caller can publish it standalone if its own transaction never
+    /// reaches authority.
+    deferred_tree: Option<crate::repository_commit::AdmittedWorkspaceTree>,
+}
+
+/// Where an admitted exact tree crosses repository authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TreePublication {
+    /// The admission publishes its own repository-authority successor. This is
+    /// the ambient watcher path and every explicit standalone admission.
+    Standalone,
+    /// The caller carries the tree transition in its own transaction. Nothing
+    /// is published here, so the caller owns the interval in which the derived
+    /// graph holds a tree repository authority has not yet accepted.
+    DeferredToCaller,
 }
 
 fn canonicalize_host_parent_preserving_leaf(path: &Path) -> std::io::Result<PathBuf> {
@@ -347,6 +373,32 @@ fn event_is_beneath_graph_only_member(state: &DaemonState, event: &FileEvent) ->
     }
 }
 
+/// Whether the graph-owned admission policy excludes the path this event names,
+/// and graph truth does not already track it.
+///
+/// The exact test the walk and the authority boundary both apply, asked of one
+/// host notification. `policy` is the last resolved one; before the first
+/// admission of a daemon's life there is none and nothing is dropped.
+fn event_is_policy_excluded(
+    state: &DaemonState,
+    policy: Option<&kin_index::ResolvedAdmissionMatcher>,
+    event: &FileEvent,
+) -> bool {
+    let Some(policy) = policy else {
+        return false;
+    };
+    let path = match event {
+        FileEvent::Changed(path) | FileEvent::Removed(path) => path,
+    };
+    let Ok(Some(repo_path)) = repo_path(path, state.layout.working_dir()) else {
+        return false;
+    };
+    if state.graph.artifact_id_at_path(&repo_path).is_some() {
+        return false;
+    }
+    policy.decide(&repo_path, false, false).is_ignored()
+}
+
 fn is_within_graph_only_member(state: &DaemonState, path: &RepoPath) -> Result<bool> {
     for artifact in state.graph.resolved_tree().artifacts_by_path() {
         if kin_core::source_projection_disposition(&artifact.path, artifact.entry)?
@@ -417,13 +469,35 @@ fn mass_deletion_refused(removed: u64, total_graph_files: u64) -> DaemonError {
     ))
 }
 
-/// Read the repository roots the next observation will be planned against.
-pub(crate) fn current_authority_roots(state: &DaemonState) -> Result<kin_model::RootBundle> {
+/// Read the authority roots an admission plans against and the exact admission
+/// policy that authority will judge it by, from one open.
+///
+/// One open rather than two because the pair has to be coherent: planning a
+/// tree against one generation's roots and filtering it through another
+/// generation's rules would leave the walk proposing paths the publication is
+/// about to refuse, which is the failure this reads the policy to avoid.
+///
+/// A repository with no local workspace — a hosted snapshot daemon — has no
+/// policy to resolve and reports `None`. Nothing is filtered in that case, and
+/// nothing is published from a host walk there either.
+pub(crate) fn current_authority_admission(
+    state: &DaemonState,
+) -> Result<(
+    kin_model::RootBundle,
+    Option<kin_index::ResolvedAdmissionMatcher>,
+)> {
     let authority_context =
         crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)?;
     let authority = authority_context.open().map_err(DaemonError::Graph)?;
     let roots = authority.read_authority().roots().clone();
-    Ok(roots)
+    let policy = authority
+        .workspace_admission_snapshot(
+            authority_context.repository_id(),
+            &authority_context.workspace_id(),
+        )
+        .map_err(DaemonError::Graph)?
+        .map(|snapshot| snapshot.matcher);
+    Ok((roots, policy))
 }
 
 /// What one complete walk declined to observe, taken from its own diagnostics.
@@ -437,7 +511,33 @@ fn excluded_host_content(
     crate::background_work::ExcludedHostContent {
         ignored: diagnostics.ignored_untracked_entries as u64,
         unsupported: diagnostics.unsupported_untracked_entries as u64,
+        policy_excluded: diagnostics.policy_excluded_untracked_entries as u64,
     }
+}
+
+/// Say once per pass what the graph-owned policy kept out of it.
+///
+/// Once per pass and bounded, not once per path: the founder's daemon logged
+/// the same refusal continuously, and a walk that meets a churning excluded
+/// directory would reproduce that at debug if it named every leaf. The count is
+/// complete and the sample is what makes the rule recognizable.
+fn announce_policy_exclusions(scan: &kin_index::CompleteRepositoryScan) {
+    let excluded = scan.diagnostics().policy_excluded_untracked_entries;
+    if excluded == 0 {
+        return;
+    }
+    let sample = scan
+        .policy_excluded_paths_sample()
+        .iter()
+        .map(|path| path.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    debug!(
+        count = excluded,
+        sample = %sample,
+        "the graph-owned admission policy excludes these untracked host paths; \
+         they were skipped rather than proposed"
+    );
 }
 
 /// Report whether one repository path was named by an observation, either
@@ -487,13 +587,14 @@ fn observation_covers_path(observed: &BTreeSet<RepoPath>, path: &RepoPath) -> bo
 fn exact_tree_admission(
     state: &DaemonState,
     observation: Option<&BTreeSet<RepoPath>>,
+    publication: TreePublication,
 ) -> Result<ExactTreeAdmission> {
     let working_dir = state.layout.working_dir();
     // Read the authority roots the observation is about to be planned against.
     // Publication compare-and-swaps on this bundle, so a repository that moves
     // while the host walk is running fails the whole admission instead of
     // having its desired tree replanned onto the newer authority.
-    let expected_roots = current_authority_roots(state)?;
+    let (expected_roots, policy) = current_authority_admission(state)?;
     let previous = state.graph.resolved_tree();
     let tracked_paths = previous
         .artifacts_by_path()
@@ -536,15 +637,21 @@ fn exact_tree_admission(
         .iter()
         .filter(|path| !retracted_paths.contains(*path))
         .collect::<Vec<&RepoPath>>();
-    let scan = kin_index::scan_repository_preserving_graph_only(
-        working_dir,
-        &ignore,
-        scanned_tracked.into_iter(),
-        graph_only_paths.iter(),
-    )
+    let scan = crate::mcp_commit::timed_commit_phase("scan_working_copy", || {
+        kin_index::scan_repository_preserving_graph_only(
+            working_dir,
+            &ignore,
+            policy.as_ref(),
+            scanned_tracked.into_iter(),
+            graph_only_paths.iter(),
+        )
+    })
     .map_err(kin_index::IndexError::from)?;
+    announce_policy_exclusions(&scan);
     let mut observed =
-        crate::commit_deltas::observed_tree_from_complete_scan(&state.blobs, &scan, &previous)?;
+        crate::mcp_commit::timed_commit_phase("observe_tree_and_stage_blobs", || {
+            crate::commit_deltas::observed_tree_from_complete_scan(&state.blobs, &scan, &previous)
+        })?;
     if let Some(observation) = observation {
         for artifact in previous.artifacts_by_path() {
             if observation_covers_path(observation, &artifact.path) {
@@ -645,6 +752,7 @@ fn exact_tree_admission(
         }
     }
 
+    let mut deferred_tree = None;
     if !deltas.is_empty() {
         let desired_tree = previous.apply(&deltas).map_err(invalid_tree_transition)?;
         // Repository authority moves first. The in-memory graph is a derived
@@ -658,7 +766,32 @@ fn exact_tree_admission(
             previous.clone(),
             desired_tree,
         );
-        let _ = publish_exact_workspace_tree(state, &admitted)?;
+        // A deferring caller publishes this same transition inside its own
+        // transaction, so authority still moves before anything outside the
+        // caller can observe the graph: the coordination gate the caller holds
+        // spans this admission and that publication, and the caller restores
+        // this ordering by publishing the deferred tree if its transaction
+        // never reaches authority. What it buys is one repository-authority
+        // successor for the whole commit rather than two, each of which
+        // prepares and persists the complete store.
+        //
+        // A transition that moves a graph-only repository member is never
+        // deferred. An exact-source projection may not carry one, so the
+        // caller's transaction would refuse it; this publishes it here exactly
+        // as a standalone admission does.
+        let defer = publication == TreePublication::DeferredToCaller
+            && !transition_touches_graph_only_member(&deltas)?;
+        if defer {
+            deferred_tree = Some(admitted);
+        } else {
+            // The phase stays on the standalone path, which is the path that
+            // still spends it. A deferring caller reports its own publication
+            // instead, so a collapsed commit names no admission publication at
+            // all, which is what the phase table should show.
+            let _ = crate::mcp_commit::timed_commit_phase("publish_workspace_admission", || {
+                publish_exact_workspace_tree(state, &admitted)
+            })?;
+        }
         // Authority has committed the removal, so the entities derived from
         // those paths go before the graph is asked to match. kin-db refuses a
         // tree transition that leaves an entity on a path the staged tree no
@@ -706,7 +839,28 @@ fn exact_tree_admission(
         deltas,
         changed_paths,
         semantic_events: dedup_file_events(semantic_events),
+        policy,
+        deferred_tree,
     })
+}
+
+/// Report whether one planned exact-tree transition moves a repository member
+/// that has no host representation.
+///
+/// An exact-source projection refuses to carry a graph-only transition, so a
+/// caller that means to fold the tree into its own transaction has to know
+/// before it plans rather than discover it at the projection boundary.
+fn transition_touches_graph_only_member(deltas: &[TreeDelta]) -> Result<bool> {
+    for delta in deltas {
+        for located in [delta.old_state(), delta.new_state()].into_iter().flatten() {
+            if kin_core::source_projection_disposition(&located.path, located.entry)?
+                != kin_core::SourceProjectionDisposition::Materialized
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Classify one host event against exact repository-tree truth that has
@@ -861,7 +1015,7 @@ fn admit_file_event_with_exact_tree(
 fn admit_file_event(state: &DaemonState, event: &FileEvent) -> Result<AdmittedFileEvent> {
     // Mirror production ordering: one complete-scan transaction crosses
     // authority first, then host events are classified against what it moved.
-    let admission = exact_tree_admission(state, None)?;
+    let admission = exact_tree_admission(state, None, TreePublication::Standalone)?;
     admit_file_event_with_exact_tree(state, event, &admission.changed_paths)
 }
 
@@ -876,7 +1030,7 @@ fn admit_file_event_ambient(state: &DaemonState, event: &FileEvent) -> Result<Ad
     let observation = repo_path(path, state.layout.working_dir())?
         .into_iter()
         .collect::<BTreeSet<_>>();
-    let admission = exact_tree_admission(state, Some(&observation))?;
+    let admission = exact_tree_admission(state, Some(&observation), TreePublication::Standalone)?;
     admit_file_event_with_exact_tree(state, event, &admission.changed_paths)
 }
 
@@ -1519,6 +1673,11 @@ pub async fn run_loop(
     // larger than `batch_size` is deferred instead of silently discarded.
     let mut pending_events: VecDeque<FileEvent> = VecDeque::new();
     let mut backlog_warning_active = false;
+    // The admission policy the last complete pass planned against, kept so the
+    // event filter below costs no authority load of its own. `None` until the
+    // first pass resolves one, which is the safe direction: nothing is dropped
+    // and the pass itself still enforces the policy exactly.
+    let mut graph_owned_policy: Option<kin_index::ResolvedAdmissionMatcher> = None;
 
     // Register with the self-limit supervisor. Registered here rather than at
     // daemon start so a repository that never runs this loop — filesystem
@@ -1608,6 +1767,33 @@ pub async fn run_loop(
             retry_lane.forget(path);
             false
         });
+        // A path the graph-owned admission policy excludes is dropped for the
+        // same reason and with more force. Authority would refuse to admit it,
+        // and that refusal is not per-path: it fails the whole exact-tree
+        // admission, so one churning excluded file used to defer every other
+        // path in the working copy and admit nothing (FIR-2346). Even with the
+        // walk no longer proposing it, waking the tick on such an event would
+        // still buy a complete working-copy admission that can only conclude
+        // there is nothing to do, and a working stretch that records no
+        // progress is what the supervisor eventually parks the loop for. So the
+        // event never schedules work, and it ends whatever ladder the path had:
+        // the rules exclude it, so no retry can ever reach a different answer.
+        let mut policy_excluded_events = 0usize;
+        incoming_events.retain(|event| {
+            if !event_is_policy_excluded(&state, graph_owned_policy.as_ref(), event) {
+                return true;
+            }
+            let (FileEvent::Changed(path) | FileEvent::Removed(path)) = event;
+            retry_lane.forget(path);
+            policy_excluded_events += 1;
+            false
+        });
+        if policy_excluded_events > 0 {
+            debug!(
+                count = policy_excluded_events,
+                "dropped host events for paths the graph-owned admission policy excludes"
+            );
+        }
         // A path already waiting out a ladder step is not looked at again until
         // that step elapses, whichever queue its next notification arrived on.
         // The retry is already owed and re-reads whatever the file then holds, so
@@ -1722,7 +1908,11 @@ pub async fn run_loop(
                 }
             })
             .collect::<BTreeSet<_>>();
-        let exact_admission = match exact_tree_admission(&state, Some(&observation)) {
+        let exact_admission = match exact_tree_admission(
+            &state,
+            Some(&observation),
+            TreePublication::Standalone,
+        ) {
             Ok(admission) => {
                 state
                     .background_work
@@ -1732,6 +1922,7 @@ pub async fn run_loop(
                     &state.layout,
                     state.graph.resolved_tree().len() as u64,
                 );
+                graph_owned_policy.clone_from(&admission.policy);
                 admission
             }
             Err(error) => {
@@ -2825,6 +3016,191 @@ mod tests {
         );
     }
 
+    /// Read the repository-authority generation one admission would advance.
+    ///
+    /// Every committed repository transaction advances it by exactly one, and
+    /// preparing that successor plus persisting the store is the O(store) cost
+    /// this whole seam exists to stop paying twice, so the generation is a
+    /// direct count of successors rather than a proxy for one.
+    fn authority_generation(state: &DaemonState) -> u64 {
+        current_authority_admission(state).unwrap().0.generation
+    }
+
+    /// The ambient watcher path publishes its own successor. Nothing about the
+    /// commit seam's deferral is allowed to reach it: an ambient tick has no
+    /// later transaction to carry its tree, so a tick that stopped publishing
+    /// would leave every observed write outside repository authority.
+    #[test]
+    // Commit phases are emitted at debug level when they are fast, and the
+    // level a `tracing` event is filtered by is a process-global hint. A test
+    // that captures those events therefore cannot run beside one that emits
+    // them, so every test on either side of that shares this group.
+    #[serial_test::serial(commit_phase_capture)]
+    fn an_ambient_tick_publishes_its_own_authority_successor() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        std::fs::write(
+            repo.path().join("ambient.rs"),
+            b"pub fn ambient() -> u32 { 1 }\n",
+        )
+        .unwrap();
+        let repo_path = test_repo_path("ambient.rs");
+        let observation = std::iter::once(repo_path.clone()).collect::<BTreeSet<_>>();
+
+        let before = authority_generation(&state);
+        let admission =
+            exact_tree_admission(&state, Some(&observation), TreePublication::Standalone).unwrap();
+
+        assert!(
+            admission.deferred_tree.is_none(),
+            "a standalone admission owns its publication and defers nothing"
+        );
+        assert_eq!(
+            authority_generation(&state) - before,
+            1,
+            "the tick must publish exactly one repository-authority successor"
+        );
+        assert!(
+            state
+                .graph
+                .resolved_tree()
+                .artifact_at_path(&repo_path)
+                .is_some(),
+            "the derived graph carries the admitted path"
+        );
+    }
+
+    /// The commit seam derives the same transition and publishes nothing, so
+    /// its caller can carry the tree in the transaction that publishes the
+    /// change. The graph still advances: the caller's transaction is what
+    /// closes the gap, and the coordination gate it holds spans both.
+    #[test]
+    // Commit phases are emitted at debug level when they are fast, and the
+    // level a `tracing` event is filtered by is a process-global hint. A test
+    // that captures those events therefore cannot run beside one that emits
+    // them, so every test on either side of that shares this group.
+    #[serial_test::serial(commit_phase_capture)]
+    fn a_deferring_admission_advances_no_authority_generation() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        std::fs::write(
+            repo.path().join("deferred.rs"),
+            b"pub fn deferred() -> u32 { 1 }\n",
+        )
+        .unwrap();
+        let repo_path = test_repo_path("deferred.rs");
+
+        let before = authority_generation(&state);
+        let admission =
+            exact_tree_admission(&state, None, TreePublication::DeferredToCaller).unwrap();
+
+        assert!(
+            !admission.deltas.is_empty(),
+            "the working copy moved, so the admission must plan a transition"
+        );
+        let deferred = admission
+            .deferred_tree
+            .expect("a deferring admission hands its transition back to the caller");
+        assert_eq!(
+            authority_generation(&state),
+            before,
+            "nothing may be published until the caller's own transaction publishes it"
+        );
+        assert!(
+            state
+                .graph
+                .resolved_tree()
+                .artifact_at_path(&repo_path)
+                .is_some(),
+            "the derived graph carries the admitted path so the commit can plan against it"
+        );
+
+        // Closing the deferral is what a commit that never reaches authority
+        // does, and it must leave exactly the state a standalone admission
+        // would have.
+        publish_deferred_tree_after_failure(&state, &deferred);
+        assert_eq!(
+            authority_generation(&state) - before,
+            1,
+            "closing the deferral publishes the one successor it withheld"
+        );
+    }
+
+    /// A collapsed commit publishes the tree its own walk proved, or none.
+    ///
+    /// The completion proof rides along as a value only a finished walk can
+    /// mint, which is what stops a collapsed commit being assembled from a
+    /// partial one. That alone is not enough: a token says some walk finished,
+    /// not which tree it observed. So the proof is checked against the plan,
+    /// and this drives the two apart to watch the check fire. The graph moves
+    /// after the admission returns, exactly as a stray in-process tree
+    /// mutation between admission and publication would move it, and the
+    /// commit that would then publish an unobserved transition is refused.
+    #[test]
+    // Commit phases are emitted at debug level when they are fast, and the
+    // level a `tracing` event is filtered by is a process-global hint. A test
+    // that captures those events therefore cannot run beside one that emits
+    // them, so every test on either side of that shares this group.
+    #[serial_test::serial(commit_phase_capture)]
+    fn a_collapsed_commit_refuses_a_tree_its_walk_did_not_observe() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        std::fs::write(
+            repo.path().join("observed.rs"),
+            b"pub fn observed() -> u32 { 1 }\n",
+        )
+        .unwrap();
+
+        let admission =
+            exact_tree_admission(&state, None, TreePublication::DeferredToCaller).unwrap();
+        let deferred = admission
+            .deferred_tree
+            .expect("the admission defers its transition to this caller");
+
+        // Move the derived tree after the walk proved it, so the plan below
+        // targets a tree no walk observed.
+        state
+            .graph
+            .apply_transaction_delta(&TransactionDelta {
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id: kin_model::ArtifactId::new(),
+                    new: kin_model::LocatedEntry::new(
+                        test_repo_path("never_walked.rs"),
+                        TreeEntry::gitlink(kin_model::GitObjectId::sha1([0x7c; 20])),
+                    ),
+                }],
+                ..TransactionDelta::default()
+            })
+            .unwrap();
+
+        let authority_context =
+            crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
+                .unwrap();
+        let plan = crate::repository_commit::plan_native_commit(
+            &state.graph,
+            state.blobs.as_ref(),
+            &authority_context,
+            kin_model::OperationId::new(),
+            kin_model::Timestamp::now(),
+            kin_model::AuthorId::new("collapsed-proof-test"),
+            "publish a tree no walk observed".to_string(),
+        )
+        .unwrap();
+
+        let error = crate::repository_commit::commit_native_plan_with_observed_target_tree(
+            &state.layout,
+            state.blobs.as_ref(),
+            &authority_context,
+            plan,
+            &deferred,
+        )
+        .expect_err("a plan targeting an unobserved tree must be refused");
+        assert!(
+            error.to_string().contains("no walk observed"),
+            "the refusal must name what went wrong: {error}"
+        );
+    }
+
     /// The livelock signature stays dead, in the counters that carried it.
     ///
     /// The earlier spin was a closed loop: an unadmitted path failed the host
@@ -2843,13 +3219,15 @@ mod tests {
         let repo_path = test_repo_path("brand_new.rs");
         let observation = std::iter::once(repo_path.clone()).collect::<BTreeSet<_>>();
 
-        let first = exact_tree_admission(&state, Some(&observation)).unwrap();
+        let first =
+            exact_tree_admission(&state, Some(&observation), TreePublication::Standalone).unwrap();
         assert!(
             first.changed_paths.contains(&repo_path),
             "the first tick admits the observed path"
         );
 
-        let second = exact_tree_admission(&state, Some(&observation)).unwrap();
+        let second =
+            exact_tree_admission(&state, Some(&observation), TreePublication::Standalone).unwrap();
         assert!(
             second.deltas.is_empty() && second.changed_paths.is_empty(),
             "a settled path must plan nothing on the next tick: {:?}",
@@ -2944,7 +3322,8 @@ mod tests {
         // The admission runs against a working copy that does not hold the file,
         // exactly as a walk that finished before the file landed would have.
         let observation = BTreeSet::new();
-        let admission = exact_tree_admission(&state, Some(&observation)).unwrap();
+        let admission =
+            exact_tree_admission(&state, Some(&observation), TreePublication::Standalone).unwrap();
         std::fs::write(&missed, b"pub fn raced() -> u32 { 1 }\n").unwrap();
 
         let admitted = admit_file_event_with_exact_tree(
@@ -3010,7 +3389,7 @@ mod tests {
         // The commit seam, and nothing after it: no watcher event is delivered,
         // which is exactly the quiescent working copy the stale record survived
         // on.
-        exact_tree_admission(&state, None).unwrap();
+        exact_tree_admission(&state, None, TreePublication::Standalone).unwrap();
         assert!(
             tree_entry(&state, "unobserved.rs").is_some(),
             "the seam must admit the path this disclosure was about"
@@ -4454,6 +4833,248 @@ mod tests {
         assert_eq!(entity_ids_for(&state, "keep.rs"), kept_entities);
     }
 
+    /// Establish a repository whose graph-owned admission policy excludes
+    /// `.claude/`, the way every real one does: the rule file is tracked before
+    /// the excluded content exists.
+    ///
+    /// A repository imported from Git resolves its policy from the `.gitignore`
+    /// blobs the import carried, so the rules are in force before the daemon's
+    /// first ambient pass. This fixture reproduces that state rather than
+    /// asserting anything about it.
+    async fn repository_with_policy_excluding_claude(root: &Path, state: &DaemonState) {
+        std::fs::write(root.join(".gitignore"), b".claude/\n").unwrap();
+        std::fs::write(root.join("keep.rs"), b"pub fn kept() -> u32 { 1 }\n").unwrap();
+        sync_filesystem_with_graph(state).await.unwrap();
+        assert!(
+            tree_entry(state, ".gitignore").is_some(),
+            "the fixture never admitted its own rule file, so no policy is in force"
+        );
+    }
+
+    /// A dirty subtree the graph-owned policy excludes admits the rest of the
+    /// tree instead of failing the whole admission.
+    ///
+    /// The scanner reads `.kinignore` and its built-in defaults; the durable
+    /// admission policy is compiled from every `.gitignore` and `.kinignore`
+    /// blob in the tree plus the frozen local overlay. A path only the second
+    /// one excludes was proposed by the walk and refused at the authority
+    /// boundary, and that refusal fails the entire exact-tree admission, so one
+    /// churning agent lock file left every other file in the working copy
+    /// unadmitted and the store answered from nothing (FIR-2346).
+    ///
+    /// The nested checkout under the excluded directory is the shape that
+    /// produced it on the founder's machine: a git worktree whose `.git` file
+    /// is control metadata while everything beside it is ordinary content.
+    #[tokio::test]
+    async fn a_dirty_policy_excluded_subtree_admits_the_rest_of_the_tree() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let root = state.layout.working_dir().to_path_buf();
+        repository_with_policy_excluding_claude(&root, &state).await;
+
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), b"pub fn library() -> u32 { 2 }\n").unwrap();
+        std::fs::create_dir_all(root.join(".claude/worktrees/lane-a/src")).unwrap();
+        std::fs::write(root.join(".claude/scheduled_tasks.lock"), b"held\n").unwrap();
+        std::fs::write(
+            root.join(".claude/worktrees/lane-a/.git"),
+            b"gitdir: ../../../.git/worktrees/lane-a\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".claude/worktrees/lane-a/src/dirty.rs"),
+            b"pub fn dirty() -> u32 { 3 }\n",
+        )
+        .unwrap();
+
+        // The pass completing at all is what proves nothing was deferred: a
+        // deferral is only reachable from the failure arm this admission used
+        // to take, where the loop defers every path in the batch and admits
+        // none of them.
+        sync_filesystem_with_graph(&state).await.unwrap();
+
+        assert!(
+            tree_entry(&state, "src/lib.rs").is_some(),
+            "an excluded subtree left an ordinary file unadmitted"
+        );
+        assert!(
+            !entity_ids_for(&state, "src/lib.rs").is_empty(),
+            "the pass admitted a tree it derived no semantics from, which is no progress"
+        );
+        assert!(
+            tree_entry(&state, "keep.rs").is_some(),
+            "the file admitted before the excluded subtree appeared was dropped"
+        );
+        assert!(tree_entry(&state, ".gitignore").is_some());
+        assert!(
+            tree_entry(&state, ".claude/scheduled_tasks.lock").is_none(),
+            "a policy-excluded path reached repository truth"
+        );
+        assert!(tree_entry(&state, ".claude/worktrees/lane-a/src/dirty.rs").is_none());
+
+        // The walk declined to observe them rather than silently finding
+        // nothing, and it says how many. An operator reading a missing file
+        // gets an answer instead of a quiet tree.
+        let excluded = state
+            .background_work
+            .reconcile()
+            .report(Instant::now())
+            .policy_excluded_path_count;
+        assert!(
+            excluded > 0,
+            "the pass skipped policy-excluded content without disclosing any of it"
+        );
+    }
+
+    /// Churn under an excluded path is not work, and the loop must not spend a
+    /// working stretch on it.
+    ///
+    /// Every excluded notification used to schedule a complete working-copy
+    /// admission that could only conclude there was nothing to admit, which is
+    /// a working stretch that records no progress. Ten minutes of that is what
+    /// the supervisor parks a pass for, and it parked the founder's store at
+    /// zero entities while the loop was doing exactly what it should.
+    #[tokio::test]
+    async fn continuous_excluded_churn_never_reaches_the_admission_path() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let root = state.layout.working_dir().to_path_buf();
+        repository_with_policy_excluding_claude(&root, &state).await;
+
+        let (_, policy) = current_authority_admission(&state).unwrap();
+        let policy = policy.expect("a local workspace resolves an admission policy");
+        std::fs::create_dir_all(root.join(".claude/worktrees/lane-a")).unwrap();
+        std::fs::write(root.join(".claude/scheduled_tasks.lock"), b"held\n").unwrap();
+        std::fs::write(root.join("src.rs"), b"pub fn src() -> u32 { 4 }\n").unwrap();
+
+        let excluded = FileEvent::Changed(root.join(".claude/scheduled_tasks.lock"));
+        assert!(
+            event_is_policy_excluded(&state, Some(&policy), &excluded),
+            "a churning excluded path still schedules a complete admission"
+        );
+        assert!(event_is_policy_excluded(
+            &state,
+            Some(&policy),
+            &FileEvent::Changed(root.join(".claude/worktrees/lane-a/head")),
+        ));
+
+        // Two-sided, or the predicate could be "drop everything". Ordinary
+        // content still reaches the admission path, and so does a tracked path
+        // even when the rules would exclude it today.
+        assert!(!event_is_policy_excluded(
+            &state,
+            Some(&policy),
+            &FileEvent::Changed(root.join("src.rs")),
+        ));
+        assert!(!event_is_policy_excluded(
+            &state,
+            Some(&policy),
+            &FileEvent::Changed(root.join("keep.rs")),
+        ));
+        // Before the first pass of a daemon's life there is no resolved policy,
+        // and nothing may be dropped on the strength of not having one.
+        assert!(!event_is_policy_excluded(&state, None, &excluded));
+    }
+
+    /// A pass making real progress is never stalled by excluded churn beside
+    /// it.
+    ///
+    /// The supervisor's verdict is the half that decides whether the store
+    /// survives, so it is exercised directly rather than inferred from the
+    /// filter above: excluded notifications arrive continuously for well past
+    /// the stall threshold while the loop keeps admitting, and the sweep must
+    /// leave the pass running.
+    #[test]
+    fn excluded_churn_beside_real_progress_never_parks_the_pass() {
+        let supervisor =
+            crate::background_work::BackgroundWorkSupervisor::new(Duration::from_secs(600));
+        let pass = supervisor.pass(crate::background_work::PASS_RECONCILE);
+        let start = Instant::now();
+
+        // Twenty minutes of ticks. Each one admits something real while
+        // excluded paths churn beside it, which is the working copy of anyone
+        // running an agent in their repository.
+        let mut now = start;
+        for tick in 0..120 {
+            now = start + Duration::from_secs(tick * 10);
+            pass.working(now);
+            pass.advanced(1, now);
+            assert!(
+                supervisor.sweep(now).is_empty(),
+                "a pass that is admitting was parked at tick {tick}"
+            );
+        }
+        assert!(!pass.halted());
+        assert!(supervisor.reconcile_report(now).parked.is_none());
+
+        // The other side: with the same clock and no progress, the sweep does
+        // stop it. Without this the assertions above would hold for a
+        // supervisor that never parks anything.
+        let starved =
+            crate::background_work::BackgroundWorkSupervisor::new(Duration::from_secs(600));
+        let starved_pass = starved.pass(crate::background_work::PASS_RECONCILE);
+        starved_pass.working(start);
+        assert!(starved.sweep(start + Duration::from_secs(1_200)).len() == 1);
+        assert!(starved_pass.halted());
+    }
+
+    /// The park names its own cause wherever the status string appears.
+    ///
+    /// `parked-by-supervisor` was the whole account a surface gave, and the
+    /// reason lived only in a log line from whenever it happened. The
+    /// supervisor already held the reason and the readings behind it.
+    #[test]
+    fn a_parked_reconcile_pass_publishes_its_reason_and_its_counts() {
+        let supervisor =
+            crate::background_work::BackgroundWorkSupervisor::new(Duration::from_secs(600));
+        let pass = supervisor.pass(crate::background_work::PASS_RECONCILE);
+        let start = Instant::now();
+        pass.working(start);
+        pass.advanced(3, start);
+        pass.set_deferred(true, start);
+        let stopped = supervisor.sweep(start + Duration::from_secs(1_050));
+        assert_eq!(stopped.len(), 1);
+
+        let report = supervisor.reconcile_report(start + Duration::from_secs(1_050));
+        let parked = report
+            .parked
+            .clone()
+            .expect("a parked pass reports its park");
+        assert!(parked.reason.contains("without recording any progress"));
+        assert_eq!(parked.progress, 3);
+        assert_eq!(parked.stall_threshold_seconds, 600);
+        assert_eq!(parked.progress_age_seconds, Some(1_050));
+        assert_eq!(parked.deferred_seconds, Some(1_050));
+        assert!(
+            report
+                .degraded_reasons()
+                .iter()
+                .any(|reason| reason.contains("parked by the background-work supervisor")),
+            "a parked loop reported no degraded reason: {:?}",
+            report.degraded_reasons()
+        );
+
+        // It serializes, because every surface that carries it is JSON, and it
+        // stays absent on a healthy loop rather than serializing an empty park.
+        let encoded = serde_json::to_value(&report).unwrap();
+        assert_eq!(encoded["parked"]["progress"], 3);
+        assert_eq!(encoded["parked"]["stall_threshold_seconds"], 600);
+        assert!(encoded["parked"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("was stopped"));
+        let decoded: kin_cli::commands::resources::ReconcileHealth =
+            serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.parked, report.parked);
+
+        let healthy =
+            crate::background_work::BackgroundWorkSupervisor::new(Duration::from_secs(600));
+        healthy.pass(crate::background_work::PASS_RECONCILE);
+        let healthy_report = healthy.reconcile_report(start);
+        assert!(healthy_report.parked.is_none());
+        assert!(serde_json::to_value(&healthy_report).unwrap()["parked"].is_null());
+    }
+
     /// A rule wide enough to empty the repository is refused, not obeyed.
     ///
     /// Retraction is automatic now, so a careless rule reaches graph truth
@@ -4638,6 +5259,80 @@ pub async fn sync_filesystem_with_graph(state: &DaemonState) -> Result<()> {
 pub(crate) async fn sync_filesystem_with_graph_under_coordination(
     state: &DaemonState,
 ) -> Result<()> {
+    sync_filesystem_with_graph_publishing(state, TreePublication::Standalone)
+        .await
+        .map(|_| ())
+}
+
+/// Admit the host checkout without publishing its tree transition, and return
+/// the transition for the caller to carry.
+///
+/// `/commands/commit` uses this so one repository-authority successor carries
+/// both the admitted exact tree and the semantic change it produces. Preparing
+/// a successor and persisting the store is O(store) on both sides of the
+/// commit, so publishing the tree on its own first makes a one-line change pay
+/// that cost twice.
+///
+/// The caller must hold `coordination_gate` across this call and its own
+/// publication, and must publish the returned tree standalone if its
+/// transaction never reaches authority. `None` means nothing moved, or that
+/// the transition was not eligible to be deferred and has already been
+/// published here.
+pub(crate) async fn sync_filesystem_with_graph_deferring_tree_publication(
+    state: &DaemonState,
+) -> Result<Option<crate::repository_commit::AdmittedWorkspaceTree>> {
+    sync_filesystem_with_graph_publishing(state, TreePublication::DeferredToCaller).await
+}
+
+async fn sync_filesystem_with_graph_publishing(
+    state: &DaemonState,
+    publication: TreePublication,
+) -> Result<Option<crate::repository_commit::AdmittedWorkspaceTree>> {
+    let mut deferred = None;
+    match sync_filesystem_with_graph_publishing_inner(state, publication, &mut deferred).await {
+        Ok(()) => Ok(deferred),
+        Err(error) => {
+            if let Some(admitted) = deferred {
+                publish_deferred_tree_after_failure(state, &admitted);
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Close a deferral whose caller will never publish it.
+///
+/// The derived graph already carries the admitted tree, so leaving it
+/// unpublished would leave the graph ahead of repository authority, and every
+/// later admission plans its transition out of the graph's tree and would be
+/// refused against the older authority tree. Publishing here restores the
+/// ordering a standalone admission would have established, which is exactly
+/// the state a failed commit leaves behind today.
+///
+/// This is the one path where publication itself can fail with nothing left to
+/// try. It is reported at error level rather than swallowed, and the failure a
+/// later admission raises stays loud, because a daemon whose graph outruns
+/// authority must be restarted to rebuild the graph rather than keep answering
+/// from it.
+pub(crate) fn publish_deferred_tree_after_failure(
+    state: &DaemonState,
+    admitted: &crate::repository_commit::AdmittedWorkspaceTree,
+) {
+    if let Err(error) = publish_exact_workspace_tree(state, admitted) {
+        error!(
+            error = %error,
+            "failed to publish the deferred exact workspace tree after the carrying transaction \
+             did not reach authority; the derived graph is ahead of repository authority and this \
+             daemon must be restarted before it can admit again"
+        );
+    }
+}
+
+async fn sync_filesystem_with_graph_publishing_inner(
+    state: &DaemonState,
+    publication: TreePublication,
+    deferred_out: &mut Option<crate::repository_commit::AdmittedWorkspaceTree>,
+) -> Result<()> {
     if state.filesystem_reconcile_disabled() {
         debug!(
             env = DISABLE_FILESYSTEM_RECONCILE_ENV,
@@ -4656,7 +5351,10 @@ pub(crate) async fn sync_filesystem_with_graph_under_coordination(
     // An explicit admission seam. Everything the working copy holds crosses
     // the compare-and-swap here, which is why `/commands/commit` calls it
     // rather than relying on whatever the watcher happened to observe.
-    let exact_admission = exact_tree_admission(state, None)?;
+    let mut exact_admission = exact_tree_admission(state, None, publication)?;
+    // Recorded before anything below can fail, so a pass that dies part way
+    // through enrichment still hands the deferral back to be closed.
+    *deferred_out = exact_admission.deferred_tree.take();
     if exact_admission.deltas.is_empty() {
         drop(graph_mutation);
         return Ok(());

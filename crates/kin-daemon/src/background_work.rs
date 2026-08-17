@@ -310,6 +310,35 @@ impl BackgroundPass {
         self.lock().progress
     }
 
+    /// This pass's park, with the readings the verdict was reached on, or
+    /// `None` while it is running.
+    ///
+    /// Read under one lock so the reason and the counts beside it describe the
+    /// same instant. `stall_threshold` travels with them because a park is only
+    /// legible against the limit it was measured by.
+    fn parked_report(
+        &self,
+        now: Instant,
+        stall_threshold: Duration,
+    ) -> Option<kin_cli::commands::resources::ReconcileParked> {
+        let inner = self.lock();
+        let reason = inner.halt.clone()?;
+        Some(kin_cli::commands::resources::ReconcileParked {
+            reason,
+            progress: inner.progress,
+            working_seconds: inner
+                .working_since
+                .map(|since| now.saturating_duration_since(since).as_secs()),
+            progress_age_seconds: inner
+                .progress_at
+                .map(|at| now.saturating_duration_since(at).as_secs()),
+            deferred_seconds: inner
+                .deferred_since
+                .map(|since| now.saturating_duration_since(since).as_secs()),
+            stall_threshold_seconds: stall_threshold.as_secs(),
+        })
+    }
+
     fn report(&self, now: Instant) -> BackgroundPassReport {
         let inner = self.lock();
         // `working` outranks `waiting_deferred`: a pass burning CPU on this tick
@@ -413,6 +442,22 @@ impl BackgroundWorkSupervisor {
     /// The reconcile loop's probe handle, for the loop to record into.
     pub fn reconcile(&self) -> &ReconcileProbes {
         &self.reconcile
+    }
+
+    /// The reconcile loop's complete account of itself, park included.
+    ///
+    /// The probes know what the loop admitted and dropped; only the supervisor
+    /// knows whether it stopped the pass. Assembled here rather than by each
+    /// surface, because a surface that reads the probes alone publishes a
+    /// parked loop as an ordinary quiet one, and the status string beside it
+    /// says `parked-by-supervisor` with nothing to explain it. Every disclosure
+    /// this daemon builds goes through here.
+    pub fn reconcile_report(&self, now: Instant) -> ReconcileHealth {
+        let mut report = self.reconcile.report(now);
+        report.parked = self
+            .registered(PASS_RECONCILE)
+            .and_then(|pass| pass.parked_report(now, self.stall_threshold));
+        report
     }
 
     fn passes(
@@ -567,14 +612,14 @@ impl BackgroundWorkSupervisor {
             // not one, so the caller that can see both fills this in.
             authority_loads: None,
             passes: self.reports(now),
-            reconcile: self.reconcile.report(now),
+            reconcile: self.reconcile_report(now),
         }
     }
 
     /// Whether the reconcile loop's own account of itself is degraded. Drives
     /// the `attention` health status beside `any_stopped`.
     pub fn reconcile_degraded(&self, now: Instant) -> bool {
-        self.reconcile.report(now).degraded()
+        self.reconcile_report(now).degraded()
     }
 }
 
@@ -683,6 +728,15 @@ pub struct ExcludedHostContent {
     pub ignored: u64,
     /// Untracked leaves outside Kin's regular-file and symbolic-link tree.
     pub unsupported: u64,
+    /// Untracked entries the graph-owned admission policy excluded.
+    ///
+    /// Counted apart from `ignored` because they answer different questions. A
+    /// path in `ignored` is named by this repository's `.kinignore` or a
+    /// built-in default, which an operator edits in the working copy. A path
+    /// here is excluded by the durable policy compiled from the tree's
+    /// `.gitignore`/`.kinignore` blobs and the frozen local overlay, and it is
+    /// the set that used to fail the whole admission instead of being skipped.
+    pub policy_excluded: u64,
 }
 
 /// How many untracked paths a disclosure names outright.
@@ -799,6 +853,8 @@ impl ReconcileProbes {
             untracked_paths_sample: inner.untracked_paths_sample.clone(),
             ignored_path_count: inner.excluded.ignored,
             unsupported_path_count: inner.excluded.unsupported,
+            policy_excluded_path_count: inner.excluded.policy_excluded,
+            parked: None,
         }
     }
 }

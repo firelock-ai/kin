@@ -99,14 +99,17 @@ pub(crate) fn execute(
         });
     }
 
-    let expected_roots = crate::loop_runner::current_authority_roots(state)?;
+    let (expected_roots, policy) = crate::loop_runner::current_authority_admission(state)?;
     let retained_tracked = tracked
         .iter()
         .filter(|path| !purge_set.contains(*path))
         .collect::<Vec<&RepoPath>>();
+    // A purge publishes the tree its own walk observed, so it is judged by the
+    // same admission policy and must not propose what that policy excludes.
     let scan = kin_index::scan_repository_preserving_graph_only(
         working_dir,
         &ignore,
+        policy.as_ref(),
         retained_tracked.into_iter(),
         graph_only.iter(),
     )
