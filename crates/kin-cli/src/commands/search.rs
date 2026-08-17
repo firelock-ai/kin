@@ -3,6 +3,7 @@
 
 use anyhow::{Context, Result};
 use kin_db::{ResolvedRetrievalItem, RetrievalKey};
+use kin_mcp::handlers::common::{entity_presentation_end_line, entity_presentation_start_line};
 use kin_model::EntityStore;
 use kin_model::{Entity, EntityFilter, EntityKind, LanguageId};
 #[cfg(feature = "vector")]
@@ -846,6 +847,21 @@ fn looks_non_production_path(path: &str) -> bool {
         || path.ends_with(".test.js")
 }
 
+/// `path:line` for a search hit, or the path alone when the record carries no
+/// line.
+///
+/// The record's `start_line` is already 1-based, converted at the one seam that
+/// builds it, so this only decides how to render it. An entity the graph carries
+/// no span for has no line to report, and the `:0` that used to appear here was a
+/// position no editor can open. Extracted from the print so the rendering is
+/// reachable from a test.
+fn search_hit_location(file: String, start_line: Option<u32>) -> String {
+    match start_line {
+        Some(line) => format!("{file}:{line}"),
+        None => file,
+    }
+}
+
 fn daemon_record_to_json(record: &DaemonSearchRecord) -> SearchJsonRecord {
     match record {
         DaemonSearchRecord::Entity(entity) => SearchJsonRecord::Entity(SearchJsonEntity {
@@ -853,6 +869,10 @@ fn daemon_record_to_json(record: &DaemonSearchRecord) -> SearchJsonRecord {
             kind: entity.kind.clone(),
             name: entity.name.clone(),
             file: entity.file.clone().unwrap_or_default(),
+            // Already 1-based: the record's lines are converted at the one seam
+            // that builds it. This field is not optional in the JSON contract, so
+            // an entity with no span keeps the "top of the file" fallback, which
+            // in a 1-based world is a line a reader can actually open.
             line: entity.start_line.unwrap_or(1),
             end_line: entity.end_line,
             score: entity.score,
@@ -903,8 +923,17 @@ fn entity_to_daemon_record(
         kind: format!("{:?}", entity.kind),
         language: entity.language.to_string(),
         file: entity.file_origin.as_ref().map(|f| f.0.clone()),
-        start_line: span.map(|span| span.start_line),
-        end_line: span.map(|span| span.end_line),
+        // The graph stores tree-sitter rows, which are 0-based; every
+        // agent-facing `file:line` is 1-based. This is the one seam a search
+        // record's lines are built at, so both emitters downstream (the JSON
+        // record and the `--body` human line) pass the converted value through
+        // rather than each converting, or each forgetting to.
+        //
+        // `start_byte`/`end_byte` are deliberately NOT shifted. They are byte
+        // offsets rather than line numbers, and the daemon slices a source blob
+        // with them to build `body`.
+        start_line: entity_presentation_start_line(entity),
+        end_line: entity_presentation_end_line(entity),
         start_byte: span.map(|span| span.start_byte),
         end_byte: span.map(|span| span.end_byte),
         signature: (!entity.signature.is_empty()).then(|| entity.signature.clone()),
@@ -943,11 +972,11 @@ fn resolved_item_to_daemon_record(
             context: format!("{:?}, {}", entity.kind, entity.language),
             file,
             artifact_kind: "entity".to_string(),
-            line: entity
-                .span
-                .as_ref()
-                .map(|span| span.start_line)
-                .unwrap_or(1),
+            // 1-based, like the three whole-file arms below that report `line: 1`.
+            // This row's `line` is not optional, so a spanless entity keeps that
+            // same "top of the file" fallback rather than gaining a `0` no editor
+            // can open.
+            line: entity_presentation_start_line(entity).unwrap_or(1),
             preview: entity
                 .doc_summary
                 .clone()
@@ -1228,10 +1257,11 @@ fn render_daemon_search_response(
                         .as_deref()
                         .map(|file| display_read_path(layout, file))
                         .unwrap_or_else(|| "unknown".to_string());
-                    let line_num = entity.start_line.unwrap_or(0);
                     println!(
-                        "{} ({}) @ {}:{}",
-                        entity.name, entity.kind, file_str, line_num
+                        "{} ({}) @ {}",
+                        entity.name,
+                        entity.kind,
+                        search_hit_location(file_str, entity.start_line)
                     );
                     if let Some(body) = entity.body.as_deref() {
                         for line in body.lines() {
@@ -1515,6 +1545,114 @@ mod tests {
             created_in: None,
             superseded_by: None,
         }
+    }
+
+    /// Every `kin search` emitter reports the line a human editor shows.
+    ///
+    /// The graph stores tree-sitter rows, which are 0-based, and
+    /// `kin-mcp`'s `handlers::common` documents that every agent-facing
+    /// `file:line` is 1-based, converted at exactly one seam per surface. `kin
+    /// search` emitted the raw row from three places, so it disagreed with `kin
+    /// refs`, `kin trace-data-flow`, and every MCP read surface about the same
+    /// entity, and a reader acting on it edited the line above the hit.
+    ///
+    /// One test covering all three emitters on purpose: they are one contract
+    /// stated once, and the wire record they share is the seam the conversion
+    /// happens at, so asserting them apart would let the record and its renderers
+    /// drift.
+    #[test]
+    fn every_search_emitter_reports_the_line_a_human_editor_shows() {
+        use super::{
+            daemon_record_to_json, entity_to_daemon_record, resolved_item_to_daemon_record,
+            search_hit_location, SearchJsonRecord, SearchMatchKind,
+        };
+
+        const SOURCE: &str = "# header\n\ndef probe_handler():\n    return 1\n";
+        // What a reader counting lines in an editor would say.
+        let human_line = SOURCE
+            .lines()
+            .position(|line| line.contains("def probe_handler"))
+            .map(|index| index + 1)
+            .expect("the fixture declares the handler") as u32;
+        let graph_row = human_line - 1;
+        assert_eq!(
+            graph_row, 2,
+            "fixture sanity: the raw row differs from the line"
+        );
+
+        let mut entity = dedupe_test_entity("probe_handler", "src/probe.py");
+        {
+            let span = entity.span.as_mut().expect("fixture carries a span");
+            span.start_line = graph_row;
+            span.end_line = graph_row + 1;
+        }
+        let (start_byte, end_byte) = entity
+            .span
+            .as_ref()
+            .map(|span| (span.start_byte, span.end_byte))
+            .expect("fixture carries a span");
+
+        // Emitter 1: the wire record every search surface is rendered from.
+        let record = entity_to_daemon_record(&entity, SearchMatchKind::Semantic, Some(0.5));
+        assert_eq!(
+            record.start_line,
+            Some(human_line),
+            "the record must carry the 1-based line, not the raw row {graph_row}"
+        );
+        assert_eq!(record.end_line, Some(human_line + 1));
+        // Byte offsets are not line numbers and must not be shifted: the daemon
+        // slices a source blob with them to build `body`.
+        assert_eq!(record.start_byte, Some(start_byte));
+        assert_eq!(record.end_byte, Some(end_byte));
+
+        // Emitter 2: `kin search --json`.
+        let SearchJsonRecord::Entity(json_entity) =
+            daemon_record_to_json(&super::DaemonSearchRecord::Entity(record.clone()))
+        else {
+            panic!("expected an entity record");
+        };
+        let json = serde_json::to_value(&json_entity).expect("serialize");
+        assert_eq!(
+            json["line"].as_u64(),
+            Some(human_line as u64),
+            "the JSON line must be the one a reader would count: {json}"
+        );
+
+        // Emitter 3: the `--body` human `file:line`.
+        assert_eq!(
+            search_hit_location("src/probe.py".to_string(), record.start_line),
+            format!("src/probe.py:{human_line}")
+        );
+        // A hit the graph carries no span for names its file alone. `:0` was a
+        // position no editor can open.
+        assert_eq!(
+            search_hit_location("src/probe.py".to_string(), None),
+            "src/probe.py"
+        );
+
+        // Emitter 4: the artifact row, whose `line` is not optional and so keeps
+        // the same "top of the file" fallback its three whole-file siblings use.
+        let artifact = resolved_item_to_daemon_record(
+            &ResolvedRetrievalItem::Entity(entity.clone()),
+            SearchMatchKind::Semantic,
+            Some(0.5),
+        );
+        assert_eq!(
+            artifact.line, human_line,
+            "the artifact row must carry the 1-based line"
+        );
+        let mut spanless = entity;
+        spanless.span = None;
+        assert_eq!(
+            resolved_item_to_daemon_record(
+                &ResolvedRetrievalItem::Entity(spanless),
+                SearchMatchKind::Semantic,
+                Some(0.5),
+            )
+            .line,
+            1,
+            "a spanless artifact row points at the top of the file, never line 0"
+        );
     }
 
     #[test]
