@@ -23,7 +23,6 @@ use kin_parser::{
 };
 
 use crate::error::{IndexError, Result as IndexResult};
-use crate::resolution::{RelationResolution, RESOLUTION_TIER_LADDER};
 
 /// Graph-assigned artifact identities keyed by repository-relative path.
 ///
@@ -5172,6 +5171,7 @@ fn normalize_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resolution::{RelationResolution, RESOLUTION_TIER_LADDER};
     use kin_model::{
         ArtifactId, EntityKind, EntityMetadata, EntityRole, FilePathId, FingerprintAlgorithm,
         GraphNodeId, Hash256, LanguageId, SemanticFingerprint, SourceSpan, Visibility,
