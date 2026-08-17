@@ -31,8 +31,8 @@ pub use firestore::FirestoreSpineBackend;
 #[cfg(feature = "firestore")]
 pub use firestore::FirestoreStore;
 pub use index::{
-    CrossRepoEdge, CrossRepoEdgesSnapshot, EntityEntry, SpineIndex, SpineXrefAuthorityAnchor,
-    SpineXrefDecodeError, SpineXrefResponse,
+    AuthorityRootState, CrossRepoEdge, CrossRepoEdgesSnapshot, EntityEntry, SpineIndex,
+    SpineXrefAuthorityAnchor, SpineXrefDecodeError, SpineXrefResponse,
 };
 pub use query::{classify_spine_probe, SpineProbe, SpineQuery};
 pub use routing::{RepoEndpoint, RoutingTable};

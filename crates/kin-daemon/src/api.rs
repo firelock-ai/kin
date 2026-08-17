@@ -3449,9 +3449,29 @@ async fn command_graph(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let repository_authority = state
+    // Through the cache rather than the bare binding. `graph status` reads
+    // durable repository state, and an open re-verifies every persisted body
+    // against its content address, so opening per request made it cost the
+    // whole store every time it printed counters. The cache is keyed on the
+    // durable publication identity read before the load it labels, so a reused
+    // authority is one this daemon confirmed is still current.
+    //
+    // Resolved lazily rather than eagerly, because `graph inspect` answers from
+    // the live graph alone. Eager resolution would make it start requiring a
+    // storage capability it has never needed and pay for an open it never
+    // reads.
+    let binding = state
         .local_repository_authority_binding()
         .map_err(repository_authority_error)?;
+    let resolver_state = Arc::clone(&state);
+    let repository_authority =
+        kin_cli::commands::repository_authority::RequestRepositoryAuthority::shared(
+            binding,
+            Arc::new(move || {
+                command_repository_authority(&resolver_state)
+                    .map_err(|(_, message)| anyhow::anyhow!(message))
+            }),
+        );
     let embedding_runtime = graph_status_embedding_runtime(&state, &graph);
     let response = kin_cli::commands::graph::execute_graph_command(
         &repository_authority,
@@ -13412,7 +13432,9 @@ mod tests {
 
         let runtime = graph_status_embedding_runtime(&state, &state.graph);
         let response = kin_cli::commands::graph::execute_graph_command(
-            &state.local_repository_authority_binding().unwrap(),
+            &kin_cli::commands::repository_authority::RequestRepositoryAuthority::pinned(
+                state.local_repository_authority_binding().unwrap(),
+            ),
             state.graph.as_ref(),
             &kin_cli::commands::graph::GraphCommandRequest::Status,
             &Default::default(),
@@ -15647,6 +15669,31 @@ mod tests {
             created_in: None,
             superseded_by: None,
         }
+    }
+
+    /// Two entities in different files joined by a `Calls` edge: the evidence
+    /// that this graph links references across files for the language, which is
+    /// what an absence claim over reference edges depends on. Without it an empty
+    /// reference answer is a fact about the graph rather than about the target.
+    fn seed_cross_file_call_witness(state: &Arc<DaemonState>) {
+        let caller = test_entity("witness_caller", "src/witness_caller.py");
+        let callee = test_entity("witness_callee", "src/witness_callee.py");
+        state.graph.upsert_entity(&caller).unwrap();
+        state.graph.upsert_entity(&callee).unwrap();
+        state
+            .graph
+            .upsert_relation(&kin_model::relation::Relation {
+                id: kin_model::ids::RelationId::new(),
+                kind: kin_model::relation::RelationKind::Calls,
+                src: kin_model::relation::GraphNodeId::Entity(caller.id),
+                dst: kin_model::relation::GraphNodeId::Entity(callee.id),
+                confidence: 1.0,
+                origin: kin_model::relation::RelationOrigin::Parsed,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
     }
 
     fn install_repository_file(
@@ -26732,6 +26779,7 @@ mod tests {
         let target = test_entity("target", "src/lib.rs");
         let source = test_entity("caller", "src/app.rs");
         state.graph.upsert_entity(&target).unwrap();
+        seed_cross_file_call_witness(&state);
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);

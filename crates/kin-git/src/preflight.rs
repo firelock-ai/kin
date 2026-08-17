@@ -448,6 +448,12 @@ struct ExpectedIndexEntry {
 /// observation is repeated before returning to close the practical TOCTOU
 /// window; any change fails closed.
 ///
+/// This is the standalone form, for the first proof of an admission, where
+/// there is nothing earlier to compare against. It is also the only form that
+/// structurally revalidates the import plan, which is what makes it the
+/// expensive one: see [`reprove_git_migration`] for what a later proof in the
+/// same admission may reuse from it and why.
+///
 /// A later history-enrichment/admission step must still attach and validate
 /// shared admission policy deltas before repository authority can be published.
 pub fn preflight_git_migration(
@@ -456,7 +462,61 @@ pub fn preflight_git_migration(
     plan: &SemanticGitImportPlan,
     blob_store: &BlobStore,
 ) -> Result<GitMigrationPreflightProof> {
-    preflight_git_migration_with_hook(repo_path, snapshot, plan, blob_store, None, || {})
+    preflight_git_migration_with_hook(repo_path, snapshot, plan, blob_store, None, None, || {})
+}
+
+/// Repeat a source proof this admission already took, against that proof.
+///
+/// The invariant is the same one [`preflight_git_migration`] establishes: the
+/// mutable Git boundary this admission is reading still holds exactly the
+/// committed state the capture was taken from. What differs is only how much
+/// work it takes to establish it a second time, and the whole of that
+/// difference rests on `baseline` being a proof of the SAME source, snapshot,
+/// and plan, taken earlier in this admission.
+///
+/// Two reuses follow from that, and neither weakens the proof:
+///
+/// The single observation. A standalone proof observes twice and requires the
+/// two to agree, because on its own it has no earlier reading to be measured
+/// against and a lone observation could be a torn read. A re-proof does have
+/// one: `baseline`. Requiring one fresh observation to equal `baseline` is
+/// strictly stronger than requiring two adjacent observations to equal each
+/// other, because the baseline was taken minutes rather than seconds earlier,
+/// so its window contains the doubled window entirely. A torn read still fails,
+/// because a torn read does not equal the clean baseline either. Neither form
+/// can see a source that changes and changes back between samples; adding a
+/// third sample would not close that, and pretending it does is the reason the
+/// doubling looked load-bearing.
+///
+/// The skipped plan revalidation. [`SemanticGitImportPlan::validate`] rebuilds
+/// the entire plan from the captured objects and requires the rebuild to be
+/// identical, which is the guard against a plan enriched with anything not
+/// derivable from the source. It is a pure function of an immutable in-memory
+/// plan and an append-only content-addressed store, so re-running it over the
+/// same plan value cannot reach a different verdict. What it would catch, a
+/// plan that is not the one the baseline proved, is caught instead by
+/// `semantic_plan_fingerprint`, which is still derived fresh on every
+/// observation and compared through the whole-proof comparison below.
+pub fn reprove_git_migration(
+    repo_path: &Path,
+    baseline: &GitMigrationPreflightProof,
+    snapshot: &LosslessGitRepository,
+    plan: &SemanticGitImportPlan,
+    blob_store: &BlobStore,
+) -> Result<GitMigrationPreflightProof> {
+    preflight_git_migration_with_hook(
+        repo_path,
+        snapshot,
+        plan,
+        blob_store,
+        None,
+        Some(ProofBaseline {
+            proof: baseline,
+            changed: "Git source proof changed before repository publication; retry from a fresh \
+                      capture",
+        }),
+        || {},
+    )
 }
 
 /// Repeat an exact Git source proof after Kin has atomically installed `.kin`.
@@ -464,7 +524,53 @@ pub fn preflight_git_migration(
 /// Only the supplied real `.kin` directory at the canonical worktree root is
 /// excluded from the worktree walk. Every Git object, ref, index byte, tracked
 /// leaf, ignored-local fact, and any other untracked path remains subject to
-/// the same two-observation proof as pre-publication migration.
+/// the same proof as pre-publication migration, and the result must equal
+/// `baseline` exactly.
+///
+/// This is the one proof publication itself can move, and it is why the
+/// exclusion is spelled out rather than inferred: publication is a single
+/// no-replace rename of a staged directory into the worktree root, so the only
+/// difference from `baseline` it can legitimately produce is that `.kin` now
+/// exists. Anything else this observes, a second path that appeared, a tracked
+/// leaf whose bytes moved, an object or ref that is no longer the captured one,
+/// is either publication writing somewhere it must not or a non-cooperating
+/// writer racing the rename. Both are refusals, and because the rename has
+/// already happened they are detections rather than preventions: the caller
+/// reports them as a published repository that is not safe to use without
+/// recovery.
+///
+/// It observes once for the reasons given at [`reprove_git_migration`].
+pub fn reprove_git_migration_after_publication(
+    repo_path: &Path,
+    published_kin_dir: &Path,
+    baseline: &GitMigrationPreflightProof,
+    snapshot: &LosslessGitRepository,
+    plan: &SemanticGitImportPlan,
+    blob_store: &BlobStore,
+) -> Result<GitMigrationPreflightProof> {
+    let source_worktree =
+        fs::canonicalize(repo_path).map_err(|error| GitError::io(repo_path, error))?;
+    let published_kin_dir = canonical_published_kin_dir(&source_worktree, published_kin_dir)?;
+    preflight_git_migration_with_hook(
+        &source_worktree,
+        snapshot,
+        plan,
+        blob_store,
+        Some(&published_kin_dir),
+        Some(ProofBaseline {
+            proof: baseline,
+            changed: "Git source proof changed across repository publication; published \
+                      authority is not safe to use without recovery",
+        }),
+        || {},
+    )
+}
+
+/// Repeat an exact Git source proof after publication, without a baseline.
+///
+/// The standalone post-publication form, kept for callers that have no earlier
+/// proof of this source to measure against. An admission always does, and uses
+/// [`reprove_git_migration_after_publication`].
 pub fn preflight_git_migration_after_publication(
     repo_path: &Path,
     published_kin_dir: &Path,
@@ -474,6 +580,27 @@ pub fn preflight_git_migration_after_publication(
 ) -> Result<GitMigrationPreflightProof> {
     let source_worktree =
         fs::canonicalize(repo_path).map_err(|error| GitError::io(repo_path, error))?;
+    let published_kin_dir = canonical_published_kin_dir(&source_worktree, published_kin_dir)?;
+    preflight_git_migration_with_hook(
+        &source_worktree,
+        snapshot,
+        plan,
+        blob_store,
+        Some(&published_kin_dir),
+        None,
+        || {},
+    )
+}
+
+/// The exact `.kin` a post-publication proof is allowed to exclude.
+///
+/// Only a real directory at the canonical worktree root qualifies. Resolving
+/// through a symlink, or accepting a path elsewhere, would let the exclusion
+/// hide a part of the worktree the proof is supposed to cover.
+fn canonical_published_kin_dir(
+    source_worktree: &Path,
+    published_kin_dir: &Path,
+) -> Result<PathBuf> {
     let expected_kin_dir = source_worktree.join(".kin");
     let metadata = fs::symlink_metadata(published_kin_dir)
         .map_err(|error| GitError::io(published_kin_dir, error))?;
@@ -491,14 +618,20 @@ pub fn preflight_git_migration_after_publication(
             expected_kin_dir.display()
         )));
     }
-    preflight_git_migration_with_hook(
-        &source_worktree,
-        snapshot,
-        plan,
-        blob_store,
-        Some(&published_kin_dir),
-        || {},
-    )
+    Ok(published_kin_dir)
+}
+
+/// An earlier proof of this same admission, and what to say when the source no
+/// longer matches it.
+///
+/// Carrying the sentence here rather than leaving the comparison to the caller
+/// is what keeps the cheaper single-observation path from being reachable
+/// without one: the baseline is the argument that makes one observation
+/// sufficient, so the type that authorizes it also performs the comparison.
+#[derive(Clone, Copy)]
+struct ProofBaseline<'a> {
+    proof: &'a GitMigrationPreflightProof,
+    changed: &'static str,
 }
 
 fn preflight_git_migration_with_hook(
@@ -507,41 +640,57 @@ fn preflight_git_migration_with_hook(
     plan: &SemanticGitImportPlan,
     blob_store: &BlobStore,
     published_kin_dir: Option<&Path>,
+    baseline: Option<ProofBaseline<'_>>,
     after_first_observation: impl FnOnce(),
 ) -> Result<GitMigrationPreflightProof> {
-    validate_plan_binding(snapshot, plan, blob_store)?;
-    let expected = expected_index_entries(snapshot, plan)?;
-    let first = observe(
-        repo_path,
-        snapshot,
-        plan,
-        blob_store,
-        &expected,
-        published_kin_dir,
-    )?;
-    after_first_observation();
-    let second = observe(
-        repo_path,
-        snapshot,
-        plan,
-        blob_store,
-        &expected,
-        published_kin_dir,
-    )?;
-    if first != second {
-        return Err(preflight_error(
-            "Git source changed during migration preflight; retry from a fresh snapshot",
-        ));
+    // Structurally rebuilding the plan is what a baselined re-proof reuses
+    // rather than repeats; the binding comparison below is cheap and runs
+    // either way. Both halves of the reasoning are at `reprove_git_migration`.
+    if baseline.is_none() {
+        plan.validate(blob_store)?;
     }
-    Ok(second.proof)
+    bind_plan_to_snapshot(snapshot, plan)?;
+    // A pure function of the plan, which no observation mutates. Derived once
+    // per proof rather than once per observation, and still derived rather than
+    // carried over from a baseline, so a plan that is not the proved one moves
+    // the proof and fails the comparison.
+    let semantic_plan_fingerprint = fingerprint_plan(plan)?;
+    let expected = expected_index_entries(snapshot, plan)?;
+    let observation = || {
+        observe(
+            repo_path,
+            snapshot,
+            plan,
+            blob_store,
+            &expected,
+            published_kin_dir,
+            semantic_plan_fingerprint,
+        )
+    };
+
+    let Some(baseline) = baseline else {
+        let first = observation()?;
+        after_first_observation();
+        let second = observation()?;
+        if first != second {
+            return Err(preflight_error(
+                "Git source changed during migration preflight; retry from a fresh snapshot",
+            ));
+        }
+        return Ok(second.proof);
+    };
+
+    let observed = observation()?;
+    if observed.proof != *baseline.proof {
+        return Err(preflight_error(baseline.changed));
+    }
+    Ok(observed.proof)
 }
 
-fn validate_plan_binding(
+fn bind_plan_to_snapshot(
     snapshot: &LosslessGitRepository,
     plan: &SemanticGitImportPlan,
-    blob_store: &BlobStore,
 ) -> Result<()> {
-    plan.validate(blob_store)?;
     if plan.repository_id != snapshot.repository_id
         || plan.object_format != snapshot.object_format
         || plan.external_objects != snapshot.objects
@@ -562,6 +711,7 @@ fn observe(
     blob_store: &BlobStore,
     expected_entries: &BTreeMap<RepoPath, ExpectedIndexEntry>,
     published_kin_dir: Option<&Path>,
+    semantic_plan_fingerprint: Hash256,
 ) -> Result<PreflightObservation> {
     let source_worktree =
         fs::canonicalize(repo_path).map_err(|error| GitError::io(repo_path, error))?;
@@ -656,7 +806,6 @@ fn observe(
     )?;
     let workspace_divergence = divergence.finish();
     let snapshot_fingerprint = fingerprint_snapshot(&snapshot);
-    let semantic_plan_fingerprint = fingerprint_plan(plan)?;
     let compatibility = GitMigrationCompatibilityFacts {
         // Tolerated siblings are recorded rather than dropped. Both
         // observations carry them, so one appearing or vanishing mid-proof
@@ -3975,6 +4124,134 @@ mod tests {
         assert_eq!(proof.tracked_worktree.gitlink_count, 0);
     }
 
+    /// A baselined re-proof of an unchanged source agrees with its baseline,
+    /// and both re-proof forms refuse the moment it does not.
+    ///
+    /// This is what pays for observing once instead of twice, so it is asserted
+    /// on both entry points rather than assumed from one. The post-publication
+    /// arm additionally has to accept the `.kin` publication installed, which is
+    /// the only difference it is allowed to tolerate.
+    #[test]
+    fn a_baselined_reproof_agrees_with_its_baseline_and_refuses_any_drift() {
+        let fixture = Fixture::clean();
+        let baseline = fixture.preflight().expect("baseline proof");
+
+        let agreed = reprove_git_migration(
+            &fixture.repo,
+            &baseline,
+            &fixture.snapshot,
+            &fixture.plan,
+            &fixture.store,
+        )
+        .expect("an unchanged source re-proves against its baseline");
+        assert_eq!(agreed, baseline);
+
+        let published_kin = fixture.repo.join(".kin");
+        fs::create_dir(&published_kin).expect("published Kin directory");
+        fs::write(published_kin.join("version"), b"6\n").expect("published Kin metadata");
+        let after_publication = reprove_git_migration_after_publication(
+            &fixture.repo,
+            &published_kin,
+            &baseline,
+            &fixture.snapshot,
+            &fixture.plan,
+            &fixture.store,
+        )
+        .expect("publication alone does not move the proof");
+        assert_eq!(after_publication, baseline);
+
+        // One tracked byte is enough, and it must refuse on both arms rather
+        // than report the drift, because a single observation has no second
+        // reading of its own to disagree with.
+        fs::write(fixture.repo.join("compose.yaml"), b"services: {}\n")
+            .expect("tracked source drift");
+        let before_publication = reprove_git_migration(
+            &fixture.repo,
+            &baseline,
+            &fixture.snapshot,
+            &fixture.plan,
+            &fixture.store,
+        )
+        .expect_err("drift before publication is refused");
+        assert!(
+            before_publication
+                .to_string()
+                .contains("source proof changed"),
+            "{before_publication}"
+        );
+        let across_publication = reprove_git_migration_after_publication(
+            &fixture.repo,
+            &published_kin,
+            &baseline,
+            &fixture.snapshot,
+            &fixture.plan,
+            &fixture.store,
+        )
+        .expect_err("drift across publication is refused");
+        assert!(
+            across_publication
+                .to_string()
+                .contains("changed across repository publication"),
+            "{across_publication}"
+        );
+    }
+
+    /// A path that appears outside `.kin` after publication is still caught.
+    ///
+    /// The exclusion is the one thing the post-publication re-proof tolerates,
+    /// so the test that matters is that it tolerates nothing beside it.
+    #[test]
+    fn a_baselined_post_publication_reproof_excludes_only_the_published_kin_directory() {
+        let fixture = Fixture::clean();
+        let baseline = fixture.preflight().expect("baseline proof");
+        let published_kin = fixture.repo.join(".kin");
+        fs::create_dir(&published_kin).expect("published Kin directory");
+        fs::write(published_kin.join("version"), b"6\n").expect("published Kin metadata");
+        fs::write(fixture.repo.join("outside-kin.txt"), b"untracked\n").expect("untracked sibling");
+
+        let error = reprove_git_migration_after_publication(
+            &fixture.repo,
+            &published_kin,
+            &baseline,
+            &fixture.snapshot,
+            &fixture.plan,
+            &fixture.store,
+        )
+        .expect_err("a path that appeared beside .kin is not excluded");
+        assert!(
+            error
+                .to_string()
+                .contains("changed across repository publication"),
+            "{error}"
+        );
+    }
+
+    /// A re-proof will not accept a baseline taken from a different plan.
+    ///
+    /// Skipping the structural plan rebuild rests on the plan being the one the
+    /// baseline proved, and `semantic_plan_fingerprint` is what carries that.
+    /// It is still derived on every observation, so a mismatched plan moves the
+    /// proof and fails the comparison rather than passing unvalidated.
+    #[test]
+    fn a_baselined_reproof_refuses_a_baseline_from_another_plan() {
+        let fixture = Fixture::clean();
+        let mut baseline = fixture.preflight().expect("baseline proof");
+        baseline.semantic_plan_fingerprint = digest(b"a plan this admission never proved");
+
+        let error = reprove_git_migration(
+            &fixture.repo,
+            &baseline,
+            &fixture.snapshot,
+            &fixture.plan,
+            &fixture.store,
+        )
+        .expect_err("a baseline bound to another plan is refused");
+        assert!(
+            error.to_string().contains("source proof changed"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn post_publication_proof_excludes_only_the_exact_published_kin_directory() {
         let fixture = Fixture::clean();
@@ -4885,6 +5162,7 @@ mod tests {
             &fixture.plan,
             &fixture.store,
             None,
+            None,
             move || {
                 git(&repo, &["config", "--unset-all", "remote.origin.url"]);
                 git(
@@ -5199,6 +5477,7 @@ mod tests {
             &source_change.plan,
             &source_change.store,
             None,
+            None,
             move || {
                 fs::write(repo.join("ignored/new-cache"), b"new\n").expect("TOCTOU file");
             },
@@ -5215,6 +5494,7 @@ mod tests {
             &ignore_change.snapshot,
             &ignore_change.plan,
             &ignore_change.store,
+            None,
             None,
             move || {
                 let mut file = fs::OpenOptions::new()
