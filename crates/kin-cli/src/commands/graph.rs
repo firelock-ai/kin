@@ -254,6 +254,84 @@ fn embedding_coverage_is_measured(_graph: &kin_db::InMemoryGraph) -> bool {
     true
 }
 
+/// Language servers this build can actually enrich with, and the binaries that
+/// provide them.
+///
+/// Two facts have to hold together for a reference edge to exist: the daemon
+/// wires an adapter for the language, and a server binary is installed. The
+/// binary names mirror `kin_lsp::discovery::KNOWN_SERVERS` for exactly the
+/// languages `kin_core::cross_file_coverage::ENRICHABLE_LANGUAGES` names;
+/// probing them here rather than through `discover_servers` keeps the daemon's
+/// status path off a subprocess, since discovery runs `--version` on every
+/// server it finds.
+pub(crate) const LANGUAGE_SERVER_BINARIES: &[(kin_model::LanguageId, &[&str])] = &[
+    (kin_model::LanguageId::Rust, &["rust-analyzer"]),
+    (
+        kin_model::LanguageId::Python,
+        &["pyright-langserver", "pylsp"],
+    ),
+];
+
+/// Languages whose enrichment server is installed on this host.
+pub(crate) fn installed_language_servers() -> HashSet<kin_model::LanguageId> {
+    LANGUAGE_SERVER_BINARIES
+        .iter()
+        .filter(|(_, binaries)| binaries.iter().any(|binary| which::which(binary).is_ok()))
+        .map(|(language, _)| *language)
+        .collect()
+}
+
+/// Measure how much of this graph's knowledge crosses a file boundary, and why
+/// the rest does not.
+///
+/// Artifact-level import edges are not reachable from an entity-rooted
+/// traversal, so they are derived as the difference between the graph-wide
+/// count of a kind and the entity-rooted count the caller already has.
+fn cross_file_coverage(
+    graph: &kin_db::InMemoryGraph,
+    entities: &[Entity],
+    entity_relation_counts: &HashMap<RelationKind, usize>,
+    cross_file_by_language: &HashMap<kin_model::LanguageId, usize>,
+    entity_relations: usize,
+    cross_file_relations: usize,
+) -> kin_core::cross_file_coverage::CrossFileCoverage {
+    let stats = graph.graph_stats();
+    let artifact_import_relations: usize = [RelationKind::Imports, RelationKind::Includes]
+        .into_iter()
+        .map(|kind| {
+            let graph_wide = stats
+                .relation_counts
+                .get(&format!("{kind:?}"))
+                .copied()
+                .unwrap_or(0);
+            let entity_rooted = entity_relation_counts.get(&kind).copied().unwrap_or(0);
+            graph_wide.saturating_sub(entity_rooted)
+        })
+        .sum();
+
+    // Entities without a file origin are external reference targets this
+    // repository does not own; counting their language would report coverage
+    // for a language the repository holds no source in.
+    let mut entities_by_language: HashMap<kin_model::LanguageId, usize> = HashMap::new();
+    for entity in entities.iter().filter(|e| e.file_origin.is_some()) {
+        *entities_by_language.entry(entity.language).or_insert(0) += 1;
+    }
+
+    kin_core::cross_file_coverage::CrossFileCoverage::assemble(
+        entity_relations,
+        cross_file_relations,
+        artifact_import_relations,
+        entities_by_language.into_iter().map(|(language, count)| {
+            (
+                language,
+                count,
+                cross_file_by_language.get(&language).copied().unwrap_or(0),
+            )
+        }),
+        &installed_language_servers(),
+    )
+}
+
 fn build_graph_status_response(
     binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
@@ -307,11 +385,40 @@ fn build_graph_status_response(
     let mut relation_counts: HashMap<RelationKind, usize> = HashMap::new();
     let mut seen_relation_ids = HashSet::new();
     let mut total_relations = 0usize;
+    // Whether an edge crosses a file boundary is the fact that decides whether
+    // this graph can answer what calls what, and it is invisible in the
+    // relation-kind histogram: a `Calls` total says nothing about how many of
+    // those calls left the file they were written in. Both endpoints are
+    // resolved through the entity's own file origin, so an edge is only counted
+    // as cross-file when the graph knows both files and they differ.
+    let origin_by_entity: HashMap<kin_model::EntityId, (&str, kin_model::LanguageId)> = entities
+        .iter()
+        .filter_map(|e| {
+            e.file_origin
+                .as_ref()
+                .map(|file| (e.id, (file.0.as_str(), e.language)))
+        })
+        .collect();
+    let mut cross_file_relations = 0usize;
+    let mut cross_file_by_language: HashMap<kin_model::LanguageId, usize> = HashMap::new();
     for e in &entities {
         for rel in graph.get_all_relations_for_entity(&e.id)? {
             if seen_relation_ids.insert(rel.id) {
                 *relation_counts.entry(rel.kind).or_insert(0) += 1;
                 total_relations += 1;
+                let crossing =
+                    rel.src
+                        .as_entity()
+                        .zip(rel.dst.as_entity())
+                        .and_then(|(src, dst)| {
+                            let (src_file, src_language) = origin_by_entity.get(&src)?;
+                            let (dst_file, _) = origin_by_entity.get(&dst)?;
+                            (src_file != dst_file).then_some(*src_language)
+                        });
+                if let Some(src_language) = crossing {
+                    cross_file_relations += 1;
+                    *cross_file_by_language.entry(src_language).or_insert(0) += 1;
+                }
             }
         }
     }
@@ -374,6 +481,22 @@ fn build_graph_status_response(
         "Entity-to-entity relation kinds: {}",
         rel_parts.join(", ")
     ));
+
+    // Cross-file coverage, stated beside the kind breakdown the reader just
+    // saw. A kind histogram cannot say whether any edge leaves its own file,
+    // and a graph that answers nothing across a file boundary looks identical
+    // to a healthy one at this level of detail.
+    lines.extend(
+        cross_file_coverage(
+            graph,
+            &entities,
+            &relation_counts,
+            &cross_file_by_language,
+            total_relations,
+            cross_file_relations,
+        )
+        .disclosure_lines(),
+    );
 
     // Kind distribution
     let mut kind_pairs: Vec<_> = kind_counts.iter().collect();
@@ -1569,6 +1692,87 @@ mod tests {
                 .iter()
                 .any(|line| line.starts_with("Relations: ") || line.contains("  |  Relations: ")),
             "{:?}",
+            response.lines
+        );
+    }
+
+    fn test_entity_in_file(name: &str, file: &str) -> Entity {
+        let mut entity = test_entity(name);
+        entity.file_origin = Some(kin_model::FilePathId::new(file));
+        entity
+    }
+
+    /// A graph whose every edge stays inside one file must say so.
+    ///
+    /// This is the state the isolation experiment found and the kind histogram
+    /// cannot express: `Calls: 8` reads identically whether those calls reach
+    /// another module or none of them do.
+    #[test]
+    fn graph_status_names_a_graph_whose_edges_never_leave_their_file() {
+        let (_temp, binding, graph) = graph_validation_fixture();
+        let caller = test_entity_in_file("ingest_note", "storage.py");
+        let callee = test_entity_in_file("normalize", "storage.py");
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&callee).unwrap();
+        graph
+            .upsert_relation(&test_relation(RelationKind::Calls, caller.id, callee.id))
+            .unwrap();
+
+        let response =
+            build_graph_status_response(&binding, &graph, &Default::default(), &Default::default())
+                .unwrap();
+
+        assert!(
+            response
+                .lines
+                .iter()
+                .any(|line| line.starts_with("Cross-file entity relations: 0 of 1")),
+            "the cross-file count belongs beside the kind breakdown: {:?}",
+            response.lines
+        );
+        assert!(
+            response
+                .lines
+                .iter()
+                .any(|line| line.contains("no relation in this graph crosses a file boundary")),
+            "a graph that cannot leave a file must state it: {:?}",
+            response.lines
+        );
+    }
+
+    /// The counterpart: one edge across a file boundary withdraws the claim.
+    /// Without this, the test above would still pass if the disclosure were
+    /// printed unconditionally, which would make it decoration rather than a
+    /// measurement.
+    #[test]
+    fn graph_status_withdraws_the_shortfall_once_an_edge_crosses_files() {
+        let (_temp, binding, graph) = graph_validation_fixture();
+        let caller = test_entity_in_file("ingest_note", "storage.py");
+        let callee = test_entity_in_file("parse_note", "parsing.py");
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&callee).unwrap();
+        graph
+            .upsert_relation(&test_relation(RelationKind::Calls, caller.id, callee.id))
+            .unwrap();
+
+        let response =
+            build_graph_status_response(&binding, &graph, &Default::default(), &Default::default())
+                .unwrap();
+
+        assert!(
+            response
+                .lines
+                .iter()
+                .any(|line| line.starts_with("Cross-file entity relations: 1 of 1")),
+            "{:?}",
+            response.lines
+        );
+        assert!(
+            !response
+                .lines
+                .iter()
+                .any(|line| line.contains("no relation in this graph crosses a file boundary")),
+            "a graph that does cross files must not be told it cannot: {:?}",
             response.lines
         );
     }

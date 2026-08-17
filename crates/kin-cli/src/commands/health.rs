@@ -170,6 +170,7 @@ pub async fn run_health_checks() -> HealthReport {
     checks.push(check_semantic_query_readiness().await);
     checks.push(check_background_work().await);
     checks.push(check_retrieval_profile());
+    checks.push(check_cross_file_enrichment());
     checks.push(check_update_policy());
     checks.push(check_binary_assessment_load());
 
@@ -2109,6 +2110,74 @@ async fn check_semantic_query_readiness() -> HealthCheck {
     semantic_query_health_from_runtime(&daemon_url, &response.embed_runtime)
 }
 
+/// Report whether cross-file reference edges can be produced on this host.
+///
+/// Reference and override edges are not derivable from a single-file parse:
+/// they need a resolved program, which Kin gets from an external language
+/// server. On a host with none installed the graph simply never gains that edge
+/// class, and until this row existed the only trace was a relation count a
+/// reader had to already know the expected value of. The row names the language
+/// and the missing binary so the gap is a fact on the page rather than an
+/// inference from a ratio.
+///
+/// It reports `Stale` rather than `Missing`: the graph still answers, with
+/// import and call edges resolved from source, so this degrades an install
+/// without breaking it.
+fn check_cross_file_enrichment() -> HealthCheck {
+    cross_file_enrichment_check(&crate::commands::graph::installed_language_servers())
+}
+
+/// The verdict half of [`check_cross_file_enrichment`], over an explicit set of
+/// installed servers so both outcomes can be exercised on any host.
+fn cross_file_enrichment_check(
+    installed: &std::collections::HashSet<kin_model::LanguageId>,
+) -> HealthCheck {
+    let mut available: Vec<String> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+    for (language, binaries) in crate::commands::graph::LANGUAGE_SERVER_BINARIES {
+        if installed.contains(language) {
+            available.push(language.to_string());
+        } else {
+            missing.push(format!("{language} ({})", binaries.join(" or ")));
+        }
+    }
+
+    if missing.is_empty() {
+        return HealthCheck::new(
+            "cross_file_enrichment",
+            "Cross-file reference edges",
+            HealthStatus::Healthy,
+            format!("language server found for {}", available.join(", ")),
+        );
+    }
+
+    let detail = format!(
+        "cross-file reference and override edges unavailable: no language server found for {}",
+        missing.join(", ")
+    );
+    HealthCheck::new(
+        "cross_file_enrichment",
+        "Cross-file reference edges",
+        HealthStatus::Stale,
+        // Say what still works. A row that reports only the loss reads as "the
+        // graph knows nothing across files", and import-bound calls are
+        // resolved from source with no language server involved at all.
+        format!(
+            "{detail}; import and call edges are still resolved from source. Languages outside \
+             {} gain no reference edges in this build either",
+            crate::commands::graph::LANGUAGE_SERVER_BINARIES
+                .iter()
+                .map(|(language, _)| language.to_string())
+                .collect::<Vec<_>>()
+                .join("/")
+        ),
+    )
+    .with_manual_fix(
+        "install a language server for the named language (for example `npm i -g pyright` or \
+         `rustup component add rust-analyzer`), then restart the daemon",
+    )
+}
+
 /// Report the active retrieval quality profile and the effective lever set,
 /// so an operator can see at a glance whether they are getting full
 /// retrieval capability — and why not, when a lever is off.
@@ -2211,6 +2280,61 @@ mod tests {
     use super::*;
     use kin_core::test_env::EnvVarGuard;
     use serial_test::serial;
+
+    /// A host with no language server must be told which language lost which
+    /// edge class, and told it in words rather than as a low relation count.
+    #[test]
+    fn doctor_names_the_language_whose_missing_server_costs_cross_file_edges() {
+        let check = cross_file_enrichment_check(&std::collections::HashSet::new());
+
+        assert!(matches!(check.status, HealthStatus::Stale));
+        assert!(
+            check.detail.contains("no language server found for"),
+            "{}",
+            check.detail
+        );
+        assert!(check.detail.contains("python"), "{}", check.detail);
+        assert!(
+            check.detail.contains("pyright-langserver"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check
+                .detail
+                .contains("import and call edges are still resolved from source"),
+            "the row must not read as a total loss: {}",
+            check.detail
+        );
+        assert!(check.manual_fix.is_some());
+    }
+
+    /// The counterpart, so the row above cannot be an unconditional warning:
+    /// with every wired language's server installed there is no gap to report.
+    #[test]
+    fn doctor_reports_no_gap_once_every_wired_language_server_is_installed() {
+        let installed: std::collections::HashSet<kin_model::LanguageId> =
+            crate::commands::graph::LANGUAGE_SERVER_BINARIES
+                .iter()
+                .map(|(language, _)| *language)
+                .collect();
+        let check = cross_file_enrichment_check(&installed);
+
+        assert!(matches!(check.status, HealthStatus::Healthy));
+        assert!(!check.detail.contains("unavailable"), "{}", check.detail);
+    }
+
+    /// A `Stale` row needs attention without failing readiness. A missing
+    /// language server degrades a working install; calling it a failure would
+    /// turn `kin doctor` red on every host that never installed one.
+    #[test]
+    fn a_missing_language_server_needs_attention_without_blocking_readiness() {
+        let check = cross_file_enrichment_check(&std::collections::HashSet::new());
+        assert!(!blocks_readiness(&check));
+        let report = assemble_health_report("test".to_string(), vec![check]);
+        assert!(report.healthy);
+        assert_eq!(report.summary().attention, 1);
+    }
 
     fn write_file(path: &Path, bytes: &[u8]) {
         use std::io::Write;

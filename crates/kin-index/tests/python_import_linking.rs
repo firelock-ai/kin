@@ -22,7 +22,9 @@ fn parse_with(adapter: &dyn LanguageAdapter, path: &str, src: &str) -> FileParse
     let file_id = FilePathId::new(path);
     let bytes = src.as_bytes();
     let tree = adapter.parse(bytes).expect("fixture parses");
-    let output = adapter.extract(&tree, bytes, &file_id).expect("fixture extracts");
+    let output = adapter
+        .extract(&tree, bytes, &file_id)
+        .expect("fixture extracts");
     let entities: Vec<Entity> = output
         .entities
         .into_iter()

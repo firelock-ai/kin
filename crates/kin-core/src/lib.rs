@@ -14,6 +14,7 @@ pub mod assistant;
 pub mod assistant_sync;
 pub mod behavior_env;
 pub mod config;
+pub mod cross_file_coverage;
 pub mod dependencies;
 pub mod diff;
 pub mod disambiguation;
