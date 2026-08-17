@@ -451,7 +451,10 @@ fn extract_value_refs_from_definition(
     if let Some(params) = node.child_by_field_name("parameters") {
         let mut cursor = params.walk();
         for param in params.named_children(&mut cursor) {
-            if matches!(param.kind(), "default_parameter" | "typed_default_parameter") {
+            if matches!(
+                param.kind(),
+                "default_parameter" | "typed_default_parameter"
+            ) {
                 if let Some(value) = param.child_by_field_name("value") {
                     collect_python_value_refs(&value, source, context_name, &shadowed, out);
                 }
@@ -601,9 +604,7 @@ fn collect_python_value_refs(
                 .child_by_field_name("attribute")
                 .and_then(|n| n.utf8_text(source).ok());
             match (object, leaf) {
-                (Some(object), Some(leaf))
-                    if object.kind() == "identifier" && !leaf.is_empty() =>
-                {
+                (Some(object), Some(leaf)) if object.kind() == "identifier" && !leaf.is_empty() => {
                     if let Ok(root) = object.utf8_text(source) {
                         if !root.is_empty() && !shadowed.contains(root) {
                             out.push(PythonValueRef {
@@ -628,13 +629,7 @@ fn collect_python_value_refs(
                     "identifier" => {}
                     "attribute" => {
                         if let Some(object) = function.child_by_field_name("object") {
-                            collect_python_value_refs(
-                                &object,
-                                source,
-                                context_name,
-                                shadowed,
-                                out,
-                            );
+                            collect_python_value_refs(&object, source, context_name, shadowed, out);
                         }
                     }
                     _ => collect_python_value_refs(&function, source, context_name, shadowed, out),
@@ -664,8 +659,13 @@ fn collect_python_value_refs(
                 collect_python_value_refs(&body, source, context_name, shadowed, out);
             }
         }
-        "parameters" | "type" | "import_statement" | "import_from_statement"
-        | "future_import_statement" | "global_statement" | "nonlocal_statement" => {}
+        "parameters"
+        | "type"
+        | "import_statement"
+        | "import_from_statement"
+        | "future_import_statement"
+        | "global_statement"
+        | "nonlocal_statement" => {}
         _ => {
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
@@ -1484,5 +1484,288 @@ mod tests {
             .filter(|e| e.name == "Color")
             .collect();
         assert_eq!(classes[0].kind, EntityKind::EnumDef);
+    }
+
+    /// Value references made by `path`, as `(src, dst)` pairs.
+    fn value_refs(path: &str, source: &str) -> Vec<(String, String)> {
+        let adapter = PythonAdapter;
+        let bytes = source.as_bytes();
+        let tree = adapter.parse(bytes).unwrap();
+        let output = adapter
+            .extract(&tree, bytes, &FilePathId::new(path))
+            .unwrap();
+        output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::References)
+            .map(|r| (r.src_name.clone(), r.dst_name.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn a_function_passed_as_a_keyword_argument_is_referenced() {
+        // The reported shape: an argparse subcommand wired by name. `cmd_ingest`
+        // is never called anywhere, so without this edge it owns none at all.
+        let refs = value_refs(
+            "cli.py",
+            "def cmd_ingest(args):\n    return 1\n\ndef main():\n    ingest.set_defaults(func=cmd_ingest)\n",
+        );
+        assert!(
+            refs.contains(&("main".to_string(), "cmd_ingest".to_string())),
+            "expected main -> cmd_ingest, got {refs:?}"
+        );
+    }
+
+    #[test]
+    fn every_value_position_that_names_a_local_entity_is_referenced() {
+        let refs = value_refs(
+            "wire.py",
+            concat!(
+                "def handler(args):\n    return 1\n\n",
+                "def by_argument():\n    register(handler)\n\n",
+                "def by_assignment():\n    chosen = handler\n    return chosen\n\n",
+                "def by_collection():\n    return [handler]\n\n",
+                "def by_mapping():\n    return {\"ingest\": handler}\n\n",
+                "def by_default(fn=handler):\n    return fn\n\n",
+                "def by_return():\n    return handler\n",
+            ),
+        );
+        for src in [
+            "by_argument",
+            "by_assignment",
+            "by_collection",
+            "by_mapping",
+            "by_default",
+            "by_return",
+        ] {
+            assert!(
+                refs.contains(&(src.to_string(), "handler".to_string())),
+                "expected {src} -> handler, got {refs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn attribute_access_on_a_module_constant_references_the_constant() {
+        // `TAG_RE.findall(...)` reads TAG_RE. The `.findall` leaf names a method
+        // of the compiled regex, not a symbol of this file.
+        let refs = value_refs(
+            "parsing.py",
+            "TAG_RE = compile(\"#\")\n\ndef extract_tags(text):\n    return TAG_RE.findall(text)\n",
+        );
+        assert!(
+            refs.contains(&("extract_tags".to_string(), "TAG_RE".to_string())),
+            "expected extract_tags -> TAG_RE, got {refs:?}"
+        );
+        assert!(
+            !refs.iter().any(|(_, dst)| dst == "findall"),
+            "the attribute leaf is not a symbol of this file, got {refs:?}"
+        );
+    }
+
+    #[test]
+    fn an_imported_constant_read_through_an_attribute_is_referenced_by_its_bare_name() {
+        // Cross-file: the linker binds this through the file's import table, so
+        // the destination must be the imported name, not a dotted form.
+        let refs = value_refs(
+            "cli.py",
+            "from parsing import TAG_RE\n\ndef build_parser():\n    return TAG_RE.pattern\n",
+        );
+        assert!(
+            refs.contains(&("build_parser".to_string(), "TAG_RE".to_string())),
+            "expected build_parser -> TAG_RE, got {refs:?}"
+        );
+    }
+
+    #[test]
+    fn a_constant_reached_through_a_module_import_keeps_its_module_qualifier() {
+        // `import parsing` binds the module; `parsing.TAG_RE` names a member of
+        // it. The dotted form is what the linker's namespace-member tier
+        // resolves, and reducing it to the bare leaf would let a same-named
+        // symbol in any other file answer for it.
+        let refs = value_refs(
+            "cli.py",
+            "import parsing\n\ndef build_parser():\n    return parsing.TAG_RE\n",
+        );
+        assert!(
+            refs.contains(&("build_parser".to_string(), "parsing.TAG_RE".to_string())),
+            "expected build_parser -> parsing.TAG_RE, got {refs:?}"
+        );
+    }
+
+    #[test]
+    fn import_source_is_annotated_on_a_value_reference() {
+        let adapter = PythonAdapter;
+        let source =
+            b"from parsing import TAG_RE\n\ndef build_parser():\n    return TAG_RE.pattern\n";
+        let tree = adapter.parse(source).unwrap();
+        let output = adapter
+            .extract(&tree, source, &FilePathId::new("cli.py"))
+            .unwrap();
+        let annotated = output
+            .relations
+            .iter()
+            .find(|r| r.kind == kin_model::RelationKind::References && r.dst_name == "TAG_RE")
+            .expect("the value reference exists");
+        assert_eq!(annotated.import_source.as_deref(), Some("parsing"));
+    }
+
+    #[test]
+    fn a_module_scope_reference_is_sourced_from_the_module() {
+        let refs = value_refs(
+            "cli.py",
+            "def cmd_ingest(args):\n    return 1\n\nHANDLERS = {\"ingest\": cmd_ingest}\n",
+        );
+        assert!(
+            refs.contains(&("cli".to_string(), "cmd_ingest".to_string())),
+            "expected cli -> cmd_ingest, got {refs:?}"
+        );
+    }
+
+    #[test]
+    fn a_class_body_assignment_references_from_the_class() {
+        let refs = value_refs(
+            "cli.py",
+            "def handler(args):\n    return 1\n\nclass Router:\n    default = handler\n",
+        );
+        assert!(
+            refs.contains(&("Router".to_string(), "handler".to_string())),
+            "expected Router -> handler, got {refs:?}"
+        );
+    }
+
+    #[test]
+    fn a_local_binding_shadows_a_module_level_name_of_the_same_name() {
+        // `handler` inside `run` is a local, so reading it says nothing about
+        // the module-level function. Without the shadow rule this edge would
+        // make genuinely dead code look alive.
+        let refs = value_refs(
+            "cli.py",
+            "def handler(args):\n    return 1\n\ndef run(handler):\n    return handler\n\ndef other():\n    handler = 1\n    return handler\n",
+        );
+        assert!(
+            !refs.contains(&("run".to_string(), "handler".to_string())),
+            "a parameter shadows the module scope, got {refs:?}"
+        );
+        assert!(
+            !refs.contains(&("other".to_string(), "handler".to_string())),
+            "a local assignment shadows the module scope, got {refs:?}"
+        );
+    }
+
+    #[test]
+    fn a_global_declaration_lifts_the_local_shadow() {
+        let refs = value_refs(
+            "counters.py",
+            "TOTAL_SEEN = 0\n\ndef bump():\n    global TOTAL_SEEN\n    TOTAL_SEEN = TOTAL_SEEN + 1\n",
+        );
+        assert!(
+            refs.contains(&("bump".to_string(), "TOTAL_SEEN".to_string())),
+            "expected bump -> TOTAL_SEEN, got {refs:?}"
+        );
+    }
+
+    #[test]
+    fn a_name_this_file_neither_defines_nor_imports_emits_no_reference() {
+        // Locals, parameters and builtins are the bulk of every value position.
+        // Emitting them would let the linker bind a local called `config` to an
+        // unrelated module-level `config` in some other file, by name alone.
+        let refs = value_refs(
+            "cli.py",
+            "def run(payload):\n    total = len(payload)\n    return total\n",
+        );
+        assert!(refs.is_empty(), "expected no references, got {refs:?}");
+    }
+
+    #[test]
+    fn an_unreferenced_function_still_owns_no_edge() {
+        // The opposite direction: the rows that should stay on a dead-code list
+        // must keep reporting nothing.
+        let refs = value_refs(
+            "parsing.py",
+            "def unused_helper(text):\n    return text\n\ndef used_helper(text):\n    return text\n\ndef caller():\n    return used_helper\n",
+        );
+        assert!(
+            refs.contains(&("caller".to_string(), "used_helper".to_string())),
+            "expected caller -> used_helper, got {refs:?}"
+        );
+        assert!(
+            !refs.iter().any(|(_, dst)| dst == "unused_helper"),
+            "unused_helper is named nowhere, got {refs:?}"
+        );
+    }
+
+    #[test]
+    fn a_self_reference_emits_no_edge() {
+        let refs = value_refs(
+            "rec.py",
+            "def wrapper(n):\n    if n:\n        return wrapper\n    return None\n",
+        );
+        assert!(
+            !refs.contains(&("wrapper".to_string(), "wrapper".to_string())),
+            "a self-reference establishes no reachability, got {refs:?}"
+        );
+    }
+
+    #[test]
+    fn a_repeated_reference_emits_one_edge() {
+        let refs = value_refs(
+            "cli.py",
+            "def handler(args):\n    return 1\n\ndef wire():\n    a.set_defaults(func=handler)\n    b.set_defaults(func=handler)\n",
+        );
+        let hits = refs
+            .iter()
+            .filter(|(src, dst)| src == "wire" && dst == "handler")
+            .count();
+        assert_eq!(hits, 1, "expected one deduped edge, got {refs:?}");
+    }
+
+    #[test]
+    fn a_bare_decorator_stays_a_call_edge_and_gains_no_duplicate_reference() {
+        // A decorator applies its target at definition time, so it is already a
+        // Calls edge. Adding a second References edge for the same site would
+        // double-count one use.
+        let adapter = PythonAdapter;
+        let source =
+            b"def register(fn):\n    return fn\n\n@register\ndef handler():\n    return 1\n";
+        let tree = adapter.parse(source).unwrap();
+        let output = adapter
+            .extract(&tree, source, &FilePathId::new("cli.py"))
+            .unwrap();
+        assert!(
+            output.relations.iter().any(|r| {
+                r.kind == kin_model::RelationKind::Calls
+                    && r.src_name == "handler"
+                    && r.dst_name == "register"
+            }),
+            "the decorator keeps its Calls edge"
+        );
+        assert!(
+            !output
+                .relations
+                .iter()
+                .any(|r| r.kind == kin_model::RelationKind::References && r.dst_name == "register"),
+            "no duplicate reference for the same decorator site"
+        );
+    }
+
+    #[test]
+    fn a_value_reference_does_not_change_call_coverage() {
+        // The call-extraction audit records what the CALL walk could not
+        // represent. Routing value references through it would report a file as
+        // call-incomplete for reading a constant.
+        let adapter = PythonAdapter;
+        let source = b"HANDLER = 1\n\ndef run():\n    return HANDLER\n";
+        let tree = adapter.parse(source).unwrap();
+        let output = adapter
+            .extract(&tree, source, &FilePathId::new("cov.py"))
+            .unwrap();
+        assert!(
+            !output
+                .relations
+                .iter()
+                .any(crate::extract::is_call_extraction_incomplete_marker),
+            "reading a constant is not an unrepresented call"
+        );
     }
 }
