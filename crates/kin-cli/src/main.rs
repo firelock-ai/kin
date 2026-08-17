@@ -8,6 +8,7 @@ use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{self, Shell};
 use kin_cli::commands;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use tracing::Instrument;
 use tracing_subscriber::prelude::*;
@@ -2336,7 +2337,18 @@ fn main() -> Result<()> {
     } else {
         tracing_subscriber::registry()
             .with(default_env_filter(&command_name))
-            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+            .with(AdmissionProgressLayer)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::stderr)
+                    // The fmt layer does not sniff for a terminal, so without
+                    // this it writes colour escapes into a redirected log or a
+                    // captured transcript.
+                    .with_ansi(std::io::stderr().is_terminal())
+                    .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+                        !is_periodic_admission_progress(metadata.target())
+                    })),
+            )
             .init();
     }
 
@@ -3530,6 +3542,85 @@ fn env_flag(name: &str) -> bool {
 /// killed after 11h43m of silence that turned out to be ordinary progress.
 const PROGRESS_REPORTING_COMMANDS: [&str; 2] = ["init", "clone"];
 
+/// Targets whose events are progress within an admission phase, not outcomes.
+///
+/// These report the same work the phase ladder is already drawing a line for,
+/// repeatedly, while that line is on screen. Formatting them as log records put
+/// ANSI escapes and the internal span path they were emitted under straight
+/// through a redrawn progress display, so [`AdmissionProgressLayer`] takes them
+/// and the fmt layer is filtered to leave them alone.
+fn is_periodic_admission_progress(target: &str) -> bool {
+    target == "kin_db::storage::history_replay"
+}
+
+/// Render an admission progress event onto the live phase line.
+///
+/// The event's own message is not reused. `history_replay` reports elapsed
+/// whole seconds, so its terminal line reads "validated 6,413 changes in 0s"
+/// for any replay under a second and says nothing useful about a replay that
+/// took two minutes. The phase line already carries its own elapsed time, so
+/// what is wanted from the event is how far along it is, which is what its
+/// `validated` and `total` fields carry.
+///
+/// With no ladder open the line is printed plainly instead of dropped, so
+/// running an admission phase's instrumentation outside the ladder still says
+/// something, just without escapes or span paths.
+struct AdmissionProgressLayer;
+
+#[derive(Default)]
+struct AdmissionProgressFields {
+    message: Option<String>,
+    validated: Option<u64>,
+    total: Option<u64>,
+}
+
+impl tracing::field::Visit for AdmissionProgressFields {
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        match field.name() {
+            "validated" => self.validated = Some(value),
+            "total" => self.total = Some(value),
+            _ => {}
+        }
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.message = Some(format!("{value:?}"));
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.message = Some(value.to_string());
+        }
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AdmissionProgressLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if !is_periodic_admission_progress(event.metadata().target()) {
+            return;
+        }
+        let mut fields = AdmissionProgressFields::default();
+        event.record(&mut fields);
+        let detail = match (fields.validated, fields.total) {
+            (Some(validated), Some(total)) => format!("{validated}/{total} changes validated"),
+            (Some(validated), None) => format!("{validated} changes validated"),
+            _ => match fields.message {
+                Some(message) => message,
+                None => return,
+            },
+        };
+        if !kin_core::report_admission_progress(&detail) {
+            eprintln!("  {detail}");
+        }
+    }
+}
+
 /// Admission targets raised to `info` for [`PROGRESS_REPORTING_COMMANDS`].
 ///
 /// Deliberately target-scoped rather than crate-wide. `kin_core=info` would also
@@ -3546,15 +3637,17 @@ const PROGRESS_REPORTING_COMMANDS: [&str; 2] = ["init", "clone"];
 ///   admission surfaces its own outcome and so no further `kin-cli` change is
 ///   needed later.
 /// - `kin_db::storage::history_replay` is the only periodic emitter, throttled
-///   at its source. It does not exist in the KinDB this workspace currently
-///   pins, and a directive naming an absent target simply never matches, so it
-///   is pre-wired and inert.
+///   at its source. It is **live**, and has been since this workspace's KinDB
+///   pin moved: the module ships in the pinned version, so the directive that
+///   was written as pre-wired and inert now matches. That is how raw log
+///   records first appeared inside the phase ladder's display, and it is why
+///   [`AdmissionProgressLayer`] exists rather than the fmt layer rendering
+///   them. Anything added to this list that emits mid-flight rather than
+///   terminally needs the same treatment, or it will scribble over the ladder
+///   the same way.
 ///
-/// So a long admission does **not** report mid-flight progress at this version.
-/// It begins the moment this workspace consumes a KinDB shipping
-/// `storage::history_replay`, with no change here. Anyone diagnosing an
-/// apparently stalled `kin init` before then should not read silence as
-/// evidence that the instrumentation ran.
+/// So a long admission does report mid-flight progress, on the phase line
+/// itself rather than as separate records.
 ///
 /// `kin_db::storage::snapshot` is deliberately not here, despite carrying three
 /// live conditional `info!` sites. All three sit on `SnapshotManager` reopen and
@@ -3817,18 +3910,62 @@ mod tests {
                 )),
                 "kin {command} must admit Git admission output"
             );
-            // Pre-wired rather than live: no module of this name exists in the
-            // KinDB this workspace pins, so nothing emits on it yet. Probing it
-            // proves the directive carries such events the moment one does,
-            // which is the only thing pre-wiring can be held to.
+            // Live, not pre-wired: the module ships in the pinned KinDB and
+            // emits during the commit phase. It has to survive the filter to
+            // reach `AdmissionProgressLayer`, which is what draws it onto the
+            // phase line instead of letting the fmt layer print it.
             assert!(
                 survives(installed_filter(command), || tracing::info!(
                     target: "kin_db::storage::history_replay",
                     "probe"
                 )),
-                "kin {command} must already admit the pre-wired replay target"
+                "kin {command} must admit the replay progress target"
             );
         }
+    }
+
+    /// The periodic replay target reaches the progress layer and not the fmt
+    /// layer, and every other admission target keeps printing as a record.
+    ///
+    /// Both halves matter and they fail differently. If the replay target were
+    /// not excluded from fmt it would print raw, with ANSI and the internal
+    /// span path, over the redrawn phase line, which is the defect. If the
+    /// exclusion were written broadly enough to catch `kin_core::git_init` it
+    /// would swallow the admission receipt, and the command would finish
+    /// saying nothing about what it admitted.
+    #[test]
+    fn only_the_periodic_replay_target_is_taken_off_the_record_layer() {
+        assert!(is_periodic_admission_progress(
+            "kin_db::storage::history_replay"
+        ));
+        for printed in [
+            "kin_core::init",
+            "kin_core::git_init",
+            "kin_db::storage::snapshot",
+            "kin_db::storage::repository",
+            "kin_cli",
+        ] {
+            assert!(
+                !is_periodic_admission_progress(printed),
+                "{printed} must keep printing as a record"
+            );
+        }
+    }
+
+    /// With no admission ladder open, a progress event is printed rather than
+    /// dropped.
+    ///
+    /// The sink reports whether a live phase took the line, and that return is
+    /// the only thing standing between "routed onto the phase line" and
+    /// "silently discarded". A sink that always answered true would make an
+    /// admission's instrumentation vanish outside the ladder, and nothing about
+    /// the display would look wrong while it did.
+    #[test]
+    fn a_progress_report_with_no_ladder_open_is_not_swallowed() {
+        assert!(
+            !kin_core::report_admission_progress("4096/6413 changes validated"),
+            "no ladder is open in a unit test, so the sink must decline the line"
+        );
     }
 
     #[test]

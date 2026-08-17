@@ -81,7 +81,10 @@ pub fn inspect_support_graph(
     binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
 ) -> Result<SupportJson> {
-    let health = super::graph_health::inspect_graph(binding, graph)?;
+    let health = super::graph_health::inspect_graph(
+        &super::repository_authority::RequestRepositoryAuthority::pinned(binding.clone()),
+        graph,
+    )?;
     let stats = graph.graph_stats();
     Ok(SupportJson::from_parts(&stats, health))
 }

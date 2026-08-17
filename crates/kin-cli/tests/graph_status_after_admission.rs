@@ -204,7 +204,9 @@ fn graph_status(
     graph: &kin_db::InMemoryGraph,
 ) -> kin_cli::commands::graph::GraphCommandResponse {
     execute_graph_command(
-        binding,
+        &kin_cli::commands::repository_authority::RequestRepositoryAuthority::pinned(
+            binding.clone(),
+        ),
         graph,
         &GraphCommandRequest::Status,
         &Default::default(),
@@ -266,7 +268,9 @@ fn graph_validate(
     graph: &kin_db::InMemoryGraph,
 ) -> kin_cli::commands::graph::GraphCommandResponse {
     execute_graph_command(
-        binding,
+        &kin_cli::commands::repository_authority::RequestRepositoryAuthority::pinned(
+            binding.clone(),
+        ),
         graph,
         &GraphCommandRequest::Validate,
         &Default::default(),
