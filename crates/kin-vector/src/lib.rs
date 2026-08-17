@@ -112,6 +112,15 @@ const PARALLEL_SEED: usize = 128;
 
 type CanonicalOrderItem<Id> = (u64, Vec<u8>, Id, Vec<f32>, usize);
 
+/// Everything a canonical rebuild needs, copied out of a live graph so the
+/// rebuild can run with no lock held.
+struct CanonicalRebuildInputs<Id> {
+    items: Vec<CanonicalOrderItem<Id>>,
+    dimensions: usize,
+    reserved_legacy_slot: u64,
+    descriptor: IndexDescriptor,
+}
+
 /// Normalization factor for level generation: 1 / ln(M).
 fn ml() -> f64 {
     1.0 / (M as f64).ln()
@@ -647,6 +656,21 @@ pub struct HnswGraph<Id: VectorId = DefaultId> {
     /// canonical key order so final topology is independent of ingestion order.
     #[serde(skip)]
     pub canonical_order_dirty: bool,
+    /// Monotonic count of content mutations, bumped by [`HnswGraph::mark_mutated`]
+    /// alongside every `canonical_order_dirty` set.
+    ///
+    /// `save` canonicalizes a snapshot taken under a read lock, off the lock, and
+    /// then installs the result back so the next save stays cheap. That install is
+    /// only sound while the live graph still holds exactly the content the snapshot
+    /// was taken from, and the dirty flag alone cannot say so: it is already `true`
+    /// at snapshot time and stays `true` whether or not an upsert landed during the
+    /// rebuild. This counter is that witness — an unchanged value means no mutation
+    /// intervened, so installing the rebuild cannot drop one.
+    ///
+    /// Not serialized: it describes a live graph's mutation history within one
+    /// process, never the persisted bytes.
+    #[serde(skip)]
+    pub mutation_seq: u64,
     /// [`squared_norm`] of each node's vector, parallel to `nodes`. A search
     /// evaluates a node's norm once per query without it; with it, once per
     /// load.
@@ -691,8 +715,17 @@ impl<Id: VectorId> HnswGraph<Id> {
             descriptor: IndexDescriptor::default(),
             backlinks: Vec::new(),
             canonical_order_dirty: false,
+            mutation_seq: 0,
             sq_norms: Vec::new(),
         }
+    }
+
+    /// Record a content mutation: the canonical order is now stale, and any
+    /// off-lock canonicalization taken before this point no longer describes the
+    /// live graph.
+    fn mark_mutated(&mut self) {
+        self.canonical_order_dirty = true;
+        self.mutation_seq = self.mutation_seq.wrapping_add(1);
     }
 
     fn active_count(&self) -> usize {
@@ -716,6 +749,7 @@ impl<Id: VectorId> HnswGraph<Id> {
             descriptor: self.descriptor.clone(),
             backlinks: Vec::new(),
             canonical_order_dirty: false,
+            mutation_seq: self.mutation_seq,
             sq_norms: Vec::new(),
         }
     }
@@ -1048,7 +1082,7 @@ impl<Id: VectorId> HnswGraph<Id> {
     fn insert(&mut self, entity_id: Id, vector: &[f32]) -> Result<(), VectorError> {
         let level = hnsw_level_for_key(&entity_id);
         self.insert_with_level(entity_id, vector, level)?;
-        self.canonical_order_dirty = true;
+        self.mark_mutated();
         Ok(())
     }
 
@@ -1204,14 +1238,13 @@ impl<Id: VectorId> HnswGraph<Id> {
         }
     }
 
-    fn ensure_canonical_order(&mut self) -> Result<(), VectorError> {
-        if !self.canonical_order_dirty {
-            return Ok(());
-        }
-
-        let dimensions = self.dimensions;
-        let reserved_legacy_slot = self.reserved_legacy_slot;
-        let descriptor = self.descriptor.clone();
+    /// The inputs a canonical rebuild consumes, copied out of the live graph.
+    ///
+    /// Read-only and cheap relative to the rebuild itself: it copies each live
+    /// node's vector, key and level, and none of the edge structure the rebuild
+    /// recomputes. Splitting it out is what lets `save` hold the graph lock for a
+    /// copy instead of for a full re-insertion of every node (FIR-2367).
+    fn canonical_rebuild_inputs(&self) -> Result<CanonicalRebuildInputs<Id>, VectorError> {
         let mut items: Vec<CanonicalOrderItem<Id>> = Vec::with_capacity(self.id_to_idx.len());
 
         for (&id, &idx) in &self.id_to_idx {
@@ -1234,6 +1267,31 @@ impl<Id: VectorId> HnswGraph<Id> {
             ));
         }
 
+        Ok(CanonicalRebuildInputs {
+            items,
+            dimensions: self.dimensions,
+            reserved_legacy_slot: self.reserved_legacy_slot,
+            descriptor: self.descriptor.clone(),
+        })
+    }
+
+    /// THE canonicalization. Every persisted or queried canonical graph in this
+    /// crate is produced here and nowhere else, so byte-identity across rebuilds
+    /// is a property of one function rather than of two that have to agree.
+    ///
+    /// Order is a pure function of the key set — keys sort by stable digest then
+    /// by canonical id bytes — and each node re-enters at the level
+    /// [`hnsw_level_for_key`] assigns it, which is likewise a digest of the key.
+    /// So the same key set yields the same topology, in the same slot order, no
+    /// matter what order the keys arrived in or on which thread this runs.
+    fn rebuild_canonical(inputs: CanonicalRebuildInputs<Id>) -> Result<HnswGraph<Id>, VectorError> {
+        let CanonicalRebuildInputs {
+            mut items,
+            dimensions,
+            reserved_legacy_slot,
+            descriptor,
+        } = inputs;
+
         items.sort_by(|a, b| Self::canonical_id_cmp(&(a.0, &a.1), &(b.0, &b.1)));
 
         let mut rebuilt = HnswGraph::new(dimensions);
@@ -1243,6 +1301,19 @@ impl<Id: VectorId> HnswGraph<Id> {
             rebuilt.insert_with_level(id, &vector, level)?;
         }
         rebuilt.canonical_order_dirty = false;
+
+        Ok(rebuilt)
+    }
+
+    fn ensure_canonical_order(&mut self) -> Result<(), VectorError> {
+        if !self.canonical_order_dirty {
+            return Ok(());
+        }
+
+        let mut rebuilt = Self::rebuild_canonical(self.canonical_rebuild_inputs()?)?;
+        // The rebuild counted its own insertions; the live graph's mutation
+        // history is what callers compare against, so carry it forward.
+        rebuilt.mutation_seq = self.mutation_seq;
         *self = rebuilt;
 
         Ok(())
@@ -1295,7 +1366,7 @@ impl<Id: VectorId> HnswGraph<Id> {
             self.backlinks[idx].clear();
         }
         self.free_list.push(idx);
-        self.canonical_order_dirty = true;
+        self.mark_mutated();
 
         // If we removed the entry point, pick a new one.
         //
@@ -1724,6 +1795,7 @@ fn decode_v2<Id: VectorId>(bytes: &[u8]) -> Result<(HnswGraph<Id>, KvecLoadStats
         descriptor: header.descriptor,
         backlinks: Vec::new(),
         canonical_order_dirty: false,
+        mutation_seq: 0,
         sq_norms: Vec::new(),
     };
     graph.rebuild_backlinks();
@@ -2227,18 +2299,45 @@ pub struct VectorIndex<Id: VectorId = DefaultId> {
 }
 
 impl<Id: VectorId> VectorIndex<Id> {
-    fn with_canonical_graph<R>(
-        &self,
-        f: impl FnOnce(&HnswGraph<Id>) -> Result<R, VectorError>,
-    ) -> Result<R, VectorError> {
-        let graph = self.graph.upgradable_read();
-        if graph.canonical_order_dirty {
-            let mut graph = parking_lot::RwLockUpgradableReadGuard::upgrade(graph);
-            graph.ensure_canonical_order()?;
-            f(&graph)
-        } else {
-            f(&graph)
+    /// A canonical, detached copy of the graph, produced without holding the
+    /// graph lock across the rebuild.
+    ///
+    /// The lock is held only for [`HnswGraph::canonical_rebuild_inputs`], which
+    /// copies each live node's key, vector and level. The re-insertion that
+    /// actually costs — every node re-linked against a growing graph — runs on
+    /// the copy with no lock held, so a concurrent upsert waits for a memcpy
+    /// rather than for a full HNSW rebuild.
+    ///
+    /// Returns the copy and the mutation counter it was taken at, or `None` for
+    /// that counter when the live graph was already canonical and the copy is a
+    /// plain persistence clone with nothing to install back.
+    fn canonical_persist_snapshot(&self) -> Result<(HnswGraph<Id>, Option<u64>), VectorError> {
+        let (inputs, snapshot_seq) = {
+            let graph = self.graph.read();
+            if !graph.canonical_order_dirty {
+                return Ok((graph.clone_for_persist(), None));
+            }
+            (graph.canonical_rebuild_inputs()?, graph.mutation_seq)
+        };
+        Ok((HnswGraph::rebuild_canonical(inputs)?, Some(snapshot_seq)))
+    }
+
+    /// Install an off-lock rebuild onto the live graph, if and only if nothing
+    /// mutated that graph since the snapshot the rebuild was built from.
+    ///
+    /// The rebuild is exactly what [`HnswGraph::ensure_canonical_order`] would
+    /// have produced in place, so installing it under an unchanged
+    /// `mutation_seq` reaches the same state by a cheaper route and keeps the
+    /// next save off the rebuild path. Under a changed one it is stale by
+    /// precisely the mutations it missed, and is dropped rather than allowed to
+    /// revert them.
+    fn install_canonical_rebuild(&self, mut rebuilt: HnswGraph<Id>, snapshot_seq: u64) {
+        let mut graph = self.graph.write();
+        if graph.mutation_seq != snapshot_seq {
+            return;
         }
+        rebuilt.mutation_seq = snapshot_seq;
+        *graph = rebuilt;
     }
 
     /// Create a new vector index for embeddings of the given dimensionality.
@@ -2275,7 +2374,13 @@ impl<Id: VectorId> VectorIndex<Id> {
 
     /// Stamp / replace the self-description; persisted on the next `save`.
     pub fn set_descriptor(&self, descriptor: IndexDescriptor) {
-        self.graph.write().descriptor = descriptor;
+        let mut graph = self.graph.write();
+        graph.descriptor = descriptor;
+        // The descriptor is not topology, so this does not dirty the canonical
+        // order. It is still a content change a concurrent save's snapshot
+        // predates, so the counter moves and that save declines to install over
+        // it.
+        graph.mutation_seq = graph.mutation_seq.wrapping_add(1);
     }
 
     /// The dimensionality of vectors in this index.
@@ -2448,7 +2553,7 @@ impl<Id: VectorId> VectorIndex<Id> {
             cursor = end;
         }
 
-        graph.canonical_order_dirty = true;
+        graph.mark_mutated();
         Ok(())
     }
 
@@ -2470,7 +2575,7 @@ impl<Id: VectorId> VectorIndex<Id> {
     /// After the call `deleted_fraction()` returns `0.0`.
     pub fn compact(&self) -> Result<(), VectorError> {
         let mut graph = self.graph.write();
-        graph.canonical_order_dirty = true;
+        graph.mark_mutated();
         graph.ensure_canonical_order()
     }
 
@@ -2564,12 +2669,19 @@ impl<Id: VectorId> VectorIndex<Id> {
             path = %path.display()
         )
         .entered();
-        // Canonicalize (if needed) and copy a consistent snapshot under the graph
-        // lock, then release the lock BEFORE the heavy serialize + fsync so the
-        // GPU-fed upsert path is not blocked by index IO. Concurrent upserts after
-        // this point simply land in the next save.
-        let graph = self.with_canonical_graph(|graph| Ok(graph.clone_for_persist()))?;
-        let bytes = encode_v2(&graph)?;
+        // Copy a consistent snapshot under a READ lock, then canonicalize,
+        // serialize and fsync it with NO lock held, so the GPU-fed upsert path is
+        // blocked by neither the HNSW rebuild nor the index IO. Concurrent upserts
+        // after the snapshot simply land in the next save.
+        let (snapshot, snapshot_seq) = self.canonical_persist_snapshot()?;
+        let bytes = encode_v2(&snapshot)?;
+        // Keep the canonical form so an index nobody has touched since does not
+        // re-canonicalize on its next save. Skipped when a mutation landed while
+        // the rebuild was running, which leaves the live graph dirty and the next
+        // save to redo it against the newer content.
+        if let Some(seq) = snapshot_seq {
+            self.install_canonical_rebuild(snapshot, seq);
+        }
         atomic_save_bytes(path, &bytes, "vector index")
     }
 
@@ -3130,7 +3242,7 @@ mod tests {
 
     /// Canonicalization is now deferred (lazy): public search no longer rebuilds
     /// the graph on every call; callers run [`VectorIndex::ensure_canonical_order`]
-    /// (or `save`, which canonicalizes via `with_canonical_graph`) at the boundary
+    /// (or `save`, which canonicalizes an off-lock copy) at the boundary
     /// where order-independence is required. This pins the two guarantees that make
     /// that safe: (1) the lazy explicit canonicalization and the eager save-path
     /// canonicalization produce bit-identical query results, even from different
@@ -3174,7 +3286,7 @@ mod tests {
         };
 
         // Eager: `save` canonicalizes the in-memory graph in place via
-        // `with_canonical_graph` (the pre-existing canonicalization entry point).
+        // the off-lock snapshot path, then installs the result back.
         let eager = build(&reversed, dim);
         let dir = tempfile::tempdir().unwrap();
         eager.save(&dir.path().join("eager.hnsw")).unwrap();
@@ -4864,6 +4976,252 @@ mod tests {
         );
     }
 
+    /// Citable-bar guarantee, across the two routes canonicalization can take:
+    /// an index that is built, saved, reloaded and rebuilt must serialize to the
+    /// SAME bytes whether the rebuild ran in place under the write lock or on the
+    /// off-lock copy `save` takes.
+    ///
+    /// This is the property the fix had to keep. A rebuild is a pure function of
+    /// the key set — level comes from [`hnsw_level_for_key`], a stable digest of
+    /// the key, and slot order comes from a digest-then-id-bytes sort — so moving
+    /// WHERE the rebuild runs must not move WHAT it produces. Both routes call
+    /// [`HnswGraph::rebuild_canonical`], and this holds them to it end to end,
+    /// through a real reload rather than only in memory.
+    #[test]
+    fn a_reloaded_index_rebuilds_to_byte_identical_bytes() {
+        let dim = 24;
+        let idx = container_fixture(400, dim);
+
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.kvec");
+        idx.save(&first).unwrap();
+        let reference = std::fs::read(&first).unwrap();
+
+        // Route 1: reload, rebuild IN PLACE under the write lock, save.
+        let in_place = VectorIndex::<u64>::load_from_disk(&first).unwrap();
+        in_place.compact().unwrap();
+        let in_place_path = dir.path().join("in_place.kvec");
+        in_place.save(&in_place_path).unwrap();
+        assert_eq!(
+            std::fs::read(&in_place_path).unwrap(),
+            reference,
+            "an in-place rebuild of a reloaded index did not reproduce the saved bytes"
+        );
+
+        // Route 2: reload, mark the order stale, and let `save` canonicalize its
+        // off-lock copy — the path this change introduced.
+        let off_lock = VectorIndex::<u64>::load_from_disk(&first).unwrap();
+        off_lock.graph.write().mark_mutated();
+        let off_lock_path = dir.path().join("off_lock.kvec");
+        off_lock.save(&off_lock_path).unwrap();
+        assert_eq!(
+            std::fs::read(&off_lock_path).unwrap(),
+            reference,
+            "an off-lock rebuild did not reproduce the saved bytes"
+        );
+
+        // Having rebuilt off the lock with nothing racing it, `save` must have
+        // installed the result, so the next save of an untouched index takes the
+        // already-canonical path — and still writes the same bytes.
+        assert!(
+            !off_lock.graph.read().canonical_order_dirty,
+            "an uncontended save must leave the live graph canonical, or every \
+             later save re-canonicalizes from scratch"
+        );
+        let again_path = dir.path().join("again.kvec");
+        off_lock.save(&again_path).unwrap();
+        assert_eq!(
+            std::fs::read(&again_path).unwrap(),
+            reference,
+            "the already-canonical save path diverged from the rebuild path"
+        );
+    }
+
+    /// FIR-2367: `save` must not hold the graph lock across the HNSW rebuild.
+    ///
+    /// Before the fix, `save` upgraded the graph lock to a writer and rebuilt
+    /// every node in place before it could copy anything out, so a concurrent
+    /// upsert waited for the whole rebuild. That was the stall a commit minting
+    /// vectors paid. The fix copies the rebuild's inputs under a READ lock and
+    /// rebuilds off the lock, so the longest anyone waits is that copy.
+    ///
+    /// Asserted as a RATIO against the save's own duration rather than an absolute
+    /// bound, so it means the same thing on a fast machine and a loaded one: with
+    /// the lock held across the rebuild the worst stall is essentially the entire
+    /// save, and with it released the stall is the copy, a small fraction of it.
+    /// The two counters also make the test unable to pass vacuously — a reader or
+    /// writer that never ran would report no stall at all.
+    #[test]
+    fn a_save_does_not_hold_the_graph_lock_across_the_rebuild() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+        use std::sync::{Arc, Barrier};
+        use std::time::Instant;
+
+        let dim = 32;
+        let n: u64 = 2500;
+        let idx = Arc::new(VectorIndex::<u64>::new(dim).unwrap());
+        idx.upsert_batch((0..n).map(|k| (k, batch_test_vec(k, dim))).collect())
+            .unwrap();
+        assert!(
+            idx.graph.read().canonical_order_dirty,
+            "the save under test must be one that actually rebuilds"
+        );
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(Barrier::new(3));
+        let write_stall_ns = Arc::new(AtomicU64::new(0));
+        let read_stall_ns = Arc::new(AtomicU64::new(0));
+
+        let writer = {
+            let (idx, stop, ready, stall) = (
+                Arc::clone(&idx),
+                Arc::clone(&stop),
+                Arc::clone(&ready),
+                Arc::clone(&write_stall_ns),
+            );
+            std::thread::spawn(move || {
+                ready.wait();
+                let mut key = n;
+                let mut ops = 0u64;
+                while !stop.load(AtomicOrdering::Relaxed) {
+                    let vector = batch_test_vec(key, dim);
+                    let started = Instant::now();
+                    idx.upsert(key, &vector).unwrap();
+                    stall.fetch_max(started.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+                    key += 1;
+                    ops += 1;
+                }
+                ops
+            })
+        };
+
+        let reader = {
+            let (idx, stop, ready, stall) = (
+                Arc::clone(&idx),
+                Arc::clone(&stop),
+                Arc::clone(&ready),
+                Arc::clone(&read_stall_ns),
+            );
+            std::thread::spawn(move || {
+                ready.wait();
+                let probe = batch_test_vec(11, dim);
+                let mut ops = 0u64;
+                while !stop.load(AtomicOrdering::Relaxed) {
+                    let started = Instant::now();
+                    idx.search_similar(&probe, 10).unwrap();
+                    stall.fetch_max(started.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+                    ops += 1;
+                }
+                ops
+            })
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        ready.wait();
+        let started = Instant::now();
+        idx.save(&dir.path().join("idx.kvec")).unwrap();
+        let save_ns = started.elapsed().as_nanos() as u64;
+        stop.store(true, AtomicOrdering::Relaxed);
+
+        let writes = writer.join().unwrap();
+        let reads = reader.join().unwrap();
+        assert!(
+            writes > 0 && reads > 0,
+            "no concurrent work ran, so the stalls below measure nothing: \
+             {writes} upserts, {reads} searches"
+        );
+
+        let worst_write = write_stall_ns.load(AtomicOrdering::Relaxed);
+        let worst_read = read_stall_ns.load(AtomicOrdering::Relaxed);
+        assert!(
+            worst_write * 2 < save_ns,
+            "an upsert stalled {worst_write} ns during a {save_ns} ns save, which \
+             is the graph lock being held across the rebuild"
+        );
+        assert!(
+            worst_read * 2 < save_ns,
+            "a search stalled {worst_read} ns during a {save_ns} ns save, which is \
+             the graph lock being held across the rebuild"
+        );
+    }
+
+    /// The hazard the off-lock rebuild creates, and the guard that closes it.
+    ///
+    /// `save` canonicalizes a copy taken before the upserts that land while it
+    /// runs, then installs that copy back so the next save stays cheap. Installed
+    /// unconditionally, it would silently revert every one of those upserts —
+    /// vectors accepted, acknowledged, and then gone. The mutation counter is what
+    /// makes the install decline instead.
+    ///
+    /// Writes NEW keys throughout the save, then asserts every one is still
+    /// retrievable. The counters keep it from passing vacuously: a run where the
+    /// writer finished before the rebuild began would prove nothing, so the test
+    /// requires writes to have landed on both sides of the snapshot.
+    #[test]
+    fn upserts_landing_during_a_save_are_not_reverted_by_the_install() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+        use std::sync::{Arc, Barrier};
+
+        let dim = 32;
+        let n: u64 = 2000;
+        let idx = Arc::new(VectorIndex::<u64>::new(dim).unwrap());
+        idx.upsert_batch((0..n).map(|k| (k, batch_test_vec(k, dim))).collect())
+            .unwrap();
+        assert!(
+            idx.graph.read().canonical_order_dirty,
+            "the save under test must be one that actually rebuilds"
+        );
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(Barrier::new(2));
+        let written = Arc::new(AtomicU64::new(0));
+
+        let writer = {
+            let (idx, stop, ready, written) = (
+                Arc::clone(&idx),
+                Arc::clone(&stop),
+                Arc::clone(&ready),
+                Arc::clone(&written),
+            );
+            std::thread::spawn(move || {
+                ready.wait();
+                let mut key = n;
+                while !stop.load(AtomicOrdering::Relaxed) {
+                    idx.upsert(key, &batch_test_vec(key, dim)).unwrap();
+                    written.store(key + 1, AtomicOrdering::Release);
+                    key += 1;
+                }
+                key
+            })
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        ready.wait();
+        idx.save(&dir.path().join("idx.kvec")).unwrap();
+        stop.store(true, AtomicOrdering::Relaxed);
+        let last_key = writer.join().unwrap();
+
+        let added = last_key - n;
+        assert!(
+            added > 1,
+            "only {added} concurrent upserts landed, too few for the install to \
+             have had anything to revert"
+        );
+
+        for key in n..last_key {
+            assert!(
+                idx.get(&key).is_some(),
+                "key {key}, upserted during the save, was lost when the off-lock \
+                 rebuild was installed"
+            );
+        }
+        assert_eq!(
+            idx.len(),
+            (last_key) as usize,
+            "the index lost or gained entries across a save that raced upserts"
+        );
+    }
+
     /// Recall metric: for each query, compute the true k-NN by brute force over
     /// `candidates`, then measure what fraction the ANN result captures.
     fn recall_at_k(
@@ -4986,9 +5344,7 @@ mod tests {
     /// Serialize a graph the way the version 1 writer did, so the tests have a
     /// genuine legacy file to read rather than an imagined one.
     fn encode_v1(index: &VectorIndex<u64>) -> Vec<u8> {
-        let graph = index
-            .with_canonical_graph(|graph| Ok(graph.clone_for_persist()))
-            .unwrap();
+        let graph = index.canonical_persist_snapshot().unwrap().0;
         rmp_serde::to_vec(&HnswSnapshot {
             format_version: HNSW_FORMAT_VERSION,
             graph,
@@ -5092,11 +5448,7 @@ mod tests {
         let idx = container_fixture(120, dim);
 
         let v1_bytes = encode_v1(&idx);
-        let v2_bytes = encode_v2(
-            &idx.with_canonical_graph(|graph| Ok(graph.clone_for_persist()))
-                .unwrap(),
-        )
-        .unwrap();
+        let v2_bytes = encode_v2(&idx.canonical_persist_snapshot().unwrap().0).unwrap();
 
         // Positive control: the legacy decoder reads a legacy container.
         decode_v1::<u64>(&v1_bytes).expect("the v1 decoder must accept a v1 container");
@@ -5291,11 +5643,7 @@ mod tests {
     fn malformed_v2_containers_are_refused() {
         let dim = 8;
         let idx = container_fixture(32, dim);
-        let good = encode_v2(
-            &idx.with_canonical_graph(|graph| Ok(graph.clone_for_persist()))
-                .unwrap(),
-        )
-        .unwrap();
+        let good = encode_v2(&idx.canonical_persist_snapshot().unwrap().0).unwrap();
         // Positive control: the decoder accepts the container it is given.
         decode_v2::<u64>(&good).expect("a well-formed container must decode");
 
