@@ -1227,6 +1227,93 @@ export class Dog extends Animal implements Pet {
     }
 
     #[test]
+    fn ts_require_binding_is_an_import_not_a_constant() {
+        // TypeScript files in Node packages still use CommonJS. The adapter
+        // recognized no `require` shape at all before, so every dependency line
+        // became a Constant and none reached the import surface.
+        let adapter = TypeScriptAdapter;
+        let source = br#"
+const contentType = require('content-type');
+const { METHODS } = require('node:http');
+const isAbsolute = require('node:path').isAbsolute;
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.ts");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        assert!(
+            output.entities.is_empty(),
+            "require bindings must not produce entities, got {:?}",
+            output
+                .entities
+                .iter()
+                .map(|e| (e.kind, e.name.as_str()))
+                .collect::<Vec<_>>()
+        );
+        let modules: Vec<&str> = output
+            .imports
+            .iter()
+            .map(|i| i.module_path.as_str())
+            .collect();
+        assert_eq!(modules, vec!["content-type", "node:http", "node:path"]);
+    }
+
+    #[test]
+    fn ts_receiver_assignment_is_a_method() {
+        // `Foo.prototype.bar = function () {}` in a .ts file is the same shape
+        // as in a .js file and must extract identically.
+        let adapter = TypeScriptAdapter;
+        let source = b"function View(name: string) { this.name = name; }\nView.prototype.lookup = function lookup(n: string) { return n; };";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.ts");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let named: Vec<(EntityKind, &str)> = output
+            .entities
+            .iter()
+            .map(|e| (e.kind, e.name.as_str()))
+            .collect();
+        assert!(named.contains(&(EntityKind::Class, "View")), "{named:?}");
+        assert!(
+            named.contains(&(EntityKind::Method, "View.lookup")),
+            "{named:?}"
+        );
+        let contains: Vec<(&str, &str)> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Contains)
+            .map(|r| (r.src_name.as_str(), r.dst_name.as_str()))
+            .collect();
+        assert_eq!(contains, vec![("View", "View.lookup")]);
+    }
+
+    #[test]
+    fn ts_class_expression_binding() {
+        let adapter = TypeScriptAdapter;
+        let source = b"const Timer = class extends Base { start(): void { tick(); } };";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.ts");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let named: Vec<(EntityKind, &str)> = output
+            .entities
+            .iter()
+            .map(|e| (e.kind, e.name.as_str()))
+            .collect();
+        assert_eq!(
+            named,
+            vec![
+                (EntityKind::Class, "Timer"),
+                (EntityKind::Method, "Timer.start"),
+            ]
+        );
+        let extends: Vec<(&str, &str)> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Extends)
+            .map(|r| (r.src_name.as_str(), r.dst_name.as_str()))
+            .collect();
+        assert_eq!(extends, vec![("Timer", "Base")]);
+    }
+
+    #[test]
     fn keep_object_literal_with_callbacks() {
         let adapter = TypeScriptAdapter;
         // Object literals containing function-like nodes are meaningful code.

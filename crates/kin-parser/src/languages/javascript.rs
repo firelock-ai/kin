@@ -807,17 +807,25 @@ fn extract_js_class_like(
         // `method_definition` covers methods, getters, setters and static
         // members. `field_definition` is a method only when its value is a
         // function (`handleClick = () => {}`, the React class-property form);
-        // a data field is not a callable and stays out of the graph.
-        let is_callable_field = member.kind() == "field_definition"
-            && member
-                .child_by_field_name("value")
-                .as_ref()
-                .is_some_and(is_js_function_like_node);
-        if member.kind() != "method_definition" && !is_callable_field {
-            continue;
-        }
-        let Some(method_name) = member
-            .child_by_field_name("name")
+        // a data field is not a callable and stays out of the graph. The
+        // grammar gives `field_definition` no `name`/`value` fields, so its
+        // parts are read positionally: the property first, the initializer last.
+        let name_node = match member.kind() {
+            "method_definition" => member.child_by_field_name("name"),
+            "field_definition" => {
+                let mut field_cursor = member.walk();
+                let parts: Vec<tree_sitter::Node> =
+                    member.named_children(&mut field_cursor).collect();
+                match parts.last() {
+                    Some(initializer) if is_js_function_like_node(initializer) => {
+                        parts.first().copied()
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let Some(method_name) = name_node
             .and_then(|n| n.utf8_text(source).ok())
             .filter(|n| !n.is_empty())
         else {
@@ -1857,6 +1865,75 @@ exports.static = require('serve-static');
             .specifiers
             .iter()
             .any(|spec| spec.local_name == "*"));
+    }
+
+    #[test]
+    fn parse_js_class_expression_binding() {
+        // `const Foo = class extends Bar {}` is a class declaration wearing a
+        // binding; it must produce the same shape as `class Foo extends Bar {}`.
+        let adapter = JavaScriptAdapter;
+        let source = b"const Timer = class extends Base { start() { return tick(); } };";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let named: Vec<(EntityKind, &str)> = output
+            .entities
+            .iter()
+            .map(|e| (e.kind, e.name.as_str()))
+            .collect();
+        assert_eq!(
+            named,
+            vec![
+                (EntityKind::Class, "Timer"),
+                (EntityKind::Method, "Timer.start"),
+            ]
+        );
+        let extends: Vec<(&str, &str)> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Extends)
+            .map(|r| (r.src_name.as_str(), r.dst_name.as_str()))
+            .collect();
+        assert_eq!(extends, vec![("Timer", "Base")]);
+    }
+
+    #[test]
+    fn parse_js_class_extends_namespace_member() {
+        // `extends React.Component` reduces to the rightmost identifier, which
+        // is the name the linker resolves. Reading the whole member expression
+        // yields `React.Component`, which matches no entity.
+        let adapter = JavaScriptAdapter;
+        let source = b"class Panel extends React.Component { render() {} }";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let extends: Vec<(&str, &str)> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Extends)
+            .map(|r| (r.src_name.as_str(), r.dst_name.as_str()))
+            .collect();
+        assert_eq!(extends, vec![("Panel", "Component")]);
+    }
+
+    #[test]
+    fn parse_js_class_field_arrow_is_a_method() {
+        // The React class-property form `handleClick = () => {}` is a callable
+        // member; a data field is not and stays out of the graph.
+        let adapter = JavaScriptAdapter;
+        let source =
+            b"class Panel { state = { open: false }; handleClick = (e) => { this.toggle(e); } }";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let methods: Vec<&str> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Method)
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(methods, vec!["Panel.handleClick"]);
     }
 
     #[test]
