@@ -470,8 +470,11 @@ fn removing_the_destination_file_retires_its_edges_and_a_replacement_rebinds() {
         "removing the destination file must take its edges with it"
     );
 
-    // The waiting index must have been rebuilt for storage.py, or a
-    // re-created destination would never bind again.
+    // Re-creating the destination and touching the importer must bind again.
+    // The importer is touched on purpose and the assertion is written to match:
+    // deleting a destination does not put its dependents back on the waiting
+    // index, so the destination's return alone does not rebind them. The report
+    // states that limit.
     repo.commit("parsing.py", PARSING);
     repo.commit("storage.py", STORAGE);
     let parse_note = repo.entity("parsing.py", "parse_note");

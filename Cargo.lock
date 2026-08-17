@@ -3047,8 +3047,6 @@ dependencies = [
 [[package]]
 name = "kin-blobs"
 version = "0.1.5"
-source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "bde2186360c16ff9fda080b4b9f6489e7aee8cb0cb30f803e8bd22b1ed4af609"
 dependencies = [
  "hex",
  "schemars",
@@ -3367,8 +3365,6 @@ dependencies = [
 [[package]]
 name = "kin-infer"
 version = "0.2.44"
-source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "ef68ba648007b5ad912bc968ad92fa9ab77c78569b2c5ecefcf31d1a51e08a07"
 dependencies = [
  "block",
  "half",
@@ -3411,8 +3407,6 @@ dependencies = [
 [[package]]
 name = "kin-lsp"
 version = "0.6.12"
-source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "bb2026d10f41f36fad8fad9709195e587611507a885d0956e6e6fea28adb97f4"
 dependencies = [
  "kin-model",
  "serde",
@@ -3486,8 +3480,6 @@ dependencies = [
 [[package]]
 name = "kin-model"
 version = "0.7.8"
-source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "75c237b19289638e728e70048011c5d5731d9ef45878f078e7663f2b0e9475e1"
 dependencies = [
  "chrono",
  "gix-hash",
@@ -3691,8 +3683,6 @@ dependencies = [
 [[package]]
 name = "kin-search"
 version = "0.1.5"
-source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "90b1943f2fa86bf338b63f662229f2fc009dff069a5851b928db1f7c0ebab5c1"
 dependencies = [
  "bincode",
  "parking_lot",
@@ -3741,8 +3731,6 @@ dependencies = [
 [[package]]
 name = "kin-vector"
 version = "0.1.11"
-source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "c1904ba13d244810b195168b04ada8884094f8d5374c54f36e9b9375ac6e625a"
 dependencies = [
  "fs2",
  "hashbrown 0.15.5",
@@ -7198,3 +7186,35 @@ dependencies = [
  "log",
  "simd-adler32",
 ]
+
+[[patch.unused]]
+name = "kin-context"
+version = "0.5.36"
+
+[[patch.unused]]
+name = "kin-index"
+version = "0.5.36"
+
+[[patch.unused]]
+name = "kin-mcp"
+version = "0.5.36"
+
+[[patch.unused]]
+name = "kin-parser"
+version = "0.5.36"
+
+[[patch.unused]]
+name = "kin-ranking"
+version = "0.5.36"
+
+[[patch.unused]]
+name = "kin-spine"
+version = "0.5.36"
+
+[[patch.unused]]
+name = "kin-db"
+version = "0.7.31"
+
+[[patch.unused]]
+name = "kin-vfs-core"
+version = "0.4.1"
