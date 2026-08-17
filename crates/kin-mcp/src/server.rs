@@ -1160,7 +1160,7 @@ async fn handle_tools_call_daemon(
         match daemon_delegate::forward_tool_call(&call_params.name, &call_params.arguments).await {
             Ok(Some(result)) => (result, Envelope::daemon()),
             Ok(None) => (
-                daemon_delegate::daemon_unavailable_tool_result(&call_params.name),
+                daemon_delegate::daemon_unavailable_tool_result(&call_params.name).await,
                 Envelope::daemon_unreachable(),
             ),
             Err(error) => (ToolCallResult::error(error), Envelope::daemon()),
@@ -1735,7 +1735,13 @@ mod tests {
         let text = match result.content.first().unwrap() {
             ContentBlock::Text { text } => text,
         };
-        assert!(text.contains("Kin daemon is required"));
+        // A repository with no daemon serving it is one of the three
+        // distinguished gaps, and it is the one this fixture builds. What the
+        // test locks down is that dispatch never reaches a local handler.
+        assert!(
+            text.contains("no daemon is serving it"),
+            "expected the repository-present, daemon-absent gap, got: {text}"
+        );
         drop(remove_kin_dir);
     }
 

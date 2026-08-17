@@ -150,6 +150,12 @@ async fn run_startup_binding(
     // The probe closure defers to the daemon-lifecycle IO boundary; this
     // module and the transport crate stay free of filesystem primitives.
     let discovered = kin_core::KinLayout::discover(&cwd);
+    // Whether a repository existed here when this server started is the fact
+    // that separates "the daemon went away" from "this server predates the
+    // repository", and it is only knowable now. Recorded rather than inferred
+    // later: once `kin init` has run, nothing on disk still says what the
+    // launch directory looked like before it.
+    kin_mcp::note_startup_repository(discovered.is_some());
     if let Some(layout) = &discovered {
         let kin_root = layout.root().to_path_buf();
         startup.set_phase_probe(Box::new(move || {

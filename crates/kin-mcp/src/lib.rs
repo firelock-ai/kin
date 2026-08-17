@@ -12,6 +12,7 @@ pub mod startup_binding;
 pub mod tools;
 pub mod types;
 
+pub use daemon_delegate::note_startup_repository;
 pub use envelope::{
     annotate as annotate_with_envelope, finalize as finalize_with_envelope, Envelope, ENVELOPE_KEY,
     ENVELOPE_VERSION,
