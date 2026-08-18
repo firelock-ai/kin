@@ -206,6 +206,125 @@ impl GraphState {
     }
 }
 
+/// A durability state's wire word. Three states, and `unknown` is a real
+/// answer rather than a placeholder for one of the other two.
+const DURABILITY_RECORDED: &str = "recorded";
+const DURABILITY_LIVE_UNCOMMITTED: &str = "live_uncommitted";
+const DURABILITY_UNKNOWN: &str = "unknown";
+
+/// Whether the graph that answered this call is recorded by durable repository
+/// authority, or lives only in the daemon's query layer (FIR-2421).
+///
+/// `completeness` says how much of the substrate the answer could see.
+/// This says whether the substrate survives the process serving it. They are
+/// independent: a graph can be complete, fully embedded, and gone the moment
+/// the daemon exits, which is exactly the state that produced this object.
+///
+/// A daemon admits host content into its live query graph continuously, so an
+/// agent that writes a file and locates it a second later gets a real entity id
+/// back. Nothing in that exchange said the entity was uncommitted, and an agent
+/// reading a populated `entity_count` beside a successful locate concluded its
+/// work was in the graph and never committed. The entities went with the
+/// daemon; the payloads it read were all true and all silent about it.
+///
+/// Nothing here is fabricated. `live_only_entities` is a difference between two
+/// counts the daemon observed, and when the two cannot be reconciled the state
+/// is `unknown` with no count rather than a number the reader would act on.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Durability {
+    /// `recorded` when durable authority carries every entity the selected
+    /// graph holds, `live_uncommitted` when it carries fewer, `unknown` when
+    /// the daemon reported no durable observation or the two counts cannot be
+    /// reconciled.
+    pub state: String,
+    /// Entities in the live query graph that answered this call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_entities: Option<u64>,
+    /// Entities durable repository authority carried when this daemon last
+    /// levelled its query graph with authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_entities: Option<u64>,
+    /// How many of `live_entities` no committed change carries. Absent
+    /// whenever `state` is `unknown`, because the whole point of that state is
+    /// that this number could not be derived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_only_entities: Option<u64>,
+    /// One line an agent can act on without reading the counts.
+    pub note: String,
+}
+
+impl Durability {
+    /// Derive the durability state from the two counts the daemon observed.
+    ///
+    /// `durable` is `None` when the daemon has never levelled its query graph
+    /// with durable authority and therefore has nothing to report; that is
+    /// `unknown`, not zero. A durable count ABOVE the live count is also
+    /// `unknown`: the live graph has dropped entities authority still carries,
+    /// so the difference is not a count of uncommitted work and reporting
+    /// `recorded` there would be the false all-clear this object exists to
+    /// prevent.
+    pub fn observe(live: u64, durable: Option<u64>) -> Self {
+        let Some(durable) = durable else {
+            return Self {
+                state: DURABILITY_UNKNOWN.to_string(),
+                live_entities: Some(live),
+                durable_entities: None,
+                live_only_entities: None,
+                note: "This daemon has not levelled its query graph with durable repository \
+                       authority, so whether these entities are recorded is unknown. Run `kin \
+                       status` to read durable authority directly."
+                    .to_string(),
+            };
+        };
+        if durable > live {
+            return Self {
+                state: DURABILITY_UNKNOWN.to_string(),
+                live_entities: Some(live),
+                durable_entities: Some(durable),
+                live_only_entities: None,
+                note: format!(
+                    "The live query graph holds {live} entities and durable authority carries \
+                     {durable}, so this answer cannot say how much of it is recorded. Run `kin \
+                     status` to read durable authority directly."
+                ),
+            };
+        }
+        let live_only = live - durable;
+        if live_only == 0 {
+            return Self {
+                state: DURABILITY_RECORDED.to_string(),
+                live_entities: Some(live),
+                durable_entities: Some(durable),
+                live_only_entities: Some(0),
+                note: format!(
+                    "{live} entities, 0 uncommitted; durable repository authority records \
+                     everything answering here."
+                ),
+            };
+        }
+        Self {
+            state: DURABILITY_LIVE_UNCOMMITTED.to_string(),
+            live_entities: Some(live),
+            durable_entities: Some(durable),
+            live_only_entities: Some(live_only),
+            note: format!(
+                "{live} entities, {live_only} uncommitted; {} is recorded yet, and the \
+                 uncommitted work is lost when this daemon exits. Commit to record it.",
+                if durable == 0 {
+                    "nothing you wrote"
+                } else {
+                    "not all of what you wrote"
+                }
+            ),
+        }
+    }
+
+    /// True when durable authority does not carry everything the answer read.
+    pub fn is_live_uncommitted(&self) -> bool {
+        self.state == DURABILITY_LIVE_UNCOMMITTED
+    }
+}
+
 /// Which completeness gate governs whether an *absent* result can be trusted as
 /// a definitive negative. Different retrieval families depend on different
 /// substrates, so "is the index complete enough to trust an empty answer?" has
@@ -667,6 +786,14 @@ pub struct Envelope {
     /// from a tool payload's own `graph_as_of`/`as_of` marker when one is carried.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graph_as_of: Option<Value>,
+    /// Whether the graph that answered survives the daemon serving it, beside
+    /// the freshness marker rather than inside it: `graph_as_of` names WHICH
+    /// graph state answered, and this names whether that state is recorded
+    /// anywhere. Absent when the runtime reported no durable observation at
+    /// all, which is the one case where saying nothing is more honest than
+    /// saying `unknown` for a runtime that has no durable layer to compare to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durability: Option<Durability>,
     /// Honest graph freshness context; omitted entirely when nothing is known.
     #[serde(default, skip_serializing_if = "GraphState::is_empty")]
     pub graph_state: GraphState,
@@ -697,6 +824,7 @@ impl Envelope {
             runtime: Runtime::OfflineInProcess,
             semantic_coverage: None,
             graph_as_of: None,
+            durability: None,
             graph_state: GraphState::default(),
             degraded: Degraded {
                 offline_fallback: Some(true),
@@ -716,6 +844,7 @@ impl Envelope {
             runtime: Runtime::RepoDaemon,
             semantic_coverage: None,
             graph_as_of: None,
+            durability: None,
             graph_state: GraphState::default(),
             degraded: Degraded::default(),
             completeness: None,
@@ -731,12 +860,17 @@ impl Envelope {
     /// would mix two graph views in one payload. Graph status instead supplies
     /// its own entity and embedding observations here. Fields that only
     /// `/health` knows stay absent rather than being borrowed from HEAD.
+    ///
+    /// `durable_entity_count` is the one durable reading graph status carries
+    /// itself, because the question it answers is about the selected graph and
+    /// not about HEAD. `None` reaches [`Durability::observe`] as `unknown`.
     pub fn with_selected_graph_observation(
         mut self,
         entity_count: u64,
         embeddings_indexed: u64,
         embeddings_pending: u64,
         embeddings_total: u64,
+        durable_entity_count: Option<u64>,
     ) -> Self {
         let complete = embeddings_pending == 0 && embeddings_indexed == embeddings_total;
         self.runtime = Runtime::RepoDaemon;
@@ -754,6 +888,7 @@ impl Envelope {
             graph_body_gap_paths: None,
         });
         self.graph_as_of = None;
+        self.durability = Some(Durability::observe(entity_count, durable_entity_count));
         self.graph_state = GraphState {
             entity_count: Some(entity_count),
             ..GraphState::default()
@@ -770,6 +905,7 @@ impl Envelope {
             runtime: Runtime::RepoDaemon,
             semantic_coverage: None,
             graph_as_of: None,
+            durability: None,
             graph_state: GraphState::default(),
             degraded: Degraded {
                 daemon_unreachable: Some(true),
@@ -794,6 +930,7 @@ impl Envelope {
             runtime: Runtime::RepoDaemon,
             semantic_coverage: None,
             graph_as_of: None,
+            durability: None,
             graph_state: GraphState::default(),
             degraded: Degraded {
                 workspace_mismatch: Some(true),
@@ -826,6 +963,18 @@ impl Envelope {
         }
         if let Some(value) = health.get("initialized").and_then(Value::as_bool) {
             self.graph_state.initialized = Some(value);
+        }
+        // Derived from the pair rather than reported by the daemon, because the
+        // live count is the one this envelope already carries and deriving it
+        // here keeps the two numbers from describing different instants. A
+        // daemon that reports no live count has nothing to compare against, so
+        // the object stays absent instead of asserting `unknown` about a graph
+        // it never measured.
+        if let Some(live) = self.graph_state.entity_count {
+            self.durability = Some(Durability::observe(
+                live,
+                health.get("durable_entity_count").and_then(Value::as_u64),
+            ));
         }
         // The daemon `/health` `graph_generation` marker (monotonic snapshot
         // generation, bumped per committed snapshot) is a precise freshness
@@ -1244,6 +1393,84 @@ mod tests {
         assert_eq!(env.graph_state.loaded, Some(true));
         assert_eq!(env.graph_state.initialized, Some(true));
         assert!(env.degraded.any());
+    }
+
+    /// The four states a durability observation can be in, including the two
+    /// that must refuse to name a number.
+    ///
+    /// `durable > live` is the one worth writing down. The live graph has
+    /// dropped entities authority still carries, so the difference is not a
+    /// count of uncommitted work, and a `recorded` verdict there would be the
+    /// false all-clear this object exists to prevent. It is reachable: an
+    /// admission that evicts a removed path's entities shrinks the live graph
+    /// while authority still holds them.
+    #[test]
+    fn durability_names_a_count_only_when_the_two_counts_can_be_reconciled() {
+        let uncommitted = Durability::observe(14, Some(0));
+        assert_eq!(uncommitted.state, "live_uncommitted");
+        assert_eq!(uncommitted.live_only_entities, Some(14));
+        assert!(
+            uncommitted.note.contains("14 entities, 14 uncommitted")
+                && uncommitted.note.contains("nothing you wrote"),
+            "an empty durable authority means none of it is recorded: {}",
+            uncommitted.note
+        );
+
+        let partly = Durability::observe(14, Some(9));
+        assert_eq!(partly.state, "live_uncommitted");
+        assert_eq!(partly.live_only_entities, Some(5));
+        assert!(
+            partly.note.contains("not all of what you wrote"),
+            "a nonempty durable authority records some of it: {}",
+            partly.note
+        );
+
+        let recorded = Durability::observe(14, Some(14));
+        assert_eq!(recorded.state, "recorded");
+        assert_eq!(recorded.live_only_entities, Some(0));
+
+        let unmeasured = Durability::observe(14, None);
+        assert_eq!(unmeasured.state, "unknown");
+        assert_eq!(
+            unmeasured.live_only_entities, None,
+            "an unlevelled daemon must not report 14 uncommitted entities it cannot see"
+        );
+
+        let shrunk = Durability::observe(9, Some(14));
+        assert_eq!(
+            shrunk.state, "unknown",
+            "a live graph below durable authority cannot be read as recorded"
+        );
+        assert_eq!(shrunk.live_only_entities, None);
+    }
+
+    /// The generic tool path takes its envelope from `/health`, so the fold
+    /// there is what decides whether a locate carries the disclosure at all.
+    #[test]
+    fn with_health_derives_durability_from_the_live_and_durable_counts() {
+        let env = Envelope::daemon().with_health(&serde_json::json!({
+            "graph_entity_count": 22,
+            "durable_entity_count": 0,
+        }));
+        let durability = env
+            .durability
+            .expect("a measured live count carries durability");
+        assert_eq!(durability.state, "live_uncommitted");
+        assert_eq!(durability.live_only_entities, Some(22));
+
+        // A daemon that reports no durable reading is unknown, not recorded.
+        let unlevelled = Envelope::daemon()
+            .with_health(&serde_json::json!({ "graph_entity_count": 22 }))
+            .durability
+            .expect("a measured live count carries durability");
+        assert_eq!(unlevelled.state, "unknown");
+
+        // And a runtime that measured no live count has nothing to compare, so
+        // the object stays absent rather than asserting anything.
+        assert!(Envelope::daemon()
+            .with_health(&serde_json::json!({ "graph_loaded": true }))
+            .durability
+            .is_none());
     }
 
     #[test]
