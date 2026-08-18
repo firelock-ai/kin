@@ -1,8 +1,8 @@
 # Kin for Claude Code
 
-Semantic code retrieval over a graph of entities, relationships, changes, and provenance.
-Locate, search, context packs, data-flow tracing, and impact analysis without raw file
-search.
+Kin keeps a living map of the software itself so humans and agents can understand what
+every change touches. Locate, search, context packs, data-flow tracing, and impact
+analysis without raw file search.
 
 ## Install
 
