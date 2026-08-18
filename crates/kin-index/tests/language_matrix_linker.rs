@@ -27,7 +27,7 @@ use kin_model::{
     SemanticFingerprint, SourceSpan, Visibility,
 };
 use kin_parser::{
-    CSharpAdapter, ExtractedRelation, JavaAdapter, JavaScriptAdapter, LanguageAdapter,
+    CSharpAdapter, ExtractedRelation, FileImport, JavaAdapter, JavaScriptAdapter, LanguageAdapter,
     PythonAdapter, TypeScriptAdapter,
 };
 
@@ -266,7 +266,16 @@ fn receiver_fanout_call_count(n: usize) -> usize {
         file_path: "caller.rs".to_string(),
         entities: vec![caller],
         relations: vec![calls_relation("build", "make")],
-        imports: vec![],
+        // Load-bearing. These entities are Rust, and a bare Rust `make()` reaches
+        // the owner-qualified `Impl0::make` only from a file whose import list
+        // cannot answer whether it binds that name. An empty list is
+        // name-complete, so the call would be refused before it could fan out at
+        // all, and this helper would measure the FIR-1581 gate instead of the cap
+        // it exists to measure. A glob import is the stand-down that gate documents.
+        imports: vec![FileImport {
+            module_path: "crate::impls".to_string(),
+            specifiers: vec![],
+        }],
     }];
     for i in 0..n {
         let path = format!("impl{i}.rs");
