@@ -76,6 +76,14 @@ pub struct SemanticCoverage {
     /// semantic signal was partial.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Graph-owned source paths carrying no body, when the payload reported it.
+    ///
+    /// `complete` above is a conjunction of the embedding count and this number,
+    /// so the flag alone cannot say which of the two limited the answer. A
+    /// caller reading `complete: false` beside `indexed == total` is looking at
+    /// a body gap, and the remediation is a reconcile rather than an embed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_body_gap_paths: Option<u64>,
 }
 
 impl SemanticCoverage {
@@ -90,6 +98,14 @@ impl SemanticCoverage {
             pending: obj.get("pending").and_then(Value::as_u64)?,
             complete: obj.get("complete").and_then(Value::as_bool)?,
             note: obj.get("note").and_then(Value::as_str).map(str::to_string),
+            // Optional: payloads from surfaces that ran no retrieval, and every
+            // payload minted before graph-body coverage existed, carry no such
+            // object. Absent stays absent rather than becoming a fabricated zero.
+            graph_body_gap_paths: obj
+                .get("graph_bodies")
+                .and_then(Value::as_object)
+                .and_then(|bodies| bodies.get("gap_paths"))
+                .and_then(Value::as_u64),
         })
     }
 }
@@ -279,6 +295,9 @@ impl Envelope {
                 "Selected-graph embedding coverage is incomplete at this point-in-time observation."
                     .to_string()
             }),
+            // Graph status observes embeddings, not the source-text phase's body
+            // resolution, so it has no reading to report here.
+            graph_body_gap_paths: None,
         });
         self.graph_as_of = None;
         self.graph_state = GraphState {
@@ -413,6 +432,20 @@ impl Envelope {
                     false,
                     "coverage_unknown: embedding coverage was not reported, so an empty result may mean 'not indexed' rather than 'not present'",
                 ),
+                // A body gap and an embedding shortfall both clear `complete`,
+                // and they are different problems with different remediations.
+                // Reporting a body gap as "the semantic index is incomplete"
+                // sends a caller to `kin embed` on a store whose embeddings are
+                // already whole, so the limiting factor is named.
+                Some(coverage)
+                    if !coverage.complete
+                        && coverage.graph_body_gap_paths.is_some_and(|gaps| gaps > 0) =>
+                {
+                    (
+                        false,
+                        "coverage_graph_body_gap: graph-owned source bodies are missing for some paths, so entities in them rank on text fallback and an empty result may mean 'no body to rank' rather than 'not present'",
+                    )
+                }
                 Some(coverage) if !coverage.complete => (
                     false,
                     "coverage_partial: the semantic index is incomplete, so an empty result may mean 'not indexed' rather than 'not present'",

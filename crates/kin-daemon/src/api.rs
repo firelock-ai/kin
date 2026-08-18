@@ -12622,6 +12622,7 @@ mod tests {
             pending: 0,
             complete: true,
             note: None,
+            graph_bodies: None,
         };
         let tool = semantic_locate_payload(
             "where does the daemon start",
