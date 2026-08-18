@@ -173,7 +173,6 @@ pub async fn run_health_checks() -> HealthReport {
     checks.push(check_background_work().await);
     checks.push(check_embedding_model().await);
     checks.push(check_retrieval_profile());
-    checks.push(check_cross_file_enrichment());
     checks.push(check_update_policy());
     checks.push(check_binary_assessment_load());
 
@@ -2126,6 +2125,13 @@ async fn check_reference_edge_coverage() -> HealthCheck {
     const ID: &str = "reference_edge_coverage";
     const LABEL: &str = "Reference edge coverage";
 
+    // Probed first, because it needs no daemon. Every branch below that cannot
+    // read the graph still reports this half, so a repository whose daemon is
+    // down does not silently lose the language-server signal that used to have
+    // its own row.
+    let missing_servers =
+        missing_language_servers(&crate::commands::graph::installed_language_servers());
+
     let cwd = env::current_dir().unwrap_or_default();
     let Some(layout) = kin_core::KinLayout::discover(&cwd) else {
         return HealthCheck::new(
@@ -2137,14 +2143,13 @@ async fn check_reference_edge_coverage() -> HealthCheck {
     };
     let Some(daemon_url) = crate::daemon_client::resolve_daemon_url_if_running_async(&layout).await
     else {
-        return HealthCheck::new(
-            ID,
-            LABEL,
+        return coverage_unreadable(
             HealthStatus::Unsupported,
-            "n/a — no daemon running for this repository, so relation-graph completeness cannot \
-             be read; a daemon starts on first use",
-        )
-        .with_manual_fix("run any `kin` command in the repo to auto-start the daemon");
+            "no daemon running for this repository, so relation-graph completeness cannot be \
+             read; a daemon starts on first use",
+            "run any `kin` command in the repo to auto-start the daemon",
+            &missing_servers,
+        );
     };
     let client = match crate::daemon_client::DaemonClient::from_base_url_for_layout(
         daemon_url.clone(),
@@ -2152,11 +2157,11 @@ async fn check_reference_edge_coverage() -> HealthCheck {
     ) {
         Ok(client) => client,
         Err(error) => {
-            return HealthCheck::new(
-                ID,
-                LABEL,
+            return coverage_unreadable(
                 HealthStatus::Stale,
                 format!("daemon reachable ({daemon_url}), but its URL is invalid: {error}"),
+                "check the daemon URL recorded for this repository",
+                &missing_servers,
             );
         }
     };
@@ -2166,29 +2171,61 @@ async fn check_reference_edge_coverage() -> HealthCheck {
     {
         Ok(response) => response,
         Err(error) => {
-            return HealthCheck::new(
-                ID,
-                LABEL,
+            return coverage_unreadable(
                 HealthStatus::Stale,
                 format!(
                     "daemon reachable ({daemon_url}), but relation-graph completeness is \
                      unavailable: {error}"
                 ),
-            )
-            .with_manual_fix("run `kin graph status` and resolve the reported daemon error");
+                "run `kin graph status` and resolve the reported daemon error",
+                &missing_servers,
+            );
         }
     };
     let Some(coverage) = response.reference_edge_coverage else {
-        return HealthCheck::new(
-            ID,
-            LABEL,
+        return coverage_unreadable(
             HealthStatus::Stale,
             "the daemon serving this repository does not report relation-graph completeness; it \
              predates the measurement",
-        )
-        .with_manual_fix("restart the daemon with `kin daemon restart` to pick up this build");
+            "restart the daemon with `kin daemon restart` to pick up this build",
+            &missing_servers,
+        );
     };
     reference_edge_coverage_health(&coverage)
+}
+
+/// The row for every state where the graph itself could not be read.
+///
+/// It still reports the host probe, because that needed no daemon. Reporting
+/// only "completeness unavailable" would drop a fact this process holds, and
+/// this row is the only one that carries it now.
+fn coverage_unreadable(
+    status: HealthStatus,
+    detail: impl Into<String>,
+    manual_fix: &str,
+    missing_servers: &[String],
+) -> HealthCheck {
+    const ID: &str = "reference_edge_coverage";
+    const LABEL: &str = "Reference edge coverage";
+
+    let detail = detail.into();
+    if missing_servers.is_empty() {
+        return HealthCheck::new(ID, LABEL, status, format!("n/a — {detail}"))
+            .with_manual_fix(manual_fix);
+    }
+    // A missing server is a measured host fact even when the graph is not
+    // readable, so it decides the status rather than deferring to the unread
+    // half. Stale, not Missing: the graph still answers from the edges it holds.
+    HealthCheck::new(
+        ID,
+        LABEL,
+        HealthStatus::Stale,
+        format!(
+            "{}; graph completeness not read: {detail}",
+            language_server_gap_detail(missing_servers)
+        ),
+    )
+    .with_manual_fix(LANGUAGE_SERVER_FIX)
 }
 
 /// Turn the measurement into a verdict, split from its fetch so the rule is
@@ -2226,7 +2263,20 @@ pub(crate) fn reference_edge_coverage_health(
         .collect::<Vec<_>>()
         .join("; ");
 
-    let gaps = coverage.unsupportable_absence_reasons();
+    // The language-server state arrives measured, per language this repository
+    // actually holds, rather than probed against every wired language. This row
+    // used to have a sibling that probed the host, and that sibling warned about
+    // rust-analyzer on a Python-only repository, which is exactly the row a
+    // reader learns to skip.
+    let missing_servers = coverage.languages_missing_a_language_server();
+    let mut gaps = coverage.unsupportable_absence_reasons();
+    if !missing_servers.is_empty() {
+        gaps.push(format!(
+            "cross-file reference and override edges unavailable for {}: no language server \
+             found. Import and call edges are still resolved from source",
+            missing_servers.join(", ")
+        ));
+    }
     if gaps.is_empty() {
         return HealthCheck::new(ID, LABEL, HealthStatus::Healthy, summary);
     }
@@ -2435,71 +2485,46 @@ async fn check_semantic_query_readiness() -> HealthCheck {
     semantic_query_health_from_runtime(&daemon_url, &response.embed_runtime)
 }
 
-/// Report whether cross-file reference edges can be produced on this host.
+/// Which wired languages have no language server on this host.
 ///
 /// Reference and override edges are not derivable from a single-file parse:
 /// they need a resolved program, which Kin gets from an external language
 /// server. On a host with none installed the graph simply never gains that edge
-/// class, and until this row existed the only trace was a relation count a
-/// reader had to already know the expected value of. The row names the language
-/// and the missing binary so the gap is a fact on the page rather than an
-/// inference from a ratio.
+/// class, and the only trace used to be a relation count a reader had to
+/// already know the expected value of.
 ///
-/// It reports `Stale` rather than `Missing`: the graph still answers, with
-/// import and call edges resolved from source, so this degrades an install
-/// without breaking it.
-fn check_cross_file_enrichment() -> HealthCheck {
-    cross_file_enrichment_check(&crate::commands::graph::installed_language_servers())
+/// This probes the host and needs no daemon, so it is what the completeness row
+/// falls back to when the graph itself cannot be read. When the graph IS
+/// readable the same fact arrives measured, per language the repository
+/// actually holds, and [`reference_edge_coverage_health`] reads it from there
+/// instead: warning about rust-analyzer on a Python-only repository is a row a
+/// reader learns to skip.
+fn missing_language_servers(
+    installed: &std::collections::HashSet<kin_model::LanguageId>,
+) -> Vec<String> {
+    crate::commands::graph::LANGUAGE_SERVER_BINARIES
+        .iter()
+        .filter(|(language, _)| !installed.contains(language))
+        .map(|(language, binaries)| format!("{language} ({})", binaries.join(" or ")))
+        .collect()
 }
 
-/// The verdict half of [`check_cross_file_enrichment`], over an explicit set of
-/// installed servers so both outcomes can be exercised on any host.
-fn cross_file_enrichment_check(
-    installed: &std::collections::HashSet<kin_model::LanguageId>,
-) -> HealthCheck {
-    let mut available: Vec<String> = Vec::new();
-    let mut missing: Vec<String> = Vec::new();
-    for (language, binaries) in crate::commands::graph::LANGUAGE_SERVER_BINARIES {
-        if installed.contains(language) {
-            available.push(language.to_string());
-        } else {
-            missing.push(format!("{language} ({})", binaries.join(" or ")));
-        }
-    }
-
-    if missing.is_empty() {
-        return HealthCheck::new(
-            "cross_file_enrichment",
-            "Cross-file reference edges",
-            HealthStatus::Healthy,
-            format!("language server found for {}", available.join(", ")),
-        );
-    }
-
-    let detail = format!(
-        "cross-file reference and override edges unavailable: no language server found for {}",
-        missing.join(", ")
-    );
-    HealthCheck::new(
-        "cross_file_enrichment",
-        "Cross-file reference edges",
-        HealthStatus::Stale,
-        // Say what still works. A row that reports only the loss reads as "the
-        // graph knows nothing across files", and import-bound calls are
-        // resolved from source with no language server involved at all.
-        format!(
-            "{detail}; import and call edges are still resolved from source. Languages outside \
-             {} gain no reference edges in this build either",
-            crate::commands::graph::LANGUAGE_SERVER_BINARIES
-                .iter()
-                .map(|(language, _)| language.to_string())
-                .collect::<Vec<_>>()
-                .join("/")
-        ),
-    )
-    .with_manual_fix(
-        "install a language server for the named language (for example `npm i -g pyright` or \
-         `rustup component add rust-analyzer`), then restart the daemon",
+/// The sentence that names what a missing server costs, and what still works.
+///
+/// A row that reports only the loss reads as "the graph knows nothing across
+/// files", and import-bound calls are resolved from source with no language
+/// server involved at all.
+fn language_server_gap_detail(missing: &[String]) -> String {
+    format!(
+        "cross-file reference and override edges unavailable: no language server found for {}; \
+         import and call edges are still resolved from source. Languages outside {} gain no \
+         reference edges in this build either",
+        missing.join(", "),
+        crate::commands::graph::LANGUAGE_SERVER_BINARIES
+            .iter()
+            .map(|(language, _)| language.to_string())
+            .collect::<Vec<_>>()
+            .join("/")
     )
 }
 
@@ -2619,6 +2644,10 @@ fn embedding_model_check_from(
     ))
 }
 
+const LANGUAGE_SERVER_FIX: &str =
+    "install a language server for the named language (for example `npm i -g pyright` or \
+     `rustup component add rust-analyzer`), then restart the daemon";
+
 /// Report the active retrieval quality profile and the effective lever set,
 /// so an operator can see at a glance whether they are getting full
 /// retrieval capability — and why not, when a lever is off.
@@ -2726,9 +2755,17 @@ mod tests {
 
     /// A host with no language server must be told which language lost which
     /// edge class, and told it in words rather than as a low relation count.
+    /// The graph is unreadable here, which is exactly the state that used to
+    /// carry its own row; folding the two rows must not lose the probe.
     #[test]
     fn doctor_names_the_language_whose_missing_server_costs_cross_file_edges() {
-        let check = cross_file_enrichment_check(&std::collections::HashSet::new());
+        let missing = missing_language_servers(&std::collections::HashSet::new());
+        let check = coverage_unreadable(
+            HealthStatus::Unsupported,
+            "no daemon running for this repository",
+            "start the daemon",
+            &missing,
+        );
 
         assert!(matches!(check.status, HealthStatus::Stale));
         assert!(
@@ -2749,6 +2786,11 @@ mod tests {
             "the row must not read as a total loss: {}",
             check.detail
         );
+        assert!(
+            check.detail.contains("no daemon running"),
+            "the unread half is reported beside the probed one, in one row: {}",
+            check.detail
+        );
         assert!(check.manual_fix.is_some());
     }
 
@@ -2761,9 +2803,16 @@ mod tests {
                 .iter()
                 .map(|(language, _)| *language)
                 .collect();
-        let check = cross_file_enrichment_check(&installed);
+        let missing = missing_language_servers(&installed);
+        assert!(missing.is_empty(), "{missing:?}");
 
-        assert!(matches!(check.status, HealthStatus::Healthy));
+        let check = coverage_unreadable(
+            HealthStatus::Unsupported,
+            "no daemon running for this repository",
+            "start the daemon",
+            &missing,
+        );
+        assert!(matches!(check.status, HealthStatus::Unsupported));
         assert!(!check.detail.contains("unavailable"), "{}", check.detail);
     }
 
@@ -2772,11 +2821,71 @@ mod tests {
     /// turn `kin doctor` red on every host that never installed one.
     #[test]
     fn a_missing_language_server_needs_attention_without_blocking_readiness() {
-        let check = cross_file_enrichment_check(&std::collections::HashSet::new());
+        let missing = missing_language_servers(&std::collections::HashSet::new());
+        let check = coverage_unreadable(
+            HealthStatus::Unsupported,
+            "no daemon running for this repository",
+            "start the daemon",
+            &missing,
+        );
         assert!(!blocks_readiness(&check));
         let report = assemble_health_report("test".to_string(), vec![check]);
         assert!(report.healthy);
         assert_eq!(report.summary().attention, 1);
+    }
+
+    /// FIR-2370. Two rows about one graph teach an operator to skip both, so the
+    /// measured completeness and the language-server state are ONE row. This
+    /// pins that: when the graph is readable, the single row carries both facts,
+    /// and the language-server half is read per language the repository
+    /// actually holds rather than probed against every wired language.
+    #[test]
+    fn one_doctor_row_carries_both_completeness_facts() {
+        use kin_core::reference_coverage::{
+            LanguageReferenceCoverage, ReferenceEdgeCoverage, ReferenceEnrichment,
+            ReferenceResolution,
+        };
+
+        let coverage = ReferenceEdgeCoverage {
+            languages: vec![LanguageReferenceCoverage {
+                language: "python".to_string(),
+                files: 12,
+                files_measured: 12,
+                entities: 46,
+                parsed_call_sites: Some(78),
+                parsed_import_statements: Some(16),
+                resolved_call_edges: 16,
+                resolved_import_edges: 0,
+                cross_file_reference_edges: 0,
+                intra_file_reference_edges: 16,
+                external_reference_edges: 0,
+                resolution: ReferenceResolution::PartiallyResolved,
+                reference_enrichment: ReferenceEnrichment::NoLanguageServer,
+            }],
+            totals: None,
+        };
+
+        let check = reference_edge_coverage_health(&coverage);
+        assert_eq!(check.id, "reference_edge_coverage");
+        assert!(
+            check.detail.contains("no cross-file reference edge"),
+            "the measured gap: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("no language server found"),
+            "and the host gap, in the same row: {}",
+            check.detail
+        );
+
+        // A language the repository holds no source in produces no row at all,
+        // so no gap is reported for it. The old second row probed every wired
+        // language and warned about rust-analyzer on a Python-only repository.
+        assert!(
+            !check.detail.contains("rust"),
+            "a language this repository holds nothing in is not a gap: {}",
+            check.detail
+        );
     }
 
     fn write_file(path: &Path, bytes: &[u8]) {
@@ -3532,7 +3641,8 @@ mod tests {
     #[test]
     fn reference_edge_coverage_needs_attention_when_absence_is_unanswerable() {
         use kin_core::reference_coverage::{
-            LanguageReferenceCoverage, ReferenceEdgeCoverage, ReferenceResolution,
+            LanguageReferenceCoverage, ReferenceEdgeCoverage, ReferenceEnrichment,
+            ReferenceResolution,
         };
 
         fn python(cross_file: u64, resolved_calls: u64) -> ReferenceEdgeCoverage {
@@ -3550,7 +3660,9 @@ mod tests {
                     intra_file_reference_edges: 16,
                     external_reference_edges: 0,
                     resolution: ReferenceResolution::PartiallyResolved,
+                    reference_enrichment: ReferenceEnrichment::Available,
                 }],
+                totals: None,
             }
         }
 

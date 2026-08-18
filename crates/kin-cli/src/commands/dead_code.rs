@@ -62,7 +62,15 @@ pub struct DeadCodeSeededCandidate {
     pub kind: String,
     pub file: Option<String>,
     pub signature: Option<String>,
+    /// Distinct entities holding an inbound reference edge, at any resolution.
     pub reference_count: usize,
+    /// How many of those edges are proven rather than a repo-wide same-name
+    /// match. `dead` is decided on this count, so a row with references and a
+    /// proven count of zero carries its own explanation for why it is still
+    /// listed. Defaulted so an older daemon's response reads as unmeasured
+    /// rather than as zero proven edges.
+    #[serde(default)]
+    pub proven_reference_count: usize,
     pub dead: bool,
 }
 
@@ -169,24 +177,39 @@ fn build_dead_code_report(
     let mut trait_satisfying = 0usize;
     let mut referenced_in_file = 0usize;
     let mut declared_entry_points = 0usize;
+    // Entities the graph reaches only by a name-only edge. They belong on the
+    // list, because a repo-wide same-name match proves nothing about this
+    // destination, and they belong there LABELLED, because discarding their
+    // only evidence is a decision this scan made rather than a fact about the
+    // code.
+    let mut name_only_ids: std::collections::HashSet<EntityId> = std::collections::HashSet::new();
     for entity in graph.find_dead_code()? {
         if entity.role != EntityRole::Source {
             nonproduction += 1;
-        } else if entity.kind == EntityKind::Method && satisfies_trait_contract(graph, &entity.id)?
-        {
-            trait_satisfying += 1;
-        } else if has_incoming_reference(graph, &entity.id)? {
-            // The candidate generator asks only whether an inbound edge crosses
-            // a file boundary, so an entity whose only caller sits beside it in
-            // the same file arrives here. `find_references` reads that caller
-            // and reports it; consulting the same collector is what stops the
-            // two surfaces from answering opposite things about one edge.
-            referenced_in_file += 1;
-        } else if is_entry_point(&entity, entry_points) {
-            declared_entry_points += 1;
-        } else {
-            unreferenced.push(entity);
+            continue;
         }
+        if entity.kind == EntityKind::Method && satisfies_trait_contract(graph, &entity.id)? {
+            trait_satisfying += 1;
+            continue;
+        }
+        // The candidate generator asks only whether an inbound edge crosses a
+        // file boundary, so an entity whose only caller sits beside it in the
+        // same file arrives here. `find_references` reads that caller and
+        // reports it; consulting the same collector is what stops the two
+        // surfaces from answering opposite things about one edge.
+        let strength = incoming_reference_strength(graph, &entity.id)?;
+        if strength == Reachability::Proven {
+            referenced_in_file += 1;
+            continue;
+        }
+        if is_entry_point(&entity, entry_points) {
+            declared_entry_points += 1;
+            continue;
+        }
+        if strength == Reachability::NameOnly {
+            name_only_ids.insert(entity.id);
+        }
+        unreferenced.push(entity);
     }
 
     // The scan reads a randomly seeded hash map in parallel, so without an
@@ -234,10 +257,23 @@ fn build_dead_code_report(
         })
         .collect();
     let row_is_unverified = |entity: &kin_model::Entity| {
-        manifest_gap.is_some() || unsupportable.contains_key(&entity.language.to_string())
+        manifest_gap.is_some()
+            || name_only_ids.contains(&entity.id)
+            || unsupportable.contains_key(&entity.language.to_string())
     };
     let unverified_rows = unreferenced.iter().filter(|e| row_is_unverified(e)).count();
     let mut unverified_reasons: Vec<String> = unsupportable.values().cloned().collect();
+    let name_only_rows = unreferenced
+        .iter()
+        .filter(|entity| name_only_ids.contains(&entity.id))
+        .count();
+    if name_only_rows > 0 {
+        unverified_reasons.push(format!(
+            "{name_only_rows} listed entities are reached only by name-only edges, which name a \
+             same-named symbol somewhere in the repository rather than prove this one is reached; \
+             the edge was discarded as evidence, so the row is a candidate rather than a find"
+        ));
+    }
     unverified_reasons.extend(manifest_gap.clone());
     // The verdict is about the rows this run printed. A gap in a language nothing
     // was listed for is still disclosed below, but it does not make the listed
@@ -317,19 +353,58 @@ fn build_dead_code_report(
     })
 }
 
-/// Whether the graph holds an inbound reference edge for this entity, read
-/// through the same collector `kin refs` and `find_references` read.
+/// What the graph's inbound reference edges prove about one entity.
 ///
-/// An inbound edge whose caller record is missing still counts: the edge exists,
-/// so absence cannot be claimed, and reporting the entity as deletable because
-/// the caller's own record is absent is the least safe reading available.
-fn has_incoming_reference(graph: &impl GraphStore, entity_id: &EntityId) -> Result<bool> {
+/// Read through the same collector `kin refs` and `find_references` read, so
+/// the three surfaces cannot disagree about a single edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reachability {
+    /// At least one inbound edge is proven: the destination was established by
+    /// an import, a resolved type, or a language server.
+    Proven,
+    /// Inbound edges exist, and every one of them was chosen by matching a bare
+    /// name across the repository. A same-named method on an unrelated type
+    /// matches equally well, so these are candidates for where a call went, not
+    /// evidence this entity is used.
+    NameOnly,
+    /// No inbound reference edge at all.
+    None,
+}
+
+/// Classify an entity by the strongest inbound reference edge the graph holds.
+///
+/// An inbound edge whose caller record is missing counts as proven: the edge
+/// exists, so absence cannot be claimed, and reporting the entity as deletable
+/// because the caller's own record is absent is the least safe reading
+/// available.
+///
+/// This decides intra-file evidence only, and not because it chooses to.
+/// `kin_db::find_dead_code` builds the candidate set by excluding any entity
+/// with a cross-file inbound edge at ANY resolution, so a cross-file name-only
+/// edge removes an entity upstream of this call. The MCP `dead_code` tool's
+/// file-scoped path and both seeded surfaces classify entities directly rather
+/// than through that generator, so they apply the rule in full.
+fn incoming_reference_strength(
+    graph: &impl GraphStore,
+    entity_id: &EntityId,
+) -> Result<Reachability> {
     let collected = crate::commands::refs::collect_graph_references(
         graph,
         entity_id,
         &kin_core::reference_coverage::REFERENCE_RELATION_KINDS,
     )?;
-    Ok(!collected.references.is_empty() || !collected.missing_source_ids.is_empty())
+    if !collected.missing_source_ids.is_empty()
+        || collected
+            .references
+            .iter()
+            .any(|reference| reference.resolution.is_proven())
+    {
+        return Ok(Reachability::Proven);
+    }
+    if collected.references.is_empty() {
+        return Ok(Reachability::None);
+    }
+    Ok(Reachability::NameOnly)
 }
 
 /// Whether this entity is an entry point, so no inbound edge was ever owed.
@@ -511,8 +586,11 @@ pub fn build_dead_code_seeded_response(
             }
         }
 
-        let reference_count = count_incoming_references(graph, &entity_id, &reference_kinds)?;
-        let dead = reference_count == 0;
+        let counts = count_incoming_references(graph, &entity_id, &reference_kinds)?;
+        // Decided on proven edges, the same rule the whole-repo scan and the MCP
+        // `dead_code` tool apply. Deciding it on the raw count here would make
+        // one entity dead on one surface and live on another.
+        let dead = counts.proven == 0;
 
         candidates.push(DeadCodeSeededCandidate {
             id: entity.id.to_string(),
@@ -520,14 +598,20 @@ pub fn build_dead_code_seeded_response(
             kind: format!("{:?}", entity.kind),
             file: entity.file_origin.as_ref().map(|p| p.0.clone()),
             signature: (!entity.signature.is_empty()).then(|| entity.signature.clone()),
-            reference_count,
+            reference_count: counts.total,
+            proven_reference_count: counts.proven,
             dead,
         });
     }
 
+    // Dead first, and `dead` keys on the proven count, so the proven count is
+    // what orders the page. Sorting on the raw count would bury an entity whose
+    // every inbound edge was discarded as a same-name guess below entities the
+    // graph really does reach.
     candidates.sort_by(|a, b| {
-        a.reference_count
-            .cmp(&b.reference_count)
+        a.proven_reference_count
+            .cmp(&b.proven_reference_count)
+            .then_with(|| a.reference_count.cmp(&b.reference_count))
             .then_with(|| a.name.cmp(&b.name))
             .then_with(|| a.id.cmp(&b.id))
     });
@@ -539,18 +623,38 @@ pub fn build_dead_code_seeded_response(
     })
 }
 
+/// Referencing entities, split by whether their edge proves anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReferenceCounts {
+    /// Distinct referencing entities at any resolution.
+    total: usize,
+    /// How many of those hold a proven edge.
+    proven: usize,
+}
+
 /// Count the entities that reference this one, of the given kinds.
 ///
 /// Reads the collector `kin refs`, `kin refs --bulk-json` and the whole-repo
-/// scan read, so the `dead` flag here means exactly what those surfaces report:
-/// distinct referencing entities, self-edges excluded.
+/// scan read, so the counts here mean exactly what those surfaces report:
+/// distinct referencing entities, self-edges excluded. A referencing entity
+/// whose own record is missing counts as proven, because the edge exists and
+/// only its source is unreadable.
 fn count_incoming_references(
     graph: &impl GraphStore,
     entity_id: &EntityId,
     kinds: &[RelationKind],
-) -> Result<usize> {
+) -> Result<ReferenceCounts> {
     let collected = crate::commands::refs::collect_graph_references(graph, entity_id, kinds)?;
-    Ok(collected.references.len() + collected.missing_source_ids.len())
+    let proven = collected
+        .references
+        .iter()
+        .filter(|reference| reference.resolution.is_proven())
+        .count()
+        + collected.missing_source_ids.len();
+    Ok(ReferenceCounts {
+        total: collected.references.len() + collected.missing_source_ids.len(),
+        proven,
+    })
 }
 
 #[cfg(test)]
@@ -648,6 +752,126 @@ mod tests {
             .unwrap_or(false)
     }
 
+    /// Build a relation at an explicit linker confidence tier, so a test names
+    /// the resolution it means rather than inheriting one.
+    fn make_relation_at(
+        src: EntityId,
+        dst: EntityId,
+        kind: RelationKind,
+        confidence: f32,
+    ) -> Relation {
+        Relation {
+            confidence,
+            origin: RelationOrigin::Inferred,
+            ..make_relation(src, dst, kind)
+        }
+    }
+
+    /// FIR-2384. PR #868 published `RelationResolution::is_proven` and said
+    /// dead-code would filter on it; the consumer it named counted any inbound
+    /// edge. A name-only edge is a repo-wide same-name match with nothing at the
+    /// call site proving the destination, so it does not keep an entity off the
+    /// list — and because discarding it is a decision this scan made rather than
+    /// a fact about the code, the row it produces says so.
+    ///
+    /// The edges here are INTRA-file, which is the case this scan can decide.
+    /// `kin_db::find_dead_code` builds the candidate set by excluding anything
+    /// with a cross-file inbound edge, at any resolution, so a cross-file
+    /// name-only edge removes an entity before this filter ever sees it. That
+    /// bound lives in kin-db, not here.
+    #[test]
+    fn a_name_only_edge_does_not_rescue_an_entity_and_its_row_says_why() {
+        let graph = InMemoryGraph::new();
+        let caller = measured(make_entity("probe_caller", "src/a.rs"), 2, 0);
+        let guessed = measured(make_entity("probe_guessed", "src/a.rs"), 0, 0);
+        let proven = measured(make_entity("probe_proven", "src/a.rs"), 0, 0);
+
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&guessed).unwrap();
+        graph.upsert_entity(&proven).unwrap();
+        // 0.3 is the receiver-method fan-out tier: every same-named method in
+        // the repo. 0.9 is module-known, symbol-selected-inside-it.
+        graph
+            .upsert_relation(&make_relation_at(
+                caller.id,
+                guessed.id,
+                RelationKind::Calls,
+                0.3,
+            ))
+            .unwrap();
+        graph
+            .upsert_relation(&make_relation_at(
+                caller.id,
+                proven.id,
+                RelationKind::Calls,
+                0.9,
+            ))
+            .unwrap();
+
+        let response = scan(&graph);
+        let output = response.lines.join("\n");
+
+        assert!(
+            output.contains("probe_guessed"),
+            "a name-only edge is a candidate, not evidence of use: {output}"
+        );
+        assert!(
+            !output.contains("probe_proven"),
+            "an import-scoped edge does prove use: {output}"
+        );
+        assert!(
+            !response.verified,
+            "a row whose only evidence this scan discarded cannot be stood behind: {output}"
+        );
+        assert!(
+            response
+                .unverified_reasons
+                .iter()
+                .any(|reason| reason.contains("name-only edges")),
+            "the reason names the discarded evidence: {:?}",
+            response.unverified_reasons
+        );
+        assert!(
+            output.contains("[unverified] probe_guessed"),
+            "and the row itself carries the label: {output}"
+        );
+    }
+
+    /// The counterpart, so the label above cannot be unconditional: an entity
+    /// nothing references at all is a plain find, not an unverified one.
+    #[test]
+    fn an_entity_with_no_inbound_edge_at_all_is_a_verified_find() {
+        let graph = InMemoryGraph::new();
+        let caller = measured(make_entity("probe_caller", "src/a.rs"), 1, 0);
+        let live = measured(make_entity("probe_live", "src/a.rs"), 0, 0);
+        let orphan = measured(make_entity("probe_orphan", "src/a.rs"), 0, 0);
+
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&live).unwrap();
+        graph.upsert_entity(&orphan).unwrap();
+        graph
+            .upsert_relation(&make_relation_at(
+                caller.id,
+                live.id,
+                RelationKind::Calls,
+                0.9,
+            ))
+            .unwrap();
+
+        let response = scan(&graph);
+        let output = response.lines.join("\n");
+
+        assert!(output.contains("probe_orphan"), "{output}");
+        assert!(
+            response.verified,
+            "nothing was discarded to reach this row: {output}"
+        );
+        assert!(
+            !output.contains("[unverified]"),
+            "no row is labelled when no evidence was discarded: {output}"
+        );
+    }
+
     #[test]
     fn count_incoming_references_filters_relation_kind_and_self_loops() {
         let graph = InMemoryGraph::new();
@@ -666,7 +890,7 @@ mod tests {
             .upsert_relation(&make_relation(target_id, target_id, RelationKind::Calls))
             .unwrap();
 
-        let count = count_incoming_references(
+        let counts = count_incoming_references(
             &graph,
             &target_id,
             &[
@@ -677,8 +901,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            count, 1,
+            counts.total, 1,
             "should count the single caller, not the self-loop"
+        );
+        assert_eq!(
+            counts.proven, 1,
+            "an import-scoped caller is proven, so it counts as evidence of use"
         );
     }
 
