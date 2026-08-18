@@ -2308,7 +2308,7 @@ mod tests {
         install_empty_store_exact_tree(&mut store, source._dir.path());
         let authority = test_repository_authority(source._dir.path());
 
-        let value = focal_context_json(&store, entity, false, Some(&authority)).unwrap();
+        let value = focal_context_json(&store, entity, Some(&authority)).unwrap();
         let object = value.as_object().unwrap();
         let body = object.get("body").and_then(|value| value.as_str()).unwrap();
 
@@ -2338,7 +2338,7 @@ mod tests {
         install_empty_store_exact_tree(&mut store, source._dir.path());
         let authority = test_repository_authority(source._dir.path());
 
-        let value = focal_context_json(&store, entity, false, Some(&authority)).unwrap();
+        let value = focal_context_json(&store, entity, Some(&authority)).unwrap();
         let object = value.as_object().unwrap();
 
         let marker = object.get("source").and_then(|v| v.as_str()).unwrap();
@@ -2394,7 +2394,7 @@ mod tests {
             "get_entity must present row 0 as line 1"
         );
 
-        let focal = focal_context_json(&store, entity, false, Some(&authority)).unwrap();
+        let focal = focal_context_json(&store, entity, Some(&authority)).unwrap();
         assert_eq!(
             focal["start_line"], 1,
             "get_context_pack focal must agree with get_entity"
@@ -2567,7 +2567,7 @@ mod tests {
             projection_level: kin_model::ProjectionLevel::FullBody,
             content: project_full_body_stub(entity),
         };
-        let focal = focal_context_json(&store, entity, false, Some(&authority)).unwrap();
+        let focal = focal_context_json(&store, entity, Some(&authority)).unwrap();
         let focal_body = focal["body"]
             .as_str()
             .expect("focal body must be a string, never null, when the graph has the source");
@@ -2617,7 +2617,7 @@ mod tests {
         install_empty_store_exact_tree(&mut store, source._dir.path());
         let authority = test_repository_authority(source._dir.path());
 
-        let focal = focal_context_json(&store, &spanless, false, Some(&authority)).unwrap();
+        let focal = focal_context_json(&store, &spanless, Some(&authority)).unwrap();
 
         assert!(
             focal["body"].is_null(),
@@ -2735,7 +2735,7 @@ mod tests {
             "the body must be the post-commit source: {excerpt}"
         );
 
-        let focal = focal_context_json(&store, &moved, false, Some(&authority)).unwrap();
+        let focal = focal_context_json(&store, &moved, Some(&authority)).unwrap();
         assert_eq!(
             focal["start_line"], 3,
             "the context pack must not serve the pre-commit position"
@@ -2967,6 +2967,301 @@ mod tests {
         );
     }
 
+    /// A pack fixture with both dependency shapes: a class whose only edges are
+    /// containment, so its dependency section can only be filled from the
+    /// neighbours in its file, and a function that really does call two
+    /// entities. One store, so the two answers are told apart by what the
+    /// payload says rather than by which fixture produced it.
+    struct PackProvenanceFixture {
+        _dir: tempfile::TempDir,
+        _env: EnvVarGuard,
+        store: EmptyStore,
+        authority: RequestRepositoryAuthority,
+        note_store: Entity,
+        reader: Entity,
+    }
+
+    const NOTES_SOURCE: &str = "export class NoteStore {\n  open(): void {}\n  close(): void {}\n  stats(): number { return 0; }\n}\n";
+
+    fn pack_provenance_fixture() -> PackProvenanceFixture {
+        let dir = tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        fs::create_dir_all(&kin_dir).unwrap();
+        let env = EnvVarGuard::set("KIN_SOURCE_ROOT", dir.path());
+        let blob_store = kin_blobs::BlobStore::new(kin_dir.join("objects")).unwrap();
+
+        let reader_source =
+            "export function readNotes(store: NoteStore): NoteRecord[] {\n  return [];\n}\n";
+        let records_source = "export class LinkRecord {}\nexport class NoteRecord {}\n";
+
+        let mut store = EmptyStore::default();
+        let mut file_entity =
+            |path: &str, source: &str, name: &str, kind: EntityKind, line: u32| {
+                let file_id = FilePathId::new(path);
+                let hash = blob_store.write(source.as_bytes()).unwrap();
+                store.file_hashes.insert(file_id.clone(), hash);
+                let entity = Entity {
+                    id: EntityId::new(),
+                    kind,
+                    name: name.to_string(),
+                    language: LanguageId::TypeScript,
+                    fingerprint: kin_model::entity::SemanticFingerprint {
+                        algorithm: kin_model::entity::FingerprintAlgorithm::V1TreeSitter,
+                        ast_hash: Hash256::from_bytes([5; 32]),
+                        signature_hash: Hash256::from_bytes([5; 32]),
+                        behavior_hash: Hash256::from_bytes([5; 32]),
+                        equivalence_hash: Hash256::from_bytes([0; 32]),
+                        stability_score: 1.0,
+                    },
+                    file_origin: Some(file_id.clone()),
+                    span: Some(kin_model::entity::SourceSpan {
+                        file: file_id,
+                        start_byte: 0,
+                        end_byte: source.len(),
+                        start_line: line,
+                        start_col: 0,
+                        end_line: line,
+                        end_col: 1,
+                    }),
+                    signature: format!("export {name}"),
+                    visibility: Visibility::Public,
+                    role: kin_model::entity::EntityRole::Source,
+                    doc_summary: None,
+                    metadata: kin_model::entity::EntityMetadata::default(),
+                    lineage_parent: None,
+                    created_in: None,
+                    superseded_by: None,
+                };
+                store.insert_test_entity(entity.clone());
+                entity
+            };
+
+        let note_store = file_entity("notes.ts", NOTES_SOURCE, "NoteStore", EntityKind::Class, 0);
+        let members: Vec<Entity> = ["NoteStore.open", "NoteStore.close", "NoteStore.stats"]
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                file_entity(
+                    "notes.ts",
+                    NOTES_SOURCE,
+                    name,
+                    EntityKind::Method,
+                    index as u32 + 1,
+                )
+            })
+            .collect();
+        let reader = file_entity(
+            "reader.ts",
+            reader_source,
+            "readNotes",
+            EntityKind::Function,
+            0,
+        );
+        let link_record = file_entity(
+            "records.ts",
+            records_source,
+            "LinkRecord",
+            EntityKind::Class,
+            0,
+        );
+        let note_record = file_entity(
+            "records.ts",
+            records_source,
+            "NoteRecord",
+            EntityKind::Class,
+            1,
+        );
+
+        // The class's only edges are containment, which is the shape that sends
+        // the builder to its same-file fallback: edges exist, none of them is a
+        // dependency.
+        for member in &members {
+            let relation = Relation {
+                id: RelationId::new(),
+                kind: RelationKind::Contains,
+                src: kin_model::GraphNodeId::Entity(note_store.id),
+                dst: kin_model::GraphNodeId::Entity(member.id),
+                confidence: 1.0,
+                origin: kin_model::relation::RelationOrigin::Parsed,
+                created_in: None,
+                import_source: None,
+                evidence: vec![],
+            };
+            store
+                .relations_by_entity
+                .entry(note_store.id)
+                .or_default()
+                .push(relation.clone());
+            store
+                .relations_by_entity
+                .entry(member.id)
+                .or_default()
+                .push(relation);
+        }
+        store.insert_test_calls_relation(&reader, &link_record);
+        store.insert_test_calls_relation(&reader, &note_record);
+
+        install_empty_store_exact_tree(&mut store, dir.path());
+        let authority = test_repository_authority(dir.path());
+
+        PackProvenanceFixture {
+            _dir: dir,
+            _env: env,
+            store,
+            authority,
+            note_store,
+            reader,
+        }
+    }
+
+    fn context_pack_json(
+        fixture: &PackProvenanceFixture,
+        entity: &Entity,
+        compact: bool,
+    ) -> serde_json::Value {
+        let sessions = SessionRegistry::new();
+        let args = HashMap::from([
+            (
+                "entity_id".to_string(),
+                serde_json::json!(entity.id.to_string()),
+            ),
+            ("compact".to_string(), serde_json::json!(compact)),
+        ]);
+        tool_result_json(
+            entities::handle_get_context_pack(
+                &args,
+                &fixture.store,
+                &sessions,
+                Some(&fixture.authority),
+            )
+            .unwrap(),
+        )
+    }
+
+    /// A class with no dependency edge came back with six `dependencies` that
+    /// were not dependencies at all: same-file neighbours the builder reached
+    /// for, tagged only inside an `entry.content` string this handler never
+    /// serializes. On the wire they were indistinguishable from edges, and the
+    /// stranger who hit this read them as the class's dependency list.
+    #[test]
+    fn a_context_pack_marks_its_same_file_fallback_rows() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = pack_provenance_fixture();
+
+        for compact in [false, true] {
+            let value = context_pack_json(&fixture, &fixture.note_store, compact);
+            let rows = value["dependencies"]
+                .as_array()
+                .unwrap_or_else(|| panic!("the pack must carry dependency rows: {value}"));
+            assert_eq!(
+                rows.len(),
+                3,
+                "the fixture's three same-file neighbours are what fills this section: {value}"
+            );
+            for row in rows {
+                assert_eq!(
+                    row["relation"],
+                    serde_json::json!("same_file_neighbor"),
+                    "a fallback row must say it is a neighbour, not an edge (compact={compact}): \
+                     {value}"
+                );
+            }
+            assert_eq!(
+                value["dependency_selection"]["source"],
+                serde_json::json!("same_file_fallback"),
+                "the pack must name the selection that filled it (compact={compact}): {value}"
+            );
+            assert_eq!(value["dependency_selection"]["returned"], 3);
+            assert_eq!(value["dependency_selection"]["same_file_candidates"], 3);
+            assert_eq!(value["dependency_selection"]["same_file_dropped"], 0);
+        }
+    }
+
+    /// The control that makes the marker mean something: a focal with real
+    /// dependency edges must report those as edges. A payload that stamped
+    /// every row `same_file_neighbor` would pass the test above and be just as
+    /// wrong.
+    #[test]
+    fn a_context_pack_marks_real_dependency_edges_as_edges() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = pack_provenance_fixture();
+
+        for compact in [false, true] {
+            let value = context_pack_json(&fixture, &fixture.reader, compact);
+            let rows = value["dependencies"]
+                .as_array()
+                .unwrap_or_else(|| panic!("the pack must carry dependency rows: {value}"));
+            assert_eq!(
+                rows.len(),
+                2,
+                "the fixture's two call edges are what fills this section: {value}"
+            );
+            for row in rows {
+                assert_eq!(
+                    row["relation"],
+                    serde_json::json!("dependency_edge"),
+                    "an edge row must say so (compact={compact}): {value}"
+                );
+            }
+            assert_eq!(
+                value["dependency_selection"]["source"],
+                serde_json::json!("dependency_edges"),
+                "a pack built from edges must not report the fallback: {value}"
+            );
+            assert_eq!(value["dependency_selection"]["same_file_candidates"], 0);
+        }
+    }
+
+    /// `compact: true` dropped the focal body while still paying for the read
+    /// that produced it, so the cheaper mode omitted the one thing the pack is
+    /// for and a caller spent a whole call learning it had to ask again.
+    /// Compact bounds the neighbour rows; the focal body stays.
+    #[test]
+    fn a_compact_context_pack_still_carries_the_focal_body() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = pack_provenance_fixture();
+
+        let compact = context_pack_json(&fixture, &fixture.note_store, true);
+        assert!(
+            compact["focal_entity"]["body"]
+                .as_str()
+                .is_some_and(|body| body.contains("export class NoteStore")),
+            "a compact pack must still serve the focal body: {compact}"
+        );
+
+        // The neighbour rows are what compact actually trims, and the control
+        // that keeps this test from passing on a compact mode that trims
+        // nothing at all.
+        let rows = compact["dependencies"].as_array().expect("rows");
+        assert!(
+            rows.iter()
+                .all(|row| row.get("body").is_none() && row.get("projection").is_none()),
+            "compact must still drop the neighbour bodies and projections: {compact}"
+        );
+        let full = context_pack_json(&fixture, &fixture.note_store, false);
+        assert!(
+            full["dependencies"]
+                .as_array()
+                .expect("rows")
+                .iter()
+                .all(|row| row.get("projection").is_some()),
+            "full mode is what carries the projection levels: {full}"
+        );
+        assert_eq!(
+            full["focal_entity"]["body"], compact["focal_entity"]["body"],
+            "the focal body must not depend on the mode"
+        );
+    }
+
     /// A path whose bytes are not valid UTF-8 keeps its byte-exact spelling.
     ///
     /// Dropping `artifact_path` as redundant is only true where a plain path can
@@ -3060,7 +3355,7 @@ mod tests {
         install_empty_store_exact_tree(&mut store, source._dir.path());
         let authority = test_repository_authority(source._dir.path());
 
-        let value = focal_context_json(&store, entity, false, Some(&authority)).unwrap();
+        let value = focal_context_json(&store, entity, Some(&authority)).unwrap();
         let object = value.as_object().unwrap();
         let body = object.get("body").and_then(|value| value.as_str()).unwrap();
 
