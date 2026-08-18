@@ -790,6 +790,9 @@ jobs:
           REQUIRED_CHECKS: |
             Check & Test (ubuntu-latest)
             Check & Test (macos-latest)
+            Falsify guards
+            Feature permutation tests (ubuntu-latest)
+            Feature permutation tests (macos-latest)
             DCO Sign-off
             cargo-deny
             gitleaks (full history)
@@ -881,6 +884,24 @@ jobs:
                   release_branch,
               ),
               "Check & Test (macos-latest)": (
+                  245803170,
+                  ".github/workflows/ci.yml",
+                  "push",
+                  release_branch,
+              ),
+              "Falsify guards": (
+                  245803170,
+                  ".github/workflows/ci.yml",
+                  "push",
+                  release_branch,
+              ),
+              "Feature permutation tests (ubuntu-latest)": (
+                  245803170,
+                  ".github/workflows/ci.yml",
+                  "push",
+                  release_branch,
+              ),
+              "Feature permutation tests (macos-latest)": (
                   245803170,
                   ".github/workflows/ci.yml",
                   "push",
