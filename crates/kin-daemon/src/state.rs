@@ -163,13 +163,24 @@ impl OpenPhases {
             .join(" ")
     }
 
-    fn emit(&self, repository: &str) {
+    /// Log what this open cost, and leave the total in the store for the next
+    /// spawn to size its idle window against.
+    ///
+    /// Both from one elapsed reading. Taking the total twice would let the log
+    /// and the record disagree by however long the write took, and a persisted
+    /// number that does not match the line above it is worse than no number.
+    ///
+    /// The record is a lifecycle hint, not retrieval authority: it is written
+    /// once per open at the end of one, and nothing reads it to answer a query.
+    fn emit(&self, repository: &str, layout: &KinLayout) {
+        let total_ms = self.started.elapsed().as_millis() as u64;
         info!(
             repository = repository,
-            total_ms = self.started.elapsed().as_millis() as u64,
+            total_ms = total_ms,
             phases = %self.breakdown(),
             "daemon startup phases completed"
         );
+        kin_daemon_spawn::record_boot_cost(layout.root(), total_ms);
     }
 }
 
@@ -2377,7 +2388,7 @@ impl DaemonState {
             }
         }
         state.register_daemon_system_session();
-        phases.emit(&state.cached_repo_id);
+        phases.emit(&state.cached_repo_id, &state.layout);
         Ok(state)
     }
 
@@ -7131,6 +7142,33 @@ mod tests {
         let repo_dir = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo_dir.path()).unwrap();
         DaemonState::open(init.layout).expect("current-version repo must open");
+    }
+
+    /// FIR-2426. The daemon that pays an open is the only process that can
+    /// measure it, and the next CLI spawn is the process that needs the number.
+    /// Nothing but a record in the store carries it across that boundary, so an
+    /// open that logs its cost and persists nothing leaves the next spawn
+    /// guessing exactly as before.
+    #[test]
+    fn open_records_what_it_cost_for_the_next_spawn_to_size_its_idle_window() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let kin_root = init.layout.root().to_path_buf();
+        assert_eq!(
+            kin_daemon_spawn::read_boot_cost(&kin_root),
+            None,
+            "a store nothing has opened carries no cost"
+        );
+
+        DaemonState::open(init.layout).expect("current-version repo must open");
+
+        let recorded = kin_daemon_spawn::read_boot_cost(&kin_root)
+            .expect("an open must leave its cost in the store it opened");
+        assert!(
+            kin_daemon_spawn::cli_idle_window(Some(recorded.total_ms)).secs
+                >= kin_daemon_spawn::CLI_IDLE_FLOOR_SECS,
+            "a recorded cost must produce a usable window"
+        );
     }
 
     #[test]

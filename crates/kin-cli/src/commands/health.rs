@@ -158,6 +158,7 @@ pub async fn run_health_checks() -> HealthReport {
         check_kin_daemon_binary(),
         check_supervisor_startup_protocol(),
         check_daemon_running().await,
+        check_daemon_idle_window(),
         check_vfs_projection(),
         check_projection_mode(),
         check_repo_init(),
@@ -607,6 +608,45 @@ fn daemon_not_running_check_for(repo: &str, endpoint_record: &Path) -> HealthChe
         .fixable()
         .with_manual_fix("run any `kin` command in the repo to auto-start the daemon")
     }
+}
+
+/// Report the idle window the next CLI-spawned daemon for this repository will
+/// take, and what decided it.
+///
+/// Always advisory: every window here is a correct one. The check exists
+/// because the window used to be a compiled 60 seconds for every store, which
+/// was shorter than a converted repository's own cold start, so each command
+/// paid a fresh open and nothing on any surface said why. A number an operator
+/// cannot see is a number nobody can question.
+fn check_daemon_idle_window() -> HealthCheck {
+    let cwd = env::current_dir().unwrap_or_default();
+    let Some(layout) = kin_core::KinLayout::discover(&cwd) else {
+        return HealthCheck::new(
+            "daemon_idle_window",
+            "Daemon idle window",
+            HealthStatus::Unsupported,
+            "n/a — not in a Kin repository (the idle window is per-store)",
+        );
+    };
+    if let Ok(user_value) = env::var("KIN_DAEMON_IDLE_TIMEOUT_SECS") {
+        return HealthCheck::new(
+            "daemon_idle_window",
+            "Daemon idle window",
+            HealthStatus::Healthy,
+            format!(
+                "{}s, from KIN_DAEMON_IDLE_TIMEOUT_SECS in this environment, which overrides \
+                 the measured rule",
+                user_value.trim()
+            ),
+        );
+    }
+    let window = kin_daemon_spawn::cli_idle_window_for_store(layout.root());
+    HealthCheck::new(
+        "daemon_idle_window",
+        "Daemon idle window",
+        HealthStatus::Healthy,
+        window.describe(),
+    )
 }
 
 fn check_vfs_projection() -> HealthCheck {

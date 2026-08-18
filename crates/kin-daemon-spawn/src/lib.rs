@@ -250,6 +250,156 @@ pub fn clear_open_transaction(kin_root: &Path) {
     let _ = fs::remove_file(kin_root.join(TRANSACTION_FILE_NAME));
 }
 
+/// File a daemon writes its own open cost into, for the next spawn to size an
+/// idle window against.
+pub const BOOT_COST_FILE_NAME: &str = "daemon-boot-cost.json";
+
+/// Shortest idle window a CLI-spawned daemon may take, in seconds.
+///
+/// This was the unconditional window every CLI spawn used before the open cost
+/// was measured, so a store with no record keeps exactly the behavior it had.
+pub const CLI_IDLE_FLOOR_SECS: u64 = 60;
+
+/// Longest idle window the boot-cost rule may ask for, in seconds.
+///
+/// Equal to [`MCP_IDLE_TIMEOUT_SECS`]. A store slow enough to want more than
+/// half an hour of patience has a problem the idle window cannot solve, and an
+/// unbounded rule would let one pathological open pin a daemon's memory for the
+/// rest of the day.
+pub const CLI_IDLE_CEILING_SECS: u64 = 1800;
+
+/// How many of the last open's cost the idle window has to cover.
+///
+/// An idle window shorter than the boot it causes is wrong by construction: the
+/// daemon expires between two commands, the next command pays the whole open
+/// again, and the window that was chosen to save memory spends more wall clock
+/// than it could ever save. Ten opens' worth is the margin that makes a
+/// second command in the same working session free.
+pub const CLI_IDLE_BOOT_MULTIPLE: u64 = 10;
+
+/// What the last local open of a store cost, in the store.
+///
+/// Written by the daemon that paid it and read by the next CLI spawn, which is
+/// a different process on a different invocation. Nothing else can carry it:
+/// the spawning command has no way to know what an open of this store costs
+/// until one has happened, and the cost is a property of the store (its graph
+/// size, its index state) rather than of the machine or the command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DaemonBootCost {
+    /// Wall milliseconds the open took, end to end.
+    pub total_ms: u64,
+}
+
+/// Where the boot-cost record for `kin_root` lives.
+pub fn boot_cost_path(kin_root: &Path) -> PathBuf {
+    kin_root.join(BOOT_COST_FILE_NAME)
+}
+
+/// Record what an open of this store cost.
+///
+/// Best effort and atomic, like every other marker here: a reader must never
+/// see half a record, and a daemon that has just come up must never fail
+/// because it could not write a hint for the next one.
+pub fn record_boot_cost(kin_root: &Path, total_ms: u64) {
+    let Ok(body) = serde_json::to_string(&DaemonBootCost { total_ms }) else {
+        return;
+    };
+    let tmp = kin_root.join(format!("{BOOT_COST_FILE_NAME}.tmp"));
+    if fs::write(&tmp, body).is_ok() && fs::rename(&tmp, boot_cost_path(kin_root)).is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+}
+
+/// Read the boot-cost record for `kin_root`, if one is there.
+///
+/// `None` means no local daemon has opened this store since the record was
+/// introduced, which is the state every freshly converted repository starts in.
+pub fn read_boot_cost(kin_root: &Path) -> Option<DaemonBootCost> {
+    let raw = fs::read_to_string(boot_cost_path(kin_root)).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// The idle window a CLI spawn should give a daemon, and what decided it.
+///
+/// Carried as a value rather than a bare number so `kin doctor` can say why the
+/// window is what it is. An operator who sees only the number cannot tell a
+/// store that has never been opened from one whose open is slow enough to have
+/// hit the ceiling, and those want different remedies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdleWindow {
+    /// The window itself, in seconds.
+    pub secs: u64,
+    /// The open cost it was sized against, or `None` when the store has no
+    /// record yet.
+    pub boot_ms: Option<u64>,
+    /// Whether [`CLI_IDLE_FLOOR_SECS`] raised the window above what the rule
+    /// asked for.
+    pub at_floor: bool,
+    /// Whether [`CLI_IDLE_CEILING_SECS`] cut the window below what the rule
+    /// asked for.
+    pub at_ceiling: bool,
+}
+
+impl IdleWindow {
+    /// One sentence naming the window and what decided it.
+    pub fn describe(&self) -> String {
+        match self.boot_ms {
+            None => format!(
+                "{}s, the floor: no local daemon has recorded an open cost for this store yet",
+                self.secs
+            ),
+            Some(boot_ms) if self.at_floor => format!(
+                "{}s, the floor: {CLI_IDLE_BOOT_MULTIPLE} times the last open of this store \
+                 ({boot_ms}ms) is shorter than it",
+                self.secs
+            ),
+            Some(boot_ms) if self.at_ceiling => format!(
+                "{}s, the ceiling: {CLI_IDLE_BOOT_MULTIPLE} times the last open of this store \
+                 ({boot_ms}ms) is longer than it",
+                self.secs
+            ),
+            Some(boot_ms) => format!(
+                "{}s, {CLI_IDLE_BOOT_MULTIPLE} times the last open of this store ({boot_ms}ms), \
+                 so a second command in the same session does not pay that open again",
+                self.secs
+            ),
+        }
+    }
+}
+
+/// Size a CLI-spawned daemon's idle window against what opening this store last
+/// cost.
+///
+/// Pure, so the policy is provable without starting a process or writing a
+/// file. `None` reproduces the old unconditional default exactly.
+pub fn cli_idle_window(boot_ms: Option<u64>) -> IdleWindow {
+    let Some(boot_ms) = boot_ms else {
+        return IdleWindow {
+            secs: CLI_IDLE_FLOOR_SECS,
+            boot_ms: None,
+            at_floor: true,
+            at_ceiling: false,
+        };
+    };
+    // Integer division truncates, which rounds the window DOWN toward the
+    // floor. That is the safe direction: the clamp below cannot be defeated by
+    // rounding, and a window one second short of the ideal still covers ten
+    // opens to within a rounding error.
+    let wanted = (boot_ms / 1000).saturating_mul(CLI_IDLE_BOOT_MULTIPLE);
+    let secs = wanted.clamp(CLI_IDLE_FLOOR_SECS, CLI_IDLE_CEILING_SECS);
+    IdleWindow {
+        secs,
+        boot_ms: Some(boot_ms),
+        at_floor: wanted < CLI_IDLE_FLOOR_SECS,
+        at_ceiling: wanted > CLI_IDLE_CEILING_SECS,
+    }
+}
+
+/// The idle window for a store, read from its own recorded open cost.
+pub fn cli_idle_window_for_store(kin_root: &Path) -> IdleWindow {
+    cli_idle_window(read_boot_cost(kin_root).map(|cost| cost.total_ms))
+}
+
 /// Append a line to the repo daemon's own log.
 ///
 /// The one place a killer can put its reason where the operator will look. The
@@ -2879,8 +3029,11 @@ pub struct DaemonSpawnPlan {
     /// Idle timeout to inject, or `None` to leave the daemon's default alone.
     ///
     /// An explicit `KIN_DAEMON_IDLE_TIMEOUT_SECS` in the caller's environment
-    /// always wins; resolve that before building the plan.
-    pub idle_timeout_secs: Option<&'static str>,
+    /// always wins; resolve that before building the plan. Owned rather than
+    /// borrowed because the CLI path sizes this against the store's own
+    /// recorded open cost ([`cli_idle_window`]), which is not a compile-time
+    /// constant.
+    pub idle_timeout_secs: Option<String>,
     /// Supervisor endpoint to hand the daemon, when the caller has one.
     pub supervisor_url: Option<String>,
 }
@@ -2901,7 +3054,7 @@ impl DaemonSpawnPlan {
             "--port",
             DAEMON_PORT_ARGUMENT,
         ]);
-        if let Some(timeout) = self.idle_timeout_secs {
+        if let Some(timeout) = &self.idle_timeout_secs {
             cmd.env("KIN_DAEMON_IDLE_TIMEOUT_SECS", timeout);
         }
         if let Some(supervisor_url) = &self.supervisor_url {
@@ -5483,6 +5636,136 @@ mod tests {
         );
     }
 
+    // ── boot-cost-sized idle window (FIR-2426) ─────────────────────────────
+
+    /// The rule the ticket names: an idle window shorter than the boot it
+    /// causes is wrong by construction. Brown's daemon log measured five cold
+    /// starts between 48851 ms and 71094 ms on a converted repository whose
+    /// CLI-spawned daemon took a 60-second window, so every A/B task paid a
+    /// fresh open. Sixty seconds of open must buy at least ten minutes of
+    /// patience.
+    #[test]
+    fn a_sixty_second_open_buys_at_least_ten_minutes() {
+        let window = cli_idle_window(Some(60_000));
+        assert_eq!(window.secs, 600);
+        assert!(
+            window.secs >= 600,
+            "60s of open must buy at least ten minutes, got {}s",
+            window.secs
+        );
+        assert!(!window.at_floor, "600s is above the floor");
+        assert!(!window.at_ceiling, "600s is below the ceiling");
+    }
+
+    /// Every measured cold start from that log gets a window longer than the
+    /// open it would otherwise force the next command to repeat. This is the
+    /// property, stated over the real numbers rather than over one of them.
+    #[test]
+    fn every_measured_cold_start_gets_a_window_longer_than_itself() {
+        for boot_ms in [48851u64, 52_000, 61_500, 68_300, 71_094] {
+            let window = cli_idle_window(Some(boot_ms));
+            assert!(
+                window.secs * 1000 > boot_ms,
+                "a {boot_ms}ms open must not be forced to repeat inside its own \
+                 window, got {}s",
+                window.secs
+            );
+        }
+    }
+
+    /// Control: a store with no record keeps the exact window every CLI spawn
+    /// used before this rule existed, so the rule cannot pass by lengthening
+    /// every window.
+    #[test]
+    fn no_recorded_cost_keeps_the_old_window() {
+        let window = cli_idle_window(None);
+        assert_eq!(window.secs, CLI_IDLE_FLOOR_SECS);
+        assert_eq!(CLI_IDLE_FLOOR_SECS, 60);
+        assert_eq!(window.boot_ms, None);
+        assert!(window.at_floor);
+    }
+
+    /// Control at the other end: a fast store is not given a shorter window
+    /// than the floor, and a pathological one cannot pin a daemon past the
+    /// ceiling.
+    #[test]
+    fn the_window_is_clamped_at_both_ends() {
+        let fast = cli_idle_window(Some(1_000));
+        assert_eq!(fast.secs, CLI_IDLE_FLOOR_SECS);
+        assert!(fast.at_floor && !fast.at_ceiling);
+
+        let pathological = cli_idle_window(Some(600_000));
+        assert_eq!(pathological.secs, CLI_IDLE_CEILING_SECS);
+        assert!(pathological.at_ceiling && !pathological.at_floor);
+    }
+
+    /// The ceiling and the MCP window are the same number in two types. A
+    /// reader who changes one and not the other would have a CLI window that
+    /// outlives an interactive agent session's.
+    #[test]
+    fn the_ceiling_and_the_mcp_window_agree() {
+        assert_eq!(
+            MCP_IDLE_TIMEOUT_SECS.parse::<u64>().unwrap(),
+            CLI_IDLE_CEILING_SECS
+        );
+    }
+
+    /// The record survives the process boundary it exists to cross: the daemon
+    /// that paid the cost writes it, and a later spawn reads it back and sizes
+    /// its window against it.
+    #[test]
+    fn a_recorded_cost_round_trips_and_sizes_the_next_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let kin_root = dir.path();
+        assert_eq!(
+            cli_idle_window_for_store(kin_root).secs,
+            CLI_IDLE_FLOOR_SECS,
+            "an unopened store has no record and takes the floor"
+        );
+
+        record_boot_cost(kin_root, 60_000);
+        assert_eq!(
+            read_boot_cost(kin_root),
+            Some(DaemonBootCost { total_ms: 60_000 })
+        );
+        assert_eq!(cli_idle_window_for_store(kin_root).secs, 600);
+        assert!(
+            !boot_cost_path(kin_root).with_extension("json.tmp").exists(),
+            "the atomic write leaves no temp file behind"
+        );
+    }
+
+    /// A corrupt or truncated record reads as no record, not as a zero cost. A
+    /// zero would silently reinstate the floor while looking like a measurement.
+    #[test]
+    fn an_unreadable_record_is_absent_rather_than_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(boot_cost_path(dir.path()), "{\"total_ms\": ").unwrap();
+        assert_eq!(read_boot_cost(dir.path()), None);
+        assert_eq!(
+            cli_idle_window_for_store(dir.path()).secs,
+            CLI_IDLE_FLOOR_SECS
+        );
+    }
+
+    /// The explanation names the deciding cause, because the number alone
+    /// cannot separate a store that has never been opened from one whose open
+    /// is slow enough to hit the ceiling.
+    #[test]
+    fn the_explanation_names_what_decided_the_window() {
+        assert!(cli_idle_window(None).describe().contains("no local daemon"));
+        assert!(cli_idle_window(Some(1_000)).describe().contains("the floor"));
+        assert!(
+            cli_idle_window(Some(600_000))
+                .describe()
+                .contains("the ceiling")
+        );
+        let scaled = cli_idle_window(Some(60_000));
+        let described = scaled.describe();
+        assert!(described.contains("600s"), "{described}");
+        assert!(described.contains("60000ms"), "{described}");
+    }
+
     #[test]
     fn spawn_plan_always_lets_the_daemon_choose_the_port() {
         let plan = DaemonSpawnPlan {
@@ -5504,7 +5787,7 @@ mod tests {
         let plan = DaemonSpawnPlan {
             daemon_bin: PathBuf::from("/usr/bin/kin-daemon"),
             working_dir: PathBuf::from("/repo"),
-            idle_timeout_secs: Some(MCP_IDLE_TIMEOUT_SECS),
+            idle_timeout_secs: Some(MCP_IDLE_TIMEOUT_SECS.to_string()),
             supervisor_url: Some("http://127.0.0.1:9000".to_string()),
         };
         let cmd = plan.command();
