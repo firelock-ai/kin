@@ -1623,7 +1623,23 @@ mod tests {
             let variants = tool["inputSchema"]["properties"]["operations"]["items"]["oneOf"]
                 .as_array()
                 .expect("transaction operations must be disjoint oneOf variants");
-            assert_eq!(variants.len(), 2, "{tool_name}");
+            assert_eq!(variants.len(), 3, "{tool_name}");
+
+            let new_source_file = variants
+                .iter()
+                .find(|variant| variant["title"] == "New source file")
+                .expect("payload-less new-source-file branch");
+            assert_eq!(
+                required_set(new_source_file),
+                ["body", "description", "target", "verb"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+            );
+            assert!(
+                new_source_file["properties"].get("payload").is_none(),
+                "payload-less new-source-file branch must reject payload"
+            );
 
             let body_edit = variants
                 .iter()
