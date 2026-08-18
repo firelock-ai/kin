@@ -879,6 +879,165 @@ mod tests {
         );
     }
 
+    /// `kin refs` and MCP `find_references` must return the same number for the
+    /// same entity on the same graph.
+    ///
+    /// They did not. The CLI counts distinct referencing entities; the MCP tool
+    /// keyed its rows on the caller's FILE path and so counted distinct files,
+    /// which is FIR-2398. Two surfaces answering one question with two numbers
+    /// is worse than either being wrong alone, because whichever an agent read
+    /// looked internally consistent.
+    ///
+    /// The fixture is built so the two counts cannot coincide by luck: three
+    /// callers share one file, a fourth sits in another, and the target also
+    /// calls itself. Under the old rule the MCP tool saw three keys
+    /// (two caller files plus the target's own, from the self edge) against the
+    /// CLI's four entities, so a regression separates them again.
+    #[tokio::test]
+    async fn cli_refs_and_mcp_find_references_agree_on_the_caller_count() {
+        use kin_db::InMemoryGraph;
+        use kin_model::relation::{Relation, RelationOrigin};
+        use kin_model::{
+            Entity, EntityId, EntityKind, EntityMetadata, EntityRole, EntityStore, FilePathId,
+            FingerprintAlgorithm, GraphNodeId, Hash256, LanguageId, SemanticFingerprint,
+            Visibility,
+        };
+
+        fn entity(name: &str, rel_path: &str) -> Entity {
+            Entity {
+                id: EntityId::new(),
+                kind: EntityKind::Function,
+                name: name.to_string(),
+                language: LanguageId::Rust,
+                fingerprint: SemanticFingerprint {
+                    algorithm: FingerprintAlgorithm::V1TreeSitter,
+                    ast_hash: Hash256::from_bytes([0; 32]),
+                    signature_hash: Hash256::from_bytes([0; 32]),
+                    behavior_hash: Hash256::from_bytes([0; 32]),
+                    equivalence_hash: kin_model::Hash256::from_bytes([0; 32]),
+                    stability_score: 1.0,
+                },
+                file_origin: Some(FilePathId::new(rel_path)),
+                span: None,
+                signature: name.to_string(),
+                visibility: Visibility::Public,
+                role: EntityRole::Source,
+                doc_summary: None,
+                metadata: EntityMetadata::default(),
+                lineage_parent: None,
+                created_in: None,
+                superseded_by: None,
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let graph = InMemoryGraph::new();
+
+        let target = entity("to_dot", "linkgraph.rs");
+        let callers = [
+            entity("draws_nodes", "test_linkgraph.rs"),
+            entity("draws_edges", "test_linkgraph.rs"),
+            entity("draws_dashed", "test_linkgraph.rs"),
+            entity("cmd_graph", "cli.rs"),
+        ];
+        graph.upsert_entity(&target).unwrap();
+
+        let edge = |src: EntityId, dst: EntityId| {
+            graph
+                .upsert_relation(&Relation {
+                    id: kin_model::ids::RelationId::new(),
+                    kind: RelationKind::Calls,
+                    src: GraphNodeId::Entity(src),
+                    dst: GraphNodeId::Entity(dst),
+                    confidence: 1.0,
+                    origin: RelationOrigin::Parsed,
+                    created_in: None,
+                    import_source: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        };
+        for caller in &callers {
+            graph.upsert_entity(caller).unwrap();
+            edge(caller.id, target.id);
+        }
+        // Recursive: an upstream caller on neither surface.
+        edge(target.id, target.id);
+
+        let cli = build_refs_response(
+            &layout,
+            &graph,
+            &RefsRequest {
+                entity: target.id.to_string(),
+                kind: "calls".to_string(),
+            },
+        )
+        .unwrap();
+        let cli_text = cli.lines.join("\n");
+
+        let args = std::collections::HashMap::from([
+            (
+                "entity_id".to_string(),
+                serde_json::json!(target.id.to_string()),
+            ),
+            ("relation_kinds".to_string(), serde_json::json!(["calls"])),
+        ]);
+        let mcp = kin_mcp::handlers::entities::handle_find_references(&args, &graph, None)
+            .await
+            .unwrap();
+        let kin_mcp::types::ContentBlock::Text { text } = mcp.content.first().unwrap();
+        let mcp_body: serde_json::Value = serde_json::from_str(text).unwrap();
+        let mcp_count = mcp_body["total_upstream"].as_u64().unwrap();
+
+        // Absolute value first: two surfaces agreeing on a wrong number is not
+        // agreement, and this is the assertion that catches both regressing the
+        // same way.
+        assert_eq!(
+            mcp_count, 4,
+            "four callers, whichever files they share: {mcp_body:#}"
+        );
+        assert!(
+            cli_text.contains("referenced by 4 entities:"),
+            "the CLI must count the same four: {cli_text}"
+        );
+        assert_eq!(
+            mcp_body["counts"]["counted"], "referencing_entities",
+            "the agreed count must name its unit: {mcp_body:#}"
+        );
+        // Non-vacuity: the file count is genuinely different, so the assertions
+        // above are not passing because every number in the fixture is 4.
+        assert_eq!(
+            mcp_body["counts"]["files"], 2,
+            "the fixture must span fewer files than callers: {mcp_body:#}"
+        );
+
+        // Row for row, not just in total: every caller the CLI names is a row
+        // the MCP tool returned, by entity id.
+        let mcp_ids = mcp_body["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["entity_id"].as_str().unwrap().to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        for caller in &callers {
+            assert!(
+                mcp_ids.contains(&caller.id.to_string()),
+                "MCP dropped caller {}: {mcp_body:#}",
+                caller.name
+            );
+            assert!(
+                cli_text.contains(&caller.name),
+                "the CLI dropped caller {}: {cli_text}",
+                caller.name
+            );
+        }
+        assert!(
+            !mcp_ids.contains(&target.id.to_string()),
+            "the recursive edge must not be reported as a caller: {mcp_body:#}"
+        );
+    }
+
     #[test]
     fn parse_relation_kinds_accepts_import_alias() {
         let kinds = parse_relation_kinds("import").unwrap();

@@ -884,15 +884,24 @@ pub fn handle_trace_computation<G: GraphStore>(
 }
 
 pub const FIND_REFERENCES_DESC: &str = "\
-Find who depends on an entity — its direct upstream callers, importers, and references. \
+Find who depends on an entity: its direct upstream callers, importers, and references. \
 Give it an entity_id or an exact symbol name (it resolves the best-matching canonical \
-definition) and it returns one row per upstream site with the relation kind, file path, \
-line, and signature. Use it to answer \"who calls / imports / uses this?\" before you \
+definition) and it returns ONE ROW PER REFERENCING ENTITY, with that caller's entity id, \
+name, kind, file path, its own definition line (start_line), and every line inside it \
+that references the focal (reference_lines). Two callers in one file are two rows, and \
+`total_upstream` is the number of referencing entities, the same unit `kin refs` prints. \
+The `counts` object states the unit outright and adds `files` and `reference_sites`, so \
+a count is never read against the wrong unit. `reference_sites` is null when some row's \
+sites could not be located, with `known_reference_sites` the lower bound and each such \
+row naming why under `reference_lines_absent_reason`. Rows omit the caller's body by \
+default to keep the response small; pass include_snippets=true for the signature and a \
+bounded body excerpt, or drill to any row's entity_id with get_entity_source. \
+Use it to answer \"who calls / imports / uses this?\" before you \
 change or remove something, to gauge blast radius, or to navigate from a definition out \
 to its usages. Filter with relation_kinds (calls, imports, references) when you only \
 care about one kind of edge; it defaults to all three. When you need this answer for \
 many entities at once (e.g. classifying a whole set as used vs. unused), don't loop \
-this call per entity — bulk_check_references does the batch in one shot. \
+this call per entity, because bulk_check_references does the batch in one shot. \
 When no references come back, the additive `negative` object's `safe_to_conclude_absent` \
 flag says whether \"nothing depends on this\" is authoritative (daemon-owned graph, \
 complete coverage, no degraded signals) or merely \"not indexed yet\" — consult it \
@@ -1011,8 +1020,10 @@ fn spine_reference_rows(
             kind: source.map(|entity| format!("{:?}", entity.kind)),
             file_path: Some(file_path),
             start_line: None,
-            // A federated xref carries no site span from the other repo's graph.
+            // A federated xref carries no site span from the other repo's graph,
+            // and says so rather than leaving an unexplained empty list.
             reference_lines: Vec::new(),
+            reference_lines_absent: Some(ReferenceLinesAbsent::FederatedXref),
             signature: source.map(|entity| entity.signature.clone()),
             snippet: None,
             // CrossRepoEdge proves a dependency but does not retain whether
@@ -1033,8 +1044,53 @@ fn reference_filter_covers_unknown_subtypes(relation_kinds: &[RelationKind]) -> 
         && defaults.iter().all(|kind| relation_kinds.contains(kind))
 }
 
-fn reference_row_json(row: ReferenceRow) -> serde_json::Value {
+/// What a reference answer counted, stated rather than left to be inferred.
+///
+/// `total_upstream` is a bare number, and a reader who does not know its unit
+/// cannot tell an under-count from a small repository. It counted distinct FILES
+/// until FIR-2398, which is how eleven callers across two files were served as
+/// "2" beside two flags that read complete.
+///
+/// The site total follows the rule `bulk_check_references` already uses: a
+/// number is emitted only when it is complete, and the lower bound is named as a
+/// bound otherwise. A row whose site lines the graph does not carry makes the
+/// site total a floor, never a fact.
+///
+/// `reference_sites_complete` is about the rows that came back: it says every
+/// returned reference could be located at a line. Whether the row SET itself is
+/// complete is the `negative` object's question for an empty answer and
+/// `edge_coverage`'s for the classes the query read; this field does not restate
+/// either, and on an empty answer it describes an empty set.
+fn reference_counts(rows: &[ReferenceRow]) -> serde_json::Value {
+    let known_reference_sites: usize = rows.iter().map(|row| row.reference_lines.len()).sum();
+    let reference_sites_complete = rows.iter().all(|row| !row.reference_lines.is_empty());
+    let files = rows
+        .iter()
+        .filter_map(|row| row.file_path.as_deref())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
     serde_json::json!({
+        "counted": "referencing_entities",
+        "referencing_entities": rows.len(),
+        "files": files,
+        "reference_sites": reference_sites_complete.then_some(known_reference_sites),
+        "known_reference_sites": known_reference_sites,
+        "reference_sites_complete": reference_sites_complete,
+    })
+}
+
+/// Project one reference row.
+///
+/// `include_snippets` adds the caller's bounded body and signature. They are off
+/// by default because the row count is now the caller count rather than the file
+/// count, and each body runs to [`RETRIEVAL_SNIPPET_MAX_CHARS`]: the case that
+/// motivated the row change went from two rows to eleven, so bodies scale with
+/// callers where they used to scale with files. The identifying fields an agent
+/// navigates by (entity id, name, kind, file, caller line, site lines, relation
+/// kinds, resolution) are always present, and `entity_id` still drills straight
+/// to the body on demand.
+fn reference_row_json(row: ReferenceRow, include_snippets: bool) -> serde_json::Value {
+    let mut value = serde_json::json!({
         "entity_id": row.entity_id,
         "name": row.name,
         "kind": row.kind,
@@ -1044,8 +1100,15 @@ fn reference_row_json(row: ReferenceRow) -> serde_json::Value {
         // agent never has to count forward from a definition to find a call site.
         "start_line": row.start_line,
         "reference_lines": row.reference_lines,
-        "signature": row.signature,
-        "snippet": row.snippet,
+        "reference_line_count": row.reference_lines.len(),
+        // Why `reference_lines` is empty, when it is: `no_evidence_span` (the
+        // parser recorded the edge without a position), `span_outside_caller_file`
+        // (the spans it recorded name another file), or `federated_xref` (the
+        // edge lives in another repository's graph). Null when site lines came
+        // back, so an empty list is never an unexplained silence.
+        "reference_lines_absent_reason": row
+            .reference_lines_absent
+            .map(ReferenceLinesAbsent::as_str),
         "relation_kinds": row
             .relation_kinds
             .into_iter()
@@ -1057,7 +1120,12 @@ fn reference_row_json(row: ReferenceRow) -> serde_json::Value {
         // candidate rather than a fact. Absent only for a federated row, whose
         // edge lives in another repository's graph.
         "resolution": row.resolution.map(RelationResolution::as_str),
-    })
+    });
+    if include_snippets {
+        value["signature"] = serde_json::json!(row.signature);
+        value["snippet"] = serde_json::json!(row.snippet);
+    }
+    value
 }
 
 /// Machine-readable codes a spine unavailability can carry, each the name of one
@@ -1218,6 +1286,7 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     authority_source: FindReferencesAuthoritySource<'_>,
     repository_authority: Option<&RequestRepositoryAuthority>,
 ) -> Result<ToolCallResult> {
+    let include_snippets = get_optional_bool(args, "include_snippets", false);
     let relation_kinds = if let Some(raw_kinds) = get_optional_string_array(args, "relation_kinds")
     {
         if raw_kinds.is_empty() {
@@ -1291,7 +1360,7 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
                 };
                 let federated_references = federated_rows
                     .into_iter()
-                    .map(reference_row_json)
+                    .map(|row| reference_row_json(row, include_snippets))
                     .collect::<Vec<_>>();
                 let authority_complete = body.authority_complete_for(&repo_id, &target.id);
                 serde_json::json!({
@@ -1320,15 +1389,27 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
         },
     };
 
+    // Same order as the shared CLI collector, entity id included: rows come off
+    // a hash map, and several callers can share a file and a name, so without
+    // the last key the order of two such rows is whatever the map iterated.
     rows.sort_by(|left, right| {
         left.file_path
             .cmp(&right.file_path)
             .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.entity_id.cmp(&right.entity_id))
     });
+
+    // What this answer counted, computed before the rows are projected. One row
+    // is one referencing entity, so `referencing_entities` is the row count and
+    // `files` is what the pre-FIR-2398 `total_upstream` was reporting.
+    let counts = reference_counts(&rows);
 
     // `entity_id` remains the local drill-through keystone. Federated rows use
     // repo-qualified paths and carry no local entity id.
-    let references = rows.into_iter().map(reference_row_json).collect::<Vec<_>>();
+    let references = rows
+        .into_iter()
+        .map(|row| reference_row_json(row, include_snippets))
+        .collect::<Vec<_>>();
 
     // What the graph can structurally answer over the edge classes this query
     // reads. An empty reference list is only evidence about the code when the
@@ -1356,7 +1437,13 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
             .copied()
             .map(relation_kind_name)
             .collect::<Vec<_>>(),
+        // One referencing entity per unit, which is what `kin refs` prints as
+        // "referenced by N entities". It counted distinct FILES until FIR-2398.
+        // `counts.counted` names the unit in the payload so no reader has to
+        // infer it, and `counts.reference_sites` carries the finer number when
+        // every row could be located.
         "total_upstream": references.len(),
+        "counts": counts,
         "references": references,
         "cross_repo": cross_repo,
     });
@@ -3660,7 +3747,9 @@ mod tests {
     };
     use kin_model::graph::EntityStore as _;
     use kin_model::ids::{EntityId, FilePathId, Hash256, LanguageId, RelationId};
-    use kin_model::relation::{GraphNodeId, Relation, RelationKind, RelationOrigin};
+    use kin_model::relation::{
+        GraphNodeId, Relation, RelationEvidence, RelationKind, RelationOrigin,
+    };
     use kin_spine::SpineBackend as _;
 
     fn make_entity(name: &str, file: &str) -> Entity {
@@ -4210,9 +4299,280 @@ mod tests {
         // The keystone: each reference carries the caller's graph entity_id so an
         // agent can drill straight to its body with no name re-resolution.
         assert_eq!(refs[0]["entity_id"], caller_id.to_string());
-        // `snippet` is always present in the shape (null here: the fixture has no
+        // Bodies are opt-in, so the default row carries neither the excerpt nor
+        // the signature. `entity_id` above is what reaches the body.
+        assert!(!refs[0].as_object().unwrap().contains_key("snippet"));
+        assert!(!refs[0].as_object().unwrap().contains_key("signature"));
+
+        args.insert("include_snippets".to_string(), serde_json::json!(true));
+        let verbose = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+        let verbose_refs = verbose["references"].as_array().unwrap();
+        // Present in the shape when asked for (null here: the fixture has no
         // blob-backed body to project).
-        assert!(refs[0].as_object().unwrap().contains_key("snippet"));
+        assert!(verbose_refs[0].as_object().unwrap().contains_key("snippet"));
+        assert_eq!(verbose_refs[0]["signature"], "fn caller()");
+    }
+
+    /// One row per REFERENCING ENTITY, and `total_upstream` counting those
+    /// entities rather than the files they sit in.
+    ///
+    /// Rows were keyed on the caller's file path, so every caller in one file
+    /// collapsed into a single row keeping the first caller's id and name, and
+    /// `total_upstream` reported the number of distinct files. That is how
+    /// FIR-2398's `to_dot`, with eleven callers across two files, was answered
+    /// with "2" beside `authority_complete` and `relation_subtype_complete` both
+    /// true. The tool's stated job is blast radius, so an agent renaming or
+    /// deleting on that answer saw a fifth of the work.
+    ///
+    /// The fixture is deliberately lopsided: three callers in one file and one
+    /// in another. A balanced fixture would let the file count and the caller
+    /// count coincide, and the assertion could not fail.
+    #[tokio::test]
+    async fn find_references_reports_every_caller_not_one_row_per_file() {
+        let store = InMemoryGraph::new();
+        let target = make_entity("to_dot", "src/linkgraph.rs");
+        store.upsert_entity(&target).unwrap();
+
+        let shared_file_callers = ["draws_nodes", "draws_edges", "draws_dashed"]
+            .map(|name| make_entity(name, "tests/test_linkgraph.rs"));
+        let other_file_caller = make_entity("cmd_graph", "src/cli.rs");
+        for caller in shared_file_callers.iter().chain([&other_file_caller]) {
+            store.upsert_entity(caller).unwrap();
+            store
+                .upsert_relation(&make_relation(caller.id, target.id, RelationKind::Calls))
+                .unwrap();
+        }
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+
+        let refs = body["references"].as_array().unwrap();
+        assert_eq!(
+            refs.len(),
+            4,
+            "four callers are four rows, whatever files they share: {body:#}"
+        );
+        assert_eq!(
+            body["total_upstream"], 4,
+            "total_upstream counts referencing entities, not the 2 files: {body:#}"
+        );
+
+        // Every caller present by identity, so a row cannot stand in for the
+        // callers it collapsed. Names are distinct here only to make a failure
+        // readable; the ids are the assertion that matters.
+        let returned_ids = refs
+            .iter()
+            .map(|row| row["entity_id"].as_str().unwrap().to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        for caller in shared_file_callers.iter().chain([&other_file_caller]) {
+            assert!(
+                returned_ids.contains(&caller.id.to_string()),
+                "caller {} is missing from the answer: {body:#}",
+                caller.name
+            );
+        }
+
+        // The unit is named in the payload, and the file count is still
+        // available beside it rather than being what `total_upstream` means.
+        assert_eq!(body["counts"]["counted"], "referencing_entities");
+        assert_eq!(body["counts"]["referencing_entities"], 4);
+        assert_eq!(body["counts"]["files"], 2);
+    }
+
+    /// A returned reference with no site lines says why, and the answer says
+    /// whether any site could be located at all.
+    ///
+    /// FIR-2357 item 3: an empty `reference_lines` on a row that DID come back
+    /// is the quiet-partial failure in miniature. No production ingest path
+    /// populates `RelationEvidence::source_span` today (measured and asserted at
+    /// zero by `kin-index`'s `relation_evidence_span_coverage`), so this is what
+    /// every real answer looks like, and saying so is the difference between a
+    /// caller that knows the sites are unavailable and one that reads `[]` as
+    /// "no sites".
+    #[tokio::test]
+    async fn find_references_says_why_a_row_carries_no_site_lines() {
+        let store = InMemoryGraph::new();
+        let caller = make_entity("caller", "src/a.rs");
+        let target = make_entity("target", "src/b.rs");
+        store.upsert_entity(&caller).unwrap();
+        store.upsert_entity(&target).unwrap();
+        store
+            .upsert_relation(&make_relation(caller.id, target.id, RelationKind::Calls))
+            .unwrap();
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+        let row = &body["references"].as_array().unwrap()[0];
+
+        assert_eq!(row["reference_lines"], serde_json::json!([]));
+        assert_eq!(row["reference_line_count"], 0);
+        assert_eq!(
+            row["reference_lines_absent_reason"], "no_evidence_span",
+            "an empty site list must name its cause, not stay silent: {body:#}"
+        );
+        // The row is still reported. Dropping a caller whose site the graph does
+        // not carry would understate blast radius, which is the defect this
+        // whole surface is being fixed for.
+        assert_eq!(body["total_upstream"], 1);
+
+        assert_eq!(
+            body["counts"]["reference_sites"],
+            serde_json::Value::Null,
+            "a site total that cannot be completed is not emitted as a number: {body:#}"
+        );
+        assert_eq!(body["counts"]["known_reference_sites"], 0);
+        assert_eq!(body["counts"]["reference_sites_complete"], false);
+    }
+
+    /// The completeness signal must be able to say "complete".
+    ///
+    /// FIR-2357 item 4 names the lazy regression directly: a fix that marks
+    /// every answer uncertain is not a fix. This is the same surface as the test
+    /// above with the one input changed that should flip the verdict, so a
+    /// hardcoded `false` fails here and a hardcoded `true` fails there.
+    #[tokio::test]
+    async fn find_references_reports_complete_sites_when_the_graph_carries_spans() {
+        let store = InMemoryGraph::new();
+        let caller_file = FilePathId::new("src/a.rs");
+        let caller = make_entity("caller", "src/a.rs");
+        let target = make_entity("target", "src/b.rs");
+        store.upsert_entity(&caller).unwrap();
+        store.upsert_entity(&target).unwrap();
+
+        // Two call sites inside one caller, graph rows 11 and 41, which the
+        // agent-facing surface reports 1-based as 12 and 42.
+        let site_span = |row: u32| kin_model::entity::SourceSpan {
+            file: caller_file.clone(),
+            start_byte: 0,
+            end_byte: 1,
+            start_line: row,
+            start_col: 0,
+            end_line: row,
+            end_col: 1,
+        };
+        let mut relation = make_relation(caller.id, target.id, RelationKind::Calls);
+        relation.evidence = vec![11, 41]
+            .into_iter()
+            .map(|row| RelationEvidence {
+                source_span: Some(site_span(row)),
+                ..RelationEvidence::default()
+            })
+            .collect();
+        store.upsert_relation(&relation).unwrap();
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+        let row = &body["references"].as_array().unwrap()[0];
+
+        assert_eq!(
+            row["reference_lines"],
+            serde_json::json!([12, 42]),
+            "both sites, 1-based, ascending: {body:#}"
+        );
+        assert_eq!(row["reference_line_count"], 2);
+        assert_eq!(
+            row["reference_lines_absent_reason"],
+            serde_json::Value::Null,
+            "a row with sites has no absence to explain: {body:#}"
+        );
+        // One caller, two sites: the counts object distinguishes them, which is
+        // the whole point of naming the unit.
+        assert_eq!(body["total_upstream"], 1);
+        assert_eq!(body["counts"]["referencing_entities"], 1);
+        assert_eq!(body["counts"]["reference_sites"], 2);
+        assert_eq!(body["counts"]["known_reference_sites"], 2);
+        assert_eq!(body["counts"]["reference_sites_complete"], true);
+    }
+
+    /// A span the parser recorded against some other file is dropped, and the
+    /// drop is declared rather than looking like a parser that recorded nothing.
+    ///
+    /// The two absences call for different follow-ups, so collapsing them into
+    /// one empty list would hide which one held.
+    #[tokio::test]
+    async fn find_references_distinguishes_a_dropped_span_from_a_missing_one() {
+        let store = InMemoryGraph::new();
+        let caller = make_entity("caller", "src/a.rs");
+        let target = make_entity("target", "src/b.rs");
+        store.upsert_entity(&caller).unwrap();
+        store.upsert_entity(&target).unwrap();
+
+        let mut relation = make_relation(caller.id, target.id, RelationKind::Calls);
+        relation.evidence = vec![RelationEvidence {
+            source_span: Some(kin_model::entity::SourceSpan {
+                file: FilePathId::new("src/somewhere_else.rs"),
+                start_byte: 0,
+                end_byte: 1,
+                start_line: 7,
+                start_col: 0,
+                end_line: 7,
+                end_col: 1,
+            }),
+            ..RelationEvidence::default()
+        }];
+        store.upsert_relation(&relation).unwrap();
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+        let row = &body["references"].as_array().unwrap()[0];
+
+        assert_eq!(
+            row["reference_lines"],
+            serde_json::json!([]),
+            "line 8 of another file is not a line of src/a.rs: {body:#}"
+        );
+        assert_eq!(
+            row["reference_lines_absent_reason"], "span_outside_caller_file",
+            "the reason must name the condition that held: {body:#}"
+        );
+    }
+
+    /// A recursive edge is not an upstream caller, on either surface.
+    ///
+    /// The shared CLI collector has always excluded self edges, so counting them
+    /// here would put `kin refs` and `find_references` one apart on every
+    /// recursive function while both looked internally consistent.
+    #[tokio::test]
+    async fn find_references_excludes_a_self_edge() {
+        let store = InMemoryGraph::new();
+        let caller = make_entity("caller", "src/a.rs");
+        let target = make_entity("recurse", "src/b.rs");
+        store.upsert_entity(&caller).unwrap();
+        store.upsert_entity(&target).unwrap();
+        store
+            .upsert_relation(&make_relation(target.id, target.id, RelationKind::Calls))
+            .unwrap();
+        store
+            .upsert_relation(&make_relation(caller.id, target.id, RelationKind::Calls))
+            .unwrap();
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+
+        assert_eq!(
+            body["total_upstream"], 1,
+            "the recursive edge is not a second caller: {body:#}"
+        );
+        assert_eq!(
+            body["references"][0]["entity_id"],
+            caller.id.to_string(),
+            "the one row must be the external caller: {body:#}"
+        );
     }
 
     #[tokio::test]
