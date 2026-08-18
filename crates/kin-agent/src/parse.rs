@@ -89,17 +89,15 @@ pub fn parse_choice(choice: &Value, known: &BTreeSet<String>) -> Turn {
         };
     }
 
-    for (parser, shape) in [
-        (
-            parse_qwen_text_calls as fn(&str, &BTreeSet<String>) -> Vec<ToolCall>,
-            CallShape::QwenText,
-        ),
-        (parse_gemma_text_calls, CallShape::GemmaText),
-        (parse_json_text_calls, CallShape::JsonText),
+    // Each reader stamps its own CallShape on the calls it produces, so the order here is
+    // only about which markup is looked for first.
+    for parser in [
+        parse_qwen_text_calls as fn(&str, &BTreeSet<String>) -> Vec<ToolCall>,
+        parse_gemma_text_calls,
+        parse_json_text_calls,
     ] {
         let calls = parser(&text, known);
         if !calls.is_empty() {
-            let _ = shape;
             return Turn::ToolCalls {
                 text: strip_tool_call_markup(&text),
                 calls,

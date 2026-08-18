@@ -252,6 +252,7 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
             }));
             match complete_with_retry(&provider, &messages, &[], &mut counters) {
                 Ok(completion) => {
+                    counters.absorb(&completion.usage);
                     let turn = parse::parse_choice(&completion.choice, belt.names());
                     let text = match turn {
                         Turn::Final { text } => text,
