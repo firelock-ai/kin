@@ -972,6 +972,15 @@ pub async fn run(json: bool, wait_quiesce: std::time::Duration) -> Result<()> {
     } else {
         let footprint = StoreFootprint::measure(&layout);
         print!("{}", render_text(&report, None, Some(&footprint)));
+        // Which projection served the files this status describes. Appended
+        // here rather than folded into the report for the same reason store
+        // size is: the report is authority truth and must not move with the
+        // filesystem, and the projection in force is a measurement of this
+        // host.
+        println!(
+            "{}",
+            crate::commands::projection::status_line(layout.root())
+        );
     }
     Ok(())
 }
