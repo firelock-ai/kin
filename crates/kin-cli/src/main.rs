@@ -1164,6 +1164,11 @@ enum Command {
         #[arg(long, default_value_t = false)]
         check: bool,
     },
+    /// Engage, disengage, or report the filesystem projection for this repository
+    Vfs {
+        #[command(subcommand)]
+        action: VfsAction,
+    },
     /// Send a user-facing notification through Kin's own identity
     Notify {
         #[command(subcommand)]
@@ -2101,6 +2106,29 @@ enum SetupAction {
         #[arg(long, default_value_t = false)]
         force: bool,
         /// Emit the per-artifact outcomes as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+}
+
+/// `kin vfs`: one command for the projection that shows graph truth as files.
+///
+/// The graph is the authority either way. These verbs decide which of the three
+/// views of it this repository gets, and prove the one they engaged rather than
+/// announcing it.
+#[derive(Subcommand)]
+enum VfsAction {
+    /// Engage the projection for this repository
+    On {
+        /// Force a projection mode: shim, nfs, or fuse
+        #[arg(long, value_parser = ["shim", "nfs", "fuse"])]
+        mode: Option<String>,
+    },
+    /// Disengage the projection for this repository
+    Off,
+    /// Report which projection is in force, probed live
+    Status {
+        /// Emit the probe results as JSON
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -3559,6 +3587,11 @@ fn main() -> Result<()> {
                         commands::setup::doctor(fix, json).await
                     }
                 }
+                Command::Vfs { action } => match action {
+                    VfsAction::On { mode } => commands::projection::on(mode).await,
+                    VfsAction::Off => commands::projection::off().await,
+                    VfsAction::Status { json } => commands::projection::status(json).await,
+                },
                 Command::Notify {
                     action,
                     title,
