@@ -8330,7 +8330,10 @@ def main() -> None:
                 f"release recovery contains forbidden authority or retry state: {forbidden}"
             )
 
-    pinned_readme_version = re.search(r"\bv?\d+\.\d+\.\d+\b", readme)
+    # A dotted quad is not a version. `\b\d+\.\d+\.\d+\b` matches "127.0.0" inside
+    # "127.0.0.1", so documenting a loopback endpoint tripped this guard with a message
+    # about pinning a release. Refuse a match that has a digit or dot on either side.
+    pinned_readme_version = re.search(r"(?<![\d.])v?\d+\.\d+\.\d+(?![\d.])", readme)
     if pinned_readme_version:
         raise AssertionError(
             "README must follow the proven latest release instead of pinning "

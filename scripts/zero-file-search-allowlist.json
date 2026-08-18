@@ -552,6 +552,49 @@
       "allow_match": [
         "pid: std::process::id(),"
       ]
+    },
+    {
+      "file": "crates/kin-agent/src/belt.rs",
+      "reason": "kin-agent is a CLIENT of graph authority, never a source of it. It reaches Kin only through the MCP server over stdio, so every tool result it hands a model comes from the graph, and it deliberately ships no file-read, file-search or shell tool for a model to call. The filesystem and subprocess touches here are the two explicit boundaries the zero-file-search rule allows: materializing an edit the model asked for, and writing the run's own transcript. This module is the write boundary. `edit_file` reads the one file it is about to change so a find-and-replace can be exact and can refuse an ambiguous match, and `write_file` writes the one file it was given; both resolve the path inside the repository first and refuse any escape. Neither answers a question: the model has already been told where the code is by `mcp__kin__semantic_locate` and what it says by `mcp__kin__get_entity_source`, and nothing derived from these reads reaches a tool result. Pinned rather than whole-file so a newly added filesystem primitive in this module fails the guard, which is exactly what should happen if anyone ever adds a read or search tool to the belt.",
+      "owner": "kin-agent",
+      "expiration": "2026-12-31",
+      "allow_match": [
+        "std::fs::read_to_string(&path)",
+        "std::fs::write(&path, &updated)",
+        "std::fs::create_dir_all(parent)",
+        "path.exists()",
+        "std::fs::write(&path, content)"
+      ]
+    },
+    {
+      "file": "crates/kin-agent/src/mcp.rs",
+      "reason": "kin-agent is a CLIENT of graph authority, never a source of it. It reaches Kin only through the MCP server over stdio, so every tool result it hands a model comes from the graph, and it deliberately ships no file-read, file-search or shell tool for a model to call. The filesystem and subprocess touches here are the two explicit boundaries the zero-file-search rule allows: materializing an edit the model asked for, and writing the run's own transcript. This module is the transport that reaches authority rather than a substitute for it: it spawns the MCP server as a child process and speaks JSON-RPC to it over stdio. The subprocess is the graph, so forbidding it here would forbid consulting the graph at all. It touches no path of its own. Pinned so any filesystem primitive added to this module fails the guard.",
+      "owner": "kin-agent",
+      "expiration": "2026-12-31",
+      "allow_match": [
+        "std::process::{Child, ChildStdin, ChildStdout, Command, Stdio}",
+        "Command::new(program)"
+      ]
+    },
+    {
+      "file": "crates/kin-agent/src/run.rs",
+      "reason": "kin-agent is a CLIENT of graph authority, never a source of it. It reaches Kin only through the MCP server over stdio, so every tool result it hands a model comes from the graph, and it deliberately ships no file-read, file-search or shell tool for a model to call. The filesystem and subprocess touches here are the two explicit boundaries the zero-file-search rule allows: materializing an edit the model asked for, and writing the run's own transcript. Two touches in the loop itself. `std::process::id()` is this agent's own pid, reported to `kin_session_start` so the graph's session record names the process that made the change; it spawns nothing. The `std::fs::write` emits `result.json`, the run's terminal record, into the output directory the caller named. Pinned so any retrieval-shaped filesystem call added to the loop fails the guard.",
+      "owner": "kin-agent",
+      "expiration": "2026-12-31",
+      "allow_match": [
+        "std::process::id()",
+        "std::fs::write("
+      ]
+    },
+    {
+      "file": "crates/kin-agent/src/transcript.rs",
+      "reason": "kin-agent is a CLIENT of graph authority, never a source of it. It reaches Kin only through the MCP server over stdio, so every tool result it hands a model comes from the graph, and it deliberately ships no file-read, file-search or shell tool for a model to call. The filesystem and subprocess touches here are the two explicit boundaries the zero-file-search rule allows: materializing an edit the model asked for, and writing the run's own transcript. This module only writes. It creates the output directory and the two output files, `transcript.jsonl` and `kin-trace.jsonl`, and reads nothing at all. A transcript is a record of a run, never an input to an answer. Pinned so a read added to this module fails the guard.",
+      "owner": "kin-agent",
+      "expiration": "2026-12-31",
+      "allow_match": [
+        "std::fs::File",
+        "std::fs::create_dir_all(out_dir)"
+      ]
     }
   ]
 }
