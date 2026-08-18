@@ -1097,6 +1097,66 @@ fn reference_filter_covers_unknown_subtypes(relation_kinds: &[RelationKind]) -> 
         && defaults.iter().all(|kind| relation_kinds.contains(kind))
 }
 
+/// The reference classes this answer itself proves the graph holds across files.
+///
+/// A returned row IS a resolved edge, so a row whose caller sits in a different
+/// file from the focal and carries the focal's language is exactly the witness
+/// the language scan in [`crate::edge_coverage`] goes looking for. Handing it
+/// over spares that scan on the healthy path, which matters now that an
+/// observation is taken on every answer rather than only on empty ones.
+///
+/// The language check is not optional. The scan is scoped to the focal's
+/// language because extraction gaps are per-language, so a caller written in
+/// another language proves nothing about whether THIS language's edges resolve,
+/// and a witness taken from one would let a well-linked language lend coverage
+/// to a language whose edges were never produced.
+///
+/// A row this cannot confirm contributes nothing and the scan runs, so the
+/// failure direction is a scan that was not needed rather than a class reported
+/// present on evidence that did not support it.
+fn answer_witnessed_classes<G: GraphStore>(
+    store: &G,
+    focal: &kin_model::entity::Entity,
+    rows: &[ReferenceRow],
+) -> Vec<RelationKind> {
+    let focal_file = focal.file_origin.as_ref().map(|path| path.0.clone());
+    let mut witnessed: Vec<RelationKind> = Vec::new();
+    for row in rows {
+        if row
+            .relation_kinds
+            .iter()
+            .all(|kind| witnessed.contains(kind))
+        {
+            continue;
+        }
+        let Some(file_path) = row.file_path.as_ref() else {
+            continue;
+        };
+        if focal_file.as_ref() == Some(file_path) {
+            continue;
+        }
+        let Some(entity_id) = row
+            .entity_id
+            .as_deref()
+            .and_then(|id| parse_entity_id(id).ok())
+        else {
+            continue;
+        };
+        let Ok(Some(caller)) = store.get_entity(&entity_id) else {
+            continue;
+        };
+        if caller.language != focal.language {
+            continue;
+        }
+        for kind in &row.relation_kinds {
+            if !witnessed.contains(kind) {
+                witnessed.push(*kind);
+            }
+        }
+    }
+    witnessed
+}
+
 /// What a reference answer counted, stated rather than left to be inferred.
 ///
 /// `total_upstream` is a bare number, and a reader who does not know its unit
@@ -1456,6 +1516,9 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     // is one referencing entity, so `referencing_entities` is the row count and
     // `files` is what the pre-FIR-2398 `total_upstream` was reporting.
     let counts = reference_counts(&rows);
+    // Read off the rows before they are projected, where the caller's entity id
+    // is still addressable.
+    let witnessed = answer_witnessed_classes(store, &target, &rows);
 
     // `entity_id` remains the local drill-through keystone. Federated rows use
     // repo-qualified paths and carry no local entity id.
@@ -1465,17 +1528,24 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
         .collect::<Vec<_>>();
 
     // What the graph can structurally answer over the edge classes this query
-    // reads. An empty reference list is only evidence about the code when the
-    // graph demonstrably holds cross-file edges of those classes for the focal's
+    // reads. A reference list is only evidence about the code when the graph
+    // demonstrably holds cross-file edges of those classes for the focal's
     // language, and nothing else in this payload reports that.
     //
-    // Observed only for an empty answer, which is the only answer whose trust
-    // depends on it: an answer that returned rows has proved the edges exist by
-    // returning them, and paying a language scan on the populated path would be
-    // a cost with nothing to buy.
-    let edge_coverage = references.is_empty().then(|| {
-        crate::edge_coverage::observe_cross_file_reference_coverage(store, &target, &relation_kinds)
-    });
+    // Observed on EVERY answer, empty or not (FIR-2357 item 1). The reasoning
+    // that limited it to empty answers is the defect: an answer that returned
+    // rows proved the classes those rows came through, and proved nothing about
+    // the class a caller it missed would have come through. `normalize_title`
+    // came back with one intra-file caller for a symbol five call sites reached,
+    // and an unqualified `1` is the answer an agent cannot tell from a complete
+    // one. The witnesses the rows already carry keep the healthy path from
+    // paying a language scan for a fact it is holding.
+    let edge_coverage = crate::edge_coverage::observe_cross_file_reference_coverage_witnessed(
+        store,
+        &target,
+        &relation_kinds,
+        &witnessed,
+    );
 
     let mut result = serde_json::json!({
         "focal_entity": {
@@ -1500,9 +1570,7 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
         "references": references,
         "cross_repo": cross_repo,
     });
-    if let Some(edge_coverage) = edge_coverage {
-        result[crate::edge_coverage::EDGE_COVERAGE_KEY] = edge_coverage;
-    }
+    result[crate::edge_coverage::EDGE_COVERAGE_KEY] = edge_coverage;
 
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
@@ -3167,17 +3235,22 @@ pub fn handle_trace_data_flow<G: GraphStore>(
     }
 
     let total_steps = chain.len();
-    // The walk expands exactly the reference kinds above, so an empty chain is
-    // only evidence about the focal when the graph holds cross-file edges of
-    // those kinds for its language. A walk that returned steps needs no such
-    // evidence and pays no scan for it.
-    let edge_coverage = chain.is_empty().then(|| {
-        crate::edge_coverage::observe_cross_file_reference_coverage(
-            store,
-            &focal_entity,
-            &reference_kinds,
-        )
-    });
+    // The walk expands exactly the reference kinds above, so a chain is only
+    // evidence about the focal when the graph holds cross-file edges of those
+    // kinds for its language. Observed on every walk rather than only on an
+    // empty one (FIR-2357 item 1): a walk that returned three steps over a graph
+    // holding no cross-file calls has stayed inside one file, and reporting that
+    // as an unqualified chain is the same quiet partial the reference tool had.
+    //
+    // No witness is passed here, unlike `find_references`. A chain step records
+    // the entity reached, not which class of edge reached it, and a witness
+    // asserted for the wrong class is the one thing this observation must never
+    // accept.
+    let edge_coverage = crate::edge_coverage::observe_cross_file_reference_coverage(
+        store,
+        &focal_entity,
+        &reference_kinds,
+    );
     let mut result = serde_json::json!({
         "focal_id": focal_entity.id.to_string(),
         "focal_name": focal_entity.name.clone(),
@@ -3199,9 +3272,7 @@ pub fn handle_trace_data_flow<G: GraphStore>(
             "same_name_candidates": same_name_candidates,
         },
     });
-    if let Some(edge_coverage) = edge_coverage {
-        result[crate::edge_coverage::EDGE_COVERAGE_KEY] = edge_coverage;
-    }
+    result[crate::edge_coverage::EDGE_COVERAGE_KEY] = edge_coverage;
     if !clipped_steps.is_empty() {
         result["clipped_steps"] = serde_json::Value::Array(clipped_steps);
     }
@@ -4842,11 +4913,18 @@ mod tests {
         );
     }
 
-    /// An answer that returned rows proved the edges exist by returning them, so
-    /// it pays no language scan and carries no observation. Stating it as a test
-    /// keeps the populated path from silently acquiring one.
+    /// A populated answer over a graph that demonstrably links calls across
+    /// files reports itself complete, and its count is exact.
+    ///
+    /// This test asserted the opposite until FIR-2357: that a populated answer
+    /// carried no observation at all, on the reasoning that rows prove the edges
+    /// exist by existing. They prove the classes those rows came through and
+    /// nothing about the class a caller the answer MISSED would have come
+    /// through, which is how a 20%-complete answer shipped with no signal. The
+    /// observation is now taken on every answer, and this is the direction that
+    /// stops it from degrading into marking everything uncertain.
     #[tokio::test]
-    async fn a_populated_reference_answer_carries_no_edge_observation() {
+    async fn a_populated_cross_file_answer_reports_itself_complete() {
         let store = InMemoryGraph::new();
         let caller = make_entity("caller", "src/a.rs");
         let target = make_entity("target", "src/b.rs");
@@ -4866,16 +4944,143 @@ mod tests {
             "find_references",
         ));
         assert_eq!(response["total_upstream"], 1);
+
+        let completeness = &response["_kin"]["completeness"];
+        assert_eq!(completeness["status"], "complete", "{completeness}");
+        assert_eq!(completeness["bound"], "exact", "{completeness}");
+        assert_eq!(completeness["counted"]["reported"], 1);
+
+        // The row itself was the witness, so the language scan never ran. That
+        // is what keeps an observation on every answer from costing a
+        // language-wide relation walk per call on a healthy graph.
+        let coverage = &response[crate::edge_coverage::EDGE_COVERAGE_KEY];
+        assert_eq!(coverage["scan"], "skipped_answer_witnessed", "{coverage}");
+        assert_eq!(
+            coverage["witnessed_by_answer"],
+            serde_json::json!(["calls"])
+        );
+        assert_eq!(coverage["entities_examined"], 0);
+
         assert!(
-            response
-                .get(crate::edge_coverage::EDGE_COVERAGE_KEY)
-                .is_none(),
-            "a populated answer needs no coverage observation: {response}"
+            response.get("negative").is_none(),
+            "a populated answer still synthesizes no negative, which is why the \
+             completeness signal is the one that has to carry this case"
+        );
+    }
+
+    /// The FIR-2357 headline end to end. A graph holding one intra-file call
+    /// edge answers for a symbol a sibling file also calls, and returns exactly
+    /// one caller. Ground truth is more, and every freshness signal reads
+    /// healthy, so nothing in the response used to suggest the answer was a
+    /// fifth of the truth.
+    ///
+    /// This is the shape the isolated stranger hit on `normalize_title`: one
+    /// reference back, `total_upstream: 1`, no negative because the answer was
+    /// not empty, and an agent that reasonably concluded the function was local.
+    #[tokio::test]
+    async fn a_partial_reference_answer_says_its_count_is_a_floor() {
+        let store = InMemoryGraph::new();
+        let target = make_entity("normalize_title", "nk/parsing.rs");
+        let same_file_caller = make_entity("extract_links", "nk/parsing.rs");
+        // The sibling file that really calls the target. The extractor linked
+        // nothing across files, so no edge represents it and the answer cannot
+        // find it. That gap is the fact the response has to report.
+        let cross_file_caller = make_entity("render_note", "nk/render.rs");
+        store.upsert_entity(&target).unwrap();
+        store.upsert_entity(&same_file_caller).unwrap();
+        store.upsert_entity(&cross_file_caller).unwrap();
+        store
+            .upsert_relation(&make_relation(
+                same_file_caller.id,
+                target.id,
+                RelationKind::Calls,
+            ))
+            .unwrap();
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let response = parsed_response(&crate::finalize_with_envelope(
+            handle_find_references(&args, &store, None).await.unwrap(),
+            structurally_ready_envelope(),
+            "find_references",
+        ));
+
+        assert_eq!(
+            response["total_upstream"], 1,
+            "the answer itself is unchanged; what changes is what rides beside it"
         );
         assert!(
             response.get("negative").is_none(),
-            "and carries no negative to consume one"
+            "non-empty, so the negative object never fires here"
         );
+
+        let completeness = &response["_kin"]["completeness"];
+        assert_eq!(
+            completeness["status"], "partial",
+            "a graph with no cross-file call edge could not have found the sibling \
+             caller: {completeness}"
+        );
+        assert_eq!(
+            completeness["bound"], "at_least",
+            "so the 1 is a floor rather than a fact: {completeness}"
+        );
+        assert_eq!(completeness["classes"]["calls"], "absent");
+        assert_eq!(completeness["decided_by"], serde_json::json!(["calls"]));
+        assert!(
+            completeness["limits"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("edge_coverage:calls_absent")),
+            "{completeness}"
+        );
+        // The row's own caller sits in the target's file, so it witnesses
+        // nothing cross-file and the scan runs.
+        let coverage = &response[crate::edge_coverage::EDGE_COVERAGE_KEY];
+        assert_eq!(coverage["scan"], "ran", "{coverage}");
+        assert_eq!(coverage["witnessed_by_answer"], serde_json::json!([]));
+    }
+
+    /// The count side (FIR-2357 item 2). When the graph carries a parse-side
+    /// call-site count, a short answer says how short: parsed call sites against
+    /// the reference edges that resolved, so "1 of 5" is readable off the
+    /// response instead of an unqualified "1".
+    #[tokio::test]
+    async fn a_partial_reference_answer_reports_parsed_against_resolved() {
+        let store = InMemoryGraph::new();
+        let mut target = make_entity("normalize_title", "nk/parsing.rs");
+        let mut caller = make_entity("extract_links", "nk/parsing.rs");
+        // What extraction recorded for the file: five call sites read from the
+        // source, against the one edge that resolved.
+        for entity in [&mut target, &mut caller] {
+            entity.metadata.extra.insert(
+                kin_parser::FILE_PARSED_CALL_SITES_KEY.to_string(),
+                serde_json::json!(5),
+            );
+        }
+        store.upsert_entity(&target).unwrap();
+        store.upsert_entity(&caller).unwrap();
+        store
+            .upsert_relation(&make_relation(caller.id, target.id, RelationKind::Calls))
+            .unwrap();
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let response = parsed_response(&crate::finalize_with_envelope(
+            handle_find_references(&args, &store, None).await.unwrap(),
+            structurally_ready_envelope(),
+            "find_references",
+        ));
+
+        let resolution = &response["_kin"]["completeness"]["reference_resolution"];
+        assert_eq!(resolution["parsed_call_sites"], 5, "{resolution}");
+        assert_eq!(resolution["resolved_call_edges"], 1, "{resolution}");
+        assert_eq!(resolution["call_percent"], 20, "{resolution}");
+        assert_eq!(resolution["resolution"], "partial", "{resolution}");
+        assert_eq!(response["_kin"]["completeness"]["bound"], "at_least");
     }
 
     /// The other half of the same claim, on the daemon authority path so nothing

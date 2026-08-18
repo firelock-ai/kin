@@ -225,6 +225,432 @@ pub enum NegativeClass {
     Structural,
 }
 
+/// Which substrate an answer was drawn from, and therefore what "complete"
+/// means for it.
+///
+/// Derived from the two registries that already exist rather than declared in a
+/// third: a tool that names cross-file edge classes in
+/// [`crate::negative::absence_cross_file_classes`] answers from edges, a tool
+/// whose [`NegativeClass`] is `Semantic` answers from embeddings, and every
+/// other retrieval tool answers from the entity/relation index. A third list
+/// would drift from the two, which is the failure the per-tool maps in
+/// [`crate::negative`] were written to avoid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoverageSubstrate {
+    Edges,
+    Embeddings,
+    Graph,
+}
+
+impl CoverageSubstrate {
+    fn as_str(self) -> &'static str {
+        match self {
+            CoverageSubstrate::Edges => "edges",
+            CoverageSubstrate::Embeddings => "embeddings",
+            CoverageSubstrate::Graph => "graph",
+        }
+    }
+
+    /// The substrate as it reads inside a sentence, which is not the same word
+    /// as the wire value: "the edges classes" is not English, and the note is
+    /// read by whoever has to act on a partial answer.
+    fn noun(self) -> &'static str {
+        match self {
+            CoverageSubstrate::Edges => "edge",
+            CoverageSubstrate::Embeddings => "embedding",
+            CoverageSubstrate::Graph => "graph",
+        }
+    }
+}
+
+/// A coverage class's observed state, spelled the same way
+/// [`crate::edge_coverage`] spells it so a reader never has to reconcile two
+/// vocabularies for one fact.
+const STATE_PRESENT: &str = "present";
+const STATE_ABSENT: &str = "absent";
+const STATE_UNKNOWN: &str = "unknown";
+
+/// The completeness signal every retrieval response carries, empty or not
+/// (FIR-2357 item 1).
+///
+/// The `negative` object guards the LOUD failure: an empty answer, which makes a
+/// careful agent suspicious on its own. This guards the quiet one. A partial
+/// answer looks exactly like a complete one, so `find_references` returned a
+/// single caller for a symbol five call sites reached and carried nothing at all
+/// saying the answer was a floor. An agent that reads one file back and
+/// concludes the function is local is reasoning correctly from what it was
+/// given, which is what makes the missing signal the defect rather than the
+/// agent.
+///
+/// One shape across every retrieval tool. What varies between them is which
+/// substrate they read, named in `substrate`, and which classes of it their
+/// answer depended on, named in `classes`. Nothing here is fabricated: a class
+/// nothing was observed about is `unknown`, and `unknown` is not `absent`.
+///
+/// ## What decides `status`
+///
+/// `decided_by` is a subset of `classes`, and the gap between them is
+/// deliberate. `classes` DISCLOSES every class the query read; `decided_by`
+/// carries only the ones whose absence would actually have hidden an answer.
+/// Kin mints no entity-level `Imports` edge at all, so requiring every requested
+/// class to be present would report every answer on every healthy graph as
+/// partial, which is the "mark everything uncertain" regression FIR-2357 item 4
+/// bars by test. [`crate::negative::load_bearing_classes`] is the same narrowing
+/// the absence verdict already uses, and it is reused here rather than
+/// re-derived.
+///
+/// ## What decides `bound`
+///
+/// `status` is about the substrate; `bound` is about the numbers the answer
+/// printed. They come apart in both directions: a complete substrate still
+/// yields a floor when the response budget dropped rows, and a partial substrate
+/// still counts exactly what it holds. `at_least` is the field that kills the
+/// unqualified count the ticket names, so it is set whenever the answer cannot
+/// be shown to be whole.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Completeness {
+    /// `complete` when every deciding class was observed present, `partial` when
+    /// one was observed absent, `unknown` when the observation could not say.
+    pub status: String,
+    /// `exact` when the counts in this answer are the whole set, `at_least` when
+    /// they are a floor. Never omitted: a caller reading a bare number is the
+    /// failure this object exists to prevent.
+    pub bound: String,
+    /// Which substrate this answer was drawn from: `edges`, `embeddings`, or
+    /// `graph`.
+    pub substrate: String,
+    /// Every coverage class the answer depended on, each `present`, `absent`, or
+    /// `unknown`.
+    pub classes: Map<String, Value>,
+    /// The subset of `classes` whose state decided `status`.
+    pub decided_by: Vec<String>,
+    /// What the answer counted and whether that count is the whole set, lifted
+    /// from the payload's own accounting rather than recomputed here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counted: Option<Value>,
+    /// Parsed call sites against resolved reference edges for the focal's
+    /// language, when the graph carries a parse-side count to compare against
+    /// (FIR-2357 item 2). This is the reading that makes "1 of 5" sayable;
+    /// absent when nothing measured it, never a fabricated ratio.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_resolution: Option<Value>,
+    /// Machine-stable labels for every shortfall this answer's own observation
+    /// names, including ones that did not decide `status`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub limits: Vec<String>,
+    /// One line an agent can act on without knowing the ground truth.
+    pub note: String,
+}
+
+impl Completeness {
+    /// Build the signal for `tool` from its payload and the envelope beside it,
+    /// or `None` for a tool that is not retrieval.
+    ///
+    /// Retrieval membership is derived, not listed: a tool qualifies when it has
+    /// a negative spec or when it declares cross-file edge classes. Both
+    /// registries live in [`crate::negative`], so a new retrieval tool earns a
+    /// completeness signal by declaring what it reads, exactly as it earns an
+    /// absence verdict.
+    fn for_tool(tool: &str, payload: &Value, envelope: &Envelope) -> Option<Self> {
+        let edge_classes = crate::negative::absence_cross_file_classes(tool, payload);
+        let substrate = if !edge_classes.is_empty() {
+            CoverageSubstrate::Edges
+        } else {
+            match crate::negative::negative_class_for(tool)? {
+                NegativeClass::Semantic => CoverageSubstrate::Embeddings,
+                NegativeClass::Structural => CoverageSubstrate::Graph,
+            }
+        };
+
+        let (classes, decided_by, mut limits) = match substrate {
+            CoverageSubstrate::Edges => edge_class_states(tool, payload, &edge_classes),
+            CoverageSubstrate::Embeddings => embedding_class_states(envelope),
+            CoverageSubstrate::Graph => graph_class_states(envelope),
+        };
+
+        // Runtime facts are disclosed and never decide. The question this object
+        // answers is whether the substrate was whole, and `_kin.runtime` plus
+        // `_kin.degraded` already answer the separate question of who served it.
+        // Folding them in would make every offline answer uncertain regardless
+        // of its coverage, which is the barred regression wearing a different
+        // costume.
+        for label in envelope.degraded.active_labels() {
+            limits.push(format!("degraded:{label}"));
+        }
+
+        let deciding_states: Vec<&str> = decided_by
+            .iter()
+            .map(|class| {
+                classes
+                    .get(class)
+                    .and_then(Value::as_str)
+                    .unwrap_or(STATE_UNKNOWN)
+            })
+            .collect();
+        let status = if deciding_states.is_empty() {
+            STATE_UNKNOWN
+        } else if deciding_states.iter().any(|state| *state == STATE_ABSENT) {
+            "partial"
+        } else if deciding_states.iter().any(|state| *state == STATE_UNKNOWN) {
+            STATE_UNKNOWN
+        } else {
+            "complete"
+        };
+
+        let mut counted = counted_for(tool, payload);
+        // A payload that says it stopped early is a floor whatever its substrate
+        // looked like, so its own truncation flag can veto a complete verdict.
+        let walk_truncated = counted
+            .as_ref()
+            .and_then(|counted| counted.get("floor_reason"))
+            .is_some();
+        let bound = if status == "complete" && !walk_truncated {
+            "exact"
+        } else {
+            "at_least"
+        };
+        // One authority for one fact. `bound` decides, and the count restates it
+        // where a reader looking at the number will actually see it, because a
+        // `counted` reading `exact: true` beside a `bound` of `at_least` is the
+        // same contradiction inside one object that this object exists to end
+        // between two.
+        if let Some(counted) = counted.as_mut().and_then(Value::as_object_mut) {
+            counted.insert("exact".to_string(), json!(bound == "exact"));
+        }
+
+        let reference_resolution = payload
+            .get(crate::edge_coverage::EDGE_COVERAGE_KEY)
+            .and_then(|coverage| coverage.get(crate::edge_coverage::REFERENCE_RESOLUTION_KEY))
+            .cloned();
+
+        Some(Completeness {
+            note: completeness_note(status, bound, substrate, &limits),
+            status: status.to_string(),
+            bound: bound.to_string(),
+            substrate: substrate.as_str().to_string(),
+            classes,
+            decided_by,
+            counted,
+            reference_resolution,
+            limits,
+        })
+    }
+
+    /// Downgrade the signal to a floor because the response budget removed rows.
+    ///
+    /// The budget runs after this object is serialized, so the cut cannot be
+    /// known when the verdict is built. A response shortened by the budget is
+    /// partial by exactly the definition this object uses, and letting it keep
+    /// `exact` would reintroduce the unqualified count through the one path that
+    /// removes answers on purpose.
+    fn mark_response_bounded(value: &mut Value) {
+        let Some(object) = value.as_object_mut() else {
+            return;
+        };
+        object.insert("bound".to_string(), json!("at_least"));
+        if let Some(counted) = object.get_mut("counted").and_then(Value::as_object_mut) {
+            counted.insert("exact".to_string(), json!(false));
+        }
+        let limits = object
+            .entry("limits".to_string())
+            .or_insert_with(|| json!([]));
+        if let Some(limits) = limits.as_array_mut() {
+            let label = json!("response_bounded");
+            if !limits.contains(&label) {
+                limits.push(label);
+            }
+        }
+        object.insert(
+            "note".to_string(),
+            json!(
+                "The response budget withheld part of this answer, so its counts are a lower \
+                 bound. `_kin.response` names what was cut and how to ask for the rest."
+            ),
+        );
+    }
+}
+
+/// The edge-class states this answer depended on, read off the observation the
+/// payload carries.
+///
+/// A payload with no observation leaves every class `unknown` rather than
+/// healthy. That is the same reading [`crate::negative::edge_coverage_gap`]
+/// takes, and it is what makes a tool publish the observation before it can
+/// report itself complete.
+fn edge_class_states(
+    tool: &str,
+    payload: &Value,
+    requested: &[String],
+) -> (Map<String, Value>, Vec<String>, Vec<String>) {
+    let observation = payload
+        .get(crate::edge_coverage::EDGE_COVERAGE_KEY)
+        .and_then(Value::as_object);
+    let states = observation.and_then(|observation| {
+        observation
+            .get("classes")
+            .and_then(Value::as_object)
+            .cloned()
+    });
+    let mut classes = Map::new();
+    for class in requested {
+        let state = states
+            .as_ref()
+            .and_then(|states| states.get(class))
+            .and_then(Value::as_str)
+            .unwrap_or(STATE_UNKNOWN);
+        classes.insert(class.clone(), json!(state));
+    }
+    let decided_by = crate::negative::load_bearing_classes(requested);
+    let limits = crate::negative::edge_coverage_degradation_labels(tool, payload);
+    (classes, decided_by, limits)
+}
+
+/// The embedding class state, from the coverage the envelope already lifted.
+fn embedding_class_states(envelope: &Envelope) -> (Map<String, Value>, Vec<String>, Vec<String>) {
+    let mut limits = Vec::new();
+    let state = match &envelope.semantic_coverage {
+        None => STATE_UNKNOWN,
+        Some(coverage) if coverage.complete => STATE_PRESENT,
+        Some(coverage) => {
+            if coverage.graph_body_gap_paths.is_some_and(|gaps| gaps > 0) {
+                limits.push("graph_body_gap".to_string());
+            }
+            STATE_ABSENT
+        }
+    };
+    let mut classes = Map::new();
+    classes.insert("embeddings".to_string(), json!(state));
+    if state != STATE_PRESENT {
+        limits.push(format!("embeddings_{state}"));
+    }
+    (classes, vec!["embeddings".to_string()], limits)
+}
+
+/// The graph class state, from the freshness signals the envelope observed.
+///
+/// Both halves have to be affirmatively true. `initialized` says first
+/// reconciliation finished and `loaded` says a graph is actually mounted; either
+/// one false means the index a structural answer read is not the whole one.
+fn graph_class_states(envelope: &Envelope) -> (Map<String, Value>, Vec<String>, Vec<String>) {
+    let state = match (
+        envelope.graph_state.initialized,
+        envelope.graph_state.loaded,
+    ) {
+        (Some(true), Some(true)) => STATE_PRESENT,
+        (Some(false), _) | (_, Some(false)) => STATE_ABSENT,
+        _ => STATE_UNKNOWN,
+    };
+    let mut classes = Map::new();
+    classes.insert("graph".to_string(), json!(state));
+    let limits = if state == STATE_PRESENT {
+        Vec::new()
+    } else {
+        vec![format!("graph_{state}")]
+    };
+    (classes, vec!["graph".to_string()], limits)
+}
+
+/// What this answer counted and whether the count is the whole set, lifted from
+/// the payload's own accounting.
+///
+/// Nothing is recounted here. The handlers already publish what their number
+/// means (`counts.counted` names the unit, `counts.reference_sites_complete`
+/// says whether the finer number is whole), and recomputing it in the envelope
+/// is how two counters come to disagree about one answer.
+fn counted_for(tool: &str, payload: &Value) -> Option<Value> {
+    let (unit, reported) = match tool {
+        "find_references" => (
+            payload
+                .get("counts")
+                .and_then(|counts| counts.get("counted"))
+                .and_then(Value::as_str)
+                .unwrap_or("referencing_entities"),
+            payload.get("total_upstream").and_then(Value::as_u64)?,
+        ),
+        "trace_data_flow" => ("steps", payload.get("total_steps").and_then(Value::as_u64)?),
+        "bulk_check_references" => (
+            "entities",
+            payload
+                .get("results")
+                .and_then(Value::as_array)
+                .map(|rows| rows.len() as u64)?,
+        ),
+        _ => return None,
+    };
+
+    // A response that says it stopped early is a floor whatever its substrate
+    // looked like, so the payload's own truncation flag outranks the class
+    // verdict for this field.
+    let truncated = payload.get("truncated").and_then(Value::as_bool) == Some(true);
+    let mut counted = json!({
+        "unit": unit,
+        "reported": reported,
+        "exact": !truncated,
+    });
+    if truncated {
+        counted["floor_reason"] = json!("walk_truncated");
+    }
+    // The site numbers FIR-2398 added answer a narrower question than this
+    // object does: whether every RETURNED row could be located at a line, not
+    // whether the row set is whole. They are carried verbatim rather than folded
+    // into `exact`, because collapsing the two is how a complete row set with one
+    // unlocatable site would come to read as an incomplete answer.
+    if let Some(sites) = payload.get("counts").and_then(|counts| {
+        let object = counts.as_object()?;
+        let mut sites = Map::new();
+        for key in [
+            "reference_sites",
+            "known_reference_sites",
+            "reference_sites_complete",
+        ] {
+            if let Some(value) = object.get(key) {
+                sites.insert(key.to_string(), value.clone());
+            }
+        }
+        (!sites.is_empty()).then_some(Value::Object(sites))
+    }) {
+        counted["sites"] = sites;
+    }
+    Some(counted)
+}
+
+/// One line an agent can act on. Says what the answer is worth and, when it is
+/// worth less than it looks, what limited it.
+fn completeness_note(
+    status: &str,
+    bound: &str,
+    substrate: CoverageSubstrate,
+    limits: &[String],
+) -> String {
+    let named = if limits.is_empty() {
+        String::new()
+    } else {
+        format!(" Limited by: {}.", limits.join(", "))
+    };
+    match (status, bound) {
+        ("complete", "exact") => format!(
+            "Every {} class this answer depended on was observed present, so the counts here are \
+             the whole set.",
+            substrate.noun()
+        ),
+        ("complete", _) => format!(
+            "Every {} class this answer depended on was observed present, but the counts are a \
+             lower bound.{named}",
+            substrate.noun()
+        ),
+        ("partial", _) => format!(
+            "One of the {} classes this answer depended on was observed absent, so what came back \
+             is a lower bound and its absence proves nothing about the code.{named}",
+            substrate.noun()
+        ),
+        _ => format!(
+            "Whether the {} classes this answer depended on were available could not be \
+             established, so treat the counts as a lower bound.{named}",
+            substrate.noun()
+        ),
+    }
+}
+
 /// The versioned MCP response envelope shared by every tool family.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Envelope {
@@ -247,6 +673,12 @@ pub struct Envelope {
     /// Degraded-state flags (always present; individual flags omitted when not
     /// observed).
     pub degraded: Degraded,
+    /// The completeness signal (FIR-2357): what this answer's substrate could
+    /// have found, present on every retrieval response whether it came back
+    /// empty or full. `negative` guards only the empty case; this guards the
+    /// partial one, which is the case an agent cannot see.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completeness: Option<Completeness>,
     /// What the response budget did to this payload: the budget applied and what
     /// the response measured before it. Present only on the retrieval tools the
     /// budget governs, and written by [`finalize_bounded`] AFTER this struct is
@@ -270,6 +702,7 @@ impl Envelope {
                 offline_fallback: Some(true),
                 ..Degraded::default()
             },
+            completeness: None,
             response: None,
         }
     }
@@ -285,6 +718,7 @@ impl Envelope {
             graph_as_of: None,
             graph_state: GraphState::default(),
             degraded: Degraded::default(),
+            completeness: None,
             response: None,
         }
     }
@@ -341,6 +775,7 @@ impl Envelope {
                 daemon_unreachable: Some(true),
                 ..Degraded::default()
             },
+            completeness: None,
             response: None,
         }
     }
@@ -364,6 +799,7 @@ impl Envelope {
                 workspace_mismatch: Some(true),
                 ..Degraded::default()
             },
+            completeness: None,
             response: None,
         }
     }
@@ -620,10 +1056,17 @@ pub fn finalize_bounded(
     budget: &ResponseBudget,
 ) -> ToolCallResult {
     let payload = first_payload_value(&result);
-    let envelope = match &payload {
+    let mut envelope = match &payload {
         Some(payload) => base.with_payload_metadata(payload),
         None => base,
     };
+    // Built for every retrieval answer that carried a payload at all, empty or
+    // full. A call that failed before producing one has no substrate to report
+    // on, and the `negative` synthesized for it below is the signal that case
+    // needs.
+    if let Some(payload) = &payload {
+        envelope.completeness = Completeness::for_tool(tool_name, payload, &envelope);
+    }
     let negative = match &payload {
         Some(payload) => crate::negative::negative_for(tool_name, payload, &envelope),
         None if result.is_error == Some(true) => first_message_text(&result).and_then(|message| {
@@ -704,6 +1147,15 @@ fn apply_response_budget(annotated: &mut Value, tool_name: &str, budget: &Respon
         accounting.chars_before = chars_before;
     }
     write_response_accounting(annotated, &accounting);
+    if accounting.bounded {
+        if let Some(completeness) = annotated
+            .get_mut(ENVELOPE_KEY)
+            .and_then(Value::as_object_mut)
+            .and_then(|envelope| envelope.get_mut("completeness"))
+        {
+            Completeness::mark_response_bounded(completeness);
+        }
+    }
 }
 
 fn write_response_accounting(annotated: &mut Value, accounting: &crate::budget::BudgetAccounting) {
@@ -950,6 +1402,260 @@ mod tests {
         assert_eq!(whole[ENVELOPE_KEY]["degraded"]["daemon_unreachable"], true);
         // Human substring is still findable inside the wrapped JSON.
         assert!(text.contains("daemon is unreachable"));
+    }
+
+    /// A daemon envelope over a graph that reports itself ready, which is the
+    /// state every one of these fixtures answers from.
+    fn ready_daemon_envelope() -> Envelope {
+        Envelope::daemon().with_health(&json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "reconciliation_status": "clean",
+        }))
+    }
+
+    fn completeness_of(result: &ToolCallResult) -> Value {
+        envelope_of(result)
+            .get("completeness")
+            .cloned()
+            .expect("every retrieval response carries a completeness signal")
+    }
+
+    fn annotated_value(result: &ToolCallResult) -> Value {
+        let ContentBlock::Text { text } = result.content.first().expect("one content block");
+        serde_json::from_str(text).expect("annotated payload is JSON")
+    }
+
+    /// One reference answer, parameterised by what the graph could see.
+    fn reference_payload(returned: u64, calls_state: &str) -> ToolCallResult {
+        ToolCallResult::text(
+            json!({
+                "total_upstream": returned,
+                "counts": {
+                    "counted": "referencing_entities",
+                    "referencing_entities": returned,
+                    "reference_sites": returned,
+                    "known_reference_sites": returned,
+                    "reference_sites_complete": true,
+                },
+                "references": vec![json!({"name": "extract_links"}); returned as usize],
+                "relation_kinds": ["calls", "imports", "references"],
+                "edge_coverage": {
+                    "scope": "language",
+                    "language": "Python",
+                    "classes": {
+                        "calls": calls_state,
+                        "imports": "absent",
+                        "references": "absent",
+                    },
+                    "reference_enrichment": "unknown",
+                    "budget_exhausted": false,
+                },
+            })
+            .to_string(),
+        )
+    }
+
+    /// The FIR-2357 headline at the envelope layer. A NON-empty answer over a
+    /// graph holding no cross-file call edges is 20% complete and used to ship
+    /// with nothing at all saying so: no negative, no trust field, no caveat.
+    /// The signal has to be there, and it has to say the count is a floor.
+    #[test]
+    fn a_partial_non_empty_answer_carries_a_completeness_signal() {
+        let annotated = finalize(
+            reference_payload(1, "absent"),
+            ready_daemon_envelope(),
+            "find_references",
+        );
+        let completeness = completeness_of(&annotated);
+
+        assert_eq!(
+            completeness["status"], "partial",
+            "a graph holding no cross-file calls cannot have found the other callers: \
+             {completeness}"
+        );
+        assert_eq!(
+            completeness["bound"], "at_least",
+            "and the count it did return is a floor, not a fact: {completeness}"
+        );
+        assert_eq!(completeness["substrate"], "edges");
+        assert_eq!(completeness["counted"]["reported"], 1);
+        assert_eq!(completeness["counted"]["unit"], "referencing_entities");
+        assert!(
+            completeness["limits"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("edge_coverage:calls_absent")),
+            "the limiting class is named rather than left to be inferred: {completeness}"
+        );
+
+        // The payload is not empty, so the object that used to be the only trust
+        // signal is absent by design. That asymmetry is the defect this closes:
+        // without the completeness object this response carries nothing.
+        assert!(
+            !annotated_value(&annotated)
+                .as_object()
+                .unwrap()
+                .contains_key(crate::negative::NEGATIVE_KEY),
+            "a populated answer synthesizes no negative, which is why it needed this"
+        );
+    }
+
+    /// The regression FIR-2357 item 4 bars, held in the opposite direction. A
+    /// graph that demonstrably links calls across files answers completely, and
+    /// a fix that marked everything uncertain would fail here while passing the
+    /// test above.
+    #[test]
+    fn a_fully_resolved_answer_reports_complete_and_exact() {
+        let annotated = finalize(
+            reference_payload(5, "present"),
+            ready_daemon_envelope(),
+            "find_references",
+        );
+        let completeness = completeness_of(&annotated);
+
+        assert_eq!(completeness["status"], "complete", "{completeness}");
+        assert_eq!(completeness["bound"], "exact", "{completeness}");
+        assert_eq!(completeness["counted"]["reported"], 5);
+        assert_eq!(completeness["counted"]["exact"], true);
+        // `imports` and `references` are absent in this fixture and always are
+        // on a real graph, since Kin mints no entity-level import edge. They are
+        // disclosed and they do not decide, which is the only way both
+        // directions of this contract can hold at once.
+        assert_eq!(completeness["classes"]["imports"], "absent");
+        assert_eq!(completeness["decided_by"], json!(["calls"]));
+    }
+
+    /// Unobserved is not healthy. A payload carrying no observation leaves every
+    /// class unknown and the answer a floor, so a tool cannot earn a complete
+    /// verdict by declining to measure.
+    #[test]
+    fn an_unobserved_answer_is_unknown_rather_than_complete() {
+        let payload = ToolCallResult::text(
+            json!({
+                "total_upstream": 3,
+                "references": [{"name": "a"}, {"name": "b"}, {"name": "c"}],
+                "relation_kinds": ["calls"],
+            })
+            .to_string(),
+        );
+        let completeness = completeness_of(&finalize(
+            payload,
+            ready_daemon_envelope(),
+            "find_references",
+        ));
+
+        assert_eq!(completeness["status"], "unknown", "{completeness}");
+        assert_eq!(completeness["bound"], "at_least", "{completeness}");
+        assert_eq!(completeness["classes"]["calls"], "unknown");
+        assert!(completeness["limits"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("edge_coverage:unreported")));
+    }
+
+    /// The budget removes rows on purpose, and a response it shortened is
+    /// partial by exactly the definition this object uses. The cut happens after
+    /// the verdict is built, so the downgrade has to be applied to the
+    /// serialized signal or the one path that removes answers deliberately would
+    /// be the one path that reports them as whole.
+    #[test]
+    fn a_budget_shortened_answer_reports_a_floor() {
+        let rows: Vec<Value> = (0..400)
+            .map(|index| {
+                json!({
+                    "name": format!("caller_{index}"),
+                    "body": "x".repeat(200),
+                })
+            })
+            .collect();
+        let payload = ToolCallResult::text(
+            json!({
+                "total_upstream": rows.len(),
+                "counts": {
+                    "counted": "referencing_entities",
+                    "reference_sites_complete": true,
+                },
+                "references": rows,
+                "relation_kinds": ["calls"],
+                "edge_coverage": {
+                    "language": "Python",
+                    "classes": { "calls": "present" },
+                    "reference_enrichment": "unknown",
+                    "budget_exhausted": false,
+                },
+            })
+            .to_string(),
+        );
+        let budget = ResponseBudget {
+            max_chars: 4_000,
+            ..ResponseBudget::default()
+        };
+        let annotated =
+            finalize_bounded(payload, ready_daemon_envelope(), "find_references", &budget);
+        let envelope = envelope_of(&annotated);
+        assert_eq!(
+            envelope["response"]["bounded"], true,
+            "the fixture has to actually trip the budget: {}",
+            envelope["response"]
+        );
+
+        let completeness = &envelope["completeness"];
+        assert_eq!(
+            completeness["bound"], "at_least",
+            "a response the budget cut is a floor however healthy its graph was: {completeness}"
+        );
+        assert_eq!(completeness["counted"]["exact"], false);
+        assert!(completeness["limits"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("response_bounded")));
+    }
+
+    /// One shape, but not one substrate. A ranked answer depends on embeddings
+    /// and never traverses an edge, so its classes name embeddings and an
+    /// incomplete index makes it partial.
+    #[test]
+    fn a_ranked_answer_reports_the_embedding_substrate() {
+        let payload = ToolCallResult::text(
+            json!({
+                "results": [{"name": "normalize_title"}],
+                "semantic_coverage": {
+                    "indexed": 40,
+                    "total": 100,
+                    "pending": 60,
+                    "complete": false,
+                },
+            })
+            .to_string(),
+        );
+        let completeness = completeness_of(&finalize(
+            payload,
+            ready_daemon_envelope(),
+            "semantic_locate",
+        ));
+
+        assert_eq!(completeness["substrate"], "embeddings");
+        assert_eq!(completeness["classes"]["embeddings"], "absent");
+        assert_eq!(completeness["status"], "partial", "{completeness}");
+        assert_eq!(completeness["bound"], "at_least");
+    }
+
+    /// A mutation is not retrieval and carries no completeness object, so the
+    /// signal means something where it appears rather than becoming a field
+    /// every response has to carry an answer for.
+    #[test]
+    fn a_non_retrieval_tool_carries_no_completeness_signal() {
+        let annotated = finalize(
+            ToolCallResult::text(json!({"committed": true}).to_string()),
+            ready_daemon_envelope(),
+            "kin_transaction_commit",
+        );
+        assert!(
+            envelope_of(&annotated).get("completeness").is_none(),
+            "{}",
+            envelope_of(&annotated)
+        );
     }
 
     #[test]
