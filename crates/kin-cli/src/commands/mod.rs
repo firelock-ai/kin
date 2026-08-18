@@ -80,6 +80,7 @@ pub mod session_run;
 pub mod session_workspace;
 pub mod setup;
 pub mod setup_ledger;
+pub mod setup_verify;
 pub mod spec;
 pub mod stash;
 pub mod status;

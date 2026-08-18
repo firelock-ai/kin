@@ -1024,6 +1024,11 @@ pub struct WizardOptions {
     /// `advanced`. When absent, interactive runs ask and non-interactive runs
     /// default to `agent` (the smallest path to value).
     pub intent: Option<String>,
+    /// Skip the per-client MCP round trip that proves a written config can
+    /// actually reach Kin. For a scripted install with no repository yet, where
+    /// there is nothing for a tool call to answer about. The skip is printed
+    /// per client rather than silently dropping the section.
+    pub skip_mcp_check: bool,
 }
 
 /// First-run intent — what the user wants out of Kin. Each intent maps to a
@@ -11724,7 +11729,8 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     let shell_name = opts.shell.as_deref().unwrap_or_else(|| detect_shell());
     let plan = build_plan(intent, &opts, &assistants, shell_name, interactive)?;
 
-    let configured_assistants = apply_plan(&plan, &assistants, shell_name).await?;
+    let configured_assistants =
+        apply_plan(&plan, &assistants, shell_name, !opts.skip_mcp_check).await?;
 
     print_intent_followups(&plan, interactive);
 
@@ -12006,6 +12012,7 @@ async fn apply_plan(
     plan: &SetupPlan,
     assistants: &[AiAssistant],
     shell_name: &str,
+    verify_mcp_round_trip: bool,
 ) -> Result<Vec<(String, Option<PathBuf>)>> {
     // Shell integration.
     if plan.install_shell_hook {
@@ -12109,6 +12116,22 @@ async fn apply_plan(
             );
         }
         println!();
+
+        // Writing the entry is not the same as the entry working. A recorded
+        // launcher that no longer exists, or a server that cannot hold a
+        // handshake, leaves a config file that reads as perfectly valid while
+        // every call the agent makes fails, and setup used to report that as a
+        // configured client. Launch each entry the way its client would and
+        // report what one real tool call answered.
+        let registered: Vec<(String, PathBuf)> = configured_assistants
+            .iter()
+            .filter_map(|(name, path)| path.clone().map(|path| (name.clone(), path)))
+            .collect();
+        let proofs = crate::commands::setup_verify::prove_registered_clients(
+            &registered,
+            verify_mcp_round_trip,
+        );
+        crate::commands::setup_verify::print_proofs(&proofs);
     }
 
     // Agent discovery reminders.
@@ -14126,6 +14149,7 @@ mod tests {
             auto_daemon: false,
             no_interactive: true,
             intent: None,
+            skip_mcp_check: false,
         }
     }
 
