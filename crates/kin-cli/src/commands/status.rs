@@ -1056,7 +1056,15 @@ fn render_text(
             report.semantic_enrichment.authority_generation,
             report.semantic_enrichment.workspace_generation
         ),
-        "Live graph enrichment: see `kin graph status`".to_string(),
+        // The counter above is durable authority truth; `kin graph status`
+        // measures the daemon's live query graph and excludes external
+        // reference targets from its entity total. Both are correct and they do
+        // not match, so this line names the second view rather than leaving a
+        // reader to discover the disagreement by running both commands.
+        "Live graph enrichment: see `kin graph status`, which counts the daemon's live query \
+         graph and excludes external reference targets, so its entity total is lower than the \
+         durable one above"
+            .to_string(),
         format!(
             "Live embedding coverage: {}",
             render_embedding_coverage(&report.embedding_coverage)

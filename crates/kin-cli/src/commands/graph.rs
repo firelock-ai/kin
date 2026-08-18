@@ -453,8 +453,14 @@ fn build_graph_status_response(
     let mut lines = Vec::new();
     lines.push("=== Graph Health ===".to_string());
     lines.push(String::new());
+    // Name the view before the number. This counter and the one `kin status`
+    // prints are two different measurements of one store, and a reader given
+    // both bare totals has no way to tell which denominator applies to the
+    // coverage question they are actually asking. Each surface states what it
+    // counts, and the reconciliation below states why they differ.
     lines.push(format!(
-        "Entities: {}  |  Entity-to-entity relations: {}  |  Files: {}",
+        "Entities: {} (live query graph, definitions this repository owns)  |  Entity-to-entity \
+         relations: {}  |  Files: {} (files those entities originate in)",
         entity_count,
         total_relations,
         unique_files.len()
@@ -467,8 +473,22 @@ fn build_graph_status_response(
             total_relations as f64 / entity_count as f64
         }
     ));
+    // The reconciliation between this surface and `kin status`, stated as
+    // arithmetic rather than left to the reader.
+    //
+    // These two totals counted the same store and disagreed by 45 on the
+    // 0.5.36 evidence store, with nothing on either surface acknowledging a
+    // second view existed. The excluded set is not a rounding difference: the
+    // partition above drops external reference targets from `entity_count` on
+    // purpose (counting a node this repository merely references would report
+    // documentation coverage falling with no change to documentation), while
+    // durable authority enrichment replays every semantic identity it admitted
+    // and so counts them. Naming the excluded count beside the total is what
+    // makes the two surfaces add up.
     lines.push(format!(
-        "External reference targets: {}",
+        "External reference targets: {} (referenced elsewhere, not defined here, and excluded \
+         from the entity total above; `kin status` reports durable authority enrichment, a \
+         different view that counts them, so its entity total is the larger of the two)",
         external_targets.len()
     ));
     lines.push(String::new());
@@ -580,8 +600,22 @@ fn build_graph_status_response(
         }
     }
     lines.push(embeddings_line);
+    // A census, not a queue, and the label has to say so.
+    //
+    // This counter sat directly beneath the embeddings line above, which IS a
+    // fill counter with a real pending count, and read as the same kind of
+    // thing. On the 0.5.36 evidence store it showed 305/777 at the start of a
+    // session and the identical 305/777 at the end, which a reader took for a
+    // stalled worker. Nothing stalled and nothing was scheduled: `doc_summary`
+    // is set by the language extractors from the comment preceding a
+    // declaration (`extract_preceding_comment`, every adapter in kin-parser)
+    // and by nothing else on any live path. So the fraction is a property of
+    // the source code, and it moves only when the source gains or loses doc
+    // comments. Stating that inline is the fix; there is no queue depth to
+    // publish and no stalled flag to raise.
     lines.push(format!(
-        "Doc summaries: {}/{} ({:.0}%)",
+        "Documented entities: {}/{} ({:.0}%) carry a doc comment extracted from the source at \
+         parse time (a census of the code as written, not a job filling in the background)",
         with_docs,
         entity_count,
         if entity_count == 0 {
@@ -1766,6 +1800,122 @@ mod tests {
                 .iter()
                 .any(|line| line.starts_with("Relations: ") || line.contains("  |  Relations: ")),
             "{:?}",
+            response.lines
+        );
+    }
+
+    /// Two surfaces counting one store must each name the view they show, and
+    /// the surface holding the excluded set must publish the arithmetic that
+    /// reconciles them.
+    ///
+    /// `kin graph status` and `kin status` disagreed by 45 entities on one store
+    /// at one instant with neither acknowledging a second view existed, so a
+    /// reader judging coverage had two denominators and no way to choose. The
+    /// gap is not an error: external reference targets are dropped from this
+    /// surface's entity total on purpose and counted by durable authority
+    /// enrichment. Reverting either half of the disclosure fails this test.
+    #[test]
+    fn graph_status_names_its_entity_view_and_reconciles_it_with_durable_status() {
+        let (_temp, binding, graph) = graph_validation_fixture();
+        graph.upsert_entity(&test_entity("run_task")).unwrap();
+        // Two nodes this repository references without defining. They are real
+        // entities in the graph and are excluded from the entity total below,
+        // which is exactly the shape that made the two surfaces disagree.
+        graph
+            .upsert_entity(&external_target_entity("requests.adapters", 1))
+            .unwrap();
+        graph
+            .upsert_entity(&external_target_entity("urllib3.poolmanager", 2))
+            .unwrap();
+
+        let response = build_graph_status_response(
+            &pinned(&binding),
+            &graph,
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
+
+        let entity_line = response
+            .lines
+            .iter()
+            .find(|line| line.starts_with("Entities: "))
+            .unwrap_or_else(|| panic!("no entity line: {:?}", response.lines));
+        assert!(
+            entity_line.contains("Entities: 1"),
+            "the entity total must still exclude external reference targets: {entity_line}"
+        );
+        assert!(
+            entity_line.contains("live query graph"),
+            "the entity total must name the view it counts: {entity_line}"
+        );
+
+        let external_line = response
+            .lines
+            .iter()
+            .find(|line| line.starts_with("External reference targets: "))
+            .unwrap_or_else(|| panic!("no external line: {:?}", response.lines));
+        assert!(
+            external_line.contains("External reference targets: 2"),
+            "the excluded count must be stated: {external_line}"
+        );
+        assert!(
+            external_line.contains("excluded from the entity total"),
+            "the excluded set must say it is excluded, or the two totals do not add up for a \
+             reader: {external_line}"
+        );
+        assert!(
+            external_line.contains("kin status"),
+            "the reconciliation must name the other surface, or a reader still has to guess \
+             which denominator is real: {external_line}"
+        );
+    }
+
+    /// A census must not wear a queue's clothes.
+    ///
+    /// `doc_summary` is set by the language extractors from the comment
+    /// preceding a declaration and by nothing else on any live path: there is no
+    /// worker, no queue, and nothing that can stall. The old label read
+    /// "Doc summaries: 305/777 (39%)" one line under a genuine embedding fill
+    /// counter, and an unchanging fraction across a session was reported as a
+    /// silently stalled job. This holds the line that the counter states what it
+    /// measures.
+    #[test]
+    fn documented_entity_census_does_not_read_as_a_pending_queue() {
+        let (_temp, binding, graph) = graph_validation_fixture();
+        let mut documented = test_entity("send");
+        documented.doc_summary = Some("Send the prepared request.".to_string());
+        graph.upsert_entity(&documented).unwrap();
+        graph.upsert_entity(&test_entity("undocumented")).unwrap();
+
+        let response = build_graph_status_response(
+            &pinned(&binding),
+            &graph,
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
+
+        let line = response
+            .lines
+            .iter()
+            .find(|line| line.starts_with("Documented entities: "))
+            .unwrap_or_else(|| panic!("no documented-entity line: {:?}", response.lines));
+        assert!(
+            line.contains("1/2"),
+            "the census must still count accurately: {line}"
+        );
+        assert!(
+            line.contains("parse time") && line.contains("not a job filling in the background"),
+            "the line must say the fraction is extraction-time source truth, or an unchanging \
+             value reads as a stalled worker: {line}"
+        );
+        assert!(
+            !response
+                .lines
+                .iter()
+                .any(|line| line.starts_with("Doc summaries: ")),
+            "the queue-shaped label must be gone: {:?}",
             response.lines
         );
     }
