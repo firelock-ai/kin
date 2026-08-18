@@ -390,3 +390,48 @@ fn incremental_hierarchy_persists_across_steps() {
         "an inheritance walk must cross incremental step boundaries via recorded hierarchy state"
     );
 }
+
+/// The receiver-reach narrowing is a property of BOTH fan-out tiers, so the
+/// incremental linker must drop the same unreachable candidate the batch linker
+/// does. Without this the live-edit path re-mints the false inbound caller the
+/// moment the calling file is relinked.
+#[test]
+fn incremental_receiver_call_does_not_reach_an_unimportable_owner() {
+    use kin_index::{link_cross_file_incremental, IncrementalLinker};
+
+    let files = vec![
+        parse_py(
+            "app/adapter.py",
+            "class Adapter:\n    def send(self, request):\n        return request\n",
+        ),
+        parse_py(
+            "app/session.py",
+            "from .adapter import Adapter\n\n\nclass Session:\n    def __init__(self):\n        self.adapter = Adapter()\n\n    def send(self, request):\n        return self.adapter.send(request)\n",
+        ),
+        parse_py(
+            "app/pipeline.py",
+            "from .session import Session\n\n\ndef run_all(session):\n    return session.send({})\n",
+        ),
+    ];
+
+    let mut linker = IncrementalLinker::new();
+    for file in &files {
+        linker.add_file(&file.file_path, ArtifactId::new(), &file.entities);
+    }
+    linker.record_class_bases(&files);
+
+    let run_all = entity_id(&files, "app/pipeline.py", "run_all");
+    let session_send = entity_id(&files, "app/session.py", "Session.send");
+    let adapter_send = entity_id(&files, "app/adapter.py", "Adapter.send");
+
+    let relations = link_cross_file_incremental(&files, &linker)
+        .expect("every fixture file has an explicitly assigned artifact identity");
+    assert!(
+        has_call(&relations, run_all, session_send),
+        "`session.send(...)` must still reach `Session.send`, whose type this file imports"
+    );
+    assert!(
+        !has_call(&relations, run_all, adapter_send),
+        "`app/pipeline.py` never names `Adapter`, so `Adapter.send` cannot be this receiver"
+    );
+}
