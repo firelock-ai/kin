@@ -392,7 +392,7 @@ fn registered_tools() -> ToolsListResult {
                         "query": { "type": "string", "description": "Exact entity name to resolve to a focal entity. Required if `entity_id` is not given." },
                         "depth": { "type": "integer", "description": "Dependency traversal depth across the trace neighborhood", "default": 3 },
                         "token_budget": { "type": "integer", "description": "Token budget for the assembled trace response", "default": 8000 },
-                        "compact": { "type": "boolean", "description": "If true, return signature-only entries for everyone (smaller). If false (default), focal gets FullBody, deps get SignatureOnly — better for trace-style reasoning.", "default": false }
+                        "compact": { "type": "boolean", "description": "If true, return signature-only entries for everyone (smaller). If false (default), focal gets FullBody and deps get SignatureOnly, which is better for trace-style reasoning.", "default": false }
                     }
                 }),
             },
@@ -414,7 +414,7 @@ fn registered_tools() -> ToolsListResult {
                         "limit_per_step": { "type": "integer", "description": "Max relations expanded per step (default 5, capped at 25). Kept by relevance, not by relation order; a step whose fan-out was cut says so with the count it dropped.", "default": 5, "minimum": 1, "maximum": 25 },
                         "include_body": {
                             "type": "boolean",
-                            "description": "Inline each step's source body (default true). Pass false to ask for the SHAPE of the chain — names, kinds, roles, spans, edges — which is a fraction of the size and is what you want unless you intend to read the code.",
+                            "description": "Inline each step's source body (default true). Pass false to ask for the SHAPE of the chain (names, kinds, roles, spans, edges), which is a fraction of the size and is what you want unless you intend to read the code.",
                             "default": true
                         },
                         "compact": {
@@ -511,7 +511,7 @@ fn registered_tools() -> ToolsListResult {
                         "base": { "type": "string", "description": "Base semantic change ID (hex)" },
                         "head": { "type": "string", "description": "Head semantic change ID (hex)" },
                         "entity_ids": { "type": "array", "items": { "type": "string" }, "description": "Entity UUIDs to analyze impact for" },
-                        "files": { "type": "array", "items": { "type": "string" }, "description": "File paths — resolves to entities, then analyzes impact" },
+                        "files": { "type": "array", "items": { "type": "string" }, "description": "File paths: resolves to entities, then analyzes impact" },
                         "change_ids": { "type": "array", "items": { "type": "string" }, "description": "Change ID hexes to combine and analyze impact" },
                         "include_traffic": { "type": "boolean", "description": "Include active traffic on impacted entities", "default": true }
                     }
@@ -527,7 +527,7 @@ fn registered_tools() -> ToolsListResult {
                         "base": { "type": "string", "description": "Base semantic change ID (hex)" },
                         "head": { "type": "string", "description": "Head semantic change ID (hex)" },
                         "entity_ids": { "type": "array", "items": { "type": "string" }, "description": "Entity UUIDs to diff (current state vs history)" },
-                        "files": { "type": "array", "items": { "type": "string" }, "description": "File paths — resolves to entities, then diffs" },
+                        "files": { "type": "array", "items": { "type": "string" }, "description": "File paths: resolves to entities, then diffs" },
                         "change_ids": { "type": "array", "items": { "type": "string" }, "description": "Change ID hexes to combine into one diff" }
                     }
                 }),
@@ -542,7 +542,7 @@ fn registered_tools() -> ToolsListResult {
                         "base": { "type": "string", "description": "Base semantic change ID (hex)" },
                         "head": { "type": "string", "description": "Head semantic change ID (hex)" },
                         "entity_ids": { "type": "array", "items": { "type": "string" }, "description": "Entity UUIDs to review (current state vs history)" },
-                        "files": { "type": "array", "items": { "type": "string" }, "description": "File paths — resolves to entities, then reviews" },
+                        "files": { "type": "array", "items": { "type": "string" }, "description": "File paths: resolves to entities, then reviews" },
                         "change_ids": { "type": "array", "items": { "type": "string" }, "description": "Change ID hexes to combine into one review" },
                         "format": { "type": "string", "enum": ["text", "json"], "description": "Response format. Use json for editor integrations.", "default": "text" },
                         "include_traffic": { "type": "boolean", "description": "Include active traffic on reviewed entities", "default": true }
@@ -593,7 +593,7 @@ fn registered_tools() -> ToolsListResult {
                         "compact": { "type": "boolean", "description": "If true (default), omit ranking explanation and per-signal breakdowns and return one shape per hit. Pass false (or explain: true) to get the breakdowns back.", "default": true },
                         "query": {
                             "type": "string",
-                            "description": "Search query — concept or partial name to seed candidates"
+                            "description": "Search query: concept or partial name to seed candidates"
                         },
                         "limit": {
                             "type": "integer",
@@ -1328,11 +1328,11 @@ pub fn agent_default_tool_names() -> &'static [&'static str] {
 /// This is the belt the graph-native benchmark agent arm drives: purely
 /// graph-native retrieval/read tools and NO write-side session/transaction tools
 /// (which `agent_default_tool_names` carries) and NO filesystem tools (there are
-/// none to expose — the entire MCP surface is graph-backed). It includes
+/// none to expose, because the entire MCP surface is graph-backed). It includes
 /// `semantic_locate` (entity-centric + paged), which `benchmark_tool_names`
 /// omits, so the agent can do natural-language entity retrieval, drill via
 /// `find_references`/`trace_data_flow`/`graph_neighborhood`, and read bodies via
-/// `get_entity_source`/`get_context_pack` — all without ever touching a file.
+/// `get_entity_source`/`get_context_pack`, all without ever touching a file.
 pub fn context_bench_tool_names() -> &'static [&'static str] {
     &[
         "kin_artifact_list",
@@ -2028,7 +2028,7 @@ The Kin MCP server exposes 2 semantic tools to AI assistants.
         }
 
         // GRAPH-NATIVE: not a single filesystem tool name in the belt (there are
-        // none to expose — the whole MCP surface is graph-backed).
+        // none to expose, because the whole MCP surface is graph-backed).
         for fs in ["cat", "ls", "grep", "find", "read_file", "open_file"] {
             assert!(
                 !profile.contains(&fs),

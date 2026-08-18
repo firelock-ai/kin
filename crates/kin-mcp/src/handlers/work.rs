@@ -12,8 +12,8 @@ use crate::types::ToolCallResult;
 use super::common::*;
 
 pub const WORK_CREATE_DESC: &str = "\
-Create a work item in Kin's work graph — a feature, task, issue, debt, todo, or \
-investigation — with a title and optional description, acceptance criteria, and linked \
+Create a work item in Kin's work graph (a feature, task, issue, debt, todo, or \
+investigation) with a title and optional description, acceptance criteria, and linked \
 scopes. Reach for it to capture a unit of work as first-class graph truth so it can be \
 linked to the actual entities it concerns, decomposed into children, blocked by other \
 work, and tracked through status changes. Returns the new work item's ID, which the \
@@ -86,7 +86,7 @@ pub fn handle_work_create<G: GraphStore>(
 pub const WORK_LIST_DESC: &str = "\
 List work items, optionally filtered by status (proposed, planned, in_progress, \
 blocked, done, verified, archived), kind, or scope. Reach for it to survey the backlog \
-or current work — what's in progress, what's blocked, what touches a given scope. \
+or current work: what's in progress, what's blocked, what touches a given scope. \
 Returns compact rows; use kin_work_show to pull the full detail (relationships, \
 annotations) of a specific item.";
 
@@ -138,8 +138,8 @@ pub fn handle_work_list<G: GraphStore>(
 }
 
 pub const WORK_SHOW_DESC: &str = "\
-Show one work item in full: its details plus its graph relationships — parents, \
-children, blockers, the scopes/entities implementing it — and any attached annotations. \
+Show one work item in full: its details plus its graph relationships (parents, \
+children, blockers, the scopes/entities implementing it) and any attached annotations. \
 Reach for it to understand a single piece of work in context: what it depends on, what \
 breaks it down into, and what code realizes it. It assembles the whole picture in one \
 call rather than chasing each relationship separately. Find work IDs with kin_work_list.";
@@ -201,7 +201,7 @@ pub fn handle_work_show<G: GraphStore>(
 }
 
 pub const WORK_LINK_DESC: &str = "\
-Link a work item to semantic scopes — the entities, contracts, or artifacts it concerns. \
+Link a work item to semantic scopes: the entities, contracts, or artifacts it concerns. \
 Reach for it to connect planning to code so the work item shows up in context when \
 someone looks at those scopes, and so impact/coverage reasoning can relate work to the \
 declarations it touches. This expresses what the work is *about*; use kin_work_implement \
@@ -249,8 +249,8 @@ pub fn handle_work_link<G: GraphStore>(
 
 pub const WORK_DECOMPOSE_DESC: &str = "\
 Establish a parent/child relationship between two work items, breaking a larger item \
-down into a smaller one. Reach for it to build a work hierarchy — an epic into tasks, a \
-feature into subtasks — so progress and structure roll up through the graph. Both items \
+down into a smaller one. Reach for it to build a work hierarchy (an epic into tasks, a \
+feature into subtasks) so progress and structure roll up through the graph. Both items \
 must already exist (create them with kin_work_create first).";
 
 pub fn handle_work_decompose<G: GraphStore>(
@@ -277,7 +277,7 @@ pub fn handle_work_decompose<G: GraphStore>(
 pub const WORK_BLOCK_DESC: &str = "\
 Record that one work item is blocked by another. Reach for it to capture real \
 dependencies between pieces of work so the graph reflects what can't start until \
-something else lands — useful for sequencing and for surfacing what's holding a task up \
+something else lands. This is useful for sequencing and for surfacing what's holding a task up \
 (visible via kin_work_show). Both items must already exist.";
 
 pub fn handle_work_block<G: GraphStore>(
@@ -303,7 +303,7 @@ pub fn handle_work_block<G: GraphStore>(
 
 pub const WORK_IMPLEMENT_DESC: &str = "\
 Record the semantic scopes (entities, contracts, artifacts) that actually implement a \
-work item — the code that fulfills it. Reach for it once you've written or identified \
+work item: the code that fulfills it. Reach for it once you've written or identified \
 the implementation, so the graph ties the work to its realization: this powers \
 traceability (\"what code delivered this feature?\") and lets coverage/verification \
 relate tests back to the work. Distinct from kin_work_link, which marks what the work \
@@ -337,7 +337,7 @@ pub fn handle_work_implement<G: GraphStore>(
 }
 
 pub const WORK_STATUS_DESC: &str = "\
-Update a work item's status — proposed, planned, in_progress, blocked, done, verified, \
+Update a work item's status: proposed, planned, in_progress, blocked, done, verified, \
 or archived. Reach for it to move work through its lifecycle so the graph reflects \
 current reality and kin_work_list filters stay meaningful. The item must already exist.";
 
@@ -364,7 +364,7 @@ pub fn handle_work_status<G: GraphStore>(
 }
 
 pub const ANNOTATION_ADD_DESC: &str = "\
-Attach a semantic annotation — a comment, warning, instruction, or piece of reasoning — \
+Attach a semantic annotation (a comment, warning, instruction, or piece of reasoning) \
 to one or more targets (entities, contracts, artifacts, changes, or work items). Reach \
 for it to leave durable, scope-anchored knowledge in the graph: a warning on a fragile \
 function, an instruction for whoever touches a module, the reasoning behind a decision. \
@@ -447,7 +447,7 @@ List the annotations attached to given targets (entities, contracts, artifacts, 
 changes, or work items), or across the graph when no targets are given. Set \
 include_stale to control whether annotations whose anchor has drifted are included. \
 Reach for it to surface the warnings, instructions, comments, and reasoning recorded \
-about the code you're about to touch — the read side of kin_annotation_add. Resolve \
+about the code you're about to touch. This is the read side of kin_annotation_add. Resolve \
 ones that no longer apply with kin_annotation_mark_resolved.";
 
 pub fn handle_annotation_list<G: GraphStore>(
@@ -536,7 +536,7 @@ pub fn handle_annotation_mark_resolved<G: GraphStore>(
 pub const TODO_IMPORT_DESC: &str = "\
 Scan source files for inline TODO/FIXME/HACK markers and import each as a work item in \
 the graph. Point it at a root directory (defaults to the working directory). Reach for \
-it to promote scattered in-code reminders into tracked, linkable work — so they can be \
+it to promote scattered in-code reminders into tracked, linkable work, so they can be \
 prioritized, decomposed, and tracked like any other work item rather than being lost in \
 comments. A one-shot way to bootstrap a backlog from an existing codebase.";
 

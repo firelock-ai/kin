@@ -185,8 +185,8 @@ pub fn handle_provenance_query<G: GraphStore>(
     // An id that resolves to nothing and has nothing recorded against it is a
     // resolution miss, not an empty provenance record.
     //
-    // Both cases used to answer identically — change_count 0, latest_change
-    // null, empty approvals and audit events, no error — so an agent that
+    // Both cases used to answer identically (change_count 0, latest_change
+    // null, empty approvals and audit events, no error), so an agent that
     // fat-fingered an id, or passed an artifact_id, read "nothing is recorded
     // about this code" and moved on. `get_entity_source` fails loudly on the
     // same id; this tool succeeded.
