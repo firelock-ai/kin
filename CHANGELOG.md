@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.40] - 2026-08-18
+
+### Changed
+
+- Run the guard falsification and the feature permutations beside Check & Test (#912)
+
+
 ## [0.5.39] - 2026-08-18
 
 ### Changed
