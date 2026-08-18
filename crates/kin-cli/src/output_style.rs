@@ -94,10 +94,17 @@ fn paint_refs(line: &str) -> String {
         return format!("referenced by {ACCENT_BOLD}{}{RESET} entities:", &caps[1]);
     }
 
-    let entry = compiled(&ENTRY, r"^  (.+) @ (\S+:\d+) \[([^\]]*)\]$");
+    // A row's location omits `:line` when the entity carries no span, and the
+    // resolution marker trails the relation bracket. Anchoring on either shape
+    // loses the color silently, because an unmatched line prints as plain text.
+    let entry = compiled(&ENTRY, r"^  (.+) @ (\S+) \[([^\]]*)\](?: \(([^)]*)\))?$");
     if let Some(caps) = entry.captures(line) {
+        let resolution = caps
+            .get(4)
+            .map(|marker| format!(" {DIM}({}){RESET}", marker.as_str()))
+            .unwrap_or_default();
         return format!(
-            "  {BRIGHT}{}{RESET} @ {ACCENT}{}{RESET} {FAINT}[{}]{RESET}",
+            "  {BRIGHT}{}{RESET} @ {ACCENT}{}{RESET} {FAINT}[{}]{RESET}{resolution}",
             &caps[1], &caps[2], &caps[3]
         );
     }
@@ -245,25 +252,162 @@ mod tests {
         assert_eq!(strip_ansi(painted), plain, "round trip changed the line");
     }
 
-    #[test]
-    fn refs_header_is_painted() {
-        let plain = "References to 'probe' -> probe_symbol (Function) @ src/target.rs";
-        let painted = paint_refs(plain);
-        assert_painted(&painted, plain, &format!("{BOLD_WHITE}probe_symbol"));
-        assert!(painted.contains(&format!("{ACCENT}src/target.rs")));
-        assert!(painted.contains(&format!("{DIM}(Function)")));
+    /// A `kin refs` answer as the product composes it.
+    ///
+    /// The styler is fed these lines rather than strings written here to match
+    /// its regexes, because a hand-written fixture agrees with the pattern by
+    /// construction and stays green when the composed row moves underneath it.
+    /// That is how the anchored `:line` row survived both spanless locations
+    /// and the trailing resolution marker without a red test.
+    fn real_refs_response_lines() -> Vec<String> {
+        use crate::commands::refs::{build_refs_response, RefsRequest};
+        use kin_db::InMemoryGraph;
+        use kin_model::relation::{Relation, RelationOrigin};
+        use kin_model::{
+            Entity, EntityId, EntityKind, EntityMetadata, EntityRole, EntityStore, FilePathId,
+            FingerprintAlgorithm, GraphNodeId, Hash256, LanguageId, RelationKind,
+            SemanticFingerprint, SourceSpan, Visibility,
+        };
+
+        fn entity(name: &str, rel_path: &str, start_line: Option<u32>) -> Entity {
+            Entity {
+                id: EntityId::new(),
+                kind: EntityKind::Function,
+                name: name.to_string(),
+                language: LanguageId::Rust,
+                fingerprint: SemanticFingerprint {
+                    algorithm: FingerprintAlgorithm::V1TreeSitter,
+                    ast_hash: Hash256::from_bytes([0; 32]),
+                    signature_hash: Hash256::from_bytes([0; 32]),
+                    behavior_hash: Hash256::from_bytes([0; 32]),
+                    equivalence_hash: Hash256::from_bytes([0; 32]),
+                    stability_score: 1.0,
+                },
+                file_origin: Some(FilePathId::new(rel_path)),
+                span: start_line.map(|line| SourceSpan {
+                    file: FilePathId::new(rel_path),
+                    start_byte: 0,
+                    end_byte: 0,
+                    start_line: line,
+                    start_col: 1,
+                    end_line: line,
+                    end_col: 1,
+                }),
+                signature: format!("fn {name}()"),
+                visibility: Visibility::Public,
+                role: EntityRole::Source,
+                doc_summary: None,
+                metadata: EntityMetadata::default(),
+                lineage_parent: None,
+                created_in: None,
+                superseded_by: None,
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+
+        let target = entity("probe_symbol", "target_mod.rs", Some(0));
+        // One caller carries a span and one does not, so the answer holds both
+        // location shapes a row can take.
+        let spanned = entity("spanned_caller", "spanned.rs", Some(2));
+        let spanless = entity("spanless_caller", "spanless.rs", None);
+
+        let graph = InMemoryGraph::new();
+        for record in [&target, &spanned, &spanless] {
+            graph.upsert_entity(record).unwrap();
+        }
+        // Two confidences, so the rows carry two different resolution markers
+        // and a painter that assumed one value would be caught.
+        for (caller, confidence) in [(&spanned, 1.0), (&spanless, 0.5)] {
+            graph
+                .upsert_relation(&Relation {
+                    id: kin_model::ids::RelationId::new(),
+                    kind: RelationKind::References,
+                    src: GraphNodeId::Entity(caller.id),
+                    dst: GraphNodeId::Entity(target.id),
+                    confidence,
+                    origin: RelationOrigin::Parsed,
+                    created_in: None,
+                    import_source: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        }
+
+        build_refs_response(
+            &layout,
+            &graph,
+            &RefsRequest {
+                entity: "probe_symbol".to_string(),
+                kind: "all".to_string(),
+            },
+        )
+        .unwrap()
+        .lines
     }
 
     #[test]
-    fn refs_count_and_entry_are_painted() {
-        let count = "referenced by 2 entities:";
+    fn refs_lines_the_product_composed_are_painted() {
+        let lines = real_refs_response_lines();
+
+        let header = lines.first().expect("a response opens with its header");
+        let painted = paint_refs(header);
+        assert_painted(&painted, header, &format!("{BOLD_WHITE}probe_symbol"));
+        assert!(
+            painted.contains(&format!("{ACCENT}target_mod.rs{RESET}")),
+            "target location must be painted whole: {painted:?}"
+        );
+        assert!(painted.contains(&format!("{DIM}(Function)")));
+
+        let count = lines
+            .iter()
+            .find(|line| line.starts_with("referenced by "))
+            .unwrap_or_else(|| panic!("no count line in {lines:?}"));
         assert_painted(&paint_refs(count), count, &format!("{ACCENT_BOLD}2"));
 
-        let entry = "  disk_only @ src/caller.rs:3 [Calls, References]";
-        let painted = paint_refs(entry);
-        assert_painted(&painted, entry, &format!("{BRIGHT}disk_only"));
-        assert!(painted.contains(&format!("{ACCENT}src/caller.rs:3")));
-        assert!(painted.contains(&format!("{FAINT}[Calls, References]")));
+        let rows: Vec<&str> = lines
+            .iter()
+            .filter(|line| line.starts_with("  "))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(rows.len(), 2, "one row per caller: {lines:?}");
+
+        let spanned = rows
+            .iter()
+            .copied()
+            .find(|row| row.contains("spanned_caller"))
+            .unwrap_or_else(|| panic!("no spanned row in {rows:?}"));
+        let painted = paint_refs(spanned);
+        assert_painted(&painted, spanned, &format!("{BRIGHT}spanned_caller"));
+        assert!(
+            painted.contains(&format!("{ACCENT}spanned.rs:3{RESET}")),
+            "a location carrying a line number must be painted whole: {painted:?}"
+        );
+        assert!(
+            painted.contains(&format!("{FAINT}[References]{RESET}")),
+            "the relation bracket must be painted: {painted:?}"
+        );
+        assert!(
+            painted.contains(&format!("{DIM}(type_resolved){RESET}")),
+            "the resolution marker must be painted: {painted:?}"
+        );
+
+        let spanless = rows
+            .iter()
+            .copied()
+            .find(|row| row.contains("spanless_caller"))
+            .unwrap_or_else(|| panic!("no spanless row in {rows:?}"));
+        let painted = paint_refs(spanless);
+        assert_painted(&painted, spanless, &format!("{BRIGHT}spanless_caller"));
+        assert!(
+            painted.contains(&format!("{ACCENT}spanless.rs{RESET}")),
+            "a location with no line number must still be painted: {painted:?}"
+        );
+        assert!(
+            painted.contains(&format!("{DIM}(name_only){RESET}")),
+            "the resolution marker must be painted: {painted:?}"
+        );
     }
 
     #[test]
