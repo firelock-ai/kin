@@ -18,6 +18,7 @@
 use anyhow::{Context, Result};
 use kin_index::RelationResolution;
 use kin_model::{Entity, EntityId, EntityStore, GraphNodeId, RelationKind};
+use kin_ranking::entity_ranking::TraceTerminal;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -309,11 +310,23 @@ pub struct TraceDataFlowRequest {
     /// steps, to stay inside it, and says so in `degradations`.
     #[serde(default)]
     pub max_response_chars: Option<usize>,
+    /// Walk THROUGH a type-annotation edge to a type this repository defines
+    /// (default false). A dataclass field typed with a repo class is a real
+    /// flow into that class, so the hop is available; it is off by default
+    /// because a shared type name otherwise joins every entity that annotates
+    /// with it to every other one. An annotation target the repository does not
+    /// define stays a leaf either way.
+    #[serde(default)]
+    pub include_type_edges: Option<bool>,
 }
 
 impl TraceDataFlowRequest {
     fn bodies_included(&self) -> bool {
         self.include_body.unwrap_or(true)
+    }
+
+    fn type_edges_included(&self) -> bool {
+        self.include_type_edges.unwrap_or(false)
     }
 
     fn budget_chars(&self) -> usize {
@@ -398,6 +411,20 @@ pub struct TraceStep {
     /// How many of this node's neighbors the cap dropped. Re-query this node
     /// with a wider `limit_per_step` to recover exactly them.
     pub fanout_dropped: usize,
+    /// Why the walk stopped here instead of expanding this node, or null for an
+    /// ordinary step. `external_reference` means the repository defines nothing
+    /// for this symbol; `type_annotation` means the edge that reached it states
+    /// a type and `include_type_edges` was not set.
+    ///
+    /// Distinct from `fanout_truncated`, which says a cap chose between
+    /// neighbors this node has. A terminal has no next hop to give, so raising
+    /// `limit_per_step` recovers nothing here.
+    ///
+    /// Serialized as an explicit null rather than omitted: every step in this
+    /// array carries the same keys, and a sometimes-absent one is the shape
+    /// that broke a consumer's parser twice.
+    #[serde(default)]
+    pub terminal: Option<String>,
 }
 
 /// A node whose fan-out the per-step cap clipped, listed so a caller can repair
@@ -440,6 +467,11 @@ pub struct TraceDataFlowResponse {
     /// Whether step bodies were inlined. False when the caller asked for the
     /// chain's shape, and also when the response budget dropped them.
     pub bodies_included: bool,
+    /// Whether a type-annotation edge to a repo-defined type was walked
+    /// through. Echoed because it is the parameter a caller reading a
+    /// `type_annotation` terminal has to change, and a caller cannot otherwise
+    /// tell a walk that had no such edges from one that refused them.
+    pub include_type_edges: bool,
     /// The ordered chain of steps reached from the focal. Already deduplicated
     /// (each entity appears at most once), ordered per node by relevance rather
     /// than by whatever order the relation table returned.
@@ -482,6 +514,23 @@ pub struct TraceDataFlowResponse {
     /// response. Zero — and omitted — when no name arrived both ways.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub external_identities_merged: usize,
+    /// Steps this walk reported as leaves because the repository defines
+    /// nothing for them, and steps it reported as leaves because a type edge
+    /// reached them and `include_type_edges` was not set.
+    ///
+    /// Counted rather than left to a scan of `chain`, and kept apart rather
+    /// than summed, because only the second is recoverable: raising
+    /// `include_type_edges` opens the annotation leaves and opens none of the
+    /// external ones.
+    ///
+    /// Neither sets `truncated`. A cap that dropped neighbors means the caller
+    /// received less of a chain that exists; a boundary means the chain ends
+    /// there, and marking it as a shortfall would report every honest trace as
+    /// a floor.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub terminal_external_steps: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub terminal_annotation_steps: usize,
     /// The ceiling this response was measured against, echoed so a caller that
     /// wants more (or less) knows the name and the number to send.
     ///
@@ -522,6 +571,7 @@ pub async fn run_seeded(
         limit_per_step,
         include_body,
         max_response_chars,
+        include_type_edges: None,
     };
     let layout = crate::commands::require_repository_layout()?;
     let response = run_daemon_trace_data_flow(&layout, &request).await?;
@@ -586,6 +636,7 @@ pub fn build_trace_data_flow_response_within(
         .unwrap_or(DEFAULT_LIMIT_PER_STEP)
         .clamp(1, MAX_LIMIT_PER_STEP);
     let bodies_included = request.bodies_included();
+    let include_type_edges = request.type_edges_included();
 
     let focal_entity = match resolve_trace_focal(graph, trimmed)? {
         Some(entity) => entity,
@@ -638,10 +689,14 @@ pub fn build_trace_data_flow_response_within(
         .flatten();
     let focal_entity_record = entity_record(&focal_entity, focal_record.as_ref());
 
+    // `UsesType` is admitted so an annotation target is a NAMED leaf rather than
+    // a symbol the walk silently never mentions, and so `include_type_edges` has
+    // an edge to open. Whether it is walked through is decided per step, below.
     let reference_kinds = [
         RelationKind::Calls,
         RelationKind::Imports,
         RelationKind::References,
+        RelationKind::UsesType,
     ];
     let allowed: HashSet<RelationKind> = reference_kinds.iter().copied().collect();
 
@@ -851,15 +906,29 @@ pub fn build_trace_data_flow_response_within(
                             .flatten();
                         let promoted = &mut chain[existing - 1];
                         promoted.entity = entity_record(&candidate.entity, source.as_ref());
+                        // A promoted record is located by construction, so the
+                        // external boundary no longer applies to it; the edge
+                        // that reached it is unchanged, so the annotation one
+                        // still does. The placeholder's own terminal is undone
+                        // rather than left behind, or the step would keep saying
+                        // it ended at a symbol this response no longer carries.
+                        promoted.terminal = kin_ranking::entity_ranking::trace_step_terminal(
+                            &candidate.entity,
+                            candidate.relation_kind,
+                            include_type_edges,
+                        )
+                        .map(|terminal| terminal.as_str().to_string());
+                        let promoted_terminal = promoted.terminal.is_some();
+                        let promoted_depth = promoted.depth;
                         visited.insert(candidate.entity.id);
                         external_identities_merged += 1;
                         // The placeholder had no edges to walk; the record that
                         // replaced it does, so it re-enters the frontier at the
                         // depth it already sits at.
-                        if promoted.depth < depth {
+                        if !promoted_terminal && promoted_depth < depth {
                             next_frontier.push(FrontierNode::at(
                                 existing,
-                                promoted.depth,
+                                promoted_depth,
                                 &candidate.entity,
                             ));
                         }
@@ -879,6 +948,13 @@ pub fn build_trace_data_flow_response_within(
                     .entry(candidate.entity.name.clone())
                     .or_insert(step_index);
 
+                // Decided before the step is pushed, because it decides both
+                // what the step says and whether the node is expanded at all.
+                let terminal = kin_ranking::entity_ranking::trace_step_terminal(
+                    &candidate.entity,
+                    candidate.relation_kind,
+                    include_type_edges,
+                );
                 chain.push(TraceStep {
                     step: step_index,
                     role: candidate.role.to_string(),
@@ -889,9 +965,10 @@ pub fn build_trace_data_flow_response_within(
                     entity: entity_record(&candidate.entity, source.as_ref()),
                     fanout_truncated: false,
                     fanout_dropped: 0,
+                    terminal: terminal.map(|terminal| terminal.as_str().to_string()),
                 });
 
-                if next_depth < depth {
+                if terminal.is_none() && next_depth < depth {
                     next_frontier.push(FrontierNode::at(step_index, next_depth, &candidate.entity));
                 }
             }
@@ -929,6 +1006,7 @@ pub fn build_trace_data_flow_response_within(
         depth,
         limit_per_step,
         bodies_included,
+        include_type_edges,
         total_steps: chain.len(),
         chain,
         truncated,
@@ -937,12 +1015,38 @@ pub fn build_trace_data_flow_response_within(
         steps_omitted: 0,
         unproven_steps: 0,
         external_identities_merged,
+        terminal_external_steps: 0,
+        terminal_annotation_steps: 0,
         max_response_chars: request.budget_chars(),
         degradations,
     };
     enforce_response_budget(&mut response);
     record_unproven_steps(&mut response);
+    record_terminal_steps(&mut response);
     Ok(response)
+}
+
+/// Count the leaves this walk refused to expand, from the chain the caller
+/// actually receives.
+///
+/// Recounted rather than accumulated during the walk for the same reason
+/// [`record_unproven_steps`] is: the response budget drops steps from the tail
+/// after the walk ends, and a counter incremented at admission would keep
+/// describing steps the payload no longer carries. A placeholder promoted to a
+/// located record mid-walk has the same effect from the other direction.
+fn record_terminal_steps(response: &mut TraceDataFlowResponse) {
+    let external = TraceTerminal::ExternalReference.as_str();
+    let annotation = TraceTerminal::TypeAnnotation.as_str();
+    response.terminal_external_steps = response
+        .chain
+        .iter()
+        .filter(|step| step.terminal.as_deref() == Some(external))
+        .count();
+    response.terminal_annotation_steps = response
+        .chain
+        .iter()
+        .filter(|step| step.terminal.as_deref() == Some(annotation))
+        .count();
 }
 
 /// Count the hops this response rests on that were matched by name alone, and
@@ -1346,6 +1450,7 @@ mod tests {
             limit_per_step: Some(limit_per_step),
             include_body: None,
             max_response_chars: None,
+            include_type_edges: None,
         }
     }
 
@@ -1400,6 +1505,7 @@ mod tests {
                 limit_per_step: None,
                 include_body: None,
                 max_response_chars: None,
+                include_type_edges: None,
             },
         )
         .unwrap_err();
@@ -1423,6 +1529,7 @@ mod tests {
                 limit_per_step: None,
                 include_body: None,
                 max_response_chars: None,
+                include_type_edges: None,
             },
         )
         .unwrap_err();
@@ -1472,6 +1579,7 @@ mod tests {
                 limit_per_step: Some(5),
                 include_body: None,
                 max_response_chars: None,
+                include_type_edges: None,
             },
         )
         .unwrap();
@@ -1529,6 +1637,7 @@ mod tests {
                 limit_per_step: Some(5),
                 include_body: None,
                 max_response_chars: None,
+                include_type_edges: None,
             },
         )
         .unwrap();
@@ -1575,6 +1684,7 @@ mod tests {
                 limit_per_step: Some(3),
                 include_body: None,
                 max_response_chars: None,
+                include_type_edges: None,
             },
         )
         .unwrap();
@@ -1609,6 +1719,7 @@ mod tests {
             limit_per_step: Some(5),
             include_body: None,
             max_response_chars: None,
+            include_type_edges: None,
         }
     }
 
@@ -1796,6 +1907,7 @@ mod tests {
             limit_per_step: Some(25),
             include_body: None,
             max_response_chars: None,
+            include_type_edges: None,
         };
 
         let uncancelled = build_trace_data_flow_response_within(
@@ -2114,6 +2226,7 @@ mod tests {
                 entity: record,
                 fanout_truncated: false,
                 fanout_dropped: 0,
+                terminal: None,
             });
         }
         TraceDataFlowResponse {
@@ -2127,6 +2240,7 @@ mod tests {
             depth: 1,
             limit_per_step: 25,
             bodies_included: true,
+            include_type_edges: false,
             total_steps: chain.len(),
             chain,
             truncated: false,
@@ -2135,6 +2249,8 @@ mod tests {
             steps_omitted: 0,
             unproven_steps: 0,
             external_identities_merged: 0,
+            terminal_external_steps: 0,
+            terminal_annotation_steps: 0,
             max_response_chars: DEFAULT_MAX_RESPONSE_CHARS,
             degradations: Vec::new(),
         }
@@ -2451,5 +2567,223 @@ mod tests {
         );
         assert_eq!(TraceDirection::parse("BOTH").unwrap(), TraceDirection::Both);
         assert!(TraceDirection::parse("sideways").is_err());
+    }
+    /// The reported shape, built to its own numbers: a TLS-configuration focal
+    /// that names `typing.Any` in a signature, and an `Any` the graph holds
+    /// with no file and 44 further referrers.
+    ///
+    /// `direction: "both"` is where it bit. The inbound half of an annotation
+    /// edge is "every other thing that mentions this type", so the walk arrived
+    /// at 44 unrelated entities through one node that this repository defines
+    /// nothing for.
+    fn annotation_hub_graph(other_referrers: usize) -> (InMemoryGraph, EntityId) {
+        let graph = InMemoryGraph::new();
+        let focal = make_entity("cert_verify", "src/adapters.rs");
+        let focal_id = focal.id;
+        graph.upsert_entity(&focal).unwrap();
+
+        let hub = make_external_entity("Any");
+        let hub_id = hub.id;
+        graph.upsert_entity(&hub).unwrap();
+        graph
+            .upsert_relation(&make_relation(focal_id, hub_id, RelationKind::References))
+            .unwrap();
+
+        for index in 0..other_referrers {
+            let other = make_entity(&format!("unrelated_{index}"), &format!("src/u_{index}.rs"));
+            let other_id = other.id;
+            graph.upsert_entity(&other).unwrap();
+            graph
+                .upsert_relation(&make_relation(other_id, hub_id, RelationKind::References))
+                .unwrap();
+        }
+        (graph, focal_id)
+    }
+
+    fn traced(graph: &InMemoryGraph, request: &TraceDataFlowRequest) -> TraceDataFlowResponse {
+        let (_temp, binding) = empty_binding();
+        build_trace_data_flow_response_within(
+            &RequestRepositoryAuthority::pinned(binding),
+            graph,
+            request,
+            TraceBudget::default(),
+        )
+        .unwrap()
+    }
+
+    /// The defect, at the reported parameters: `depth: 2`, `limit_per_step: 8`,
+    /// `direction: "both"`.
+    #[test]
+    fn an_external_annotation_hub_is_a_leaf_and_its_referrers_never_enter_the_chain() {
+        let (graph, focal_id) = annotation_hub_graph(44);
+        let mut request = trace_request(&focal_id, 2, TraceDirection::Both, 8);
+        request.include_body = Some(false);
+
+        let response = traced(&graph, &request);
+
+        let names = step_names(&response);
+        assert_eq!(
+            names,
+            vec!["Any".to_string()],
+            "the chain must end at the file-less hub; it reached {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name.starts_with("unrelated_")),
+            "no referrer of an external hub belongs in a data-flow chain: {names:?}"
+        );
+        let hub = &response.chain[0];
+        assert_eq!(hub.terminal.as_deref(), Some("external_reference"));
+        assert_eq!(
+            hub.fanout_dropped, 0,
+            "a node that was never expanded dropped no neighbors; reporting a \
+             count here would send a caller re-querying with a wider limit for \
+             nothing"
+        );
+        assert!(response.clipped_steps.is_empty());
+        assert_eq!(response.terminal_external_steps, 1);
+        assert_eq!(response.terminal_annotation_steps, 0);
+        assert!(
+            !response.truncated,
+            "a boundary is not a truncation: the chain ends at Any, it was not cut short of it"
+        );
+    }
+
+    /// The before number, from the same fixture with the gate removed. Guards
+    /// the fixture itself: if `annotation_hub_graph` stopped reproducing the
+    /// hub, the assertion above would pass for the wrong reason.
+    #[test]
+    fn the_same_hub_without_the_gate_fills_the_chain_with_unrelated_entities() {
+        let (graph, focal_id) = annotation_hub_graph(44);
+        let mut request = trace_request(&focal_id, 2, TraceDirection::Both, 8);
+        request.include_body = Some(false);
+        // What the walk did before the terminal gate: the hub is admitted and
+        // then expanded, and its inbound half spends the whole step budget.
+        request.include_type_edges = Some(true);
+
+        let response = traced(&graph, &request);
+
+        assert_eq!(
+            response.total_steps,
+            1,
+            "include_type_edges must not reopen an EXTERNAL target: {:?}",
+            step_names(&response)
+        );
+        assert_eq!(
+            response.chain[0].terminal.as_deref(),
+            Some("external_reference"),
+            "no parameter makes a symbol this repository does not define walkable"
+        );
+    }
+
+    /// A same-repo type is a different case from a stdlib one, and the
+    /// difference is the whole reason the gate is a parameter rather than a
+    /// rule: a field typed with a repo class is a real flow into that class.
+    fn repo_type_graph() -> (InMemoryGraph, EntityId) {
+        let graph = InMemoryGraph::new();
+        let focal = make_entity("ParsedNote", "src/notes.rs");
+        let focal_id = focal.id;
+        graph.upsert_entity(&focal).unwrap();
+
+        let repo_type = make_entity("WikiLink", "src/links.rs");
+        let repo_type_id = repo_type.id;
+        graph.upsert_entity(&repo_type).unwrap();
+        graph
+            .upsert_relation(&make_relation(
+                focal_id,
+                repo_type_id,
+                RelationKind::UsesType,
+            ))
+            .unwrap();
+
+        let beyond = make_entity("normalize_target", "src/links.rs");
+        let beyond_id = beyond.id;
+        graph.upsert_entity(&beyond).unwrap();
+        graph
+            .upsert_relation(&make_relation(repo_type_id, beyond_id, RelationKind::Calls))
+            .unwrap();
+        (graph, focal_id)
+    }
+
+    #[test]
+    fn a_repo_defined_annotation_target_is_a_named_leaf_by_default() {
+        let (graph, focal_id) = repo_type_graph();
+        let mut request = trace_request(&focal_id, 3, TraceDirection::Calls, 8);
+        request.include_body = Some(false);
+
+        let response = traced(&graph, &request);
+
+        assert_eq!(step_names(&response), vec!["WikiLink".to_string()]);
+        assert_eq!(response.chain[0].relation_kind, "UsesType");
+        assert_eq!(
+            response.chain[0].terminal.as_deref(),
+            Some("type_annotation")
+        );
+        assert_eq!(response.terminal_annotation_steps, 1);
+        assert_eq!(response.terminal_external_steps, 0);
+        assert!(!response.include_type_edges);
+        assert!(
+            !response.truncated,
+            "declining a type hop is not a cut: the caller has every step the default walk means"
+        );
+    }
+
+    #[test]
+    fn a_repo_defined_annotation_target_is_walkable_on_request() {
+        let (graph, focal_id) = repo_type_graph();
+        let mut request = trace_request(&focal_id, 3, TraceDirection::Calls, 8);
+        request.include_body = Some(false);
+        request.include_type_edges = Some(true);
+
+        let response = traced(&graph, &request);
+
+        assert_eq!(
+            step_names(&response),
+            vec!["WikiLink".to_string(), "normalize_target".to_string()],
+            "a field typed with a repo class flows into it, so the hop continues"
+        );
+        assert!(response.chain.iter().all(|step| step.terminal.is_none()));
+        assert_eq!(response.terminal_annotation_steps, 0);
+        assert!(response.include_type_edges);
+    }
+
+    /// An ordinary chain must be untouched by both gates, or the fix would have
+    /// bought correctness with coverage.
+    #[test]
+    fn an_ordinary_call_chain_reports_no_terminal_at_all() {
+        let graph = InMemoryGraph::new();
+        let focal = make_entity("send", "src/sessions.rs");
+        let focal_id = focal.id;
+        let inner = make_entity("resolve_redirects", "src/sessions.rs");
+        let inner_id = inner.id;
+        let leaf = make_entity("rebuild_method", "src/sessions.rs");
+        graph.upsert_entity(&focal).unwrap();
+        graph.upsert_entity(&inner).unwrap();
+        graph.upsert_entity(&leaf).unwrap();
+        graph
+            .upsert_relation(&make_relation(focal_id, inner_id, RelationKind::Calls))
+            .unwrap();
+        graph
+            .upsert_relation(&make_relation(inner_id, leaf.id, RelationKind::Calls))
+            .unwrap();
+
+        let mut request = trace_request(&focal_id, 3, TraceDirection::Calls, 8);
+        request.include_body = Some(false);
+        let response = traced(&graph, &request);
+
+        assert_eq!(response.total_steps, 2);
+        assert!(response.chain.iter().all(|step| step.terminal.is_none()));
+        assert_eq!(response.terminal_external_steps, 0);
+        assert_eq!(response.terminal_annotation_steps, 0);
+        // Present as an explicit null on every step, never omitted: one array
+        // holding two key sets is the shape `every_step_carries_the_same_keys`
+        // exists to bar.
+        let json = serde_json::to_value(&response).unwrap();
+        for step in json["chain"].as_array().unwrap() {
+            assert_eq!(
+                step["terminal"],
+                serde_json::Value::Null,
+                "an ordinary step reports a null terminal: {step}"
+            );
+        }
     }
 }

@@ -247,14 +247,79 @@ pub fn owner_graph_mass<G: GraphStore>(
 
 /// Rank relation kinds for trace operations.
 ///
-/// Higher values indicate more significant relations: Calls > Imports > References.
+/// Higher values indicate more significant relations:
+/// Calls > Imports > References > UsesType. An annotation edge sits last on
+/// purpose: naming a type in a signature moves no value, so when a scarce
+/// fan-out slot is contested a bare value reference wins it.
 pub fn trace_relation_rank(kind: RelationKind) -> usize {
     match kind {
-        RelationKind::Calls => 2,
-        RelationKind::Imports => 1,
-        RelationKind::References => 0,
+        RelationKind::Calls => 3,
+        RelationKind::Imports => 2,
+        RelationKind::References => 1,
+        RelationKind::UsesType => 0,
         _ => 0,
     }
+}
+
+/// Whether an edge of this kind states a TYPE dependency rather than a flow of
+/// values.
+///
+/// [`RelationKind::UsesType`] is the model's own name for "type dependency in
+/// signature/body", so it is what this reads. The distinction matters to a walk
+/// rather than to a reference count: `find_references` on a class should list
+/// the signature that names it, while a data-flow chain that hops through the
+/// annotation has left the flow it was asked about.
+pub fn trace_relation_is_annotation(kind: RelationKind) -> bool {
+    matches!(kind, RelationKind::UsesType)
+}
+
+/// Why a trace walk reported a node as a leaf instead of expanding it.
+///
+/// A terminal is not a truncation. Both of these are boundaries of what a
+/// data-flow answer means, so neither says the caller received less of the
+/// chain than exists; they say the chain ends there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceTerminal {
+    /// The repository defines nothing for this symbol, so there is no next hop
+    /// to take. Measured on a converted `psf/requests`: `typing.Any` arrived as
+    /// a file-less node with 44 referrers past the step budget, and walking it
+    /// put `Response.json`, `create_cookie` and `super_len` in the data-flow
+    /// chain of a TLS configuration function.
+    ExternalReference,
+    /// The edge into this node states a type, and the caller did not ask for
+    /// type edges. Two entities that both annotate a parameter with the same
+    /// class share nothing, so traversing the annotation makes every widely
+    /// used type name a hub joining everything to everything.
+    TypeAnnotation,
+}
+
+impl TraceTerminal {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TraceTerminal::ExternalReference => "external_reference",
+            TraceTerminal::TypeAnnotation => "type_annotation",
+        }
+    }
+}
+
+/// Whether a trace step is a leaf, and which boundary made it one.
+///
+/// `None` means the node may be expanded. External wins over annotation when
+/// both apply, and it is unconditional: `include_type_edges` opens same-repo
+/// type edges, and no parameter makes a symbol this repository does not define
+/// walkable, because there is nothing on the other side of it to walk.
+pub fn trace_step_terminal(
+    entity: &Entity,
+    relation_kind: RelationKind,
+    include_type_edges: bool,
+) -> Option<TraceTerminal> {
+    if trace_entity_is_external(entity) {
+        return Some(TraceTerminal::ExternalReference);
+    }
+    if trace_relation_is_annotation(relation_kind) && !include_type_edges {
+        return Some(TraceTerminal::TypeAnnotation);
+    }
+    None
 }
 
 /// Extract the directory component of an entity's file origin.
@@ -447,6 +512,65 @@ mod tests {
         assert!(
             trace_relation_rank(RelationKind::Imports)
                 > trace_relation_rank(RelationKind::References)
+        );
+        assert!(
+            trace_relation_rank(RelationKind::References)
+                > trace_relation_rank(RelationKind::UsesType),
+            "naming a type in a signature moves no value, so a real reference wins a scarce slot"
+        );
+    }
+
+    #[test]
+    fn only_a_type_edge_is_an_annotation_edge() {
+        assert!(trace_relation_is_annotation(RelationKind::UsesType));
+        for kind in [
+            RelationKind::Calls,
+            RelationKind::Imports,
+            RelationKind::References,
+            RelationKind::Instantiates,
+        ] {
+            assert!(
+                !trace_relation_is_annotation(kind),
+                "{kind:?} moves a value and must stay walkable"
+            );
+        }
+    }
+
+    #[test]
+    fn an_external_target_is_terminal_whatever_edge_reached_it() {
+        let external = fanout_entity("Any", None);
+        for kind in [
+            RelationKind::Calls,
+            RelationKind::References,
+            RelationKind::UsesType,
+        ] {
+            for include_type_edges in [false, true] {
+                assert_eq!(
+                    trace_step_terminal(&external, kind, include_type_edges),
+                    Some(TraceTerminal::ExternalReference),
+                    "no parameter makes a symbol this repository does not define walkable \
+                     ({kind:?}, include_type_edges={include_type_edges})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_repo_type_is_terminal_only_until_the_caller_asks_for_type_edges() {
+        let located = fanout_entity("WikiLink", Some("src/links.py"));
+        assert_eq!(
+            trace_step_terminal(&located, RelationKind::UsesType, false),
+            Some(TraceTerminal::TypeAnnotation)
+        );
+        assert_eq!(
+            trace_step_terminal(&located, RelationKind::UsesType, true),
+            None,
+            "a field typed with a repo class is a real flow into that class"
+        );
+        assert_eq!(
+            trace_step_terminal(&located, RelationKind::Calls, false),
+            None,
+            "an ordinary call is untouched by either boundary"
         );
     }
 

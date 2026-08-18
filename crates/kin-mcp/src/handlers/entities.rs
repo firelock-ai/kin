@@ -2766,7 +2766,17 @@ absence. A focal that resolves to no entity at all carries the same object, nami
 resolution miss rather than reporting an empty chain. \
 Each step carries `resolution` for the edge that reached it: `type_resolved`, \
 `import_scoped`, or `name_only`. A chain is only as trustworthy as its weakest hop, so a \
-`name_only` step means the flow it claims may not exist at all.";
+`name_only` step means the flow it claims may not exist at all. \
+The walk ends at two boundaries rather than crossing them, and says which on the step that \
+stopped it. A symbol this repository does not define is a leaf carrying \
+`terminal: \"external_reference\"`: there is no next hop, and walking one turns a shared \
+stdlib name into a hub that joins unrelated code into the chain. An edge that merely states \
+a type is a leaf carrying `terminal: \"type_annotation\"`, because two entities that annotate \
+with the same class share no data; pass include_type_edges=true to walk through those when \
+the type is one this repository defines, which is a real flow for a field or a return. \
+`terminal_external_steps` and `terminal_annotation_steps` count them, kept apart because only \
+the second is recoverable by a parameter. Neither sets `truncated`: a boundary means the chain \
+ends there, not that you received less of one that exists.";
 
 /// One node of a trace walk, carrying the file and directory its fan-out is
 /// scored against.
@@ -2879,6 +2889,7 @@ fn trace_step_value(
     parent_step: usize,
     depth: usize,
     entity: &kin_model::entity::Entity,
+    terminal: Option<TraceTerminal>,
 ) -> serde_json::Value {
     let mut value = serde_json::json!({
         "step": step,
@@ -2892,6 +2903,11 @@ fn trace_step_value(
         "depth": depth,
         "fanout_truncated": false,
         "fanout_dropped": 0,
+        // Why the walk stopped here, or null for an ordinary step. Written on
+        // every step rather than only on a terminal one: this array's keys are
+        // uniform by contract, and a sometimes-absent key is the shape that
+        // broke a consumer's parser twice.
+        "terminal": terminal.map(TraceTerminal::as_str),
     });
     let record = trace_entity_value(entity);
     if let (Some(target), Some(source)) = (value.as_object_mut(), record.as_object()) {
@@ -3012,6 +3028,10 @@ pub fn handle_trace_data_flow<G: GraphStore>(
     let depth = get_optional_u64(args, "depth", DEFAULT_DEPTH).clamp(1, MAX_DEPTH) as usize;
     let limit_per_step = get_optional_u64(args, "limit_per_step", DEFAULT_LIMIT_PER_STEP)
         .clamp(1, MAX_LIMIT_PER_STEP) as usize;
+    let include_type_edges = args
+        .get("include_type_edges")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     let direction = match get_optional_string_param(args, "direction") {
         Some(value) => match value.trim().to_lowercase().as_str() {
             "calls" | "callee" | "callees" | "out" | "outgoing" => "calls",
@@ -3043,13 +3063,24 @@ pub fn handle_trace_data_flow<G: GraphStore>(
     };
     let same_name_candidates = same_name_entity_count(store, &focal_entity.name)?;
 
+    // The kinds a data-flow claim actually rests on, and the ones the coverage
+    // observation below is measured against.
     let reference_kinds = [
         RelationKind::Calls,
         RelationKind::Imports,
         RelationKind::References,
     ];
-    let allowed: std::collections::HashSet<RelationKind> =
-        reference_kinds.iter().copied().collect();
+    // `UsesType` is walkable only in the sense that it can REACH a step:
+    // admitted so an annotation target is a named leaf rather than a symbol the
+    // walk silently never mentions, and so `include_type_edges` has an edge to
+    // open. It is deliberately not in `reference_kinds`, because a graph
+    // holding no annotation edges says nothing about whether this walk's
+    // answer was whole.
+    let allowed: std::collections::HashSet<RelationKind> = reference_kinds
+        .iter()
+        .copied()
+        .chain(std::iter::once(RelationKind::UsesType))
+        .collect();
 
     let want_callees = matches!(direction, "calls" | "both");
     let want_callers = matches!(direction, "callers" | "both");
@@ -3208,6 +3239,15 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                         // rather than admitting one symbol under two identities.
                         let promoted_depth =
                             chain[existing - 1]["depth"].as_u64().unwrap_or(0) as usize;
+                        // A promoted record is located by construction, so the
+                        // external boundary no longer applies to it; the edge
+                        // that reached it is unchanged, so the annotation one
+                        // still does.
+                        let promoted_terminal = trace_step_terminal(
+                            &candidate.entity,
+                            candidate.relation_kind,
+                            include_type_edges,
+                        );
                         let promoted = trace_step_value(
                             existing,
                             chain[existing - 1]["role"].as_str().unwrap_or("callee"),
@@ -3220,11 +3260,12 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                             chain[existing - 1]["parent_step"].as_u64().unwrap_or(0) as usize,
                             promoted_depth,
                             &candidate.entity,
+                            promoted_terminal,
                         );
                         chain[existing - 1] = promoted;
                         visited.insert(candidate.entity.id);
                         external_identities_merged += 1;
-                        if promoted_depth < depth {
+                        if promoted_terminal.is_none() && promoted_depth < depth {
                             next_frontier.push(TraceFrontierNode::at(
                                 existing,
                                 promoted_depth,
@@ -3242,6 +3283,13 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                 name_index
                     .entry(candidate.entity.name.clone())
                     .or_insert(step_index);
+                // Decided before the step is pushed, because it decides both
+                // what the step says and whether the node is expanded at all.
+                let terminal = trace_step_terminal(
+                    &candidate.entity,
+                    candidate.relation_kind,
+                    include_type_edges,
+                );
                 chain.push(trace_step_value(
                     step_index,
                     candidate.role,
@@ -3250,8 +3298,9 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                     node.step,
                     next_depth,
                     &candidate.entity,
+                    terminal,
                 ));
-                if next_depth < depth {
+                if terminal.is_none() && next_depth < depth {
                     next_frontier.push(TraceFrontierNode::at(
                         step_index,
                         next_depth,
@@ -3301,6 +3350,11 @@ pub fn handle_trace_data_flow<G: GraphStore>(
         // with no repository authority to project source through. Stating it
         // keeps `include_body` from reading as honoured here.
         "bodies_included": false,
+        // Echoed because it is the parameter a caller reading a
+        // `type_annotation` terminal has to change, and a caller cannot
+        // otherwise tell a walk that had no type edges from one that refused
+        // them.
+        "include_type_edges": include_type_edges,
         "chain": chain,
         "total_steps": total_steps,
         "truncated": truncated,
@@ -3323,6 +3377,32 @@ pub fn handle_trace_data_flow<G: GraphStore>(
     );
     result["max_response_chars"] = serde_json::Value::from(max_response_chars);
     bound_trace_payload(&mut result, max_response_chars);
+    // Counted from the chain rather than during the walk, so the numbers
+    // describe the steps this payload carries after `bound_trace_payload` has
+    // dropped whatever it drops. Kept apart rather than summed because only the
+    // annotation half is recoverable: `include_type_edges` opens those leaves
+    // and opens none of the external ones. Neither sets `truncated`, since a
+    // boundary means the chain ends there rather than that the caller received
+    // less of one that exists.
+    let terminal_count = |class: TraceTerminal| {
+        result["chain"]
+            .as_array()
+            .map(|chain| {
+                chain
+                    .iter()
+                    .filter(|step| step["terminal"].as_str() == Some(class.as_str()))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    let terminal_external_steps = terminal_count(TraceTerminal::ExternalReference);
+    let terminal_annotation_steps = terminal_count(TraceTerminal::TypeAnnotation);
+    if terminal_external_steps > 0 {
+        result["terminal_external_steps"] = serde_json::Value::from(terminal_external_steps);
+    }
+    if terminal_annotation_steps > 0 {
+        result["terminal_annotation_steps"] = serde_json::Value::from(terminal_annotation_steps);
+    }
 
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
@@ -5922,6 +6002,210 @@ mod tests {
             arguments.insert((*key).to_string(), value.clone());
         }
         parsed_response(&handle_trace_data_flow(&arguments, store).unwrap())
+    }
+
+    /// The reported shape on this arm: a focal that names `typing.Any` in a
+    /// signature, and an `Any` the graph holds with no file and 44 further
+    /// referrers. `direction: "both"` is where it bit, because the inbound half
+    /// of an annotation edge is every other thing that mentions the type.
+    fn annotation_hub_store(other_referrers: usize) -> (InMemoryGraph, EntityId) {
+        let store = InMemoryGraph::new();
+        let focal = make_entity("cert_verify", "src/requests/adapters.py");
+        let focal_id = focal.id;
+        store.upsert_entity(&focal).unwrap();
+
+        let mut hub = make_entity("Any", "unused");
+        hub.kind = EntityKind::Module;
+        hub.file_origin = None;
+        let hub_id = hub.id;
+        store.upsert_entity(&hub).unwrap();
+        store
+            .upsert_relation(&make_relation(focal_id, hub_id, RelationKind::References))
+            .unwrap();
+
+        for index in 0..other_referrers {
+            let other = make_entity(
+                &format!("unrelated_{index}"),
+                &format!("src/requests/u_{index}.py"),
+            );
+            let other_id = other.id;
+            store.upsert_entity(&other).unwrap();
+            store
+                .upsert_relation(&make_relation(other_id, hub_id, RelationKind::References))
+                .unwrap();
+        }
+        (store, focal_id)
+    }
+
+    fn traced_step_names(payload: &serde_json::Value) -> Vec<String> {
+        payload["chain"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| step["entity_name"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// Both arms of one tool have to answer the same way, so the offline arm
+    /// gets the same fixture at the same reported parameters.
+    #[test]
+    fn trace_data_flow_offline_stops_at_an_external_annotation_hub() {
+        let (store, focal_id) = annotation_hub_store(44);
+        let payload = traced_payload(
+            &store,
+            &[
+                ("focal", serde_json::json!(focal_id.to_string())),
+                ("direction", serde_json::json!("both")),
+                ("depth", serde_json::json!(2)),
+                ("limit_per_step", serde_json::json!(8)),
+            ],
+        );
+
+        let names = traced_step_names(&payload);
+        assert_eq!(
+            names,
+            vec!["Any".to_string()],
+            "the chain must end at the file-less hub; it reached {names:?}"
+        );
+        assert_eq!(
+            payload["chain"][0]["terminal"],
+            serde_json::json!("external_reference")
+        );
+        assert_eq!(payload["terminal_external_steps"], serde_json::json!(1));
+        assert_eq!(payload["truncated"], serde_json::json!(false));
+        assert_eq!(payload["clipped_steps"], serde_json::Value::Null);
+    }
+
+    /// `include_type_edges` opens a type edge to a type this repository
+    /// defines, and opens nothing else. Both halves are asserted, because a
+    /// parameter that reopened the external hub would put the defect back
+    /// behind an argument.
+    #[test]
+    fn trace_data_flow_offline_type_edges_open_a_repo_type_and_never_an_external_one() {
+        let store = InMemoryGraph::new();
+        let focal = make_entity("ParsedNote", "src/notes.py");
+        let repo_type = make_entity("WikiLink", "src/links.py");
+        let beyond = make_entity("normalize_target", "src/links.py");
+        let mut stdlib = make_entity("Any", "unused");
+        stdlib.kind = EntityKind::Module;
+        stdlib.file_origin = None;
+        let unrelated = make_entity("unrelated", "src/other.py");
+        for entity in [&focal, &repo_type, &beyond, &stdlib, &unrelated] {
+            store.upsert_entity(entity).unwrap();
+        }
+        store
+            .upsert_relation(&make_relation(
+                focal.id,
+                repo_type.id,
+                RelationKind::UsesType,
+            ))
+            .unwrap();
+        store
+            .upsert_relation(&make_relation(repo_type.id, beyond.id, RelationKind::Calls))
+            .unwrap();
+        store
+            .upsert_relation(&make_relation(focal.id, stdlib.id, RelationKind::UsesType))
+            .unwrap();
+        store
+            .upsert_relation(&make_relation(
+                unrelated.id,
+                stdlib.id,
+                RelationKind::UsesType,
+            ))
+            .unwrap();
+
+        let args = |include: bool| {
+            [
+                ("focal", serde_json::json!(focal.id.to_string())),
+                ("direction", serde_json::json!("both")),
+                ("depth", serde_json::json!(3)),
+                ("include_type_edges", serde_json::json!(include)),
+            ]
+        };
+
+        let closed = traced_payload(&store, &args(false));
+        let mut closed_names = traced_step_names(&closed);
+        closed_names.sort();
+        assert_eq!(
+            closed_names,
+            vec!["Any".to_string(), "WikiLink".to_string()]
+        );
+        assert_eq!(closed["terminal_annotation_steps"], serde_json::json!(1));
+        assert_eq!(closed["terminal_external_steps"], serde_json::json!(1));
+        assert_eq!(closed["include_type_edges"], serde_json::json!(false));
+
+        let open = traced_payload(&store, &args(true));
+        let mut open_names = traced_step_names(&open);
+        open_names.sort();
+        assert_eq!(
+            open_names,
+            vec![
+                "Any".to_string(),
+                "WikiLink".to_string(),
+                "normalize_target".to_string(),
+            ],
+            "the repo type opens and the stdlib one does not"
+        );
+        assert_eq!(open["terminal_annotation_steps"], serde_json::Value::Null);
+        assert_eq!(
+            open["terminal_external_steps"],
+            serde_json::json!(1),
+            "no parameter makes a symbol this repository does not define walkable"
+        );
+        assert!(
+            !open_names.iter().any(|name| name == "unrelated"),
+            "the other annotator of the stdlib type is not in this flow: {open_names:?}"
+        );
+    }
+
+    /// The recoverable half is disclosed on the envelope; the unrecoverable one
+    /// is not, because no parameter would produce more of it.
+    #[test]
+    fn a_withheld_type_hop_is_named_in_completeness_limits_and_an_external_leaf_is_not() {
+        let (store, focal_id) = annotation_hub_store(2);
+        let mut args = HashMap::new();
+        args.insert("focal".to_string(), serde_json::json!(focal_id.to_string()));
+        args.insert("direction".to_string(), serde_json::json!("both"));
+        let external_only = parsed_response(&crate::finalize_with_envelope(
+            handle_trace_data_flow(&args, &store).unwrap(),
+            populated_ready_envelope(),
+            "trace_data_flow",
+        ));
+        let limits = external_only["_kin"]["completeness"]["limits"].to_string();
+        assert!(
+            !limits.contains("type_annotation_edges_not_walked"),
+            "an external leaf is not a shortfall a parameter can repair: {limits}"
+        );
+
+        let annotated = InMemoryGraph::new();
+        let focal = make_entity("ParsedNote", "src/notes.py");
+        let repo_type = make_entity("WikiLink", "src/links.py");
+        annotated.upsert_entity(&focal).unwrap();
+        annotated.upsert_entity(&repo_type).unwrap();
+        annotated
+            .upsert_relation(&make_relation(
+                focal.id,
+                repo_type.id,
+                RelationKind::UsesType,
+            ))
+            .unwrap();
+        let mut args = HashMap::new();
+        args.insert("focal".to_string(), serde_json::json!(focal.id.to_string()));
+        let withheld = parsed_response(&crate::finalize_with_envelope(
+            handle_trace_data_flow(&args, &annotated).unwrap(),
+            populated_ready_envelope(),
+            "trace_data_flow",
+        ));
+        let limits = withheld["_kin"]["completeness"]["limits"].to_string();
+        assert!(
+            limits.contains("type_annotation_edges_not_walked"),
+            "a withheld type hop is disclosed: {limits}"
+        );
+        assert_eq!(
+            withheld["_kin"]["completeness"]["bound"],
+            serde_json::json!("exact"),
+            "disclosure only: declining a type hop must not make an honest chain read as a floor"
+        );
     }
 
     /// The measured fan-out inversion on this arm: a node whose callees include

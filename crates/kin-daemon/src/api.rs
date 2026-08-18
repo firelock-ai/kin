@@ -8481,6 +8481,10 @@ async fn mcp_tools_call_inner(
                 kin_cli::commands::trace_data_flow::focal_not_found_error(&focal).to_string(),
             )));
         }
+        let include_type_edges = request
+            .arguments
+            .get("include_type_edges")
+            .and_then(serde_json::Value::as_bool);
         let req = kin_cli::commands::trace_data_flow::TraceDataFlowRequest {
             focal,
             depth,
@@ -8488,6 +8492,7 @@ async fn mcp_tools_call_inner(
             limit_per_step,
             include_body,
             max_response_chars,
+            include_type_edges,
         };
         let repository_authority = match require_mcp_command_repository_authority(&state) {
             Ok(authority) => authority,
