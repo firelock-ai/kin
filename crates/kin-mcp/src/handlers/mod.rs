@@ -3706,7 +3706,10 @@ mod tests {
         store
             .entities_by_file
             .insert("src/other.ts".into(), vec![ignored.clone()]);
-        store.live_entity_ids.insert(live.id);
+        // A real proven inbound edge, not the store's liveness shortcut: the
+        // scope now reads the same relations `find_references` reads, so a
+        // fixture that only flips a flag would be asserting on the mock.
+        insert_resolved_call(&mut store, &ignored, &live, 0.9);
 
         let mut args = HashMap::new();
         args.insert("limit".into(), serde_json::json!(50));
@@ -3727,6 +3730,198 @@ mod tests {
             parsed[0]["file_origin"],
             dead.file_origin.as_ref().unwrap().0
         );
+    }
+
+    /// FIR-2371. `files:` narrows WHICH entities are classified, never the
+    /// evidence they are classified on. The file-scoped branch used to exclude
+    /// within-file callers, which answers "unused outside this file" — a
+    /// different question the undifferentiated row shape cannot report. On a
+    /// graph holding no cross-file edge that named every entity in the file,
+    /// callers and all, which is how a stranger got a delete list of live code.
+    #[test]
+    fn file_scoped_dead_code_keeps_an_entity_its_own_file_calls() {
+        let caller = make_dead_code_entity("nk/parsing.py", "probeParse_1d8f8275", 10);
+        let callee = make_dead_code_entity("nk/parsing.py", "probeToken_1d8f8275", 40);
+        let orphan = make_dead_code_entity("nk/parsing.py", "probeOrphan_1d8f8275", 70);
+
+        let mut store = EmptyStore::default();
+        store.entities_by_file.insert(
+            "nk/parsing.py".into(),
+            vec![caller.clone(), callee.clone(), orphan.clone()],
+        );
+        // The only edge in this graph stays inside the file, exactly the
+        // FIR-2356 fixture's shape.
+        store.insert_test_calls_relation(&caller, &callee);
+
+        let mut args = HashMap::new();
+        args.insert("files".into(), serde_json::json!(["nk/parsing.py"]));
+
+        let result = entities::handle_dead_code(&args, &store).unwrap();
+        let text = match &result.content[0] {
+            crate::types::ContentBlock::Text { text } => text.clone(),
+        };
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+        let names: Vec<&str> = parsed
+            .iter()
+            .map(|row| row["name"].as_str().unwrap())
+            .collect();
+
+        assert!(
+            !names.contains(&callee.name.as_str()),
+            "an entity its own file calls is live in both scopes: {names:?}"
+        );
+        assert!(
+            names.contains(&orphan.name.as_str()),
+            "an entity nothing references is still reported: {names:?}"
+        );
+        assert!(
+            names.contains(&caller.name.as_str()),
+            "the caller itself has no inbound edge, so it stays a find: {names:?}"
+        );
+    }
+
+    /// FIR-2371. A `main` is called by the runtime rather than by any edge, so
+    /// no inbound edge was ever owed. The whole-repo scope already skipped one;
+    /// the file-scoped scope did not, and listed it.
+    #[test]
+    fn file_scoped_dead_code_never_lists_a_runtime_entry_point() {
+        let main = make_dead_code_entity("src/cli.rs", "main", 1);
+        let orphan = make_dead_code_entity("src/cli.rs", "probeOrphan_1d8f8275", 20);
+
+        let mut store = EmptyStore::default();
+        store
+            .entities_by_file
+            .insert("src/cli.rs".into(), vec![main.clone(), orphan.clone()]);
+
+        let mut args = HashMap::new();
+        args.insert("files".into(), serde_json::json!(["src/cli.rs"]));
+
+        let result = entities::handle_dead_code(&args, &store).unwrap();
+        let text = match &result.content[0] {
+            crate::types::ContentBlock::Text { text } => text.clone(),
+        };
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+        let names: Vec<&str> = parsed
+            .iter()
+            .map(|row| row["name"].as_str().unwrap())
+            .collect();
+
+        assert_eq!(
+            names,
+            vec![orphan.name.as_str()],
+            "a runtime entry point is never a delete candidate: {names:?}"
+        );
+    }
+
+    /// FIR-2384. PR #868 published `RelationResolution::is_proven` and said
+    /// dead-code would filter on it; the consumer it named counted any inbound
+    /// edge. A `name_only` edge is a repo-wide same-name match with nothing at
+    /// the call site proving the destination, so it must not rescue an entity
+    /// from the delete list.
+    #[test]
+    fn a_name_only_edge_does_not_rescue_an_entity_from_the_delete_list() {
+        let caller = make_dead_code_entity("src/a.ts", "probeCaller_1d8f8275", 10);
+        let guessed = make_dead_code_entity("src/b.ts", "probeGuessed_1d8f8275", 20);
+        let proven = make_dead_code_entity("src/c.ts", "probeProven_1d8f8275", 30);
+
+        let mut store = EmptyStore::default();
+        store
+            .entities_by_file
+            .insert("src/b.ts".into(), vec![guessed.clone()]);
+        store
+            .entities_by_file
+            .insert("src/c.ts".into(), vec![proven.clone()]);
+        // 0.3 is the receiver-method fan-out tier: every same-named method in
+        // the repo. 0.9 is module-known, symbol-selected-inside-it.
+        insert_resolved_call(&mut store, &caller, &guessed, 0.3);
+        insert_resolved_call(&mut store, &caller, &proven, 0.9);
+
+        let mut args = HashMap::new();
+        args.insert("files".into(), serde_json::json!(["src/b.ts", "src/c.ts"]));
+
+        let result = entities::handle_dead_code(&args, &store).unwrap();
+        let text = match &result.content[0] {
+            crate::types::ContentBlock::Text { text } => text.clone(),
+        };
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+        let names: Vec<&str> = parsed
+            .iter()
+            .map(|row| row["name"].as_str().unwrap())
+            .collect();
+
+        assert!(
+            names.contains(&guessed.name.as_str()),
+            "a name-only edge is a candidate, not evidence of use: {names:?}"
+        );
+        assert!(
+            !names.contains(&proven.name.as_str()),
+            "an import-scoped edge does prove use: {names:?}"
+        );
+    }
+
+    /// The seeded surface decides `dead` on the same rule, and publishes both
+    /// counts so a row with references that is still dead carries its own
+    /// explanation rather than reading as a contradiction.
+    #[test]
+    fn seeded_dead_code_decides_dead_on_proven_edges_and_publishes_both_counts() {
+        let caller = make_dead_code_entity("src/a.ts", "probeCaller_9f2b", 10);
+        let guessed = make_dead_code_entity("src/b.ts", "probeSeeded_9f2b", 20);
+
+        let mut store = EmptyStore::default();
+        store.insert_test_entity(guessed.clone());
+        insert_resolved_call(&mut store, &caller, &guessed, 0.3);
+
+        let mut args = HashMap::new();
+        args.insert("query".into(), serde_json::json!("probeSeeded_9f2b"));
+
+        let result = entities::handle_find_dead_code_seeded(&args, &store).unwrap();
+        let text = match &result.content[0] {
+            crate::types::ContentBlock::Text { text } => text.clone(),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let row = &parsed["candidates"][0];
+
+        assert_eq!(row["name"], guessed.name);
+        assert_eq!(
+            row["reference_count"], 1,
+            "the raw count is still published"
+        );
+        assert_eq!(row["proven_reference_count"], 0);
+        assert_eq!(
+            row["dead"], true,
+            "dead keys on the proven count, so this row agrees with dead_code"
+        );
+    }
+
+    /// Insert a Calls edge at an explicit linker confidence tier, so a test can
+    /// name the resolution it means rather than inherit one.
+    fn insert_resolved_call(
+        store: &mut EmptyStore,
+        caller: &Entity,
+        callee: &Entity,
+        confidence: f32,
+    ) {
+        let relation = Relation {
+            id: RelationId::new(),
+            kind: RelationKind::Calls,
+            src: kin_model::GraphNodeId::Entity(caller.id),
+            dst: kin_model::GraphNodeId::Entity(callee.id),
+            confidence,
+            origin: kin_model::relation::RelationOrigin::Inferred,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        store
+            .relations_by_entity
+            .entry(callee.id)
+            .or_default()
+            .push(relation.clone());
+        store
+            .relations_by_entity
+            .entry(caller.id)
+            .or_default()
+            .push(relation);
     }
 
     #[test]

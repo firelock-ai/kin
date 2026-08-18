@@ -283,7 +283,7 @@ fn embedding_coverage_is_measured(_graph: &kin_db::InMemoryGraph) -> bool {
 /// Two facts have to hold together for a reference edge to exist: the daemon
 /// wires an adapter for the language, and a server binary is installed. The
 /// binary names mirror `kin_lsp::discovery::KNOWN_SERVERS` for exactly the
-/// languages `kin_core::cross_file_coverage::ENRICHABLE_LANGUAGES` names;
+/// languages `kin_core::reference_coverage::ENRICHABLE_LANGUAGES` names;
 /// probing them here rather than through `discover_servers` keeps the daemon's
 /// status path off a subprocess, since discovery runs `--version` on every
 /// server it finds.
@@ -304,20 +304,18 @@ pub(crate) fn installed_language_servers() -> HashSet<kin_model::LanguageId> {
         .collect()
 }
 
-/// Measure how much of this graph's knowledge crosses a file boundary, and why
-/// the rest does not.
+/// The whole-graph relation totals the completeness section reports beside its
+/// per-language reference rows.
 ///
 /// Artifact-level import edges are not reachable from an entity-rooted
 /// traversal, so they are derived as the difference between the graph-wide
 /// count of a kind and the entity-rooted count the caller already has.
-fn cross_file_coverage(
+fn graph_relation_totals(
     graph: &kin_db::InMemoryGraph,
-    entities: &[Entity],
     entity_relation_counts: &HashMap<RelationKind, usize>,
-    cross_file_by_language: &HashMap<kin_model::LanguageId, usize>,
     entity_relations: usize,
     cross_file_relations: usize,
-) -> kin_core::cross_file_coverage::CrossFileCoverage {
+) -> kin_core::reference_coverage::GraphRelationTotals {
     let stats = graph.graph_stats();
     let artifact_import_relations: usize = [RelationKind::Imports, RelationKind::Includes]
         .into_iter()
@@ -332,27 +330,11 @@ fn cross_file_coverage(
         })
         .sum();
 
-    // Entities without a file origin are external reference targets this
-    // repository does not own; counting their language would report coverage
-    // for a language the repository holds no source in.
-    let mut entities_by_language: HashMap<kin_model::LanguageId, usize> = HashMap::new();
-    for entity in entities.iter().filter(|e| e.file_origin.is_some()) {
-        *entities_by_language.entry(entity.language).or_insert(0) += 1;
-    }
-
-    kin_core::cross_file_coverage::CrossFileCoverage::assemble(
+    kin_core::reference_coverage::GraphRelationTotals {
         entity_relations,
-        cross_file_relations,
+        cross_file_entity_relations: cross_file_relations,
         artifact_import_relations,
-        entities_by_language.into_iter().map(|(language, count)| {
-            (
-                language,
-                count,
-                cross_file_by_language.get(&language).copied().unwrap_or(0),
-            )
-        }),
-        &installed_language_servers(),
-    )
+    }
 }
 
 fn build_graph_status_response(
@@ -372,7 +354,7 @@ fn build_graph_status_response(
     // the health report, which used to take its own and clone every entity in
     // the graph a second time.
     let entities = graph.list_all_entities()?;
-    let health =
+    let mut health =
         inspect_graph_with_entities(authority, graph, &entities, Some(embed_status.pending))?;
 
     // An external reference target is a node this repository references without
@@ -426,7 +408,6 @@ fn build_graph_status_response(
         })
         .collect();
     let mut cross_file_relations = 0usize;
-    let mut cross_file_by_language: HashMap<kin_model::LanguageId, usize> = HashMap::new();
     for e in &entities {
         for rel in graph.get_all_relations_for_entity(&e.id)? {
             if seen_relation_ids.insert(rel.id) {
@@ -436,18 +417,32 @@ fn build_graph_status_response(
                     rel.src
                         .as_entity()
                         .zip(rel.dst.as_entity())
-                        .and_then(|(src, dst)| {
-                            let (src_file, src_language) = origin_by_entity.get(&src)?;
-                            let (dst_file, _) = origin_by_entity.get(&dst)?;
-                            (src_file != dst_file).then_some(*src_language)
+                        .is_some_and(|(src, dst)| {
+                            match (origin_by_entity.get(&src), origin_by_entity.get(&dst)) {
+                                (Some((src_file, _)), Some((dst_file, _))) => src_file != dst_file,
+                                _ => false,
+                            }
                         });
-                if let Some(src_language) = crossing {
+                if crossing {
                     cross_file_relations += 1;
-                    *cross_file_by_language.entry(src_language).or_insert(0) += 1;
                 }
             }
         }
     }
+
+    // One completeness statement for this response, assembled where the counts
+    // already exist. The all-kinds totals are counted here rather than re-walked
+    // inside the collector, so every edge is counted once, and the
+    // language-server probe is attached here rather than in kin-core, which
+    // measures graph truth and never probes the host.
+    health.reference_edge_coverage = std::mem::take(&mut health.reference_edge_coverage)
+        .with_totals(graph_relation_totals(
+            graph,
+            &relation_counts,
+            total_relations,
+            cross_file_relations,
+        ))
+        .with_language_servers(&installed_language_servers());
 
     // File count
     let unique_files: HashSet<_> = entities
@@ -527,22 +522,6 @@ fn build_graph_status_response(
         "Entity-to-entity relation kinds: {}",
         rel_parts.join(", ")
     ));
-
-    // Cross-file coverage, stated beside the kind breakdown the reader just
-    // saw. A kind histogram cannot say whether any edge leaves its own file,
-    // and a graph that answers nothing across a file boundary looks identical
-    // to a healthy one at this level of detail.
-    lines.extend(
-        cross_file_coverage(
-            graph,
-            &entities,
-            &relation_counts,
-            &cross_file_by_language,
-            total_relations,
-            cross_file_relations,
-        )
-        .disclosure_lines(),
-    );
 
     // Kind distribution
     let mut kind_pairs: Vec<_> = kind_counts.iter().collect();

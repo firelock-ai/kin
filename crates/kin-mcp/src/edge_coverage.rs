@@ -53,7 +53,7 @@
 
 use serde_json::{json, Map, Value};
 
-use kin_core::cross_file_coverage::{ReferenceEnrichment, ENRICHABLE_LANGUAGES};
+use kin_core::reference_coverage::{ReferenceEnrichment, ENRICHABLE_LANGUAGES};
 use kin_model::entity::Entity;
 use kin_model::graph::{EntityFilter, EntityStore};
 use kin_model::ids::{EntityId, FilePathId, LanguageId};
@@ -419,7 +419,9 @@ fn attach_reference_resolution<S: EntityStore>(
 /// Only the unsupported half is published as a verdict. Whether an installed
 /// server actually backs a wired adapter is a HOST fact this observation does not
 /// probe (the CLI's status path does, through `which`), so a wired language
-/// reports `unknown` rather than claiming an availability nothing here checked.
+/// reports [`ReferenceEnrichment::Unknown`] rather than claiming an availability
+/// nothing here checked. That variant carries the wire string, so this gate and
+/// the status surfaces cannot drift on what an unprobed language looks like.
 /// The weakest language governs, matching how the class states above merge: one
 /// unsupported language in a batch makes the batch's reference evidence
 /// unproducible.
@@ -430,7 +432,7 @@ fn reference_enrichment(languages: &[LanguageId]) -> Value {
     {
         json!(ReferenceEnrichment::Unsupported)
     } else {
-        json!("unknown")
+        json!(ReferenceEnrichment::Unknown)
     }
 }
 

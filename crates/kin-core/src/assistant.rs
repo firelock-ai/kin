@@ -295,12 +295,14 @@ pub fn doctor(layout: &KinLayout, kind: AssistantKind) -> Result<DoctorReport> {
             name: "Adapter config".into(),
             passed: true,
             detail: format!("Found at {}", config_path.display()),
+            verified: true,
         });
     } else {
         checks.push(DoctorCheck {
             name: "Adapter config".into(),
             passed: false,
             detail: format!("Missing: {}", config_path.display()),
+            verified: true,
         });
     }
 
@@ -316,6 +318,7 @@ pub fn doctor(layout: &KinLayout, kind: AssistantKind) -> Result<DoctorReport> {
         } else {
             "Missing; run `kin assistant install` to generate".into()
         },
+        verified: true,
     });
 
     // Check AGENTS.md
@@ -328,6 +331,7 @@ pub fn doctor(layout: &KinLayout, kind: AssistantKind) -> Result<DoctorReport> {
         } else {
             "Missing; run `kin assistant install` to generate".into()
         },
+        verified: true,
     });
 
     if let Some(target_path) = assistant_target_path(kind) {
@@ -343,6 +347,7 @@ pub fn doctor(layout: &KinLayout, kind: AssistantKind) -> Result<DoctorReport> {
                     kind
                 )
             },
+            verified: true,
         });
     }
 
@@ -360,6 +365,7 @@ pub fn doctor(layout: &KinLayout, kind: AssistantKind) -> Result<DoctorReport> {
                 } else {
                     "No managed block; run `kin assistant sync` to generate".into()
                 },
+                verified: true,
             });
         }
     }
@@ -380,30 +386,37 @@ pub fn doctor(layout: &KinLayout, kind: AssistantKind) -> Result<DoctorReport> {
                     } else {
                         "Found but missing kin server entry".into()
                     },
+                    verified: true,
                 });
             } else {
                 checks.push(DoctorCheck {
                     name: "MCP config (.mcp.json)".into(),
                     passed: false,
                     detail: "Not found; create with `kin assistant snippets claude-code` or `claude mcp add kin -- kin mcp start`".into(),
+                    verified: true,
                 });
             }
         }
         AssistantKind::Codex => {
-            // Codex uses ~/.codex/config.toml — repo-local .mcp.json is not its path
-            checks.push(DoctorCheck {
-                name: "MCP config (codex)".into(),
-                passed: true, // Advisory — we can't reliably check the global config here
-                detail: "Run `codex mcp add kin -- kin mcp start` to register MCP globally; or see `kin assistant snippets codex`".into(),
-            });
+            // Codex uses ~/.codex/config.toml — repo-local .mcp.json is not its
+            // path, so this row is guidance and nothing here read a file. The
+            // global registration IS checked further down; this row must not be
+            // counted as a second, passing check of the same thing.
+            checks.push(DoctorCheck::unverified(
+                "MCP config (codex)",
+                "not checked here — repo-local `.mcp.json` is not Codex's path. Run `codex mcp \
+                 add kin -- kin mcp start` to register MCP globally; or see `kin assistant \
+                 snippets codex`",
+            ));
         }
         AssistantKind::GeminiCli => {
-            // Gemini uses ~/.gemini/settings.json
-            checks.push(DoctorCheck {
-                name: "MCP config (gemini)".into(),
-                passed: true, // Advisory
-                detail: "Run `gemini mcp add kin -- kin mcp start` to register MCP globally; or see `kin assistant snippets gemini-cli`".into(),
-            });
+            // Gemini uses ~/.gemini/settings.json — same reasoning as Codex above.
+            checks.push(DoctorCheck::unverified(
+                "MCP config (gemini)",
+                "not checked here — repo-local `.mcp.json` is not Gemini's path. Run `gemini mcp \
+                 add kin -- kin mcp start` to register MCP globally; or see `kin assistant \
+                 snippets gemini-cli`",
+            ));
         }
         _ => {
             // Generic/Cursor — check .mcp.json as best-effort
@@ -417,6 +430,7 @@ pub fn doctor(layout: &KinLayout, kind: AssistantKind) -> Result<DoctorReport> {
                 } else {
                     "No .mcp.json; configure MCP manually for your assistant".into()
                 },
+                verified: true,
             });
         }
     }
@@ -438,12 +452,14 @@ pub fn doctor(layout: &KinLayout, kind: AssistantKind) -> Result<DoctorReport> {
                     target_name, target_name
                 )
             },
+            verified: true,
         });
     } else {
         checks.push(DoctorCheck {
             name: "Sync config".into(),
             passed: false,
             detail: "No assistant-sync.toml; run `kin assistant sync` to create".into(),
+            verified: true,
         });
     }
 
@@ -461,6 +477,7 @@ pub fn doctor(layout: &KinLayout, kind: AssistantKind) -> Result<DoctorReport> {
         } else {
             "kin not found on PATH; MCP server requires kin to be available".into()
         },
+        verified: true,
     });
 
     // Check global MCP registration for Claude Code
@@ -512,6 +529,7 @@ pub fn doctor(layout: &KinLayout, kind: AssistantKind) -> Result<DoctorReport> {
                 name: "Global MCP registration".into(),
                 passed: found,
                 detail,
+                verified: true,
             });
         }
     }
@@ -550,6 +568,7 @@ pub fn doctor(layout: &KinLayout, kind: AssistantKind) -> Result<DoctorReport> {
                 name: "Global MCP registration".into(),
                 passed: found,
                 detail,
+                verified: true,
             });
         }
     }
@@ -588,6 +607,7 @@ pub fn doctor(layout: &KinLayout, kind: AssistantKind) -> Result<DoctorReport> {
                 name: "Global MCP registration".into(),
                 passed: found,
                 detail,
+                verified: true,
             });
         }
     }
@@ -601,6 +621,7 @@ pub fn doctor(layout: &KinLayout, kind: AssistantKind) -> Result<DoctorReport> {
         } else {
             "Not a Kin repository".into()
         },
+        verified: true,
     });
 
     let all_passed = checks.iter().all(|c| c.passed);
@@ -618,6 +639,46 @@ pub struct DoctorCheck {
     pub name: String,
     pub passed: bool,
     pub detail: String,
+    /// Whether this row was actually checked.
+    ///
+    /// Two rows cannot be: an assistant whose MCP registration lives in a global
+    /// config this process has no reliable path to reports `passed` because
+    /// nothing contradicted it, not because anything was read. A summary that
+    /// folds those into "All checks passed" claims a completeness it never
+    /// established, which is the same defect `graph validate` carried when it
+    /// reported a clean bill on a graph missing every cross-file edge.
+    ///
+    /// Defaulted true so a serialized report written before this field existed
+    /// reads as fully checked rather than as wholly unverified.
+    #[serde(default = "check_is_verified_by_default")]
+    pub verified: bool,
+}
+
+fn check_is_verified_by_default() -> bool {
+    true
+}
+
+impl DoctorCheck {
+    /// A row this process actually established.
+    pub fn checked(name: impl Into<String>, passed: bool, detail: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            passed,
+            detail: detail.into(),
+            verified: true,
+        }
+    }
+
+    /// A row nothing could establish, carried so the reader sees the gap rather
+    /// than an absence they cannot distinguish from a pass.
+    pub fn unverified(name: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            passed: true,
+            detail: detail.into(),
+            verified: false,
+        }
+    }
 }
 
 /// Doctor report for an assistant.
@@ -629,18 +690,46 @@ pub struct DoctorReport {
 }
 
 impl DoctorReport {
+    /// Names of the rows nothing established, in report order.
+    pub fn unverified_checks(&self) -> Vec<&str> {
+        self.checks
+            .iter()
+            .filter(|check| !check.verified)
+            .map(|check| check.name.as_str())
+            .collect()
+    }
+
     pub fn summary(&self) -> String {
         use std::fmt::Write;
         let mut out = String::new();
         writeln!(out, "Doctor report for {}", self.kind).unwrap();
         for check in &self.checks {
-            let icon = if check.passed { "OK" } else { "FAIL" };
+            let icon = if !check.verified {
+                "SKIP"
+            } else if check.passed {
+                "OK"
+            } else {
+                "FAIL"
+            };
             writeln!(out, "  [{}] {}: {}", icon, check.name, check.detail).unwrap();
         }
-        if self.all_passed {
+        // A verdict states which question it answered. A row nothing could read
+        // is not a row that passed, and folding it into "All checks passed" is
+        // the same unqualified completeness claim `graph validate` used to make
+        // about a graph whose integrity was all it had checked.
+        let unverified = self.unverified_checks();
+        if !self.all_passed {
+            writeln!(out, "\nSome checks failed.").unwrap();
+        } else if unverified.is_empty() {
             writeln!(out, "\nAll checks passed.").unwrap();
         } else {
-            writeln!(out, "\nSome checks failed.").unwrap();
+            writeln!(
+                out,
+                "\nEvery check that could run passed. Not covered by that: {}. A [SKIP] row was \
+                 not read here, so this report does not say whether it is configured.",
+                unverified.join(", ")
+            )
+            .unwrap();
         }
         out
     }
@@ -1419,6 +1508,87 @@ mod tests {
         assert!(config_dir.exists());
         assert!(config_dir.join(".mcp.json").exists());
         assert!(config_dir.join("settings.json").exists());
+    }
+
+    /// FIR-2384. `graph validate` used to report "All checks passed" on a graph
+    /// missing every cross-file edge; the CLI now narrows that to "All INTEGRITY
+    /// checks passed" and prints what it did not check beside it. This surface
+    /// made the same unqualified claim for a different reason: two of its rows
+    /// report `passed` because nothing contradicted them, not because anything
+    /// was read, and the summary folded them in.
+    #[test]
+    fn a_summary_does_not_call_an_unread_row_a_passed_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        std::fs::create_dir_all(&kin_dir).unwrap();
+        let layout = KinLayout::new(kin_dir);
+
+        let report = doctor(&layout, AssistantKind::Codex).unwrap();
+        let unread = report
+            .checks
+            .iter()
+            .find(|check| check.name == "MCP config (codex)")
+            .expect("the row is still reported, so the gap is visible");
+
+        assert!(
+            !unread.verified,
+            "repo-local .mcp.json is not Codex's path, so nothing here read one"
+        );
+        assert!(
+            unread.detail.contains("not checked here"),
+            "the row says so in its own words: {}",
+            unread.detail
+        );
+        assert_eq!(
+            report.unverified_checks(),
+            vec!["MCP config (codex)"],
+            "and it is the only such row"
+        );
+
+        let summary = report.summary();
+        assert!(
+            summary.contains("[SKIP] MCP config (codex)"),
+            "an unread row does not render as OK: {summary}"
+        );
+        assert!(
+            !summary.contains("All checks passed."),
+            "the unqualified claim is what FIR-2358 objected to: {summary}"
+        );
+    }
+
+    /// The counterpart, so the qualification above cannot be unconditional: an
+    /// assistant whose every row this process really can read still gets the
+    /// plain sentence.
+    #[test]
+    fn an_assistant_whose_every_row_was_read_still_reports_all_checks_passed() {
+        let dir = tempfile::tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        std::fs::create_dir_all(&kin_dir).unwrap();
+        let layout = KinLayout::new(kin_dir);
+
+        let report = doctor(&layout, AssistantKind::ClaudeCode).unwrap();
+        assert!(
+            report.unverified_checks().is_empty(),
+            "every Claude Code row reads a path this process holds: {:?}",
+            report.unverified_checks()
+        );
+        assert!(!report.summary().contains("[SKIP]"), "{}", report.summary());
+
+        // A bare `.kin` directory fails the config rows, so the fixture above
+        // reaches "Some checks failed." and cannot exercise the plain verdict
+        // at all. Build the all-read, all-passed report directly, or the
+        // sentence this test is named for goes unasserted while the test
+        // passes.
+        let clean = DoctorReport {
+            kind: AssistantKind::ClaudeCode,
+            checks: vec![DoctorCheck::checked("MCP config", true, "configured")],
+            all_passed: true,
+        };
+        assert!(
+            clean.summary().contains("All checks passed."),
+            "nothing was skipped, so the verdict carries no qualification: {}",
+            clean.summary()
+        );
     }
 
     #[test]

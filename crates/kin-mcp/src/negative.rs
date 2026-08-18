@@ -311,7 +311,7 @@ pub(crate) fn load_bearing_classes(requested: &[String]) -> Vec<String> {
 /// before it can certify anything.
 ///
 /// The extraction side grew a richer statement of the same fact under FIR-2354:
-/// `kin_core::cross_file_coverage::CrossFileCoverage`, whole-graph counts plus a
+/// `kin_core::reference_coverage::ReferenceEdgeCoverage`, whole-graph counts plus a
 /// per-language entry carrying `reference_enrichment`, which knows something a
 /// witness scan cannot observe from the graph alone. Half of that now reaches
 /// this gate: [`crate::edge_coverage`] publishes `reference_enrichment`, and the

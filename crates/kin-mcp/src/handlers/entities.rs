@@ -2447,8 +2447,10 @@ List dead or unreachable code straight from the semantic graph. With no filters 
 returns entities that have no incoming relations at all — nothing calls, imports, or \
 references them — across the whole repo, up to `limit`. Pass `files` to narrow the \
 scan to specific file paths and return only the dead functions, methods, and classes \
-declared there, ignoring within-file references so genuinely-unused declarations stand \
-out. Reach for it when you want to find removable code, audit a module for orphaned \
+declared there. `files` narrows WHICH entities are classified, never the evidence they \
+are classified on: a declaration its own file calls is live in both modes, so the \
+answer means the same thing whether or not you passed `files`. \
+Reach for it when you want to find removable code, audit a module for orphaned \
 definitions, or check whether a particular file still has live entry points. Because \
 reachability is read directly off the graph's relation edges, you get the answer in one \
 call without manually cross-referencing every symbol. When you'd rather start from a \
@@ -2456,6 +2458,10 @@ search concept than scan files — \"which of the entities matching X are dead?\
 find_dead_code_seeded combines the search and the dead-classification in one step. \
 A runtime entry point (a `main`) is never listed: it is called by the runtime rather than \
 by any edge, so no inbound edge was ever owed. \
+Only a PROVEN inbound edge counts as life. An edge the linker chose by matching a bare \
+name across the repository is a candidate, not evidence, so it does not keep an entity \
+off this list; that makes the list longer rather than shorter, which is why you must \
+read coverage before acting on it. \
 The response carries an additive `negative` object whose `safe_to_conclude_absent` flag \
 says whether \"nothing dead found\" is authoritative or limited by index freshness — \
 check it before concluding everything is reachable. Absence is only as good as the \
@@ -2468,14 +2474,13 @@ pub fn handle_dead_code<G: GraphStore>(
 ) -> Result<ToolCallResult> {
     let limit = get_optional_u64(args, "limit", 50) as usize;
     let files = get_optional_string_array(args, "files").unwrap_or_default();
+    // One reference-kind list for both scopes. Passing `files` chooses which
+    // entities are classified; it must not change what "dead" means, or the two
+    // modes answer different questions under one tool name.
+    let incoming_kinds = default_reference_kinds();
 
     if !files.is_empty() {
         let mut dead = Vec::new();
-        let incoming_kinds = [
-            RelationKind::Calls,
-            RelationKind::Imports,
-            RelationKind::References,
-        ];
 
         for file in files {
             let mut entities = store
@@ -2510,15 +2515,22 @@ pub fn handle_dead_code<G: GraphStore>(
             });
 
             for entity in entities {
-                let is_live = store
-                    .has_incoming_relation_kinds(&entity.id, &incoming_kinds, true)
-                    .map_err(McpError::graph)?;
-                if !is_live {
-                    dead.push(entity);
-                    if dead.len() >= limit {
-                        let json = serde_json::to_string_pretty(&dead).map_err(McpError::Json)?;
-                        return Ok(ToolCallResult::text(json));
-                    }
+                // Same rule as the whole-repo scope below, read off the same
+                // edges `find_references` reads. This branch used to exclude
+                // within-file callers, which answers "unused OUTSIDE this file"
+                // — a different question that the undifferentiated row shape
+                // cannot report. On a graph holding no cross-file edge it named
+                // every entity in the file, callers and all.
+                if kin_core::entry_points::is_conventional_entry_point(&entity) {
+                    continue;
+                }
+                if has_incoming_reference_edge(store, &entity.id, &incoming_kinds)? {
+                    continue;
+                }
+                dead.push(entity);
+                if dead.len() >= limit {
+                    let json = serde_json::to_string_pretty(&dead).map_err(McpError::Json)?;
+                    return Ok(ToolCallResult::text(json));
                 }
             }
         }
@@ -2534,7 +2546,6 @@ pub fn handle_dead_code<G: GraphStore>(
     // only the candidates that have none, read through the same reference kinds
     // `find_references` defaults to. An entry point is referenced by the runtime
     // rather than by an edge, so it is not a candidate either.
-    let incoming_kinds = default_reference_kinds();
     let mut dead = Vec::new();
     for entity in store.find_dead_code().map_err(McpError::graph)? {
         if dead.len() >= limit {
@@ -2559,6 +2570,14 @@ pub fn handle_dead_code<G: GraphStore>(
 ///
 /// A self-recursive function references nothing but itself, so its own edge
 /// never makes it reachable.
+///
+/// Only a proven edge counts. A `name_only` edge was chosen by matching a bare
+/// name across the whole repository, so it is a candidate for where a call went
+/// rather than evidence that this destination is used, and counting one as life
+/// is exactly what made `Session.request` appear to call
+/// `RequestsCookieJar.update`. Discarding it lengthens the delete list rather
+/// than shortening it, so every surface that prints the list states its own
+/// reference-edge coverage beside it.
 fn has_incoming_reference_edge<G: GraphStore>(
     store: &G,
     entity_id: &kin_model::EntityId,
@@ -2574,6 +2593,7 @@ fn has_incoming_reference_edge<G: GraphStore>(
         if relation.dst != kin_model::GraphNodeId::Entity(*entity_id)
             || !kinds.contains(&relation.kind)
             || source == *entity_id
+            || !RelationResolution::of(&relation).is_proven()
         {
             continue;
         }
@@ -2586,8 +2606,11 @@ pub const FIND_DEAD_CODE_SEEDED_DESC: &str = "\
 Find dead code starting from a search concept, in a single call. Give it a query (a \
 concept or partial name) and it searches the graph for the top-N matching entities, \
 counts each one's incoming references, and returns them ranked dead-first — each row \
-annotated with reference_count and a boolean `dead` flag, plus name, kind, file, and \
-signature. Reach for it when you suspect a feature/area is unused and want to confirm \
+annotated with reference_count, proven_reference_count and a boolean `dead` flag, plus \
+name, kind, file, and signature. `dead` is decided on the PROVEN count, the same rule \
+dead_code applies, so a row can carry references and still be dead: the difference \
+between the two counts is the edges the linker chose by matching a bare name across \
+the repository, which prove nothing about this destination. Reach for it when you suspect a feature/area is unused and want to confirm \
 which of its declarations are actually orphaned, without first knowing their IDs. Its \
 value is that it fuses three steps — semantic_search, then a reference count per match, \
 then the dead filter — into one response, so you don't loop find_references over every \
@@ -2643,6 +2666,7 @@ pub fn handle_find_dead_code_seeded<G: GraphStore>(
             continue;
         }
         let mut reference_count = 0usize;
+        let mut proven_reference_count = 0usize;
         for rel in store
             .get_all_relations_for_entity(&entity.id)
             .map_err(McpError::graph)?
@@ -2660,8 +2684,15 @@ pub fn handle_find_dead_code_seeded<G: GraphStore>(
                 continue;
             }
             reference_count += 1;
+            if RelationResolution::of(&rel).is_proven() {
+                proven_reference_count += 1;
+            }
         }
-        let dead = reference_count == 0;
+        // Decided on proven edges, the same rule `dead_code` and the CLI scan
+        // apply. A raw count here would make one entity dead on one surface and
+        // live on another, and the row carries both counts so a reader can see
+        // which edges were discarded rather than infer it.
+        let dead = proven_reference_count == 0;
         candidates.push(serde_json::json!({
             "id": entity.id.to_string(),
             "name": entity.name,
@@ -2669,19 +2700,25 @@ pub fn handle_find_dead_code_seeded<G: GraphStore>(
             "file": entity.file_origin.as_ref().map(|p| p.to_string()),
             "signature": (!entity.signature.is_empty()).then_some(entity.signature),
             "reference_count": reference_count,
+            "proven_reference_count": proven_reference_count,
             "dead": dead,
         }));
     }
 
+    // Dead first, and `dead` keys on the proven count, so the proven count is
+    // what orders the page.
     candidates.sort_by(|a, b| {
+        let a_proven = a["proven_reference_count"].as_u64().unwrap_or(0);
+        let b_proven = b["proven_reference_count"].as_u64().unwrap_or(0);
         let a_count = a["reference_count"].as_u64().unwrap_or(0);
         let b_count = b["reference_count"].as_u64().unwrap_or(0);
         let a_name = a["name"].as_str().unwrap_or("");
         let b_name = b["name"].as_str().unwrap_or("");
         let a_id = a["id"].as_str().unwrap_or("");
         let b_id = b["id"].as_str().unwrap_or("");
-        a_count
-            .cmp(&b_count)
+        a_proven
+            .cmp(&b_proven)
+            .then_with(|| a_count.cmp(&b_count))
             .then_with(|| a_name.cmp(b_name))
             .then_with(|| a_id.cmp(b_id))
     });

@@ -182,7 +182,7 @@ pub struct SemanticCoverage {
 /// which is precisely the state that produces `all_fallback: true` on a fully
 /// embedded store.
 ///
-/// Deliberately NOT a new coverage type alongside `kin_core::cross_file_coverage`
+/// Deliberately NOT a new coverage type alongside `kin_core::reference_coverage`
 /// and `kin_mcp::edge_coverage`. Those answer questions about relation topology:
 /// whether edges leave their file, and whether the graph holds the edge class an
 /// absence claim depends on. Body presence is a different axis, and it belongs on
