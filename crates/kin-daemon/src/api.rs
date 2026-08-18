@@ -8084,11 +8084,81 @@ fn resolved_entity_source_from_outcome<E: std::fmt::Display>(
     }
 }
 
+/// POST /mcp/tools/call.
+///
+/// The route bounds every retrieval response it serves, on the same budget and
+/// through the same ladder the stdio MCP path applies. This arm carries no
+/// `_kin` envelope, which was already a gap, and serving an unbounded payload
+/// here would have widened it into a second one: a client calling the daemon
+/// directly would have been handed exactly the response the stdio client is
+/// protected from, and the tool would have been bounded or not depending on
+/// which door the caller came through.
+///
+/// It cuts against the budget less the envelope reserve, because the stdio path
+/// wraps this payload in `_kin` and `negative` before a client counts it. Both
+/// arms measuring the full budget would put every enveloped response slightly
+/// over it and make the stdio pass re-cut a payload that had already been cut to
+/// fit.
 async fn mcp_tools_call(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<McpToolCallRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let budget =
+        kin_mcp::budget::ResponseBudget::from_arguments(&request.arguments).less_envelope_reserve();
+    let tool = request.name.clone();
+    let Json(result) = mcp_tools_call_inner(headers, State(state), Json(request)).await?;
+    Ok(Json(bound_mcp_tool_result(result, &tool, &budget)))
+}
+
+/// Apply the response budget to one tool result's payload text.
+///
+/// Measured and rewritten on the serialized payload rather than inside each
+/// handler because the tools this route serves build their JSON in six different
+/// places, and a bound implemented once per handler is a bound six code paths
+/// can each forget. A payload that is not JSON, or a tool the budget does not
+/// govern, is returned exactly as built.
+fn bound_mcp_tool_result(
+    result: kin_mcp::ToolCallResult,
+    tool: &str,
+    budget: &kin_mcp::budget::ResponseBudget,
+) -> kin_mcp::ToolCallResult {
+    if !kin_mcp::budget::is_budgeted(tool) {
+        return result;
+    }
+    let content = result
+        .content
+        .into_iter()
+        .map(|block| {
+            let kin_mcp::ContentBlock::Text { text } = block;
+            let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(&text) else {
+                return kin_mcp::ContentBlock::Text { text };
+            };
+            if !payload.is_object() {
+                return kin_mcp::ContentBlock::Text { text };
+            }
+            kin_mcp::budget::enforce(&mut payload, tool, budget);
+            match serde_json::to_string_pretty(&payload) {
+                Ok(rendered) => kin_mcp::ContentBlock::Text { text: rendered },
+                Err(_) => kin_mcp::ContentBlock::Text { text },
+            }
+        })
+        .collect();
+    kin_mcp::ToolCallResult {
+        content,
+        is_error: result.is_error,
+    }
+}
+
+async fn mcp_tools_call_inner(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<McpToolCallRequest>,
+) -> Result<Json<kin_mcp::ToolCallResult>, (StatusCode, String)> {
+    // The same budget the wrapper will enforce, so an arm that bounds its own
+    // walk bounds it to the number this call is actually served under.
+    let response_budget =
+        kin_mcp::budget::ResponseBudget::from_arguments(&request.arguments).less_envelope_reserve();
     if !state
         .is_initialized
         .load(std::sync::atomic::Ordering::Relaxed)
@@ -8247,11 +8317,17 @@ async fn mcp_tools_call(
                     .and_then(serde_json::Value::as_bool)
                     .map(|compact| !compact)
             });
+        // Defaulted to the budget THIS ROUTE will enforce rather than to the
+        // tool's own default, so one call is bounded once. The walk and the
+        // route pass would otherwise hold two different numbers for the same
+        // response, the walk would cut to the larger, and the route would cut
+        // again to a smaller one that the walk's own disclosure does not name.
         let max_response_chars = request
             .arguments
             .get("max_response_chars")
             .and_then(serde_json::Value::as_u64)
-            .map(|v| v as usize);
+            .map(|v| v as usize)
+            .or(Some(response_budget.max_chars));
         let Some(focal) = focal else {
             return Ok(Json(kin_mcp::ToolCallResult::error(
                 "missing required parameter: focal".to_string(),
@@ -30455,5 +30531,239 @@ mod tests {
                 .is_some(),
             "the committed file must be graph-owned after the single successor"
         );
+    }
+
+    /// FIR-2396: the call from the ticket, at the scale it was measured at.
+    ///
+    /// A `semantic_locate` with three query variants at `limit: 10` returned
+    /// 80,571 characters on the v0.5.38 release-candidate bytes and Claude Code
+    /// refused it, spilling the answer to a file the agent then had to read. The
+    /// fixture reproduces that scale through the REAL fused serializer, so the
+    /// number under test is the one the tool actually emits rather than a
+    /// hand-built object that resembles it.
+    #[test]
+    fn semantic_locate_at_the_measured_scale_fits_the_response_budget() {
+        use kin_cli::commands::locate::{
+            LocateEntity, LocateFileEntry, LocateProvenance, LocateResult, LocateSymbol,
+        };
+        let variants = vec![
+            "resolve_redirects".to_string(),
+            "follow redirect chain build next request".to_string(),
+            "Location header handling 301 302 303 307 308".to_string(),
+        ];
+        let body = |name: &str, lines: usize| {
+            format!(
+                "def {name}(self, resp, req, stream=False, timeout=None, verify=True, cert=None, \
+                 proxies=None, yield_requests=False, **adapter_kwargs):\n{}",
+                "    hist = []  # keep track of history of redirects for this request\n"
+                    .repeat(lines)
+            )
+        };
+        let make_entities = || -> Vec<LocateEntity> {
+            (0..10)
+                .map(|index| LocateEntity {
+                    entity_id: format!("0000{index:04}-0000-4000-8000-000000000000"),
+                    id_space: kin_cli::commands::locate::LocateIdSpace::Entity,
+                    artifact_path: None,
+                    kind: "method".into(),
+                    name: format!("resolve_redirects_variant_{index}"),
+                    signature: "def resolve_redirects(self, resp, req, stream=False)".into(),
+                    score: 0.9 - (index as f32 / 100.0),
+                    definition: true,
+                    span: Some([100 + index as u32, 220 + index as u32]),
+                    body: Some(body(&format!("resolve_redirects_variant_{index}"), 22)),
+                    match_kind: None,
+                    provenance: LocateProvenance {
+                        file: Some(format!("requests/sessions_{index}.py")),
+                        origin: "vector".into(),
+                        cosine: Some(0.71),
+                    },
+                    matched_queries: variants.clone(),
+                })
+                .collect()
+        };
+        let make_files = || -> Vec<LocateFileEntry> {
+            (0..10)
+                .map(|index| LocateFileEntry {
+                    path: format!("requests/sessions_{index}.py"),
+                    score: 0.9 - (index as f32 / 100.0),
+                    signals: vec![
+                        "vector".into(),
+                        "lexical".into(),
+                        "graph".into(),
+                        "name_exact".into(),
+                    ],
+                    spans: vec![[100, 220], [240, 300]],
+                    symbols: (0..6)
+                        .map(|symbol| LocateSymbol {
+                            name: format!("symbol_{index}_{symbol}_rebuild_auth"),
+                            span: Some([10 * symbol as u32, 40 * symbol as u32]),
+                            score: 0.5,
+                            kind: "function".into(),
+                            definition: true,
+                            origin: "vector".into(),
+                            cosine: Some(0.6),
+                            snippet: Some(body(&format!("symbol_{index}_{symbol}"), 9)),
+                        })
+                        .collect(),
+                    explain: vec![
+                        "vector similarity 0.81 on the primary variant".to_string(),
+                        "lexical hit on token `redirect`".to_string(),
+                        "graph: called by Session.send".to_string(),
+                    ],
+                    provenance: None,
+                    signal_scores: None,
+                    score_breakdown: None,
+                    matched_queries: variants.clone(),
+                })
+                .collect()
+        };
+        let make_result = || LocateResult {
+            entities: make_entities(),
+            next_cursor: Some("deadbeefdeadbeef.1".to_string()),
+            page: 0,
+            total_ranked: 47,
+            files: make_files(),
+            queries: variants.clone(),
+            ..Default::default()
+        };
+
+        let unbounded = mcp_result_text(&fused_semantic_locate_payload(
+            make_result(),
+            "where HTTP redirects are actually resolved and followed",
+            false,
+        ));
+        assert!(
+            unbounded.len() > kin_mcp::budget::RESPONSE_DEFAULT_MAX_CHARS,
+            "the fixture must reproduce the overflow, or the bound is untested: {} chars",
+            unbounded.len()
+        );
+
+        // The budget the route actually applies: the default less the room the
+        // stdio path's envelope and negative need.
+        let budget = kin_mcp::budget::ResponseBudget::default().less_envelope_reserve();
+        let bounded = mcp_result_text(&bound_mcp_tool_result(
+            fused_semantic_locate_payload(
+                make_result(),
+                "where HTTP redirects are actually resolved and followed",
+                false,
+            ),
+            "semantic_locate",
+            &budget,
+        ));
+        eprintln!(
+            "FIR-2396 semantic_locate: {} chars unbounded, {} chars bounded",
+            unbounded.len(),
+            bounded.len()
+        );
+        assert!(
+            bounded.len() <= budget.max_chars,
+            "the response a client receives must fit its budget: {} chars against {}",
+            bounded.len(),
+            budget.max_chars
+        );
+        let payload: serde_json::Value =
+            serde_json::from_str(&bounded).expect("a bounded locate response is still JSON");
+        // The ranking itself is what a caller came for, so the hits survive and
+        // the cut lands on the diagnostics and the duplicated roll-up first.
+        assert_eq!(
+            payload["entities"].as_array().map(Vec::len),
+            Some(10),
+            "every hit the caller asked for is still reported: {payload}"
+        );
+        for hit in payload["entities"].as_array().unwrap() {
+            assert!(
+                hit.get("match_evidence").is_none(),
+                "compact is the default: the per-signal breakdown is not shipped unasked"
+            );
+            assert!(hit["entity_id"].is_string(), "a hit keeps its handle");
+        }
+        assert_eq!(
+            payload["total_ranked"],
+            json!(47),
+            "the full ranking size is still reported so the page is not mistaken for the whole"
+        );
+        assert_eq!(
+            payload["next_cursor"],
+            json!("deadbeefdeadbeef.1"),
+            "the rest of the ranking stays reachable through the cursor"
+        );
+        let cut = payload["degradations"]
+            .as_array()
+            .expect("a cut must be disclosed")
+            .iter()
+            .find(|entry| entry["component"] == json!("response_budget"))
+            .expect("the budget discloses its own cut");
+        assert_eq!(
+            cut["max_chars"],
+            json!(budget.max_chars),
+            "the applied budget is named"
+        );
+        assert!(
+            cut["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("symbol roll-up"),
+            "the disclosure names what it took: {cut}"
+        );
+    }
+
+    /// The raw daemon route carries no `_kin` envelope, which is a known gap.
+    /// Serving an unbounded payload here would have made it two gaps: a client
+    /// calling the daemon directly would get exactly the response the stdio
+    /// client is protected from.
+    #[test]
+    fn the_raw_route_bounds_a_tool_the_stdio_path_would_have_bounded() {
+        let oversized = json!({
+            "focal_entity": { "name": "resolve_redirects" },
+            "total_upstream": 400,
+            "references": (0..400).map(|index| json!({
+                "name": format!("caller_{index}"),
+                "file_path": format!("requests/module_{index}/handler.py"),
+                "line": index,
+                "relation_kind": "calls",
+                "snippet": "def send(self, request, **kwargs):\n    return self.adapter.send(request)\n".repeat(6),
+            })).collect::<Vec<_>>(),
+        });
+        let built = kin_mcp::ToolCallResult::text(
+            serde_json::to_string_pretty(&oversized).expect("fixture serializes"),
+        );
+        let before = mcp_result_text(&built).len();
+        assert!(
+            before > kin_mcp::budget::RESPONSE_DEFAULT_MAX_CHARS,
+            "the fixture must overflow: {before} chars"
+        );
+        let budget = kin_mcp::budget::ResponseBudget::default().less_envelope_reserve();
+        let bounded = mcp_result_text(&bound_mcp_tool_result(built, "find_references", &budget));
+        assert!(
+            bounded.len() <= budget.max_chars,
+            "the raw route must hold the same bound: {} chars against {}",
+            bounded.len(),
+            budget.max_chars
+        );
+        // Reserved room, so the stdio path's envelope and negative still fit
+        // inside the budget a client counts rather than pushing it back over.
+        assert!(
+            bounded.len()
+                <= kin_mcp::budget::RESPONSE_DEFAULT_MAX_CHARS
+                    - kin_mcp::budget::RESPONSE_ENVELOPE_RESERVE_CHARS
+        );
+        let payload: serde_json::Value = serde_json::from_str(&bounded).unwrap();
+        assert_eq!(payload["total_upstream"], json!(400));
+    }
+
+    /// A tool the budget does not govern is returned exactly as built. A source
+    /// read that silently returned less code than was asked for would be
+    /// answering a different question.
+    #[test]
+    fn the_raw_route_leaves_an_unbudgeted_tool_byte_identical() {
+        let text = "x".repeat(200_000);
+        let built = kin_mcp::ToolCallResult::text(text.clone());
+        let after = bound_mcp_tool_result(
+            built,
+            "get_entity_source",
+            &kin_mcp::budget::ResponseBudget::default(),
+        );
+        assert_eq!(mcp_result_text(&after), text);
     }
 }

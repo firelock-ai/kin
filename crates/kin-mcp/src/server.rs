@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
+use crate::budget::ResponseBudget;
 use crate::daemon_delegate;
 use crate::envelope::{self, Envelope};
 use crate::error::{McpError, Result};
@@ -1049,6 +1050,7 @@ async fn handle_tools_call<G: PersistableMcpStore>(
             return JsonRpcResponse::error(id, -32602, format!("Invalid params: {}", e));
         }
     };
+    let budget = ResponseBudget::from_arguments(&call_params.arguments);
 
     if let Some(allowed) = &config.allowed_tools {
         if !allowed.contains(&call_params.name) {
@@ -1056,7 +1058,7 @@ async fn handle_tools_call<G: PersistableMcpStore>(
                 "tool '{}' is not enabled in this MCP profile",
                 call_params.name
             ));
-            return offline_envelope_success(id, error_result, &call_params.name);
+            return offline_envelope_success(id, error_result, &call_params.name, &budget);
         }
     }
 
@@ -1105,14 +1107,17 @@ async fn handle_tools_call<G: PersistableMcpStore>(
                     let error_result = ToolCallResult::error(format!(
                         "tool succeeded but snapshot persistence failed: {error}"
                     ));
-                    return offline_envelope_success(id, error_result, &call_params.name);
+                    return offline_envelope_success(id, error_result, &call_params.name, &budget);
                 }
             }
-            offline_envelope_success(id, result, &call_params.name)
+            offline_envelope_success(id, result, &call_params.name, &budget)
         }
-        Err(e) => {
-            offline_envelope_success(id, ToolCallResult::error(e.to_string()), &call_params.name)
-        }
+        Err(e) => offline_envelope_success(
+            id,
+            ToolCallResult::error(e.to_string()),
+            &call_params.name,
+            &budget,
+        ),
     }
 }
 
@@ -1125,8 +1130,9 @@ fn offline_envelope_success(
     id: Option<serde_json::Value>,
     result: ToolCallResult,
     tool_name: &str,
+    budget: &ResponseBudget,
 ) -> JsonRpcResponse {
-    let enveloped = envelope::finalize(result, Envelope::offline(), tool_name);
+    let enveloped = envelope::finalize_bounded(result, Envelope::offline(), tool_name, budget);
     JsonRpcResponse::success(id, serde_json::to_value(&enveloped).unwrap_or_default())
 }
 
@@ -1141,6 +1147,7 @@ async fn handle_tools_call_daemon(
             return JsonRpcResponse::error(id, -32602, format!("Invalid params: {}", e));
         }
     };
+    let budget = ResponseBudget::from_arguments(&call_params.arguments);
 
     if let Some(allowed) = &config.allowed_tools {
         if !allowed.contains(&call_params.name) {
@@ -1148,7 +1155,12 @@ async fn handle_tools_call_daemon(
                 "tool '{}' is not enabled in this MCP profile",
                 call_params.name
             ));
-            let enveloped = envelope::finalize(error_result, Envelope::daemon(), &call_params.name);
+            let enveloped = envelope::finalize_bounded(
+                error_result,
+                Envelope::daemon(),
+                &call_params.name,
+                &budget,
+            );
             return JsonRpcResponse::success(
                 id,
                 serde_json::to_value(&enveloped).unwrap_or_default(),
@@ -1185,7 +1197,7 @@ async fn handle_tools_call_daemon(
         }
     }
 
-    let enveloped = envelope::finalize(result, base_env, &call_params.name);
+    let enveloped = envelope::finalize_bounded(result, base_env, &call_params.name, &budget);
     JsonRpcResponse::success(id, serde_json::to_value(&enveloped).unwrap_or_default())
 }
 
