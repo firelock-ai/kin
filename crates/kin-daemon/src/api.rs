@@ -4756,6 +4756,9 @@ fn command_commit_after_admission(
         )
     })
     .map_err(repository_commit_error)?;
+    if let Some(refusal) = refuse_a_successor_that_records_nothing(&plan) {
+        return Err(refusal);
+    }
     let change_id = plan.change.id;
     let branch_name = plan.branch.clone();
     let entity_count = plan.entity_count;
@@ -4859,6 +4862,47 @@ fn command_commit_after_admission(
         relation_count,
         file_count,
     }))
+}
+
+/// Refuse a commit whose successor would record nothing at all.
+///
+/// A `kin commit` on a tree Kin has already committed used to be accepted and
+/// published as a change with `entities=0 relations=0 tree=0`. Nothing about
+/// that change is recoverable information: it names no entity, no relation and
+/// no file, and it exists only because a caller asked twice. The way callers
+/// ask twice is the point. A commit whose reply the client never received looks
+/// exactly like a commit that never happened, so the next thing a person does
+/// is run it again, and the retry mints the empty change on top of the real
+/// one. Refusing here rather than in the CLI is what makes the guarantee hold
+/// for every caller of this endpoint, including the one that has already
+/// decided the first attempt failed.
+///
+/// A policy-only change still commits: an admission policy delta is a recorded
+/// transition even when no entity, relation or file moved.
+fn refuse_a_successor_that_records_nothing(
+    plan: &crate::repository_commit::NativeCommitPlan,
+) -> Option<(StatusCode, String)> {
+    let change = &plan.change;
+    if !change.entity_deltas.is_empty()
+        || !change.relation_deltas.is_empty()
+        || !change.tree_deltas.is_empty()
+        || change.admission_policy_delta.is_some()
+    {
+        return None;
+    }
+    let already = change.parents.first();
+    let message = match already {
+        Some(parent) => format!("nothing to commit: this tree is already committed as {parent}"),
+        None => "nothing to commit: this workspace holds no entities, relations or files to \
+                 record"
+            .to_string(),
+    };
+    let body = serde_json::json!({
+        "error": "nothing_to_commit",
+        "change_id": already.map(|parent| parent.to_string()),
+        "message": message,
+    });
+    Some((StatusCode::CONFLICT, body.to_string()))
 }
 
 fn repository_commit_error(error: crate::error::DaemonError) -> (StatusCode, String) {
@@ -19300,6 +19344,104 @@ mod tests {
                 .is_some(),
             "the committed file must be graph-owned after the single successor"
         );
+    }
+
+    /// A second commit on a tree Kin already committed is refused by the daemon.
+    ///
+    /// The retry is not hypothetical. A commit whose reply the client never
+    /// received looks exactly like a commit that never happened, so the next
+    /// thing that happens is the same commit again, and on a converted
+    /// psf/requests store that second attempt was accepted and recorded as
+    /// `entities=0 relations=0 tree=0` on top of the real change. The refusal
+    /// lives here rather than in the CLI so it holds for any caller of this
+    /// endpoint, including one that has already decided the first attempt
+    /// failed. Falsify by deleting the
+    /// `refuse_a_successor_that_records_nothing` call in
+    /// `command_commit_after_admission`: the second request then returns 200 and
+    /// the change count below goes to two.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn a_second_commit_on_an_unchanged_tree_is_refused_and_records_nothing() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        std::fs::write(
+            repo.path().join("committed_once.rs"),
+            b"pub fn committed_once() -> u32 { 1 }\n",
+        )
+        .unwrap();
+
+        let commit = |message: &'static str| {
+            let state = Arc::clone(&state);
+            async move {
+                let response = router(state)
+                    .oneshot(
+                        Request::post("/commands/commit")
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                json!({
+                                    "operation_id": kin_model::OperationId::new(),
+                                    "timestamp": kin_model::Timestamp::now(),
+                                    "author": "Test Author <test@example.invalid>",
+                                    "message": message
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                    .await
+                    .unwrap();
+                (status, String::from_utf8_lossy(&body).to_string())
+            }
+        };
+
+        let (status, body) = commit("publish the file once").await;
+        assert_eq!(status, StatusCode::OK, "the first commit must land: {body}");
+        let first: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let landed = first["change_id"].as_str().unwrap().to_string();
+
+        let changes_after_first = authority_change_count(&state);
+        let (status, body) = commit("publish the same tree again").await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a commit that would record nothing must be refused: {body}"
+        );
+        let refusal: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(refusal["error"], "nothing_to_commit");
+        assert_eq!(
+            refusal["change_id"].as_str(),
+            Some(landed.as_str()),
+            "the refusal must name the change that already holds this tree: {body}"
+        );
+        assert!(
+            refusal["message"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("already committed as {landed}")),
+            "the refusal must read as one sentence a person can act on: {body}"
+        );
+        assert_eq!(
+            authority_change_count(&state),
+            changes_after_first,
+            "a refused commit must record no change at all"
+        );
+    }
+
+    /// Changes in repository authority, read the way `kin log` reads them.
+    fn authority_change_count(state: &Arc<DaemonState>) -> usize {
+        let context =
+            crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)
+                .unwrap();
+        let authority = context.open().unwrap();
+        let lease = authority.read_authority();
+        let count = lease.snapshot().changes.len();
+        count
     }
 
     /// The endpoint used to resolve its own author, and the resolution was two

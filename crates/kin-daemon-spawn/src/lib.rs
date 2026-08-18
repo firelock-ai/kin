@@ -143,6 +143,91 @@ pub fn clear_daemon_death_note(kin_root: &Path) {
     let _ = fs::remove_file(kin_root.join(DEATH_FILE_NAME));
 }
 
+/// File a daemon publishes its open write transaction into.
+pub const TRANSACTION_FILE_NAME: &str = "daemon.transaction";
+
+/// How long a published beat stays trustworthy.
+///
+/// Twelve beats at the daemon's five-second interval. A daemon whose beat
+/// thread has not been scheduled for a minute is wedged rather than busy, and
+/// nothing may report it as working.
+pub const TRANSACTION_BEAT_STALE_AFTER: Duration = Duration::from_secs(60);
+
+/// What one daemon publishes about the transaction it currently has open.
+///
+/// Written by the daemon's beat thread and read by two other processes: the
+/// supervisor deciding whether a silent daemon is wedged or merely busy, and
+/// the CLI deciding whether a commit whose reply it never received is still
+/// running. One definition rather than three, because a reader carrying its own
+/// copy of these field names would report "no transaction open" for every shape
+/// change the writer made, which is the same answer a dead daemon produces.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OpenTransaction {
+    /// The daemon that owns this transaction. A marker naming a different pid
+    /// than the daemon being judged is a leftover and shields nobody.
+    pub pid: u32,
+    /// Which write path is open, e.g. `commit`.
+    pub operation: String,
+    /// Phase currently running, when one has been entered.
+    pub phase: Option<String>,
+    /// Wall seconds since the transaction opened.
+    pub elapsed_secs: u64,
+    /// Wall seconds since the running phase was entered.
+    pub phase_elapsed_secs: u64,
+    /// Unix seconds at the last beat. Freshness is decided against this.
+    pub beat_unix: u64,
+}
+
+impl OpenTransaction {
+    /// Seconds since the last published beat, at `now_unix`.
+    pub fn beat_age_secs(&self, now_unix: u64) -> u64 {
+        now_unix.saturating_sub(self.beat_unix)
+    }
+
+    /// Whether this marker is beating fresh enough to prove work in flight.
+    pub fn is_beating(&self, now_unix: u64) -> bool {
+        self.beat_age_secs(now_unix) <= TRANSACTION_BEAT_STALE_AFTER.as_secs()
+    }
+
+    /// One line naming what is open and how long it has run.
+    pub fn summary(&self) -> String {
+        match &self.phase {
+            Some(phase) => format!(
+                "{} in phase {} for {}s",
+                self.operation, phase, self.elapsed_secs
+            ),
+            None => format!("{} for {}s", self.operation, self.elapsed_secs),
+        }
+    }
+}
+
+/// Publish the open-transaction marker for `kin_root`.
+///
+/// Best effort and atomic: a reader must never see half a record, and a beat
+/// that could not be written must never end the transaction it describes.
+pub fn write_open_transaction(kin_root: &Path, record: &OpenTransaction) {
+    let Ok(body) = serde_json::to_string(record) else {
+        return;
+    };
+    let tmp = kin_root.join(format!("{TRANSACTION_FILE_NAME}.tmp"));
+    if fs::write(&tmp, body).is_ok()
+        && fs::rename(&tmp, kin_root.join(TRANSACTION_FILE_NAME)).is_err()
+    {
+        let _ = fs::remove_file(&tmp);
+    }
+}
+
+/// Read the open-transaction marker for `kin_root`, if one is there.
+pub fn read_open_transaction(kin_root: &Path) -> Option<OpenTransaction> {
+    let raw = fs::read_to_string(kin_root.join(TRANSACTION_FILE_NAME)).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Retire the open-transaction marker for `kin_root`.
+pub fn clear_open_transaction(kin_root: &Path) {
+    let _ = fs::remove_file(kin_root.join(TRANSACTION_FILE_NAME));
+}
+
 /// Append a line to the repo daemon's own log.
 ///
 /// The one place a killer can put its reason where the operator will look. The
