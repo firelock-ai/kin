@@ -441,10 +441,10 @@ The checks (IDs as emitted in `--json`):
 | --- | --- |
 | `kin_binary` | The `kin` binary resolved (reports version + path). |
 | `kin_daemon_binary` | `kin-daemon` found beside `kin` or on `PATH`. |
-| `vfs_projection` | The VFS shim is installed and non-zero in `~/.kin/lib` (macOS/Linux). On native Windows this is **unsupported**; use WSL2. |
+| `vfs_projection` | The VFS shim is installed and non-zero in `~/.kin/lib`, and the `kin-vfs` driver beside `kin`, in `~/.kin/bin`, or on PATH runs when probed (macOS/Linux). A driver that is present but will not load is **MISCONFIGURED** and the row quotes the loader; no driver and no shim is **n/a**. On native Windows this is **unsupported**; use WSL2. |
 | `repo_init` | The current directory is inside a Kin repository. |
-| `shell_path` | The `kin-vfs` shell hook is installed and sourced from your rc, and the managed `~/.kin/bin` directory is on PATH now or will be after shell restart. |
-| `mcp_client_*` (e.g. `mcp_client_claude`) | A detected AI client has the `kin` MCP server with the `agent-default` profile. With no client configs present, a single `mcp_clients` check reports ok ("nothing to configure"). |
+| `shell_path` | The `kin-vfs` shell hook is installed and sourced from your rc, and the managed `~/.kin/bin` directory is on PATH now or will be after shell restart. On an install that does not create `~/.kin/bin`, such as an archive or Homebrew one, no PATH line is written and the row says so. |
+| `mcp_client_*` (e.g. `mcp_client_claude`) | A detected AI client has the `kin` MCP server with the `agent-default` profile. With no client configs present, a single `mcp_clients` check reports ok when no client is installed either, and **n/a** naming the detected clients that `kin setup` would configure. |
 | `editor` | The `kin-editor` VS Code extension is detected in `~/.vscode/extensions`. **n/a** if not found / non-VS Code. |
 | `kinlab_connect` | A stored KinLab credential is present. **n/a** when nothing is stored; `kin auth login` connects this machine. |
 | `semantic_query_readiness` | The daemon is reachable and the vector index exists. **yellow/STALE** until you run `kin embed`; **MISSING** if the daemon isn't running. |
