@@ -21,6 +21,9 @@ pub mod provider;
 pub mod run;
 pub mod transcript;
 
+#[cfg(test)]
+mod tests;
+
 pub use provider::{Provider, ProviderConfig, ProviderError};
 pub use run::{run, DEFAULT_SYSTEM_PROMPT};
 
