@@ -27,6 +27,9 @@ RELEASE_RECOVERY = WORKFLOWS / "release-recovery.yml"
 RELEASE_TAG = WORKFLOWS / "release-tag.yml"
 RELEASE_TRAIN = WORKFLOWS / "release-train.yml"
 RELEASE_SENTINEL = WORKFLOWS / "release-sentinel.yml"
+SAST = WORKFLOWS / "sast.yml"
+ADVISORY_SWEEP = WORKFLOWS / "advisory-sweep.yml"
+ADVISORY_SWEEP_SCRIPT = ROOT / "scripts" / "advisory-sweep.mjs"
 HOLD_ALARM = ROOT / "scripts" / "release-hold-alarm.mjs"
 HOLD_ALARM_POLICY = "scripts/release-hold-alarm.mjs"
 INSTALL_PROOF_CANARY = WORKFLOWS / "install-proof-canary.yml"
@@ -516,6 +519,13 @@ CI_JOB_DISPLAY_NAMES = {
     "install-proof-pr-gate": "Install Proof (PR) Gate",
 }
 EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
+    # The scheduled advisory sweep. It publishes no required context and runs on
+    # no pull-request or merge-group event, so it can never claim one; it is
+    # registered here because this census is what would otherwise let a new
+    # job's NAME appear unreviewed.
+    ".github/workflows/advisory-sweep.yml": {
+        "sweep": "Sweep advisories",
+    },
     ".github/workflows/approve-to-merge.yml": {
         "gate": None,
     },
@@ -3165,6 +3175,163 @@ def workflow_job_blocks(workflow: str) -> dict[str, str]:
         end = matches[index + 1].start() if index + 1 < len(matches) else len(jobs)
         blocks[job] = jobs[match.start() : end].rstrip()
     return blocks
+
+
+# The full cargo-deny check set, spelled once. A merge group that ran a subset
+# of this would stop reading the advisory database on the one event that reads
+# the merged tree, which is the fix that was tried and refused: see the step's
+# own comment in sast.yml.
+CARGO_DENY_FULL_CHECK = (
+    "cargo deny --log-level warn --manifest-path ./Cargo.toml --all-features check"
+)
+
+
+def workflow_step_shell(job: str, name: str) -> str:
+    """Return one named step's active shell body, dedented and comment-free.
+
+    Unlike workflow_step_source this resolves a step that is the last one in
+    its job, which is where the cargo-deny gate sits.
+    """
+
+    anchor = f"      - name: {name}\n"
+    if job.count(anchor) != 1:
+        raise AssertionError(f"job must declare exactly one step named {name}")
+    lines = job[job.index(anchor) :].splitlines()
+    try:
+        run_block = lines.index("        run: |")
+    except ValueError as error:
+        raise AssertionError(
+            f"step {name} must carry one literal shell run block"
+        ) from error
+    body: list[str] = []
+    for line in lines[run_block + 1 :]:
+        if not line.strip():
+            continue
+        if len(line) - len(line.lstrip()) <= 8:
+            break
+        body.append(line.rstrip())
+    source = textwrap.dedent("\n".join(body))
+    return "\n".join(
+        line for line in source.splitlines() if not line.lstrip().startswith("#")
+    )
+
+
+def assert_cargo_deny_reads_every_advisory(sast: str) -> None:
+    """Keep advisories in every cargo-deny run, and make a merge group say why.
+
+    Skipping `advisories` inside `merge_group` stops a freshly published
+    advisory from ejecting an innocent pull request, and it also stops the one
+    gate that reads the merged tree from reading the advisory database at all.
+    The sweep closes that window by landing the bump on a schedule instead, so
+    this check stays whole and only its failure message changes.
+    """
+
+    job = workflow_job_blocks(sast).get("cargo-deny")
+    if job is None:
+        raise AssertionError("SAST must declare the cargo-deny job")
+    shell = workflow_step_shell(job, "Run cargo-deny")
+    # Continuations joined first, so a wrapped invocation is judged whole, and
+    # the shell grammar around it stripped, so `if cargo deny ...; then` reads
+    # as the invocation it is.
+    joined = re.sub(r"\\\n\s*", " ", shell)
+    gating = []
+    for line in joined.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("if "):
+            stripped = stripped[3:]
+        if stripped.endswith("; then"):
+            stripped = stripped[: -len("; then")]
+        if stripped.startswith("cargo deny"):
+            gating.append(re.sub(r"\s+", " ", stripped).strip())
+    if not gating or gating[0] != CARGO_DENY_FULL_CHECK:
+        raise AssertionError(
+            "the cargo-deny gate must run the whole default check set, advisories "
+            f"included, on every event (first invocation: {gating[0] if gating else 'none'})"
+        )
+    narrowed = f"{CARGO_DENY_FULL_CHECK} bans licenses sources"
+    if narrowed in re.sub(r"\s+", " ", joined):
+        raise AssertionError(
+            "the cargo-deny gate must not narrow its check set: dropping advisories "
+            "inside a merge group stops the one run that reads the merged tree from "
+            "reading the advisory database"
+        )
+    if "--annotate-merge-group" not in shell:
+        raise AssertionError(
+            "a merge-group cargo-deny failure must name the advisory and its bump "
+            "command, or the queue ejects an entry with no cause recorded anywhere"
+        )
+    if not shell.rstrip().endswith("exit 1"):
+        raise AssertionError(
+            "a merge-group cargo-deny failure must still fail: the advisory is real "
+            "and only its message changes"
+        )
+
+
+def assert_advisory_sweep_authority(sweep: str, release_train: str) -> None:
+    """Pin what lets the sweep write to the repository unattended."""
+
+    header = sweep.split("\njobs:", maxsplit=1)[0]
+    if "\n  schedule:\n" not in header:
+        raise AssertionError("the advisory sweep must run on a schedule, not on demand only")
+    if "types: [advisory-sweep]" not in header:
+        raise AssertionError(
+            "the advisory sweep's manual path must be a repository dispatch pinned to "
+            "one action, which always resolves this workflow file from the default branch"
+        )
+    if "ALLOWED_ACTORS: |" not in sweep:
+        raise AssertionError(
+            "the advisory sweep's manual path must be gated to the reviewed actor set"
+        )
+    for pin, label in (
+        (
+            "actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1",
+            "release App token minter",
+        ),
+        (
+            "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+            "checkout",
+        ),
+    ):
+        if pin not in sweep:
+            raise AssertionError(
+                f"the advisory sweep must pin its {label} to the reviewed object"
+            )
+        if pin not in release_train:
+            raise AssertionError(
+                f"the advisory sweep's {label} pin no longer matches release-train.yml"
+            )
+    if "environment: release-tag" not in sweep:
+        raise AssertionError(
+            "the advisory sweep must declare the environment its App credentials are "
+            "scoped to, or it silently falls back to repository-scoped copies"
+        )
+    for needle, label in (
+        ("cargo metadata --locked", "prove the hand-written lock is one cargo would produce"),
+        (
+            "cargo deny --log-level warn --manifest-path ./Cargo.toml --all-features check advisories",
+            "prove the advisory the bump exists for is actually gone",
+        ),
+        ('if [ "$changed" != "Cargo.lock" ]', "refuse a bump that touched anything but the lock"),
+        ("git diff --numstat -- Cargo.lock", "refuse a bump that moved more lock lines than it named"),
+    ):
+        if needle not in sweep:
+            raise AssertionError(
+                f"the advisory sweep must {label} before it opens a pull request"
+            )
+    for job_step, gate in (
+        ("Open or update the bump pull request", "steps.plan.outputs.bumps != '0'"),
+        ("Arm protected auto-merge", "steps.plan.outputs.bumps != '0'"),
+        ("Open or update the unfixable-advisory issue", "steps.plan.outputs.unfixable != '0'"),
+    ):
+        anchor = f"      - name: {job_step}\n"
+        if anchor not in sweep:
+            raise AssertionError(f"the advisory sweep must declare the {job_step} step")
+        block = sweep[sweep.index(anchor) : sweep.index(anchor) + 400]
+        if f"if: {gate}" not in block:
+            raise AssertionError(
+                f"the advisory sweep's {job_step} step must be gated on {gate}, so a "
+                "clean sweep opens nothing"
+            )
 
 
 WINDOWS_DAEMON_SIBLING_BUILD = (
@@ -7387,6 +7554,8 @@ def main() -> None:
     release_tag = RELEASE_TAG.read_text(encoding="utf-8")
     release_train = RELEASE_TRAIN.read_text(encoding="utf-8")
     release_sentinel = RELEASE_SENTINEL.read_text(encoding="utf-8")
+    sast = SAST.read_text(encoding="utf-8")
+    advisory_sweep = ADVISORY_SWEEP.read_text(encoding="utf-8")
     hold_alarm = HOLD_ALARM.read_text(encoding="utf-8")
     release_bot_doc = RELEASE_BOT_DOC.read_text(encoding="utf-8")
     install_proof = INSTALL_PROOF.read_text(encoding="utf-8")
@@ -10612,6 +10781,120 @@ def main() -> None:
     classifier = ci_workflow[classifier_start:classifier_end]
     assert_docs_only_classifier_guard(ci_workflow)
     assert_assertion_reachability_gate_wired(ci_workflow)
+    assert_cargo_deny_reads_every_advisory(sast)
+    assert_advisory_sweep_authority(advisory_sweep, release_train)
+    for label, source, original, replacement, expected, check in (
+        (
+            "the gate stops running the whole default check set",
+            sast,
+            f"{CARGO_DENY_FULL_CHECK}; then",
+            f"{CARGO_DENY_FULL_CHECK} advisories; then",
+            "must run the whole default check set",
+            "sast",
+        ),
+        (
+            "a merge group narrows the check set back to the refused subset",
+            sast,
+            "            --annotate-merge-group\n",
+            "            --annotate-merge-group\n"
+            f"          {CARGO_DENY_FULL_CHECK} bans licenses sources\n",
+            "must not narrow its check set",
+            "sast",
+        ),
+        (
+            "a merge-group failure stops naming the advisory that caused it",
+            sast,
+            "--annotate-merge-group",
+            "--dry-run",
+            "must name the advisory and its bump command",
+            "sast",
+        ),
+        (
+            "a merge-group advisory failure is downgraded to a pass",
+            sast,
+            "            --annotate-merge-group\n          exit 1\n",
+            "            --annotate-merge-group\n          exit 0\n",
+            "must still fail",
+            "sast",
+        ),
+        (
+            "the sweep loses its schedule and runs only when asked",
+            advisory_sweep,
+            "on:\n  schedule:\n",
+            "on:\n  # schedule removed\n",
+            "must run on a schedule",
+            "sweep",
+        ),
+        (
+            "the sweep's manual path stops being pinned to one dispatch action",
+            advisory_sweep,
+            "types: [advisory-sweep]",
+            "types: [anything]",
+            "pinned to one action",
+            "sweep",
+        ),
+        (
+            "the sweep stops gating its manual path on the reviewed actors",
+            advisory_sweep,
+            "ALLOWED_ACTORS: |",
+            "UNUSED_ACTORS: |",
+            "gated to the reviewed actor set",
+            "sweep",
+        ),
+        (
+            "the sweep stops proving the hand-written lock is coherent",
+            advisory_sweep,
+            "cargo metadata --locked",
+            "cargo metadata",
+            "prove the hand-written lock",
+            "sweep",
+        ),
+        (
+            "the sweep stops proving the advisory it bumped for is gone",
+            advisory_sweep,
+            "--all-features check advisories\n\n      - name: Publish",
+            "--all-features check\n\n      - name: Publish",
+            "prove the advisory the bump exists for is actually gone",
+            "sweep",
+        ),
+        (
+            "the sweep stops refusing a bump that escaped the lockfile",
+            advisory_sweep,
+            'if [ "$changed" != "Cargo.lock" ]',
+            'if [ "$changed" = "never" ]',
+            "refuse a bump that touched anything but the lock",
+            "sweep",
+        ),
+        (
+            "a clean sweep opens a pull request anyway",
+            advisory_sweep,
+            "      - name: Arm protected auto-merge\n        if: steps.plan.outputs.bumps != '0'\n",
+            "      - name: Arm protected auto-merge\n        if: always()\n",
+            "must be gated on steps.plan.outputs.bumps != '0'",
+            "sweep",
+        ),
+        (
+            "an unfixable advisory opens a pull request instead of an issue",
+            advisory_sweep,
+            "      - name: Open or update the unfixable-advisory issue\n        if: steps.plan.outputs.unfixable != '0'\n",
+            "      - name: Open or update the unfixable-advisory issue\n        if: always()\n",
+            "must be gated on steps.plan.outputs.unfixable != '0'",
+            "sweep",
+        ),
+    ):
+        mutant = replace_exactly_once(source, original, replacement, label)
+        if check == "sast":
+            expect_assertion(
+                label,
+                expected,
+                lambda mutant=mutant: assert_cargo_deny_reads_every_advisory(mutant),
+            )
+        else:
+            expect_assertion(
+                label,
+                expected,
+                lambda mutant=mutant: assert_advisory_sweep_authority(mutant, release_train),
+            )
     assert_kin_vfs_compat_gate_wired(ci_workflow)
     assert_glibc_floor_guard_wired(ci_workflow, release)
     expect_assertion(
