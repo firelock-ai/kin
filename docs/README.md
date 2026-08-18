@@ -15,6 +15,10 @@ repository, and walks the everyday loop end to end. Once Kin is running, the
 4. **[Session runtime](session-runtime.md)** explains how `kin exec`,
    `kin shell`, `kin with`, and `kin open` run ordinary tools against
    materialized graph truth, and what happens when one of them fails.
+5. **[`kin agent`](cli-reference.md#kin-agent)** is Kin's own agent and the path
+   we recommend for agent work. It drives any OpenAI-compatible endpoint, local
+   or hosted, answers only from the graph, and records every run as a transcript
+   plus a Kin trace.
 
 ## Reference
 

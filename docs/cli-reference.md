@@ -8,7 +8,7 @@ Kin is pre-1.0 and the command surface moves. Where this page and your build dis
 
 Descriptions are the command's own help text. A `--json` flag switches that command to machine-readable output. Angle brackets mark a required argument, square brackets an optional one, and a trailing `...` an argument that takes the rest of the line.
 
-81 commands are documented below. 4 further commands (`bench-meta`, `contextbench-locate`, `prepared-state`, `semantic-only-guard`) are hidden from `kin --help` because they exist for benchmark and internal orchestration, and they are not part of the supported surface.
+82 commands are documented below. 4 further commands (`bench-meta`, `contextbench-locate`, `prepared-state`, `semantic-only-guard`) are hidden from `kin --help` because they exist for benchmark and internal orchestration, and they are not part of the supported surface.
 
 `kin capabilities` prints the readiness matrix for the Git-replacement command set, and `kin capabilities --json` gives the same inventory to a machine. Reach for it before scripting against a command you have not used.
 
@@ -32,7 +32,7 @@ These apply to every command.
 - [More graph queries](#more-graph-queries): `history`, `blame`, `overview`, `deps`, `xref`, `dead-code`, `trace-data-flow`, `security`, `languages`, `scope`, `locate-debug`
 - [Branches, merges, and exact trees](#branches-merges-and-exact-trees): `branch`, `checkout`, `merge`, `conflicts`, `resolve`, `stash`, `rollback`, `tag`, `semver`, `purge-ignored`, `admit`, `reconcile`, `migrate`, `eject`, `git`
 - [Review and verification](#review-and-verification): `review`, `approvals`, `verify`, `spec`, `audit`, `rename`
-- [Sessions and agents](#sessions-and-agents): `exec`, `shell`, `open`, `with`, `mcp`, `assistant`, `intent`, `traffic`, `work`, `note`, `todo`, `feature`
+- [Sessions and agents](#sessions-and-agents): `agent`, `exec`, `shell`, `open`, `with`, `mcp`, `assistant`, `intent`, `traffic`, `work`, `note`, `todo`, `feature`
 - [Remotes and publishing](#remotes-and-publishing): `auth`, `remote`, `push`, `pull`, `publish`, `release`, `hosted-release`, `pipeline`, `secret`
 - [Graph, store, and daemon operations](#graph-store-and-daemon-operations): `graph`, `embed`, `cache`, `backup`, `resources`, `support`, `daemon`, `registry`, `telemetry`, `notify`, `bench`
 - [Install and health](#install-and-health): `capabilities`, `setup`, `doctor`, `update`, `completions`
@@ -1123,6 +1123,87 @@ kin rename <symbol> <new-name> [options]
 ## Sessions and agents
 
 Running tools and assistants against materialized graph truth.
+
+### `kin agent`
+
+Run a task through Kin's own agent loop, or check that it can start
+
+```
+kin agent <subcommand>
+```
+
+`kin agent` is Kin's own agent, and the path the product recommends for agent work.
+It drives any OpenAI-compatible endpoint, so a local model in LM Studio, Ollama,
+llama.cpp or vLLM works from the same flags as a hosted one, and it reaches the graph
+over the same MCP server `kin mcp start` serves, so it sees the real tools, the `_kin`
+freshness envelope, and the `negative` verdict on an empty result.
+
+The policy is the product's thesis, enforced in the agent's own process rather than
+borrowed from a vendor's permission layer. The belt is Kin's tools plus exactly two
+local tools, `edit_file` and `write_file`. There is no shell, no grep and no
+file-reading tool, so there is nothing to fall back to, and a tool the model invents is
+refused by name. When a result reports `safe_to_conclude_absent` false, the agent is
+told the answer is unknown and given the named gap rather than being allowed to conclude
+the thing does not exist. Every edit runs inside a Kin transaction under a Kin session,
+so the change carries provenance naming the agent.
+
+Working with Claude Code, Codex, Cursor and Gemini stays first class; `kin setup
+--intent agent` still configures every client it detects.
+
+Subcommands:
+
+#### `kin agent run`
+
+Run one task to completion against an OpenAI-compatible endpoint
+
+```
+kin agent run --task <FILE|TEXT> --model <ID> --base-url <URL> [options]
+```
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--task <file\|text>` | required | The task: a path to a file holding it, or the text itself |
+| `--model <id>` | required | Model id as the endpoint names it |
+| `--base-url <url>` | required | OpenAI-compatible base URL, with or without a trailing `/v1` |
+| `--api-key-env <name>` |  | Name of an environment variable holding the API key. The key itself is never accepted on the command line, so it cannot land in a process listing. |
+| `--repo <path>` | current directory | Repository to work in |
+| `--mcp-command <cmd>` | this binary serving `--repo` | Override the MCP server command |
+| `--out <dir>` | `.kin/agent/<timestamp>` | Directory for the transcript, the Kin trace and the result record |
+| `--max-tool-calls <n>` | `40` | Tool-call budget before the agent is asked for a final answer |
+| `--deadline <s>` | `900` | Wall-clock deadline in seconds |
+| `--system <file>` |  | File holding a system prompt that replaces the built-in one |
+| `--temperature <f>` |  | Sampling temperature passed through to the endpoint |
+| `--tool-profile <profile>` |  | Tool surface the MCP server should serve |
+
+Three files land under `--out`. `transcript.jsonl` is the run, one JSON object per line,
+in the same stream-json shape Claude Code emits, so existing transcript analyzers read it
+unchanged. `kin-trace.jsonl` is one row per tool call carrying the `_kin` envelope, the
+`negative` verdict and the policy decision, joinable to the transcript on `tool_use_id`.
+`result.json` is the terminal record on its own.
+
+The exit code is the run's outcome: `0` a final answer, `1` a harness error, `2` the
+tool-call budget was spent, `3` the deadline expired, `4` the endpoint was unreachable or
+answered with nothing usable, `5` the MCP server failed. A transcript is written and
+closed on every one of them, so a failed run is still measurable.
+
+#### `kin agent doctor`
+
+Check that the model endpoint and the Kin MCP server both answer
+
+```
+kin agent doctor --base-url <URL> [options]
+```
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--base-url <url>` | required | OpenAI-compatible base URL |
+| `--model <id>` |  | Model id to look for in the endpoint's list |
+| `--repo <path>` | current directory | Repository to serve |
+| `--mcp-command <cmd>` | this binary serving `--repo` | Override the MCP server command |
+| `--api-key-env <name>` |  | Name of an environment variable holding the API key |
+| `--tool-profile <profile>` |  | Tool surface the MCP server should serve |
+
+Exit `0` when both answer, `4` when the endpoint does not, `5` when the MCP server does not.
 
 ### `kin exec`
 
