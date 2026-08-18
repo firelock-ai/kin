@@ -298,6 +298,9 @@ jobs:
 REQUIRED_RELEASE_CHECKS = (
     "Check & Test (ubuntu-latest)",
     "Check & Test (macos-latest)",
+    "Falsify guards",
+    "Feature permutation tests (ubuntu-latest)",
+    "Feature permutation tests (macos-latest)",
     "DCO Sign-off",
     "cargo-deny",
     "gitleaks (full history)",
@@ -660,6 +663,13 @@ REQUIRED_CHECK_JOB_PRODUCERS = {
         (".github/workflows/ci.yml", "check-docs-only"),
         (".github/workflows/ci.yml", "check"),
     },
+    "Falsify guards": {
+        (".github/workflows/ci.yml", "falsify-guards"),
+    },
+    "Feature permutation tests": {
+        (".github/workflows/ci.yml", "feature-tests-docs-only"),
+        (".github/workflows/ci.yml", "feature-tests"),
+    },
     "DCO Sign-off": {
         (".github/workflows/ci.yml", "dco"),
     },
@@ -691,6 +701,17 @@ REQUIRED_RELEASE_CHECK_PROVENANCE = {
         "push",
     ),
     "Check & Test (macos-latest)": (
+        245_803_170,
+        ".github/workflows/ci.yml",
+        "push",
+    ),
+    "Falsify guards": (245_803_170, ".github/workflows/ci.yml", "push"),
+    "Feature permutation tests (ubuntu-latest)": (
+        245_803_170,
+        ".github/workflows/ci.yml",
+        "push",
+    ),
+    "Feature permutation tests (macos-latest)": (
         245_803_170,
         ".github/workflows/ci.yml",
         "push",
