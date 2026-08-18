@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Run the guard falsification and the feature permutations beside Check & Test (#912)
+- Run the public install proof at pull-request time (#911)
+- Land the stranger-run fixes: commit deadline and empty duplicates, reference rows, MCP budget and roots, absence gate, annotation edges, builtin calls, model download, context-pack rows, doctor and setup, phase-capture flake (#913)
 
 
 ## [0.5.39] - 2026-08-18
