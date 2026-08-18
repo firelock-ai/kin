@@ -15837,7 +15837,7 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_that_misses_a_field_is_refused_by_the_writer_before_it_is_persisted() {
+    fn a_head_rebuilt_from_a_hand_built_frame_that_lost_a_change_fails_admission() {
         let directory = TempDir::new().unwrap();
         let (_backend, manager) = framed_local_repository(&directory);
         let current = manager.read_authority().snapshot().clone();
@@ -16287,6 +16287,29 @@ mod tests {
         }
     }
 
+    /// `framed_local_repository` behind the fault script: one committed
+    /// generation, frames admitted by size, and no fault scripted yet.
+    fn fault_scripted_repository(
+        directory: &TempDir,
+    ) -> (
+        Arc<FaultScriptedBackend>,
+        RepositoryAuthorityManager<FaultScriptedBackend>,
+    ) {
+        let backend = Arc::new(FaultScriptedBackend::new(Arc::new(LocalFileBackend::new(
+            directory.path(),
+        ))));
+        let manager =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        manager
+            .commit_repository_transaction(arbitrary_repository_transaction(&manager))
+            .unwrap();
+        manager
+            .persistence()
+            .set_journal_byte_bound_for_test(Some(u64::MAX));
+        assert_eq!(manager.read_authority().generation(), 1);
+        (backend, manager)
+    }
+
     /// A frame retained after an indeterminate append belongs to exactly one
     /// candidate. Once a reconciliation proves that candidate was not
     /// committed, the publication drops it, and a later successor at the same
@@ -16300,18 +16323,7 @@ mod tests {
     #[test]
     fn a_dropped_frame_candidate_is_not_reconciled_against_a_later_successor() {
         let directory = TempDir::new().unwrap();
-        let backend = Arc::new(FaultScriptedBackend::new(Arc::new(LocalFileBackend::new(
-            directory.path(),
-        ))));
-        let manager =
-            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
-        manager
-            .commit_repository_transaction(arbitrary_repository_transaction(&manager))
-            .unwrap();
-        manager
-            .persistence()
-            .set_journal_byte_bound_for_test(Some(u64::MAX));
-        assert_eq!(manager.read_authority().generation(), 1);
+        let (backend, manager) = fault_scripted_repository(&directory);
 
         // Candidate A: a frame append whose outcome is unknown and which
         // installed nothing.
@@ -16397,6 +16409,107 @@ mod tests {
             &manager.read_authority(),
             &reopen(&directory).read_authority(),
             "after the dropped candidate",
+        );
+    }
+
+    /// The first half of the rule above, watched from inside the persistence
+    /// state: the frame retained after an indeterminate append is dropped the
+    /// moment a reconciliation refuses it, not kept until some later commit
+    /// happens to overwrite it.
+    #[test]
+    fn a_refused_frame_reconciliation_drops_the_retained_frame() {
+        let directory = TempDir::new().unwrap();
+        let (backend, manager) = fault_scripted_repository(&directory);
+
+        backend.script_frame_append(InjectedOutcome::Indeterminate);
+        let error = manager
+            .commit_repository_transaction(overlay_publication(&manager, 0xf2_2347_2921, 0x84))
+            .expect_err("an indeterminate append fails the commit");
+        assert!(
+            matches!(error, KinDbError::SnapshotPersistenceIndeterminate(_)),
+            "{error}"
+        );
+        {
+            let state = manager.persistence().state.lock();
+            let retained = state
+                .pending_frame
+                .as_ref()
+                .expect("an indeterminate append retains its frame for reconciliation");
+            assert_eq!(retained.roots.generation, 2);
+        }
+
+        backend.script_frame_append(InjectedOutcome::NotCommitted);
+        let error = manager
+            .commit_repository_transaction(overlay_publication(&manager, 0xf2_2347_2922, 0x85))
+            .expect_err("a refused reconciliation fails the commit that triggered it");
+        assert!(
+            error
+                .to_string()
+                .contains("injected: the frame append lost"),
+            "{error}"
+        );
+        assert!(
+            manager.persistence().state.lock().pending_frame.is_none(),
+            "a refused reconciliation must drop the retained frame"
+        );
+        assert_eq!(manager.read_authority().generation(), 1);
+        assert_eq!(acknowledged_frame_count(&directory), 0);
+    }
+
+    /// The second half on its own: a retained frame is consulted only for the
+    /// successor whose roots it carries. One that names other roots at the
+    /// same generation is dropped rather than retried, even when the candidate
+    /// being reconciled is the very one whose append retained it.
+    #[test]
+    fn a_retained_frame_naming_other_roots_at_the_same_generation_is_dropped_not_retried() {
+        let directory = TempDir::new().unwrap();
+        let (backend, manager) = fault_scripted_repository(&directory);
+
+        backend.script_frame_append(InjectedOutcome::Indeterminate);
+        let candidate = overlay_publication(&manager, 0xf2_2347_2931, 0x86);
+        let error = manager
+            .commit_repository_transaction(candidate.clone())
+            .expect_err("an indeterminate append fails the commit");
+        assert!(
+            matches!(error, KinDbError::SnapshotPersistenceIndeterminate(_)),
+            "{error}"
+        );
+        assert_eq!(acknowledged_frame_count(&directory), 0);
+
+        // The retained frame now claims a history root the candidate does not
+        // have. Its generation still matches, so a writer keyed on generation
+        // alone would retry these bytes for the candidate.
+        {
+            let mut state = manager.persistence().state.lock();
+            let retained = state
+                .pending_frame
+                .as_mut()
+                .expect("an indeterminate append retains its frame for reconciliation");
+            assert_eq!(retained.roots.generation, 2);
+            retained.roots.history.hash =
+                Hash256::from_bytes(*Sha256::digest(b"another candidate at generation 2").as_ref());
+        }
+
+        let receipt = manager
+            .commit_repository_transaction(candidate)
+            .expect("the candidate reconciles as committed and replays");
+        assert_eq!(receipt.generation, 2);
+        assert_eq!(manager.read_authority().generation(), 2);
+        assert_eq!(
+            record_version(&directory),
+            3,
+            "the candidate landed whole, not through the foreign frame"
+        );
+        assert_eq!(acknowledged_frame_count(&directory), 0);
+        assert!(
+            !frame_path(&directory, 2).exists(),
+            "the foreign frame was never installed"
+        );
+        assert!(manager.persistence().state.lock().pending_frame.is_none());
+        assert_same_authority(
+            &manager.read_authority(),
+            &reopen(&directory).read_authority(),
+            "after the foreign frame was dropped",
         );
     }
 
