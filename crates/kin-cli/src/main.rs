@@ -1156,6 +1156,10 @@ enum Command {
         /// Run non-interactively using defaults or provided flags
         #[arg(long, global = true)]
         no_interactive: bool,
+        /// Skip the MCP round trip that proves each configured AI client can
+        /// actually call Kin (for a scripted install with no repository yet)
+        #[arg(long, global = true)]
+        skip_mcp_check: bool,
         /// Skip the wizard and only run the first-run health check
         #[arg(long, default_value_t = false)]
         check: bool,
@@ -3603,6 +3607,7 @@ fn main() -> Result<()> {
                     shell,
                     auto_daemon,
                     no_interactive,
+                    skip_mcp_check,
                     check,
                 } => match action {
                     Some(SetupAction::Status { json }) => commands::setup::status(json).await,
@@ -3626,6 +3631,7 @@ fn main() -> Result<()> {
                             auto_daemon,
                             no_interactive,
                             intent,
+                            skip_mcp_check,
                         })
                         .await
                     }

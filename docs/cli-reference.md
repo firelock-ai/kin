@@ -2581,6 +2581,7 @@ kin setup [<subcommand>] [options]
 | `--shell <shell>` |  | Shell to configure: zsh, bash, or powershell |
 | `--auto-daemon` |  | Auto-start kin-daemon when entering workspaces |
 | `--no-interactive` |  | Run non-interactively using defaults or provided flags |
+| `--skip-mcp-check` |  | Skip the MCP round trip that proves each configured AI client can actually call Kin (for a scripted install with no repository yet) |
 | `--check` |  | Skip the wizard and only run the first-run health check |
 
 Run `kin setup` with no subcommand for the default behavior above, or one of:
