@@ -6664,7 +6664,7 @@ mod tests {
                 .upsert_relation(&make_relation(focal_id, dep.id, RelationKind::Calls))
                 .unwrap();
         }
-        let sessions = SessionRegistry::new();
+        let sessions = SessionRegistry::empty_for_test();
         let args = HashMap::from([
             (
                 "entity_id".to_string(),
