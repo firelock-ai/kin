@@ -23,7 +23,7 @@ pub use java::JavaAdapter;
 pub use javascript::JavaScriptAdapter;
 pub use kotlin::KotlinAdapter;
 pub use php::PhpAdapter;
-pub use python::PythonAdapter;
+pub use python::{is_python_builtin_name, PythonAdapter, PYTHON_BUILTIN_NAMES};
 pub use rust_lang::RustAdapter;
 pub use shallow_backed::{CSharpAdapter, RubyAdapter};
 pub use swift::SwiftAdapter;
