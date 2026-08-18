@@ -70,6 +70,7 @@ serde_json = { workspace = true }
 semver = { workspace = true }
 chrono = { workspace = true }
 filetime = { workspace = true }
+kin-agent = { workspace = true }
 reqwest = { workspace = true, features = ["blocking", "json"] }
 hex = { workspace = true }
 sha2.workspace = true

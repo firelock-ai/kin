@@ -626,6 +626,17 @@ enum Command {
         #[command(subcommand)]
         action: McpAction,
     },
+    /// Run a task through Kin's own agent loop, or check that it can start.
+    ///
+    /// The agent answers repository questions from the Kin graph over MCP and has no
+    /// shell, no grep and no file-reading tool, so it cannot fall back to raw file
+    /// search. Its only writes are edit_file and write_file, and each one runs inside a
+    /// Kin transaction under a Kin session, so the change carries provenance naming the
+    /// agent rather than landing as an anonymous file write.
+    Agent {
+        #[command(subcommand)]
+        action: AgentAction,
+    },
     /// Authenticate with KinLab for native remotes
     Auth {
         #[command(subcommand)]
@@ -1729,6 +1740,71 @@ enum StashAction {
         /// Output the machine-readable stash report
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentAction {
+    /// Run one task to completion against an OpenAI-compatible endpoint
+    Run {
+        /// The task: a path to a file holding it, or the text itself
+        #[arg(long, value_name = "FILE|TEXT")]
+        task: String,
+        /// Model id as the endpoint names it
+        #[arg(long, value_name = "ID")]
+        model: String,
+        /// OpenAI-compatible base URL, with or without a trailing /v1
+        #[arg(long = "base-url", value_name = "URL")]
+        base_url: String,
+        /// Name of an environment variable holding the API key. The key itself is never
+        /// accepted on the command line, so it cannot land in a process listing.
+        #[arg(long = "api-key-env", value_name = "NAME")]
+        api_key_env: Option<String>,
+        /// Repository to work in (default: the current directory)
+        #[arg(long, value_name = "PATH")]
+        repo: Option<PathBuf>,
+        /// Override the MCP server command (default: this binary serving --repo)
+        #[arg(long = "mcp-command", value_name = "CMD")]
+        mcp_command: Option<String>,
+        /// Directory for the transcript, the Kin trace and the result record
+        #[arg(long, value_name = "DIR")]
+        out: Option<PathBuf>,
+        /// Tool-call budget before the agent is asked for a final answer
+        #[arg(long = "max-tool-calls", value_name = "N")]
+        max_tool_calls: Option<u32>,
+        /// Wall-clock deadline in seconds
+        #[arg(long, value_name = "S")]
+        deadline: Option<u64>,
+        /// File holding a system prompt that replaces the built-in one
+        #[arg(long, value_name = "FILE")]
+        system: Option<PathBuf>,
+        /// Sampling temperature passed through to the endpoint
+        #[arg(long, value_name = "F")]
+        temperature: Option<f32>,
+        /// Tool surface the MCP server should serve
+        #[arg(long = "tool-profile", value_name = "PROFILE")]
+        tool_profile: Option<String>,
+    },
+    /// Check that the model endpoint and the Kin MCP server both answer
+    Doctor {
+        /// OpenAI-compatible base URL
+        #[arg(long = "base-url", value_name = "URL")]
+        base_url: String,
+        /// Model id to look for in the endpoint's list
+        #[arg(long, value_name = "ID")]
+        model: Option<String>,
+        /// Repository to serve (default: the current directory)
+        #[arg(long, value_name = "PATH")]
+        repo: Option<PathBuf>,
+        /// Override the MCP server command
+        #[arg(long = "mcp-command", value_name = "CMD")]
+        mcp_command: Option<String>,
+        /// Name of an environment variable holding the API key
+        #[arg(long = "api-key-env", value_name = "NAME")]
+        api_key_env: Option<String>,
+        /// Tool surface the MCP server should serve
+        #[arg(long = "tool-profile", value_name = "PROFILE")]
+        tool_profile: Option<String>,
     },
 }
 
@@ -2966,6 +3042,64 @@ fn main() -> Result<()> {
                 },
                 Command::Blame { entity, reference } => {
                     commands::blame::run(entity, reference).await
+                }
+                Command::Agent { action } => {
+                    // The agent loop is blocking, and a blocking HTTP client builds and
+                    // drops its own runtime. Dropping one inside an async context panics,
+                    // so the whole command runs on a plain thread outside this runtime.
+                    let code = std::thread::spawn(move || match action {
+                        AgentAction::Run {
+                            task,
+                            model,
+                            base_url,
+                            api_key_env,
+                            repo,
+                            mcp_command,
+                            out,
+                            max_tool_calls,
+                            deadline,
+                            system,
+                            temperature,
+                            tool_profile,
+                        } => commands::agent::run(commands::agent::RunArgs {
+                            task,
+                            model,
+                            base_url,
+                            api_key_env,
+                            repo,
+                            mcp_command,
+                            out,
+                            max_tool_calls,
+                            deadline,
+                            system,
+                            temperature,
+                            tool_profile,
+                        }),
+                        AgentAction::Doctor {
+                            base_url,
+                            model,
+                            repo,
+                            mcp_command,
+                            api_key_env,
+                            tool_profile,
+                        } => commands::agent::doctor(
+                            base_url,
+                            model,
+                            repo,
+                            mcp_command,
+                            api_key_env,
+                            tool_profile,
+                        ),
+                    })
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("the agent thread panicked"))??;
+                    // The run's own taxonomy is reported through the exit code: 2 budget,
+                    // 3 deadline, 4 endpoint, 5 MCP. A caller must be able to tell a task
+                    // the agent could not do from an endpoint that was never there.
+                    if code != 0 {
+                        std::process::exit(code);
+                    }
+                    Ok(())
                 }
                 Command::Mcp { action } => match action {
                     McpAction::Start {

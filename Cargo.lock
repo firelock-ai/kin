@@ -3045,6 +3045,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "kin-agent"
+version = "0.5.39"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "kin-blobs"
 version = "0.1.5"
 source = "sparse+https://kinlab.ai/registry/cargo/"
@@ -3088,6 +3102,7 @@ dependencies = [
  "fs2",
  "hex",
  "keyring",
+ "kin-agent",
  "kin-blobs",
  "kin-buildinfo",
  "kin-context",

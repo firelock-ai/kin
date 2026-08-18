@@ -1,0 +1,831 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Firelock, LLC
+
+//! End-to-end tests for the loop.
+//!
+//! The model is a scripted OpenAI-compatible responder on a loopback socket, so a turn
+//! sequence is exact rather than sampled. The graph server is a scripted MCP stdio server
+//! for the hermetic tests and a real `kin mcp start` for the ignored one, so the wire
+//! contract is proven against the product rather than only against a stand-in.
+
+use kin_agent::{AgentConfig, ExitStatus, ProviderConfig};
+use serde_json::{json, Value};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+/// A scripted chat endpoint. Each request pops the next response off the script, so a
+/// test asserts on a fixed turn sequence instead of a model's mood.
+struct FakeEndpoint {
+    base_url: String,
+    handle: Option<std::thread::JoinHandle<Vec<Value>>>,
+}
+
+impl FakeEndpoint {
+    fn start(script: Vec<Value>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for response in script.into_iter() {
+                let Ok((stream, _)) = listener.accept() else {
+                    break;
+                };
+                match serve_one(stream, &response) {
+                    Some(request) => seen.push(request),
+                    None => break,
+                }
+            }
+            seen
+        });
+        FakeEndpoint {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            handle: Some(handle),
+        }
+    }
+
+    /// Every request body the endpoint received, in order.
+    fn requests(mut self) -> Vec<Value> {
+        self.handle
+            .take()
+            .expect("started")
+            .join()
+            .expect("endpoint thread")
+    }
+}
+
+fn serve_one(mut stream: TcpStream, response: &Value) -> Option<Value> {
+    let mut reader = BufReader::new(stream.try_clone().ok()?);
+    let mut content_length = 0usize;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).ok()? == 0 {
+            return None;
+        }
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some(value) = trimmed
+            .strip_prefix("Content-Length:")
+            .or_else(|| trimmed.strip_prefix("content-length:"))
+        {
+            content_length = value.trim().parse().ok()?;
+        }
+    }
+    let mut body = vec![0u8; content_length];
+    reader.read_exact(&mut body).ok()?;
+    let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+
+    let payload = response.to_string();
+    let http = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        payload.len(),
+        payload
+    );
+    stream.write_all(http.as_bytes()).ok()?;
+    stream.flush().ok()?;
+    Some(request)
+}
+
+fn completion(content: &str, tool_calls: Option<Value>) -> Value {
+    let mut message = json!({ "role": "assistant", "content": content });
+    let finish = if tool_calls.is_some() {
+        "tool_calls"
+    } else {
+        "stop"
+    };
+    if let Some(calls) = tool_calls {
+        message["tool_calls"] = calls;
+    }
+    json!({
+        "id": "chatcmpl-test",
+        "choices": [{ "index": 0, "message": message, "finish_reason": finish }],
+        "usage": { "prompt_tokens": 100, "completion_tokens": 20 }
+    })
+}
+
+fn tool_call(id: &str, name: &str, arguments: Value) -> Value {
+    json!([{
+        "id": id,
+        "type": "function",
+        "function": { "name": name, "arguments": arguments.to_string() }
+    }])
+}
+
+/// Write a scripted MCP stdio server that speaks the real wire shapes: an `initialize`
+/// reply, a `tools/list` carrying the session and transaction tools, and tool results
+/// whose payload sits inside `content[0].text` with a `_kin` envelope.
+fn write_fake_mcp_server(dir: &Path) -> PathBuf {
+    let path = dir.join("fake_mcp_server.py");
+    std::fs::write(&path, FAKE_SERVER).expect("write fake server");
+    path
+}
+
+const FAKE_SERVER: &str = r#"#!/usr/bin/env python3
+import json, sys
+
+LOG = sys.argv[1]
+
+TOOLS = [
+    {"name": "semantic_locate", "description": "Find entities by meaning.",
+     "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}},
+                     "required": ["query"]}},
+    {"name": "get_entity_source", "description": "Read exact source.",
+     "inputSchema": {"type": "object", "properties": {"entity": {"type": "string"}},
+                     "required": ["entity"]}},
+    {"name": "kin_session_start", "description": "Start a session.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "kin_session_end", "description": "End a session.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "kin_transaction_begin", "description": "Begin a transaction.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "kin_transaction_commit", "description": "Commit a transaction.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "kin_transaction_abort", "description": "Abort a transaction.",
+     "inputSchema": {"type": "object", "properties": {}}},
+]
+
+ENVELOPE = {"envelope_version": "1", "runtime": "RepoDaemon",
+            "graph_as_of": "2026-08-18T00:00:00Z",
+            "semantic_coverage": 0.91, "degraded": []}
+
+
+def payload(obj, is_error=False):
+    return {"content": [{"type": "text", "text": json.dumps(obj)}], "isError": is_error}
+
+
+def call(name, args):
+    with open(LOG, "a") as fh:
+        fh.write(json.dumps({"tool": name, "args": args}) + "\n")
+    if name == "semantic_locate":
+        if args.get("query") == "nothing at all":
+            return payload({"results": [], "_kin": ENVELOPE,
+                            "negative": {"safe_to_conclude_absent": False,
+                                         "limiting_factor": "markdown bodies are not indexed"}})
+        return payload({"results": [{"name": "greet", "path": "src/greet.py", "line": 1}],
+                        "_kin": ENVELOPE})
+    if name == "get_entity_source":
+        return payload({"source": "def greet(name):\n    return name\n", "_kin": ENVELOPE})
+    if name == "kin_session_start":
+        return payload({"session_id": "sess-fixture-1", "_kin": ENVELOPE})
+    if name == "kin_session_end":
+        return payload({"ended": True, "_kin": ENVELOPE})
+    if name == "kin_transaction_begin":
+        return payload({"transaction_id": "txn-fixture-1", "_kin": ENVELOPE})
+    if name == "kin_transaction_commit":
+        return payload({"committed": True, "transaction_id": "txn-fixture-1", "_kin": ENVELOPE})
+    if name == "kin_transaction_abort":
+        return payload({"aborted": True, "_kin": ENVELOPE})
+    return payload({"error": "unknown tool " + name}, is_error=True)
+
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    method = msg.get("method")
+    if "id" not in msg:
+        continue
+    if method == "initialize":
+        result = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
+                  "serverInfo": {"name": "fake-kin", "version": "0"}}
+    elif method == "tools/list":
+        result = {"tools": TOOLS}
+    elif method == "tools/call":
+        params = msg.get("params", {})
+        result = call(params.get("name", ""), params.get("arguments", {}))
+    else:
+        result = {}
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": result}) + "\n")
+    sys.stdout.flush()
+"#;
+
+fn fixture_repo(dir: &Path) -> PathBuf {
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(
+        repo.join("src/greet.py"),
+        "def greet(name):\n    return f\"hello {name}\"\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("README.md"), "# fixture\n").unwrap();
+    repo
+}
+
+fn config(repo: &Path, out: &Path, base_url: &str, mcp_command: Vec<String>) -> AgentConfig {
+    AgentConfig {
+        task: "Find where greet is defined and add a one-line docstring.".into(),
+        system_prompt: Some("You are a test agent.".into()),
+        repo: repo.to_path_buf(),
+        out_dir: out.to_path_buf(),
+        provider: ProviderConfig {
+            base_url: ProviderConfig::normalize_base_url(base_url),
+            model: "fixture-model".into(),
+            api_key: None,
+            temperature: None,
+            request_timeout: Duration::from_secs(20),
+        },
+        mcp_command,
+        mcp_timeout: Duration::from_secs(60),
+        max_tool_calls: 10,
+        deadline: Duration::from_secs(120),
+        tool_profile: None,
+    }
+}
+
+fn read_jsonl(path: &Path) -> Vec<Value> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("every transcript line is JSON"))
+        .collect()
+}
+
+/// A reader that mirrors what `usage.py` and `analyze.py` take off a transcript, so the
+/// shape is asserted against the fields the fleet's analyzers actually read.
+struct AnalyzerView {
+    init: Value,
+    result: Value,
+    tool_uses: Vec<(String, String, Value)>,
+    tool_results: Vec<(String, String, bool)>,
+    assistant_text: String,
+}
+
+fn analyze(records: &[Value]) -> AnalyzerView {
+    let mut init = Value::Null;
+    let mut result = Value::Null;
+    let mut tool_uses = Vec::new();
+    let mut tool_results = Vec::new();
+    let mut assistant_text = String::new();
+    for record in records {
+        // Every record must carry a timestamp or the analyzers lose their latency.
+        assert!(
+            record.get("timestamp").and_then(Value::as_str).is_some(),
+            "record without a timestamp: {record}"
+        );
+        match record.get("type").and_then(Value::as_str) {
+            Some("system") => init = record.clone(),
+            Some("result") => result = record.clone(),
+            Some("assistant") => {
+                for block in record
+                    .pointer("/message/content")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+                {
+                    match block.get("type").and_then(Value::as_str) {
+                        Some("tool_use") => tool_uses.push((
+                            block["id"].as_str().unwrap().to_string(),
+                            block["name"].as_str().unwrap().to_string(),
+                            block["input"].clone(),
+                        )),
+                        Some("text") => {
+                            assistant_text.push_str(block["text"].as_str().unwrap_or_default())
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some("user") => {
+                for block in record
+                    .pointer("/message/content")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+                {
+                    if block.get("type").and_then(Value::as_str) == Some("tool_result") {
+                        tool_results.push((
+                            block["tool_use_id"].as_str().unwrap().to_string(),
+                            block["content"].as_str().unwrap_or_default().to_string(),
+                            block["is_error"].as_bool().unwrap_or(false),
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    AnalyzerView {
+        init,
+        result,
+        tool_uses,
+        tool_results,
+        assistant_text,
+    }
+}
+
+/// The log path travels as an argument rather than an environment variable, because the
+/// test binary runs its tests as threads in one process and a shared variable would race.
+fn mcp_command(server: &Path, log: &Path) -> Vec<String> {
+    vec![
+        "python3".to_string(),
+        server.display().to_string(),
+        log.display().to_string(),
+    ]
+}
+
+fn mcp_log(path: &Path) -> Vec<Value> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[test]
+fn a_tool_call_reaches_kin_the_edit_is_bracketed_and_the_transcript_records_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(dir.path());
+    let out = dir.path().join("out");
+    let server = write_fake_mcp_server(dir.path());
+    let log = dir.path().join("mcp-calls.jsonl");
+
+    let endpoint = FakeEndpoint::start(vec![
+        completion(
+            "Let me find it.",
+            Some(tool_call(
+                "c1",
+                "mcp__kin__semantic_locate",
+                json!({ "query": "greet" }),
+            )),
+        ),
+        completion(
+            "Now the edit.",
+            Some(tool_call(
+                "c2",
+                "edit_file",
+                json!({
+                    "path": "src/greet.py",
+                    "find": "def greet(name):",
+                    "replace": "def greet(name):\n    \"\"\"Return a greeting for name.\"\"\""
+                }),
+            )),
+        ),
+        completion(
+            "greet is in src/greet.py and now carries a docstring.",
+            None,
+        ),
+    ]);
+    let base_url = endpoint.base_url.clone();
+
+    let outcome = kin_agent::run(config(&repo, &out, &base_url, mcp_command(&server, &log)))
+        .expect("the run completes");
+
+    assert_eq!(outcome.status, ExitStatus::Success);
+    assert_eq!(
+        outcome.final_text,
+        "greet is in src/greet.py and now carries a docstring."
+    );
+
+    // The edit landed on disk.
+    let edited = std::fs::read_to_string(repo.join("src/greet.py")).unwrap();
+    assert!(
+        edited.contains("\"\"\"Return a greeting for name.\"\"\""),
+        "the docstring must be in the file: {edited}"
+    );
+
+    // The call reached the graph server, and the edit was bracketed by a transaction
+    // under a session, in that order.
+    let calls = mcp_log(&log);
+    let names: Vec<&str> = calls
+        .iter()
+        .map(|call| call["tool"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "kin_session_start",
+            "semantic_locate",
+            "kin_transaction_begin",
+            "kin_transaction_commit",
+            "kin_session_end"
+        ],
+        "the edit must be bracketed by begin/commit under a session"
+    );
+    assert_eq!(calls[1]["args"]["query"], "greet");
+
+    // The transcript records it in the shape the analyzers read.
+    let records = read_jsonl(&outcome.transcript_path);
+    let view = analyze(&records);
+    assert_eq!(view.init["subtype"], "init");
+    assert_eq!(view.init["model"], "fixture-model");
+    assert_eq!(view.init["mcp_servers"][0]["status"], "connected");
+    assert_eq!(view.init["mcp_server_errors"].as_array().unwrap().len(), 0);
+    let tools: Vec<&str> = view.init["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_str().unwrap())
+        .collect();
+    assert!(tools.contains(&"mcp__kin__semantic_locate"));
+    assert!(tools.contains(&"edit_file"));
+    // The session and transaction tools are the harness's, never the model's.
+    assert!(!tools.iter().any(|name| name.contains("kin_transaction")));
+    assert!(!tools.iter().any(|name| name.contains("kin_session")));
+
+    assert_eq!(view.tool_uses.len(), 2);
+    assert_eq!(view.tool_uses[0].1, "mcp__kin__semantic_locate");
+    assert_eq!(view.tool_uses[1].1, "edit_file");
+    assert_eq!(view.tool_results.len(), 2);
+    // Each result is joinable to its call, which is how latency is derived.
+    assert_eq!(view.tool_uses[0].0, view.tool_results[0].0);
+    assert_eq!(view.tool_uses[1].0, view.tool_results[1].0);
+    assert!(!view.tool_results[0].2 && !view.tool_results[1].2);
+    assert!(view.assistant_text.contains("Let me find it."));
+
+    assert_eq!(view.result["subtype"], "success");
+    assert_eq!(view.result["kin_agent"]["exit_code"], 0);
+    assert_eq!(view.result["kin_agent"]["tool_calls"], 2);
+    assert_eq!(view.result["kin_agent"]["kin_calls"], 1);
+    assert_eq!(view.result["kin_agent"]["local_calls"], 1);
+    assert_eq!(view.result["kin_agent"]["files_changed"][0], "src/greet.py");
+    // Usage is carried through from the endpoint rather than defaulted.
+    assert_eq!(view.result["usage"]["input_tokens"], 300);
+
+    // The sidecar carries the envelope and the provenance, joinable on tool_use_id.
+    let trace = read_jsonl(&outcome.trace_path);
+    let locate = trace
+        .iter()
+        .find(|row| row["tool"] == "semantic_locate" && row["surface"] == "kin")
+        .expect("the Kin call is traced");
+    assert_eq!(locate["tool_use_id"], view.tool_uses[0].0);
+    assert_eq!(locate["envelope"]["runtime"], "RepoDaemon");
+    assert_eq!(locate["envelope"]["semantic_coverage"], 0.91);
+    assert_eq!(locate["policy"], "allowed");
+    let edit = trace
+        .iter()
+        .find(|row| row["surface"] == "local" && row["tool"] == "edit_file")
+        .expect("the local edit is traced");
+    assert_eq!(edit["provenance"]["bracketed"], true);
+    assert_eq!(edit["provenance"]["transaction_id"], "txn-fixture-1");
+    assert_eq!(edit["provenance"]["closed_with"], "kin_transaction_commit");
+    assert_eq!(edit["provenance"]["closed_cleanly"], true);
+    // The whole written body stays out of the trace row; the transcript already has it.
+    assert!(edit["args"]["replace"]
+        .as_str()
+        .unwrap()
+        .ends_with(" bytes>"));
+
+    let requests = endpoint.requests();
+    assert_eq!(requests.len(), 3);
+    // The belt reached the model, and the shell never did.
+    let sent: Vec<&str> = requests[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|spec| spec["function"]["name"].as_str().unwrap())
+        .collect();
+    assert!(sent.contains(&"mcp__kin__semantic_locate"));
+    assert!(sent.contains(&"edit_file"));
+    assert!(!sent.iter().any(|name| name.contains("bash")));
+    // The observation went back as a tool message keyed on the same id.
+    assert_eq!(
+        requests[1]["messages"].as_array().unwrap().last().unwrap()["role"],
+        "tool"
+    );
+}
+
+#[test]
+fn an_untrusted_absence_is_handed_to_the_model_as_unknown_with_the_named_gap() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(dir.path());
+    let out = dir.path().join("out");
+    let server = write_fake_mcp_server(dir.path());
+    let log = dir.path().join("mcp-calls.jsonl");
+
+    let endpoint = FakeEndpoint::start(vec![
+        completion(
+            "",
+            Some(tool_call(
+                "c1",
+                "mcp__kin__semantic_locate",
+                json!({ "query": "nothing at all" }),
+            )),
+        ),
+        completion(
+            "I do not know; the graph does not index markdown bodies.",
+            None,
+        ),
+    ]);
+    let base_url = endpoint.base_url.clone();
+
+    let outcome = kin_agent::run(config(&repo, &out, &base_url, mcp_command(&server, &log)))
+        .expect("the run completes");
+    assert_eq!(outcome.status, ExitStatus::Success);
+
+    let records = read_jsonl(&outcome.transcript_path);
+    let view = analyze(&records);
+    let (_, observation, _) = &view.tool_results[0];
+    assert!(
+        observation.contains("CANNOT be trusted"),
+        "the model must be told the absence is untrusted: {observation}"
+    );
+    assert!(
+        observation.contains("markdown bodies are not indexed"),
+        "the named gap must be handed through: {observation}"
+    );
+    assert!(
+        observation.contains("unknown"),
+        "the model must be told to treat it as unknown: {observation}"
+    );
+    assert_eq!(view.result["kin_agent"]["unsafe_absence_events"], 1);
+
+    let trace = read_jsonl(&outcome.trace_path);
+    let row = trace
+        .iter()
+        .find(|row| row["tool"] == "semantic_locate")
+        .unwrap();
+    assert_eq!(row["negative"]["safe_to_conclude_absent"], false);
+    assert_eq!(
+        row["negative"]["limiting_factor"],
+        "markdown bodies are not indexed"
+    );
+}
+
+#[test]
+fn an_off_belt_tool_is_refused_and_never_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(dir.path());
+    let out = dir.path().join("out");
+    let server = write_fake_mcp_server(dir.path());
+    let log = dir.path().join("mcp-calls.jsonl");
+    let canary = repo.join("canary.txt");
+
+    let endpoint = FakeEndpoint::start(vec![
+        completion(
+            "",
+            Some(tool_call(
+                "c1",
+                "bash",
+                json!({ "command": format!("touch {}", canary.display()) }),
+            )),
+        ),
+        completion("There is no shell, so I used Kin instead.", None),
+    ]);
+    let base_url = endpoint.base_url.clone();
+
+    let outcome = kin_agent::run(config(&repo, &out, &base_url, mcp_command(&server, &log)))
+        .expect("the run completes");
+
+    assert!(
+        !canary.exists(),
+        "a refused shell call must not have run anything"
+    );
+    let view = analyze(&read_jsonl(&outcome.transcript_path));
+    let (_, observation, is_error) = &view.tool_results[0];
+    assert!(*is_error, "a refusal is an error result");
+    assert!(
+        observation.contains("no shell"),
+        "the refusal must say why: {observation}"
+    );
+    assert_eq!(view.result["kin_agent"]["refused_calls"], 1);
+    // Nothing reached the graph server except the session bracket.
+    let names: Vec<String> = mcp_log(&log)
+        .iter()
+        .map(|call| call["tool"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        !names.iter().any(|name| name == "bash"),
+        "the refused call must not reach Kin: {names:?}"
+    );
+}
+
+#[test]
+fn malformed_arguments_get_one_repair_turn_and_the_call_does_not_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(dir.path());
+    let out = dir.path().join("out");
+    let server = write_fake_mcp_server(dir.path());
+    let log = dir.path().join("mcp-calls.jsonl");
+
+    let endpoint = FakeEndpoint::start(vec![
+        // A missing required argument, which is the failure small local models actually
+        // produce, rather than an invented one.
+        completion(
+            "",
+            Some(tool_call("c1", "mcp__kin__semantic_locate", json!({}))),
+        ),
+        completion(
+            "",
+            Some(tool_call(
+                "c2",
+                "mcp__kin__semantic_locate",
+                json!({ "query": "greet" }),
+            )),
+        ),
+        completion("Found it.", None),
+    ]);
+    let base_url = endpoint.base_url.clone();
+
+    let outcome = kin_agent::run(config(&repo, &out, &base_url, mcp_command(&server, &log)))
+        .expect("the run completes");
+
+    let view = analyze(&read_jsonl(&outcome.transcript_path));
+    let (_, first, is_error) = &view.tool_results[0];
+    assert!(*is_error);
+    assert!(
+        first.contains("`query`") && first.contains("was missing"),
+        "the repair must name the field: {first}"
+    );
+    assert_eq!(view.result["kin_agent"]["repairs"], 1);
+    // The bad call never reached the graph; the corrected one did.
+    let names: Vec<String> = mcp_log(&log)
+        .iter()
+        .map(|call| call["tool"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        names
+            .iter()
+            .filter(|name| *name == "semantic_locate")
+            .count(),
+        1,
+        "only the corrected call runs: {names:?}"
+    );
+}
+
+#[test]
+fn the_tool_call_cap_forces_a_tool_free_final_answer_and_exits_two() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(dir.path());
+    let out = dir.path().join("out");
+    let server = write_fake_mcp_server(dir.path());
+    let log = dir.path().join("mcp-calls.jsonl");
+
+    let mut script = Vec::new();
+    for index in 0..3 {
+        script.push(completion(
+            "",
+            Some(tool_call(
+                &format!("c{index}"),
+                "mcp__kin__semantic_locate",
+                json!({ "query": "greet" }),
+            )),
+        ));
+    }
+    script.push(completion(
+        "I ran out of budget; greet is in src/greet.py.",
+        None,
+    ));
+    let endpoint = FakeEndpoint::start(script);
+    let base_url = endpoint.base_url.clone();
+
+    let mut cfg = config(&repo, &out, &base_url, mcp_command(&server, &log));
+    cfg.max_tool_calls = 3;
+    let outcome = kin_agent::run(cfg).expect("the run completes");
+
+    assert_eq!(outcome.status, ExitStatus::CapReached);
+    assert_eq!(outcome.status.code(), 2);
+    assert_eq!(
+        outcome.final_text,
+        "I ran out of budget; greet is in src/greet.py."
+    );
+    let view = analyze(&read_jsonl(&outcome.transcript_path));
+    assert_eq!(view.result["subtype"], "cap_reached");
+    assert_eq!(view.result["kin_agent"]["stop_reason"], "tool_call_cap");
+    assert_eq!(view.result["kin_agent"]["tool_calls"], 3);
+    // The forced turn was asked with nothing to call.
+    let requests = endpoint.requests();
+    let last = requests.last().unwrap();
+    assert!(
+        last.get("tools").is_none(),
+        "the forced final turn must offer no tools"
+    );
+}
+
+#[test]
+fn a_dead_endpoint_exits_four_and_still_closes_the_transcript() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(dir.path());
+    let out = dir.path().join("out");
+    let server = write_fake_mcp_server(dir.path());
+    let log = dir.path().join("mcp-calls.jsonl");
+
+    // A port nothing is listening on.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let outcome = kin_agent::run(config(
+        &repo,
+        &out,
+        &format!("http://127.0.0.1:{port}/v1"),
+        mcp_command(&server, &log),
+    ))
+    .expect("the run returns rather than panicking");
+
+    assert_eq!(outcome.status, ExitStatus::EndpointError);
+    assert_eq!(outcome.status.code(), 4);
+    let view = analyze(&read_jsonl(&outcome.transcript_path));
+    assert_eq!(view.result["subtype"], "endpoint_error");
+    assert_eq!(view.result["is_error"], true);
+}
+
+#[test]
+fn a_missing_mcp_server_exits_five_and_says_kin_never_attached() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(dir.path());
+    let out = dir.path().join("out");
+
+    let endpoint = FakeEndpoint::start(vec![completion("unreachable", None)]);
+    let base_url = endpoint.base_url.clone();
+    let outcome = kin_agent::run(config(
+        &repo,
+        &out,
+        &base_url,
+        vec!["kin-agent-no-such-binary".to_string()],
+    ))
+    .expect("the run returns rather than panicking");
+
+    assert_eq!(outcome.status, ExitStatus::McpError);
+    assert_eq!(outcome.status.code(), 5);
+    let view = analyze(&read_jsonl(&outcome.transcript_path));
+    assert_eq!(view.init["mcp_servers"][0]["status"], "failed");
+    assert!(
+        !view.init["mcp_server_errors"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "a run where Kin never attached must be loud"
+    );
+    assert_eq!(view.result["subtype"], "mcp_error");
+}
+
+/// The same loop against a real `kin mcp start` on a two-file fixture repository.
+///
+/// Ignored by default because it builds a real graph and starts a real daemon, which the
+/// default suite must never trigger. Run it with the binary named:
+///
+/// ```text
+/// KIN_AGENT_TEST_KIN_BIN=/path/to/kin cargo test -p kin-agent -- --ignored
+/// ```
+#[test]
+#[ignore = "starts a real daemon and builds a real graph"]
+fn the_loop_drives_a_real_kin_mcp_server() {
+    let binary = std::env::var("KIN_AGENT_TEST_KIN_BIN").expect(
+        "KIN_AGENT_TEST_KIN_BIN must name the kin binary; the test refuses to pass without one",
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(dir.path());
+    let out = dir.path().join("out");
+
+    let init = std::process::Command::new(&binary)
+        .args(["init"])
+        .current_dir(&repo)
+        .output()
+        .expect("kin init runs");
+    assert!(
+        init.status.success(),
+        "kin init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    let endpoint = FakeEndpoint::start(vec![
+        completion(
+            "",
+            Some(tool_call(
+                "c1",
+                "mcp__kin__semantic_locate",
+                json!({ "query": "greet" }),
+            )),
+        ),
+        completion("greet is defined in src/greet.py.", None),
+    ]);
+    let base_url = endpoint.base_url.clone();
+
+    let mut cfg = config(
+        &repo,
+        &out,
+        &base_url,
+        vec![
+            binary,
+            "mcp".into(),
+            "start".into(),
+            "--repo".into(),
+            repo.display().to_string(),
+        ],
+    );
+    cfg.mcp_timeout = Duration::from_secs(300);
+    cfg.deadline = Duration::from_secs(600);
+    let outcome = kin_agent::run(cfg).expect("the run completes");
+
+    assert_eq!(outcome.status, ExitStatus::Success, "{:?}", outcome.result);
+    let view = analyze(&read_jsonl(&outcome.transcript_path));
+    assert_eq!(view.init["mcp_servers"][0]["status"], "connected");
+    assert_eq!(view.result["kin_agent"]["kin_calls"], 1);
+    // The real server's envelope reached the sidecar, which is the whole point of
+    // speaking MCP rather than a translated CLI bridge.
+    let trace = read_jsonl(&outcome.trace_path);
+    let row = trace
+        .iter()
+        .find(|row| row["tool"] == "semantic_locate")
+        .expect("the Kin call is traced");
+    assert!(
+        row["envelope"].is_object(),
+        "the real server must carry a _kin envelope: {row}"
+    );
+}

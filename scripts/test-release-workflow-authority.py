@@ -301,6 +301,9 @@ jobs:
 REQUIRED_RELEASE_CHECKS = (
     "Check & Test (ubuntu-latest)",
     "Check & Test (macos-latest)",
+    "Falsify guards",
+    "Feature permutation tests (ubuntu-latest)",
+    "Feature permutation tests (macos-latest)",
     "DCO Sign-off",
     "cargo-deny",
     "gitleaks (full history)",
@@ -670,6 +673,13 @@ REQUIRED_CHECK_JOB_PRODUCERS = {
         (".github/workflows/ci.yml", "check-docs-only"),
         (".github/workflows/ci.yml", "check"),
     },
+    "Falsify guards": {
+        (".github/workflows/ci.yml", "falsify-guards"),
+    },
+    "Feature permutation tests": {
+        (".github/workflows/ci.yml", "feature-tests-docs-only"),
+        (".github/workflows/ci.yml", "feature-tests"),
+    },
     "DCO Sign-off": {
         (".github/workflows/ci.yml", "dco"),
     },
@@ -701,6 +711,17 @@ REQUIRED_RELEASE_CHECK_PROVENANCE = {
         "push",
     ),
     "Check & Test (macos-latest)": (
+        245_803_170,
+        ".github/workflows/ci.yml",
+        "push",
+    ),
+    "Falsify guards": (245_803_170, ".github/workflows/ci.yml", "push"),
+    "Feature permutation tests (ubuntu-latest)": (
+        245_803_170,
+        ".github/workflows/ci.yml",
+        "push",
+    ),
+    "Feature permutation tests (macos-latest)": (
         245_803_170,
         ".github/workflows/ci.yml",
         "push",
@@ -8309,7 +8330,10 @@ def main() -> None:
                 f"release recovery contains forbidden authority or retry state: {forbidden}"
             )
 
-    pinned_readme_version = re.search(r"\bv?\d+\.\d+\.\d+\b", readme)
+    # A dotted quad is not a version. `\b\d+\.\d+\.\d+\b` matches "127.0.0" inside
+    # "127.0.0.1", so documenting a loopback endpoint tripped this guard with a message
+    # about pinning a release. Refuse a match that has a digit or dot on either side.
+    pinned_readme_version = re.search(r"(?<![\d.])v?\d+\.\d+\.\d+(?![\d.])", readme)
     if pinned_readme_version:
         raise AssertionError(
             "README must follow the proven latest release instead of pinning "

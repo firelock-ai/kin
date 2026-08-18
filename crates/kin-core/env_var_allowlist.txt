@@ -12,6 +12,7 @@
 # conscious decision to keep a name out of the registry, not a place to silence a
 # real gap.
 #
+KIN_AGENT_TEST_KIN_BIN
 KIN_GIT_TEST_NO_SYMLINK_PRIVILEGE
 KIN_INIT_INTERRUPTED_TEST_BARRIER
 KIN_INIT_INTERRUPTED_TEST_SOURCE
