@@ -26,6 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Read one reference collector for dead code and gate the delete list on measured edge coverage (#866)
 - Bound trace_data_flow's own response, order its fan-out by relevance, and give every step one shape (#867)
 - chore(ci): pin kin-actions v0.1.30 (#885)
+- Model JavaScript and TypeScript receivers, classes and requires as a graph (#864)
+- Report graph-body coverage, and make each status counter name the view it shows (#875)
 
 
 ## [0.5.37] - 2026-08-17
