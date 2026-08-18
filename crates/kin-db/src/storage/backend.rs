@@ -6333,9 +6333,16 @@ impl LocalFileBackend {
             )));
         }
 
-        // Validate the bytes without re-serializing — from_bytes proves the
-        // data round-trips, then we write the *original* bytes to disk.
-        let _snapshot = GraphSnapshot::from_bytes(data)?;
+        // Validate the bytes without re-serializing — decoding proves the data
+        // round-trips, then we write the *original* bytes to disk. A caller
+        // naming a history validator asserts these exact bytes were serialized
+        // from a state that already passed the semantic admission gate, so
+        // repeating that pass here would re-walk every Git projection tree the
+        // gate just walked.
+        let _snapshot = match history_validator_version {
+            Some(_) => GraphSnapshot::decode_pre_validated(data)?,
+            None => GraphSnapshot::from_bytes(data)?,
+        };
         let new_gen = checked_next_generation(current_gen, "local snapshot")?;
         let snapshots = namespace
             .surface(Self::snapshots_surface_name(), true)?

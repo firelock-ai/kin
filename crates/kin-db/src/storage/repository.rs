@@ -574,6 +574,14 @@ impl PersistedRepositoryAuthority {
 
     /// Fail closed on malformed, non-canonical, or root-inconsistent metadata.
     pub fn validate_against_snapshot(&self, snapshot: &GraphSnapshot) -> Result<(), KinDbError> {
+        self.validate_against_snapshot_with(snapshot, GitProjectionTreeReplay::Required)
+    }
+
+    pub(crate) fn validate_against_snapshot_with(
+        &self,
+        snapshot: &GraphSnapshot,
+        replay: GitProjectionTreeReplay,
+    ) -> Result<(), KinDbError> {
         if self.schema_version != REPOSITORY_AUTHORITY_SCHEMA_VERSION {
             return Err(storage(format!(
                 "unsupported repository authority schema {}; expected {}",
@@ -636,7 +644,7 @@ impl PersistedRepositoryAuthority {
                 )));
             }
         }
-        validate_git_authority_shape_and_projection(snapshot, self)?;
+        validate_git_authority_shape_and_projection(snapshot, self, replay)?;
         for workspace in &self.workspaces {
             workspace.validate()?;
             if workspace.repository_id != self.repository_id {
@@ -2138,7 +2146,13 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
         .receipts
         .sort_by_key(|persisted| persisted.operation_id);
     snapshot.repository_authority = Some(metadata);
-    snapshot.validate_storage_admission()?;
+    // Every input to the Git projection tree replay is final by the time
+    // `apply_git_authority` proves it above: `snapshot.changes` after
+    // `admit_changes`, the external objects after `admit_external_objects`, the
+    // aliases after `admit_aliases`, and the authority itself after the delta is
+    // applied. A write to any of them between that call and this line restores
+    // this caller's obligation to `GitProjectionTreeReplay::Required`.
+    snapshot.validate_storage_admission_with(GitProjectionTreeReplay::Proven)?;
     let storage_admission_ms = timer.lap_ms();
 
     let state =
@@ -2190,8 +2204,35 @@ fn admit_external_objects<B: StorageBackend + ?Sized>(
     metadata: &mut PersistedRepositoryAuthority,
     incoming: &[ExternalObjectRecord],
 ) -> Result<(), KinDbError> {
-    let mut objects: BTreeMap<ExternalObjectId, ExternalObjectRecord> = metadata
-        .external_objects
+    let mut progress =
+        ReplayProgress::new("external_object_admission", "Git objects", incoming.len());
+    match admitted_external_objects(
+        backend,
+        repository_id,
+        &metadata.external_objects,
+        incoming,
+        &mut progress,
+    ) {
+        Ok(objects) => {
+            progress.finish();
+            metadata.external_objects = objects;
+            Ok(())
+        }
+        Err(error) => {
+            progress.abandon();
+            Err(error)
+        }
+    }
+}
+
+fn admitted_external_objects<B: StorageBackend + ?Sized>(
+    backend: &B,
+    repository_id: &RepositoryId,
+    persisted: &[ExternalObjectRecord],
+    incoming: &[ExternalObjectRecord],
+    progress: &mut ReplayProgress,
+) -> Result<Vec<ExternalObjectRecord>, KinDbError> {
+    let mut objects: BTreeMap<ExternalObjectId, ExternalObjectRecord> = persisted
         .iter()
         .cloned()
         .map(|record| (record.object, record))
@@ -2216,9 +2257,9 @@ fn admit_external_objects<B: StorageBackend + ?Sized>(
         } else {
             objects.insert(record.object, record.clone());
         }
+        progress.record();
     }
-    metadata.external_objects = objects.into_values().collect();
-    Ok(())
+    Ok(objects.into_values().collect())
 }
 
 fn admit_changes(
@@ -2342,7 +2383,11 @@ fn apply_git_authority<B: StorageBackend + ?Sized>(
         transaction,
         metadata.git_external_authority.as_ref(),
     )?;
-    validate_git_authority_shape_and_projection(snapshot, metadata)?;
+    validate_git_authority_shape_and_projection(
+        snapshot,
+        metadata,
+        GitProjectionTreeReplay::Required,
+    )?;
     if transaction.git_authority_delta.is_some() {
         validate_git_authority_bodies(
             backend,
@@ -2390,9 +2435,29 @@ fn validate_transaction_git_projection_membership(
     Ok(())
 }
 
+/// Whether a caller still owes the Git projection tree replay.
+///
+/// The replay is a pure function of four inputs: the authority's object
+/// closure, its commit projections, the repository-scoped aliases, and
+/// `snapshot.changes`. Every other check in
+/// [`validate_git_authority_shape_and_projection`] costs one pass over
+/// already-decoded metadata, while the replay materializes a full recursive
+/// Git tree per projected commit, so a repository imported from Git pays it
+/// once per commit in its history.
+///
+/// [`GitProjectionTreeReplay::Proven`] therefore states an exact obligation
+/// rather than a preference: the caller has already run the replay against
+/// byte-identical inputs and no write to any of the four has intervened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GitProjectionTreeReplay {
+    Required,
+    Proven,
+}
+
 fn validate_git_authority_shape_and_projection(
     snapshot: &GraphSnapshot,
     metadata: &PersistedRepositoryAuthority,
+    replay: GitProjectionTreeReplay,
 ) -> Result<(), KinDbError> {
     let Some(authority) = &metadata.git_external_authority else {
         return validate_persisted_git_alias_coverage(snapshot, metadata);
@@ -2407,13 +2472,6 @@ fn validate_git_authority_shape_and_projection(
     authority.validate_shape().map_err(|error| {
         ModelError::InvalidOperation(format!("invalid Git external authority shape: {error}"))
     })?;
-    let closure_entries = authority
-        .closure
-        .objects
-        .iter()
-        .map(|entry| (entry.record.object, entry))
-        .collect::<BTreeMap<_, _>>();
-
     let records = metadata
         .external_objects
         .iter()
@@ -2514,9 +2572,17 @@ fn validate_git_authority_shape_and_projection(
             .into());
         }
     }
-    validate_git_projection_tree_replay(snapshot, &tree_targets, |raw_tree_oid| {
-        materialize_git_tree(&closure_entries, raw_tree_oid)
-    })?;
+    if replay == GitProjectionTreeReplay::Required {
+        let closure_entries = authority
+            .closure
+            .objects
+            .iter()
+            .map(|entry| (entry.record.object, entry))
+            .collect::<BTreeMap<_, _>>();
+        validate_git_projection_tree_replay(snapshot, &tree_targets, |raw_tree_oid| {
+            materialize_git_tree(&closure_entries, raw_tree_oid)
+        })?;
+    }
     validate_persisted_git_alias_coverage(snapshot, metadata)
 }
 
@@ -2572,7 +2638,7 @@ where
         }
     }
 
-    let mut progress = ReplayProgress::new("git_projection_replay", targets.len());
+    let mut progress = ReplayProgress::new("git_projection_replay", "Git commits", targets.len());
     match walk_git_projection_forest(
         snapshot,
         targets,
@@ -2759,10 +2825,33 @@ fn validate_persisted_git_alias_coverage(
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Recursive tree walks performed on this thread.
+    ///
+    /// A projected commit needs exactly one. The count is the only surface that
+    /// separates one walk per projection from a repeated one, because both
+    /// admit the identical transaction and persist identical bytes.
+    static MATERIALIZED_GIT_TREES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_materialized_git_trees() {
+    MATERIALIZED_GIT_TREES.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn materialized_git_trees() -> usize {
+    MATERIALIZED_GIT_TREES.with(std::cell::Cell::get)
+}
+
 fn materialize_git_tree(
     entries: &BTreeMap<ExternalObjectId, &kin_model::GitObjectClosureEntry>,
     root_oid: GitObjectId,
 ) -> Result<BTreeMap<RepoPath, TreeEntry>, KinDbError> {
+    #[cfg(test)]
+    MATERIALIZED_GIT_TREES.with(|count| count.set(count.get() + 1));
+
     let root = ExternalObjectId::new(ExternalObjectKind::Tree, root_oid);
     if !entries.contains_key(&root) {
         return Err(ModelError::InvalidOperation(format!(
@@ -7268,8 +7357,8 @@ mod tests {
         gitlink_target: GitObjectId,
     }
 
-    fn git_authority_transaction_fixture(
-        manager: &RepositoryAuthorityManager<MemoryBackend>,
+    fn git_authority_transaction_fixture<B: StorageBackend + ?Sized + 'static>(
+        manager: &RepositoryAuthorityManager<B>,
         operation: u128,
     ) -> GitAuthorityTransactionFixture {
         let mut bodies = TestGitBodies::default();
@@ -7882,6 +7971,42 @@ mod tests {
             .git_external_authority
             .is_none());
         assert_eq!(reopened.read_authority().roots(), &removed_roots);
+    }
+
+    /// One admitted transaction must walk each projected commit's Git tree once.
+    ///
+    /// Cost is the whole observable difference. A repeated walk over the
+    /// identical closure admits the identical transaction and persists identical
+    /// bytes, so no assertion on the committed authority can separate one walk
+    /// from two, while an imported repository pays the repeat as a full
+    /// recursive materialization per commit in its history.
+    ///
+    /// The backend is the local file one on purpose. The in-memory test double
+    /// re-decodes every persisted snapshot through the full storage-admission
+    /// gate, which is a walk per projection that no shipped backend performs.
+    #[test]
+    fn a_git_authority_commit_walks_each_projected_tree_once() {
+        let directory = TempDir::new().unwrap();
+        let backend = Arc::new(LocalFileBackend::new(directory.path()));
+        let manager =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        let fixture = git_authority_transaction_fixture(&manager, 0xa060);
+        let projections = fixture.authority.commit_projections.len();
+        assert!(
+            projections > 1,
+            "a single-projection fixture cannot separate per-commit cost from per-commit walks"
+        );
+
+        reset_materialized_git_trees();
+        manager
+            .commit_repository_transaction(fixture.transaction)
+            .unwrap();
+
+        assert_eq!(
+            materialized_git_trees(),
+            projections,
+            "admitting {projections} Git commit projections must materialize {projections} trees"
+        );
     }
 
     #[test]

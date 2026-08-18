@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::storage::change_validation::validate_semantic_change_entries;
-use crate::storage::repository::PersistedRepositoryAuthority;
+use crate::storage::repository::{GitProjectionTreeReplay, PersistedRepositoryAuthority};
 use crate::types::*;
 
 /// Statistics from a snapshot compaction pass.
@@ -447,6 +447,23 @@ impl GraphSnapshot {
             .map(|(snapshot, _)| snapshot)
     }
 
+    /// Decode exact snapshot bytes whose writer already proved admission.
+    ///
+    /// This stays a checksum-verifying decoder and still refuses a malformed
+    /// frame, an unsupported version, a corrupt body, or a bad root-hash
+    /// trailer. It skips only the semantic storage-admission pass, whose cost on
+    /// a repository imported from Git is one full recursive Git tree walk per
+    /// projected commit.
+    ///
+    /// The obligation is the mirror of [`Self::to_bytes_pre_validated`]: a
+    /// caller may enter this boundary only for bytes serialized from a state
+    /// that passed the admission gate and could not change between that gate and
+    /// this decode.
+    pub(crate) fn decode_pre_validated(data: &[u8]) -> Result<Self, crate::error::KinDbError> {
+        Self::from_bytes_with_persisted_root_hash_inner(data, true, false)
+            .map(|(snapshot, _)| snapshot)
+    }
+
     fn from_bytes_with_persisted_root_hash_inner(
         data: &[u8],
         verify_checksum: bool,
@@ -553,6 +570,13 @@ impl GraphSnapshot {
     }
 
     pub(crate) fn validate_storage_admission(&self) -> Result<(), crate::error::KinDbError> {
+        self.validate_storage_admission_with(GitProjectionTreeReplay::Required)
+    }
+
+    pub(crate) fn validate_storage_admission_with(
+        &self,
+        replay: GitProjectionTreeReplay,
+    ) -> Result<(), crate::error::KinDbError> {
         validate_semantic_change_entries(self.changes.iter(), "snapshot")?;
         for (id, reference) in &self.external_references {
             validate_external_reference_entry(id, reference, "snapshot")?;
@@ -589,7 +613,7 @@ impl GraphSnapshot {
             }
         }
         if let Some(authority) = &self.repository_authority {
-            authority.validate_against_snapshot(self)?;
+            authority.validate_against_snapshot_with(self, replay)?;
         }
         Ok(())
     }

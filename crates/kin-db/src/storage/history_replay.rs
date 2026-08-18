@@ -63,12 +63,19 @@ fn storage(message: String) -> KinDbError {
     KinDbError::StorageError(message)
 }
 
-/// Periodic `commits validated / total, elapsed` reporting for one replay.
+/// Periodic `validated / total, elapsed` reporting for one admission phase.
 ///
 /// Long admissions previously ran for hours with no output at all, which left
 /// an operator unable to tell a slow phase from a wedged one.
+///
+/// Every emit here carries the target of this module, which is the target a
+/// `kin` command raises to `info` while admitting a repository. A phase that
+/// reports from elsewhere in kin-db is silent to that command by default.
 pub(crate) struct ReplayProgress {
     phase: &'static str,
+    /// What one unit of this phase is, so a phase counting Git objects does not
+    /// report them as changes.
+    unit: &'static str,
     total: usize,
     validated: usize,
     started: Instant,
@@ -80,21 +87,23 @@ pub(crate) struct ReplayProgress {
 }
 
 impl ReplayProgress {
-    pub(crate) fn new(phase: &'static str, total: usize) -> Self {
-        Self::with_interval(phase, total, PROGRESS_INTERVAL)
+    pub(crate) fn new(phase: &'static str, unit: &'static str, total: usize) -> Self {
+        Self::with_interval(phase, unit, total, PROGRESS_INTERVAL)
     }
 
-    fn with_interval(phase: &'static str, total: usize, interval: Duration) -> Self {
+    fn with_interval(
+        phase: &'static str,
+        unit: &'static str,
+        total: usize,
+        interval: Duration,
+    ) -> Self {
         let now = Instant::now();
         if total >= PROGRESS_MIN_TOTAL {
-            tracing::info!(
-                phase,
-                total,
-                "kindb: validating repository history, {total} changes"
-            );
+            tracing::info!(phase, unit, total, "kindb: validating {total} {unit}");
         }
         Self {
             phase,
+            unit,
             total,
             validated: 0,
             started: now,
@@ -117,13 +126,14 @@ impl ReplayProgress {
         self.last_report = now;
         self.reports += 1;
         let elapsed_secs = self.started.elapsed().as_secs();
-        let (phase, validated, total) = (self.phase, self.validated, self.total);
+        let (phase, unit, validated, total) = (self.phase, self.unit, self.validated, self.total);
         tracing::info!(
             phase,
+            unit,
             validated,
             total,
             elapsed_secs,
-            "kindb: validated {validated}/{total} changes in {elapsed_secs}s"
+            "kindb: validated {validated}/{total} {unit} in {elapsed_secs}s"
         );
     }
 
@@ -132,12 +142,13 @@ impl ReplayProgress {
             return;
         }
         let elapsed_secs = self.started.elapsed().as_secs();
-        let (phase, validated) = (self.phase, self.validated);
+        let (phase, unit, validated) = (self.phase, self.unit, self.validated);
         tracing::info!(
             phase,
+            unit,
             validated,
             elapsed_secs,
-            "kindb: validated {validated} changes in {elapsed_secs}s"
+            "kindb: validated {validated} {unit} in {elapsed_secs}s"
         );
     }
 
@@ -156,12 +167,13 @@ impl ReplayProgress {
             return;
         }
         let elapsed_secs = self.started.elapsed().as_secs();
-        let (phase, validated) = (self.phase, self.validated);
+        let (phase, unit, validated) = (self.phase, self.unit, self.validated);
         tracing::info!(
             phase,
+            unit,
             validated,
             elapsed_secs,
-            "kindb: refused after validating {validated} changes in {elapsed_secs}s"
+            "kindb: refused after validating {validated} {unit} in {elapsed_secs}s"
         );
     }
 }
@@ -298,7 +310,7 @@ pub(crate) fn validate_first_parent_history(
         }
     }
 
-    let mut progress = ReplayProgress::new("history_replay", lineage.len());
+    let mut progress = ReplayProgress::new("history_replay", "changes", lineage.len());
     match walk_first_parent_forest(changes, &lineage, &children, &roots, &mut progress) {
         Ok(()) => {
             progress.finish();
@@ -969,7 +981,7 @@ mod tests {
     #[test]
     fn progress_reports_periodically_once_past_the_threshold() {
         let mut reporting =
-            ReplayProgress::with_interval("test", PROGRESS_MIN_TOTAL, Duration::ZERO);
+            ReplayProgress::with_interval("test", "changes", PROGRESS_MIN_TOTAL, Duration::ZERO);
         for _ in 0..PROGRESS_CLOCK_STRIDE * 2 {
             reporting.record();
         }
@@ -980,8 +992,12 @@ mod tests {
         );
         reporting.finish();
 
-        let mut below =
-            ReplayProgress::with_interval("test", PROGRESS_MIN_TOTAL - 1, Duration::ZERO);
+        let mut below = ReplayProgress::with_interval(
+            "test",
+            "changes",
+            PROGRESS_MIN_TOTAL - 1,
+            Duration::ZERO,
+        );
         for _ in 0..PROGRESS_CLOCK_STRIDE * 2 {
             below.record();
         }
