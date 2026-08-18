@@ -1726,6 +1726,20 @@ enum StashAction {
 #[derive(Subcommand)]
 enum McpAction {
     /// Start the MCP stdio server
+    ///
+    /// The server binds one Kin repository: the one named by --repo or
+    /// KIN_MCP_REPO, otherwise the one containing its working directory,
+    /// otherwise whatever the MCP client's workspace roots point at.
+    ///
+    /// A server that bound a repository of its own keeps serving it and ignores
+    /// client workspace roots it cannot resolve to a Kin repository. That is
+    /// what makes a container or remote registration work: with
+    /// `docker exec -i -w /work/repo <container> kin mcp start`, the client
+    /// announces host paths that do not exist inside the container, and treating
+    /// them as a workspace change would refuse every call. Roots that do name a
+    /// Kin repository this server can see, and does not serve, are still a real
+    /// disagreement and are refused rather than answered from the wrong
+    /// repository.
     Start {
         /// Run in global mode, serving all registered repos from ~/.kin/registry.toml
         #[arg(long)]
@@ -1733,7 +1747,8 @@ enum McpAction {
         /// Bind this server to a specific Kin repository instead of relying on
         /// the launching process's working directory. Overrides KIN_MCP_REPO.
         /// Use this for a global agent-CLI MCP entry that may launch outside
-        /// any Kin repository (e.g. an umbrella workspace root).
+        /// any Kin repository (e.g. an umbrella workspace root). The pin is
+        /// never repointed by the client's workspace roots.
         #[arg(long, value_name = "PATH")]
         repo: Option<PathBuf>,
         /// Tool surface to serve: `agent-default` (the curated agent belt, and
@@ -4483,6 +4498,50 @@ mod tests {
                      an open gate"
                 );
             }
+        });
+    }
+
+    /// A server reached through `docker exec` or over a remote boundary can
+    /// never bind the host paths its client announces, so it holds the
+    /// repository it was started with instead. An operator registering that
+    /// shape has to be able to learn it from the command itself rather than from
+    /// a refusal mid-session, which is why the behavior is documented where the
+    /// registration is written.
+    #[test]
+    fn mcp_start_help_documents_that_a_bound_server_holds_unresolvable_client_roots() {
+        on_cli_test_stack(|| {
+            let command = Cli::command();
+            let start = command
+                .get_subcommands()
+                .find(|subcommand| subcommand.get_name() == "mcp")
+                .expect("kin mcp must exist")
+                .get_subcommands()
+                .find(|subcommand| subcommand.get_name() == "start")
+                .expect("kin mcp start must exist")
+                .clone();
+            let help = start
+                .get_long_about()
+                .or_else(|| start.get_about())
+                .expect("kin mcp start must carry help text")
+                .to_string();
+            let flattened = help.split_whitespace().collect::<Vec<_>>().join(" ");
+
+            assert!(
+                flattened.contains("ignores client workspace roots it cannot resolve"),
+                "help must state that a bound server ignores roots it cannot resolve: {flattened}"
+            );
+            assert!(
+                flattened.contains("docker exec"),
+                "help must name the container registration this supports: {flattened}"
+            );
+
+            // Falsification: a phrase that was never written must be absent, so
+            // a `contains` that passes on anything cannot be what made the two
+            // assertions above green.
+            assert!(
+                !flattened.contains("ignores client workspace roots entirely"),
+                "the check must be able to fail: {flattened}"
+            );
         });
     }
 

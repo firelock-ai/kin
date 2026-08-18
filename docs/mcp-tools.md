@@ -29,7 +29,10 @@ The envelope's fields:
 - `semantic_coverage`: `indexed`, `total`, `pending`, and `complete` for the embedding
   signal, carried only when the daemon computed it and never fabricated here.
 - `degraded`: honest flags (`daemon_unreachable`, `embed_worker_failed`,
-  `mass_deletion_blocked`, `offline_fallback`), each present only when observed.
+  `mass_deletion_blocked`, `offline_fallback`, `workspace_mismatch`), each present only
+  when observed. `workspace_mismatch` is a refusal about which repository an answer would
+  be about, not a transport failure: the daemon is reachable and the server declined to
+  answer from a repository the client is not looking at.
 
 Empty results carry a named trust verdict, so an agent can tell "not present" apart from
 "not indexed yet". Semantic tools (`semantic_locate`, `semantic_search`) report
@@ -72,6 +75,22 @@ see the quickstart's advanced configuration for its exact JSON and repository-bo
 To wire a client up by hand, or to use the canonical npm wrapper (`@kinlab/kin`, which
 can run `kin mcp start` with the same `agent-default` profile), see
 [Advanced configuration](quickstart.md#9-advanced-configuration) in the quickstart.
+
+### Which repository the server serves
+
+A server binds one repository: the one named by `--repo` or `KIN_MCP_REPO`, otherwise the
+one containing its working directory, otherwise whatever the client's MCP workspace roots
+point at. An editor that moves its window to another Kin repository is followed, because a
+confident answer about the codebase you just left is worse than an error.
+
+A server that bound a repository of its own keeps serving it and ignores client workspace
+roots it cannot resolve to a Kin repository. That is what makes a container or remote
+registration work. Registered as `docker exec -i -w /work/repo <container> kin mcp start`,
+the server serves a container path while the client announces host paths that do not exist
+inside the container, and reading those as a workspace change would refuse every call for
+the life of the process. Roots that do name a Kin repository the server can see, and does
+not serve, are a real disagreement: those calls are refused, and the refusal carries
+`degraded.workspace_mismatch` with both paths named.
 
 ### Tool profiles
 

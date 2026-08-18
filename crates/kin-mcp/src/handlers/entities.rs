@@ -3535,6 +3535,7 @@ impl GraphStatusReport {
             || envelope.degraded.embed_worker_failed.is_some()
             || envelope.degraded.mass_deletion_blocked.is_some()
             || envelope.degraded.offline_fallback.is_some()
+            || envelope.degraded.workspace_mismatch.is_some()
         {
             return Err(
                 "_kin carries unscoped daemon health alongside selected-graph status".to_string(),
