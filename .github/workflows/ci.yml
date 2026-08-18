@@ -893,8 +893,26 @@ jobs:
           if ! command -v rg >/dev/null 2>&1; then
             case "$RUNNER_OS" in
               Linux)
-                sudo apt-get update
-                sudo apt-get install --yes ripgrep
+                # apt is bounded so a stalled mirror fails in minutes; if it
+                # still fails, the pinned release tarball is the second path,
+                # verified by checksum, so one stalled channel cannot hold
+                # the job to its timeout.
+                if ! scripts/ci-apt-install.sh ripgrep; then
+                  echo "apt failed; installing ripgrep from the pinned release tarball" >&2
+                  if [ "$(uname -m)" != "x86_64" ]; then
+                    echo "::error::no pinned ripgrep tarball for $(uname -m)"
+                    exit 1
+                  fi
+                  RG_VERSION=15.2.0
+                  RG_SHA256=33e15bcf1624b25cdd2a55813a47a2f95dbe126268203e76aa6a585d1e7b149c
+                  RG_DIR="ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl"
+                  tmp="$(mktemp -d)"
+                  curl -fsSL --retry 3 --max-time 120 -o "$tmp/rg.tgz" \
+                    "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${RG_DIR}.tar.gz"
+                  echo "${RG_SHA256}  $tmp/rg.tgz" | sha256sum --check --strict
+                  tar -xzf "$tmp/rg.tgz" -C "$tmp"
+                  sudo install -m 0755 "$tmp/${RG_DIR}/rg" /usr/local/bin/rg
+                fi
                 ;;
               macOS)
                 brew install ripgrep
@@ -1207,8 +1225,7 @@ jobs:
           rustup target add x86_64-unknown-linux-musl
           # ring, oniguruma, sqlite, and tree-sitter compile C against musl, so
           # this needs the same musl-gcc the release legs install.
-          sudo apt-get update
-          sudo apt-get install --yes musl-tools
+          scripts/ci-apt-install.sh musl-tools
           cargo check --locked --target x86_64-unknown-linux-musl \
             -p kin-cli -p kin-daemon
 
@@ -1241,8 +1258,7 @@ jobs:
           # refreshed the index. This is a required context, so an implicit
           # ordering dependency between two steps is a way for a reorder to
           # turn a stale index into a red Check & Test.
-          sudo apt-get update
-          sudo apt-get install --yes gcc-aarch64-linux-gnu
+          scripts/ci-apt-install.sh gcc-aarch64-linux-gnu
           CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc \
           AR_aarch64_unknown_linux_musl=aarch64-linux-gnu-ar \
             cargo check --locked --target aarch64-unknown-linux-musl \
