@@ -120,6 +120,7 @@ EXPECTED_SELECTOR_INVOCATIONS = {
 HEALTH = ROOT / "crates" / "kin-cli" / "src" / "commands" / "health.rs"
 SETUP = ROOT / "crates" / "kin-cli" / "src" / "commands" / "setup.rs"
 DOCKERFILE = ROOT / "Dockerfile"
+CI_APT_INSTALL = ROOT / "scripts" / "ci-apt-install.sh"
 BASE_IMAGE_REGISTRY = "docker.io"
 BASE_IMAGE_MIRROR = 'mirrors = ["mirror.gcr.io"]'
 BASE_IMAGE_MIRROR_INPUT = "buildkitd-config-inline:"
@@ -9499,12 +9500,34 @@ def main() -> None:
 
     dockerfile = DOCKERFILE.read_text(encoding="utf-8")
     # P3-4's content landed without a guard, so a deliberate deletion of the
-    # index refresh was invisible to the suite.
+    # index refresh was invisible to the suite. The refresh now lives in the
+    # bounded apt helper every apt site in the check job calls, so the guard
+    # follows it there: the aarch64 leg must call the helper for its cross
+    # toolchain, and the helper must still refresh the index before installing,
+    # under a timeout, or a stalled mirror holds the job to its one-hour bound
+    # and the merge queue ejects the entry without marking the pull request.
     require(
         ci_jobs["check"],
-        "sudo apt-get update",
-        "aarch64 release-target compile guard apt index refresh",
+        "scripts/ci-apt-install.sh gcc-aarch64-linux-gnu",
+        "aarch64 release-target compile guard apt install",
     )
+    ci_apt_install = CI_APT_INSTALL.read_text(encoding="utf-8")
+    for policy in (
+        'timeout "$UPDATE_BOUND" sudo apt-get "${APT_OPTS[@]}" update',
+        'timeout "$INSTALL_BOUND" sudo apt-get "${APT_OPTS[@]}" install --yes "$@"',
+        "-o Acquire::http::Timeout=30",
+        "-o Acquire::Retries=3",
+    ):
+        require(
+            ci_apt_install,
+            policy,
+            "bounded apt helper index refresh and install",
+        )
+    if "sudo apt-get" in ci_jobs["check"]:
+        raise AssertionError(
+            "the check job must reach apt only through scripts/ci-apt-install.sh, "
+            "so every apt call stays bounded"
+        )
 
     base_image_pins = BASE_IMAGE_PINS.read_text(encoding="utf-8")
     assert_pin_prover_cannot_refuse_a_release(base_image_pins)
