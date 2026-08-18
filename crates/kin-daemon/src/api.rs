@@ -5425,11 +5425,14 @@ async fn locate(
                     .get(&parsed.key)
                     .filter(|entry| entry.graph_version == graph_version)
                     .filter(|entry| entry.mode == snippet_opts.projection_mode())
-                    .map(|entry| entry.entities.clone())
+                    .map(|entry| (entry.entities.clone(), entry.queries.clone()))
             };
-            if let Some(entities) = cached {
+            if let Some((entities, queries)) = cached {
+                // The variant echo travels with the ranking, so a page reports the
+                // same fan-out the first page did instead of dropping it.
                 let mut result = kin_cli::commands::locate::LocateResult {
                     entities,
+                    queries,
                     ..Default::default()
                 };
                 kin_cli::commands::locate::apply_entity_page(
@@ -5570,6 +5573,7 @@ async fn locate(
             &state,
             &key,
             &result.entities,
+            &result.queries,
             graph_version,
             snippet_opts.projection_mode(),
         );
@@ -5863,6 +5867,7 @@ fn cache_locate_ranking(
     state: &DaemonState,
     key: &str,
     entities: &[kin_cli::commands::locate::LocateEntity],
+    queries: &[String],
     graph_version: u64,
     mode: &'static str,
 ) {
@@ -5880,6 +5885,7 @@ fn cache_locate_ranking(
         key.to_string(),
         CachedLocateRanking {
             entities: entities.to_vec(),
+            queries: queries.to_vec(),
             graph_version,
             mode,
             created: std::time::Instant::now(),
@@ -6898,6 +6904,13 @@ fn cosine_match_evidence(
 /// composite score, the definition flag, and (under `explain`) the resolution
 /// origin and seed cosine — plus the same query/name relationship the cosine arm
 /// reports. No new ranking is computed and result ordering is untouched.
+///
+/// Variant attribution is NOT here. It used to be, as a copy of the hit's
+/// `matched_queries` beside the copy the hit itself already carried, so one
+/// four-variant fan-out over twelve hits serialized ninety-six query strings.
+/// It now sits on the hit as [`write_locate_variant_indexes`] positions, which
+/// also keeps it readable in a compact response, where this whole object is
+/// shed.
 fn fused_match_evidence(
     query: &str,
     entity: &kin_cli::commands::locate::LocateEntity,
@@ -6914,12 +6927,41 @@ fn fused_match_evidence(
     if let Some(cosine) = entity.provenance.cosine {
         evidence["seed_cosine"] = json!(cosine);
     }
-    // Under multi-query fusion, report which query variants surfaced this hit.
-    // Absent for a single-query locate, so the evidence object is unchanged.
-    if !entity.matched_queries.is_empty() {
-        evidence["matched_variants"] = json!(entity.matched_queries);
-    }
     evidence
+}
+
+/// Replace one hit's copy of the matched-variant TEXT with positions in the
+/// response's own `queries` list.
+///
+/// The fan-out is a property of the response, not of a hit: every hit that four
+/// variants surfaced carried all four strings, so the list was serialized once
+/// per hit and again inside that hit's `match_evidence`. A stranger's measured
+/// `semantic_locate` ran three times the next most expensive tool on a
+/// twelve-file repository, and this was part of what it spent (FIR-2415).
+///
+/// This is the one place the MCP fused payload departs from the
+/// `kin locate --json` schema it otherwise reuses verbatim, and it departs on
+/// purpose: this surface is the one served under a character budget, where a
+/// repeated string evicts a real hit and an integer does not. `queries` carries
+/// the text, once, and `matched_variant_indexes` points into it.
+fn write_locate_variant_indexes(
+    slot: &mut serde_json::Value,
+    matched: &[String],
+    variants: &[String],
+) {
+    if let Some(object) = slot.as_object_mut() {
+        object.remove("matched_queries");
+    }
+    if matched.is_empty() {
+        return;
+    }
+    let indexes: Vec<usize> = matched
+        .iter()
+        .filter_map(|text| variants.iter().position(|variant| variant == text))
+        .collect();
+    if !indexes.is_empty() {
+        slot["matched_variant_indexes"] = json!(indexes);
+    }
 }
 
 /// POST /mcp/tools/call — execute an MCP tool against daemon-owned graph state.
@@ -6931,8 +6973,9 @@ fn fused_match_evidence(
 /// Contract (shared verbatim with the MCP server): args
 /// `{query, limit?=20, granularity?="entity"|"file", include_snippet?=true}`;
 /// response object with a ranked
-/// `results: [{entity_id, name, file, score, snippet?}]` array plus a
-/// `semantic_coverage` float (`indexed / total`). `score` is cosine similarity
+/// `results: [{entity_id, name, file, score, snippet?}]` array plus the
+/// `semantic_coverage` counter object, which is the same name and the same type
+/// the fused arm and `_kin` publish coverage under. `score` is cosine similarity
 /// (`1.0 - distance`), higher is better; results are already rank-ordered.
 /// `snippet` is a bounded inline body excerpt (entity granularity only),
 /// projected from graph-owned content via the same body projection
@@ -6970,8 +7013,7 @@ fn window_semantic_rows(
 fn semantic_locate_payload(
     query: &str,
     file_granularity: bool,
-    semantic_coverage: f32,
-    coverage_detail: &kin_cli::commands::locate::SemanticCoverage,
+    semantic_coverage: &kin_cli::commands::locate::SemanticCoverage,
     key: &str,
     page: usize,
     page_size: usize,
@@ -6990,8 +7032,15 @@ fn semantic_locate_payload(
         "query": query,
         "granularity": if file_granularity { "file" } else { "entity" },
         "routing": "cosine-v0",
+        // One name, one type, on both arms and in the `_kin` envelope. This arm
+        // used to publish a bare `indexed / total` float under this key while the
+        // fused arm published the counter OBJECT under it and a THIRD field,
+        // `semantic_coverage_detail`, carried the object a second time. One
+        // response therefore spelled the same key as two types and the same
+        // object under two names (FIR-2415). The float is gone rather than
+        // renamed: `indexed` and `total` are right here, so nothing that read it
+        // has lost a number it cannot recompute.
         "semantic_coverage": semantic_coverage,
-        "semantic_coverage_detail": coverage_detail,
         "page": page,
         "total_ranked": total,
         "next_cursor": next_cursor,
@@ -7387,19 +7436,12 @@ fn build_semantic_locate_result(
     // Coverage is reported, never gated: a partially-embedded graph still
     // returns whatever the index can answer (graceful degradation per R5).
     //
-    // Both shapes come from ONE observation. The legacy `indexed / total` float
-    // is what this arm has always published, and it is the only shape here that
-    // no response envelope can be built from: a bare number carries no counts,
-    // so the negative beside it reported coverage unknown next to a coverage
-    // figure this same payload had just printed. The counters ride alongside
-    // under the key the fused arm already uses, and taking both from one
-    // measurement is what keeps them from disagreeing.
-    let coverage_detail = kin_cli::commands::locate::local_semantic_coverage(graph, None);
-    let semantic_coverage = if coverage_detail.total == 0 {
-        0.0_f32
-    } else {
-        coverage_detail.indexed as f32 / coverage_detail.total as f32
-    };
+    // ONE observation, published under one name. This arm used to publish a bare
+    // `indexed / total` float, which is the one shape no response envelope can be
+    // built from: a bare number carries no counts, so the negative beside it
+    // reported coverage unknown next to a coverage figure this same payload had
+    // just printed.
+    let semantic_coverage = kin_cli::commands::locate::local_semantic_coverage(graph, None);
 
     // Paging fast path: a valid cursor whose ranking is still cached at the
     // current graph version is windowed straight from cache — no re-search.
@@ -7423,8 +7465,7 @@ fn build_semantic_locate_result(
                 return semantic_locate_payload(
                     &query,
                     file_granularity,
-                    semantic_coverage,
-                    &coverage_detail,
+                    &semantic_coverage,
                     &parsed.key,
                     parsed.page,
                     page_size,
@@ -7718,8 +7759,7 @@ fn build_semantic_locate_result(
     semantic_locate_payload(
         &query,
         file_granularity,
-        semantic_coverage,
-        &coverage_detail,
+        &semantic_coverage,
         &key,
         0,
         page_size,
@@ -7734,17 +7774,48 @@ fn build_semantic_locate_result(
 /// paged graph-native `entities[]` (each act-on-able via `get_entity_source`),
 /// and the `next_cursor`/`page`/`total_ranked` paging fields — so a consumer
 /// parses every Kin locate surface with one schema. The fused arm's extra
-/// top-level fields ride alongside: `routing: "fused-v1"`, the query/granularity
-/// echo, and the structured `semantic_coverage_detail`. `degradations` and the
-/// struct `semantic_coverage` are already carried by the `LocateResult` itself.
+/// top-level fields ride alongside: `routing: "fused-v1"` and the
+/// query/granularity echo. `degradations` and `semantic_coverage` are already
+/// carried by the `LocateResult` itself, and `semantic_coverage` is the counter
+/// OBJECT there, which is the one name and the one type this surface publishes
+/// coverage under.
+///
+/// `snippet_alias` repeats each hit's `body` under a second `snippet` key for a
+/// consumer that reads that name. Off by default: the two keys held the same
+/// text, so every hit paid for its source twice and the response budget evicted
+/// real hits to make room for the copies (FIR-2415).
+///
+/// One field departs from the shared schema on purpose. A hit's
+/// `matched_queries` becomes `matched_variant_indexes` here, pointing into the
+/// response's own `queries` list; see [`write_locate_variant_indexes`] for why
+/// this surface, and only this surface, normalizes it.
 ///
 /// [`LocateResult`]: kin_cli::commands::locate::LocateResult
 fn fused_semantic_locate_payload(
     result: kin_cli::commands::locate::LocateResult,
     query: &str,
     file_granularity: bool,
+    snippet_alias: bool,
 ) -> kin_mcp::ToolCallResult {
-    let coverage_detail = result.semantic_coverage.clone();
+    // The variant list every hit indexes, serialized ONCE per response. Seeded
+    // from the fused echo the `LocateResult` already carries, then extended with
+    // any variant a hit names that the echo does not, so an index can never point
+    // past the end of the list. Nothing is appended on either live path: fusion
+    // builds both lists from the same variants, and a cursor page restores the
+    // echo from the cached ranking.
+    let mut variants: Vec<String> = result.queries.clone();
+    let matched_lists = result
+        .entities
+        .iter()
+        .map(|entity| &entity.matched_queries)
+        .chain(result.files.iter().map(|file| &file.matched_queries));
+    for matched in matched_lists {
+        for text in matched {
+            if !variants.iter().any(|variant| variant == text) {
+                variants.push(text.clone());
+            }
+        }
+    }
     // Serialize the reused CLI types rather than duplicating their JSON shape:
     // this is the single source of the locate schema, so the MCP surface can
     // never drift from `kin locate --json`.
@@ -7769,8 +7840,12 @@ fn fused_semantic_locate_payload(
     // restart from an absent field. The cosine arm always states its page; now both
     // arms answer the question the same way.
     payload.insert("page".to_string(), json!(result.page));
-    if let Some(coverage) = coverage_detail {
-        payload.insert("semantic_coverage_detail".to_string(), json!(coverage));
+    // The one list the per-hit variant attribution indexes. Written explicitly
+    // rather than left to the `LocateResult` serialization, because a cursor page
+    // restores it from the cached ranking and the two paths must publish the same
+    // key. Absent when nothing was fused, so a single-query response is unchanged.
+    if !variants.is_empty() {
+        payload.insert("queries".to_string(), json!(variants));
     }
 
     // Attach the additive per-hit `match_evidence` to each serialized entity,
@@ -7783,16 +7858,23 @@ fn fused_semantic_locate_payload(
                 continue;
             }
             slot["match_evidence"] = fused_match_evidence(query, entity);
-            // The two `semantic_locate` arms carried the same graph-owned
-            // excerpt under different names: the cosine arm called it
-            // `snippet`, the fused arm `body`. An agent that set
-            // `include_snippet` and looked for `snippet` therefore found no
-            // snippet key at all on whichever arm its profile happened to
-            // serve. Mirror the field so `include_snippet` means one thing on
-            // both arms, and keep `body` for the locate-schema parity that
-            // consumers of `kin locate --json` already parse.
-            if let Some(body) = entity.body.as_ref() {
-                slot["snippet"] = json!(body);
+            write_locate_variant_indexes(slot, &entity.matched_queries, &variants);
+            // This arm carries one text per hit, under `body`, which is the name
+            // `kin locate --json` and `POST /locate` already use and the name the
+            // tool description points a caller at for this pipeline.
+            //
+            // It used to carry that same text a second time under `snippet`, to
+            // spare an agent from learning which arm it was talking to. The copy
+            // cost what the answer cost: on the measured stranger transcripts a
+            // locate response ran three times the next most expensive tool, and
+            // once the response budget landed the duplicate began evicting real
+            // hits to make room for itself. Naming the field in the tool
+            // description solves the discovery problem for free, so the mirror is
+            // now an explicit opt-in for a consumer that already reads `snippet`.
+            if snippet_alias {
+                if let Some(body) = entity.body.as_ref() {
+                    slot["snippet"] = json!(body);
+                }
             }
             // State the id space from the hit rather than assuming it. This was
             // a constant `entity` for as long as the fused projection could only
@@ -7802,6 +7884,17 @@ fn fused_semantic_locate_payload(
             // identity is written through the SAME writer the cosine arm uses,
             // so an artifact hit reads identically whichever arm answered.
             write_locate_hit_identity(slot, &locate_entity_identity(entity));
+        }
+    }
+
+    // The file surface carries the same attribution, so it pays the same cost:
+    // ten ranked files under a four-variant fan-out serialized forty query
+    // strings the response already listed once.
+    if let Some(serde_json::Value::Array(file_values)) = payload.get_mut("files") {
+        for (slot, file) in file_values.iter_mut().zip(result.files.iter()) {
+            if slot.is_object() {
+                write_locate_variant_indexes(slot, &file.matched_queries, &variants);
+            }
         }
     }
 
@@ -7817,12 +7910,15 @@ fn fused_semantic_locate_payload(
 /// an explicit per-call `pipeline: "cosine"` selects the legacy arm.
 ///
 /// Contract: args `{query, limit?=20, page_size?, cursor?,
-/// granularity?="entity"|"file", include_snippet?=true, explain?=false,
-/// pipeline?}`. The response is the SAME schema `kin locate --json` emits —
-/// the reused `LocateResult` types (`files[].symbols[]` plus the paged
-/// graph-native `entities[]`) — with the fused extras `routing: "fused-v1"`,
-/// `semantic_coverage_detail`, and `degradations` alongside, so a caller can
-/// tell which pipeline answered and parse it with the one locate schema.
+/// granularity?="entity"|"file", include_snippet?=true, snippet_alias?=false,
+/// explain?=false, pipeline?}`. The response is the SAME schema
+/// `kin locate --json` emits, meaning the reused `LocateResult` types
+/// (`files[].symbols[]` plus the paged graph-native `entities[]`), carrying the
+/// fused extras `routing: "fused-v1"`, `semantic_coverage`, and `degradations`
+/// alongside, so a caller can tell which pipeline answered and parse it with the
+/// one locate schema. This arm's source text is on `body`, and
+/// `snippet_alias: true` repeats it under `snippet` for a consumer that reads
+/// that name.
 ///
 /// Paging is arm-symmetric with the cosine arm and `POST /locate`: `page_size`
 /// (default `limit`) windows the graph-native `entities[]` ranking, the full
@@ -7873,6 +7969,14 @@ async fn build_fused_semantic_locate_result(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(true)
         && !file_granularity;
+    // Off by default. This repeats each hit's `body` under a second `snippet`
+    // key for a consumer that reads that name, and a repeat of the text is the
+    // most expensive thing a hit can carry.
+    let snippet_alias = include_snippet
+        && arguments
+            .get("snippet_alias")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
     let explain = arguments
         .get("explain")
         .and_then(serde_json::Value::as_bool)
@@ -7922,11 +8026,14 @@ async fn build_fused_semantic_locate_result(
                     // key minted in the other body mode. Keying is not enough;
                     // the held ranking's mode has to match this request's.
                     .filter(|entry| entry.mode == snippet_opts.projection_mode())
-                    .map(|entry| entry.entities.clone())
+                    .map(|entry| (entry.entities.clone(), entry.queries.clone()))
             };
-            if let Some(entities) = cached {
+            if let Some((entities, queries)) = cached {
+                // The variant echo travels with the ranking, so a paged response
+                // carries the list its hits' `matched_variant_indexes` point into.
                 let mut result = kin_cli::commands::locate::LocateResult {
                     entities,
+                    queries,
                     ..Default::default()
                 };
                 kin_cli::commands::locate::apply_entity_page(
@@ -7942,7 +8049,12 @@ async fn build_fused_semantic_locate_result(
                         graph,
                         Some(state.graph.as_ref()),
                     ));
-                return fused_semantic_locate_payload(result, &query, file_granularity);
+                return fused_semantic_locate_payload(
+                    result,
+                    &query,
+                    file_granularity,
+                    snippet_alias,
+                );
             }
         }
         // Cache miss / stale / undecodable cursor: fall through to a fresh run
@@ -8015,12 +8127,13 @@ async fn build_fused_semantic_locate_result(
         state,
         &key,
         &locate_result.entities,
+        &locate_result.queries,
         graph_version,
         snippet_opts.projection_mode(),
     );
     kin_cli::commands::locate::apply_entity_page(&mut locate_result, &key, 0, page_size);
 
-    fused_semantic_locate_payload(locate_result, &query, file_granularity)
+    fused_semantic_locate_payload(locate_result, &query, file_granularity, snippet_alias)
 }
 
 /// Map a resolved [`kin_cli::commands::graph::EntitySourceOutcome`] to an MCP
@@ -12763,7 +12876,6 @@ mod tests {
         let tool = semantic_locate_payload(
             "where does the daemon start",
             false,
-            1.0,
             &coverage,
             "cursor-key",
             page,
@@ -13086,7 +13198,7 @@ mod tests {
     }
 
     #[test]
-    fn fused_match_evidence_reports_matched_variants_under_fusion() {
+    fn a_hit_indexes_the_response_variant_list_instead_of_copying_it() {
         use kin_cli::commands::locate::{LocateEntity, LocateProvenance};
         let mut entity = LocateEntity {
             entity_id: "e1".into(),
@@ -13107,16 +13219,44 @@ mod tests {
             },
             matched_queries: Vec::new(),
         };
-        // No attribution → no matched_variants key (single-query byte-identical).
-        assert!(fused_match_evidence("q", &entity)
-            .get("matched_variants")
-            .is_none());
-        // With attribution → the variant texts are surfaced additively.
+        let variants = vec![
+            "q".to_string(),
+            "ParseRequest".to_string(),
+            "parse the request".to_string(),
+        ];
+
+        // No attribution → no attribution key (single-query byte-identical).
+        let mut slot = json!({ "entity_id": "e1" });
+        write_locate_variant_indexes(&mut slot, &entity.matched_queries, &variants);
+        assert!(slot.get("matched_variant_indexes").is_none(), "{slot}");
+
+        // With attribution → POSITIONS in the response's own variant list, and
+        // the hit's own copy of the text is gone. FIR-2415: the text copies were
+        // the cost, so a hit that serializes a variant string has regressed.
         entity.matched_queries = vec!["ParseRequest".into(), "parse the request".into()];
-        let ev = fused_match_evidence("q", &entity);
-        assert_eq!(
-            ev["matched_variants"],
-            json!(["ParseRequest", "parse the request"])
+        let mut slot = json!({
+            "entity_id": "e1",
+            "matched_queries": entity.matched_queries.clone(),
+        });
+        write_locate_variant_indexes(&mut slot, &entity.matched_queries, &variants);
+        assert_eq!(slot["matched_variant_indexes"], json!([1, 2]));
+        assert!(
+            slot.get("matched_queries").is_none(),
+            "the variant text must be carried once per response, not once per hit: {slot}"
+        );
+        let serialized = serde_json::to_string(&slot).expect("hit serializes");
+        assert!(
+            !serialized.contains("parse the request"),
+            "no hit may serialize a variant string: {serialized}"
+        );
+
+        // The evidence object carries no attribution of its own any more, so the
+        // two copies cannot come back one at a time.
+        let evidence = fused_match_evidence("q", &entity);
+        assert!(
+            evidence.get("matched_variants").is_none()
+                && evidence.get("matched_variant_indexes").is_none(),
+            "attribution belongs to the hit, not to a second object on it: {evidence}"
         );
     }
 
@@ -13146,7 +13286,7 @@ mod tests {
             entities: vec![mk("a", "alpha"), mk("b", "beta")],
             ..Default::default()
         };
-        let tool = fused_semantic_locate_payload(result, "alpha", false);
+        let tool = fused_semantic_locate_payload(result, "alpha", false, false);
         let payload: serde_json::Value = serde_json::from_str(
             tool_result_json(&tool)["content"][0]["text"]
                 .as_str()
@@ -13179,7 +13319,19 @@ mod tests {
         result: kin_cli::commands::locate::LocateResult,
         query: &str,
     ) -> serde_json::Value {
-        let tool = fused_semantic_locate_payload(result, query, false);
+        fused_locate_body_with_alias(result, query, false)
+    }
+
+    /// The same body, with the opt-in `snippet` repeat under the caller's
+    /// control. `snippet_alias: true` reproduces exactly the shape every fused
+    /// response carried before FIR-2415, which is what makes a before-and-after
+    /// measurement possible inside one build.
+    fn fused_locate_body_with_alias(
+        result: kin_cli::commands::locate::LocateResult,
+        query: &str,
+        snippet_alias: bool,
+    ) -> serde_json::Value {
+        let tool = fused_semantic_locate_payload(result, query, false, snippet_alias);
         serde_json::from_str(
             tool_result_json(&tool)["content"][0]["text"]
                 .as_str()
@@ -28923,33 +29075,35 @@ mod tests {
             kin_mcp::ContentBlock::Text { text } => text,
         };
         let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
-        assert!(
-            parsed.get("semantic_coverage").is_some(),
-            "response must carry semantic_coverage"
-        );
-        // FIR-2216: the legacy field is a bare ratio, which no response
-        // envelope can be built from, so the negative beside it reported
-        // coverage unknown next to this very number. The counters ride along
-        // under the key the fused arm already uses, and the envelope lift reads
-        // them, so the two coverage fields in one reply agree.
-        let detail = parsed
-            .get("semantic_coverage_detail")
-            .expect("cosine payload carries the structured coverage counters");
+        // FIR-2216 + FIR-2415: ONE name, ONE type. The legacy field under this
+        // key was a bare ratio, which no response envelope can be built from, so
+        // the negative beside it reported coverage unknown next to this very
+        // number; the counters then rode along under a SECOND name, which left
+        // one response spelling `semantic_coverage` as a float here and as an
+        // object in `_kin`. Both arms now publish the counter object under this
+        // one key and nothing carries a second copy.
+        let coverage = parsed
+            .get("semantic_coverage")
+            .expect("cosine payload carries the coverage counters");
         for counter in ["indexed", "total", "pending"] {
             assert!(
-                detail
+                coverage
                     .get(counter)
                     .and_then(|value| value.as_u64())
                     .is_some(),
-                "semantic_coverage_detail must carry {counter}: {detail}"
+                "semantic_coverage must carry {counter}: {coverage}"
             );
         }
         assert!(
-            detail
+            coverage
                 .get("complete")
                 .and_then(|value| value.as_bool())
                 .is_some(),
-            "semantic_coverage_detail must state completeness: {detail}"
+            "semantic_coverage must state completeness: {coverage}"
+        );
+        assert!(
+            parsed.get("semantic_coverage_detail").is_none(),
+            "the counters must not ship a second time under a second name: {parsed}"
         );
         let lifted = kin_mcp::Envelope::daemon().with_payload_metadata(&parsed);
         assert!(
@@ -29213,15 +29367,41 @@ mod tests {
         .await;
         let hits = fused["entities"].as_array().unwrap();
         assert!(!hits.is_empty(), "expected a fused hit: {fused}");
-        let snippet = hits[0]["snippet"]
+        let body = hits[0]["body"]
             .as_str()
-            .unwrap_or_else(|| panic!("fused hit must carry a `snippet` key: {}", hits[0]));
+            .unwrap_or_else(|| panic!("fused hit must carry a `body` key: {}", hits[0]));
         assert!(
-            snippet.contains("return {\"path\": path}"),
-            "the snippet must be the entity's graph-owned source: {snippet}"
+            body.contains("return {\"path\": path}"),
+            "the body must be the entity's graph-owned source: {body}"
         );
-        // `body` stays for the locate-schema parity consumers already parse.
-        assert_eq!(hits[0]["body"].as_str(), Some(snippet));
+        // FIR-2415: ONE text per hit. `body` is this arm's name for it, the same
+        // name `kin locate --json` uses, and `snippet` no longer repeats it.
+        assert!(
+            hits[0].get("snippet").is_none(),
+            "the source text must be carried once per hit: {}",
+            hits[0]
+        );
+
+        // The repeat is still reachable for a consumer that reads `snippet`, but
+        // only when it asks for it.
+        let aliased = call_semantic_locate(
+            app.clone(),
+            json!({
+                "query": "parse config",
+                "limit": 5,
+                "pipeline": "fused",
+                "include_snippet": true,
+                "snippet_alias": true
+            }),
+        )
+        .await;
+        let aliased_hits = aliased["entities"].as_array().unwrap();
+        assert_eq!(
+            aliased_hits[0]["snippet"].as_str(),
+            aliased_hits[0]["body"].as_str(),
+            "snippet_alias repeats the body verbatim: {}",
+            aliased_hits[0]
+        );
 
         // Suppression is honored, not ignored: no snippet key when opted out.
         let suppressed = call_semantic_locate(
@@ -30310,17 +30490,18 @@ mod tests {
             call_semantic_locate(app, json!({ "query": "parse config", "pipeline": "fused" }))
                 .await;
         assert_eq!(payload["routing"], "fused-v1");
-        let detail = payload["semantic_coverage_detail"]
+        let coverage = payload["semantic_coverage"]
             .as_object()
-            .expect("structured semantic_coverage_detail is preserved");
-        assert!(detail.contains_key("indexed"));
-        assert!(detail.contains_key("total"));
-        assert!(detail.contains_key("complete"));
-        // The struct `semantic_coverage` rides on the LocateResult itself, so the
-        // two coverage surfaces agree rather than drifting.
-        assert_eq!(
-            payload["semantic_coverage"],
-            payload["semantic_coverage_detail"]
+            .expect("the coverage counters ride on the LocateResult itself");
+        assert!(coverage.contains_key("indexed"));
+        assert!(coverage.contains_key("total"));
+        assert!(coverage.contains_key("complete"));
+        // FIR-2415: the same object used to ship again under
+        // `semantic_coverage_detail`, so one response carried the counters twice
+        // and the shared key named two different types across the two arms.
+        assert!(
+            payload.get("semantic_coverage_detail").is_none(),
+            "coverage ships under one name: {payload}"
         );
         // `degradations` is a LocateResult field: omitted on a clean run, an
         // array when a capability degraded — never a bespoke shape.
@@ -30649,6 +30830,7 @@ mod tests {
             make_result(),
             "where HTTP redirects are actually resolved and followed",
             false,
+            false,
         ));
         assert!(
             unbounded.len() > kin_mcp::budget::RESPONSE_DEFAULT_MAX_CHARS,
@@ -30663,6 +30845,7 @@ mod tests {
             fused_semantic_locate_payload(
                 make_result(),
                 "where HTTP redirects are actually resolved and followed",
+                false,
                 false,
             ),
             "semantic_locate",
@@ -30722,6 +30905,367 @@ mod tests {
                 .unwrap_or_default()
                 .contains("symbol roll-up"),
             "the disclosure names what it took: {cut}"
+        );
+    }
+
+    /// FIR-2415: a fused hit carries its source text ONCE.
+    ///
+    /// `body` and `snippet` held the same string on every hit, and the only
+    /// control was `include_snippet: false`, which removed the text the caller
+    /// wanted rather than the copy it did not ask for. `body` is this arm's name
+    /// for the text, the one `kin locate --json` and `POST /locate` already use,
+    /// and the tool description now points a caller at it, so the repeat is an
+    /// opt-in rather than the default.
+    #[test]
+    fn a_fused_hit_carries_its_source_text_once() {
+        use kin_cli::commands::locate::LocateResult;
+        let source = "def resolve_redirects(self, resp, req):\n    return self.next_request\n";
+        let make = || {
+            let mut entity = fused_locate_entity("resolve_redirects");
+            entity.body = Some(source.to_string());
+            LocateResult {
+                entities: vec![entity],
+                ..Default::default()
+            }
+        };
+
+        let payload = fused_locate_body(make(), "where redirects are followed");
+        let hit = &payload["entities"][0];
+        assert_eq!(
+            hit["body"].as_str(),
+            Some(source),
+            "the fused arm carries its text on `body`: {hit}"
+        );
+        assert!(
+            hit.get("snippet").is_none(),
+            "the same text must not ship twice on one hit: {hit}"
+        );
+        let text = serde_json::to_string(&payload).expect("payload serializes");
+        assert_eq!(
+            text.matches("return self.next_request").count(),
+            1,
+            "the source appears once in the whole response: {text}"
+        );
+
+        // Still reachable for a consumer that reads `snippet`, but only on ask.
+        let aliased = fused_locate_body_with_alias(make(), "where redirects are followed", true);
+        let aliased_hit = &aliased["entities"][0];
+        assert_eq!(
+            aliased_hit["snippet"].as_str(),
+            Some(source),
+            "snippet_alias repeats the body verbatim: {aliased_hit}"
+        );
+        assert_eq!(aliased_hit["body"].as_str(), Some(source));
+    }
+
+    /// FIR-2415: the fan-out list is serialized once per response.
+    ///
+    /// Every hit used to carry the matched-variant TEXT, so a four-variant
+    /// fan-out over twelve hits serialized forty-eight query strings to say what
+    /// forty-eight small integers say. Hits index the response's own `queries`
+    /// echo instead.
+    #[test]
+    fn the_fused_variant_list_is_serialized_once_per_response() {
+        use kin_cli::commands::locate::LocateResult;
+        let variants = vec![
+            "resolve_redirects".to_string(),
+            "follow the redirect chain and build the next request".to_string(),
+            "Location header handling for 301 302 303 307 308".to_string(),
+        ];
+        let entities: Vec<_> = ["alpha", "beta", "gamma", "delta"]
+            .iter()
+            .map(|name| {
+                let mut entity = fused_locate_entity(name);
+                entity.matched_queries = variants.clone();
+                entity
+            })
+            .collect();
+        let files: Vec<_> = ["src/sessions.py", "src/adapters.py"]
+            .iter()
+            .map(|path| kin_cli::commands::locate::LocateFileEntry {
+                path: (*path).to_string(),
+                score: 0.5,
+                signals: vec!["vector".into()],
+                spans: vec![[1, 20]],
+                symbols: Vec::new(),
+                explain: Vec::new(),
+                provenance: None,
+                signal_scores: None,
+                score_breakdown: None,
+                matched_queries: variants.clone(),
+            })
+            .collect();
+        let result = LocateResult {
+            entities,
+            files,
+            queries: variants.clone(),
+            ..Default::default()
+        };
+
+        let payload = fused_locate_body(result, &variants[0]);
+        assert_eq!(
+            payload["queries"],
+            json!(variants),
+            "the fan-out is echoed once, in fusion order: {payload}"
+        );
+        for hit in payload["entities"].as_array().unwrap() {
+            assert_eq!(
+                hit["matched_variant_indexes"],
+                json!([0, 1, 2]),
+                "a hit points into the list rather than copying it: {hit}"
+            );
+            assert!(
+                hit.get("matched_queries").is_none()
+                    && hit["match_evidence"].get("matched_variants").is_none(),
+                "no hit may carry the variant text, in either place it used to: {hit}"
+            );
+        }
+        let text = serde_json::to_string(&payload).expect("payload serializes");
+        // The primary appears twice by design: once as the `query` echo and once
+        // in the fan-out list. Every other variant appears exactly once, however
+        // many of the four hits it surfaced.
+        assert_eq!(
+            text.matches(variants[0].as_str()).count(),
+            2,
+            "the primary is the query echo plus one list entry: {text}"
+        );
+        for variant in &variants[1..] {
+            assert_eq!(
+                text.matches(variant.as_str()).count(),
+                1,
+                "a variant is serialized once per response, not once per hit: {text}"
+            );
+        }
+        // The file surface carries the same attribution and pays the same cost,
+        // so it is normalized the same way.
+        for file in payload["files"].as_array().unwrap() {
+            assert_eq!(file["matched_variant_indexes"], json!([0, 1, 2]), "{file}");
+            assert!(file.get("matched_queries").is_none(), "{file}");
+        }
+    }
+
+    /// A cursor page runs no retrieval, so it used to drop the fused `queries`
+    /// echo while its hits still named their variants one by one. The echo now
+    /// travels with the cached ranking; this holds the serializer's own half of
+    /// that, so an index can never point past the end of a list the response does
+    /// not carry.
+    #[test]
+    fn a_result_with_no_variant_echo_still_publishes_the_list_its_hits_index() {
+        use kin_cli::commands::locate::LocateResult;
+        let mut entity = fused_locate_entity("resolve_redirects");
+        entity.matched_queries = vec!["first variant".into(), "second variant".into()];
+        let result = LocateResult {
+            entities: vec![entity],
+            // A page carries no echo of its own; the serializer derives it from
+            // the hits rather than emitting indices into nothing.
+            ..Default::default()
+        };
+
+        let payload = fused_locate_body(result, "primary");
+        assert_eq!(
+            payload["queries"],
+            json!(["first variant", "second variant"]),
+            "the list an index points into must be in the response: {payload}"
+        );
+        assert_eq!(
+            payload["entities"][0]["matched_variant_indexes"],
+            json!([0, 1])
+        );
+    }
+
+    /// The cached ranking holds the variant echo, so a cursor page reports the
+    /// fan-out it came from instead of dropping it.
+    #[test]
+    fn the_ranking_cache_holds_the_variant_echo_with_the_ranking() {
+        let state = test_state();
+        let variants = vec!["primary text".to_string(), "second variant".to_string()];
+        cache_locate_ranking(
+            &state,
+            "ranking-key",
+            &[fused_locate_entity("resolve_redirects")],
+            &variants,
+            7,
+            "entities+bodies",
+        );
+        let cache = state.locate_rankings.lock().unwrap();
+        let entry = cache.get("ranking-key").expect("the ranking is cached");
+        assert_eq!(
+            entry.queries, variants,
+            "a page has no other way back to the variants it was fused from"
+        );
+    }
+
+    /// FIR-2415: coverage is one name with one type on the cosine arm too.
+    ///
+    /// This arm published a bare `indexed / total` float under
+    /// `semantic_coverage` and the counter object under a second name, while the
+    /// fused arm and the `_kin` envelope published the OBJECT under the shared
+    /// name. One response therefore spelled one key as two types.
+    #[test]
+    fn the_cosine_arm_publishes_coverage_under_one_name_as_one_object() {
+        let payload = cosine_locate_body(
+            &[cosine_row(
+                "start_daemon",
+                Some("src/daemon.rs"),
+                0.9,
+                Some((10, 20)),
+            )],
+            0,
+            10,
+        );
+        let coverage = payload["semantic_coverage"]
+            .as_object()
+            .unwrap_or_else(|| panic!("coverage is the counter object: {payload}"));
+        for counter in ["indexed", "total", "pending"] {
+            assert!(
+                coverage.get(counter).and_then(|v| v.as_u64()).is_some(),
+                "coverage carries {counter}: {payload}"
+            );
+        }
+        assert!(
+            payload.get("semantic_coverage_detail").is_none(),
+            "the counters must not ship again under a second name: {payload}"
+        );
+        // The envelope reads the one name and reports it, so the coverage in
+        // `_kin` and the coverage in the payload are the same observation.
+        let lifted = kin_mcp::Envelope::daemon().with_payload_metadata(&payload);
+        assert!(
+            lifted.semantic_coverage.is_some(),
+            "the envelope must lift this payload's coverage: {payload}"
+        );
+    }
+
+    /// FIR-2415: with the response budget in force, the body copy does not just
+    /// waste characters, it evicts the answer.
+    ///
+    /// One fixture, one budget, serialized twice: as the arm ships now (one text
+    /// per hit) and with `snippet_alias`, which reproduces exactly the shape
+    /// every fused response carried before this fix. The budget ladder sheds
+    /// inline source across the WHOLE response before it withholds any hit, so a
+    /// response pushed past the bound by its own copies comes back with every
+    /// hit stripped of the source the caller asked for.
+    #[test]
+    fn removing_the_body_copy_buys_answer_inside_the_same_budget() {
+        use kin_cli::commands::locate::LocateResult;
+        let body = |name: &str| {
+            format!(
+                "def {name}(self, resp, req, stream=False, timeout=None, verify=True):\n{}",
+                "    hist = []  # keep track of history of redirects for this request\n".repeat(18)
+            )
+        };
+        let make_result = || LocateResult {
+            entities: (0..10)
+                .map(|index| {
+                    let mut entity = fused_locate_entity(&format!("resolve_redirects_{index}"));
+                    entity.entity_id = format!("0000{index:04}-0000-4000-8000-000000000000");
+                    entity.provenance.file = Some(format!("requests/sessions_{index}.py"));
+                    entity.span = Some([100 + index as u32, 220 + index as u32]);
+                    entity.body = Some(body(&format!("resolve_redirects_{index}")));
+                    entity
+                })
+                .collect(),
+            total_ranked: 47,
+            next_cursor: Some("deadbeefdeadbeef.1".to_string()),
+            ..Default::default()
+        };
+        let query = "where HTTP redirects are actually resolved and followed";
+        let budget = kin_mcp::budget::ResponseBudget::default().less_envelope_reserve();
+
+        let measure = |snippet_alias: bool| {
+            let raw = mcp_result_text(&fused_semantic_locate_payload(
+                make_result(),
+                query,
+                false,
+                snippet_alias,
+            ))
+            .len();
+            let bounded = mcp_result_text(&bound_mcp_tool_result(
+                fused_semantic_locate_payload(make_result(), query, false, snippet_alias),
+                "semantic_locate",
+                &budget,
+            ));
+            let payload: serde_json::Value =
+                serde_json::from_str(&bounded).expect("a bounded locate response is still JSON");
+            let hits = payload["entities"].as_array().expect("hits survive").len();
+            let with_source = payload["entities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|hit| hit.get("body").is_some() || hit.get("snippet").is_some())
+                .count();
+            (raw, bounded.len(), hits, with_source)
+        };
+
+        let (fixed_raw, fixed_bounded, fixed_hits, fixed_with_source) = measure(false);
+        let (copy_raw, copy_bounded, copy_hits, copy_with_source) = measure(true);
+        eprintln!(
+            "FIR-2415 semantic_locate at budget {}: one text per hit = {fixed_raw} chars raw, \
+             {fixed_bounded} bounded, {fixed_hits} hits, {fixed_with_source} carrying source; \
+             body copied to snippet = {copy_raw} chars raw, {copy_bounded} bounded, {copy_hits} \
+             hits, {copy_with_source} carrying source",
+            budget.max_chars
+        );
+
+        assert!(
+            copy_raw > fixed_raw,
+            "the copy is what costs: {copy_raw} against {fixed_raw}"
+        );
+        assert!(
+            fixed_with_source > copy_with_source,
+            "the same budget must buy more answer without the copy: {fixed_with_source} hits \
+             carry source against {copy_with_source}"
+        );
+        assert_eq!(
+            fixed_with_source, fixed_hits,
+            "every hit inside the budget still carries its source: {fixed_hits} hits, \
+             {fixed_with_source} with source"
+        );
+        assert!(
+            fixed_bounded <= budget.max_chars && copy_bounded <= budget.max_chars,
+            "both arms still honour the bound: {fixed_bounded} and {copy_bounded} against {}",
+            budget.max_chars
+        );
+    }
+
+    /// The fix is a serialization change and nothing else: an unbounded request
+    /// returns the same entities, in the same order, whether or not the second
+    /// copy of the text is asked for.
+    #[test]
+    fn the_snippet_repeat_never_changes_which_entities_are_returned_or_their_order() {
+        use kin_cli::commands::locate::LocateResult;
+        let names = ["gamma", "alpha", "delta", "beta"];
+        let make_result = || LocateResult {
+            entities: names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| {
+                    let mut entity = fused_locate_entity(name);
+                    entity.entity_id = format!("0000{index:04}-0000-4000-8000-000000000000");
+                    entity.body = Some(format!("def {name}():\n    return {index}\n"));
+                    entity
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let ids = |payload: &serde_json::Value| -> Vec<String> {
+            payload["entities"]
+                .as_array()
+                .expect("entities")
+                .iter()
+                .map(|hit| hit["entity_id"].as_str().unwrap_or_default().to_string())
+                .collect()
+        };
+
+        let fixed = fused_locate_body_with_alias(make_result(), "q", false);
+        let aliased = fused_locate_body_with_alias(make_result(), "q", true);
+        let expected: Vec<String> = (0..names.len())
+            .map(|index| format!("0000{index:04}-0000-4000-8000-000000000000"))
+            .collect();
+        assert_eq!(ids(&fixed), expected, "ranking order is untouched");
+        assert_eq!(
+            ids(&fixed),
+            ids(&aliased),
+            "the same request returns the same hits in the same order either way"
         );
     }
 

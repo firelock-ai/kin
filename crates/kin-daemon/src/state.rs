@@ -1339,6 +1339,14 @@ pub struct DaemonState {
 /// graph moved under the cursor) is rejected rather than served.
 pub struct CachedLocateRanking {
     pub entities: Vec<kin_cli::commands::locate::LocateEntity>,
+    /// The fused query variants this ranking was built from, primary first, or
+    /// empty when nothing was fused.
+    ///
+    /// Held with the ranking because a cursor page runs no retrieval and has no
+    /// other way back to them. Without it a paged fused response dropped the
+    /// variant echo while its hits still named variants one by one, which is why
+    /// per-hit attribution could not simply index the response's own list.
+    pub queries: Vec<String>,
     pub graph_version: u64,
     /// Which entity projection this ranking was built in
     /// ([`kin_cli::commands::locate::projection_mode`]).
