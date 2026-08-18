@@ -290,7 +290,7 @@ reaches the graph over the same MCP server every other client uses.
 
 ```sh
 kin agent run --task "Find where the retry backoff is computed and document it" \
-  --model qwen/qwen3.6-35b-a3b --base-url http://127.0.0.1:1234/v1
+  --model qwen/qwen3.6-35b-a3b --base-url http://localhost:1234/v1
 ```
 
 What makes it different from pointing another agent at the MCP server is that the
