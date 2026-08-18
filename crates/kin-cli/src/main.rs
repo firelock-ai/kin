@@ -523,6 +523,12 @@ enum Command {
         /// bodies, and then steps, to fit (default 80000).
         #[arg(long = "max-response-chars", value_name = "C")]
         max_response_chars: Option<usize>,
+        /// Walk through a type-annotation edge to a type this repository
+        /// defines. Off by default, because a shared type name otherwise joins
+        /// every entity that annotates with it to every other one. A target
+        /// this repository does not define stays a leaf either way.
+        #[arg(long = "include-type-edges", default_value_t = false)]
+        include_type_edges: bool,
     },
     /// Show this repository's recorded cross-repo dependencies
     Deps {
@@ -3012,6 +3018,7 @@ fn main() -> Result<()> {
                     limit_per_step,
                     no_bodies,
                     max_response_chars,
+                    include_type_edges,
                 } => {
                     commands::trace_data_flow::run_seeded(
                         focal,
@@ -3020,6 +3027,7 @@ fn main() -> Result<()> {
                         limit_per_step,
                         no_bodies.then_some(false),
                         max_response_chars,
+                        include_type_edges.then_some(true),
                     )
                     .await
                 }

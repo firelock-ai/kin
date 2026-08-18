@@ -559,6 +559,7 @@ pub async fn run_seeded(
     limit_per_step: Option<usize>,
     include_body: Option<bool>,
     max_response_chars: Option<usize>,
+    include_type_edges: Option<bool>,
 ) -> Result<()> {
     let direction = match direction {
         Some(value) => Some(TraceDirection::parse(&value)?),
@@ -571,7 +572,7 @@ pub async fn run_seeded(
         limit_per_step,
         include_body,
         max_response_chars,
-        include_type_edges: None,
+        include_type_edges,
     };
     let layout = crate::commands::require_repository_layout()?;
     let response = run_daemon_trace_data_flow(&layout, &request).await?;
