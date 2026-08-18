@@ -19,6 +19,16 @@ on:
         description: Reviewed kin-vfs commit pinned by the calling release workflow.
         required: true
         type: string
+      local_artifact:
+        description: >
+          Name of an artifact in the CALLING run holding binaries this pull
+          request built, packaged in the release archive layout with its
+          checksum sidecar, the public installer, and the version, commit, and
+          Cargo.lock digest they were built from. Blank runs the public-release
+          proof unchanged. Non-blank runs the same proof against those bytes.
+        required: false
+        type: string
+        default: ""
   workflow_dispatch:
     inputs:
       release_tag:
@@ -50,22 +60,25 @@ jobs:
     continue-on-error: ${{ matrix.experimental == true }}
     strategy:
       fail-fast: false
+      # The reviewed release matrix is what every public release still proves.
+      # A pull-request run installs binaries built from that pull request, which
+      # exist for exactly one platform, so it collapses to the Linux leg rather
+      # than installing a released archive on the other four. Both lists are
+      # decoded and pinned by the release authority suite, so neither can grow,
+      # shrink, or gain an experimental row unreviewed.
+      #
+      # The pull-request list is the OVERRIDE and the release list is what an
+      # absent input falls back to. That direction is the whole point: this
+      # workflow also runs on `release: published` and on a schedule, where the
+      # `inputs` context is empty, and a condition that read the empty case as
+      # the override would silently drop four reviewed platforms from the
+      # release gate. Truthiness answers null and "" identically, so neither
+      # spelling of absent can reach the one-platform list.
       matrix:
-        include:
-          - os: ubuntu-latest
-            setup-shell: bash
-          - os: ubuntu-24.04-arm
-            setup-shell: bash
-          - os: macos-latest
-            setup-shell: zsh
-          - os: macos-15-intel
-            setup-shell: zsh
-          - os: windows-latest
-            setup-shell: powershell
-            experimental: true
+        include: ${{ fromJSON(inputs.local_artifact && '[{"os":"ubuntu-latest","setup-shell":"bash"}]' || '[{"os":"ubuntu-latest","setup-shell":"bash"},{"os":"ubuntu-24.04-arm","setup-shell":"bash"},{"os":"macos-latest","setup-shell":"zsh"},{"os":"macos-15-intel","setup-shell":"zsh"},{"os":"windows-latest","setup-shell":"powershell","experimental":true}]') }}
     steps:
       - name: Public install (Unix)
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && !inputs.local_artifact
         env:
           RELEASE_EVENT_TAG: ${{ inputs.release_tag || github.event.release.tag_name || '' }}
         run: |
@@ -95,11 +108,45 @@ jobs:
           irm https://get.kinlab.dev/install.ps1 | iex
           "$HOME\.kin\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
+      - name: Download the pull request release archive
+        if: inputs.local_artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: ${{ inputs.local_artifact }}
+          path: ${{ runner.temp }}/kin-pull-request-release
+
+      # A pull request has no published release to install from, so it serves
+      # its own archive over `file://` and hands it to the SAME installer the
+      # public proof runs. KIN_BASE_URL is the installer's own documented
+      # offline path, so nothing here reimplements extraction, the mandatory
+      # daemon assertion, the registry-authority check, or the binary moves:
+      # a break in any of them is a break here too.
+      - name: Pull request install (Unix)
+        if: runner.os != 'Windows' && inputs.local_artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$RUNNER_OS/$RUNNER_ARCH" in
+            Linux/X64) ;;
+            *) echo "pull-request install proof is built for Linux/X64 only, not $RUNNER_OS/$RUNNER_ARCH" >&2; exit 1 ;;
+          esac
+          staged="$RUNNER_TEMP/kin-pull-request-release"
+          version="$(cat "$staged/expected-version.txt")"
+          served="$RUNNER_TEMP/kin-pull-request-served"
+          mkdir -p "$served/download/v$version"
+          cp "$staged/kin-linux-x86_64.tar.gz" \
+            "$staged/kin-linux-x86_64.tar.gz.sha256" \
+            "$served/download/v$version/"
+          KIN_NO_SETUP=1 KIN_VERSION="$version" KIN_BASE_URL="file://$served" \
+            sh "$staged/install.sh"
+          echo "$HOME/.kin/bin" >> "$GITHUB_PATH"
+
       - name: Verify binaries installed + runnable
         shell: bash
         env:
           RELEASE_EVENT_TAG: ${{ inputs.release_tag || github.event.release.tag_name || '' }}
           REVIEWED_VFS_COMMIT: ${{ inputs.expected_vfs_commit || '' }}
+          LOCAL_ARTIFACT: ${{ inputs.local_artifact || '' }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -131,6 +178,34 @@ jobs:
           fs.writeFileSync("installed-kin-command.txt", `${installedKin}\n`);
           NODE
 
+          installed_version="$(printf '%s\n' "$kin_version_line" | awk '{print $2}')"
+          installed_daemon_version="$(printf '%s\n' "$daemon_version_line" | awk '{print $2}')"
+
+          # Pull-request bytes carry no release tag, no public archive, and no
+          # attestation, so the release-only bindings below have nothing to bind
+          # to. What replaces them is not weaker: the calling build wrote the
+          # commit it compiled, the digest of the Cargo.lock it compiled with,
+          # and the version it stamped, and every later assertion reads those
+          # three files exactly as it reads the release's. The installed CLI and
+          # daemon must both report that version here, and the capability
+          # validator below still requires both binaries to report that commit,
+          # a clean tree, and that lock digest.
+          if [ -n "$LOCAL_ARTIFACT" ]; then
+            staged="$RUNNER_TEMP/kin-pull-request-release"
+            cp "$staged/expected-version.txt" "$staged/expected-commit.txt" \
+              "$staged/expected-lock-sha.txt" .
+            expected_version="$(cat expected-version.txt)"
+            if [ "$installed_version" != "$expected_version" ]; then
+              echo "installed kin $installed_version, expected pull request build $expected_version" >&2
+              exit 1
+            fi
+            if [ "$installed_daemon_version" != "$expected_version" ]; then
+              echo "installed kin-daemon $installed_daemon_version, expected pull request build $expected_version" >&2
+              exit 1
+            fi
+            exit 0
+          fi
+
           expected_tag="$RELEASE_EVENT_TAG"
           if [ -z "$expected_tag" ]; then
             latest_url="$(curl -fsSLI \
@@ -156,8 +231,6 @@ jobs:
             exit 1
           fi
 
-          installed_version="$(printf '%s\n' "$kin_version_line" | awk '{print $2}')"
-          installed_daemon_version="$(printf '%s\n' "$daemon_version_line" | awk '{print $2}')"
           expected_version="${expected_tag#v}"
           if [ "$installed_version" != "$expected_version" ]; then
             echo "installed kin $installed_version, expected latest release $expected_version" >&2
@@ -1125,8 +1198,13 @@ jobs:
           child.stdin.write(`${requests.map((request) => JSON.stringify(request)).join("\n")}\n`);
           NODE
 
+      # kin-vfs and its shim are built from a separate repository at a commit
+      # the release workflow pins, so a pull request produces no such bytes and
+      # its archive carries none. The installer says so out loud and the CLI
+      # reports the projection unsupported, which the capability validator below
+      # requires in that mode rather than tolerating any status.
       - name: Graph-backed VFS projection proof
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && !inputs.local_artifact
         shell: bash
         working-directory: kin-install-proof
         run: |
@@ -1513,6 +1591,8 @@ jobs:
       - name: Validate installed capability proof
         shell: bash
         working-directory: kin-install-proof
+        env:
+          LOCAL_ARTIFACT: ${{ inputs.local_artifact || '' }}
         run: |
           set -euo pipefail
           node <<'NODE'
@@ -1521,6 +1601,7 @@ jobs:
           const path = require("path");
           const runnerOs = process.env.RUNNER_OS;
           const isWindows = runnerOs === "Windows";
+          const isPullRequestBuild = (process.env.LOCAL_ARTIFACT ?? "") !== "";
           const expectedCommit = fs.readFileSync("../expected-commit.txt", "utf8").trim();
           const expectedLock = fs.readFileSync("../expected-lock-sha.txt", "utf8").trim();
           const installedKin = fs.readFileSync("../installed-kin-command.txt", "utf8").trim();
@@ -1670,7 +1751,7 @@ jobs:
             ["shell_path", "healthy"],
             ["setup_ledger", "healthy"],
             ["registry_authority", isWindows ? "unsupported" : "healthy"],
-            ["vfs_projection", isWindows ? "unsupported" : "healthy"],
+            ["vfs_projection", isWindows || isPullRequestBuild ? "unsupported" : "healthy"],
             ["mcp_client_claude", "healthy"],
             ["mcp_client_cursor", "healthy"],
             ["mcp_client_codex", "healthy"],
