@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Register a repository with kin init so cross-repo commands can see it (#919)
 - Carry a completeness signal on every retrieval answer, not just empty ones (#921)
 - Report an unbuilt vector index, and hand the reranker the cache it probed (#922)
+- Paint the refs rows the product composes, and pin the fixture Git scope an admission proof reads (#925)
+- Move the kin registry pins to kin-db 0.7.35, kin-model 0.7.9, and kin-vector 0.1.12 (#926)
+- Resolve a Rust method call by its receiver and refuse a bare prelude call (#923)
 
 
 ## [0.5.40] - 2026-08-18
