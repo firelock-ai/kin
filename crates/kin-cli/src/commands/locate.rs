@@ -1468,22 +1468,83 @@ fn embedding_strict_mode() -> bool {
         && !locate_env_bool("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK", false)
 }
 
+/// What the cross-encoder loader is asked to load: the snapshot directory this
+/// process resolved, or the bare repo id when it resolved none.
+///
+/// Named rather than inlined because it is the whole of the handoff. The
+/// loader takes one `&str` and decides from it alone whether to read a
+/// directory or to go to the Hub, so passing the repo id where a resolved
+/// directory exists is the entire defect restored, and a decision that lives
+/// in a `match` argument cannot be asserted on without a model on disk.
+///
+/// A path that is not UTF-8 falls back to the repo id for the same reason a
+/// missing snapshot does: it cannot be spelled as the `&str` the loader takes.
+#[cfg(feature = "embeddings")]
+fn cross_encoder_load_target(model_id: &str, snapshot: Option<&std::path::Path>) -> String {
+    snapshot
+        .and_then(std::path::Path::to_str)
+        .unwrap_or(model_id)
+        .to_string()
+}
+
+/// Whether a graph has a vector index attached at all.
+///
+/// `embedding_status` cannot answer this. Its `indexed` count is derived by
+/// testing every retrievable key against the index and it answers zero for all
+/// of them when there is no index to test against, so an index that was never
+/// built and an index that is attached and empty produce identical counters.
+/// `vector_index_stats()` is the call that separates them, and reading it is a
+/// lock and an `Option` map rather than a walk of graph truth.
+#[cfg(feature = "vector")]
+fn vector_index_attached(graph: &kin_db::InMemoryGraph) -> bool {
+    graph.vector_index_stats().is_some()
+}
+
+/// Without vector support there is no index to attach. The `supported: false`
+/// arm of the coverage report is what callers read in this build; this exists
+/// so the two arms share one call shape.
+#[cfg(not(feature = "vector"))]
+fn vector_index_attached(_graph: &kin_db::InMemoryGraph) -> bool {
+    false
+}
+
+/// The embedding status backing this query's semantic signal, paired with
+/// whether the graph it came from has a vector index attached.
+///
+/// The pairing is the point. Both facts are read from the SAME graph in one
+/// place, so a caller cannot take the counters from the scoped-session vector
+/// source and the attachment from the primary graph and report a state neither
+/// of them is in.
+struct EffectiveEmbedding {
+    status: kin_db::EmbeddingStatus,
+    index_attached: bool,
+}
+
 /// Pick the embedding status that actually backs the semantic signal for this
 /// query — the primary graph when it carries embeddings (or has no entities at
 /// all), otherwise the HEAD vector source used for scoped-session search.
 /// Mirrors the graph-selection logic in `extract_embedding_signals`.
-fn effective_embedding_status(
+fn effective_embedding(
     graph: &kin_db::InMemoryGraph,
     vector_source: Option<&kin_db::InMemoryGraph>,
-) -> kin_db::EmbeddingStatus {
+) -> EffectiveEmbedding {
     let primary_status = graph.embedding_status();
     if primary_status.total == 0 || primary_status.indexed > 0 {
-        return primary_status;
+        return EffectiveEmbedding {
+            status: primary_status,
+            index_attached: vector_index_attached(graph),
+        };
     }
     if let Some(source) = vector_source.filter(|source| !std::ptr::eq(*source, graph)) {
-        return source.embedding_status();
+        return EffectiveEmbedding {
+            status: source.embedding_status(),
+            index_attached: vector_index_attached(source),
+        };
     }
-    primary_status
+    EffectiveEmbedding {
+        status: primary_status,
+        index_attached: vector_index_attached(graph),
+    }
 }
 
 /// Evaluate embedding coverage for a locate query.
@@ -1494,30 +1555,43 @@ fn effective_embedding_status(
 /// ran. Strict (benchmark) behavior, gated behind
 /// `KIN_REQUIRE_COMPLETE_EMBEDDINGS=1`: bails on incomplete coverage exactly as
 /// before, so benchmarks refuse to score a half-embedded repo.
+///
+/// The strict gate keeps reading the counters alone, deliberately. It is a
+/// benchmark-integrity check on how much of a store got embedded, and a
+/// benchmark that reaches it is running against a populated store where an
+/// absent index already shows up as `indexed < total`. What changes is the
+/// REPORT the gate does not consume.
 fn evaluate_embedding_coverage(
     graph: &kin_db::InMemoryGraph,
     vector_source: Option<&kin_db::InMemoryGraph>,
-) -> Result<SemanticCoverage> {
-    let status = effective_embedding_status(graph, vector_source);
+) -> Result<(SemanticCoverage, bool)> {
+    let effective = effective_embedding(graph, vector_source);
 
     #[cfg(feature = "vector")]
-    if !embedding_status_complete(&status) && embedding_strict_mode() {
+    if !embedding_status_complete(&effective.status) && embedding_strict_mode() {
         anyhow::bail!(
             "semantic locate requires complete embeddings; graph has {}. Run `kin embed` until `kin status --json` reports embeddingsIndexed == embeddingsTotal and embeddingsPending == 0. (Set KIN_REQUIRE_COMPLETE_EMBEDDINGS=0 to allow graceful degradation.)",
-            embedding_status_summary(&status)
+            embedding_status_summary(&effective.status)
         );
     }
 
-    Ok(coverage_from_status(&status))
+    Ok((
+        coverage_from_status(&effective.status, effective.index_attached),
+        effective.index_attached,
+    ))
 }
 
 /// Build the non-gating [`SemanticCoverage`] report from an embedding status.
 /// This is the default (non-strict) coverage `evaluate_embedding_coverage`
 /// returns, factored out so post-retrieval surfaces can re-report coverage
 /// without re-running the strict benchmark gate.
-fn coverage_from_status(status: &kin_db::EmbeddingStatus) -> SemanticCoverage {
+fn coverage_from_status(
+    status: &kin_db::EmbeddingStatus,
+    index_attached: bool,
+) -> SemanticCoverage {
     #[cfg(not(feature = "vector"))]
     {
+        let _ = index_attached;
         return SemanticCoverage {
             supported: false,
             indexed: status.indexed,
@@ -1534,9 +1608,20 @@ fn coverage_from_status(status: &kin_db::EmbeddingStatus) -> SemanticCoverage {
 
     #[cfg(feature = "vector")]
     {
-        let complete = embedding_status_complete(status);
+        // An absent index is never complete coverage, whatever the counters
+        // say. `embedding_status_complete` answers true for `total == 0`, and
+        // `total` is zero on a graph with nothing retrievable, so a store with
+        // no index at all could report complete semantic coverage and let a
+        // caller treat an empty result as a definitive absence. There is no
+        // index behind that answer to be definitive about.
+        let complete = index_attached && embedding_status_complete(status);
         let note = if complete {
             None
+        } else if !index_attached {
+            Some(format!(
+            "no vector index is attached, so nothing is embedded and semantic ranking did not run ({} entities eligible). Lexical + graph results returned; run `kin embed` to build the index.",
+            status.total
+        ))
         } else {
             Some(format!(
             "semantic signal partial: {} embedded. Lexical + graph results returned; run `kin embed` for full semantic ranking.",
@@ -1591,7 +1676,8 @@ pub fn local_semantic_coverage(
     graph: &kin_db::InMemoryGraph,
     vector_source: Option<&kin_db::InMemoryGraph>,
 ) -> SemanticCoverage {
-    coverage_from_status(&effective_embedding_status(graph, vector_source))
+    let effective = effective_embedding(graph, vector_source);
+    coverage_from_status(&effective.status, effective.index_attached)
 }
 
 /// Push a degradation once per (component, reason); repeated hits within one
@@ -1607,12 +1693,21 @@ pub fn record_degradation(sink: &mut Vec<RetrievalDegradation>, event: Retrieval
 }
 
 /// Record the vector-index state for this query as a structured degradation
-/// when it is empty or partial. The `SemanticCoverage` object already carries
-/// the numbers; this adds the machine-readable component/reason/remediation
-/// entry so an empty vector index can never read as a clean lexical answer.
+/// when it is absent, empty or partial. The `SemanticCoverage` object already
+/// carries the numbers; this adds the machine-readable
+/// component/reason/remediation entry so a vector index that is missing or
+/// unfinished can never read as a clean lexical answer.
+///
+/// `absent` is its own reason and not a shade of `empty`, because they have
+/// different remediations and only one of them is reachable by waiting. An
+/// index that is attached and empty is being filled; an index that was never
+/// built is not, and on a freshly converted repository that is the state every
+/// first query runs in. Telling them apart needs `index_attached`: the
+/// `indexed` counter reads zero for both, so a reason picked from the counters
+/// alone can neither name the absent case nor fail to name it.
 fn record_vector_index_degradation(
     coverage: &SemanticCoverage,
-    vector_source: Option<&kin_db::InMemoryGraph>,
+    index_attached: bool,
     sink: &mut Vec<RetrievalDegradation>,
 ) {
     if coverage.complete {
@@ -1631,24 +1726,62 @@ fn record_vector_index_degradation(
         );
         return;
     }
-    let vector_arm_present = coverage.indexed > 0
-        || vector_source.is_some_and(|source| source.embedding_status().indexed > 0);
-    let (reason, detail) = if vector_arm_present {
+    let (reason, detail, remediation) = if !index_attached {
+        let detail = format!(
+            "no vector index has been built for this graph, so none of its {} entities \
+             are embedded and only lexical and graph signals ranked this query",
+            coverage.total
+        );
+        // The opt-out is read from this process's own environment, which is the
+        // daemon's environment on the serving path, where the daemon reads the same
+        // variable at its own start to decide the pass. Saying which of the two
+        // states holds is the whole difference between "this fills in on its
+        // own" and "this stays as it is until someone asks".
+        if kin_daemon_spawn::auto_embed_enabled_from(
+            std::env::var(kin_daemon_spawn::DAEMON_AUTO_EMBED_ENV)
+                .ok()
+                .as_deref(),
+        ) {
+            (
+                "absent",
+                detail,
+                "wait for the background embedding pass to build the index, or run 'kin embed' \
+                 to build it now"
+                    .to_string(),
+            )
+        } else {
+            (
+                "absent_opt_out",
+                format!(
+                    "{detail}; {} opts out of the background embedding pass, so nothing will \
+                     build the index on its own",
+                    kin_daemon_spawn::DAEMON_AUTO_EMBED_ENV
+                ),
+                format!(
+                    "run 'kin embed' to build the index, or clear {} and restart the daemon to \
+                     let the background pass run",
+                    kin_daemon_spawn::DAEMON_AUTO_EMBED_ENV
+                ),
+            )
+        }
+    } else if coverage.indexed > 0 {
         (
             "partial",
             format!(
                 "semantic signal partial: {}/{} entities embedded ({} pending)",
                 coverage.indexed, coverage.total, coverage.pending
             ),
+            "run 'kin embed' until kin status reports full embedding coverage".to_string(),
         )
     } else {
         (
             "empty",
             format!(
-                "vector index empty: 0/{} entities embedded — semantic ranking disabled, \
-                 lexical + graph signals only",
+                "vector index empty: 0/{} entities embedded, so semantic ranking is off \
+                 and only lexical and graph signals ranked this query",
                 coverage.total
             ),
+            "run 'kin embed' until kin status reports full embedding coverage".to_string(),
         )
     };
     record_degradation(
@@ -1657,8 +1790,7 @@ fn record_vector_index_degradation(
             component: "vector_index".to_string(),
             reason: reason.to_string(),
             detail,
-            remediation: "run 'kin embed' until kin status reports full embedding coverage"
-                .to_string(),
+            remediation,
         },
     );
 }
@@ -2206,7 +2338,8 @@ fn run_with_graph_capture_budgeted(
     let cleaned_text = clean_issue_text(text);
     let semantic_text = strip_pr_template_boilerplate(&cleaned_text);
     let text = semantic_text.as_str();
-    let semantic_coverage = evaluate_embedding_coverage(graph, vector_source)?;
+    let (semantic_coverage, vector_index_attached) =
+        evaluate_embedding_coverage(graph, vector_source)?;
 
     // Quality profile: supplies the DEFAULT for each retrieval lever below;
     // explicit env vars always win. Resolved once per query so one run cannot
@@ -2214,7 +2347,7 @@ fn run_with_graph_capture_budgeted(
     let quality = crate::retrieval_profile::RetrievalProfile::from_env();
     // No-silent-degradation ledger for this query (attached to the result).
     let mut degradations: Vec<RetrievalDegradation> = Vec::new();
-    record_vector_index_degradation(&semantic_coverage, vector_source, &mut degradations);
+    record_vector_index_degradation(&semantic_coverage, vector_index_attached, &mut degradations);
     // Per-stage prune attribution, recorded only under --explain.
     let mut prune_ledger: Vec<PruneEvent> = Vec::new();
 
@@ -3792,7 +3925,15 @@ fn run_with_graph_capture_budgeted(
     {
         let ce_model_id = std::env::var("KIN_LOCATE_CROSS_ENCODER_MODEL")
             .unwrap_or_else(|_| "BAAI/bge-reranker-base".to_string());
-        let ce_model_cached = crate::retrieval_profile::cross_encoder_model_cached(&ce_model_id);
+        // Resolved beside the model id, not inside the arming branch below,
+        // because the cache probe needs it: a snapshot is addressed by the
+        // commit its revision ref names, so probing without the revision asks a
+        // different question than the one the loader will ask.
+        let ce_revision = std::env::var("KIN_LOCATE_CROSS_ENCODER_REVISION")
+            .unwrap_or_else(|_| "main".to_string());
+        let ce_snapshot =
+            crate::retrieval_profile::cross_encoder_model_snapshot(&ce_model_id, &ce_revision);
+        let ce_model_cached = ce_snapshot.is_some();
         if quality.cross_encoder_default(true)
             && !ce_model_cached
             && std::env::var("KIN_LOCATE_CROSS_ENCODER_ENABLED").is_err()
@@ -3825,8 +3966,13 @@ fn run_with_graph_capture_budgeted(
                 // effective in that mode.
                 if cross_encoder_has_graph_candidates(graph) {
                     let model_id = ce_model_id.clone();
-                    let revision = std::env::var("KIN_LOCATE_CROSS_ENCODER_REVISION")
-                        .unwrap_or_else(|_| "main".to_string());
+                    let revision = ce_revision.clone();
+                    // Load from the directory the cache probe resolved rather
+                    // than from the repo id, so the loader reads the snapshot
+                    // this process just verified instead of rediscovering a
+                    // root of its own. `CrossEncoder::new` takes a local
+                    // directory whenever its model id names one.
+                    let load_target = cross_encoder_load_target(&model_id, ce_snapshot.as_deref());
 
                     // 1.7 latency gate: time model acquisition + rerank so an
                     // over-budget rerank can fall back to the pre-rerank order (see
@@ -3835,7 +3981,7 @@ fn run_with_graph_capture_budgeted(
                     // here; after that the model is resident (see model_residency)
                     // and this window is the rerank itself.
                     let rerank_started = std::time::Instant::now();
-                    match crate::model_residency::cross_encoder(&model_id, &revision) {
+                    match crate::model_residency::cross_encoder(&load_target, &revision) {
                         Ok(encoder) => {
                             let mut docs = Vec::new();
                             let mut candidates = Vec::new();
@@ -20299,6 +20445,203 @@ mod tests {
         assert!(
             format!("{err}").contains("semantic locate requires complete embeddings"),
             "unexpected error: {err:#}"
+        );
+    }
+
+    /// The reranker is asked for the directory this process resolved, not for
+    /// the repo id it started from.
+    ///
+    /// `CrossEncoder::new` decides from its one string argument whether to read
+    /// a local directory or to fetch from the Hub, so which string reaches it
+    /// IS the fix. Passing the repo id where a snapshot resolved is the defect
+    /// restored in full: the loader would go back to `Cache::default()`, miss a
+    /// relocated cache, and download inside the query.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn the_reranker_is_asked_for_the_resolved_snapshot_when_there_is_one() {
+        let snapshot = std::path::Path::new("/models/hub/models--org--name/snapshots/abc123");
+
+        assert_eq!(
+            cross_encoder_load_target("org/name", Some(snapshot)),
+            snapshot.to_str().unwrap(),
+            "a resolved snapshot must be what the loader is handed"
+        );
+        assert_eq!(
+            cross_encoder_load_target("org/name", None),
+            "org/name",
+            "with nothing resolved the bare repo id still reaches hf-hub, so an \
+             explicit prefetch on a cold machine keeps working"
+        );
+    }
+
+    /// Identical counters, two different states, and only one of them fills in
+    /// on its own.
+    ///
+    /// `embedding_status` derives `indexed` by testing every retrievable key
+    /// against the vector index and answers zero for all of them when there is
+    /// no index to test against, so an index nothing has filled yet and an
+    /// index nobody built produce the same numbers. A reason picked from those
+    /// numbers cannot name the second case, which is the state every freshly
+    /// converted repository serves its first queries in.
+    ///
+    /// The `complete` half is the sharper edge. It was true whenever `total`
+    /// was zero, so a store with no vector index behind it could report
+    /// complete semantic coverage, and the envelope's semantic negative gate
+    /// reads exactly that flag to decide whether an empty result may be
+    /// reported as a definitive absence.
+    #[cfg(feature = "vector")]
+    #[test]
+    #[serial_test::serial]
+    fn coverage_separates_an_index_nobody_built_from_one_nothing_has_filled() {
+        let _opt_out =
+            kin_core::test_env::EnvVarGuard::unset(kin_daemon_spawn::DAEMON_AUTO_EMBED_ENV);
+
+        let nothing_retrievable = kin_db::EmbeddingStatus {
+            pending: 0,
+            indexed: 0,
+            total: 0,
+        };
+        assert!(
+            coverage_from_status(&nothing_retrievable, true).complete,
+            "an attached index with nothing to embed is genuinely complete"
+        );
+        assert!(
+            !coverage_from_status(&nothing_retrievable, false).complete,
+            "with no index behind it there is nothing for a negative to be definitive about"
+        );
+
+        let unfilled = kin_db::EmbeddingStatus {
+            pending: 12,
+            indexed: 0,
+            total: 12,
+        };
+        let partial = kin_db::EmbeddingStatus {
+            pending: 7,
+            indexed: 5,
+            total: 12,
+        };
+        let mut sink = Vec::new();
+        record_vector_index_degradation(&coverage_from_status(&unfilled, false), false, &mut sink);
+        record_vector_index_degradation(&coverage_from_status(&unfilled, true), true, &mut sink);
+        record_vector_index_degradation(&coverage_from_status(&partial, true), true, &mut sink);
+
+        let reasons = sink
+            .iter()
+            .map(|entry| entry.reason.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reasons,
+            vec!["absent", "empty", "partial"],
+            "the same 0/12 counters must read as absent or empty depending on the index"
+        );
+        assert!(
+            sink[0].remediation.contains("kin embed"),
+            "an unbuilt index must name the command that builds it: {}",
+            sink[0].remediation
+        );
+    }
+
+    /// An operator who turned the background pass off is in a different state
+    /// from one waiting for it, and the remediation is the difference.
+    #[cfg(feature = "vector")]
+    #[test]
+    #[serial_test::serial]
+    fn an_absent_index_nothing_will_build_is_reported_as_its_own_reason() {
+        let unfilled = kin_db::EmbeddingStatus {
+            pending: 12,
+            indexed: 0,
+            total: 12,
+        };
+
+        let mut waiting = Vec::new();
+        {
+            let _on =
+                kin_core::test_env::EnvVarGuard::unset(kin_daemon_spawn::DAEMON_AUTO_EMBED_ENV);
+            record_vector_index_degradation(
+                &coverage_from_status(&unfilled, false),
+                false,
+                &mut waiting,
+            );
+        }
+        assert_eq!(waiting[0].reason, "absent");
+        assert!(
+            waiting[0].remediation.contains("background embedding pass"),
+            "a pass that is coming is worth waiting for: {}",
+            waiting[0].remediation
+        );
+
+        let mut opted_out = Vec::new();
+        {
+            let _off =
+                kin_core::test_env::EnvVarGuard::set(kin_daemon_spawn::DAEMON_AUTO_EMBED_ENV, "0");
+            record_vector_index_degradation(
+                &coverage_from_status(&unfilled, false),
+                false,
+                &mut opted_out,
+            );
+        }
+        assert_eq!(opted_out[0].reason, "absent_opt_out");
+        assert!(
+            opted_out[0]
+                .detail
+                .contains(kin_daemon_spawn::DAEMON_AUTO_EMBED_ENV),
+            "the lever that decided this must be named: {}",
+            opted_out[0].detail
+        );
+    }
+
+    /// The pipeline itself reports the unbuilt index, not only the helper that
+    /// formats the entry.
+    ///
+    /// A graph with entities and no vector index is what `kin init` leaves
+    /// behind, and the whole defect was that a query against it came back
+    /// looking clean. This drives the real locate path over that fixture and
+    /// reads the ledger it attaches.
+    #[cfg(feature = "vector")]
+    #[test]
+    #[serial_test::serial]
+    fn locate_reports_an_unbuilt_vector_index_on_a_fresh_store() {
+        let graph = kin_db::InMemoryGraph::new();
+        let entity = test_entity("handler", "src/lib.py", 1, 5);
+        graph.upsert_entity(&entity).unwrap();
+        admit_test_source(&graph, "src/lib.py", "def handler():\n    pass\n");
+        assert!(
+            graph.vector_index_stats().is_none(),
+            "fixture control: this store must carry no vector index"
+        );
+
+        let _strict = kin_core::test_env::EnvVarGuard::unset("KIN_REQUIRE_COMPLETE_EMBEDDINGS")
+            .without(kin_daemon_spawn::DAEMON_AUTO_EMBED_ENV);
+
+        let result = run_with_graph_capture_in_workspace_budgeted(
+            &graph,
+            None,
+            "handler failure",
+            true,
+            10,
+            true,
+            LocateBudget::unbounded(),
+        )
+        .expect("locate must still serve lexical and graph signals");
+
+        let coverage = result
+            .semantic_coverage
+            .expect("locate must report semantic coverage");
+        assert!(
+            !coverage.complete,
+            "a store with no vector index must not report complete semantic coverage"
+        );
+
+        let entry = result
+            .degradations
+            .iter()
+            .find(|degradation| degradation.component == "vector_index")
+            .expect("an unbuilt vector index must reach the degradation ledger");
+        assert_eq!(entry.reason, "absent");
+        assert!(
+            entry.detail.contains("no vector index"),
+            "the detail must say which state this is: {}",
+            entry.detail
         );
     }
 

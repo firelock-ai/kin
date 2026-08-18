@@ -2626,7 +2626,9 @@ fn check_retrieval_profile() -> HealthCheck {
     let profile = crate::retrieval_profile::RetrievalProfile::from_env();
     let ce_model = env::var("KIN_LOCATE_CROSS_ENCODER_MODEL")
         .unwrap_or_else(|_| "BAAI/bge-reranker-base".to_string());
-    let ce_cached = crate::retrieval_profile::cross_encoder_model_cached(&ce_model);
+    let ce_revision =
+        env::var("KIN_LOCATE_CROSS_ENCODER_REVISION").unwrap_or_else(|_| "main".to_string());
+    let ce_cached = crate::retrieval_profile::cross_encoder_model_cached(&ce_model, &ce_revision);
     // Report the daemon-serving default (the state queries actually run
     // under), not this one-shot CLI process's own gate. The accessor answers
     // exactly that question, so this check cannot drift from the profile's
