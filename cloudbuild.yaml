@@ -11,6 +11,16 @@
 # Note: npm publication for @kin/boundary-contracts is handled by the tagged
 # GitHub release workflow so package publication follows the release path rather
 # than the push-to-main dev build path.
+#
+# Build cache: each hosted build runs on a fresh VM, so the local layer cache is
+# always empty and every push recompiled the whole Rust dependency graph. The
+# Dockerfile now splits dependency compilation into a `cargo chef cook` layer
+# keyed only on the dependency recipe, and the buildx registry cache below is
+# what carries that layer between builds. The two changes are one mechanism:
+# without the registry cache there is nothing for the split layer to be restored
+# from, and the extra planner stage would make builds slightly slower rather
+# than faster. Measured locally, a source-only change reuses the cook layer and
+# rebuilds in about 5 minutes against the 11-20 minutes seen on hosted builds.
 
 steps:
   # Build kin-daemon (Rust binary — CPU-intensive)
@@ -22,15 +32,28 @@ steps:
         branch_tag="$(echo "${BRANCH_NAME:-detached}" | tr '[:upper:]' '[:lower:]' | sed 's#[^a-z0-9._-]#-#g' | sed 's#-\{2,\}#-#g' | sed 's#^-##; s#-$##' | cut -c1-120)"
         branch_tag="${branch_tag:-detached}"
         build_branch="${BRANCH_NAME:-detached}"
-        docker build \
+        # The docker-container driver is required: the default driver cannot
+        # import or export a registry-backed cache.
+        docker buildx create --name kincache --driver docker-container --use
+        # mode=max exports the intermediate layers too, which is the only mode
+        # that carries the cook layer; mode=min would export the final stages
+        # and cache nothing that matters here. A cache-from miss is not fatal,
+        # so the very first build after this lands simply runs cold.
+        docker buildx build \
+          --cache-from "type=registry,ref=${_AR_REGISTRY}/kin-daemon:buildcache" \
+          --cache-to "type=registry,ref=${_AR_REGISTRY}/kin-daemon:buildcache,mode=max" \
           --build-arg "KIN_DB_REF=${_KIN_DB_REF}" \
           --build-arg "KIN_BUILD_GIT_SHA=${COMMIT_SHA}" \
           --build-arg "KIN_BUILD_DIRTY=false" \
           --build-arg "KIN_BUILD_BRANCH=${build_branch}" \
           -t "${_AR_REGISTRY}/kin-daemon:${COMMIT_SHA}" \
           -t "${_AR_REGISTRY}/kin-daemon:${branch_tag}" \
+          --push \
           -f Dockerfile \
           .
+        # buildx pushed the image rather than leaving it in the local daemon,
+        # so this pulls it back to run the identity assertion. That is the same
+        # bytes the registry will serve to a deployment.
         bash scripts/verify-container-build-info.sh \
           "${_AR_REGISTRY}/kin-daemon:${COMMIT_SHA}" "${COMMIT_SHA}"
     id: 'build-kin-daemon'
@@ -42,8 +65,11 @@ steps:
       - '-c'
       - |
         if [ "$BRANCH_NAME" = "main" ]; then
-          docker tag ${_AR_REGISTRY}/kin-daemon:${COMMIT_SHA} ${_AR_REGISTRY}/kin-daemon:staging-latest
-          docker push ${_AR_REGISTRY}/kin-daemon:staging-latest
+          # imagetools copies the manifest registry-side, so the staging tag
+          # costs no pull and no re-push of a multi-gigabyte image.
+          docker buildx imagetools create \
+            --tag ${_AR_REGISTRY}/kin-daemon:staging-latest \
+            ${_AR_REGISTRY}/kin-daemon:${COMMIT_SHA}
           echo "Tagged as staging-latest"
         else
           echo "Not main branch ($BRANCH_NAME), skipping staging tag"
@@ -51,8 +77,9 @@ steps:
     id: 'tag-staging'
     waitFor: ['build-kin-daemon']
 
-images:
-  - '${_AR_REGISTRY}/kin-daemon:${COMMIT_SHA}'
+# No `images:` block. buildx already pushed both tags above; listing them here
+# would make Cloud Build attempt a second push of an image that is deliberately
+# not in the local daemon store, which fails the build.
 
 substitutions:
   _AR_REGISTRY: 'us-central1-docker.pkg.dev/kin-ecosystem/kin-ecosystem'
