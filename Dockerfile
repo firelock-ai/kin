@@ -13,8 +13,30 @@
 #
 # scripts/verify-base-image-pins.sh proves both registries still serve both
 # pinned digests, and reports when the upstream tag has moved past the pin.
+# Dependency compilation is split away from workspace compilation. `cargo chef
+# prepare` distills the workspace manifests into a recipe whose bytes change
+# only when a dependency changes, so the `cook` layer in the builder keys on
+# dependencies alone and survives across source-only commits in the
+# registry-backed BuildKit cache that cloudbuild.yaml imports and exports.
+# Before the split, `COPY . /build/kin` preceded the only cargo invocation, so
+# every push to main recompiled the entire dependency graph from scratch and
+# each hosted build burned 11-20 minutes on E2_HIGHCPU_8.
+#
+# The planner repeats the pinned reference instead of deriving `FROM builder`.
+# Every FROM in this file is asserted to name docker.io and end in a digest by
+# both scripts/verify-base-image-pins.sh and
+# scripts/test-release-workflow-authority.py, and a bare stage name carries
+# neither, so stage-chaining would fail the release gates.
+FROM docker.io/library/rust:slim@sha256:5c6f46a6e4472ab1ca7ba7d494e6677f2f219ebc02f32025d3986f057635ec9c AS planner
+RUN apt-get update && apt-get install -y git pkg-config libssl-dev g++ && rm -rf /var/lib/apt/lists/*
+RUN cargo install cargo-chef --locked --version 0.1.68
+WORKDIR /build/kin
+COPY . /build/kin
+RUN cargo chef prepare --recipe-path /recipe.json
+
 FROM docker.io/library/rust:slim@sha256:5c6f46a6e4472ab1ca7ba7d494e6677f2f219ebc02f32025d3986f057635ec9c AS builder
 RUN apt-get update && apt-get install -y git pkg-config libssl-dev g++ && rm -rf /var/lib/apt/lists/*
+RUN cargo install cargo-chef --locked --version 0.1.68
 ARG KIN_DB_REF=main
 ARG KIN_BUILD_GIT_SHA=""
 ARG KIN_BUILD_DIRTY=""
@@ -23,19 +45,27 @@ ARG KIN_BUILD_BRANCH=""
 # Cargo will fetch the pinned kin-db dependency from Cargo.lock.
 WORKDIR /build
 
-# Copy kin source (this repository)
-COPY . /build/kin
-
 # Build from kin directory
 WORKDIR /build/kin
-# Keep the committed cargo config intact: it defines the [registries.kin] sparse
-# registry that kin-* crates resolve from (the Git [patch.kin] pins were dropped
-# at the registry cutover — kin no longer depends on GitHub for crate deps).
-RUN test -f .cargo/config.toml && grep -q '^\[registries\.kin\]' .cargo/config.toml
 # The kin sparse registry can return a brief 502 during a deploy/cold start.
 # Cargo's default of 3 retries can be exhausted inside such a window and fail
 # the whole build; raise the retry budget so a transient blip is ridden out.
 ENV CARGO_NET_RETRY=10
+# Keep the committed cargo config intact: it defines the [registries.kin] sparse
+# registry that kin-* crates resolve from (the Git [patch.kin] pins were dropped
+# at the registry cutover — kin no longer depends on GitHub for crate deps).
+# It lands before the cook because cooking resolves those same kin-* crates.
+COPY .cargo /build/kin/.cargo
+RUN test -f .cargo/config.toml && grep -q '^\[registries\.kin\]' .cargo/config.toml
+
+# Compile dependencies only. Feature and target selection must match the real
+# build below, or the cooked artifacts are keyed differently and the workspace
+# build recompiles them anyway.
+COPY --from=planner /recipe.json /recipe.json
+RUN cargo chef cook --locked --release --features gcs --recipe-path /recipe.json
+
+# Copy kin source (this repository)
+COPY . /build/kin
 # kin-daemon needs --features gcs for GCS StorageBackend in cloud deployment.
 # `.dockerignore` deliberately excludes `.git`, so hosted image builders pass
 # the exact source identity as an atomic three-value override. A local image

@@ -2855,6 +2855,50 @@ pub(crate) fn local_ignore_inputs(repo: &gix::Repository) -> Result<Vec<GitLocal
     Ok(inputs)
 }
 
+/// The store directory a published Kin repository owns at its root.
+const KIN_STORE_DIR: &str = ".kin";
+
+/// Whether the ignore rules Git itself resolves already hide a Kin store at
+/// this repository's root.
+///
+/// Answered from the same authority `git status` answers from: resolved global
+/// excludes, the repository's `info/exclude`, and the committed `.gitignore`
+/// mapping this module already treats as ignore authority. A caller deciding
+/// whether to write its own rule has to ask the question this way, because
+/// comparing exclude-file lines against a fixed set of spellings agrees with
+/// Git only by coincidence. It misses a rule that lives in a `core.excludesFile`
+/// the caller never reads, and it reads a later `!.kin` negation as an exclusion
+/// when Git reads it as the opposite.
+///
+/// `Err` means the question could not be put to Git at all, which is a
+/// different answer from "no rule covers it" and is left to the caller.
+pub fn kin_store_is_git_ignored(repo_root: &Path) -> Result<bool> {
+    let repo = open_repo_with_user_ignore_config(repo_root)?;
+    let index_path = repo.index_path();
+    let index = gix::index::File::at_or_default(
+        &index_path,
+        repo.object_hash(),
+        false,
+        gix::index::decode::Options::default(),
+    )
+    .map_err(|error| {
+        preflight_error(format!(
+            "open Git index while reading the Kin store's ignore state: {error}"
+        ))
+    })?;
+    let inputs = local_ignore_inputs(&repo)?;
+    let (mut excludes, _) = frozen_ignore_stack(&repo, &index, &inputs)?;
+    Ok(excludes
+        .at_entry(
+            KIN_STORE_DIR.as_bytes().as_bstr(),
+            Some(gix::index::entry::Mode::DIR),
+        )
+        .map_err(|error| {
+            preflight_error(format!("evaluate ignore rules for the Kin store: {error}"))
+        })?
+        .is_excluded())
+}
+
 pub(crate) fn frozen_ignore_stack<'repo>(
     repo: &'repo gix::Repository,
     index: &gix::index::File,
@@ -5508,6 +5552,49 @@ mod tests {
         assert!(error
             .to_string()
             .contains("changed during migration preflight"));
+    }
+
+    /// The store's ignore state is read from every rule Git resolves, including
+    /// one that lives outside the repository.
+    ///
+    /// A `core.excludesFile` is a file no reader of `info/exclude` and
+    /// `.gitignore` ever opens, so a caller checking those two alone concludes
+    /// the store is unignored and writes a rule Git already had. The controls
+    /// below assert that neither repository-local file names the store, so the
+    /// `true` can only have come from the resolved configuration.
+    #[test]
+    fn the_store_reads_as_ignored_through_a_rule_git_resolves_outside_the_repository() {
+        let (temp, repo) = config_only_repository();
+        assert!(
+            !kin_store_is_git_ignored(&repo).expect("resolve ignore rules"),
+            "the fixture must start with nothing hiding the store, or this test proves nothing"
+        );
+
+        let excludes = temp.path().join("global-excludes");
+        fs::write(&excludes, b"/.kin/\n").expect("write the excludes file");
+        git(
+            &repo,
+            &[
+                "config",
+                "core.excludesFile",
+                excludes.to_str().expect("utf-8 fixture path"),
+            ],
+        );
+
+        assert!(
+            kin_store_is_git_ignored(&repo).expect("resolve ignore rules"),
+            "a rule Git resolves outside the repository still hides the store"
+        );
+        assert!(
+            !repo.join(".gitignore").exists(),
+            "control: the tracked ignore file must not be what answered"
+        );
+        let info_exclude =
+            fs::read_to_string(repo.join(".git").join("info").join("exclude")).unwrap_or_default();
+        assert!(
+            !info_exclude.contains(".kin"),
+            "control: the local exclude file must not be what answered: {info_exclude}"
+        );
     }
 
     fn snapshot_plan(
