@@ -1473,17 +1473,22 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn hard_parent_death_terminates_the_guarded_probe() {
-        // Readiness here is a three-hop spawn chain, and its middle hop already
-        // waits out a full REAP_GRACE of its own, so a test budget no larger
-        // than one nested product budget can expire while every component is
-        // still inside its permitted window. Parent-death cleanup is contracted
-        // as "eventually", with no published latency bound anywhere, so the
-        // assertions below carry the whole requirement and these two numbers
-        // only stop a hang from running forever. They are deliberately local:
-        // REAP_GRACE carries production reap semantics at many other call
-        // sites and must not move for a test's benefit.
-        const PARENT_DEATH_READY_GUARD: Duration = Duration::from_secs(60);
-        const PARENT_DEATH_CLEANUP_GUARD: Duration = Duration::from_secs(60);
+        // Readiness here is a three-hop spawn chain whose middle hop already
+        // waits out a full REAP_GRACE of its own, so a budget no larger than one
+        // nested product budget can expire while every component is still inside
+        // its permitted window. Both guards are deliberately local: REAP_GRACE
+        // carries production reap semantics at many other call sites and must
+        // not move for a test's benefit.
+        //
+        // Both must also stay strictly BELOW the descendant fixture's own 30s
+        // lifetime. A cleanup guard above it cannot fail: a probe that survives
+        // cleanup completely would return of old age inside the window, every
+        // liveness check would find it gone, and the test would pass green while
+        // proving nothing. That ceiling, not the cleanup latency, is what bounds
+        // these numbers; observed cleanup is under 100ms, so 20s already leaves
+        // two orders of magnitude of margin.
+        const PARENT_DEATH_READY_GUARD: Duration = Duration::from_secs(20);
+        const PARENT_DEATH_CLEANUP_GUARD: Duration = Duration::from_secs(20);
 
         let temp = tempfile::tempdir().unwrap();
         let marker = temp.path().join("parent-death-probe.pid");
