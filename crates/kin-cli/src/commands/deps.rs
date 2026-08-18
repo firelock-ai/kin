@@ -102,10 +102,11 @@ pub fn registered_id_for_path<'a>(
                 String::new()
             };
             anyhow::bail!(
-                "no registry entry records the repository at {};{named} no shipped command writes \
-                 one, so the scoped view cannot answer here: `kin registry` only lists and cleans, \
-                 and the migration writer that records an entry has no caller. Use `kin deps \
-                 --all` to list the repositories that are registered",
+                "no registry entry records the repository at {};{named} `kin init` registers a \
+                 repository when it runs, so this one either predates that registration or was \
+                 never initialized with `kin init` here; `kin registry` only lists and cleans \
+                 rather than adding an entry after the fact. Use `kin deps --all` to list the \
+                 repositories that are registered",
                 working_dir.display()
             )
         }
@@ -137,9 +138,11 @@ pub fn repo_dependency_view(registry: &KinRegistry, repo_id: &str) -> Result<Rep
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "repository '{repo_id}' is not in the Kin registry, so no cross-repo dependency \
-                 records exist for it, and no shipped command writes an entry that would create \
-                 them: `kin registry` only lists and cleans. Use `kin deps --all` to list the \
-                 repositories that are registered"
+                 records exist for it. `kin init` registers a repository when it runs; this one \
+                 either predates that registration or was never initialized with `kin init` \
+                 here, and `kin registry` only lists and cleans rather than adding an entry \
+                 after the fact. Use `kin deps --all` to list the repositories that are \
+                 registered"
             )
         })?;
 
@@ -213,9 +216,9 @@ pub fn render_repo_view_lines(view: &RepoDependencyView) -> Vec<String> {
     if view.depends_on.is_empty() || view.consumers.is_empty() {
         lines.push(String::new());
         lines.push(
-            "note: dependency records are written when a repository is registered, and no \
-             shipped command writes a registry entry today, so empty directions here may mean \
-             the records were never written rather than that none exist."
+            "note: dependency records are written when `kin init` registers a repository, so \
+             empty directions here may mean this repository predates that registration rather \
+             than that none exist."
                 .to_string(),
         );
     }
@@ -236,7 +239,8 @@ fn report_every_registered_repo(registry: &KinRegistry, json: bool) -> Result<()
         } else {
             println!("No registered repositories.");
             println!(
-                "hint: no shipped command writes a registry entry; `kin registry` only lists and cleans"
+                "hint: `kin init` registers a repository when it runs; a repository \
+                 initialized before this build predates that and has no entry"
             );
         }
         return Ok(());
@@ -292,7 +296,9 @@ fn report_every_registered_repo(registry: &KinRegistry, json: bool) -> Result<()
 
     if !unrecorded.is_empty() {
         println!(
-            "note: dependency records are written at registration, and no shipped command writes a registry entry today, so these may be unrecorded rather than dependency-free: {}",
+            "note: dependency records are written when `kin init` registers a repository, so a \
+             repository initialized before this build may show no records rather than no \
+             dependencies: {}",
             unrecorded.join(", ")
         );
     }
@@ -608,10 +614,13 @@ mod tests {
 
         assert!(message.contains("not in the Kin registry"), "{message}");
         assert!(
-            message.contains("no shipped command writes an entry"),
-            "the refusal must not name a remedy that cannot register: {message}"
+            message.contains("kin init") && message.contains("registers a repository"),
+            "the refusal must explain that registration comes from `kin init`: {message}"
         );
-        assert!(!message.contains("kin init"), "{message}");
+        assert!(
+            message.contains("kin registry") && message.contains("only lists and cleans"),
+            "the refusal must still say `kin registry` cannot add an entry after the fact: {message}"
+        );
         assert!(message.contains("kin deps --all"), "{message}");
     }
 
@@ -658,10 +667,13 @@ mod tests {
         assert!(message.contains("/other/place/kin"), "{message}");
         assert!(message.contains("same directory name"), "{message}");
         assert!(
-            message.contains("no shipped command writes"),
-            "the refusal must not name a remedy that cannot register: {message}"
+            message.contains("kin init") && message.contains("registers a repository"),
+            "the refusal must explain that registration comes from `kin init`: {message}"
         );
-        assert!(!message.contains("kin init"), "{message}");
+        assert!(
+            message.contains("kin registry") && message.contains("only lists and cleans"),
+            "the refusal must still say `kin registry` cannot add an entry after the fact: {message}"
+        );
         assert!(message.contains("kin deps --all"), "{message}");
     }
 
@@ -695,7 +707,6 @@ mod tests {
 
         assert!(rendered.contains("no cross-repo dependencies recorded"));
         assert!(rendered.contains("no registered repository records this one as a provider"));
-        assert!(rendered.contains("no shipped command writes a registry entry"));
-        assert!(!rendered.contains("kin init"));
+        assert!(rendered.contains("kin init") && rendered.contains("registers a repository"));
     }
 }
