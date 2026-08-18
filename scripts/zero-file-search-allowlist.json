@@ -154,7 +154,7 @@
     },
     {
       "file": "crates/kin-daemon-spawn/src/lib.rs",
-      "reason": "Daemon process lifecycle boundary with zero answer-authority surface. The exact expression pins cover process construction, readiness records, port records, PID records, and Linux process-table inspection; each reaches or supervises the daemon that owns graph truth and never derives a semantic answer. The PID record is read to establish that a daemon is still running, which is a liveness question about a process rather than a question about repository content: it can only withhold a restart, never produce or repair an answer. ManagedInstallSpawnFence::acquire is separately function-pinned because it is an install-mutation boundary: it binds the configured executable and update lock, rejects replaced or retired install roots, and serializes daemon spawn against uninstall. It reads only install/process identity metadata and cannot answer locate, search, context, trace, review, xref, or rename. The rest of this single-module crate remains scanned, and exact pin counts make any added occurrence fail closed. The death note and the daemon-log append are the same boundary read in the other direction: a daemon ended from outside cannot log its own cause, because the reaper's SIGTERM grace is shorter than the daemon's shutdown and the SIGKILL that follows lands while the arm that would print a shutdown line is still unpolled. These write that cause into the repository the daemon served and read it back, so a failed request can name a killed daemon instead of quoting a socket error. They carry process lifecycle facts only and answer no question about repository content.",
+      "reason": "Daemon process lifecycle boundary with zero answer-authority surface. The exact expression pins cover process construction, readiness records, port records, PID records, and Linux process-table inspection; each reaches or supervises the daemon that owns graph truth and never derives a semantic answer. The PID record is read to establish that a daemon is still running, which is a liveness question about a process rather than a question about repository content: it can only withhold a restart, never produce or repair an answer. ManagedInstallSpawnFence::acquire is separately function-pinned because it is an install-mutation boundary: it binds the configured executable and update lock, rejects replaced or retired install roots, and serializes daemon spawn against uninstall. It reads only install/process identity metadata and cannot answer locate, search, context, trace, review, xref, or rename. The rest of this single-module crate remains scanned, and exact pin counts make any added occurrence fail closed. The death note and the daemon-log append are the same boundary read in the other direction: a daemon ended from outside cannot log its own cause, because the reaper's SIGTERM grace is shorter than the daemon's shutdown and the SIGKILL that follows lands while the arm that would print a shutdown line is still unpolled. These write that cause into the repository the daemon served and read it back, so a failed request can name a killed daemon instead of quoting a socket error. They carry process lifecycle facts only and answer no question about repository content. The open-transaction marker is the third instance of the same lifecycle boundary: the daemon publishes the phase and last beat of a write transaction it has open into .kin/daemon.transaction, the reaper reads it to tell a busy daemon from a wedged one, and the CLI reads it, together with the durable authority receipt, to classify a commit whose reply was lost as landed, still running, or gone. The four expressions pinned for it write, read and retire that one marker; the temporary-file removal is shared with the death note, which is why its count is two. They carry process lifecycle facts only, and none of them reads repository content or feeds a semantic answer.",
       "owner": "kin-daemon-spawn",
       "expiration": "2026-12-31",
       "allow_fn": [
@@ -198,10 +198,16 @@
           "count": 2
         },
         "if fs::write(&tmp, body).is_ok() && fs::rename(&tmp, kin_root.join(DEATH_FILE_NAME)).is_err() {",
-        "let _ = fs::remove_file(&tmp);",
+        {
+          "expr": "let _ = fs::remove_file(&tmp);",
+          "count": 2
+        },
         "let raw = fs::read_to_string(kin_root.join(DEATH_FILE_NAME)).ok()?;",
         "let _ = fs::remove_file(kin_root.join(DEATH_FILE_NAME));",
-        ".open(kin_root.join(\"daemon.log\"))"
+        ".open(kin_root.join(\"daemon.log\"))",
+        "if fs::write(&tmp, body).is_ok()",
+        "let raw = fs::read_to_string(kin_root.join(TRANSACTION_FILE_NAME)).ok()?;",
+        "let _ = fs::remove_file(kin_root.join(TRANSACTION_FILE_NAME));"
       ]
     },
     {
@@ -522,15 +528,11 @@
     },
     {
       "file": "crates/kin-daemon/src/commit_liveness.rs",
-      "reason": "Process liveness boundary with zero answer-authority surface. This module publishes one fact about the daemon process — that it currently has a write transaction open, which phase is running, and when it last beat — into .kin/daemon.transaction, and reads that file back so the supervisor's reaper can tell a busy daemon from a wedged one. It exists because the reaper's only other liveness question is GET /health, which a daemon doing synchronous commit work on a runtime worker cannot answer, so the guard that refuses to reap a working daemon could not fire for the one state it protects; a 172-second commit was SIGKILLed as a result. Every expression here writes or reads that single marker plus this process's own pid. Nothing in it reaches repository content, and it can only withhold a kill, never produce, rank, fill, or repair an answer to locate, search, context, trace, review, xref, or rename. Pinned by exact expression so any newly added filesystem primitive in this module fails the guard until it is re-justified.",
+      "reason": "Process liveness boundary with zero answer-authority surface. This module publishes one fact about the daemon process, that it currently has a write transaction open, which phase is running, and when it last beat, into .kin/daemon.transaction, and reads that file back so the supervisor's reaper can tell a busy daemon from a wedged one. It exists because the reaper's only other liveness question is GET /health, which a daemon doing synchronous commit work on a runtime worker cannot answer, so the guard that refuses to reap a working daemon could not fire for the one state it protects; a 172-second commit was SIGKILLed as a result. The marker's file reads and writes now live in kin-daemon-spawn, which both the daemon and the CLI depend on, so a lost commit reply can be classified from the same record the reaper reads; that crate's entry pins them. What remains here is this process's own pid, recorded into the marker so a reader can tell whether the daemon that opened it is still alive. Nothing in it reaches repository content, and it can only withhold a kill, never produce, rank, fill, or repair an answer to locate, search, context, trace, review, xref, or rename. Pinned by exact expression so any newly added filesystem primitive in this module fails the guard until it is re-justified.",
       "owner": "kin-daemon",
       "expiration": "2026-12-31",
       "allow_match": [
-        "let Ok(raw) = std::fs::read_to_string(transaction_path(repo_root)) else {",
-        "pid: std::process::id(),",
-        "if std::fs::write(&tmp, body).is_ok() && std::fs::rename(&tmp, &path).is_err() {",
-        "let _ = std::fs::remove_file(&tmp);",
-        "let _ = std::fs::remove_file(self.kin_root.join(TRANSACTION_FILE_NAME));"
+        "pid: std::process::id(),"
       ]
     }
   ]

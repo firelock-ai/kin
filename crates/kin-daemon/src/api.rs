@@ -19526,6 +19526,7 @@ mod tests {
     }
 
     /// Changes in repository authority, read the way `kin log` reads them.
+    #[cfg(unix)]
     fn authority_change_count(state: &Arc<DaemonState>) -> usize {
         let context =
             crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)
