@@ -399,6 +399,11 @@ fn registered_tools() -> ToolsListResult {
                             "type": "array",
                             "description": "Filter relation kinds. Supported values: calls, imports, references. Defaults to all three.",
                             "items": { "type": "string" }
+                        },
+                        "include_snippets": {
+                            "type": "boolean",
+                            "description": "If true, each row also carries the referencing entity's signature and a bounded body excerpt. Off by default, because one row is one caller and bodies would then scale with the number of callers. Every row still carries entity_id, which drills to the full body via get_entity_source.",
+                            "default": false
                         }
                     }
                 }),
