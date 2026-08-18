@@ -303,6 +303,71 @@ pub fn observe_cross_file_reference_coverage_for_languages_witnessed<S: EntitySt
     })
 }
 
+/// Observe the language scope an absence claim covers, for a tool that
+/// traverses no edge to make it.
+///
+/// `semantic_search`, `find_dead_code_seeded` and `graph_neighborhood` answer
+/// from the entity index and the walk, not from a cross-file reference class, so
+/// the witness scan above measures nothing their verdict rests on. What their
+/// verdict does rest on is which languages the claim spans and whether this
+/// build can resolve their programs, which is the one fact
+/// [`reference_enrichment`] already answers. Publishing it under the same key
+/// the reference tools publish means one gate reads one observation rather than
+/// two shapes drifting apart.
+///
+/// `classes` is deliberately empty rather than absent: this observation asserts
+/// nothing about cross-file edges, and a class map full of `unknown` would read
+/// as a scan that failed instead of one that was never the question.
+///
+/// `scope_entities` is the count of entities the query's own filter selects with
+/// its name pattern removed, so a kind-filtered absence can state the coverage
+/// of that kind. `None` leaves it out entirely, because a region nothing counted
+/// is unknown rather than empty. A resolved count of zero says the filter
+/// selected a region the index never populated, which is a fact about the index.
+pub fn observe_absence_scope(languages: &[LanguageId], scope_entities: Option<usize>) -> Value {
+    let mut observed: Vec<LanguageId> = Vec::new();
+    for language in languages {
+        if !observed.contains(language) {
+            observed.push(*language);
+        }
+    }
+    let language = if observed.is_empty() {
+        "no resolved language".to_string()
+    } else {
+        observed
+            .iter()
+            .map(|language| format!("{language:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut observation = json!({
+        "scope": "absence_scope",
+        "language": language,
+        "requested_classes": Vec::<&str>::new(),
+        "classes": Map::new(),
+        "cross_file_classes": Vec::<&str>::new(),
+        "reference_enrichment": reference_enrichment(&observed),
+        "budget_exhausted": false,
+        "entities_examined": 0,
+        "scan": "skipped_no_edge_dependency",
+    });
+    if let Some(count) = scope_entities {
+        observation["scope_entities"] = json!(count);
+    }
+    observation
+}
+
+/// The distinct languages a resolved entity set spans, in first-seen order.
+pub fn languages_of(entities: &[Entity]) -> Vec<LanguageId> {
+    let mut languages: Vec<LanguageId> = Vec::new();
+    for entity in entities {
+        if !languages.contains(&entity.language) {
+            languages.push(entity.language);
+        }
+    }
+    languages
+}
+
 /// Whether every class the absence verdict rests on is already `present`.
 ///
 /// Narrowed by [`crate::negative::load_bearing_classes`] rather than by a rule
