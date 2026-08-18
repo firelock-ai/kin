@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.41] - 2026-08-18
+
+### Changed
+
+- Stop semantic_locate spending its response on copies of its own answer (#920)
+- Register a repository with kin init so cross-repo commands can see it (#919)
+- Carry a completeness signal on every retrieval answer, not just empty ones (#921)
+- Report an unbuilt vector index, and hand the reranker the cache it probed (#922)
+
+
 ## [0.5.40] - 2026-08-18
 
 ### Changed
