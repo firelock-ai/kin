@@ -1473,6 +1473,23 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn hard_parent_death_terminates_the_guarded_probe() {
+        // Readiness here is a three-hop spawn chain whose middle hop already
+        // waits out a full REAP_GRACE of its own, so a budget no larger than one
+        // nested product budget can expire while every component is still inside
+        // its permitted window. Both guards are deliberately local: REAP_GRACE
+        // carries production reap semantics at many other call sites and must
+        // not move for a test's benefit.
+        //
+        // Both must also stay strictly BELOW the descendant fixture's own 30s
+        // lifetime. A cleanup guard above it cannot fail: a probe that survives
+        // cleanup completely would return of old age inside the window, every
+        // liveness check would find it gone, and the test would pass green while
+        // proving nothing. That ceiling, not the cleanup latency, is what bounds
+        // these numbers; observed cleanup is under 100ms, so 20s already leaves
+        // two orders of magnitude of margin.
+        const PARENT_DEATH_READY_GUARD: Duration = Duration::from_secs(20);
+        const PARENT_DEATH_CLEANUP_GUARD: Duration = Duration::from_secs(20);
+
         let temp = tempfile::tempdir().unwrap();
         let marker = temp.path().join("parent-death-probe.pid");
         let mut owner_command = Command::new(std::env::current_exe().unwrap());
@@ -1488,31 +1505,46 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let mut owner = KillAndReapOnDrop(Some(owner_command.spawn().unwrap()));
-        let ready_deadline = Instant::now() + Duration::from_secs(5);
-        let mut guarded_pid = read_pid_marker(&marker);
-        while guarded_pid.is_none() && Instant::now() < ready_deadline {
+        let owner_pid = owner.child_mut().id();
+        let ready_deadline = Instant::now() + PARENT_DEATH_READY_GUARD;
+        let guarded_pid = loop {
+            if let Some(pid) = read_pid_marker(&marker) {
+                break pid;
+            }
             assert!(
                 owner.child_mut().try_wait().unwrap().is_none(),
                 "parent fixture exited before its guarded probe became ready"
             );
+            assert!(
+                Instant::now() < ready_deadline,
+                "guarded probe published no parseable PID {}s after the owner was spawned; \
+                 the readiness chain never reached the nested probe",
+                PARENT_DEATH_READY_GUARD.as_secs()
+            );
             std::thread::sleep(POLL_INTERVAL);
-            guarded_pid = read_pid_marker(&marker);
-        }
-        let guarded_pid = guarded_pid
-            .expect("guarded probe did not publish a parseable PID for parent-death test");
+        };
+        assert_ne!(
+            guarded_pid, owner_pid,
+            "the marker must name the nested guarded probe, not the owner the test spawned"
+        );
 
         // This bypasses Rust Drop inside the owner process. Only the
         // guardian's parent-death ownership pipe can clean the nested probe.
         owner.kill_and_reap();
 
-        let cleanup_deadline = Instant::now() + REAP_GRACE;
-        while process_is_live(guarded_pid) && Instant::now() < cleanup_deadline {
+        let cleanup_deadline = Instant::now() + PARENT_DEATH_CLEANUP_GUARD;
+        loop {
+            if !process_is_live(guarded_pid) {
+                break;
+            }
+            assert!(
+                Instant::now() < cleanup_deadline,
+                "guarded probe {guarded_pid} was still live {}s after hard parent death; \
+                 the guardian's parent-death ownership pipe did not clean it",
+                PARENT_DEATH_CLEANUP_GUARD.as_secs()
+            );
             std::thread::sleep(POLL_INTERVAL);
         }
-        assert!(
-            !process_is_live(guarded_pid),
-            "guarded probe {guarded_pid} survived hard parent death"
-        );
     }
 
     #[cfg(unix)]

@@ -12,6 +12,16 @@ use tokio::io::AsyncReadExt as _;
 use tokio::process::{Child, Command};
 
 const DAEMON_REAP_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a containment spawn waits for its guardian to publish readiness.
+///
+/// This is the tightest budget on the cold-start path of every containment
+/// spawn in this suite, and it runs before any test's own readiness clock
+/// starts, so it expires as a spawn failure rather than as the readiness
+/// message a reader would expect. Reaching it costs two re-execs of the test
+/// binary, and nothing asserts how long that may take, so the number is a hang
+/// guard only.
+#[cfg(unix)]
+const GUARDIAN_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(180);
 const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const DAEMON_TEST_CAPTURE_LIMIT: usize = 4 * 1024 * 1024;
 /// Maximum rendered UTF-8 bytes, including any truncation marker.
@@ -261,7 +271,7 @@ impl DaemonContainment {
         let guardian = launcher
             .spawn_with(
                 &ready,
-                Instant::now() + Duration::from_secs(5),
+                Instant::now() + GUARDIAN_HANDSHAKE_TIMEOUT,
                 scrub_daemon_test_guardian_environment,
             )
             .map_err(|error| {

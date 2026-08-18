@@ -15,6 +15,21 @@ const TREE_PARENT: &str = "KIN_TEST_RUNTIME_TREE_PARENT";
 const TREE_DESCENDANT: &str = "KIN_TEST_RUNTIME_TREE_DESCENDANT";
 const TREE_STOP: &str = "KIN_TEST_RUNTIME_TREE_STOP";
 
+/// Ceiling on the descendant fixture's own lifetime.
+///
+/// It must strictly exceed readiness plus the entire `Drop` budget, or the
+/// descendant expires while the test is still measuring and every liveness
+/// check reads as containment on a process that died of old age. The expiry
+/// marker makes that outcome loud rather than silent, and this number is what
+/// keeps it from happening in the first place.
+const DESCENDANT_LIFETIME_CAP: Duration = Duration::from_secs(300);
+
+/// How long the test waits for the descendant to publish its pid. The
+/// descendant publishes as its first action, so this stays near its original
+/// value; whatever it becomes must satisfy readiness plus `Drop` under
+/// [`DESCENDANT_LIFETIME_CAP`].
+const DESCENDANT_READY_BUDGET: Duration = Duration::from_secs(10);
+
 #[test]
 fn bounded_capture_deadline_cannot_be_bypassed_by_continuous_output() {
     common::bounded_capture_deadline_cannot_be_bypassed_by_continuous_output();
@@ -96,11 +111,20 @@ impl Drop for KillAndReapChild {
 #[test]
 fn isolated_runtime_tree_worker() {
     if let Some(marker) = std::env::var_os(TREE_DESCENDANT) {
-        publish_marker_atomically(&PathBuf::from(marker), std::process::id().to_string());
+        let marker = PathBuf::from(marker);
+        publish_marker_atomically(&marker, std::process::id().to_string());
         let stop = PathBuf::from(std::env::var_os(TREE_STOP).expect("tree stop marker"));
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + DESCENDANT_LIFETIME_CAP;
         while !stop.is_file() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
+        }
+        // Returning of old age and being terminated by containment are the same
+        // observation from outside: the pid stops being live either way. Only a
+        // descendant that outlived its own cap can publish this, so its absence
+        // is what makes the assertions below statements about containment
+        // rather than about how long the machine took.
+        if !stop.is_file() {
+            publish_marker_atomically(&marker.with_extension("expired"), "expired");
         }
         return;
     }
@@ -137,6 +161,7 @@ fn dropping_isolated_runtime_terminates_a_late_descendant() {
     let repository = root.path().join("repository");
     std::fs::create_dir_all(&repository).expect("create repository");
     let descendant_marker = root.path().join("descendant.pid");
+    let expiry_marker = root.path().join("descendant.expired");
     let stop_marker = root.path().join("stop");
     let runtime = common::IsolatedDaemonRuntime::with_cleanup_command_for_test(
         &repository,
@@ -147,7 +172,7 @@ fn dropping_isolated_runtime_terminates_a_late_descendant() {
             "--nocapture".into(),
         ],
         Vec::new(),
-        Duration::from_secs(5),
+        Duration::from_secs(15),
     );
     let mut command =
         runtime.process_command_for_test(std::env::current_exe().expect("current test executable"));
@@ -163,7 +188,7 @@ fn dropping_isolated_runtime_terminates_a_late_descendant() {
             .expect("spawn runtime-owned process tree"),
     );
     let parent_pid = parent.id();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + DESCENDANT_READY_BUDGET;
     let descendant_pid = loop {
         if let Some(pid) = read_pid_marker(&descendant_marker) {
             break pid;
@@ -219,6 +244,11 @@ fn dropping_isolated_runtime_terminates_a_late_descendant() {
         }
     }
 
+    assert!(
+        !expiry_marker.exists(),
+        "the descendant returned at its own lifetime cap rather than being terminated, so \
+         every liveness check below would read as containment on a process that died of old age"
+    );
     assert!(
         runtime_drop.is_ok(),
         "IsolatedDaemonRuntime Drop reported containment failure"
