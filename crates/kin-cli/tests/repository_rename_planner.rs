@@ -571,6 +571,12 @@ struct LanguageFixture {
     caller_path: &'static str,
     caller_source: &'static str,
     has_named_import_without_span: bool,
+    /// Whether this language's adapter records a call site, so its `Calls`
+    /// evidence carries a `source_span` (FIR-1825). The planner does not read
+    /// spans, so its behavior below is the same either way; this keeps the
+    /// fixture honest about what the linker actually produced instead of
+    /// asserting one blanket answer for every language.
+    records_call_sites: bool,
 }
 
 fn entity_leaf(name: &str) -> &str {
@@ -587,6 +593,7 @@ const LANGUAGE_FIXTURES: &[LanguageFixture] = &[
         caller_path: "caller.rs",
         caller_source: "pub fn caller() -> u32 { target() + target() }\n",
         has_named_import_without_span: false,
+        records_call_sites: false,
     },
     LanguageFixture {
         name: "TypeScript",
@@ -595,6 +602,7 @@ const LANGUAGE_FIXTURES: &[LanguageFixture] = &[
         caller_path: "caller.ts",
         caller_source: "import { target } from './defs';\nexport function caller(): number { return target() + target(); }\n",
         has_named_import_without_span: true,
+        records_call_sites: true,
     },
     LanguageFixture {
         name: "JavaScript",
@@ -603,6 +611,7 @@ const LANGUAGE_FIXTURES: &[LanguageFixture] = &[
         caller_path: "caller.js",
         caller_source: "import { target } from './defs';\nexport function caller() { return target() + target(); }\n",
         has_named_import_without_span: true,
+        records_call_sites: true,
     },
     LanguageFixture {
         name: "Python",
@@ -611,6 +620,7 @@ const LANGUAGE_FIXTURES: &[LanguageFixture] = &[
         caller_path: "caller.py",
         caller_source: "from defs import target\n\ndef caller():\n    return target() + target()\n",
         has_named_import_without_span: true,
+        records_call_sites: true,
     },
     LanguageFixture {
         name: "Go",
@@ -619,6 +629,7 @@ const LANGUAGE_FIXTURES: &[LanguageFixture] = &[
         caller_path: "caller.go",
         caller_source: "package main\n\nfunc caller() int { return target() + target() }\n",
         has_named_import_without_span: false,
+        records_call_sites: false,
     },
     LanguageFixture {
         name: "Java",
@@ -627,6 +638,7 @@ const LANGUAGE_FIXTURES: &[LanguageFixture] = &[
         caller_path: "Caller.java",
         caller_source: "class Caller { int caller() { return target() + target(); } }\n",
         has_named_import_without_span: false,
+        records_call_sites: false,
     },
     LanguageFixture {
         name: "C",
@@ -635,6 +647,7 @@ const LANGUAGE_FIXTURES: &[LanguageFixture] = &[
         caller_path: "caller.c",
         caller_source: "int caller(void) { return target() + target(); }\n",
         has_named_import_without_span: false,
+        records_call_sites: false,
     },
     LanguageFixture {
         name: "Cpp",
@@ -643,6 +656,7 @@ const LANGUAGE_FIXTURES: &[LanguageFixture] = &[
         caller_path: "caller.cpp",
         caller_source: "int caller() { return target() + target(); }\n",
         has_named_import_without_span: false,
+        records_call_sites: false,
     },
 ];
 
@@ -736,13 +750,25 @@ fn real_linker_spanless_relations_are_exact_or_refused_across_eight_languages() 
                     && relation.dst == GraphNodeId::Entity(target.id)
             })
             .unwrap_or_else(|| panic!("{} repeated call edge", fixture.name));
-        assert!(
-            call.evidence
-                .iter()
-                .all(|evidence| evidence.source_span.is_none()),
-            "{} unexpectedly gained a relation span; update the bounded planner proof",
-            fixture.name
-        );
+        let spanned = call
+            .evidence
+            .iter()
+            .filter(|evidence| evidence.source_span.is_some())
+            .count();
+        if fixture.records_call_sites {
+            assert_eq!(
+                spanned, 2,
+                "{} records call sites, so both of its occurrences must carry one; a \
+                 reference row for this language reports them as its site lines",
+                fixture.name
+            );
+        } else {
+            assert_eq!(
+                spanned, 0,
+                "{} unexpectedly gained a relation span; update the bounded planner proof",
+                fixture.name
+            );
+        }
         assert_eq!(
             call.evidence
                 .iter()

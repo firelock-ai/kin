@@ -158,7 +158,7 @@ fn extract_php_node(
                     });
                     if let Some(cls) = class_ctx {
                         relations.push(ExtractedRelation {
-            site: None,
+                            site: None,
                             receiver: None,
                             call_shape: None,
                             kind: kin_model::RelationKind::Contains,
@@ -199,7 +199,7 @@ fn extract_php_node(
                             .to_string();
                         if !base_name.is_empty() {
                             relations.push(ExtractedRelation {
-            site: None,
+                                site: None,
                                 receiver: None,
                                 call_shape: None,
                                 kind: kin_model::RelationKind::Extends,
@@ -359,7 +359,7 @@ fn extract_php_implements(
                     let iface_name = iface.utf8_text(source).unwrap_or("").to_string();
                     if !iface_name.is_empty() {
                         relations.push(ExtractedRelation {
-            site: None,
+                            site: None,
                             receiver: None,
                             call_shape: None,
                             kind: kin_model::RelationKind::Implements,
@@ -435,7 +435,7 @@ fn extract_calls_from_body(
                 let callee = name_node.utf8_text(source).unwrap_or("").to_string();
                 if !callee.is_empty() {
                     relations.push(ExtractedRelation {
-            site: None,
+                        site: None,
                         receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::Calls,
@@ -451,7 +451,7 @@ fn extract_calls_from_body(
                     let callee = func_node.utf8_text(source).unwrap_or("").to_string();
                     if !callee.is_empty() && !callee.starts_with('"') && !callee.starts_with('\'') {
                         relations.push(ExtractedRelation {
-            site: None,
+                            site: None,
                             receiver: None,
                             call_shape: None,
                             kind: kin_model::RelationKind::Calls,

@@ -266,7 +266,7 @@ pub struct ExtractedRelation {
 /// Construct the reserved negative call-extraction coverage record.
 pub fn call_extraction_incomplete_marker() -> ExtractedRelation {
     ExtractedRelation {
-            site: None,
+        site: None,
         receiver: None,
         kind: RelationKind::DependsOn,
         src_name: String::new(),

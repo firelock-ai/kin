@@ -226,7 +226,7 @@ fn extract_ts_node(
                                     span: span_from_node(&member, file_id),
                                 });
                                 relations.push(ExtractedRelation {
-            site: None,
+                                    site: None,
                                     receiver: None,
                                     call_shape: None,
                                     kind: kin_model::RelationKind::Contains,
@@ -435,7 +435,7 @@ fn extract_ts_class_member(
                     span: span_from_node(node, file_id),
                 });
                 relations.push(ExtractedRelation {
-            site: None,
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: kin_model::RelationKind::Contains,
@@ -609,7 +609,7 @@ fn extract_ts_heritage(
                             .and_then(|value| js_heritage_name(&value, source))
                         {
                             relations.push(ExtractedRelation {
-            site: None,
+                                site: None,
                                 receiver: None,
                                 call_shape: None,
                                 kind: kin_model::RelationKind::Extends,
@@ -626,7 +626,7 @@ fn extract_ts_heritage(
                                 let iface_name = iface.utf8_text(source).unwrap_or("").to_string();
                                 if !iface_name.is_empty() {
                                     relations.push(ExtractedRelation {
-            site: None,
+                                        site: None,
                                         receiver: None,
                                         call_shape: None,
                                         kind: kin_model::RelationKind::Implements,

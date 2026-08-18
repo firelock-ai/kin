@@ -393,7 +393,7 @@ fn extract_py_node(
                 extract_value_refs_from_definition(node, source, &name, value_refs);
                 if let Some(cls) = class_ctx {
                     relations.push(ExtractedRelation {
-            site: None,
+                        site: None,
                         receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::Contains,
@@ -445,7 +445,7 @@ fn extract_py_node(
                                     is_enum = true;
                                 }
                                 relations.push(ExtractedRelation {
-            site: None,
+                                    site: None,
                                     receiver: None,
                                     call_shape: None,
                                     kind: kin_model::RelationKind::Extends,
@@ -524,7 +524,7 @@ fn extract_py_node(
                             for dec in &decorators {
                                 if is_valid_callee_name(dec) {
                                     relations.push(ExtractedRelation {
-            site: None,
+                                        site: None,
                                         receiver: None,
                                         call_shape: None,
                                         kind: kin_model::RelationKind::Calls,

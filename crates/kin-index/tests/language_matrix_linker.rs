@@ -84,7 +84,7 @@ fn method(name: &str, file_path: &str) -> Entity {
 
 fn calls_relation(src: &str, dst: &str) -> ExtractedRelation {
     ExtractedRelation {
-            site: None,
+        site: None,
         receiver: None,
         call_shape: None,
         kind: RelationKind::Calls,

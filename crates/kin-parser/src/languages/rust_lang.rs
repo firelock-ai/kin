@@ -161,7 +161,7 @@ fn extract_rust_node(
                 // Emit Implements relations for #[derive(...)] traits.
                 for trait_name in extract_derive_traits(node, source) {
                     relations.push(ExtractedRelation {
-            site: None,
+                        site: None,
                         receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::Implements,
@@ -188,7 +188,7 @@ fn extract_rust_node(
                 // Emit Implements relations for #[derive(...)] traits.
                 for trait_name in extract_derive_traits(node, source) {
                     relations.push(ExtractedRelation {
-            site: None,
+                        site: None,
                         receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::Implements,
@@ -217,7 +217,7 @@ fn extract_rust_node(
                                     span: span_from_node(&variant, file_id),
                                 });
                                 relations.push(ExtractedRelation {
-            site: None,
+                                    site: None,
                                     receiver: None,
                                     call_shape: None,
                                     kind: kin_model::RelationKind::Contains,
@@ -302,7 +302,7 @@ fn extract_rust_node(
             if let Some(ref trait_n) = trait_name {
                 if !trait_n.is_empty() && !type_name.is_empty() {
                     relations.push(ExtractedRelation {
-            site: None,
+                        site: None,
                         receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::Implements,
@@ -349,7 +349,7 @@ fn extract_rust_node(
                             if let Some(ref trait_n) = trait_name {
                                 if !trait_n.is_empty() {
                                     relations.push(ExtractedRelation {
-            site: None,
+                                        site: None,
                                         receiver: None,
                                         call_shape: None,
                                         kind: kin_model::RelationKind::Implements,
@@ -361,7 +361,7 @@ fn extract_rust_node(
                             }
                             if !type_name.is_empty() {
                                 relations.push(ExtractedRelation {
-            site: None,
+                                    site: None,
                                     receiver: None,
                                     call_shape: None,
                                     kind: kin_model::RelationKind::Contains,
@@ -565,7 +565,7 @@ fn extract_calls_from_context(
                 let (callee_name, receiver) = rust_callee_and_receiver(&function, source, owner);
                 if is_valid_callee_name(&callee_name) {
                     relations.push(ExtractedRelation {
-            site: None,
+                        site: None,
                         receiver,
                         call_shape: None,
                         kind: kin_model::RelationKind::Calls,
@@ -675,7 +675,7 @@ fn extract_calls_from_token_tree(
         let (callee_name, receiver) = fold_settled_rust_receiver(callee_name, receiver, owner);
         if is_valid_callee_name(&callee_name) {
             relations.push(ExtractedRelation {
-            site: None,
+                site: None,
                 receiver,
                 call_shape: None,
                 kind: kin_model::RelationKind::Calls,

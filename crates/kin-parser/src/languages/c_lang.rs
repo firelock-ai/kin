@@ -539,7 +539,7 @@ fn extract_calls_from_body(
                 let callee = function.utf8_text(source).unwrap_or("").to_string();
                 if is_valid_callee(&callee) {
                     relations.push(ExtractedRelation {
-            site: None,
+                        site: None,
                         receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::Calls,
@@ -995,7 +995,7 @@ fn extract_includes_and_macros_recursive(
                 if let Some(src_name) = find_enclosing_entity(node, source) {
                     if src_name != name && !src_name.ends_with(&format!("::{}", name)) {
                         relations.push(crate::extract::ExtractedRelation {
-            site: None,
+                            site: None,
                             receiver: None,
                             call_shape: None,
                             kind: kin_model::RelationKind::UsesMacro,

@@ -224,7 +224,10 @@ async fn find_references(graph: &InMemoryGraph, target: &Entity) -> serde_json::
 async fn python_and_javascript_reference_rows_carry_call_site_lines_on_both_ingest_arms() {
     for fixture in FIXTURES {
         for (arm, link) in [
-            ("batch", link_batch as fn(&[IndexedFixtureFile]) -> Vec<Relation>),
+            (
+                "batch",
+                link_batch as fn(&[IndexedFixtureFile]) -> Vec<Relation>,
+            ),
             ("incremental", link_incremental),
         ] {
             let files = index_files(fixture);
@@ -294,9 +297,7 @@ async fn python_and_javascript_reference_rows_carry_call_site_lines_on_both_inge
                 fixture.language,
             );
 
-            let layout = kin_core::KinLayout::new(
-                tempfile::tempdir().unwrap().path().join(".kin"),
-            );
+            let layout = kin_core::KinLayout::new(tempfile::tempdir().unwrap().path().join(".kin"));
             let cli = build_refs_response(
                 &layout,
                 &graph,

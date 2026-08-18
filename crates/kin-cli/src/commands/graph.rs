@@ -1517,7 +1517,7 @@ mod tests {
             file_path: "src/app.rs".to_string(),
             entities: vec![caller.clone()],
             relations: vec![kin_parser::ExtractedRelation {
-            site: None,
+                site: None,
                 receiver: None,
                 call_shape: None,
                 kind,

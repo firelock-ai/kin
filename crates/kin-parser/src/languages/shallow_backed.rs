@@ -147,7 +147,7 @@ fn extract_csharp_node(
                 });
                 if let Some(parent) = namespace_ctx {
                     relations.push(ExtractedRelation {
-            site: None,
+                        site: None,
                         receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::Contains,
@@ -199,7 +199,7 @@ fn extract_csharp_node(
                 });
                 if let Some(parent) = namespace_ctx.or(type_ctx) {
                     relations.push(ExtractedRelation {
-            site: None,
+                        site: None,
                         receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::Contains,
@@ -217,7 +217,7 @@ fn extract_csharp_node(
                 ) {
                     for base in extract_csharp_base_types(node, source) {
                         relations.push(ExtractedRelation {
-            site: None,
+                            site: None,
                             receiver: None,
                             call_shape: None,
                             kind: kin_model::RelationKind::Extends,
@@ -259,7 +259,7 @@ fn extract_csharp_node(
                         span: span_from_node(node, file_id),
                     });
                     relations.push(ExtractedRelation {
-            site: None,
+                        site: None,
                         receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::Contains,
@@ -285,7 +285,7 @@ fn extract_csharp_node(
                         span: span_from_node(node, file_id),
                     });
                     relations.push(ExtractedRelation {
-            site: None,
+                        site: None,
                         receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::Contains,
@@ -310,7 +310,7 @@ fn extract_csharp_node(
                         span: span_from_node(node, file_id),
                     });
                     relations.push(ExtractedRelation {
-            site: None,
+                        site: None,
                         receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::Contains,
@@ -335,7 +335,7 @@ fn extract_csharp_node(
                         span: span_from_node(node, file_id),
                     });
                     relations.push(ExtractedRelation {
-            site: None,
+                        site: None,
                         receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::Contains,
@@ -445,7 +445,7 @@ fn extract_csharp_calls(
                 };
                 if !callee.is_empty() {
                     relations.push(ExtractedRelation {
-            site: None,
+                        site: None,
                         receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::Calls,
@@ -460,7 +460,7 @@ fn extract_csharp_calls(
                 let target = normalize_scoped_name(text_of(&ty, source).trim());
                 if !target.is_empty() {
                     relations.push(ExtractedRelation {
-            site: None,
+                        site: None,
                         receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::References,
@@ -578,7 +578,7 @@ fn extract_ruby_node(
                 });
                 if let Some(parent) = container_ctx {
                     relations.push(ExtractedRelation {
-            site: None,
+                        site: None,
                         receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::Contains,
@@ -592,7 +592,7 @@ fn extract_ruby_node(
                         let base_name = normalize_ruby_name(text_of(&superclass, source).trim());
                         if !base_name.is_empty() {
                             relations.push(ExtractedRelation {
-            site: None,
+                                site: None,
                                 receiver: None,
                                 call_shape: None,
                                 kind: kin_model::RelationKind::Extends,
@@ -648,7 +648,7 @@ fn extract_ruby_node(
                 });
                 if let Some(owner_name) = owner {
                     relations.push(ExtractedRelation {
-            site: None,
+                        site: None,
                         receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::Contains,
@@ -688,7 +688,7 @@ fn extract_ruby_node(
                     });
                     if let Some(owner) = container_ctx {
                         relations.push(ExtractedRelation {
-            site: None,
+                            site: None,
                             receiver: None,
                             call_shape: None,
                             kind: kin_model::RelationKind::Contains,
@@ -715,7 +715,7 @@ fn extract_ruby_node(
                     if let Some(target) = extract_ruby_first_argument(node, source) {
                         if let Some(owner) = container_ctx {
                             relations.push(ExtractedRelation {
-            site: None,
+                                site: None,
                                 receiver: None,
                                 call_shape: None,
                                 kind: kin_model::RelationKind::References,
@@ -727,7 +727,7 @@ fn extract_ruby_node(
                     }
                 } else if let Some(current_callable) = callable_ctx {
                     relations.push(ExtractedRelation {
-            site: None,
+                        site: None,
                         receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::Calls,

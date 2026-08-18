@@ -177,8 +177,12 @@ impl IndexPipeline {
         }
 
         let parse_completeness = ParseCompleteness::from_parse_state(&parse_state);
-        let (relations, unresolved_relations) =
-            resolve_relations(&extracted_relations, &entities, file_id, &parse_completeness);
+        let (relations, unresolved_relations) = resolve_relations(
+            &extracted_relations,
+            &entities,
+            file_id,
+            &parse_completeness,
+        );
         let file_layout = build_layout(file_id, &entities, source.len(), &[], parse_completeness);
 
         debug!(
@@ -315,8 +319,12 @@ impl IndexPipeline {
 
         // Resolve extracted relations to model relations using entity name mapping
         let parse_completeness = ParseCompleteness::from_parse_state(&parse_state);
-        let (relations, unresolved_relations) =
-            resolve_relations(&extracted_relations, &entities, file_id, &parse_completeness);
+        let (relations, unresolved_relations) = resolve_relations(
+            &extracted_relations,
+            &entities,
+            file_id,
+            &parse_completeness,
+        );
         let file_layout = build_layout(file_id, &entities, source.len(), &[], parse_completeness);
 
         debug!(

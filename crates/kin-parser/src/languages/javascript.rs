@@ -614,7 +614,7 @@ fn extract_js_assignment_target(
                     span: span_from_node(stmt, file_id),
                 });
                 relations.push(ExtractedRelation {
-            site: None,
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: kin_model::RelationKind::Contains,
@@ -839,7 +839,7 @@ fn extract_js_class_like(
                 continue;
             };
             relations.push(ExtractedRelation {
-            site: None,
+                site: None,
                 receiver: None,
                 call_shape: None,
                 kind: kin_model::RelationKind::Extends,
