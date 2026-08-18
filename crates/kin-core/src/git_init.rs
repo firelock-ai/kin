@@ -1535,6 +1535,53 @@ mod tests {
         assert_no_staging_directories(root.path());
     }
 
+    /// A moving ambient Git scope must not move an admission proof.
+    ///
+    /// The proof folds in the bytes of whatever ignore file Git resolves for
+    /// this repository, and unpinned that file is decided by `core.excludesFile`
+    /// then `XDG_CONFIG_HOME` then `HOME`. All three are process-global and this
+    /// suite runs its tests as threads in one process, so a sibling test pinning
+    /// the ambient scope for its own resolve shifts what a proof in flight
+    /// beside it reads. The baseline then carries the host's ignore file and the
+    /// re-proof carries none, and init refuses a source nothing wrote to. That
+    /// is FIR-2388, seen as a 1-in-45 refusal of an unrelated test.
+    ///
+    /// This drives the shift deliberately, from inside the window between the
+    /// first proof and the re-proof, which is the only placement that can fail:
+    /// a scope moved before init is simply the scope all three proofs read. The
+    /// guard is dropped the instant init returns, so the window this opens for
+    /// the rest of the suite is the one it is testing and no wider.
+    #[test]
+    fn a_moving_ambient_git_scope_does_not_move_the_admission_proof() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        initialize_git(&source);
+        std::fs::write(source.join("README.md"), b"exact source\n").unwrap();
+        git(&source, ["add", "--all"]);
+        git(&source, ["commit", "-m", "initial"]);
+
+        let elsewhere = tempfile::tempdir().unwrap();
+        let global_config = elsewhere.path().join("global.gitconfig");
+        std::fs::write(&global_config, "").unwrap();
+
+        let mut ambient = None;
+        let result = init_from_git_with_hook(&source, || {
+            ambient = Some(
+                crate::test_env::EnvVarGuard::new()
+                    .with("GIT_CONFIG_NOSYSTEM", "1")
+                    .with("GIT_CONFIG_GLOBAL", &global_config)
+                    .with("HOME", elsewhere.path())
+                    .without("XDG_CONFIG_HOME"),
+            );
+        });
+        drop(ambient);
+
+        result.unwrap();
+        assert!(source.join(".kin").is_dir());
+        assert_no_staging_directories(root.path());
+    }
+
     /// A tracked edit racing publication is still fatal.
     ///
     /// The proof no longer refuses an edited worktree, so what catches this is
@@ -2231,6 +2278,28 @@ mod tests {
         git(source, ["config", "user.email", "kin@example.invalid"]);
         git(source, ["config", "user.name", "Kin Test"]);
         pin_default_hook_surface(source);
+        pin_resolved_global_excludes(source);
+    }
+
+    /// Bind a fixture's resolved global excludes to a file it owns.
+    ///
+    /// An exact source proof folds in the bytes of whatever ignore file Git
+    /// resolves for this repository, and unpinned that file is decided by
+    /// `core.excludesFile`, then `XDG_CONFIG_HOME`, then `HOME`. All three are
+    /// process-global and this suite runs its tests as threads in one process,
+    /// so a sibling test that pins the ambient Git scope for its own resolve
+    /// moves what a proof in flight beside it observes. The baseline proof then
+    /// carries the host's ignore file and the re-proof carries none, and init
+    /// refuses a source nothing wrote to. Repository scope outranks both the
+    /// host and that sibling, so pinning it here makes the observation depend on
+    /// the fixture alone.
+    fn pin_resolved_global_excludes(source: &Path) {
+        let excludes = source.join(".git/kin-fixture-global-excludes");
+        std::fs::write(&excludes, b"").unwrap();
+        git(
+            source,
+            ["config", "core.excludesFile", excludes.to_str().unwrap()],
+        );
     }
 
     /// Bind a fixture's hook surface to its own `.git/hooks`.

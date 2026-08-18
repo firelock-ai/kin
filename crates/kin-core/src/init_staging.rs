@@ -485,8 +485,8 @@ mod tests {
     ///
     /// The child holds a claimed staging directory and nothing else, so the
     /// parent can prove the signal path ran rather than that the child never
-    /// got far enough to stage anything: the assertion is made only after the
-    /// directory has been observed on disk.
+    /// got far enough to stage anything: the signal is sent only after the
+    /// child's lease has been observed on disk.
     #[cfg(unix)]
     #[test]
     fn a_terminating_signal_removes_the_capture_directory() {
@@ -506,8 +506,7 @@ mod tests {
         .spawn()
         .expect("spawn staging signal subprocess");
 
-        let staged = wait_for_capture_directory(&parent, &mut child);
-        assert!(staged.join(CAPTURE_LEASE_NAME).is_file());
+        let staged = wait_for_leased_capture_directory(&parent, &mut child);
 
         assert_eq!(
             unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) },
@@ -529,10 +528,20 @@ mod tests {
         );
     }
 
-    /// Poll for the child's capture directory, failing loudly rather than
-    /// letting a child that never staged anything pass the test above.
+    /// Poll for the child's leased capture directory, failing loudly rather
+    /// than letting a child that never staged anything pass the test above.
+    ///
+    /// The lease is the condition, not the directory. [`GitCaptureStaging::claim`]
+    /// creates the directory and only then opens and locks the lease inside it,
+    /// so a parent that returns on the directory alone observes a claim still in
+    /// flight and reads a lease the child has not written yet. That window is
+    /// wall clock rather than an event, which the child wins on an idle machine
+    /// and loses on a loaded one.
     #[cfg(unix)]
-    fn wait_for_capture_directory(parent: &Path, child: &mut std::process::Child) -> PathBuf {
+    fn wait_for_leased_capture_directory(
+        parent: &Path,
+        child: &mut std::process::Child,
+    ) -> PathBuf {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             if let Ok(entries) = std::fs::read_dir(parent) {
@@ -542,6 +551,7 @@ mod tests {
                         .to_str()
                         .is_some_and(|name| name.starts_with(GIT_CAPTURE_PREFIX))
                         && entry.path().is_dir()
+                        && entry.path().join(CAPTURE_LEASE_NAME).is_file()
                     {
                         return entry.path();
                     }
@@ -552,7 +562,7 @@ mod tests {
             }
             if std::time::Instant::now() >= deadline {
                 let _ = child.kill();
-                panic!("staging subprocess never created a capture directory");
+                panic!("staging subprocess never leased a capture directory");
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
