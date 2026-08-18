@@ -2349,10 +2349,14 @@ mod tests {
     #[test]
     fn validate_staged_operations_rejects_missing_payload() {
         // The commit path silently skips payload-less ops; stage time must not.
-        // (A payload-less UPDATE with target and body is the one valid form.)
+        // A payload-less op is valid in exactly two shapes: an entity source
+        // edit (verb "update", target plus body) and a new-source-file create
+        // (verb "create", target plus body); `op()` here supplies neither
+        // (target "function", body None), so it must still be rejected.
         let err = validate_staged_operations(&[op("create", None)]).unwrap_err();
         assert!(err.contains("missing payload"), "{err}");
-        assert!(err.contains("entity source edit"), "{err}");
+        assert!(err.contains("express an edit to an existing entity"), "{err}");
+        assert!(err.contains("admit a source file"), "{err}");
     }
 
     #[test]
