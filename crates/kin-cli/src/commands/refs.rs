@@ -3,6 +3,7 @@
 
 use anyhow::{Context, Result};
 use kin_index::RelationResolution;
+use kin_mcp::handlers::common::ReferenceLinesAbsent;
 use kin_model::{Entity, EntityId, EntityStore, GraphNodeId, GraphStore, RelationKind};
 use kin_ranking::entity_ranking;
 use serde::{Deserialize, Serialize};
@@ -223,11 +224,12 @@ pub fn build_refs_response(
             None => file_path,
         };
         lines.push(format!(
-            "  {} @ {} [{}] ({})",
+            "  {} @ {} [{}] ({}) {}",
             entry.name,
             location,
             relation_kinds_label(&entry.relation_kinds),
-            entry.resolution.as_str()
+            entry.resolution.as_str(),
+            reference_sites_label(&entry),
         ));
     };
 
@@ -256,6 +258,34 @@ pub fn build_refs_response(
     }
 
     Ok(RefsResponse { lines })
+}
+
+/// The reference sites of one entry, or the named reason it has none.
+///
+/// `start_line` locates the caller's definition and says nothing about where
+/// inside it the reference is, which is what sent readers to grep for the line
+/// they actually wanted (FIR-1825). These are the sites themselves, 1-based, in
+/// the caller's own file.
+///
+/// An entry with no sites says which absence it is rather than printing an empty
+/// list, using the same three names the MCP row carries under
+/// `reference_lines_absent_reason`, so the two surfaces can be compared word for
+/// word.
+fn reference_sites_label(entry: &ReferenceEntry) -> String {
+    if entry.reference_lines.is_empty() {
+        let reason = entry
+            .reference_lines_absent
+            .map(ReferenceLinesAbsent::as_str)
+            .unwrap_or("unknown");
+        return format!("sites none ({reason})");
+    }
+    let sites = entry
+        .reference_lines
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("sites {sites}")
 }
 
 /// What the graph still says about a target whose incoming relations are empty.
@@ -603,6 +633,15 @@ pub(crate) struct ReferenceEntry {
     /// `None` for an entity the graph carries no span for, because reporting a
     /// line for one would be a fabricated position.
     start_line: Option<u32>,
+    /// 1-based lines of the reference sites inside this caller, ascending and
+    /// deduplicated. Read from the same relation evidence and through the same
+    /// helper `find_references` uses, because two surfaces answering "where"
+    /// from two rules is how they came to disagree about "how many" (FIR-2398).
+    reference_lines: Vec<u32>,
+    /// Why this entry has no sites, and `None` when it has some. Same three
+    /// conditions the MCP row names, so a reader comparing the surfaces sees
+    /// one vocabulary.
+    reference_lines_absent: Option<ReferenceLinesAbsent>,
     pub(crate) relation_kinds: Vec<RelationKind>,
     /// Strongest resolution among the edges behind this row. A `name_only` row
     /// is a same-name match with nothing at the reference site proving it, so
@@ -677,6 +716,10 @@ pub(crate) fn collect_graph_references(
     let mut grouped: HashMap<EntityId, Vec<RelationKind>> = HashMap::new();
     let mut resolutions: HashMap<EntityId, RelationResolution> = HashMap::new();
     let mut receiver_name_guesses: HashMap<EntityId, bool> = HashMap::new();
+    // Edges kept per caller so the site tally can be taken once the caller's
+    // own file is in hand: a span naming another file is not a line under this
+    // row's path.
+    let mut edges_by_caller: HashMap<EntityId, Vec<kin_model::relation::Relation>> = HashMap::new();
     let mut matched_kinds = Vec::new();
 
     for rel in graph.get_all_relations_for_entity(entity_id)? {
@@ -707,6 +750,7 @@ pub(crate) fn collect_graph_references(
             .entry(src_entity_id)
             .and_modify(|current| *current &= guess)
             .or_insert(guess);
+        edges_by_caller.entry(src_entity_id).or_default().push(rel);
     }
 
     let mut references = Vec::with_capacity(grouped.len());
@@ -717,11 +761,32 @@ pub(crate) fn collect_graph_references(
             missing_source_ids.push(source_id);
             continue;
         };
+        let mut reference_lines = Vec::new();
+        let mut spans_outside_caller_file = 0usize;
+        for rel in edges_by_caller.get(&source_id).into_iter().flatten() {
+            let tally = kin_mcp::handlers::common::relation_reference_lines(
+                rel,
+                entity.file_origin.as_ref(),
+            );
+            reference_lines.extend(tally.lines);
+            spans_outside_caller_file += tally.outside_caller_file;
+        }
+        reference_lines.sort_unstable();
+        reference_lines.dedup();
+        let reference_lines_absent = if !reference_lines.is_empty() {
+            None
+        } else if spans_outside_caller_file > 0 {
+            Some(ReferenceLinesAbsent::SpanOutsideCallerFile)
+        } else {
+            Some(ReferenceLinesAbsent::NoEvidenceSpan)
+        };
         references.push(ReferenceEntry {
             entity_id: source_id,
             name: entity.name.clone(),
             file_path: entity.file_origin.as_ref().map(|f| f.0.clone()),
             start_line: kin_mcp::handlers::common::entity_presentation_start_line(&entity),
+            reference_lines,
+            reference_lines_absent,
             relation_kinds: source_kinds,
             resolution: resolutions
                 .get(&source_id)

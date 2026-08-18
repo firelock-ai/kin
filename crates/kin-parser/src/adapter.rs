@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use tree_sitter::{Node, Parser, Tree};
 
 use crate::error::{ParseError, Result};
-use crate::extract::ParseOutput;
+use crate::extract::{ParseOutput, RelationSite};
 
 /// Hint for incremental tree-sitter parse. Maps directly to tree_sitter::InputEdit.
 #[derive(Debug, Clone)]
@@ -293,6 +293,22 @@ pub fn span_from_node(node: &Node, file_id: &FilePathId) -> SourceSpan {
     let end = node.end_position();
     SourceSpan {
         file: file_id.clone(),
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: start.row as u32,
+        start_col: start.column as u32,
+        end_line: end.row as u32,
+        end_col: end.column as u32,
+    }
+}
+
+/// The file-free site of a node, for a relation whose evidence is the syntax at
+/// that node. Line and column are 0-based tree-sitter `Point` values, matching
+/// [`span_from_node`]; the presentation seam converts once, at the surface.
+pub fn site_from_node(node: &Node) -> RelationSite {
+    let start = node.start_position();
+    let end = node.end_position();
+    RelationSite {
         start_byte: node.start_byte(),
         end_byte: node.end_byte(),
         start_line: start.row as u32,

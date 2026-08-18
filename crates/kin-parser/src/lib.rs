@@ -52,7 +52,7 @@ pub use extract::{
     attach_file_context_metadata, attach_file_reference_parse_counts,
     call_extraction_incomplete_marker, is_call_extraction_incomplete_marker, CallArgShape,
     ExtractedEntity, ExtractedRelation, ExtractedTest, ExtractedTestKind, FileImport, ImportedName,
-    ParseOutput, CALL_EXTRACTION_INCOMPLETE_MARKER_V1, COMMAND_EFFECT_CONTRACT_KEY,
+    ParseOutput, RelationSite, CALL_EXTRACTION_INCOMPLETE_MARKER_V1, COMMAND_EFFECT_CONTRACT_KEY,
     FILE_IMPORT_CONTEXT_KEY, FILE_PARSED_CALL_SITES_KEY, FILE_PARSED_EXTERNAL_MODULE_IMPORTS_KEY,
     FILE_PARSED_IMPORT_STATEMENTS_KEY, FILE_SURFACE_CONTEXT_KEY,
 };

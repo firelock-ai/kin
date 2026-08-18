@@ -121,6 +121,7 @@ fn extract_java_node(
                     let parent_name = sc.utf8_text(source).unwrap_or("").to_string();
                     if !parent_name.is_empty() {
                         relations.push(ExtractedRelation {
+            site: None,
                             receiver: None,
                             call_shape: None,
                             kind: kin_model::RelationKind::Extends,
@@ -139,6 +140,7 @@ fn extract_java_node(
                             let iface_name = iface.utf8_text(source).unwrap_or("").to_string();
                             if !iface_name.is_empty() {
                                 relations.push(ExtractedRelation {
+            site: None,
                                     receiver: None,
                                     call_shape: None,
                                     kind: kin_model::RelationKind::Implements,
@@ -191,6 +193,7 @@ fn extract_java_node(
                             let iface_name = iface.utf8_text(source).unwrap_or("").to_string();
                             if !iface_name.is_empty() {
                                 relations.push(ExtractedRelation {
+            site: None,
                                     receiver: None,
                                     call_shape: None,
                                     kind: kin_model::RelationKind::Implements,
@@ -285,6 +288,7 @@ fn extract_java_node(
                                     span: span_from_node(&member, file_id),
                                 });
                                 relations.push(ExtractedRelation {
+            site: None,
                                     receiver: None,
                                     call_shape: None,
                                     kind: kin_model::RelationKind::Contains,
@@ -317,6 +321,7 @@ fn extract_java_node(
                 });
                 if let Some(cls) = class_ctx {
                     relations.push(ExtractedRelation {
+            site: None,
                         receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::Contains,
@@ -439,6 +444,7 @@ fn extract_calls_from_body(
                 let method_name = name_node.utf8_text(source).unwrap_or("");
                 if !method_name.is_empty() {
                     relations.push(ExtractedRelation {
+            site: None,
                         receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::Calls,

@@ -1264,13 +1264,13 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
 }
 
 /// What one relation's evidence says about where its reference sites are.
-struct RelationSpanTally {
+pub struct RelationSpanTally {
     /// 1-based site lines inside the referencing entity's own file.
-    lines: Vec<u32>,
+    pub lines: Vec<u32>,
     /// Spans that named a different file and were therefore not reportable under
     /// this row. Counted rather than discarded so an empty `lines` can be
     /// explained.
-    outside_caller_file: usize,
+    pub outside_caller_file: usize,
 }
 
 /// 1-based reference-site lines a single relation records, restricted to the
@@ -1283,7 +1283,7 @@ struct RelationSpanTally {
 /// reports one `file_path` and a line from a different file would read as a line
 /// in that one. Both kinds of miss are counted, because an empty result that
 /// cannot say why is the defect this reports around.
-fn relation_reference_lines(
+pub fn relation_reference_lines(
     rel: &kin_model::relation::Relation,
     caller_file: Option<&kin_model::ids::FilePathId>,
 ) -> RelationSpanTally {

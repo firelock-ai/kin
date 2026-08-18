@@ -178,7 +178,7 @@ impl IndexPipeline {
 
         let parse_completeness = ParseCompleteness::from_parse_state(&parse_state);
         let (relations, unresolved_relations) =
-            resolve_relations(&extracted_relations, &entities, &parse_completeness);
+            resolve_relations(&extracted_relations, &entities, file_id, &parse_completeness);
         let file_layout = build_layout(file_id, &entities, source.len(), &[], parse_completeness);
 
         debug!(
@@ -316,7 +316,7 @@ impl IndexPipeline {
         // Resolve extracted relations to model relations using entity name mapping
         let parse_completeness = ParseCompleteness::from_parse_state(&parse_state);
         let (relations, unresolved_relations) =
-            resolve_relations(&extracted_relations, &entities, &parse_completeness);
+            resolve_relations(&extracted_relations, &entities, file_id, &parse_completeness);
         let file_layout = build_layout(file_id, &entities, source.len(), &[], parse_completeness);
 
         debug!(
@@ -760,6 +760,7 @@ pub fn classify_file_role(path: &str) -> EntityRole {
 fn resolve_relations(
     extracted: &[kin_parser::ExtractedRelation],
     entities: &[Entity],
+    file_id: &FilePathId,
     parse_completeness: &ParseCompleteness,
 ) -> (Vec<Relation>, Vec<UnresolvedRelation>) {
     let mut resolved = Vec::new();
@@ -795,9 +796,9 @@ fn resolve_relations(
                         origin: RelationOrigin::Parsed,
                         created_in: None,
                         import_source: rel.import_source.clone(),
-                        evidence: crate::linker::call_shape_evidence(
-                            rel.kind,
-                            rel.call_shape.as_ref(),
+                        evidence: crate::linker::relation_evidence(
+                            rel,
+                            file_id,
                             parse_completeness,
                             call_extraction_complete,
                         ),
