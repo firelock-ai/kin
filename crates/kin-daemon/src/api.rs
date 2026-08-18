@@ -19753,7 +19753,19 @@ mod tests {
         let captured = Arc::new(std::sync::Mutex::new(Captured::default()));
         let subscriber = tracing_subscriber::registry().with(CaptureLayer(Arc::clone(&captured)));
         let response = {
-            let _default = tracing::subscriber::set_default(subscriber);
+            let _capture = crate::capture_events_on_this_thread(subscriber);
+            // The parallel test that broke this, made deliberate. A thread
+            // carrying no subscriber of its own reaches the blocking phase
+            // helper and registers its callsite. Without the second dispatcher
+            // the capture holds, `tracing` resolves that callsite against this
+            // thread's absent subscriber and caches `Interest::never()` for the
+            // whole process, so every phase below emitted through that helper is
+            // dropped while the two emitted through the async helper survive.
+            std::thread::spawn(|| {
+                crate::mcp_commit::timed_commit_phase("phase_registered_off_this_thread", || ())
+            })
+            .join()
+            .unwrap();
             app.oneshot(
                 Request::post("/commands/commit")
                     .header("content-type", "application/json")
@@ -19782,6 +19794,15 @@ mod tests {
             captured.malformed.is_empty(),
             "every commit phase line must carry both phase and elapsed_ms: {:?}",
             captured.malformed
+        );
+        assert!(
+            !captured
+                .phases
+                .iter()
+                .any(|phase| phase == "phase_registered_off_this_thread"),
+            "the capture stays scoped to the thread that installed it, so the phase \
+             registered off it must not appear; captured {:?}",
+            captured.phases
         );
         for phase in [
             "coordination_gate_wait",
