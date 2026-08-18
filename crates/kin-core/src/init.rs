@@ -3270,6 +3270,32 @@ mod tests {
         assert!(!staging_root.exists());
     }
 
+    /// The bootstrap commit reports each of its steps into the admission
+    /// phase open on the committing thread, and an exact retry reports none.
+    #[test]
+    fn a_bootstrap_commit_reports_each_step_into_the_open_admission_phase() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut prepared, transaction) = prepare_unborn(directory.path(), "progress");
+        let mut progress = crate::init_progress::PhaseProgress::new(1);
+        progress.begin("commit bootstrap transaction");
+
+        prepared
+            .commit_repository_bootstrap(transaction.clone())
+            .unwrap();
+        assert_eq!(
+            progress.detail_updates(),
+            4,
+            "validating, committing, binding and summarizing must each advance the phase line"
+        );
+
+        prepared.commit_repository_bootstrap(transaction).unwrap();
+        assert_eq!(
+            progress.detail_updates(),
+            4,
+            "an exact retry returns the existing bootstrap without reporting new work"
+        );
+    }
+
     #[test]
     fn bootstrap_allows_only_exact_operation_retry() {
         let directory = tempfile::tempdir().unwrap();

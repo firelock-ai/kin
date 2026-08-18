@@ -14,6 +14,7 @@
 //! its elapsed time; off a terminal each phase prints a start line and an end
 //! line, and in-phase detail is throttled so a pipe is not flooded.
 
+use std::cell::RefCell;
 use std::fmt::Arguments;
 use std::io::{IsTerminal, Write};
 use std::sync::{Arc, Mutex};
@@ -28,40 +29,53 @@ pub(crate) const GIT_ADMISSION_PHASES: usize = 17;
 /// terminal, so a redirected log never receives escape bytes.
 const ERASE_LINE: &str = "\x1b[2K\r";
 
-/// The ladder a long phase's own instrumentation should report into.
-///
-/// A phase that spends minutes inside one call into another crate cannot tick
-/// this ladder itself, because the call takes no progress handle and the crate
-/// below has no way to reach one. What it does have is `tracing`, and the
-/// admission commands already raise the emitting targets to `info` so the work
-/// says something while it runs. Before this, that something was a raw log
-/// record written straight over the redrawn phase line, complete with ANSI and
-/// the internal span path it was emitted under.
-///
-/// So the ladder registers itself here for its lifetime and a subscriber layer
-/// hands those events to [`report_admission_progress`] instead of formatting
-/// them. The phase line advances, and nothing internal reaches the user.
-static ACTIVE_LADDER: Mutex<Option<Arc<Mutex<Ladder>>>> = Mutex::new(None);
+thread_local! {
+    /// The ladder a long phase's own instrumentation should report into.
+    ///
+    /// A phase that spends minutes inside one call into another crate cannot tick
+    /// this ladder itself, because the call takes no progress handle and the crate
+    /// below has no way to reach one. What it does have is `tracing`, and the
+    /// admission commands already raise the emitting targets to `info` so the work
+    /// says something while it runs. Before this, that something was a raw log
+    /// record written straight over the redrawn phase line, complete with ANSI and
+    /// the internal span path it was emitted under.
+    ///
+    /// So the ladder registers itself here for its lifetime and a subscriber layer
+    /// hands those events to [`report_admission_progress`] instead of formatting
+    /// them. The phase line advances, and nothing internal reaches the user.
+    ///
+    /// The slot belongs to the thread that installs the ladder. An admission is
+    /// created, driven and dropped on one thread, and every report into it,
+    /// whether a direct call from the commit or a `tracing` event a subscriber
+    /// layer forwards, is made from that thread's own call stack.
+    static ACTIVE_LADDER: RefCell<Option<Arc<Mutex<Ladder>>>> = const { RefCell::new(None) };
+}
 
-/// Report progress within whatever admission phase is currently open.
+/// Report progress within whatever admission phase is currently open on the
+/// calling thread.
 ///
 /// Returns whether a ladder was live to take it, so a caller with no ladder to
-/// report into can print the line itself rather than dropping it.
+/// report into can print the line itself rather than dropping it. A thread
+/// that has installed no ladder is declined, whatever other threads hold.
 ///
 /// Never blocks on the ladder's own writes: the lock is held only for the
-/// redraw, and the emitting thread is by construction not the one inside a
-/// [`PhaseProgress`] method, because none of them log.
+/// redraw, and none of the [`PhaseProgress`] methods log.
 pub fn report_admission_progress(detail: &str) -> bool {
-    let Ok(active) = ACTIVE_LADDER.lock() else {
-        return false;
-    };
-    let Some(ladder) = active.as_ref() else {
+    let Some(ladder) = installed_ladder() else {
         return false;
     };
     let Ok(mut ladder) = ladder.lock() else {
         return false;
     };
     ladder.detail(format_args!("{detail}"))
+}
+
+/// The ladder the calling thread has installed, if any.
+fn installed_ladder() -> Option<Arc<Mutex<Ladder>>> {
+    ACTIVE_LADDER
+        .try_with(|active| active.try_borrow().ok().and_then(|active| active.clone()))
+        .ok()
+        .flatten()
 }
 
 /// Stderr phase reporter for a fixed-length phase ladder.
@@ -85,10 +99,10 @@ struct Ladder {
 impl PhaseProgress {
     /// Start a reporter for a ladder of `total` phases.
     ///
-    /// Installs it as the process's live admission ladder. Nested admissions do
-    /// not happen, and if one ever did the inner ladder would take the slot and
-    /// hand it back on drop, which is the same discipline a single ladder
-    /// already keeps.
+    /// Installs it as the calling thread's live admission ladder. Nested
+    /// admissions do not happen, and if one ever did the inner ladder would
+    /// take the slot and hand it back on drop, which is the same discipline a
+    /// single ladder already keeps.
     pub(crate) fn new(total: usize) -> Self {
         let ladder = Arc::new(Mutex::new(Ladder {
             total,
@@ -100,9 +114,11 @@ impl PhaseProgress {
             started: Instant::now(),
             in_phase: false,
         }));
-        if let Ok(mut active) = ACTIVE_LADDER.lock() {
-            *active = Some(Arc::clone(&ladder));
-        }
+        let _ = ACTIVE_LADDER.try_with(|active| {
+            if let Ok(mut active) = active.try_borrow_mut() {
+                *active = Some(Arc::clone(&ladder));
+            }
+        });
         Self { ladder }
     }
 
@@ -148,24 +164,26 @@ impl PhaseProgress {
     }
 
     #[cfg(test)]
-    fn detail_updates(&self) -> usize {
+    pub(crate) fn detail_updates(&self) -> usize {
         self.ladder.lock().expect("ladder lock").detail_updates
     }
 }
 
 impl Drop for PhaseProgress {
-    /// Release the process ladder slot, and terminate a line a phase abandoned
+    /// Release the thread's ladder slot, and terminate a line a phase abandoned
     /// by an early return left half-drawn, so an error message is never
     /// appended to it.
     fn drop(&mut self) {
-        if let Ok(mut active) = ACTIVE_LADDER.lock() {
-            let ours = active
-                .as_ref()
-                .is_some_and(|installed| Arc::ptr_eq(installed, &self.ladder));
-            if ours {
-                *active = None;
+        let _ = ACTIVE_LADDER.try_with(|active| {
+            if let Ok(mut active) = active.try_borrow_mut() {
+                let ours = active
+                    .as_ref()
+                    .is_some_and(|installed| Arc::ptr_eq(installed, &self.ladder));
+                if ours {
+                    *active = None;
+                }
             }
-        }
+        });
         self.with(|ladder| {
             if ladder.in_phase {
                 ladder.in_phase = false;
@@ -279,7 +297,6 @@ mod tests {
 
     #[test]
     fn a_phase_ladder_numbers_every_phase_it_enters() {
-        let _serial = ladder_slot().lock().unwrap_or_else(|e| e.into_inner());
         let mut progress = PhaseProgress::new(3);
         assert_eq!(progress.index(), 0);
         progress.begin("first");
@@ -293,7 +310,6 @@ mod tests {
 
     #[test]
     fn beginning_a_phase_closes_the_previous_one() {
-        let _serial = ladder_slot().lock().unwrap_or_else(|e| e.into_inner());
         let mut progress = PhaseProgress::new(3);
         progress.begin("first");
         progress.begin("second");
@@ -303,7 +319,6 @@ mod tests {
 
     #[test]
     fn detail_outside_a_phase_is_ignored() {
-        let _serial = ladder_slot().lock().unwrap_or_else(|e| e.into_inner());
         let mut progress = PhaseProgress::new(3);
         progress.detail(format_args!("1/2"));
         assert_eq!(progress.detail_updates(), 0);
@@ -315,7 +330,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "phase ladder completed 1 of 3 declared phases")]
     fn finishing_short_of_the_declared_total_is_a_drift_bug() {
-        let _serial = ladder_slot().lock().unwrap_or_else(|e| e.into_inner());
         let mut progress = PhaseProgress::new(3);
         progress.begin("first");
         progress.finish("done");
@@ -323,7 +337,6 @@ mod tests {
 
     #[test]
     fn finishing_on_the_declared_total_is_accepted() {
-        let _serial = ladder_slot().lock().unwrap_or_else(|e| e.into_inner());
         let mut progress = PhaseProgress::new(2);
         progress.begin("first");
         progress.begin("second");
@@ -333,14 +346,8 @@ mod tests {
 
     /// The sink advances the open phase, declines when none is open, and stops
     /// reaching a ladder that has been dropped.
-    ///
-    /// Serialized with the other ladder-installing tests through one mutex,
-    /// because the sink is process-global by construction: the events it
-    /// carries are emitted from inside a call that has no handle to pass.
     #[test]
     fn the_progress_sink_reaches_the_open_phase_and_nothing_else() {
-        let _serial = ladder_slot().lock().unwrap_or_else(|e| e.into_inner());
-
         assert!(
             !crate::report_admission_progress("before any ladder"),
             "with no ladder installed there is no phase to advance"
@@ -370,16 +377,32 @@ mod tests {
         );
     }
 
-    /// One mutex for every test that installs a ladder, since they share the
-    /// process slot.
-    fn ladder_slot() -> &'static Mutex<()> {
-        static SLOT: Mutex<()> = Mutex::new(());
-        &SLOT
+    /// A report made on a thread that installed no ladder is declined and
+    /// leaves the ladder open on another thread untouched.
+    #[test]
+    fn a_report_from_another_thread_does_not_reach_this_threads_ladder() {
+        let mut progress = PhaseProgress::new(2);
+        progress.begin("commit bootstrap transaction");
+        let foreign = std::thread::spawn(|| crate::report_admission_progress("foreign init step"))
+            .join()
+            .expect("the foreign reporter must not panic");
+        assert!(
+            !foreign,
+            "a thread with no ladder of its own must be declined, not routed into another thread's ladder"
+        );
+        assert!(
+            crate::report_admission_progress("own init step"),
+            "the installing thread's own report still takes the line"
+        );
+        assert_eq!(
+            progress.detail_updates(),
+            1,
+            "only the installing thread's report may advance the phase line"
+        );
     }
 
     #[test]
     fn each_phase_restarts_its_detail_throttle() {
-        let _serial = ladder_slot().lock().unwrap_or_else(|e| e.into_inner());
         let mut progress = PhaseProgress::new(3);
         progress.begin("first");
         progress.detail(format_args!("1/2"));
