@@ -1081,6 +1081,17 @@ pub struct ReferenceRow {
     /// the strongest contributing edge is the row's evidence. `name_only` means
     /// the reference is a guess and should be confirmed before being acted on.
     pub resolution: Option<RelationResolution>,
+    /// Whether EVERY edge behind this row is a receiver-method call the linker
+    /// matched on the bare leaf name.
+    ///
+    /// `resolution` cannot answer this. It reports the strongest contributing
+    /// edge, and `name_only` covers four tiers of very different strength: a
+    /// callee written `Error::msg` matching one entity in the repository lands
+    /// there beside the receiver fan-out that answered
+    /// `find_references(HTTPAdapter.send)` with 33 rows. Only the fan-out is a
+    /// candidate rather than a reference (FIR-1552), and only a row with no
+    /// other kind of edge behind it is one.
+    pub receiver_name_guess: bool,
 }
 
 /// Why a reference row carries no site lines.
@@ -1200,6 +1211,9 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
                 snippet,
                 relation_kinds: Vec::new(),
                 resolution: None,
+                // Every contributing edge has to be a guess for the row to be
+                // one, so this starts true and any other edge clears it.
+                receiver_name_guess: true,
             });
         if entry.file_path.is_none() {
             entry.file_path = file_path;
@@ -1226,6 +1240,7 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
             Some(current) => current.max(resolution),
             None => resolution,
         });
+        entry.receiver_name_guess &= kin_index::resolution::is_receiver_name_guess(&rel);
     }
 
     let mut rows = Vec::with_capacity(grouped.len());

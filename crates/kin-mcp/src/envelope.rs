@@ -716,13 +716,28 @@ fn counted_for(tool: &str, payload: &Value) -> Option<Value> {
     // looked like, so the payload's own truncation flag outranks the class
     // verdict for this field.
     let truncated = payload.get("truncated").and_then(Value::as_bool) == Some(true);
+    // FIR-1552: same rule, other cause. An answer that held same-name candidates
+    // out of its headline reports a number some of those candidates may belong
+    // in, so the number is a floor and this object has to say so with the count
+    // beside it. Truncation is named first where both hold, because a walk that
+    // stopped early did not even see every candidate.
+    let withheld = payload
+        .get("counts")
+        .and_then(|counts| counts.get("receiver_name_candidates"))
+        .and_then(Value::as_u64)
+        .filter(|withheld| *withheld > 0);
     let mut counted = json!({
         "unit": unit,
         "reported": reported,
-        "exact": !truncated,
+        "exact": !truncated && withheld.is_none(),
     });
+    if let Some(withheld) = withheld {
+        counted["withheld_candidates"] = json!(withheld);
+    }
     if truncated {
         counted["floor_reason"] = json!("walk_truncated");
+    } else if withheld.is_some() {
+        counted["floor_reason"] = json!("receiver_name_candidates_withheld");
     }
     // The site numbers FIR-2398 added answer a narrower question than this
     // object does: whether every RETURNED row could be located at a line, not
