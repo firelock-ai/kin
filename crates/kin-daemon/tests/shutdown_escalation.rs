@@ -34,17 +34,21 @@ const SATURATED_WORKER_ROOT: &str = "KIN_TEST_SATURATED_SHUTDOWN_ROOT";
 /// wins the race on a daemon that is not starved.
 const GRACEFUL_WORKER_ROOT: &str = "KIN_TEST_GRACEFUL_SHUTDOWN_ROOT";
 
-/// Grace the graceful worker is given: long enough that a force-exit could
-/// never be mistaken for the graceful path finishing. The whole point of that
-/// test is to distinguish the two, so this must stay far above
-/// [`GRACEFUL_EXIT_BUDGET`].
+/// Grace the graceful worker is given before its force-exit backstop fires.
 const GRACEFUL_WORKER_GRACE_SECS: u64 = 30;
 
 /// How long the parent waits for the healthy worker to exit after SIGTERM.
-/// Must stay well below [`GRACEFUL_WORKER_GRACE_SECS`]: exceeding it means the
-/// tokio signal path never observed the signal and only the backstop could
-/// still end the process.
-const GRACEFUL_EXIT_BUDGET: Duration = Duration::from_secs(8);
+///
+/// This must stay ABOVE [`GRACEFUL_WORKER_GRACE_SECS`], which is the opposite
+/// of the ordering an exit-code test would want. Both paths exit 0, so the exit
+/// code discriminates nothing and the marker the worker writes on the tokio
+/// signal path is what separates them. A displaced signal path leaves only the
+/// backstop, which exits inside this window, and the marker assertion is what
+/// then fails, with its own message, rather than a timeout blaming a slow
+/// machine. Restoring the old ordering would make the marker unreachable and
+/// silently retire the discrimination. It also stays below
+/// [`WORKER_WALL_CLOCK_CAP`], so a cap firing can never be mistaken for a pass.
+const GRACEFUL_EXIT_BUDGET: Duration = Duration::from_secs(45);
 
 /// Grace the worker grants before force-exiting, fed through the same
 /// `KIN_DAEMON_SHUTDOWN_GRACE_SECS` knob production reads. Short so the test is
@@ -164,10 +168,12 @@ fn stop_terminates_a_daemon_whose_runtime_is_saturated() {
 /// saturated test above cannot catch that, because a force-exit also satisfies
 /// "the process exited".
 ///
-/// This one distinguishes them by clock: the worker gets a 30s grace and is
-/// required to exit within 8s. Only the tokio signal path can do that, so a
-/// pass here means the graceful path observed the signal rather than the
-/// backstop rescuing a broken one.
+/// This one distinguishes them by evidence rather than by clock: the worker
+/// writes a marker from inside the tokio SIGTERM arm, which only that path can
+/// reach, so a pass means the graceful path observed the signal rather than the
+/// backstop rescuing a broken one. The budget deliberately exceeds the grace so
+/// that a displaced signal path still exits inside the window and is caught by
+/// the missing marker.
 ///
 /// Nothing about the daemon's own SIGKILL-based test helpers covers this: they
 /// reap daemons with `start_kill`, so no existing test sends SIGTERM at all.
@@ -175,6 +181,7 @@ fn stop_terminates_a_daemon_whose_runtime_is_saturated() {
 fn a_healthy_daemon_still_stops_through_the_graceful_path() {
     let root = tempfile::tempdir().expect("scratch root for the graceful worker");
     let ready = root.path().join("graceful.ready");
+    let observed = root.path().join("graceful.observed");
 
     let mut command = Command::new(std::env::current_exe().expect("current test executable"));
     command
@@ -214,15 +221,20 @@ fn a_healthy_daemon_still_stops_through_the_graceful_path() {
                 Some(0),
                 "the graceful path exits 0 of its own accord"
             );
+            assert!(
+                observed.is_file(),
+                "the worker exited 0 without ever reaching tokio's SIGTERM arm, so the \
+                 force-exit backstop ended it. Chaining the runtime-independent handler \
+                 onto SIGTERM must not displace tokio's own registration, or every stop \
+                 silently degrades to a force-exit that skips the final flush, the \
+                 derived-CAS barrier and endpoint retirement."
+            );
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "a healthy daemon did not stop through the graceful path within {}s, \
-             despite a {}s force-exit grace. Chaining the runtime-independent \
-             handler onto SIGTERM must not displace tokio's own registration, \
-             or every stop silently degrades to a force-exit that skips the \
-             final flush and endpoint retirement.",
+            "a healthy daemon did not stop at all within {}s, which is past its own {}s \
+             force-exit grace, so neither the graceful path nor the backstop ended it",
             GRACEFUL_EXIT_BUDGET.as_secs(),
             GRACEFUL_WORKER_GRACE_SECS
         );
@@ -237,7 +249,9 @@ fn graceful_daemon_shutdown_worker() {
     let Some(root) = std::env::var_os(GRACEFUL_WORKER_ROOT) else {
         return;
     };
-    let ready = PathBuf::from(root).join("graceful.ready");
+    let root = PathBuf::from(root);
+    let ready = root.join("graceful.ready");
+    let observed = root.join("graceful.observed");
 
     spawn_parent_death_watchdog();
     spawn_wall_clock_cap();
@@ -261,6 +275,10 @@ fn graceful_daemon_shutdown_worker() {
         // is still latched by tokio and delivered to `recv`.
         std::fs::write(&ready, b"listening").expect("publish readiness");
         sigterm.recv().await;
+        // Only tokio's own SIGTERM registration can reach this line. The
+        // backstop ends the process from an OS thread and never runs it, which
+        // is what lets the parent tell the two exit-0 paths apart.
+        std::fs::write(&observed, b"sigterm").expect("publish the observed marker");
         let _ = cancel_tx.send(true);
     });
 }

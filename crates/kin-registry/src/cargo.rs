@@ -54,9 +54,22 @@ pub struct CargoRegistryState {
     #[cfg(test)]
     fail_next_blob_commit: std::sync::atomic::AtomicBool,
     #[cfg(test)]
-    delay_next_blob_commit_ms: std::sync::atomic::AtomicU64,
+    blob_commit_gate: std::sync::Mutex<Option<BlobCommitGate>>,
     #[cfg(test)]
     fail_next_manifest_repair: std::sync::atomic::AtomicBool,
+}
+
+/// Parks a durable blob commit inside its blocking region until a test releases
+/// it, and reports having got there.
+///
+/// The invariant under test is that the commit runs off the async runtime's
+/// worker thread. A rendezvous proves that by having the worker answer while
+/// the commit is parked; a sleep only proves a clock did not expire, which a
+/// loaded machine can falsify on a correct product.
+#[cfg(test)]
+struct BlobCommitGate {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
 }
 
 impl CargoRegistryState {
@@ -80,7 +93,7 @@ impl CargoRegistryState {
             #[cfg(test)]
             fail_next_blob_commit: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
-            delay_next_blob_commit_ms: std::sync::atomic::AtomicU64::new(0),
+            blob_commit_gate: std::sync::Mutex::new(None),
             #[cfg(test)]
             fail_next_manifest_repair: std::sync::atomic::AtomicBool::new(false),
         }
@@ -782,11 +795,20 @@ fn write_crate_blob(
 
     #[cfg(test)]
     {
-        let delay = state
-            .delay_next_blob_commit_ms
-            .swap(0, std::sync::atomic::Ordering::SeqCst);
-        if delay > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(delay));
+        let gate = state
+            .blob_commit_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(gate) = gate {
+            let _ = gate.entered.send(());
+            gate.release
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .map_err(|_| {
+                    std::io::Error::other(
+                        "durable commit was never released: the async worker never resumed",
+                    )
+                })?;
         }
     }
 
@@ -1451,7 +1473,6 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
-    use std::time::Duration;
     use tower::ServiceExt;
 
     fn registry_state() -> (tempfile::TempDir, Arc<CargoRegistryState>) {
@@ -2022,24 +2043,30 @@ kin-blobs = { version = "0.1.0", registry = "kin", features = ["schema"] }
     #[tokio::test(flavor = "current_thread")]
     async fn delayed_durable_commit_does_not_block_the_async_worker() {
         let (_root, state) = registry_state_with_token(Some("s3cret"));
-        state
-            .delay_next_blob_commit_ms
-            .store(200, std::sync::atomic::Ordering::SeqCst);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *state
+            .blob_commit_gate
+            .lock()
+            .expect("a fresh registry state has an unpoisoned commit gate") = Some(BlobCommitGate {
+            entered: entered_tx,
+            release: release_rx,
+        });
+
         let publisher = tokio::spawn(publish(
-            state,
+            Arc::clone(&state),
             "demo",
             "1.0.0",
             Some("s3cret"),
             valid_crate("demo", "1.0.0"),
         ));
 
-        tokio::time::timeout(Duration::from_millis(75), async {
-            for _ in 0..3 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("Tokio heartbeat stalled behind the durable registry commit");
+        entered_rx
+            .await
+            .expect("the durable commit must report entering its blocking region");
+        release_tx
+            .send(())
+            .expect("the parked commit must still be waiting for the async worker");
         assert_eq!(publisher.await.unwrap(), StatusCode::OK);
     }
 
