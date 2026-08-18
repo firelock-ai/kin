@@ -266,7 +266,23 @@ kin embed
 ```
 
 Embeddings are generated locally with `nomic-embed-text-v1.5` (768 dimensions; override
-via `KIN_EMBED_MODEL_ID`). You can check coverage at any time:
+via `KIN_EMBED_MODEL_ID`).
+
+The model is not bundled with any install. The first embed on a machine downloads about
+523 MB of it from huggingface.co into the Hugging Face hub cache under your home
+directory (`~/.cache/huggingface/hub/models--nomic-ai--nomic-embed-text-v1.5`), and
+nothing embeds until that download lands. While it runs, `kin graph status` and `kin
+resources inspect` name the download and its progress rather than reporting a pass with
+nothing to show. `kin init` says up front whether this machine still owes the download,
+and `kin doctor` carries an **Embedding model** check that reports whether the weights
+are present and fails when the host cannot reach huggingface.co.
+
+To embed on a host with no egress, copy an existing hub cache from a machine that has
+the model into the same path, or point `KIN_EMBED_MODEL_ID` at a local model directory.
+Note that `HF_HOME` does not move where the embedder looks: it loads from the home cache
+root regardless, so seed that root rather than a relocated one.
+
+You can check coverage at any time:
 
 ```sh
 kin graph status   # "Embeddings: <indexed>/<total> indexed (<pending> pending)"

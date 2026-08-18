@@ -170,6 +170,7 @@ pub async fn run_health_checks() -> HealthReport {
     checks.push(check_semantic_query_readiness().await);
     checks.push(check_reference_edge_coverage().await);
     checks.push(check_background_work().await);
+    checks.push(check_embedding_model().await);
     checks.push(check_retrieval_profile());
     checks.push(check_cross_file_enrichment());
     checks.push(check_update_policy());
@@ -2310,6 +2311,122 @@ fn cross_file_enrichment_check(
         "install a language server for the named language (for example `npm i -g pyright` or \
          `rustup component add rust-analyzer`), then restart the daemon",
     )
+}
+
+/// How long the model host is given to answer before the probe gives up.
+///
+/// Bounds `kin doctor` on a host with a black-hole resolver, where a name
+/// lookup can otherwise sit for the resolver's own timeout. The budget is
+/// stated in the failing detail, because "did not answer within 3s" is what
+/// this probe actually establishes and "is unreachable" is not.
+const MODEL_HOST_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Whether the embedding model this build fetches at runtime is already here,
+/// and what a machine that does not have it owes to get it.
+///
+/// The weights are not shipped with any install. Until this check existed the
+/// first embed pass on a fresh machine spent several hundred megabytes of
+/// egress with no surface naming the download, the size, the destination, or
+/// the host it needs to reach, and an air-gapped host produced exactly the same
+/// output as a healthy one that was simply still working.
+async fn check_embedding_model() -> HealthCheck {
+    // `false`: this is a one-shot CLI process with no embed pass of its own, so
+    // the download-in-flight phase is not a state doctor can be in. Doctor
+    // answers whether the model is here, not whether some other process is
+    // fetching it this second.
+    let fetch = crate::embed_model::EmbedModelFetch::probe(false);
+    // Probed only where the answer changes the verdict. A machine that already
+    // holds the model owes no egress, and asking anyway would put a network
+    // call in the path of a check that has nothing to learn from it.
+    let reachable = if fetch.present || fetch.no_fetch_reason.is_some() {
+        None
+    } else {
+        Some(model_host_reachable(crate::embed_model::endpoint_host()).await)
+    };
+    embedding_model_check_from(&fetch, reachable)
+}
+
+/// Whether a TCP connection to the model host's HTTPS port completes inside the
+/// budget.
+///
+/// Deliberately not an HTTP request. The question is whether this host has any
+/// route to the place the weights come from, and a name that resolves plus a
+/// socket that connects answers it without depending on the endpoint's own
+/// availability or on a proxy honouring a method. Every way of not answering
+/// inside the budget, including a name that never resolves, is reported the
+/// same way, which is why the detail names the budget rather than claiming the
+/// host is down.
+async fn model_host_reachable(host: String) -> bool {
+    let target = format!("{host}:443");
+    let probe = tokio::task::spawn_blocking(move || {
+        use std::net::ToSocketAddrs;
+        let Ok(mut addrs) = target.to_socket_addrs() else {
+            return false;
+        };
+        let Some(addr) = addrs.next() else {
+            return false;
+        };
+        std::net::TcpStream::connect_timeout(&addr, MODEL_HOST_PROBE_BUDGET).is_ok()
+    });
+    matches!(
+        tokio::time::timeout(MODEL_HOST_PROBE_BUDGET, probe).await,
+        Ok(Ok(true))
+    )
+}
+
+/// The check above, with both probes taken as arguments.
+///
+/// `reachable` is `None` where the question was never asked, which is not the
+/// same fact as a host that answered no, and the two render differently.
+fn embedding_model_check_from(
+    fetch: &crate::embed_model::EmbedModelFetch,
+    reachable: Option<bool>,
+) -> HealthCheck {
+    let host = crate::embed_model::endpoint_host();
+    let model = &fetch.model_id;
+    let location = match fetch.cache_dir.as_deref() {
+        Some(dir) => format!(" at {dir}"),
+        None => String::new(),
+    };
+    let download = fetch.expected_download();
+    let (status, mut detail) = match (fetch.no_fetch_reason.as_deref(), fetch.present, reachable) {
+        (Some(reason), _, _) => (HealthStatus::Healthy, format!("{model}: {reason}")),
+        (None, true, _) => (
+            HealthStatus::Healthy,
+            format!("{model} is in the Hugging Face cache{location}, so no download is owed"),
+        ),
+        (None, false, Some(false)) => (
+            HealthStatus::Missing,
+            format!(
+                "{model} is not in the cache{location} and this host did not reach {host}:443 \
+                 within {}s; the first embed pass fetches {download} from {host}, and until \
+                 that lands nothing embeds",
+                MODEL_HOST_PROBE_BUDGET.as_secs()
+            ),
+        ),
+        (None, false, _) => (
+            HealthStatus::Pending,
+            format!(
+                "{model} is not in the cache{location}; the first embed pass fetches {download} \
+                 from {host} before it records anything"
+            ),
+        ),
+    };
+    if let Some(hf_home) = fetch.relocated_hf_home.as_deref() {
+        detail.push_str(&format!(
+            ". HF_HOME is set to {hf_home}, which the embedding loader does not read, so a model \
+             seeded there is fetched again into the cache named above"
+        ));
+    }
+    let check = HealthCheck::new("embedding_model", "Embedding model", status, detail);
+    if fetch.present || fetch.no_fetch_reason.is_some() {
+        return check;
+    }
+    check.with_manual_fix(format!(
+        "allow egress to {host} for the first embed pass, or pre-seed the model by copying an \
+         existing Hugging Face hub cache into the directory named above, or point \
+         KIN_EMBED_MODEL_ID at a local model directory"
+    ))
 }
 
 /// Report the active retrieval quality profile and the effective lever set,
@@ -4771,6 +4888,177 @@ mod tests {
         assert!(
             matches!(check_retrieval_profile().status, HealthStatus::Stale),
             "a profile someone chose is a serving decision they can be told about"
+        );
+    }
+
+    fn absent_model() -> crate::embed_model::EmbedModelFetch {
+        crate::embed_model::EmbedModelFetch {
+            model_id: crate::embed_model::DEFAULT_EMBED_MODEL_ID.to_string(),
+            cache_dir: Some(
+                "/home/dev/.cache/huggingface/hub/models--nomic-ai--nomic-embed-text-v1.5"
+                    .to_string(),
+            ),
+            present: false,
+            fetched_bytes: 0,
+            expected_bytes: Some(crate::embed_model::DEFAULT_EMBED_MODEL_BYTES),
+            fetching: false,
+            no_fetch_reason: None,
+            relocated_hf_home: None,
+        }
+    }
+
+    /// A machine that already holds the weights owes nothing, and the check
+    /// says where they are rather than only that they exist.
+    #[test]
+    #[serial]
+    fn a_cached_embedding_model_is_healthy_and_names_where_it_sits() {
+        let _endpoint = EnvVarGuard::unset("HF_ENDPOINT");
+        let cached = crate::embed_model::EmbedModelFetch {
+            present: true,
+            ..absent_model()
+        };
+        let check = embedding_model_check_from(&cached, None);
+        assert!(matches!(check.status, HealthStatus::Healthy));
+        assert!(
+            check
+                .detail
+                .contains("models--nomic-ai--nomic-embed-text-v1.5"),
+            "the cache location is named: {}",
+            check.detail
+        );
+        assert!(
+            !check.detail.contains("fetches about"),
+            "no download may be announced for a model that is here: {}",
+            check.detail
+        );
+        assert!(check.manual_fix.is_none());
+    }
+
+    /// A machine without the weights that can reach the host is doing expected
+    /// first-run work: it needs attention, states the cost and the source, and
+    /// does not block readiness.
+    #[test]
+    #[serial]
+    fn a_missing_embedding_model_states_the_fetch_it_will_do() {
+        let _endpoint = EnvVarGuard::unset("HF_ENDPOINT");
+        let check = embedding_model_check_from(&absent_model(), Some(true));
+        assert!(
+            matches!(check.status, HealthStatus::Pending),
+            "a reachable first fetch is expected work, not a fault: {:?}",
+            check.status
+        );
+        assert!(
+            check.detail.contains("about 523 MB") && check.detail.contains("huggingface.co"),
+            "the size and the source are both named: {}",
+            check.detail
+        );
+        assert!(
+            check
+                .manual_fix
+                .as_deref()
+                .is_some_and(|fix| fix.contains("pre-seed") && fix.contains("KIN_EMBED_MODEL_ID")),
+            "the way to avoid the download is named: {:?}",
+            check.manual_fix
+        );
+        assert!(!blocks_readiness(&check));
+    }
+
+    /// A machine without the weights that cannot reach the host fails loud and
+    /// blocks readiness, naming the egress the fetch requires.
+    #[test]
+    #[serial]
+    fn an_unreachable_model_host_fails_loud_with_its_egress_requirement() {
+        let _endpoint = EnvVarGuard::unset("HF_ENDPOINT");
+        let check = embedding_model_check_from(&absent_model(), Some(false));
+        assert!(
+            matches!(check.status, HealthStatus::Missing),
+            "a host that cannot fetch the model can never embed: {:?}",
+            check.status
+        );
+        assert!(blocks_readiness(&check), "the failure has to be loud");
+        assert!(
+            check
+                .detail
+                .contains("did not reach huggingface.co:443 within 3s"),
+            "the probe reports what it established: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("until that lands nothing embeds"),
+            "the consequence is named: {}",
+            check.detail
+        );
+    }
+
+    /// A configuration that fetches nothing is healthy and says why, so an
+    /// operator running against an endpoint is never told to expect a download.
+    #[test]
+    #[serial]
+    fn a_configuration_that_needs_no_model_is_healthy_and_says_why() {
+        let _endpoint = EnvVarGuard::unset("HF_ENDPOINT");
+        let remote = crate::embed_model::EmbedModelFetch {
+            model_id: "text-embedding-3-small".to_string(),
+            no_fetch_reason: Some(
+                "the openai provider embeds over HTTP, so no model is fetched to this machine"
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        let check = embedding_model_check_from(&remote, None);
+        assert!(matches!(check.status, HealthStatus::Healthy));
+        assert!(
+            check.detail.contains("embeds over HTTP"),
+            "{}",
+            check.detail
+        );
+        assert!(check.manual_fix.is_none());
+    }
+
+    /// A relocated `HF_HOME` is reported wherever the cache is, because seeding
+    /// the model there does not stop the loader fetching it again.
+    #[test]
+    #[serial]
+    fn a_relocated_hf_home_is_reported_beside_the_cache_the_loader_reads() {
+        let _endpoint = EnvVarGuard::unset("HF_ENDPOINT");
+        let relocated = crate::embed_model::EmbedModelFetch {
+            relocated_hf_home: Some("/mnt/models/hf".to_string()),
+            ..absent_model()
+        };
+        let check = embedding_model_check_from(&relocated, Some(true));
+        assert!(
+            check.detail.contains("HF_HOME is set to /mnt/models/hf")
+                && check.detail.contains("does not read"),
+            "the disagreement between the two roots is reported: {}",
+            check.detail
+        );
+    }
+
+    /// A model this build has never measured gets no size attributed to it.
+    ///
+    /// The default figure is the default model's. Printing it for an overridden
+    /// `KIN_EMBED_MODEL_ID` would put a number nobody measured in front of an
+    /// operator, which is worse than printing none.
+    #[test]
+    #[serial]
+    fn an_overridden_model_is_never_given_the_default_models_size() {
+        let _endpoint = EnvVarGuard::unset("HF_ENDPOINT");
+        let custom = crate::embed_model::EmbedModelFetch {
+            model_id: "acme/private-embed".to_string(),
+            expected_bytes: None,
+            ..absent_model()
+        };
+        let check = embedding_model_check_from(&custom, Some(true));
+        assert!(
+            !check.detail.contains("523"),
+            "no measured size may be attributed to an unmeasured model: {}",
+            check.detail
+        );
+        assert!(
+            check
+                .detail
+                .contains("fetches the model from huggingface.co"),
+            "the fetch is still named without a size: {}",
+            check.detail
         );
     }
 }
