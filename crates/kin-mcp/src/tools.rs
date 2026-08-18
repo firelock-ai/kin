@@ -55,13 +55,45 @@ fn destructive_idempotent(title: &str) -> ToolAnnotations {
 
 /// Honest JSON Schema for one transaction operation.
 ///
-/// The product daemon accepts two materially different shapes. A source-body
-/// edit is intentionally payload-less; structured entity/relation mutations
-/// require `payload`. Keeping these as disjoint `oneOf` branches prevents MCP
-/// clients from being told that the preferred source-edit form is invalid.
+/// The product daemon accepts three materially different shapes. A source-body
+/// edit and a new source file are both intentionally payload-less; structured
+/// entity/relation mutations require `payload`. Keeping these as disjoint
+/// `oneOf` branches prevents MCP clients from being told that the preferred
+/// source-edit form is invalid.
+///
+/// The branches cannot both match one operation: the two payload-less branches
+/// carry disjoint verb enums, and the structured branch requires `payload`,
+/// which neither of the others accepts.
 fn transaction_operation_schema() -> serde_json::Value {
     serde_json::json!({
         "oneOf": [
+            {
+                "title": "New source file",
+                "type": "object",
+                "properties": {
+                    "verb": {
+                        "type": "string",
+                        "enum": ["create", "add", "insert"],
+                        "description": "Admit a source file the graph has never seen. This is the only operation that introduces a new file."
+                    },
+                    "target": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Repository-relative path of the new file, such as \"src/parser.py\". No leading slash, no \"..\", and no Kin or Git control component. A path the graph already tracks is refused; edit that one with verb 'update' instead."
+                    },
+                    "body": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "The file's complete UTF-8 source text. Kin parses it with the same extractor the ingest path uses, so every entity in it enters the graph, and writes the file into the working directory when the transaction commits. You do not need to write the file yourself first."
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Human-readable explanation of this change."
+                    }
+                },
+                "required": ["verb", "target", "body", "description"],
+                "additionalProperties": false
+            },
             {
                 "title": "Entity source body edit",
                 "type": "object",

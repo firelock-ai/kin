@@ -664,8 +664,21 @@ pub async fn handle_transaction_begin(
 }
 
 pub const TRANSACTION_STAGE_DESC: &str = "\
-Stage one or more mutation operations onto an active transaction. The simplest write is \
-a payload-less entity source edit: {verb: \"update\", target: \"<entity name or id>\", \
+Stage one or more mutation operations onto an active transaction. Two verbs admit source, \
+and which one you want depends on whether the graph has seen the file before. \
+Use verb 'create' (or 'add'/'insert') to admit a file the graph has never seen: \
+{verb: \"create\", target: \"<repository-relative path, e.g. src/parser.py>\", \
+body: \"<the file's complete source text>\", description: \"...\"}. This is the ONLY \
+operation that introduces a new file, so it is what you use after writing a new module. \
+You do not have to write the file to disk first and you should not: Kin parses the body \
+with the same extractor the ingest path uses, every entity in it enters the graph, and the \
+commit writes the file into the working directory for you. Writing a file with some other \
+tool does NOT put it in the graph; nothing ambient admits it, and only this operation will. \
+Create several files in one transaction to have them reference each other, and edit an \
+existing file with 'update' in that same transaction if you need to. A path the graph \
+already tracks is refused by name rather than quietly overwritten. \
+Use verb 'update' (or 'modify') to change an entity the graph already holds. That is a \
+payload-less entity source edit: {verb: \"update\", target: \"<entity name or id>\", \
 body: \"<the entity's full new source text>\", description: \"...\"}. Prefer the entity \
 id that semantic_locate, find_references, or get_context_pack already handed you: a bare \
 name resolves only when it is unique, and an ambiguous one is refused (with the candidate \
@@ -683,8 +696,9 @@ resolved fail-closed server-side and on \
 commit the graph-to-file projection writes the body into the entity's working-directory \
 file. Structured payloads (full entity, relation add/remove) are also accepted. Each \
 operation is validated at stage time: anything the commit path would silently drop (a \
-missing or unknown verb, a missing payload outside the target/body source-edit form, a \
-nameless entity, a relation update/modify, or a blob payload) is rejected immediately with an actionable error \
+missing or unknown verb, a missing payload outside the two payload-less source forms, a \
+nameless entity, a relation update/modify, a blob payload, or a new-file path that is \
+absolute, escapes the repository, or names Kin or Git control metadata) is rejected immediately with an actionable error \
 instead of vanishing at commit. This rejection is identical in daemon and in-process \
 modes. Accepted operations are queued and can be validated or committed together.";
 
@@ -778,8 +792,12 @@ pub const TRANSACTION_COMMIT_DESC: &str = "\
 Publish all staged mutations atomically through exact repository authority. The daemon loads \
 source from repository CAS, splices existing entity \
 body edits in memory, reparses the final bytes, and journals semantic change, exact workspace \
-tree, and ref publication together. Relation-only transactions are supported. New or deleted \
-source entities, metadata-only source edits, ambiguous or overlapping spans, non-UTF-8 source, \
+tree, and ref publication together. A staged 'create' operation is admitted in the same \
+transaction: its body is written to the blob store, the file enters the exact tree, and its \
+entities and cross-file relations are derived by the same extractor and reconciler the ingest \
+path runs, so files created together can reference each other. Relation-only transactions are \
+supported. Adding or removing an entity inside an EXISTING file, metadata-only source edits, \
+ambiguous or overlapping spans, non-UTF-8 source, \
 gitlinks, and mismatched authority fail before mutation. On success the result names \
 status, ops_applied, empty, change_id, repository_generation, new_root_hash, and modified_files. \
 A workspace holding working-tree content its base change does not carry does not block the \
@@ -799,7 +817,7 @@ abandon it. An optional operations array may stage and commit in one call and us
 payload-less source-edit or structured payload operation shapes as kin_transaction_stage; it \
 commits with identical durability, so a success naming modified_files means the body reached the \
 file, and re-sending the same array after an interrupted commit resumes it rather than staging it \
-twice. New source text is carried ONLY by `body`: an operation naming it anything else is refused \
+twice. A created file appears in modified_files exactly as an edited one does. New source text is carried ONLY by `body`: an operation naming it anything else is refused \
 with the unknown field named, never accepted with the source dropped. A refusal ends with a \
 one-line JSON object carrying schema, code, and the operations it names, so you can branch on the \
 code instead of reading the sentence. On success the change is attributed to the calling session: \
