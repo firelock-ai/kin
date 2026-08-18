@@ -625,7 +625,7 @@ fn check_daemon_idle_window() -> HealthCheck {
             "daemon_idle_window",
             "Daemon idle window",
             HealthStatus::Unsupported,
-            "n/a — not in a Kin repository (the idle window is per-store)",
+            "not in a Kin repository, so there is no per-store window to report",
         );
     };
     if let Ok(user_value) = env::var("KIN_DAEMON_IDLE_TIMEOUT_SECS") {
@@ -4421,6 +4421,7 @@ mod tests {
         assert!(json.contains("\"kin_binary\""));
         assert!(json.contains("\"kin_daemon_binary\""));
         assert!(json.contains("\"daemon_running\""));
+        assert!(json.contains("\"daemon_idle_window\""));
         assert!(json.contains("\"vfs_projection\""));
         assert!(json.contains("\"shell_path\""));
         assert!(json.contains("\"registry_authority\""));
@@ -4749,6 +4750,48 @@ mod tests {
             summary.passed + summary.attention + summary.skipped,
             report.checks.len(),
             "every check lands in exactly one bucket"
+        );
+    }
+
+    /// FIR-2426. The idle window is a per-store number now, so a surface has to
+    /// say what it is. It is always advisory: every window the rule produces is
+    /// a correct one, and a check that could fail readiness over a legitimate
+    /// preference would make `kin doctor` cry wolf on a healthy install.
+    #[test]
+    fn the_idle_window_check_reports_the_window_and_never_fails_readiness() {
+        let check = check_daemon_idle_window();
+        assert_eq!(check.id, "daemon_idle_window");
+        assert!(
+            matches!(
+                check.status,
+                HealthStatus::Healthy | HealthStatus::Unsupported
+            ),
+            "the idle window is a report, not a verdict: {:?}",
+            check.status
+        );
+        assert!(
+            !blocks_readiness(&check),
+            "a legitimate window must never block readiness"
+        );
+        assert!(
+            !check.detail.trim().is_empty(),
+            "the check owes a reason, not just a status"
+        );
+    }
+
+    /// Whatever the window is, the reason names what decided it, because a
+    /// number with no cause behind it cannot be questioned.
+    #[test]
+    fn the_idle_window_detail_names_what_decided_it() {
+        let detail = check_daemon_idle_window().detail;
+        assert!(
+            detail.contains("not in a Kin repository")
+                || detail.contains("no local daemon")
+                || detail.contains("the floor")
+                || detail.contains("the ceiling")
+                || detail.contains("times the last open")
+                || detail.contains("KIN_DAEMON_IDLE_TIMEOUT_SECS"),
+            "the detail must name a cause: {detail}"
         );
     }
 
