@@ -14,8 +14,9 @@ use serde_json::Value;
 
 use crate::commands::auth::default_base_url_for_health;
 use crate::commands::setup::{
-    check_binary_in_path, configured_mcp_launcher, detect_shell, home_dir, hook_filename, kin_dir,
-    shell_rc, shim_filename, CANONICAL_NPM_MCP_COMMAND, CANONICAL_NPM_MCP_PACKAGE,
+    check_binary_in_path, configured_mcp_launcher, detect_shell, detected_ai_client_names,
+    home_dir, hook_filename, kin_dir, shell_rc, shim_filename, CANONICAL_NPM_MCP_COMMAND,
+    CANONICAL_NPM_MCP_PACKAGE,
 };
 use crate::daemon_client::{InstalledStartupProtocol, SupervisorStartupSentinel};
 
@@ -170,6 +171,7 @@ pub async fn run_health_checks() -> HealthReport {
     checks.push(check_semantic_query_readiness().await);
     checks.push(check_reference_edge_coverage().await);
     checks.push(check_background_work().await);
+    checks.push(check_embedding_model().await);
     checks.push(check_retrieval_profile());
     checks.push(check_cross_file_enrichment());
     checks.push(check_update_policy());
@@ -637,8 +639,12 @@ fn check_vfs_projection() -> HealthCheck {
         }
     };
     let lib_path = kin_home.join("lib").join(shim_filename());
+    let driver = resolve_vfs_driver(&vfs_driver_candidates(
+        &kin_home,
+        env::current_exe().ok().as_deref(),
+    ));
 
-    vfs_projection_check_for(&lib_path, projection_installed_under(&kin_home))
+    vfs_projection_check_for(&lib_path, &driver)
 }
 
 /// Name of the projection driver binary the installer places beside `kin`.
@@ -650,20 +656,125 @@ fn vfs_binary_filename() -> &'static str {
     }
 }
 
-/// Whether filesystem projection was actually installed under `kin_home`.
+/// Every place the projection driver can be, in resolution order.
 ///
-/// The installer ships projection only where it can run. When the archive
-/// carries no projection, or the host loader cannot execute the one it carries,
-/// the installer deletes `kin-vfs` and the shim together and says so out loud:
-/// "Filesystem projection is unavailable on this platform; core CLI and daemon
-/// are fully functional without it." So a shim absent beside an absent
-/// `kin-vfs` is that sanctioned outcome, not a broken install — and telling
-/// such a user to reinstall contradicts what the installer just told them and
-/// sends them somewhere that cannot help. A shim absent while `kin-vfs` is
-/// installed is the opposite case: projection is on this machine and the half
-/// that gets injected into processes is gone.
-fn projection_installed_under(kin_home: &Path) -> bool {
-    kin_home.join("bin").join(vfs_binary_filename()).exists()
+/// The installer ships `kin-vfs` beside the `kin` binary it installs, and that
+/// is `~/.kin/bin` only for the managed layout. An archive or Homebrew install
+/// puts both somewhere else, so looking in `~/.kin/bin` alone read a driver
+/// sitting next to the running binary as absent, and the check then phrased
+/// that guess as a confident "neither is present here".
+fn vfs_driver_candidates(kin_home: &Path, exe: Option<&Path>) -> Vec<PathBuf> {
+    fn push_unique(into: &mut Vec<PathBuf>, path: PathBuf) {
+        if !into.contains(&path) {
+            into.push(path);
+        }
+    }
+
+    let name = vfs_binary_filename();
+    let mut candidates = Vec::new();
+    if let Some(dir) = exe.and_then(Path::parent) {
+        push_unique(&mut candidates, dir.join(name));
+    }
+    push_unique(&mut candidates, kin_home.join("bin").join(name));
+    if let Some(found) = check_binary_in_path("kin-vfs") {
+        push_unique(&mut candidates, found);
+    }
+    candidates
+}
+
+/// What a projection driver on disk actually does when it is run.
+///
+/// The installer removes `kin-vfs` and its shim together where projection
+/// cannot run, so an absent driver is a sanctioned outcome rather than a broken
+/// install. A driver that is present and refuses to load is neither: it is a
+/// real defect, and reporting it as absence tells a user nothing is missing on
+/// a machine where projection is installed and dead.
+#[derive(Debug, PartialEq, Eq)]
+enum VfsDriverState {
+    /// No `kin-vfs` beside the running binary, in `~/.kin/bin`, or on PATH.
+    Absent,
+    /// A driver that runs: probing it reached the driver's own code.
+    Loadable(PathBuf),
+    /// A driver on disk the loader refuses, carrying its literal complaint.
+    Unloadable { path: PathBuf, message: String },
+}
+
+/// Probe one driver path by running it.
+///
+/// Existence is not loadability. The linux-aarch64 archive has shipped a
+/// `kin-vfs` needing a newer glibc than the host carries, and on disk that
+/// driver is an ordinary file: only executing it produces the loader's refusal.
+/// Stdin is closed so a candidate that is not Kin's driver cannot stall the
+/// check by reading from the terminal.
+fn probe_vfs_driver(path: &Path) -> VfsDriverState {
+    use std::process::{Command, Stdio};
+
+    match Command::new(path)
+        .arg("--help")
+        .stdin(Stdio::null())
+        .output()
+    {
+        Ok(output) if driver_ran(&output.status) => VfsDriverState::Loadable(path.to_path_buf()),
+        Ok(output) => VfsDriverState::Unloadable {
+            path: path.to_path_buf(),
+            message: loader_failure_message(&output.stderr, &output.status),
+        },
+        Err(error) => VfsDriverState::Unloadable {
+            path: path.to_path_buf(),
+            message: error.to_string(),
+        },
+    }
+}
+
+/// Whether the probed process actually reached its own code.
+///
+/// Loading is not the same as exiting zero. `kin-vfs` takes a subcommand and
+/// carries no `--version`, so `kin-vfs --version` exits 2 with a clap usage
+/// error on a perfectly healthy install; judging on `success()` would have
+/// reported every installed driver as broken, which is the same shape of wrong
+/// answer this check exists to remove. What a refusal to load looks like is a
+/// process that never reaches main: `ld.so` prints its complaint and exits 127,
+/// dyld kills the process outright, and a wrong-architecture or unreadable file
+/// fails at spawn.
+fn driver_ran(status: &std::process::ExitStatus) -> bool {
+    match status.code() {
+        Some(127) => false,
+        Some(_) => true,
+        None => false,
+    }
+}
+
+/// The loader's own words, or the exit status when it said nothing.
+fn loader_failure_message(stderr: &[u8], status: &std::process::ExitStatus) -> String {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("it exited with {status} and printed nothing"))
+}
+
+/// Resolve the projection driver by running the candidates in order.
+///
+/// A driver that runs wins over one that does not, so a stale copy in one
+/// location cannot hide a working install in another. A candidate that exists
+/// and refuses to run is reported only when nothing else runs.
+fn resolve_vfs_driver(candidates: &[PathBuf]) -> VfsDriverState {
+    let mut refused: Option<VfsDriverState> = None;
+    for candidate in candidates {
+        if !candidate.is_file() {
+            continue;
+        }
+        match probe_vfs_driver(candidate) {
+            VfsDriverState::Loadable(path) => return VfsDriverState::Loadable(path),
+            state => {
+                if refused.is_none() {
+                    refused = Some(state);
+                }
+            }
+        }
+    }
+    refused.unwrap_or(VfsDriverState::Absent)
 }
 
 /// The durable step that repairs a missing or corrupt shim when `kin doctor
@@ -672,6 +783,15 @@ fn projection_installed_under(kin_home: &Path) -> bool {
 /// list, where pointing back at the command that just ran is a dead loop.
 const SHIM_REINSTALL_HINT: &str =
     "reinstall kin to restore the shim: curl -fsSL https://get.kinlab.dev/install | sh";
+
+/// The durable step for a projection driver the loader refuses. It must not
+/// promise that a reinstall clears it: the loader's message can name a system
+/// library this host is too old to carry, and no build of the driver runs on
+/// such a host. Saying so is the difference between a remediation and a loop.
+const BROKEN_DRIVER_HINT: &str =
+    "reinstall kin for this platform: curl -fsSL https://get.kinlab.dev/install | sh. If the \
+     message names a system library version this host does not have, projection cannot run \
+     here, and the CLI and daemon are fully functional without it.";
 
 /// On-disk state of the VFS shim. Existence alone is not health: a 0-byte file
 /// crashes every process the shim is injected into, and a non-object blob is a
@@ -759,12 +879,36 @@ fn shim_object_kind() -> &'static str {
     }
 }
 
-/// Build the `vfs_projection` check from a resolved shim path and whether
-/// projection is installed on this machine at all. Split out from
-/// [`check_vfs_projection`] so the size/magic classification is testable.
-fn vfs_projection_check_for(lib_path: &Path, projection_installed: bool) -> HealthCheck {
+/// Build the `vfs_projection` check from a resolved shim path and the probed
+/// state of the projection driver. Split out from [`check_vfs_projection`] so
+/// the size/magic classification and the three driver states are testable.
+///
+/// The driver decides the headline. A driver that will not load is a defect
+/// whatever the shim looks like, and it is the one state the old check could
+/// not express: it inferred absence from `~/.kin/bin` alone and reported it as
+/// "neither is present here", which is a confident negative built from a place
+/// it never looked.
+fn vfs_projection_check_for(lib_path: &Path, driver: &VfsDriverState) -> HealthCheck {
+    if let VfsDriverState::Unloadable { path, message } = driver {
+        return HealthCheck::new(
+            "vfs_projection",
+            "VFS projection",
+            HealthStatus::Misconfigured,
+            format!(
+                "the kin-vfs driver at {} is installed but will not run: {message}",
+                path.display()
+            ),
+        )
+        .with_manual_fix(BROKEN_DRIVER_HINT);
+    }
+
+    let driver_note = match driver {
+        VfsDriverState::Loadable(path) => format!("; kin-vfs driver at {} runs", path.display()),
+        _ => String::new(),
+    };
+
     match classify_shim(lib_path) {
-        ShimState::Missing if !projection_installed => HealthCheck::new(
+        ShimState::Missing if matches!(driver, VfsDriverState::Absent) => HealthCheck::new(
             "vfs_projection",
             "VFS projection",
             HealthStatus::Unsupported,
@@ -773,14 +917,17 @@ fn vfs_projection_check_for(lib_path: &Path, projection_installed: bool) -> Heal
         )
         .with_platform_note(
             "The installer ships projection only where it can run, and removes the kin-vfs \
-             driver and its shim together when it cannot. Neither is present here, so nothing \
-             is missing.",
+             driver and its shim together when it cannot. No kin-vfs was found beside the kin \
+             binary, in ~/.kin/bin, or on PATH, and no shim is installed, so nothing is missing.",
         ),
         ShimState::Valid(size) => HealthCheck::new(
             "vfs_projection",
             "VFS projection",
             HealthStatus::Healthy,
-            format!("shim installed ({size} bytes, {})", lib_path.display()),
+            format!(
+                "shim installed ({size} bytes, {}){driver_note}",
+                lib_path.display()
+            ),
         ),
         ShimState::Empty => HealthCheck::new(
             "vfs_projection",
@@ -809,7 +956,7 @@ fn vfs_projection_check_for(lib_path: &Path, projection_installed: bool) -> Heal
             "vfs_projection",
             "VFS projection",
             HealthStatus::Missing,
-            format!("shim not installed at {}", lib_path.display()),
+            format!("shim not installed at {}{driver_note}", lib_path.display()),
         )
         .fixable()
         .with_manual_fix(SHIM_REINSTALL_HINT),
@@ -983,6 +1130,7 @@ fn check_shell_path() -> HealthCheck {
         hook_path: &hook_path,
         rc_display: &rc_display,
         bin_dir: &bin_dir,
+        bin_dir_present: bin_dir.is_dir(),
         hook_installed,
         rc_sources,
         on_path,
@@ -1025,6 +1173,10 @@ struct ShellIntegrationState<'a> {
     hook_path: &'a Path,
     rc_display: &'a str,
     bin_dir: &'a Path,
+    /// Whether `~/.kin/bin` exists at all. Only the launcher-provisioned layout
+    /// populates it, so an archive or Homebrew install has no such directory and
+    /// nothing that belongs on PATH through it.
+    bin_dir_present: bool,
     hook_installed: bool,
     rc_sources: bool,
     on_path: bool,
@@ -1053,6 +1205,7 @@ fn shell_path_check_from(state: ShellIntegrationState<'_>) -> HealthCheck {
         hook_path,
         rc_display,
         bin_dir,
+        bin_dir_present,
         hook_installed,
         rc_sources,
         on_path,
@@ -1060,21 +1213,33 @@ fn shell_path_check_from(state: ShellIntegrationState<'_>) -> HealthCheck {
         recorded_by_setup,
     } = state;
 
-    if hook_installed && rc_sources && (on_path || rc_sets_path) {
-        let detail = match (on_path, rc_sets_path) {
-            (true, _) => {
+    if hook_installed && rc_sources && (on_path || rc_sets_path || !bin_dir_present) {
+        let detail = match (bin_dir_present, on_path, rc_sets_path) {
+            (true, true, _) => {
                 format!(
                     "{shell} hook installed and sourced from {rc_display}; {} on PATH",
                     bin_dir.display()
                 )
             }
-            (false, true) => {
+            (true, false, true) => {
                 format!(
                     "{shell} hook installed and sourced from {rc_display}; {} will be on PATH after shell restart",
                     bin_dir.display()
                 )
             }
-            (false, false) => unreachable!(),
+            (false, _, true) => {
+                format!(
+                    "{shell} hook installed and sourced from {rc_display}; that rc adds {} to PATH, a directory this install did not create",
+                    bin_dir.display()
+                )
+            }
+            (false, _, false) => {
+                format!(
+                    "{shell} hook installed and sourced from {rc_display}; no PATH line was added because {} does not exist on this host",
+                    bin_dir.display()
+                )
+            }
+            (true, false, false) => unreachable!(),
         };
         HealthCheck::new(
             "shell_path",
@@ -1100,7 +1265,7 @@ fn shell_path_check_from(state: ShellIntegrationState<'_>) -> HealthCheck {
         if !rc_sources {
             missing.push(format!("{rc_display} does not source the kin-vfs hook"));
         }
-        if !on_path && !rc_sets_path {
+        if bin_dir_present && !on_path && !rc_sets_path {
             missing.push(format!(
                 "{rc_display} does not add {} to PATH",
                 bin_dir.display()
@@ -1597,6 +1762,37 @@ fn mcp_client_check_from(
     }
 }
 
+/// Build the row for a machine carrying no AI client config file at all.
+///
+/// A config file is evidence a client was configured, not evidence one is
+/// installed. Reading only config files, this row told the user there was
+/// nothing to configure in the same minute `kin setup` detected Claude Code and
+/// wrote both its MCP config and a global instruction file. Both surfaces now
+/// read setup's detection, so they cannot disagree about what is on the machine.
+fn no_mcp_client_config_check(detected: &[&str]) -> HealthCheck {
+    if detected.is_empty() {
+        return HealthCheck::new(
+            "mcp_clients",
+            "AI client MCP config",
+            HealthStatus::Healthy,
+            "no AI client detected and no client config files present, so there is nothing \
+             to configure",
+        );
+    }
+
+    HealthCheck::new(
+        "mcp_clients",
+        "AI client MCP config",
+        HealthStatus::Unsupported,
+        format!(
+            "{} detected with no client config file yet; `kin setup` writes the kin MCP server \
+             entry for it",
+            detected.join(", ")
+        ),
+    )
+    .with_manual_fix("run `kin setup` to register the kin MCP server with the detected client(s)")
+}
+
 fn check_mcp_clients() -> Vec<HealthCheck> {
     let clients: Vec<McpClient> = mcp_client_config_paths()
         .into_iter()
@@ -1605,12 +1801,7 @@ fn check_mcp_clients() -> Vec<HealthCheck> {
         .collect();
 
     if clients.is_empty() {
-        return vec![HealthCheck::new(
-            "mcp_clients",
-            "AI client MCP config",
-            HealthStatus::Healthy,
-            "no AI client config files detected — nothing to configure",
-        )];
+        return vec![no_mcp_client_config_check(&detected_ai_client_names())];
     }
 
     let recorded = mcp_paths_recorded_by_setup();
@@ -2312,6 +2503,122 @@ fn cross_file_enrichment_check(
     )
 }
 
+/// How long the model host is given to answer before the probe gives up.
+///
+/// Bounds `kin doctor` on a host with a black-hole resolver, where a name
+/// lookup can otherwise sit for the resolver's own timeout. The budget is
+/// stated in the failing detail, because "did not answer within 3s" is what
+/// this probe actually establishes and "is unreachable" is not.
+const MODEL_HOST_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Whether the embedding model this build fetches at runtime is already here,
+/// and what a machine that does not have it owes to get it.
+///
+/// The weights are not shipped with any install. Until this check existed the
+/// first embed pass on a fresh machine spent several hundred megabytes of
+/// egress with no surface naming the download, the size, the destination, or
+/// the host it needs to reach, and an air-gapped host produced exactly the same
+/// output as a healthy one that was simply still working.
+async fn check_embedding_model() -> HealthCheck {
+    // `false`: this is a one-shot CLI process with no embed pass of its own, so
+    // the download-in-flight phase is not a state doctor can be in. Doctor
+    // answers whether the model is here, not whether some other process is
+    // fetching it this second.
+    let fetch = crate::embed_model::EmbedModelFetch::probe(false);
+    // Probed only where the answer changes the verdict. A machine that already
+    // holds the model owes no egress, and asking anyway would put a network
+    // call in the path of a check that has nothing to learn from it.
+    let reachable = if fetch.present || fetch.no_fetch_reason.is_some() {
+        None
+    } else {
+        Some(model_host_reachable(crate::embed_model::endpoint_host()).await)
+    };
+    embedding_model_check_from(&fetch, reachable)
+}
+
+/// Whether a TCP connection to the model host's HTTPS port completes inside the
+/// budget.
+///
+/// Deliberately not an HTTP request. The question is whether this host has any
+/// route to the place the weights come from, and a name that resolves plus a
+/// socket that connects answers it without depending on the endpoint's own
+/// availability or on a proxy honouring a method. Every way of not answering
+/// inside the budget, including a name that never resolves, is reported the
+/// same way, which is why the detail names the budget rather than claiming the
+/// host is down.
+async fn model_host_reachable(host: String) -> bool {
+    let target = format!("{host}:443");
+    let probe = tokio::task::spawn_blocking(move || {
+        use std::net::ToSocketAddrs;
+        let Ok(mut addrs) = target.to_socket_addrs() else {
+            return false;
+        };
+        let Some(addr) = addrs.next() else {
+            return false;
+        };
+        std::net::TcpStream::connect_timeout(&addr, MODEL_HOST_PROBE_BUDGET).is_ok()
+    });
+    matches!(
+        tokio::time::timeout(MODEL_HOST_PROBE_BUDGET, probe).await,
+        Ok(Ok(true))
+    )
+}
+
+/// The check above, with both probes taken as arguments.
+///
+/// `reachable` is `None` where the question was never asked, which is not the
+/// same fact as a host that answered no, and the two render differently.
+fn embedding_model_check_from(
+    fetch: &crate::embed_model::EmbedModelFetch,
+    reachable: Option<bool>,
+) -> HealthCheck {
+    let host = crate::embed_model::endpoint_host();
+    let model = &fetch.model_id;
+    let location = match fetch.cache_dir.as_deref() {
+        Some(dir) => format!(" at {dir}"),
+        None => String::new(),
+    };
+    let download = fetch.expected_download();
+    let (status, mut detail) = match (fetch.no_fetch_reason.as_deref(), fetch.present, reachable) {
+        (Some(reason), _, _) => (HealthStatus::Healthy, format!("{model}: {reason}")),
+        (None, true, _) => (
+            HealthStatus::Healthy,
+            format!("{model} is in the Hugging Face cache{location}, so no download is owed"),
+        ),
+        (None, false, Some(false)) => (
+            HealthStatus::Missing,
+            format!(
+                "{model} is not in the cache{location} and this host did not reach {host}:443 \
+                 within {}s; the first embed pass fetches {download} from {host}, and until \
+                 that lands nothing embeds",
+                MODEL_HOST_PROBE_BUDGET.as_secs()
+            ),
+        ),
+        (None, false, _) => (
+            HealthStatus::Pending,
+            format!(
+                "{model} is not in the cache{location}; the first embed pass fetches {download} \
+                 from {host} before it records anything"
+            ),
+        ),
+    };
+    if let Some(hf_home) = fetch.relocated_hf_home.as_deref() {
+        detail.push_str(&format!(
+            ". HF_HOME is set to {hf_home}, which the embedding loader does not read, so a model \
+             seeded there is fetched again into the cache named above"
+        ));
+    }
+    let check = HealthCheck::new("embedding_model", "Embedding model", status, detail);
+    if fetch.present || fetch.no_fetch_reason.is_some() {
+        return check;
+    }
+    check.with_manual_fix(format!(
+        "allow egress to {host} for the first embed pass, or pre-seed the model by copying an \
+         existing Hugging Face hub cache into the directory named above, or point \
+         KIN_EMBED_MODEL_ID at a local model directory"
+    ))
+}
+
 /// Report the active retrieval quality profile and the effective lever set,
 /// so an operator can see at a glance whether they are getting full
 /// retrieval capability — and why not, when a lever is off.
@@ -2683,8 +2990,9 @@ mod tests {
         let corrupt = dir.path().join("corrupt");
         write_file(&corrupt, b"not an object file");
 
+        let driver = VfsDriverState::Loadable(dir.path().join(vfs_binary_filename()));
         for path in [&missing, &empty, &corrupt] {
-            let check = vfs_projection_check_for(path, true);
+            let check = vfs_projection_check_for(path, &driver);
             assert!(check.fixable, "{}: should be fixable", path.display());
             let fix = check.manual_fix.clone().unwrap_or_default();
             assert!(!fix.is_empty(), "{}: missing manual fix", path.display());
@@ -2706,7 +3014,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("libkin_vfs_shim");
 
-        let uninstalled = vfs_projection_check_for(&missing, false);
+        let uninstalled = vfs_projection_check_for(&missing, &VfsDriverState::Absent);
         assert!(
             matches!(uninstalled.status, HealthStatus::Unsupported),
             "no projection on this machine must be skipped, got {:?}",
@@ -2723,8 +3031,11 @@ mod tests {
         );
         assert!(uninstalled.platform_note.is_some());
 
-        // Falsification: flip only the installed flag, keep the same path.
-        let installed = vfs_projection_check_for(&missing, true);
+        // Falsification: flip only the driver state, keep the same path.
+        let installed = vfs_projection_check_for(
+            &missing,
+            &VfsDriverState::Loadable(dir.path().join(vfs_binary_filename())),
+        );
         assert!(
             matches!(installed.status, HealthStatus::Missing),
             "a shim missing where projection is installed must stay a failure, got {:?}",
@@ -2747,7 +3058,7 @@ mod tests {
         write_file(&corrupt, b"not an object file");
 
         for path in [&empty, &corrupt] {
-            let check = vfs_projection_check_for(path, false);
+            let check = vfs_projection_check_for(path, &VfsDriverState::Absent);
             if cfg!(any(target_os = "macos", target_os = "linux")) || path == &empty {
                 assert!(
                     is_failing(&check.status),
@@ -2759,15 +3070,169 @@ mod tests {
         }
     }
 
+    /// The driver the user just ran `kin` from is the one to judge. An archive
+    /// or Homebrew install puts `kin-vfs` beside the `kin` binary rather than in
+    /// `~/.kin/bin`, and looking only in `~/.kin/bin` reported that driver as
+    /// absent.
     #[test]
-    fn projection_is_detected_from_the_driver_beside_the_managed_binaries() {
+    fn the_driver_beside_the_running_binary_is_a_candidate() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(!projection_installed_under(dir.path()));
+        let install = dir.path().join("opt/kin");
+        std::fs::create_dir_all(&install).unwrap();
+        let exe = install.join("kin");
+        write_file(&exe, b"kin");
 
-        let bin = dir.path().join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        write_file(&bin.join(vfs_binary_filename()), b"driver");
-        assert!(projection_installed_under(dir.path()));
+        let candidates = vfs_driver_candidates(&dir.path().join("kin-home"), Some(&exe));
+        assert!(
+            candidates.contains(&install.join(vfs_binary_filename())),
+            "a driver beside the running binary must be probed: {candidates:?}"
+        );
+        assert!(
+            candidates.contains(
+                &dir.path()
+                    .join("kin-home")
+                    .join("bin")
+                    .join(vfs_binary_filename())
+            ),
+            "the managed location must still be probed: {candidates:?}"
+        );
+    }
+
+    /// Write an executable stand-in for the projection driver.
+    #[cfg(unix)]
+    fn write_driver(path: &Path, script: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        write_file(path, script.as_bytes());
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A driver the loader refuses is not an absent driver. The linux-aarch64
+    /// archive shipped a `kin-vfs` requiring a newer glibc than the host had,
+    /// and the check reported "neither is present here" with both files sitting
+    /// beside the `kin` binary it had just resolved by full path.
+    #[test]
+    #[cfg(unix)]
+    fn a_driver_that_will_not_load_is_reported_as_broken_rather_than_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let driver = dir.path().join(vfs_binary_filename());
+        write_driver(
+            &driver,
+            "#!/bin/sh\necho \"kin-vfs: /lib/libc.so.6: version GLIBC_2.39 not found\" >&2\nexit 127\n",
+        );
+
+        let state = resolve_vfs_driver(std::slice::from_ref(&driver));
+        let VfsDriverState::Unloadable { path, message } = &state else {
+            panic!("a driver that refuses to run must be Unloadable, got {state:?}");
+        };
+        assert_eq!(path, &driver);
+        assert!(
+            message.contains("GLIBC_2.39"),
+            "the loader's own words must reach the report: {message}"
+        );
+
+        let check = vfs_projection_check_for(&dir.path().join("no-shim"), &state);
+        assert!(
+            is_failing(&check.status),
+            "a driver that cannot run must need attention, got {:?}",
+            check.status
+        );
+        assert!(
+            check.detail.contains("GLIBC_2.39")
+                && check.detail.contains(&driver.display().to_string()),
+            "the row must name the driver and quote the loader: {}",
+            check.detail
+        );
+        let fix = check.manual_fix.clone().unwrap_or_default();
+        assert!(!fix.is_empty(), "a broken driver must carry a remediation");
+        assert!(!fix.contains("doctor --fix"), "circular fix text: {fix}");
+
+        // Falsification: the same missing shim with no driver anywhere is the
+        // installer's sanctioned outcome and stays a green n/a.
+        let absent = vfs_projection_check_for(&dir.path().join("no-shim"), &VfsDriverState::Absent);
+        assert!(
+            matches!(absent.status, HealthStatus::Unsupported),
+            "an absent driver must stay skipped, got {:?}",
+            absent.status
+        );
+        assert!(!is_failing(&absent.status));
+    }
+
+    /// The probe may not require a successful exit. The shipped `kin-vfs` takes
+    /// a subcommand and carries no `--version`, so it answers an unknown flag
+    /// with a clap usage error and exit 2 on a healthy install. Scoring that as
+    /// a driver that will not load fails every install that works.
+    #[test]
+    #[cfg(unix)]
+    fn a_driver_answering_with_a_usage_error_still_counts_as_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let driver = dir.path().join(vfs_binary_filename());
+        write_driver(
+            &driver,
+            "#!/bin/sh\necho \"error: unexpected argument found\" >&2\nexit 2\n",
+        );
+
+        assert_eq!(
+            resolve_vfs_driver(std::slice::from_ref(&driver)),
+            VfsDriverState::Loadable(driver.clone()),
+            "a driver that ran and complained about arguments is installed and loadable"
+        );
+
+        // Falsification: the loader's own refusal exits 127 and stays broken.
+        let refused = dir.path().join("refused").join(vfs_binary_filename());
+        std::fs::create_dir_all(refused.parent().unwrap()).unwrap();
+        write_driver(
+            &refused,
+            "#!/bin/sh\necho 'libc.so.6: version not found' >&2\nexit 127\n",
+        );
+        assert!(
+            matches!(
+                resolve_vfs_driver(std::slice::from_ref(&refused)),
+                VfsDriverState::Unloadable { .. }
+            ),
+            "a loader refusal must still be caught"
+        );
+    }
+
+    /// Absent, present and loadable, present and unloadable must be three
+    /// different rows. They were two: the first two were the same green n/a,
+    /// and the third had no way to be said at all.
+    #[test]
+    #[cfg(unix)]
+    fn the_three_driver_states_are_three_different_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_shim = dir.path().join("no-shim");
+
+        let working = dir.path().join("works").join(vfs_binary_filename());
+        std::fs::create_dir_all(working.parent().unwrap()).unwrap();
+        write_driver(&working, "#!/bin/sh\necho 'kin-vfs 0.0.0-test'\n");
+        let loadable = resolve_vfs_driver(std::slice::from_ref(&working));
+        assert_eq!(loadable, VfsDriverState::Loadable(working.clone()));
+
+        let broken = dir.path().join("broken").join(vfs_binary_filename());
+        std::fs::create_dir_all(broken.parent().unwrap()).unwrap();
+        write_driver(&broken, "#!/bin/sh\nexit 127\n");
+
+        let absent = vfs_projection_check_for(&missing_shim, &VfsDriverState::Absent);
+        let installed = vfs_projection_check_for(&missing_shim, &loadable);
+        let unloadable = vfs_projection_check_for(
+            &missing_shim,
+            &resolve_vfs_driver(std::slice::from_ref(&broken)),
+        );
+
+        assert!(matches!(absent.status, HealthStatus::Unsupported));
+        assert!(matches!(installed.status, HealthStatus::Missing));
+        assert!(matches!(unloadable.status, HealthStatus::Misconfigured));
+        assert!(
+            installed.detail.contains(&working.display().to_string()),
+            "a driver that runs must be named as running: {}",
+            installed.detail
+        );
+        let details = [&absent.detail, &installed.detail, &unloadable.detail];
+        for (i, left) in details.iter().enumerate() {
+            for right in details.iter().skip(i + 1) {
+                assert_ne!(left, right, "two states must never print the same row");
+            }
+        }
     }
 
     /// A repository that has never started a daemon is the resting state every
@@ -2918,6 +3383,7 @@ mod tests {
             hook_path: Path::new("/home/u/.kin/shell/kin-vfs.zsh"),
             rc_display: "/home/u/.zshrc",
             bin_dir: Path::new("/home/u/.kin/bin"),
+            bin_dir_present: true,
             hook_installed,
             rc_sources: hook_installed,
             on_path: hook_installed,
@@ -3138,7 +3604,7 @@ mod tests {
         let checks = vec![
             check_with("kin_binary", HealthStatus::Healthy),
             check_with("kin_daemon_binary", HealthStatus::Healthy),
-            vfs_projection_check_for(&dir.path().join("no-shim"), false),
+            vfs_projection_check_for(&dir.path().join("no-shim"), &VfsDriverState::Absent),
             repo_init_check_for(&repo, None, None),
             daemon_not_running_check_for("/repo", &dir.path().join("daemon.pid")),
             mcp_client_check_from(
@@ -3232,6 +3698,46 @@ mod tests {
         assert!(matches!(check.status, HealthStatus::Healthy));
     }
 
+    /// The row that reported `~/.kin/bin will be on PATH after shell restart`
+    /// on a host where that directory did not exist. Which of the two cases the
+    /// install is in has to be in the row, since the PATH line is written only
+    /// in one of them.
+    #[test]
+    fn the_shell_row_says_whether_a_path_line_was_wanted() {
+        let mut archive = shell_state(true, true);
+        archive.bin_dir_present = false;
+        archive.on_path = false;
+        archive.rc_sets_path = false;
+        let check = shell_path_check_from(archive);
+        assert!(
+            matches!(check.status, HealthStatus::Healthy),
+            "a hook installed by an archive install is not broken: {:?}",
+            check.status
+        );
+        assert!(
+            check.detail.contains("does not exist"),
+            "the row must say why no PATH line was written: {}",
+            check.detail
+        );
+
+        // Falsification: the same rc on the layout that does provision the
+        // directory is a real missing PATH line and stays a failure.
+        let mut managed = shell_state(true, true);
+        managed.on_path = false;
+        managed.rc_sets_path = false;
+        let check = shell_path_check_from(managed);
+        assert!(
+            matches!(check.status, HealthStatus::Misconfigured),
+            "a provisioned bin directory missing from PATH stays a failure: {:?}",
+            check.status
+        );
+        assert!(
+            check.detail.contains("does not add"),
+            "the failing row still names the missing PATH line: {}",
+            check.detail
+        );
+    }
+
     #[test]
     #[serial]
     fn shell_path_is_healthy_when_rc_declares_path_for_next_shell() {
@@ -3241,6 +3747,8 @@ mod tests {
         let hook_dir = kin_home.join("shell");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&hook_dir).unwrap();
+
+        std::fs::create_dir_all(kin_home.join("bin")).unwrap();
 
         let hook = hook_dir.join(hook_filename("zsh"));
         std::fs::write(&hook, "# kin-vfs test hook\n").unwrap();
@@ -3334,6 +3842,93 @@ mod tests {
 
     fn check_with(id: &str, status: HealthStatus) -> HealthCheck {
         HealthCheck::new(id, id, status, "")
+    }
+
+    /// Doctor said "no AI client config files detected, nothing to configure"
+    /// and `kin setup` configured Claude Code seconds later on the same host.
+    /// The row now reports what setup's own detection sees, so the two surfaces
+    /// cannot contradict each other.
+    #[test]
+    fn the_no_client_row_reports_detection_rather_than_config_files() {
+        let nothing = no_mcp_client_config_check(&[]);
+        assert!(matches!(nothing.status, HealthStatus::Healthy));
+        assert!(
+            nothing.detail.contains("nothing to configure"),
+            "a host with no client keeps the settled answer: {}",
+            nothing.detail
+        );
+
+        // Falsification: one detected client and the same absent config files.
+        let detected = no_mcp_client_config_check(&["Claude Code"]);
+        assert!(
+            detected.detail.contains("Claude Code"),
+            "a detected client must be named: {}",
+            detected.detail
+        );
+        assert!(
+            !detected.detail.contains("nothing to configure"),
+            "setup has work to do here, so the row may not say otherwise: {}",
+            detected.detail
+        );
+        assert!(
+            detected.manual_fix.is_some(),
+            "the row must point at the command that does the work"
+        );
+        assert!(
+            !is_failing(&detected.status),
+            "an unconfigured client is first-run work, not a broken install: {:?}",
+            detected.status
+        );
+    }
+
+    /// The same question asked of the real check, with a real home that has no
+    /// client config and a PATH that does or does not carry a client binary.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn a_detected_client_reaches_the_row_that_used_to_say_nothing_to_configure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let empty_bin = tmp.path().join("empty-bin");
+        let client_bin = tmp.path().join("client-bin");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&empty_bin).unwrap();
+        std::fs::create_dir_all(&client_bin).unwrap();
+
+        let _home = EnvVarGuard::set("HOME", &home);
+
+        let without = {
+            let _path = EnvVarGuard::set("PATH", &empty_bin);
+            check_mcp_clients()
+        };
+        assert_eq!(without.len(), 1, "no config files means one rollup row");
+        assert!(
+            !without[0].detail.contains("Claude Code"),
+            "no client on PATH and none in this home: {}",
+            without[0].detail
+        );
+
+        let claude = client_bin.join("claude");
+        write_file(&claude, b"#!/bin/sh\nexit 0\n");
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let with = {
+            let _path = EnvVarGuard::set("PATH", &client_bin);
+            check_mcp_clients()
+        };
+        assert_eq!(with.len(), 1, "still no config files, still one rollup row");
+        assert!(
+            with[0].detail.contains("Claude Code"),
+            "an installed client must reach the row: {}",
+            with[0].detail
+        );
+        assert!(
+            !with[0].detail.contains("nothing to configure"),
+            "setup will configure it, so the row may not say there is nothing to do: {}",
+            with[0].detail
+        );
     }
 
     #[test]
@@ -4771,6 +5366,177 @@ mod tests {
         assert!(
             matches!(check_retrieval_profile().status, HealthStatus::Stale),
             "a profile someone chose is a serving decision they can be told about"
+        );
+    }
+
+    fn absent_model() -> crate::embed_model::EmbedModelFetch {
+        crate::embed_model::EmbedModelFetch {
+            model_id: crate::embed_model::DEFAULT_EMBED_MODEL_ID.to_string(),
+            cache_dir: Some(
+                "/home/dev/.cache/huggingface/hub/models--nomic-ai--nomic-embed-text-v1.5"
+                    .to_string(),
+            ),
+            present: false,
+            fetched_bytes: 0,
+            expected_bytes: Some(crate::embed_model::DEFAULT_EMBED_MODEL_BYTES),
+            fetching: false,
+            no_fetch_reason: None,
+            relocated_hf_home: None,
+        }
+    }
+
+    /// A machine that already holds the weights owes nothing, and the check
+    /// says where they are rather than only that they exist.
+    #[test]
+    #[serial]
+    fn a_cached_embedding_model_is_healthy_and_names_where_it_sits() {
+        let _endpoint = EnvVarGuard::unset("HF_ENDPOINT");
+        let cached = crate::embed_model::EmbedModelFetch {
+            present: true,
+            ..absent_model()
+        };
+        let check = embedding_model_check_from(&cached, None);
+        assert!(matches!(check.status, HealthStatus::Healthy));
+        assert!(
+            check
+                .detail
+                .contains("models--nomic-ai--nomic-embed-text-v1.5"),
+            "the cache location is named: {}",
+            check.detail
+        );
+        assert!(
+            !check.detail.contains("fetches about"),
+            "no download may be announced for a model that is here: {}",
+            check.detail
+        );
+        assert!(check.manual_fix.is_none());
+    }
+
+    /// A machine without the weights that can reach the host is doing expected
+    /// first-run work: it needs attention, states the cost and the source, and
+    /// does not block readiness.
+    #[test]
+    #[serial]
+    fn a_missing_embedding_model_states_the_fetch_it_will_do() {
+        let _endpoint = EnvVarGuard::unset("HF_ENDPOINT");
+        let check = embedding_model_check_from(&absent_model(), Some(true));
+        assert!(
+            matches!(check.status, HealthStatus::Pending),
+            "a reachable first fetch is expected work, not a fault: {:?}",
+            check.status
+        );
+        assert!(
+            check.detail.contains("about 523 MB") && check.detail.contains("huggingface.co"),
+            "the size and the source are both named: {}",
+            check.detail
+        );
+        assert!(
+            check
+                .manual_fix
+                .as_deref()
+                .is_some_and(|fix| fix.contains("pre-seed") && fix.contains("KIN_EMBED_MODEL_ID")),
+            "the way to avoid the download is named: {:?}",
+            check.manual_fix
+        );
+        assert!(!blocks_readiness(&check));
+    }
+
+    /// A machine without the weights that cannot reach the host fails loud and
+    /// blocks readiness, naming the egress the fetch requires.
+    #[test]
+    #[serial]
+    fn an_unreachable_model_host_fails_loud_with_its_egress_requirement() {
+        let _endpoint = EnvVarGuard::unset("HF_ENDPOINT");
+        let check = embedding_model_check_from(&absent_model(), Some(false));
+        assert!(
+            matches!(check.status, HealthStatus::Missing),
+            "a host that cannot fetch the model can never embed: {:?}",
+            check.status
+        );
+        assert!(blocks_readiness(&check), "the failure has to be loud");
+        assert!(
+            check
+                .detail
+                .contains("did not reach huggingface.co:443 within 3s"),
+            "the probe reports what it established: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("until that lands nothing embeds"),
+            "the consequence is named: {}",
+            check.detail
+        );
+    }
+
+    /// A configuration that fetches nothing is healthy and says why, so an
+    /// operator running against an endpoint is never told to expect a download.
+    #[test]
+    #[serial]
+    fn a_configuration_that_needs_no_model_is_healthy_and_says_why() {
+        let _endpoint = EnvVarGuard::unset("HF_ENDPOINT");
+        let remote = crate::embed_model::EmbedModelFetch {
+            model_id: "text-embedding-3-small".to_string(),
+            no_fetch_reason: Some(
+                "the openai provider embeds over HTTP, so no model is fetched to this machine"
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        let check = embedding_model_check_from(&remote, None);
+        assert!(matches!(check.status, HealthStatus::Healthy));
+        assert!(
+            check.detail.contains("embeds over HTTP"),
+            "{}",
+            check.detail
+        );
+        assert!(check.manual_fix.is_none());
+    }
+
+    /// A relocated `HF_HOME` is reported wherever the cache is, because seeding
+    /// the model there does not stop the loader fetching it again.
+    #[test]
+    #[serial]
+    fn a_relocated_hf_home_is_reported_beside_the_cache_the_loader_reads() {
+        let _endpoint = EnvVarGuard::unset("HF_ENDPOINT");
+        let relocated = crate::embed_model::EmbedModelFetch {
+            relocated_hf_home: Some("/mnt/models/hf".to_string()),
+            ..absent_model()
+        };
+        let check = embedding_model_check_from(&relocated, Some(true));
+        assert!(
+            check.detail.contains("HF_HOME is set to /mnt/models/hf")
+                && check.detail.contains("does not read"),
+            "the disagreement between the two roots is reported: {}",
+            check.detail
+        );
+    }
+
+    /// A model this build has never measured gets no size attributed to it.
+    ///
+    /// The default figure is the default model's. Printing it for an overridden
+    /// `KIN_EMBED_MODEL_ID` would put a number nobody measured in front of an
+    /// operator, which is worse than printing none.
+    #[test]
+    #[serial]
+    fn an_overridden_model_is_never_given_the_default_models_size() {
+        let _endpoint = EnvVarGuard::unset("HF_ENDPOINT");
+        let custom = crate::embed_model::EmbedModelFetch {
+            model_id: "acme/private-embed".to_string(),
+            expected_bytes: None,
+            ..absent_model()
+        };
+        let check = embedding_model_check_from(&custom, Some(true));
+        assert!(
+            !check.detail.contains("523"),
+            "no measured size may be attributed to an unmeasured model: {}",
+            check.detail
+        );
+        assert!(
+            check
+                .detail
+                .contains("fetches the model from huggingface.co"),
+            "the fetch is still named without a size: {}",
+            check.detail
         );
     }
 }

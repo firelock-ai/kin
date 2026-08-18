@@ -30,7 +30,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// File a daemon publishes its open transaction into, beside the endpoint
 /// record it already publishes.
-pub const TRANSACTION_FILE_NAME: &str = "daemon.transaction";
+///
+/// The record itself lives in `kin-daemon-spawn` because three processes read
+/// or write it: this daemon, the supervisor judging it, and the CLI asking
+/// whether the commit it lost a reply to is still running.
+pub use kin_daemon_spawn::{OpenTransaction, TRANSACTION_FILE_NAME};
 
 /// How often the beat thread republishes the marker and names the running phase.
 ///
@@ -44,25 +48,7 @@ const BEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// Twelve missed beats. A daemon whose OS thread has not been scheduled for a
 /// minute is wedged in a way this marker should not shield, and the reap that
 /// follows says so explicitly rather than treating the marker as absent.
-pub const BEAT_STALE_AFTER: Duration = Duration::from_secs(60);
-
-/// What one daemon publishes about the transaction it currently has open.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct OpenTransaction {
-    /// The daemon that owns this transaction. A marker naming a different pid
-    /// than the daemon being judged is a leftover and shields nobody.
-    pub pid: u32,
-    /// Which write path is open, e.g. `commit`.
-    pub operation: String,
-    /// Phase currently running, when one has been entered.
-    pub phase: Option<String>,
-    /// Wall seconds since the transaction opened.
-    pub elapsed_secs: u64,
-    /// Wall seconds since the running phase was entered.
-    pub phase_elapsed_secs: u64,
-    /// Unix seconds at the last beat. Freshness is decided against this.
-    pub beat_unix: u64,
-}
+pub const BEAT_STALE_AFTER: Duration = kin_daemon_spawn::TRANSACTION_BEAT_STALE_AFTER;
 
 /// How a reader should treat a daemon's transaction marker.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,10 +100,7 @@ pub fn transaction_path(repo_root: &Path) -> PathBuf {
 /// file, an unreadable file, a marker naming another pid — is merely the absence
 /// of proof. Callers use it to withhold a kill, never to authorize one.
 pub fn transaction_liveness(repo_root: &Path, pid: u32) -> TransactionLiveness {
-    let Ok(raw) = std::fs::read_to_string(transaction_path(repo_root)) else {
-        return TransactionLiveness::None;
-    };
-    let Ok(open) = serde_json::from_str::<OpenTransaction>(&raw) else {
+    let Some(open) = kin_daemon_spawn::read_open_transaction(&repo_root.join(".kin")) else {
         return TransactionLiveness::None;
     };
     if open.pid != pid {
@@ -199,14 +182,7 @@ fn publish_beat() {
 }
 
 fn write_marker(kin_root: &Path, record: &OpenTransaction) {
-    let Ok(body) = serde_json::to_string(record) else {
-        return;
-    };
-    let path = kin_root.join(TRANSACTION_FILE_NAME);
-    let tmp = kin_root.join(format!("{TRANSACTION_FILE_NAME}.tmp"));
-    if std::fs::write(&tmp, body).is_ok() && std::fs::rename(&tmp, &path).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
+    kin_daemon_spawn::write_open_transaction(kin_root, record);
 }
 
 /// Start the beat thread once per process.
@@ -277,7 +253,7 @@ impl Drop for TransactionGuard {
         // that transaction's proof of life now, and clearing it would blind the
         // reaper to a commit that is still running.
         if owned {
-            let _ = std::fs::remove_file(self.kin_root.join(TRANSACTION_FILE_NAME));
+            kin_daemon_spawn::clear_open_transaction(&self.kin_root);
         }
     }
 }

@@ -69,6 +69,27 @@ pub struct ContextTarget {
     pub budget_tokens: usize,
 }
 
+/// How the pack's dependency section was filled.
+///
+/// A pack whose focal has no dependency edge falls back to neighbours from the
+/// focal's own file, and the pack carries no field saying so: the tag lives in
+/// a comment inside each entry's content. `kin context` and the
+/// `get_context_pack` MCP tool report these same facts under these same names,
+/// so a reader moving between the two surfaces is not learning two
+/// vocabularies for one selection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextDependencySelection {
+    /// `dependency_edges` or `same_file_fallback`.
+    pub source: String,
+    /// Rows in `pack.dependency_signatures`.
+    pub returned: usize,
+    /// Same-file neighbours the fallback had to choose from. Zero when the
+    /// fallback did not run.
+    pub same_file_candidates: usize,
+    /// Same-file neighbours the cap or the token budget dropped.
+    pub same_file_dropped: usize,
+}
+
 /// The context response, structured half added alongside the rendered lines.
 ///
 /// `lines` stays first and required so an older client keeps decoding this, and
@@ -84,6 +105,10 @@ pub struct ContextResponse {
     /// rendering answers with guidance rather than a pack.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pack: Option<kin_model::context::ContextPack>,
+    /// Absent for the same reason as `pack`, and from a daemon that predates
+    /// the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependency_selection: Option<ContextDependencySelection>,
 }
 
 pub async fn run(
@@ -161,6 +186,7 @@ pub fn build_context_response(
             schema_version: CONTEXT_RESPONSE_SCHEMA_VERSION.to_string(),
             target: None,
             pack: None,
+            dependency_selection: None,
         });
     };
     let opts = kin_context::ContextOptions {
@@ -172,7 +198,8 @@ pub fn build_context_response(
         assistant_hint,
     };
 
-    let pack = kin_context::build_context_pack(graph, &target.id, &opts)?;
+    let (pack, selection) =
+        kin_context::build_context_pack_with_provenance(graph, &target.id, &opts)?;
 
     let mut lines = vec![
         format!("Context pack for '{}' ({:?}):", target.name, target.kind),
@@ -183,8 +210,9 @@ pub fn build_context_response(
         ),
         format!("  Focal: {} entries", pack.focal_entities.len()),
         format!(
-            "  Dependencies: {} entries",
-            pack.dependency_signatures.len()
+            "  Dependencies: {} entries{}",
+            pack.dependency_signatures.len(),
+            dependency_selection_note(&selection, pack.dependency_signatures.len())
         ),
         format!("  Transitive: {} entries", pack.transitive_deps.len()),
         format!("  Contracts: {} entries", pack.contracts.len()),
@@ -212,8 +240,35 @@ pub fn build_context_response(
             kind: format!("{:?}", target.kind),
             budget_tokens: token_budget.max_tokens(),
         }),
+        dependency_selection: Some(ContextDependencySelection {
+            source: selection.source().as_str().to_string(),
+            returned: pack.dependency_signatures.len(),
+            same_file_candidates: selection.same_file_candidates(),
+            same_file_dropped: selection.same_file_dropped(),
+        }),
         pack: Some(pack),
     })
+}
+
+/// The parenthetical after the dependency count in the human rendering.
+///
+/// Six rows on a class with twenty-four methods and no dependency edges look
+/// exactly like six dependencies, so the rendering says which selection ran and
+/// what the cap dropped rather than leaving the reader to infer it from a
+/// comment buried in each entry.
+fn dependency_selection_note(
+    selection: &kin_context::DependencySelection,
+    returned: usize,
+) -> String {
+    match selection.source() {
+        kin_context::DependencySource::DependencyEdges if returned == 0 => String::new(),
+        kin_context::DependencySource::DependencyEdges => " (dependency edges)".to_string(),
+        kin_context::DependencySource::SameFileFallback => format!(
+            " (same-file neighbors, no dependency edges; kept {} of {})",
+            selection.same_file_kept(),
+            selection.same_file_candidates()
+        ),
+    }
 }
 
 fn resolve_context_target(
@@ -438,6 +493,100 @@ mod tests {
         );
         assert!(older.pack.is_none());
         assert_eq!(older.lines.len(), 1);
+    }
+
+    fn file_entity(name: &str, kind: EntityKind, file: &str) -> Entity {
+        let mut entity = test_entity_kind(name, kind);
+        entity.file_origin = Some(kin_model::FilePathId::new(file));
+        entity
+    }
+
+    /// `kin context` on a class with no dependency edges lists same-file
+    /// neighbours under a heading that says "Dependencies", and the only tag
+    /// saying otherwise was a comment inside each entry. The rendering and the
+    /// structured half both name the selection now, in the same words the MCP
+    /// tool uses.
+    #[test]
+    fn a_same_file_fallback_says_so_in_both_halves_of_the_response() {
+        let graph = kin_db::InMemoryGraph::new();
+        let class = file_entity("NoteStore", EntityKind::Class, "src/notes.py");
+        graph.upsert_entity(&class).unwrap();
+        for member in ["NoteStore.open", "NoteStore.close", "NoteStore.stats"] {
+            graph
+                .upsert_entity(&file_entity(member, EntityKind::Method, "src/notes.py"))
+                .unwrap();
+        }
+
+        let response = build_context_response(
+            &graph,
+            &ContextRequest {
+                entity: "NoteStore".to_string(),
+                budget: "8k".to_string(),
+                assistant: None,
+            },
+        )
+        .expect("a resolved entity builds a context response");
+
+        let rendered = response.lines.join("\n");
+        assert!(
+            rendered.contains(
+                "Dependencies: 3 entries (same-file neighbors, no dependency edges; kept 3 of 3)"
+            ),
+            "the human rendering must name the fallback: {rendered}"
+        );
+        let selection = response
+            .dependency_selection
+            .as_ref()
+            .expect("a resolved pack reports how its dependencies were selected");
+        assert_eq!(selection.source, "same_file_fallback");
+        assert_eq!(selection.returned, 3);
+        assert_eq!(selection.same_file_candidates, 3);
+        assert_eq!(selection.same_file_dropped, 0);
+    }
+
+    /// The control: a focal with a real edge must be reported as edges on this
+    /// surface too, or the fallback wording says nothing.
+    #[test]
+    fn a_pack_built_from_edges_is_not_reported_as_a_fallback() {
+        use kin_model::relation::{Relation, RelationKind, RelationOrigin};
+
+        let graph = kin_db::InMemoryGraph::new();
+        let caller = file_entity("read_notes", EntityKind::Function, "src/reader.py");
+        let callee = file_entity("LinkRecord", EntityKind::Class, "src/records.py");
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&callee).unwrap();
+        graph
+            .upsert_relation(&Relation {
+                id: kin_model::ids::RelationId::new(),
+                kind: RelationKind::Calls,
+                src: kin_model::GraphNodeId::Entity(caller.id),
+                dst: kin_model::GraphNodeId::Entity(callee.id),
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+
+        let response = build_context_response(
+            &graph,
+            &ContextRequest {
+                entity: "read_notes".to_string(),
+                budget: "8k".to_string(),
+                assistant: None,
+            },
+        )
+        .expect("a resolved entity builds a context response");
+
+        let rendered = response.lines.join("\n");
+        assert!(
+            rendered.contains("Dependencies: 1 entries (dependency edges)"),
+            "an edge-built pack must say so: {rendered}"
+        );
+        let selection = response.dependency_selection.as_ref().expect("a selection");
+        assert_eq!(selection.source, "dependency_edges");
+        assert_eq!(selection.same_file_candidates, 0);
     }
 
     #[test]

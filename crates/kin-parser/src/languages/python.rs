@@ -13,6 +13,180 @@ use crate::extract::{
     ExtractedTest, ExtractedTestKind, FileImport, ImportedName, ParseOutput,
 };
 
+/// Every public name CPython's `builtins` module binds, sorted so
+/// [`is_python_builtin_name`] can binary-search it.
+///
+/// Read off `sorted(n for n in dir(builtins) if not n.startswith("_"))` on
+/// CPython 3.13, plus `WindowsError`, which the language reference documents as
+/// a built-in exception that only a Windows interpreter binds. Transcribing a
+/// remembered dozen would leave the rest of the table resolving by name, and the
+/// names left out are not the obvious ones: `format`, `id`, `filter`, `next` and
+/// `exit` all read like ordinary repository functions.
+///
+/// This is a complete list rather than a heuristic because Python makes it one.
+/// A module-level name is reachable inside a module only when that module
+/// defines it or imports it, so a bare call this file does neither for is a call
+/// into the interpreter, whatever a same-named symbol elsewhere in the
+/// repository looks like.
+pub const PYTHON_BUILTIN_NAMES: &[&str] = &[
+    "ArithmeticError",
+    "AssertionError",
+    "AttributeError",
+    "BaseException",
+    "BaseExceptionGroup",
+    "BlockingIOError",
+    "BrokenPipeError",
+    "BufferError",
+    "BytesWarning",
+    "ChildProcessError",
+    "ConnectionAbortedError",
+    "ConnectionError",
+    "ConnectionRefusedError",
+    "ConnectionResetError",
+    "DeprecationWarning",
+    "EOFError",
+    "Ellipsis",
+    "EncodingWarning",
+    "EnvironmentError",
+    "Exception",
+    "ExceptionGroup",
+    "False",
+    "FileExistsError",
+    "FileNotFoundError",
+    "FloatingPointError",
+    "FutureWarning",
+    "GeneratorExit",
+    "IOError",
+    "ImportError",
+    "ImportWarning",
+    "IndentationError",
+    "IndexError",
+    "InterruptedError",
+    "IsADirectoryError",
+    "KeyError",
+    "KeyboardInterrupt",
+    "LookupError",
+    "MemoryError",
+    "ModuleNotFoundError",
+    "NameError",
+    "None",
+    "NotADirectoryError",
+    "NotImplemented",
+    "NotImplementedError",
+    "OSError",
+    "OverflowError",
+    "PendingDeprecationWarning",
+    "PermissionError",
+    "ProcessLookupError",
+    "PythonFinalizationError",
+    "RecursionError",
+    "ReferenceError",
+    "ResourceWarning",
+    "RuntimeError",
+    "RuntimeWarning",
+    "StopAsyncIteration",
+    "StopIteration",
+    "SyntaxError",
+    "SyntaxWarning",
+    "SystemError",
+    "SystemExit",
+    "TabError",
+    "TimeoutError",
+    "True",
+    "TypeError",
+    "UnboundLocalError",
+    "UnicodeDecodeError",
+    "UnicodeEncodeError",
+    "UnicodeError",
+    "UnicodeTranslateError",
+    "UnicodeWarning",
+    "UserWarning",
+    "ValueError",
+    "Warning",
+    "WindowsError",
+    "ZeroDivisionError",
+    "abs",
+    "aiter",
+    "all",
+    "anext",
+    "any",
+    "ascii",
+    "bin",
+    "bool",
+    "breakpoint",
+    "bytearray",
+    "bytes",
+    "callable",
+    "chr",
+    "classmethod",
+    "compile",
+    "complex",
+    "copyright",
+    "credits",
+    "delattr",
+    "dict",
+    "dir",
+    "divmod",
+    "enumerate",
+    "eval",
+    "exec",
+    "exit",
+    "filter",
+    "float",
+    "format",
+    "frozenset",
+    "getattr",
+    "globals",
+    "hasattr",
+    "hash",
+    "help",
+    "hex",
+    "id",
+    "input",
+    "int",
+    "isinstance",
+    "issubclass",
+    "iter",
+    "len",
+    "license",
+    "list",
+    "locals",
+    "map",
+    "max",
+    "memoryview",
+    "min",
+    "next",
+    "object",
+    "oct",
+    "open",
+    "ord",
+    "pow",
+    "print",
+    "property",
+    "quit",
+    "range",
+    "repr",
+    "reversed",
+    "round",
+    "set",
+    "setattr",
+    "slice",
+    "sorted",
+    "staticmethod",
+    "str",
+    "sum",
+    "super",
+    "tuple",
+    "type",
+    "vars",
+    "zip",
+];
+
+/// Whether a bare Python name is bound by the interpreter itself.
+pub fn is_python_builtin_name(name: &str) -> bool {
+    PYTHON_BUILTIN_NAMES.binary_search(&name).is_ok()
+}
+
 pub struct PythonAdapter;
 
 impl LanguageAdapter for PythonAdapter {
@@ -420,27 +594,38 @@ fn python_module_identity(file_id: &FilePathId) -> (String, bool) {
     }
 }
 
-/// A symbol read as a VALUE rather than invoked, recorded during the walk.
+/// A symbol named without being invoked, recorded during the walk.
+///
+/// Two positions produce one of these: a VALUE read (`set_defaults(func=cmd_ingest)`)
+/// and a TYPE annotation (`def upsert(note: ParsedNote)`). Both name a symbol
+/// the enclosing entity depends on, both must be found by `find_references`,
+/// and both bind by the same rule, so they share one record and one emit path.
 ///
 /// `member` is set when the reference was written as an attribute access
-/// (`TAG_RE.pattern`), because whether that names the root or the leaf depends
-/// on how the root was bound, and the file's imports are not known until the
-/// walk finishes. Candidates are filtered rather than emitted directly because
-/// a reference may precede its definition in the file.
+/// (`TAG_RE.pattern`, `typing.Optional`), because whether that names the root or
+/// the leaf depends on how the root was bound, and the file's imports are not
+/// known until the walk finishes. Candidates are filtered rather than emitted
+/// directly because a reference may precede its definition in the file.
 struct PythonValueRef {
     src_name: String,
     root: String,
     member: Option<String>,
 }
 
-/// Collect the value references made by one `function_definition`, sourced from
-/// the entity `context_name`.
+/// Collect the references made by one `function_definition`, sourced from the
+/// entity `context_name`.
 ///
-/// Parameter defaults are walked because `def wire(handler=cmd_ingest)` reads
-/// `cmd_ingest`; parameter names and annotations are not, since a name being
-/// bound is not a name being read and a type position is a different edge
-/// class. Names the function binds locally shadow the module scope in Python,
-/// so a local called `parse` is not a read of a module-level `parse`.
+/// Three positions in a signature name a symbol. Parameter defaults read one
+/// (`def wire(handler=cmd_ingest)`), parameter annotations name a type
+/// (`def upsert(note: ParsedNote)`), and the return annotation names another
+/// (`-> ParsedNote`). Parameter NAMES are still skipped, because a name being
+/// bound is not a name being read.
+///
+/// Names the function binds locally shadow the module scope in Python, so a
+/// local called `parse` is not a read of a module-level `parse`. Annotations
+/// carry the same shadow set: it costs no recall on the CamelCase-type,
+/// snake_case-local convention Python code follows, and it keeps a local from
+/// binding to an unrelated module-level entity of the same name.
 fn extract_value_refs_from_definition(
     node: &tree_sitter::Node,
     source: &[u8],
@@ -451,6 +636,12 @@ fn extract_value_refs_from_definition(
     if let Some(params) = node.child_by_field_name("parameters") {
         let mut cursor = params.walk();
         for param in params.named_children(&mut cursor) {
+            // `typed_parameter` also carries `*args: T` and `**kw: T`, whose
+            // name sits in a splat pattern while the annotation stays on the
+            // same `type` field.
+            if let Some(annotation) = param.child_by_field_name("type") {
+                collect_python_type_refs(&annotation, source, context_name, &shadowed, out);
+            }
             if matches!(
                 param.kind(),
                 "default_parameter" | "typed_default_parameter"
@@ -460,6 +651,9 @@ fn extract_value_refs_from_definition(
                 }
             }
         }
+    }
+    if let Some(return_type) = node.child_by_field_name("return_type") {
+        collect_python_type_refs(&return_type, source, context_name, &shadowed, out);
     }
     if let Some(body) = node.child_by_field_name("body") {
         collect_python_value_refs(&body, source, context_name, &shadowed, out);
@@ -571,11 +765,17 @@ fn collect_python_binding_targets(
 /// that are not reads.
 ///
 /// Pruned: a call's callee identifier (already a `Calls` edge), an attribute's
-/// `.leaf` selector, an assignment or loop target, a keyword argument's name, a
-/// type annotation, and an import statement. Kept, because each is a genuine
-/// read of the named symbol: a call argument (`set_defaults(func=cmd_ingest)`),
-/// an assignment right-hand side, a collection literal element, a returned
-/// expression, and the receiver of an attribute access (`TAG_RE.pattern`).
+/// `.leaf` selector, an assignment or loop target, a keyword argument's name,
+/// and an import statement. Kept, because each is a genuine read of the named
+/// symbol: a call argument (`set_defaults(func=cmd_ingest)`), an assignment
+/// right-hand side, a collection literal element, a returned expression, and
+/// the receiver of an attribute access (`TAG_RE.pattern`).
+///
+/// A `type` node is not walked as a value, because the names inside an
+/// annotation are not read at this position. It is handed to
+/// [`collect_python_type_refs`] instead, which is why an annotated assignment
+/// (`links: Tuple[WikiLink, ...] = ()`) contributes both its right-hand side
+/// and the types its annotation names.
 fn collect_python_value_refs(
     node: &tree_sitter::Node,
     source: &[u8],
@@ -647,6 +847,13 @@ fn collect_python_value_refs(
             }
         }
         "assignment" | "augmented_assignment" => {
+            // `links: Tuple[WikiLink, ...] = ()` in a class body, a module-scope
+            // `TOP: ParsedNote = None`, and a body-local `note: ParsedNote = x`
+            // all wear this shape, so one arm covers every annotated binding
+            // outside a signature.
+            if let Some(annotation) = node.child_by_field_name("type") {
+                collect_python_type_refs(&annotation, source, context_name, shadowed, out);
+            }
             if let Some(right) = node.child_by_field_name("right") {
                 collect_python_value_refs(&right, source, context_name, shadowed, out);
             }
@@ -675,14 +882,119 @@ fn collect_python_value_refs(
     }
 }
 
-/// Turn collected value reads into `References` edges.
+/// Collect the symbols named inside one type annotation, sourced from the
+/// entity `context_name`.
+///
+/// A type position is a use. `def upsert(note: ParsedNote) -> int` depends on
+/// `ParsedNote` exactly as a call depends on its callee, and a rename that
+/// cannot see it leaves the old name in the signature. Before this, the Python
+/// adapter emitted no edge of any class for an annotation, so a class used only
+/// as a parameter type, a return type or a dataclass field type reported zero
+/// inbound references.
+///
+/// The walk descends through the wrappers tree-sitter builds a type expression
+/// from rather than matching each one, so `Optional[Note]`,
+/// `Tuple[WikiLink, ...]`, `dict[str, Note]`, `Note | None`,
+/// `Callable[[Note], int]` and `typing.List[Note]` each reach every name they
+/// carry. `str`, `int` and other builtins are collected here and dropped by
+/// [`emit_python_value_references`], which binds only what the file defines or
+/// imports.
+///
+/// A quoted forward reference (`x: "Note"`) is read only when the quotes hold a
+/// bare identifier. A quoted expression is left alone rather than re-parsed as
+/// a type by hand.
+fn collect_python_type_refs(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    context_name: &str,
+    shadowed: &std::collections::HashSet<String>,
+    out: &mut Vec<PythonValueRef>,
+) {
+    match node.kind() {
+        "identifier" => {
+            if let Ok(name) = node.utf8_text(source) {
+                if !name.is_empty() && !shadowed.contains(name) {
+                    out.push(PythonValueRef {
+                        src_name: context_name.to_string(),
+                        root: name.to_string(),
+                        member: None,
+                    });
+                }
+            }
+        }
+        // `typing.Optional` in a type position binds exactly as `TAG_RE.pattern`
+        // does in a value position: which half names the symbol depends on how
+        // the root was bound, so both are carried to the emit step.
+        "attribute" => {
+            let object = node.child_by_field_name("object");
+            let leaf = node
+                .child_by_field_name("attribute")
+                .and_then(|n| n.utf8_text(source).ok());
+            match (object, leaf) {
+                (Some(object), Some(leaf)) if object.kind() == "identifier" && !leaf.is_empty() => {
+                    if let Ok(root) = object.utf8_text(source) {
+                        if !root.is_empty() && !shadowed.contains(root) {
+                            out.push(PythonValueRef {
+                                src_name: context_name.to_string(),
+                                root: root.to_string(),
+                                member: Some(leaf.to_string()),
+                            });
+                        }
+                    }
+                }
+                (Some(object), _) => {
+                    collect_python_type_refs(&object, source, context_name, shadowed, out)
+                }
+                _ => {}
+            }
+        }
+        "string" => {
+            let mut cursor = node.walk();
+            let mut contents = node
+                .children(&mut cursor)
+                .filter(|child| child.kind() == "string_content");
+            if let (Some(content), None) = (contents.next(), contents.next()) {
+                if let Ok(text) = content.utf8_text(source) {
+                    if is_python_identifier(text) && !shadowed.contains(text) {
+                        out.push(PythonValueRef {
+                            src_name: context_name.to_string(),
+                            root: text.to_string(),
+                            member: None,
+                        });
+                    }
+                }
+            }
+        }
+        _ => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                collect_python_type_refs(&child, source, context_name, shadowed, out);
+            }
+        }
+    }
+}
+
+/// Whether `text` is a single Python identifier, used to decide whether a
+/// quoted forward reference names one symbol or holds an expression.
+fn is_python_identifier(text: &str) -> bool {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) if first == '_' || first.is_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|ch| ch == '_' || ch.is_alphanumeric())
+}
+
+/// Turn collected value reads and type annotations into `References` edges.
 ///
 /// Only a name this file DEFINES or IMPORTS may bind, which in Python is the
 /// complete set: a module-level symbol is reachable from a module only when it
-/// is defined there or imported into it, and anything else in a value position
-/// is a local, a parameter, or a builtin. Filtering here rather than in the
-/// linker is what keeps a local named `config` from binding by name alone to
-/// some unrelated module-level `config` in another file.
+/// is defined there or imported into it, and anything else in a value or type
+/// position is a local, a parameter, or a builtin. Filtering here rather than
+/// in the linker is what keeps a local named `config` from binding by name
+/// alone to some unrelated module-level `config` in another file, and it is
+/// what stops an annotation naming `str` or `Optional` from reaching a
+/// same-named entity in an unimported module.
 ///
 /// `RelationKind::References` is the existing kind for a non-call reference,
 /// already emitted by the Go, C++, C# and Ruby adapters and already read by the
@@ -1135,6 +1447,68 @@ fn extract_py_from_import(node: &tree_sitter::Node, source: &[u8]) -> Option<Fil
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`is_python_builtin_name`] binary-searches the table, which is only
+    /// correct while the table is sorted and holds no duplicate. A hand edit
+    /// that breaks either would make the lookup miss names silently, which
+    /// reads exactly like a name the interpreter does not bind.
+    #[test]
+    fn the_builtin_table_is_sorted_deduped_and_searchable() {
+        let mut sorted = PYTHON_BUILTIN_NAMES.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.as_slice(),
+            PYTHON_BUILTIN_NAMES,
+            "the builtins table must stay sorted and deduped for binary search"
+        );
+        for name in PYTHON_BUILTIN_NAMES {
+            assert!(
+                is_python_builtin_name(name),
+                "every table entry must be findable, missed {name}"
+            );
+        }
+    }
+
+    /// The table is the full `dir(builtins)` surface, not the handful of names
+    /// a reader remembers. The ones checked here are the ones a call-resolution
+    /// gate needs and a hand-typed list omits.
+    #[test]
+    fn the_builtin_table_covers_the_names_a_hand_typed_list_would_miss() {
+        for name in [
+            "open",
+            "print",
+            "len",
+            "range",
+            "str",
+            "list",
+            "format",
+            "id",
+            "filter",
+            "next",
+            "exit",
+            "vars",
+            "aiter",
+            "ValueError",
+            "StopIteration",
+            "NotImplemented",
+        ] {
+            assert!(is_python_builtin_name(name), "{name} must be a builtin");
+        }
+        for name in [
+            "NoteStore",
+            "parse_file",
+            "open_store",
+            "ingest_directory",
+            "os",
+            "",
+        ] {
+            assert!(
+                !is_python_builtin_name(name),
+                "{name} must not be read as a builtin"
+            );
+        }
+    }
 
     /// Depth-first search for the first `call` node in a parsed tree.
     fn first_call_node<'a>(node: tree_sitter::Node<'a>) -> Option<tree_sitter::Node<'a>> {
@@ -1766,6 +2140,172 @@ mod tests {
                 .iter()
                 .any(crate::extract::is_call_extraction_incomplete_marker),
             "reading a constant is not an unrepresented call"
+        );
+    }
+
+    /// Every `(src, dst)` the adapter emits as a `References` edge for `src`,
+    /// sorted so an assertion reads as a set rather than a walk order.
+    fn references_in(src: &str) -> Vec<(String, String)> {
+        let adapter = PythonAdapter;
+        let bytes = src.as_bytes();
+        let tree = adapter.parse(bytes).expect("fixture parses");
+        let output = adapter
+            .extract(&tree, bytes, &FilePathId::new("mod.py"))
+            .expect("fixture extracts");
+        let mut edges: Vec<(String, String)> = output
+            .relations
+            .iter()
+            .filter(|rel| rel.kind == kin_model::RelationKind::References)
+            .map(|rel| (rel.src_name.clone(), rel.dst_name.clone()))
+            .collect();
+        edges.sort();
+        edges
+    }
+
+    #[test]
+    fn a_parameter_annotation_references_the_imported_class() {
+        // The reported shape. `ParsedNote` is named only as a parameter type,
+        // so before annotations carried an edge this file reported nothing and
+        // a rename left `upsert_note` holding the old name.
+        let edges = references_in(
+            "from parsing import ParsedNote\n\n\nclass NoteStore:\n    def upsert_note(self, note: ParsedNote):\n        return 1\n",
+        );
+        assert!(
+            edges.contains(&(
+                "NoteStore.upsert_note".to_string(),
+                "ParsedNote".to_string()
+            )),
+            "a parameter annotation must reference its class, got {edges:?}"
+        );
+    }
+
+    #[test]
+    fn a_return_annotation_references_the_imported_class() {
+        let edges = references_in(
+            "from parsing import ParsedNote\n\n\ndef load(path) -> ParsedNote:\n    return parse(path)\n",
+        );
+        assert!(
+            edges.contains(&("load".to_string(), "ParsedNote".to_string())),
+            "a return annotation must reference its class, got {edges:?}"
+        );
+    }
+
+    #[test]
+    fn a_dataclass_field_annotation_references_its_element_type() {
+        // `links: Tuple[WikiLink, ...]` is the type `ParsedNote` is built from.
+        // The subscripted generic must be descended into: the edge belongs to
+        // `WikiLink`, not to `Tuple`.
+        let edges = references_in(
+            "from typing import Tuple\nfrom parsing import WikiLink\n\n\nclass ParsedNote:\n    links: Tuple[WikiLink, ...] = ()\n",
+        );
+        assert!(
+            edges.contains(&("ParsedNote".to_string(), "WikiLink".to_string())),
+            "a dataclass field type must reference its element type, got {edges:?}"
+        );
+    }
+
+    #[test]
+    fn every_annotation_wrapper_reaches_the_name_it_carries() {
+        // One fixture per wrapper tree-sitter builds a type expression from, so
+        // a grammar shape that stops the descent is a named failure rather than
+        // a quiet miss somewhere in a larger fixture.
+        let cases: [(&str, &str); 6] = [
+            ("Optional[Note]", "Optional[Note]"),
+            ("bare", "Note"),
+            ("builtin generic", "list[Note]"),
+            ("union", "Note | None"),
+            ("nested generic", "dict[str, list[Note]]"),
+            ("callable", "Callable[[Note], int]"),
+        ];
+        for (label, annotation) in cases {
+            let source = format!(
+                "from typing import Callable, Optional\nfrom parsing import Note\n\n\ndef take(value: {annotation}):\n    return value\n"
+            );
+            let edges = references_in(&source);
+            assert!(
+                edges.contains(&("take".to_string(), "Note".to_string())),
+                "`{label}` annotation `{annotation}` must reach Note, got {edges:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dotted_annotation_keeps_the_module_qualified_form() {
+        // `import parsing` binds the module, so `parsing.Note` names a member of
+        // it. Reducing that to the bare leaf would guess which module a
+        // same-named class came from, which is the linker's namespace tier's job
+        // and only possible with the dotted form.
+        let edges =
+            references_in("import parsing\n\n\ndef take(value: parsing.Note):\n    return value\n");
+        assert!(
+            edges.contains(&("take".to_string(), "parsing.Note".to_string())),
+            "a dotted annotation must keep its module-qualified form, got {edges:?}"
+        );
+    }
+
+    #[test]
+    fn a_quoted_forward_reference_references_the_named_class() {
+        let edges = references_in(
+            "from parsing import Note\n\n\nclass Holder:\n    note: \"Note\" = None\n",
+        );
+        assert!(
+            edges.contains(&("Holder".to_string(), "Note".to_string())),
+            "a quoted forward reference must reference its class, got {edges:?}"
+        );
+    }
+
+    #[test]
+    fn a_variadic_parameter_annotation_references_its_class() {
+        let edges = references_in(
+            "from parsing import Note\n\n\ndef take(*args: Note, **kw: Note):\n    return args\n",
+        );
+        assert!(
+            edges.contains(&("take".to_string(), "Note".to_string())),
+            "`*args: Note` must reference its class, got {edges:?}"
+        );
+    }
+
+    #[test]
+    fn an_annotation_naming_a_builtin_or_an_unimported_name_emits_nothing() {
+        // The precision half, and the reason the emit filter runs on annotations
+        // rather than letting the linker sort it out: `str` and `int` are
+        // builtins, and `Ghost` is defined in no file this one can reach, so a
+        // blind exact-name tier would bind them to whatever entity elsewhere
+        // happens to carry that name.
+        let edges = references_in(
+            "def take(name: str, count: int, other: Ghost) -> bool:\n    return True\n",
+        );
+        assert!(
+            edges.is_empty(),
+            "a builtin or unimported annotation must emit no reference, got {edges:?}"
+        );
+    }
+
+    #[test]
+    fn an_annotation_naming_a_local_binding_emits_nothing() {
+        // A name the function binds itself is not a module-level symbol, so it
+        // must not reach one that happens to share its name.
+        let edges = references_in(
+            "class Note:\n    pass\n\n\ndef take(Note):\n    value: Note = 1\n    return value\n",
+        );
+        assert!(
+            !edges.contains(&("take".to_string(), "Note".to_string())),
+            "a locally bound annotation name must emit no reference, got {edges:?}"
+        );
+    }
+
+    #[test]
+    fn a_parameter_name_is_still_not_a_reference() {
+        // Annotations became references; parameter NAMES did not. A parameter
+        // called `note` is a binding, and binding a name is not reading one.
+        // Two independent rules hold this, and it takes breaking both to make
+        // this assertion fail: only the `type` field of a parameter is walked,
+        // and a parameter name is in the shadow set anyway.
+        let edges =
+            references_in("def note():\n    return 1\n\n\ndef take(note: int):\n    return note\n");
+        assert!(
+            !edges.contains(&("take".to_string(), "note".to_string())),
+            "a parameter name must not reference a same-named function, got {edges:?}"
         );
     }
 }

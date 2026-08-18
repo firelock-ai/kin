@@ -41,7 +41,9 @@
 //! [`edge_coverage_gap`] is the gate that reads the observation
 //! [`crate::edge_coverage`] publishes into the payload. A tool that declares a
 //! dependency and publishes no observation is inconclusive by construction, so
-//! authority cannot be inherited by a tool that has not earned it.
+//! authority cannot be inherited by a tool that has not earned it. Which classes
+//! decide is [`load_bearing_classes`]: a present sibling class is not coverage
+//! for the class a focal is actually reached through.
 //!
 //! Gaps accumulate through [`push_gap`] in limiting-factor-first order rather
 //! than overwriting one another. Order matters as much as the verdict: a correct
@@ -231,16 +233,64 @@ fn reference_classes() -> Vec<String> {
     ]
 }
 
-/// Why the graph cannot certify this absence over the edge classes the query
-/// reads, or `None` when at least one requested class is demonstrably present.
+/// The requested classes an absence claim has to be able to SEE before it can
+/// be certified, as opposed to the ones whose absence is ordinary on a healthy
+/// graph and therefore proves nothing.
 ///
-/// One observed cross-file edge of a requested class is the bar. It is
-/// deliberately not "every requested class is present": `references` edges are
-/// legitimately rare, so demanding all of them would report every absence on
-/// every real graph as inconclusive, which is the failure mode opposite to
-/// FIR-2353 and just as useless. One witness proves the extractor and linker do
-/// produce cross-file edges of that class for this language, which is the fact
-/// an absence claim was silently assuming.
+/// Only `calls` qualifies, and the reason is measured rather than assumed. Kin's
+/// linker resolves an import statement to a cross-file `Calls` edge between the
+/// importing entity and the imported one, plus an artifact-level import edge that
+/// entity queries never reach. It mints no entity-level `Imports` edge at all: a
+/// converted Python repository whose imports resolve cleanly reports
+/// `Entity-to-entity relation kinds: Calls, Contains` and `imports 0/2 (0%)` on
+/// `kin graph status`, with `Cross-file entity relations: 4 of 9`. So `imports`
+/// reads `absent` on every language including the ones that work, and requiring
+/// it would report every absence on every real graph as inconclusive, which is
+/// the failure mode opposite to FIR-2353 and no more useful. `references` is the
+/// same story for a different reason: it needs a resolved program from a language
+/// server and is legitimately absent wherever one has not run.
+///
+/// What stops a JavaScript `module.exports` being certified is therefore not a
+/// missing `imports` witness, which Python lacks identically, but the
+/// enrichment gate below: this build wires no language-server adapter for
+/// JavaScript, so no reference edge can exist for it at any coverage. Both absent
+/// classes are still disclosed through [`edge_coverage_degradation_labels`], so a
+/// reader sees what the verdict rests on either way.
+///
+/// A query that asked for no load-bearing class falls back to the classes it did
+/// ask for, so an `imports`-only or `references`-only query is still gated on
+/// what it actually read rather than on nothing.
+fn load_bearing_classes(requested: &[String]) -> Vec<String> {
+    let load_bearing: Vec<String> = requested
+        .iter()
+        .filter(|class| class.as_str() == "calls")
+        .cloned()
+        .collect();
+    if load_bearing.is_empty() {
+        requested.to_vec()
+    } else {
+        load_bearing
+    }
+}
+
+/// Why the graph cannot certify this absence over the edge classes the query
+/// reads, or `None` when every class the focal could plausibly be reached
+/// through is demonstrably present.
+///
+/// Two gates, and an answer has to clear both. Every load-bearing requested class
+/// must be observed present ([`load_bearing_classes`] says which, and why the set
+/// is narrower than it looks), and the language must be one this build can
+/// produce reference edges for at all.
+///
+/// The second gate is what FIR-2404 added. A witness proves the extractor links
+/// SOME class across files for the language; it never proved the language's
+/// reference surface is producible in the first place. On JavaScript, where
+/// same-name bare calls resolve and this build wires no language-server adapter,
+/// a present `calls` class certified an absence over `createApplication`,
+/// express's `module.exports`, which every consuming file reaches through a
+/// `require` this graph cannot represent. The measured classes could not separate
+/// that from a healthy Python graph, because both report `imports: absent`; the
+/// adapter fact separates them and is true independent of coverage.
 ///
 /// A payload carrying no observation at all is the unknown case, not the healthy
 /// one. That is the reading the module's honesty contract already takes for
@@ -250,14 +300,18 @@ fn reference_classes() -> Vec<String> {
 ///
 /// The extraction side grew a richer statement of the same fact under FIR-2354:
 /// `kin_core::cross_file_coverage::CrossFileCoverage`, whole-graph counts plus a
-/// per-language entry carrying `reference_enrichment`, which knows something this
-/// gate cannot observe from the graph alone (a language whose server is not
-/// installed). It reaches the CLI surfaces rather than any retrieval payload
-/// today. When a payload carries it, this gate should prefer it, mapping zero
-/// cross-file entity relations to `absent` for every class, a language's zero to
-/// `absent` for that language, and an unavailable `reference_enrichment` to
-/// `unknown`; [`crate::edge_coverage`] can then be retired, since it is called
-/// from exactly three payload builders.
+/// per-language entry carrying `reference_enrichment`, which knows something a
+/// witness scan cannot observe from the graph alone. Half of that now reaches
+/// this gate: [`crate::edge_coverage`] publishes `reference_enrichment`, and the
+/// build half of it (a language this build wires no adapter for, so its reference
+/// edges are unproducible rather than unobserved) is read below. The host half (a
+/// wired adapter whose server is not installed) still reaches the CLI surfaces
+/// only, because probing it costs a filesystem lookup per query, so it publishes
+/// as `unknown` and gates nothing. When a payload carries the whole-graph object,
+/// this gate should prefer it, mapping zero cross-file entity relations to
+/// `absent` for every class and a language's zero to `absent` for that language;
+/// [`crate::edge_coverage`] can then be retired, since it is called from exactly
+/// three payload builders.
 fn edge_coverage_gap(tool: &str, payload: &Value) -> Option<String> {
     let requested = absence_cross_file_classes(tool, payload);
     if requested.is_empty() {
@@ -281,31 +335,121 @@ fn edge_coverage_gap(tool: &str, payload: &Value) -> Option<String> {
         .filter(|language| !language.trim().is_empty())
         .unwrap_or("an unreported language");
     let states = coverage.get("classes").and_then(Value::as_object);
-    let state_for = |class: &str| -> &str {
-        states
-            .and_then(|states| states.get(class))
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-    };
 
-    if requested.iter().any(|class| state_for(class) == "present") {
-        return None;
-    }
-    if requested.iter().any(|class| state_for(class) == "unknown")
+    let required = load_bearing_classes(&requested);
+    let absent = classes_in_state(&required, states, "absent");
+    let unknown = classes_in_state(&required, states, "unknown");
+    let present = classes_in_state(&requested, states, "present");
+
+    let mut gaps: Vec<String> = Vec::new();
+    if !absent.is_empty() {
+        let missing = absent.join(", ");
+        // Naming what IS present matters as much as naming what is missing. The
+        // reader's next question after "no imports edges" is "then what did the
+        // 258 entities this scan examined prove", and leaving that unanswered is
+        // how a present sibling class came to look like coverage for the absent
+        // one in the first place.
+        let observed = if present.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " (cross-file {} edges are present and do not stand in for {missing}: an entity \
+                 other files reach only through {missing} is invisible to a graph holding none)",
+                present.join(", ")
+            )
+        };
+        gaps.push(format!(
+            "cross_file_edges_absent: the graph holds no cross-file {missing} edges for \
+             {language}{observed}, so a use that reaches the target through {missing} could not \
+             have been found and an empty result says nothing about whether the target is used; \
+             the gap is in extraction/enrichment for that language, not in the code"
+        ));
+    } else if !unknown.is_empty()
         || coverage.get("budget_exhausted").and_then(Value::as_bool) == Some(true)
     {
-        return Some(format!(
+        gaps.push(format!(
             "edge_coverage_unknown: whether the graph holds cross-file {named} edges for \
              {language} could not be established, so an empty result may mean the query had no \
              edges to answer from rather than that the target is unused"
         ));
     }
-    Some(format!(
-        "cross_file_edges_absent: the graph holds no cross-file {named} edges for {language}, so \
-         no reference from another file could have been found and an empty result says nothing \
-         about whether the target is used; the gap is in extraction/enrichment for that language, \
-         not in the code"
-    ))
+
+    // Independent of what the scan measured. A class that cannot be produced at
+    // all is not a class that happened to come back empty, and no amount of
+    // scanning or re-indexing will ever move it, so an absence over a language
+    // this build cannot enrich is never certifiable however healthy its calls and
+    // imports look.
+    if coverage.get("reference_enrichment").and_then(Value::as_str) == Some("unsupported") {
+        gaps.push(format!(
+            "reference_enrichment_unsupported: this build wires no language-server adapter for \
+             {language}, so cross-file reference and override edges cannot exist for it at all, \
+             and an empty result cannot separate a symbol nothing uses from one this graph could \
+             never have linked"
+        ));
+    }
+
+    (!gaps.is_empty()).then(|| gaps.join("; "))
+}
+
+/// One class's observed state, defaulting to `unknown` for a class the
+/// observation does not mention. An unmentioned class is one nothing was
+/// established about, which is the conservative reading and the one the module's
+/// honesty contract already takes for unknown coverage.
+fn class_state<'a>(states: Option<&'a Map<String, Value>>, class: &str) -> &'a str {
+    states
+        .and_then(|states| states.get(class))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+}
+
+/// The classes among `classes` observed in `state`, in the order the query asked
+/// for them.
+fn classes_in_state<'a>(
+    classes: &'a [String],
+    states: Option<&Map<String, Value>>,
+    state: &str,
+) -> Vec<&'a str> {
+    classes
+        .iter()
+        .filter(|class| class_state(states, class) == state)
+        .map(String::as_str)
+        .collect()
+}
+
+/// Every coverage shortfall this answer's own `edge_coverage` names, as
+/// `component:reason` labels for [`degraded_signals`].
+///
+/// The verdict consumes the load-bearing classes; this consumes all of them. A
+/// negative reading "no degraded signals" beside an `edge_coverage` naming two
+/// absent classes is the contradiction the whole module exists to prevent, and
+/// it does not stop being one because the classes that were absent happened not
+/// to be the ones that decided the verdict. An authoritative absence with
+/// `edge_coverage:references_absent` beside it is saying something exact: the
+/// graph links calls and imports across files, it holds no reference edges, and
+/// the claim rests on the first fact rather than the second.
+fn edge_coverage_degradation_labels(tool: &str, payload: &Value) -> Vec<String> {
+    let requested = absence_cross_file_classes(tool, payload);
+    if requested.is_empty() {
+        return Vec::new();
+    }
+    let Some(coverage) = payload
+        .get(crate::edge_coverage::EDGE_COVERAGE_KEY)
+        .and_then(Value::as_object)
+    else {
+        return vec!["edge_coverage:unreported".to_string()];
+    };
+    let states = coverage.get("classes").and_then(Value::as_object);
+    let mut labels: Vec<String> = requested
+        .iter()
+        .filter_map(|class| match class_state(states, class) {
+            "present" => None,
+            state => Some(format!("edge_coverage:{class}_{state}")),
+        })
+        .collect();
+    if coverage.get("reference_enrichment").and_then(Value::as_str) == Some("unsupported") {
+        labels.push("edge_coverage:reference_enrichment_unsupported".to_string());
+    }
+    labels
 }
 
 /// Add one gap to the running verdict: the reason a gap names replaces a
@@ -627,16 +771,24 @@ fn payload_degradation_labels(payload: &Value) -> Vec<String> {
 }
 
 /// Every degraded signal that bears on this answer: the daemon's own flags
-/// first, then the ones the payload reported about this query, deduplicated and
-/// in a stable order.
-fn degraded_signals(payload: &Value, envelope: &Envelope) -> Vec<String> {
+/// first, then the ones the payload reported about this query, then the coverage
+/// shortfalls its own `edge_coverage` names, deduplicated and in a stable order.
+///
+/// The last group is why this takes the tool: which edge classes an answer
+/// depends on is a per-tool fact, and a signal array that omitted them let a
+/// negative say "no degraded signals" beside an observation naming two absent
+/// classes (FIR-2404).
+fn degraded_signals(tool: &str, payload: &Value, envelope: &Envelope) -> Vec<String> {
     let mut labels: Vec<String> = envelope
         .degraded
         .active_labels()
         .into_iter()
         .map(str::to_string)
         .collect();
-    for label in payload_degradation_labels(payload) {
+    for label in payload_degradation_labels(payload)
+        .into_iter()
+        .chain(edge_coverage_degradation_labels(tool, payload))
+    {
         if !labels.contains(&label) {
             labels.push(label);
         }
@@ -1112,7 +1264,7 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
         absence_advice_consequence(spec.always, trustworthy, &trust_reason)
     };
 
-    let degraded_signals = degraded_signals(payload, envelope);
+    let degraded_signals = degraded_signals(tool, payload, envelope);
 
     let mut negative = Map::new();
     negative.insert("kind".to_string(), json!(kind));
@@ -1323,6 +1475,12 @@ mod tests {
     /// no evidence that the query could have found anything, which is the whole
     /// FIR-2353 failure, so every fixture asserting authoritative absence carries
     /// it.
+    ///
+    /// The absent `imports` is not a weakness of the fixture, it is what a real
+    /// graph reports: Kin resolves an import to a cross-file `Calls` edge and an
+    /// artifact-level edge, and mints no entity-level `Imports` edge for any
+    /// language. A converted Python repository whose imports resolve cleanly
+    /// reports exactly this shape.
     fn cross_file_edges_observed() -> Value {
         json!({
             "scope": "language",
@@ -1330,6 +1488,7 @@ mod tests {
             "requested_classes": ["calls", "imports", "references"],
             "classes": { "calls": "present", "imports": "absent", "references": "absent" },
             "cross_file_classes": ["calls"],
+            "reference_enrichment": "unknown",
             "budget_exhausted": false,
             "entities_examined": 2,
         })
@@ -1783,13 +1942,133 @@ mod tests {
         assert_eq!(
             negative["safe_to_conclude_absent"],
             json!(true),
-            "one observed cross-file witness is enough to earn authority"
+            "the class this graph resolves cross-file uses into is witnessed"
         );
         assert_eq!(negative["trust"], json!("authoritative"));
         assert!(negative["trust_reason"]
             .as_str()
             .unwrap()
             .contains("structural_authoritative"));
+    }
+
+    /// FIR-2404, the reproduction: express's `createApplication`, verbatim from
+    /// the payload the isolated stranger run captured on the v0.5.38 candidate.
+    /// Same-name bare calls resolve on JavaScript so `calls` reads present, while
+    /// nothing resolves the `require` every consuming file reaches the focal
+    /// through, and the graph could not certify the absence it certified.
+    ///
+    /// The measured classes here are IDENTICAL to the healthy Python fixture
+    /// below, which is why the verdict cannot come from them: what separates the
+    /// two is that this build wires no language-server adapter for JavaScript, so
+    /// its reference surface is unproducible rather than merely unobserved.
+    ///
+    /// "If you deleted what Kin called safe to delete here, you would delete
+    /// express."
+    #[test]
+    fn a_javascript_module_export_is_not_certified_absent_without_reference_enrichment() {
+        let mut payload = authoritative_empty_references("function");
+        payload["focal_entity"]["name"] = json!("createApplication");
+        payload["focal_entity"]["file_path"] = json!("lib/express.js");
+        payload["edge_coverage"] = json!({
+            "scope": "language",
+            "language": "JavaScript",
+            "requested_classes": ["calls", "imports", "references"],
+            "classes": { "calls": "present", "imports": "absent", "references": "absent" },
+            "cross_file_classes": ["calls"],
+            "reference_enrichment": "unsupported",
+            "budget_exhausted": false,
+            "entities_examined": 258,
+        });
+        let negative = negative_for("find_references", &payload, &structural_ready_envelope())
+            .expect("empty references yields a negative");
+
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(false),
+            "a present calls class must not certify an absence in a language whose \
+             reference edges cannot exist: {}",
+            negative
+        );
+        assert_eq!(negative["trust"], json!("inconclusive"));
+
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            reason.starts_with("reference_enrichment_unsupported"),
+            "the limiting factor leads the reason: {reason}"
+        );
+        assert!(
+            reason.contains("JavaScript"),
+            "and names the language it holds for: {reason}"
+        );
+
+        // The negative may not report a clean bill beside an observation naming
+        // two absent classes. That contradiction is what let the advice line be
+        // read as a green light.
+        let signals = negative["degraded_signals"].as_array().unwrap();
+        assert!(
+            signals.contains(&json!("edge_coverage:imports_absent"))
+                && signals.contains(&json!("edge_coverage:references_absent")),
+            "both absent classes are disclosed as degraded signals: {}",
+            negative["degraded_signals"]
+        );
+        let advice = negative["advice"].as_str().unwrap();
+        assert!(
+            !advice.contains("no degraded signals"),
+            "the advice cannot read clean beside two absent classes: {advice}"
+        );
+        assert!(advice.contains("NOT authoritative"), "{advice}");
+    }
+
+    /// The other half of the same claim, and the falsification target: a gate
+    /// that answered "inconclusive" unconditionally would pass the express test
+    /// above and fail this one.
+    ///
+    /// The coverage object is copied from a real run: a converted Python
+    /// repository whose `from .parsing import ...` statements resolve cleanly
+    /// still reports `imports: absent`, because Kin resolves an import to a
+    /// cross-file `Calls` edge and an artifact-level edge and mints no
+    /// entity-level `Imports` edge at all. A gate that demanded one would report
+    /// every Python absence inconclusive while looking principled.
+    #[test]
+    fn a_python_graph_that_resolves_its_imports_still_certifies_an_unused_symbol() {
+        let mut payload = authoritative_empty_references("function");
+        payload["focal_entity"]["name"] = json!("never_used_anywhere");
+        payload["focal_entity"]["file_path"] = json!("pkg/parsing.py");
+        payload["edge_coverage"] = json!({
+            "scope": "language",
+            "language": "Python",
+            "requested_classes": ["calls", "imports", "references"],
+            "classes": { "calls": "present", "imports": "absent", "references": "absent" },
+            "cross_file_classes": ["calls"],
+            "reference_enrichment": "unknown",
+            "budget_exhausted": false,
+            "entities_examined": 12,
+        });
+        let negative = negative_for("find_references", &payload, &structural_ready_envelope())
+            .expect("empty references yields a negative");
+
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(true),
+            "a language this build can enrich, whose cross-file uses resolve, still \
+             earns absence: {}",
+            negative
+        );
+        assert_eq!(negative["trust"], json!("authoritative"));
+        assert!(negative["advice"]
+            .as_str()
+            .unwrap()
+            .contains("Absence is authoritative"));
+        // Certified, and still honest about the classes it did not observe. The
+        // verdict rests on the resolved calls; saying which classes were empty is
+        // what keeps the next reader from mistaking it for full coverage.
+        assert_eq!(
+            negative["degraded_signals"],
+            json!([
+                "edge_coverage:imports_absent",
+                "edge_coverage:references_absent"
+            ])
+        );
     }
 
     /// Tools that read no edges must not be gated by an edge observation they
@@ -1939,7 +2218,16 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("degraded"));
-        assert_eq!(negative["degraded_signals"], json!(["embed_worker_failed"]));
+        assert_eq!(
+            negative["degraded_signals"],
+            json!([
+                "embed_worker_failed",
+                "edge_coverage:imports_absent",
+                "edge_coverage:references_absent"
+            ]),
+            "the daemon's flag leads, and the answer's own coverage shortfalls follow \
+             it rather than being dropped"
+        );
     }
 
     #[test]

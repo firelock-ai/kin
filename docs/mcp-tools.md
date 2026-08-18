@@ -29,7 +29,10 @@ The envelope's fields:
 - `semantic_coverage`: `indexed`, `total`, `pending`, and `complete` for the embedding
   signal, carried only when the daemon computed it and never fabricated here.
 - `degraded`: honest flags (`daemon_unreachable`, `embed_worker_failed`,
-  `mass_deletion_blocked`, `offline_fallback`), each present only when observed.
+  `mass_deletion_blocked`, `offline_fallback`, `workspace_mismatch`), each present only
+  when observed. `workspace_mismatch` is a refusal about which repository an answer would
+  be about, not a transport failure: the daemon is reachable and the server declined to
+  answer from a repository the client is not looking at.
 
 Empty results carry a named trust verdict, so an agent can tell "not present" apart from
 "not indexed yet". Semantic tools (`semantic_locate`, `semantic_search`) report
@@ -72,6 +75,22 @@ see the quickstart's advanced configuration for its exact JSON and repository-bo
 To wire a client up by hand, or to use the canonical npm wrapper (`@kinlab/kin`, which
 can run `kin mcp start` with the same `agent-default` profile), see
 [Advanced configuration](quickstart.md#9-advanced-configuration) in the quickstart.
+
+### Which repository the server serves
+
+A server binds one repository: the one named by `--repo` or `KIN_MCP_REPO`, otherwise the
+one containing its working directory, otherwise whatever the client's MCP workspace roots
+point at. An editor that moves its window to another Kin repository is followed, because a
+confident answer about the codebase you just left is worse than an error.
+
+A server that bound a repository of its own keeps serving it and ignores client workspace
+roots it cannot resolve to a Kin repository. That is what makes a container or remote
+registration work. Registered as `docker exec -i -w /work/repo <container> kin mcp start`,
+the server serves a container path while the client announces host paths that do not exist
+inside the container, and reading those as a workspace change would refuse every call for
+the life of the process. Roots that do name a Kin repository the server can see, and does
+not serve, are a real disagreement: those calls are refused, and the refusal carries
+`degraded.workspace_mismatch` with both paths named.
 
 ### Tool profiles
 
@@ -120,7 +139,7 @@ boundary you can rely on.
 
 - **`trace_computation`**: Get a focal entity together with its control-/data-flow neighborhood in one structured response (a flat snapshot, not an ordered walk). The response carries its body plus callers, callees, and imports.
 - **`trace_data_flow`**: Walk the directional call/data-flow chain rooted at a focal entity and return it as an ordered list of steps (the path-walk counterpart to `trace_computation`'s flat neighborhood).
-- **`find_references`**: Find all entities that import, call, or reference a target symbol.
+- **`find_references`**: Find all entities that import, call, or reference a target symbol. One row is one referencing entity, so two callers in one file are two rows, and `total_upstream` counts those entities, the same unit `kin refs` prints. The `counts` object names the unit and adds the file and reference-site totals beside it. A row's `reference_lines` gives the lines inside that caller which reference the target, and names why under `reference_lines_absent_reason` when the graph does not carry them. Rows omit the caller's body by default; pass `include_snippets=true` for it.
 - **`bulk_check_references`**: Classify many entities by reachability in one call.
 - **`entity_history`**: Retrieve version changes scoped to a specific entity.
 

@@ -19,7 +19,8 @@ use kin_model::{
     Visibility,
 };
 use kin_parser::{
-    is_call_extraction_incomplete_marker, CallArgShape, ExtractedRelation, FileImport,
+    is_call_extraction_incomplete_marker, is_python_builtin_name, CallArgShape, ExtractedRelation,
+    FileImport,
 };
 
 use crate::error::{IndexError, Result as IndexResult};
@@ -853,6 +854,29 @@ fn resolve_one_file(
             continue;
         }
 
+        // (a1) Python builtin gate. `open(path)`, `len(items)` and the rest of
+        // the builtins table are bound by the interpreter, not by this
+        // repository, and the same-file tier above has already given a local
+        // definition its win. Every tier below answers by matching the name
+        // somewhere else in the repo, so without this the one entity in the
+        // graph carrying that name captures the call.
+        if is_unbound_python_builtin_call(
+            rel,
+            src_id,
+            file,
+            dst_same_file.is_some(),
+            ctx.import_map.get(file.file_path.as_str()),
+            &ctx.entity_language_by_id,
+        ) {
+            debug!(
+                src = %rel.src_name,
+                dst = %rel.dst_name,
+                file = %file.file_path,
+                "linker: bare Python builtin call the file neither defines nor imports, leaving unlinked"
+            );
+            continue;
+        }
+
         // (a2) Inheritance-aware receiver-method resolution. The Python adapter
         // emits `self.m()` / `cls.m()` class-qualified (`EnclosingClass.m`), so
         // when the owner half names a class in this file — i.e. the parser
@@ -1112,6 +1136,11 @@ fn resolve_one_file(
                     resolve_caller_import_targets(&file.file_path, &file.imports, &ctx.known_files)
                 });
                 narrow_pairs_by_receiver_reach(candidates, targets, &owner_bound)
+            } else if is_python_bare_identifier_call(rel, src_id, &ctx.entity_language_by_id) {
+                // This tier exists for calls made through a receiver. A bare
+                // Python identifier has none, so no method here is a dispatch
+                // target for it.
+                drop_method_candidates(candidates, &ctx.entity_kind_by_id)
             } else {
                 candidates
             };
@@ -2775,6 +2804,84 @@ where
     }
 }
 
+/// Whether this relation is a Python call written as a bare identifier.
+///
+/// Python is the only adapter that separates the two call shapes at extraction
+/// time: an attribute call carries its receiver as written, a `self`/`cls` call
+/// folds its owner into the callee name, and only a bare `name(...)` arrives
+/// with neither. Adapters that record no receiver at all cannot tell the shapes
+/// apart, so the gates keyed on this predicate stay off their calls rather than
+/// reading a missing receiver as proof of a bare call.
+fn is_python_bare_identifier_call(
+    rel: &ExtractedRelation,
+    src_id: EntityId,
+    languages: &HashMap<EntityId, LanguageId>,
+) -> bool {
+    rel.kind == RelationKind::Calls
+        && rel.receiver.is_none()
+        && !rel.dst_name.contains('.')
+        && !rel.dst_name.contains("::")
+        && languages.get(&src_id) == Some(&LanguageId::Python)
+}
+
+/// Whether a wildcard import could be binding names this file never spells.
+///
+/// `from constants import *` is recorded as an import with no specifiers,
+/// because there is no name to record. Every name that import binds is
+/// therefore invisible here, so a file carrying one has no answer to "does this
+/// file import that name" and the builtin gate stands down instead of guessing.
+fn imports_are_name_complete(imports: &[FileImport]) -> bool {
+    imports.iter().all(|import| !import.specifiers.is_empty())
+}
+
+/// Whether a bare Python call names a builtin this file cannot have rebound.
+///
+/// A module-level name is reachable inside a Python module only when that
+/// module defines it or imports it. So a bare call to a name in the builtins
+/// table, from a file that does neither, is a call into the interpreter, and
+/// every remaining linker tier would answer it by matching the name somewhere
+/// else in the repository. That is how `open(path)` in a parsing module that
+/// imports `os` and `re` acquired a `Calls` edge to `NoteStore.open` in a
+/// storage module it never imports, and a `trace_data_flow` subtree underneath
+/// it.
+///
+/// A local definition or an import of the same name is the shadow Python allows,
+/// and it wins: this returns false there, leaving the same-file and import tiers
+/// to resolve the call exactly as before.
+fn is_unbound_python_builtin_call(
+    rel: &ExtractedRelation,
+    src_id: EntityId,
+    file: &FileParseData,
+    defined_in_file: bool,
+    file_imports: Option<&HashMap<&str, (&str, &str)>>,
+    languages: &HashMap<EntityId, LanguageId>,
+) -> bool {
+    is_python_bare_identifier_call(rel, src_id, languages)
+        && is_python_builtin_name(rel.dst_name.as_str())
+        && !defined_in_file
+        && !file_imports.is_some_and(|imports| imports.contains_key(rel.dst_name.as_str()))
+        && imports_are_name_complete(&file.imports)
+}
+
+/// Drop the method candidates a bare Python call can never dispatch to.
+///
+/// A method needs a receiver to be reached, and a bare `name(...)` has none, so
+/// a same-named method is a decoy however few of them the repository holds. The
+/// bare-name index holds only owner-qualified entities, which is exactly where
+/// `open` found `NoteStore.open`: a `@classmethod` no bare-name call can invoke.
+///
+/// Non-method candidates are left to the builtin and import tiers above; this
+/// filter only answers the receiver question.
+fn drop_method_candidates<'a>(
+    candidates: Vec<(&'a str, EntityId)>,
+    kinds: &HashMap<EntityId, EntityKind>,
+) -> Vec<(&'a str, EntityId)> {
+    candidates
+        .into_iter()
+        .filter(|(_, id)| kinds.get(id) != Some(&EntityKind::Method))
+        .collect()
+}
+
 /// Keep a production call site from resolving to a test entity while a
 /// production entity of the same name is available.
 ///
@@ -4028,7 +4135,7 @@ pub struct IncrementalLinkerCheckpointV1 {
 }
 
 /// Bump whenever [`IncrementalLinkerCheckpointV1`] or linker semantics change.
-pub const INCREMENTAL_LINKER_CHECKPOINT_VERSION: u32 = 4;
+pub const INCREMENTAL_LINKER_CHECKPOINT_VERSION: u32 = 5;
 
 /// Build-time kin-index identity included in the composite hydration
 /// checkpoint version key.
@@ -4758,6 +4865,27 @@ fn resolve_one_file_incremental(
             continue;
         }
 
+        // (a1) Python builtin gate, mirroring the batch linker. A bare call to
+        // a name the interpreter binds, from a file that neither defines nor
+        // imports it, has no destination in this repository and must not be
+        // answered by the name tiers below.
+        if is_unbound_python_builtin_call(
+            rel,
+            src_id,
+            file,
+            dst_same_file.is_some(),
+            import_map.get(file.file_path.as_str()),
+            &linker.entity_language_by_id,
+        ) {
+            debug!(
+                src = %rel.src_name,
+                dst = %rel.dst_name,
+                file = %file.file_path,
+                "linker(incremental): bare Python builtin call the file neither defines nor imports, leaving unlinked"
+            );
+            continue;
+        }
+
         // (a2) Inheritance-aware receiver-method resolution — mirrors the
         // batch linker: a class-qualified `self.m()`/`cls.m()` callee whose
         // owner is a class in this file resolves through the recorded
@@ -5017,6 +5145,11 @@ fn resolve_one_file_incremental(
                         )
                     });
                     narrow_pairs_by_receiver_reach(candidates, targets, &owner_bound)
+                } else if is_python_bare_identifier_call(rel, src_id, &linker.entity_language_by_id)
+                {
+                    // A bare Python identifier carries no receiver, and this
+                    // tier resolves calls that have one.
+                    drop_method_candidates(candidates, &linker.entity_kind_by_id)
                 } else {
                     candidates
                 };
@@ -5280,6 +5413,7 @@ mod tests {
         ArtifactId, EntityKind, EntityMetadata, EntityRole, FilePathId, FingerprintAlgorithm,
         GraphNodeId, Hash256, LanguageId, SemanticFingerprint, SourceSpan, Visibility,
     };
+    use kin_parser::ImportedName;
     use std::sync::{Mutex, OnceLock};
 
     #[test]
@@ -7153,6 +7287,429 @@ void f();
             .expect("incremental unambiguous receiver-method call should resolve to Type::method");
         assert_eq!(calls.src, GraphNodeId::Entity(caller.id));
         assert_eq!(calls.dst, GraphNodeId::Entity(callee.id));
+    }
+
+    fn make_python_entity(name: &str, file_path: &str, kind: EntityKind) -> Entity {
+        let mut entity = make_entity(name, file_path);
+        entity.language = LanguageId::Python;
+        entity.kind = kind;
+        entity
+    }
+
+    fn python_import(module_path: &str, names: &[&str]) -> FileImport {
+        FileImport {
+            module_path: module_path.to_string(),
+            specifiers: names
+                .iter()
+                .map(|name| ImportedName {
+                    local_name: (*name).to_string(),
+                    original_name: None,
+                    is_default: false,
+                })
+                .collect(),
+        }
+    }
+
+    fn bare_call(src_name: &str, dst_name: &str) -> ExtractedRelation {
+        ExtractedRelation {
+            receiver: None,
+            call_shape: None,
+            kind: RelationKind::Calls,
+            src_name: src_name.to_string(),
+            dst_name: dst_name.to_string(),
+            import_source: None,
+        }
+    }
+
+    /// The FIR-2400 shape exactly: `parse_file` opens a path with the builtin
+    /// `open`, and a storage module the parsing module never imports defines a
+    /// `NoteStore.open` classmethod. The bare-name index held one entry, so it
+    /// captured the call and `trace_data_flow` walked a subtree of a module the
+    /// file cannot see.
+    #[test]
+    fn a_bare_python_builtin_call_reaches_no_cross_module_method() {
+        let caller =
+            make_python_entity("parse_file", "notekeeper/parsing.py", EntityKind::Function);
+        let method = make_python_entity(
+            "NoteStore.open",
+            "notekeeper/storage.py",
+            EntityKind::Method,
+        );
+
+        let files = vec![
+            FileParseData {
+                file_path: "notekeeper/parsing.py".to_string(),
+                entities: vec![caller.clone()],
+                relations: vec![bare_call("parse_file", "open")],
+                imports: vec![python_import("os", &["os"]), python_import("re", &["re"])],
+            },
+            FileParseData {
+                file_path: "notekeeper/storage.py".to_string(),
+                entities: vec![method.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        let calls: Vec<&Relation> = result
+            .iter()
+            .filter(|r| r.kind == RelationKind::Calls)
+            .collect();
+        assert!(
+            calls.is_empty(),
+            "a bare builtin call must not reach a method of an unimported module, got {calls:?}"
+        );
+    }
+
+    /// The same gate with a module-level function as the decoy. A method needs a
+    /// receiver, but a same-named free function does not, so only the builtin
+    /// table can refuse this one.
+    #[test]
+    fn a_bare_python_builtin_call_reaches_no_cross_module_function() {
+        let caller =
+            make_python_entity("parse_file", "notekeeper/parsing.py", EntityKind::Function);
+        let decoy = make_python_entity("open", "notekeeper/storage.py", EntityKind::Function);
+        let counted = make_python_entity("len", "notekeeper/metrics.py", EntityKind::Function);
+
+        let files = vec![
+            FileParseData {
+                file_path: "notekeeper/parsing.py".to_string(),
+                entities: vec![caller.clone()],
+                relations: vec![
+                    bare_call("parse_file", "open"),
+                    bare_call("parse_file", "len"),
+                ],
+                imports: vec![python_import("os", &["os"])],
+            },
+            FileParseData {
+                file_path: "notekeeper/storage.py".to_string(),
+                entities: vec![decoy.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "notekeeper/metrics.py".to_string(),
+                entities: vec![counted.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        let calls: Vec<&Relation> = result
+            .iter()
+            .filter(|r| r.kind == RelationKind::Calls)
+            .collect();
+        assert!(
+            calls.is_empty(),
+            "bare `open`/`len` calls must not reach same-named module functions, got {calls:?}"
+        );
+    }
+
+    /// The receiver half of the fix, on a name no builtins table contains: a
+    /// bare `prune_except(...)` cannot dispatch to `NoteStore.prune_except`,
+    /// because a method call needs a receiver and this call site has none.
+    #[test]
+    fn a_bare_python_call_reaches_no_method_it_has_no_receiver_for() {
+        let caller = make_python_entity("run_gc", "notekeeper/cleanup.py", EntityKind::Function);
+        let method = make_python_entity(
+            "NoteStore.prune_except",
+            "notekeeper/storage.py",
+            EntityKind::Method,
+        );
+
+        let files = vec![
+            FileParseData {
+                file_path: "notekeeper/cleanup.py".to_string(),
+                entities: vec![caller.clone()],
+                relations: vec![bare_call("run_gc", "prune_except")],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "notekeeper/storage.py".to_string(),
+                entities: vec![method.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        let calls: Vec<&Relation> = result
+            .iter()
+            .filter(|r| r.kind == RelationKind::Calls)
+            .collect();
+        assert!(
+            calls.is_empty(),
+            "a bare call must not dispatch to a method, got {calls:?}"
+        );
+    }
+
+    /// Recall control for the builtin gate: a module that defines its own
+    /// `open` shadows the interpreter's, and the same-file tier must still bind
+    /// the call at full confidence.
+    #[test]
+    fn a_python_module_that_defines_open_still_resolves_its_own_call() {
+        let caller =
+            make_python_entity("parse_file", "notekeeper/parsing.py", EntityKind::Function);
+        let local_open = make_python_entity("open", "notekeeper/parsing.py", EntityKind::Function);
+
+        let files = vec![FileParseData {
+            file_path: "notekeeper/parsing.py".to_string(),
+            entities: vec![caller.clone(), local_open.clone()],
+            relations: vec![bare_call("parse_file", "open")],
+            imports: vec![],
+        }];
+
+        let result = link_cross_file(&files);
+        let call = result
+            .iter()
+            .find(|r| r.kind == RelationKind::Calls)
+            .expect("a same-file `open` must still resolve");
+        assert_eq!(call.src, GraphNodeId::Entity(caller.id));
+        assert_eq!(call.dst, GraphNodeId::Entity(local_open.id));
+        assert_eq!(call.confidence, 1.0);
+    }
+
+    /// Recall control for the import half: `from storage import open_store` and
+    /// a bare `open_store(...)` is the shape the ticket asks to keep, and an
+    /// imported builtin name must keep resolving too.
+    #[test]
+    fn an_imported_python_name_still_resolves_including_a_builtin_one() {
+        let caller =
+            make_python_entity("parse_file", "notekeeper/parsing.py", EntityKind::Function);
+        let imported =
+            make_python_entity("open_store", "notekeeper/storage.py", EntityKind::Function);
+        let shadow = make_python_entity("open", "notekeeper/storage.py", EntityKind::Function);
+
+        let files = vec![
+            FileParseData {
+                file_path: "notekeeper/parsing.py".to_string(),
+                entities: vec![caller.clone()],
+                relations: vec![
+                    bare_call("parse_file", "open_store"),
+                    bare_call("parse_file", "open"),
+                ],
+                imports: vec![python_import("notekeeper.storage", &["open_store", "open"])],
+            },
+            FileParseData {
+                file_path: "notekeeper/storage.py".to_string(),
+                entities: vec![imported.clone(), shadow.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        let targets: HashSet<GraphNodeId> = result
+            .iter()
+            .filter(|r| r.kind == RelationKind::Calls && r.src == GraphNodeId::Entity(caller.id))
+            .map(|r| r.dst)
+            .collect();
+        assert!(
+            targets.contains(&GraphNodeId::Entity(imported.id)),
+            "an imported name must still resolve, got {targets:?}"
+        );
+        assert!(
+            targets.contains(&GraphNodeId::Entity(shadow.id)),
+            "an imported symbol that shadows a builtin must still resolve, got {targets:?}"
+        );
+    }
+
+    /// The receiver path this fix must leave alone: a file that imports the
+    /// class and calls `store.open()` reaches `NoteStore.open` through the
+    /// receiver-reach narrowing kin#888 added.
+    #[test]
+    fn a_receiver_call_on_an_imported_class_still_resolves() {
+        let caller = make_python_entity("ingest", "notekeeper/ingest.py", EntityKind::Function);
+        let method = make_python_entity(
+            "NoteStore.open",
+            "notekeeper/storage.py",
+            EntityKind::Method,
+        );
+
+        let files = vec![
+            FileParseData {
+                file_path: "notekeeper/ingest.py".to_string(),
+                entities: vec![caller.clone()],
+                relations: vec![ExtractedRelation {
+                    receiver: Some("store".to_string()),
+                    call_shape: None,
+                    kind: RelationKind::Calls,
+                    src_name: "ingest".to_string(),
+                    dst_name: "open".to_string(),
+                    import_source: None,
+                }],
+                imports: vec![python_import("notekeeper.storage", &["NoteStore"])],
+            },
+            FileParseData {
+                file_path: "notekeeper/storage.py".to_string(),
+                entities: vec![method.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        let call = result
+            .iter()
+            .find(|r| r.kind == RelationKind::Calls)
+            .expect("`store.open()` in a file importing NoteStore must still resolve");
+        assert_eq!(call.src, GraphNodeId::Entity(caller.id));
+        assert_eq!(call.dst, GraphNodeId::Entity(method.id));
+    }
+
+    /// A wildcard import records no names, so the file has no answer to "do you
+    /// import `open`". The gate stands down rather than dropping an edge it
+    /// cannot see the binding for.
+    #[test]
+    fn a_wildcard_import_stands_the_python_builtin_gate_down() {
+        let caller =
+            make_python_entity("parse_file", "notekeeper/parsing.py", EntityKind::Function);
+        let shadow = make_python_entity("open", "notekeeper/compat.py", EntityKind::Function);
+
+        let files = vec![
+            FileParseData {
+                file_path: "notekeeper/parsing.py".to_string(),
+                entities: vec![caller.clone()],
+                relations: vec![bare_call("parse_file", "open")],
+                imports: vec![FileImport {
+                    module_path: "notekeeper.compat".to_string(),
+                    specifiers: Vec::new(),
+                }],
+            },
+            FileParseData {
+                file_path: "notekeeper/compat.py".to_string(),
+                entities: vec![shadow.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        let call = result
+            .iter()
+            .find(|r| r.kind == RelationKind::Calls)
+            .expect("a star import may bind `open`, so the gate must not fire");
+        assert_eq!(call.dst, GraphNodeId::Entity(shadow.id));
+    }
+
+    /// The gates are Python-scoped because Python is the only adapter that
+    /// records a receiver for attribute calls. An adapter that records none
+    /// cannot distinguish `x.open()` from `open()`, so reading its missing
+    /// receiver as proof of a bare call would drop every receiver-method edge
+    /// it resolves.
+    #[test]
+    fn a_non_python_bare_call_still_reaches_its_method() {
+        let mut caller = make_entity("build", "src/wiring.ts");
+        caller.language = LanguageId::TypeScript;
+        let mut method = make_entity("Store.open", "src/store.ts");
+        method.language = LanguageId::TypeScript;
+        method.kind = EntityKind::Method;
+
+        let files = vec![
+            FileParseData {
+                file_path: "src/wiring.ts".to_string(),
+                entities: vec![caller.clone()],
+                relations: vec![bare_call("build", "open")],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "src/store.ts".to_string(),
+                entities: vec![method.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        let call = result
+            .iter()
+            .find(|r| r.kind == RelationKind::Calls)
+            .expect("a TypeScript receiver-method call must still resolve");
+        assert_eq!(call.dst, GraphNodeId::Entity(method.id));
+    }
+
+    /// Incremental parity: a relink of the caller alone must not re-mint the
+    /// edge the batch linker refuses.
+    #[test]
+    fn incremental_bare_python_builtin_call_reaches_no_cross_module_method() {
+        let caller =
+            make_python_entity("parse_file", "notekeeper/parsing.py", EntityKind::Function);
+        let method = make_python_entity(
+            "NoteStore.open",
+            "notekeeper/storage.py",
+            EntityKind::Method,
+        );
+
+        let mut linker = IncrementalLinker::new();
+        linker.add_file(
+            "notekeeper/parsing.py",
+            admitted_artifact_id("notekeeper/parsing.py"),
+            std::slice::from_ref(&caller),
+        );
+        linker.add_file(
+            "notekeeper/storage.py",
+            admitted_artifact_id("notekeeper/storage.py"),
+            std::slice::from_ref(&method),
+        );
+
+        let files = vec![FileParseData {
+            file_path: "notekeeper/parsing.py".to_string(),
+            entities: vec![caller.clone()],
+            relations: vec![bare_call("parse_file", "open")],
+            imports: vec![python_import("os", &["os"])],
+        }];
+
+        let result = link_cross_file_incremental(&files, &linker);
+        let calls: Vec<&Relation> = result
+            .iter()
+            .filter(|r| r.kind == RelationKind::Calls)
+            .collect();
+        assert!(
+            calls.is_empty(),
+            "incremental relink must not re-mint the builtin edge, got {calls:?}"
+        );
+    }
+
+    /// Incremental parity for the receiver half.
+    #[test]
+    fn incremental_bare_python_call_reaches_no_method_it_has_no_receiver_for() {
+        let caller = make_python_entity("run_gc", "notekeeper/cleanup.py", EntityKind::Function);
+        let method = make_python_entity(
+            "NoteStore.prune_except",
+            "notekeeper/storage.py",
+            EntityKind::Method,
+        );
+
+        let mut linker = IncrementalLinker::new();
+        linker.add_file(
+            "notekeeper/cleanup.py",
+            admitted_artifact_id("notekeeper/cleanup.py"),
+            std::slice::from_ref(&caller),
+        );
+        linker.add_file(
+            "notekeeper/storage.py",
+            admitted_artifact_id("notekeeper/storage.py"),
+            std::slice::from_ref(&method),
+        );
+
+        let files = vec![FileParseData {
+            file_path: "notekeeper/cleanup.py".to_string(),
+            entities: vec![caller.clone()],
+            relations: vec![bare_call("run_gc", "prune_except")],
+            imports: vec![],
+        }];
+
+        let result = link_cross_file_incremental(&files, &linker);
+        let calls: Vec<&Relation> = result
+            .iter()
+            .filter(|r| r.kind == RelationKind::Calls)
+            .collect();
+        assert!(
+            calls.is_empty(),
+            "incremental relink must not dispatch a bare call to a method, got {calls:?}"
+        );
     }
 
     #[test]

@@ -1455,6 +1455,14 @@ impl Default for SessionRegistry {
 }
 
 #[cfg(test)]
+impl SessionRegistry {
+    /// An empty registry for a handler unit test; compiled out of every non-test build.
+    pub(crate) fn empty_for_test() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
