@@ -140,6 +140,16 @@ BASE_IMAGE_PINS = WORKFLOWS / "base-image-pins.yml"
 RUST_CACHE_ACTION = "Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4"
 MAIN_ONLY_CACHE_SAVE = "save-if: ${{ github.ref == 'refs/heads/main' }}"
 MAIN_ONLY_CACHE_SAVE_VALUE = "${{ github.ref == 'refs/heads/main' }}"
+# A job that reads the cache entry another job writes, and must never write it
+# itself, saves on no ref at all. That is strictly narrower than the main-only
+# scalar and never broader, so it cannot become the way an untrusted ref
+# poisons a cache. These two values are the whole allowlist and anything else
+# is still rejected. Nothing here has to re-prove that a saver still exists:
+# the falsification below pins the check job's own main-only save by count.
+RESTORE_ONLY_CACHE_SAVE_VALUE = "false"
+CACHE_SAVE_VALUES = frozenset(
+    {MAIN_ONLY_CACHE_SAVE_VALUE, RESTORE_ONLY_CACHE_SAVE_VALUE}
+)
 RUST_CACHE_REFERENCE = re.compile(r"Swatinem/rust-cache@", re.IGNORECASE)
 CANONICAL_STEP_FIELDS = frozenset(
     {
@@ -493,6 +503,13 @@ CI_JOB_DISPLAY_NAMES = {
     "changes": "Classify diff scope",
     "check-docs-only": "Check & Test",
     "check": "Check & Test",
+    # Both were steps inside `check` and are jobs so they stop sitting on the
+    # merge queue's critical path. Neither is a required context until the
+    # branch ruleset names it, so each is listed here to be reviewed as a
+    # producer, and the ruleset is what makes it block.
+    "falsify-guards": "Falsify guards",
+    "feature-tests-docs-only": "Feature permutation tests",
+    "feature-tests": "Feature permutation tests",
     "coverage": "Code Coverage",
 }
 EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
@@ -4388,10 +4405,10 @@ def assert_rust_cache_steps(workflows: dict[Path, str]) -> None:
                 )
             _, save_value = save
             save_value = save_value.split(" #", 1)[0].rstrip()
-            if save_value != MAIN_ONLY_CACHE_SAVE_VALUE:
+            if save_value not in CACHE_SAVE_VALUES:
                 raise AssertionError(
                     f"{workflow.name} rust-cache save-if must be the exact "
-                    "main-only scalar"
+                    "main-only scalar or the exact restore-only scalar"
                 )
 
         for action in canonical_job_action_uses(workflow, content):
@@ -11719,7 +11736,10 @@ def main() -> None:
 
     ci_path = WORKFLOWS / "ci.yml"
     check_start = ci_workflow.index("\n  check:")
-    check_end = ci_workflow.index("\n  coverage:", check_start)
+    # `falsify-guards` and `feature-tests` sit between `check` and `coverage`,
+    # so slicing to `coverage:` would hand this falsification three jobs and
+    # count save lines that are not the check job's.
+    check_end = ci_workflow.index("\n  falsify-guards:", check_start)
     check_job = ci_workflow[check_start:check_end]
     save_line = f"          {MAIN_ONLY_CACHE_SAVE}\n"
     if check_job.count(save_line) != 1:
