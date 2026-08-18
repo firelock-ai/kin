@@ -2355,7 +2355,10 @@ mod tests {
         // (target "function", body None), so it must still be rejected.
         let err = validate_staged_operations(&[op("create", None)]).unwrap_err();
         assert!(err.contains("missing payload"), "{err}");
-        assert!(err.contains("express an edit to an existing entity"), "{err}");
+        assert!(
+            err.contains("express an edit to an existing entity"),
+            "{err}"
+        );
         assert!(err.contains("admit a source file"), "{err}");
     }
 
