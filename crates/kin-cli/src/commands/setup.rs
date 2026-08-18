@@ -1583,6 +1583,38 @@ fn detect_ai_assistants() -> Vec<AiAssistant> {
     ]
 }
 
+/// What setup may claim after writing one client's MCP config.
+///
+/// "Configured" is a statement about a client that is on this machine. Setup
+/// writes for a client it did not detect only when an operator picked one in the
+/// advanced picker, and saying "configured" there reports an install that does
+/// not exist: the only new thing on disk is the config file Kin just created.
+fn client_write_summary(name: &str, detected: bool, path: &Path) -> String {
+    if detected {
+        format!("{name} configured ({})", path.display())
+    } else {
+        format!(
+            "{name} pre-configured for a client that is not installed ({})",
+            path.display()
+        )
+    }
+}
+
+/// Names of the AI clients setup detects on this machine.
+///
+/// `kin doctor` reads this rather than keeping its own rule, because the two
+/// answered differently in the same minute: doctor said "no AI client config
+/// files detected, nothing to configure" from the absence of config files, and
+/// `kin setup` then found a client and configured it. A config file is evidence
+/// a client was configured, not evidence one is installed.
+pub(crate) fn detected_ai_client_names() -> Vec<&'static str> {
+    detect_ai_assistants()
+        .into_iter()
+        .filter(|assistant| assistant.detected)
+        .map(|assistant| assistant.name)
+        .collect()
+}
+
 /// Merge the "kin" MCP server entry into an existing JSON config file.
 /// Creates the file if it doesn't exist.
 fn merge_mcp_config(path: &PathBuf, target_id: &str) -> Result<()> {
@@ -1991,20 +2023,29 @@ These tools operate on the graph-native substrate and return richer, more
 accurate results than filesystem heuristics. Use them first.
 "#;
 
+/// Heading the reminder is recognized by, and the line setup names before it
+/// appends anything to a user's global instruction file.
+const KIN_DISCOVERY_MARKER: &str = "## Kin-first discovery (added by `kin setup`)";
+
+/// Whether an instruction file already carries Kin's reminder heading.
+fn discovery_reminder_marker_present(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .map(|content| content.contains(KIN_DISCOVERY_MARKER))
+        .unwrap_or(false)
+}
+
 /// Append the Kin-first discovery reminder to an agent instruction file
 /// (e.g. `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`).
 ///
 /// Idempotent: skips if the marker is already present.
 fn inject_discovery_reminder(path: &PathBuf) -> Result<()> {
-    const MARKER: &str = "## Kin-first discovery (added by `kin setup`)";
-
     let existing = if path.exists() {
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?
     } else {
         String::new()
     };
 
-    if existing.contains(MARKER) {
+    if existing.contains(KIN_DISCOVERY_MARKER) {
         return Ok(());
     }
 
@@ -2102,6 +2143,14 @@ fn apply_discovery_reminders(
                 );
             }
             continue;
+        }
+        if !discovery_reminder_marker_present(&path) {
+            println!(
+                "  {} {label}: appending the \"{KIN_DISCOVERY_MARKER}\" block to {}, a global \
+                 instruction file every {label} session on this host reads",
+                style("→").cyan(),
+                path.display()
+            );
         }
         match inject_discovery_reminder(&path) {
             Ok(()) => {
@@ -2274,8 +2323,15 @@ fn install_shell_hook(shell_name: &str) -> Result<(PathBuf, String)> {
         String::new()
     };
 
-    let update = plan_rc_update(&rc_content, shell_name, &source_line, &rc_path, &bin_dir);
-    for line in &update.already_present {
+    let update = plan_rc_update(
+        &rc_content,
+        shell_name,
+        &source_line,
+        &rc_path,
+        &bin_dir,
+        bin_dir.is_dir(),
+    );
+    for line in update.already_present.iter().chain(&update.skipped) {
         println!("{line}");
     }
     if !update.applied.is_empty() {
@@ -2304,6 +2360,9 @@ struct RcUpdate {
     content: String,
     applied: Vec<String>,
     already_present: Vec<String>,
+    /// Lines this run chose not to write, and why. A repair that silently
+    /// declines to act reads exactly like one that acted.
+    skipped: Vec<String>,
 }
 
 fn plan_rc_update(
@@ -2312,10 +2371,12 @@ fn plan_rc_update(
     source_line: &str,
     rc_path: &Path,
     bin_dir: &Path,
+    bin_dir_present: bool,
 ) -> RcUpdate {
     let mut content = existing.to_string();
     let mut applied = Vec::new();
     let mut already_present = Vec::new();
+    let mut skipped = Vec::new();
 
     let append = |content: &mut String, block: &str| {
         if !content.ends_with('\n') && !content.is_empty() {
@@ -2339,6 +2400,16 @@ fn plan_rc_update(
             "  Shell rc already adds {} to PATH",
             bin_dir.display()
         ));
+    } else if !bin_dir_present {
+        // Only the launcher-provisioned layout populates ~/.kin/bin. An archive
+        // or Homebrew install puts the binaries elsewhere, and writing the
+        // export anyway left the user's rc pointing at a directory this install
+        // never created, which nobody reading that rc later can tell from an
+        // install that went missing.
+        skipped.push(format!(
+            "  Skipped the PATH line: {} does not exist, and this install put nothing there",
+            bin_dir.display()
+        ));
     } else {
         append(&mut content, &rc_path_block(shell_name, bin_dir));
         applied.push(format!(
@@ -2351,6 +2422,7 @@ fn plan_rc_update(
         content,
         applied,
         already_present,
+        skipped,
     }
 }
 
@@ -12001,10 +12073,9 @@ async fn apply_plan(
             match result {
                 Some(Ok(path)) => {
                     println!(
-                        "  {} {} configured ({})",
+                        "  {} {}",
                         style("✓").green(),
-                        a.name,
-                        path.display()
+                        client_write_summary(a.name, a.detected, &path)
                     );
                     // Which repository a client ends up bound to is decided by
                     // the directory this ran in, and nothing said so. A later
@@ -14574,6 +14645,104 @@ wait
         assert_eq!(find_shim().as_deref(), Some(shim.as_path()));
     }
 
+    /// The repair `kin doctor --fix` actually runs, against the install shape an
+    /// archive or Homebrew user has: no `~/.kin/bin`, and `kin` resolved from
+    /// somewhere else. It appended the PATH export anyway, so the rc named a
+    /// directory that did not exist before the repair or after it.
+    #[test]
+    #[serial]
+    fn the_shell_repair_neither_invents_a_bin_directory_nor_points_at_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive_home = tmp.path().join("archive-home");
+        let managed_home = tmp.path().join("managed-home");
+        let kin_home = tmp.path().join("kin-home");
+        fs::create_dir_all(&archive_home).unwrap();
+        fs::create_dir_all(&managed_home).unwrap();
+
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
+        let _kin_dir = EnvVarGuard::unset("KIN_DIR");
+        let bin_dir = kin_home.join("bin");
+
+        {
+            let _home = EnvVarGuard::set("HOME", &archive_home);
+            install_shell_hook("bash").unwrap();
+        }
+        let rc = fs::read_to_string(archive_home.join(".bashrc")).unwrap();
+        assert!(
+            rc.contains("kin-vfs"),
+            "the hook source line is the repair and must still land: {rc}"
+        );
+        assert!(
+            !rc.contains(&bin_dir.display().to_string()),
+            "a repair may not write a PATH reference to a directory it did not install: {rc}"
+        );
+        assert!(
+            !bin_dir.exists(),
+            "the repair must not conjure {} either",
+            bin_dir.display()
+        );
+
+        // Falsification: on the launcher-provisioned layout, where the binaries
+        // really are under ~/.kin/bin, the same repair still writes the line.
+        fs::create_dir_all(&bin_dir).unwrap();
+        {
+            let _home = EnvVarGuard::set("HOME", &managed_home);
+            install_shell_hook("bash").unwrap();
+        }
+        let managed_rc = fs::read_to_string(managed_home.join(".bashrc")).unwrap();
+        assert!(
+            managed_rc.contains(&bin_dir.display().to_string()),
+            "a provisioned bin directory must still reach PATH: {managed_rc}"
+        );
+    }
+
+    /// Setup wrote `~/.claude.json` and a global `~/.claude/CLAUDE.md` block and
+    /// called it "Claude Code configured". "Configured" is a claim about a
+    /// client that is installed; for one that is not, the only new thing is the
+    /// file Kin just wrote, and the line has to say so.
+    #[test]
+    fn an_absent_client_is_never_reported_as_configured() {
+        let path = Path::new("/home/u/.claude.json");
+
+        let installed = client_write_summary("Claude Code", true, path);
+        assert_eq!(installed, "Claude Code configured (/home/u/.claude.json)");
+
+        // Falsification: same client, same path, detection flipped.
+        let absent = client_write_summary("Claude Code", false, path);
+        assert!(
+            absent.contains("pre-configured for a client that is not installed"),
+            "an absent client must be named as absent: {absent}"
+        );
+        assert!(
+            !absent.contains("Claude Code configured"),
+            "no wording may read as a configured install: {absent}"
+        );
+        assert!(
+            absent.contains("/home/u/.claude.json"),
+            "the file that was written is still named: {absent}"
+        );
+    }
+
+    /// The reminder is a standing directive in a file every future session of
+    /// that client reads, so setup names the file and the block before it
+    /// appends, not only after.
+    #[test]
+    fn the_discovery_reminder_marker_is_the_heading_the_block_carries() {
+        assert!(
+            KIN_DISCOVERY_REMINDER.contains(KIN_DISCOVERY_MARKER),
+            "the announced heading must be the one the block actually carries"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let instructions = tmp.path().join("CLAUDE.md");
+        assert!(!discovery_reminder_marker_present(&instructions));
+        inject_discovery_reminder(&instructions).unwrap();
+        assert!(
+            discovery_reminder_marker_present(&instructions),
+            "a written reminder must be recognized, so the announcement fires once"
+        );
+    }
+
     #[test]
     fn zsh_hook_clears_stale_preload_state() {
         assert!(ZSH_HOOK.contains("_kin_vfs_clear_preload"));
@@ -15576,13 +15745,13 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
         let bin_dir = Path::new("/home/u/.kin/bin");
         let source_line = "source /home/u/.kin/shell/kin-vfs.zsh";
 
-        let fresh = plan_rc_update("", "zsh", source_line, rc_path, bin_dir);
+        let fresh = plan_rc_update("", "zsh", source_line, rc_path, bin_dir, true);
         assert_eq!(fresh.applied.len(), 2, "{:?}", fresh.applied);
         assert!(fresh.already_present.is_empty());
         assert!(fresh.content.contains(source_line));
         assert!(fresh.content.contains(&rc_path_line("zsh", bin_dir)));
 
-        let settled = plan_rc_update(&fresh.content, "zsh", source_line, rc_path, bin_dir);
+        let settled = plan_rc_update(&fresh.content, "zsh", source_line, rc_path, bin_dir, true);
         assert!(
             settled.applied.is_empty(),
             "nothing is written on a second run, so nothing may be claimed: {:?}",
@@ -15592,6 +15761,47 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
         assert_eq!(settled.content, fresh.content);
     }
 
+    /// A repair may not write a reference to something it did not install.
+    /// `kin doctor --fix` appended `export PATH="$HOME/.kin/bin:$PATH"` to a
+    /// `.bashrc` on an archive install, and `~/.kin/bin` did not exist before
+    /// that line or after it; only the launcher-provisioned layout populates it.
+    #[test]
+    fn plan_rc_update_writes_no_path_line_for_a_directory_this_install_never_made() {
+        let rc_path = Path::new("/home/u/.bashrc");
+        let bin_dir = Path::new("/home/u/.kin/bin");
+        let source_line = "source /home/u/.kin/shell/kin-vfs.bash";
+
+        let absent = plan_rc_update("", "bash", source_line, rc_path, bin_dir, false);
+        assert!(
+            !absent.content.contains(".kin/bin"),
+            "no PATH line may reference a directory that does not exist: {}",
+            absent.content
+        );
+        assert_eq!(absent.applied.len(), 1, "{:?}", absent.applied);
+        assert!(
+            absent.applied.iter().all(|line| !line.contains("PATH")),
+            "a skipped write may not be claimed: {:?}",
+            absent.applied
+        );
+        assert_eq!(absent.skipped.len(), 1, "{:?}", absent.skipped);
+        assert!(
+            absent.skipped[0].contains("does not exist")
+                && absent.skipped[0].contains("/home/u/.kin/bin"),
+            "the skip must name the directory and the reason: {:?}",
+            absent.skipped
+        );
+
+        // Falsification: the same rc on the layout that does populate the
+        // directory still gets the line, so this is not a blanket removal.
+        let present = plan_rc_update("", "bash", source_line, rc_path, bin_dir, true);
+        assert!(
+            present.content.contains(&rc_path_line("bash", bin_dir)),
+            "a provisioned ~/.kin/bin still earns its PATH line: {}",
+            present.content
+        );
+        assert!(present.skipped.is_empty(), "{:?}", present.skipped);
+    }
+
     #[test]
     fn plan_rc_update_claims_only_the_half_that_is_missing() {
         let rc_path = Path::new("/home/u/.bashrc");
@@ -15599,7 +15809,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
         let source_line = "source /home/u/.kin/shell/kin-vfs.bash";
 
         let hook_only = format!("{}\n", rc_integration_block(source_line));
-        let update = plan_rc_update(&hook_only, "bash", source_line, rc_path, bin_dir);
+        let update = plan_rc_update(&hook_only, "bash", source_line, rc_path, bin_dir, true);
         assert_eq!(update.applied.len(), 1, "{:?}", update.applied);
         assert!(update.applied[0].contains("PATH"));
         assert_eq!(update.already_present.len(), 1);
@@ -16655,6 +16865,9 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         let home = tmp.path().join("home");
         let kin_home = tmp.path().join("kin-home");
         fs::create_dir_all(&home).unwrap();
+        // The PATH line is written for the layout that populates ~/.kin/bin, so
+        // that is the layout this idempotence contract is about.
+        fs::create_dir_all(kin_home.join("bin")).unwrap();
 
         let _home = EnvVarGuard::set("HOME", &home);
         let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
