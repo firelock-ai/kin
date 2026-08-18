@@ -2532,13 +2532,16 @@ mod tests {
     /// hard-lock scopes against every other session for the life of the daemon,
     /// because the sweeper is the only collector for those scopes. That trades
     /// a mid-write reap for a permanent leak, which is the worse of the two.
+    /// Each half owns its own coordinator because `session_idle_ttl` is fixed
+    /// at construction: one TTL cannot be both far larger than the work between
+    /// two adjacent statements and small enough to elapse during a sleep.
     #[test]
     fn a_call_in_flight_past_the_idle_window_stops_protecting_its_session() {
-        let coord = SessionCoordinator::with_session_idle_ttl(
+        let protected = SessionCoordinator::with_session_idle_ttl(
             Arc::new(kin_db::InMemoryGraph::new()),
-            Duration::from_millis(5),
+            Duration::from_secs(3600),
         );
-        let sid = coord
+        let protected_sid = protected
             .register_session(
                 "claude-code",
                 "stuck-agent",
@@ -2549,21 +2552,38 @@ mod tests {
             )
             .unwrap();
 
-        let _stuck = coord.begin_call(&sid);
+        let _stuck = protected.begin_call(&protected_sid);
         assert_eq!(
-            coord.sweep_stale_sessions().unwrap(),
+            protected.sweep_stale_sessions().unwrap(),
             0,
             "a call inside the window still protects its session"
         );
+        assert!(protected.get_session(&protected_sid).unwrap().is_some());
 
-        std::thread::sleep(Duration::from_millis(20));
+        let outrun = SessionCoordinator::with_session_idle_ttl(
+            Arc::new(kin_db::InMemoryGraph::new()),
+            Duration::from_millis(5),
+        );
+        let outrun_sid = outrun
+            .register_session(
+                "claude-code",
+                "stuck-agent",
+                SessionTransport::Mcp,
+                Some(999_999_999),
+                PathBuf::from("/"),
+                write_capabilities(),
+            )
+            .unwrap();
+
+        let _outrunning = outrun.begin_call(&outrun_sid);
+        std::thread::sleep(Duration::from_millis(100));
 
         assert_eq!(
-            coord.sweep_stale_sessions().unwrap(),
+            outrun.sweep_stale_sessions().unwrap(),
             1,
             "a call outrunning the idle window must not defer the sweep forever"
         );
-        assert!(coord.get_session(&sid).unwrap().is_none());
+        assert!(outrun.get_session(&outrun_sid).unwrap().is_none());
     }
 
     /// The reported age is the oldest call STILL RUNNING, not the start of the
@@ -2640,8 +2660,16 @@ mod tests {
     /// The default was two 30-second heartbeat intervals, so a read phase
     /// longer than a minute stranded the agent and its transaction. The
     /// default idle window is now the same one the MCP transport uses.
+    ///
+    /// `SessionCoordinator::new` resolves the window from the process
+    /// environment, which a sibling test in this binary drives through every
+    /// accepted and rejected value, so the default is only observable here with
+    /// the override cleared and the mutation domain held.
     #[test]
+    #[serial_test::serial]
     fn pid_less_sessions_survive_a_thinking_pause_by_default() {
+        let _no_override = kin_core::test_env::EnvVarGuard::unset(SESSION_IDLE_TTL_ENV);
+
         assert_eq!(DEFAULT_SESSION_IDLE_TTL, Duration::from_secs(1800));
 
         let coord = SessionCoordinator::new(Arc::new(kin_db::InMemoryGraph::new()));
