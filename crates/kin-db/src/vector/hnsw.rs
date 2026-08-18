@@ -5,6 +5,7 @@
 //! APIs at the boundary while storing `RetrievalKey` natively.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::KinDbError;
 use crate::search::{resolve_roles, ScoredHit};
@@ -21,14 +22,76 @@ use kin_vector::IndexDescriptor;
 /// `KinDbError` for seamless integration with kin-db.
 pub struct VectorIndex {
     inner: kin_vector::VectorIndex<RetrievalKey>,
+    /// Process-unique identity for this handle, minted at construction.
+    ///
+    /// Paired with `generation` it names the key set an observer saw. A bare
+    /// generation would not: a reset swaps in a fresh index whose generation
+    /// restarts at zero, and a cache keyed on the number alone would serve the
+    /// replaced index's counts for the replacement.
+    id: u64,
+    /// Bumped after every mutation that can change which keys the index holds.
+    ///
+    /// Every such mutation goes through one of this wrapper's methods, and the
+    /// `kin_vector` index behind `inner` is private to it, so the counter is
+    /// complete by construction rather than by review.
+    generation: AtomicU64,
 }
 
+/// Source of the process-unique handle ids described on [`VectorIndex::id`].
+static NEXT_INDEX_ID: AtomicU64 = AtomicU64::new(1);
+
 impl VectorIndex {
+    fn wrap(inner: kin_vector::VectorIndex<RetrievalKey>) -> Self {
+        Self {
+            inner,
+            id: NEXT_INDEX_ID.fetch_add(1, Ordering::Relaxed),
+            generation: AtomicU64::new(0),
+        }
+    }
+
+    /// Record that the key set just changed.
+    ///
+    /// Called after the mutation lands, never before: a caller that reads the
+    /// token, then counts, then stores the count against that token must have
+    /// any interleaved mutation invalidate the stored entry. Bumping first
+    /// would let a count taken before the mutation be stored against the
+    /// post-mutation token and served as current.
+    fn mark_key_set_changed(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+
+    /// Names the key set this index currently holds.
+    ///
+    /// Two reads that return the same pair observed the same keys, so a caller
+    /// can cache a derived count against it instead of rescanning the index.
+    pub fn key_set_token(&self) -> (u64, u64) {
+        (self.id, self.generation.load(Ordering::Acquire))
+    }
+
+    /// How many of `keys` this index holds, resolved in ONE index lock
+    /// acquisition.
+    ///
+    /// The per-key alternative is `contains_retrievable` in a loop, which takes
+    /// the index lock once per key. Each of those acquisitions can be forced to
+    /// wait behind an in-flight batch upsert, so a caller counting a
+    /// graph-sized key set that way blocks for the embed worker's write
+    /// duration once per key rather than once in total.
+    pub fn count_present(&self, keys: &hashbrown::HashSet<RetrievalKey>) -> usize {
+        if keys.is_empty() {
+            return 0;
+        }
+        self.inner
+            .keys()
+            .into_iter()
+            .filter(|key| keys.contains(key))
+            .count()
+    }
+
     /// Create a new vector index for embeddings of the given dimensionality.
     pub fn new(dimensions: usize) -> Result<Self, KinDbError> {
         let inner = kin_vector::VectorIndex::new(dimensions)
             .map_err(|e| KinDbError::IndexError(e.to_string()))?;
-        Ok(Self { inner })
+        Ok(Self::wrap(inner))
     }
 
     /// The index's self-description (embedding model identity + graph provenance)
@@ -103,9 +166,12 @@ impl VectorIndex {
     ) -> Result<(), KinDbError> {
         let _span =
             tracing::info_span!("kindb.vector_index.upsert", dims = embedding.len()).entered();
-        self.inner
+        let outcome = self
+            .inner
             .upsert(key, embedding)
-            .map_err(|e| KinDbError::IndexError(e.to_string()))
+            .map_err(|e| KinDbError::IndexError(e.to_string()));
+        self.mark_key_set_changed();
+        outcome
     }
 
     /// Add or update the embeddings for a batch of retrieval keys.
@@ -116,9 +182,12 @@ impl VectorIndex {
         let _span =
             tracing::info_span!("kindb.vector_index.upsert_batch", batch_size = items.len())
                 .entered();
-        self.inner
+        let outcome = self
+            .inner
             .upsert_batch(items)
-            .map_err(|e| KinDbError::IndexError(e.to_string()))
+            .map_err(|e| KinDbError::IndexError(e.to_string()));
+        self.mark_key_set_changed();
+        outcome
     }
 
     /// Remove the embedding for an entity.
@@ -130,9 +199,12 @@ impl VectorIndex {
 
     /// Remove the embedding for any retrieval key.
     pub fn remove_retrievable(&self, key: &RetrievalKey) -> Result<(), KinDbError> {
-        self.inner
+        let outcome = self
+            .inner
             .remove(key)
-            .map_err(|e| KinDbError::IndexError(e.to_string()))
+            .map_err(|e| KinDbError::IndexError(e.to_string()));
+        self.mark_key_set_changed();
+        outcome
     }
 
     /// Remove a batch of entity embeddings from the index.
@@ -142,9 +214,12 @@ impl VectorIndex {
                 .entered();
         for id in entity_ids {
             let key = RetrievalKey::from(*id);
-            self.inner
+            let outcome = self
+                .inner
                 .remove(&key)
-                .map_err(|e| KinDbError::IndexError(e.to_string()))?;
+                .map_err(|e| KinDbError::IndexError(e.to_string()));
+            self.mark_key_set_changed();
+            outcome?;
         }
         Ok(())
     }
@@ -255,7 +330,7 @@ impl VectorIndex {
         .entered();
         let inner = kin_vector::VectorIndex::<RetrievalKey>::load_from_disk(path)
             .map_err(|e| KinDbError::IndexError(e.to_string()))?;
-        Ok(Self { inner })
+        Ok(Self::wrap(inner))
     }
 
     /// Load the index at `path` and verify its self-description against
@@ -282,7 +357,7 @@ impl VectorIndex {
             }
         };
         match inner.descriptor().verify_compatible(expected) {
-            Ok(()) => IndexLoadOutcome::Loaded(Self { inner }),
+            Ok(()) => IndexLoadOutcome::Loaded(Self::wrap(inner)),
             Err(e) => IndexLoadOutcome::Incompatible(e.to_string()),
         }
     }

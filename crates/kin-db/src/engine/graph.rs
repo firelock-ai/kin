@@ -5,7 +5,7 @@ use hashbrown::{HashMap, HashSet};
 use parking_lot::RwLock;
 use rayon::prelude::*;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(any(feature = "embeddings", feature = "vector"))]
 use std::sync::Arc;
 
@@ -1907,6 +1907,66 @@ struct PendingMerkle {
     seeds: HashSet<EntityId>,
 }
 
+/// Write access to [`EntityData`] that records the mutation in the graph's
+/// truth epoch.
+///
+/// Embedding coverage is derived from entity truth, so a reader that caches a
+/// coverage count has to know when truth moved under it. Routing every write
+/// through this guard makes that complete by construction: any write at all
+/// bumps the epoch, so a missed truth-changing site is not possible, and the
+/// over-invalidation a non-truth write causes costs one recount rather than a
+/// wrong answer.
+struct TruthWriteGuard<'a> {
+    guard: Option<parking_lot::RwLockWriteGuard<'a, EntityData>>,
+    epoch: &'a AtomicU64,
+}
+
+impl std::ops::Deref for TruthWriteGuard<'_> {
+    type Target = EntityData;
+
+    fn deref(&self) -> &Self::Target {
+        self.guard
+            .as_ref()
+            .expect("entity write guard is taken only while dropping")
+    }
+}
+
+impl std::ops::DerefMut for TruthWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.guard
+            .as_mut()
+            .expect("entity write guard is taken only while dropping")
+    }
+}
+
+impl Drop for TruthWriteGuard<'_> {
+    fn drop(&mut self) {
+        // Release the lock first, then bump. A reader that has already read the
+        // new epoch is then guaranteed to observe the completed write when it
+        // takes the read lock.
+        drop(self.guard.take());
+        self.epoch.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// A cached exact answer for [`InMemoryGraph::embedding_status`]'s `indexed`
+/// and `total`.
+///
+/// Valid only while both tokens still match: `truth_epoch` covers the entity
+/// side (which keys are owed a vector) and `index_token` covers the vector side
+/// (which keys hold one). `index_token` is `None` when no index is loaded,
+/// which keeps "no index at all" distinguishable from "an index holding
+/// nothing". Both report `indexed = 0`, and an entry minted for one must never
+/// be served to the other.
+#[cfg(feature = "vector")]
+#[derive(Clone, Copy)]
+struct EmbeddingCoverage {
+    truth_epoch: u64,
+    index_token: Option<(u64, u64)>,
+    indexed: usize,
+    total: usize,
+}
+
 /// Incremental reconcile bookkeeping for the vector index.
 ///
 /// `prune_orphaned_vectors` evicts index keys that have fallen out of graph
@@ -2030,6 +2090,24 @@ pub struct InMemoryGraph {
     /// HNSW vector index for semantic similarity search, lazily initialized.
     #[cfg(feature = "vector")]
     vector_index: parking_lot::Mutex<Option<Arc<VectorIndex>>>,
+    /// Monotonic counter bumped by every [`TruthWriteGuard`] drop, i.e. by every
+    /// write to [`EntityData`]. Reading it is how a cached derivation of entity
+    /// truth knows whether truth has moved.
+    truth_epoch: AtomicU64,
+    /// Cached `(indexed, total)` embedding coverage, keyed on the truth epoch
+    /// and the vector index's key-set token.
+    ///
+    /// Recomputing it costs one pass over graph truth plus one index scan, and
+    /// the embed settle loops poll `embedding_status` every ten seconds for the
+    /// length of a bulk embed. Between two vector batches nothing either token
+    /// covers can change, so every poll in that window is answered from here.
+    #[cfg(feature = "vector")]
+    embedding_coverage: parking_lot::Mutex<Option<EmbeddingCoverage>>,
+    /// How many times the coverage above was actually recomputed. Instrumentation
+    /// for the tests that assert repeat polls are served from the cache; nothing
+    /// in the engine reads it.
+    #[cfg(feature = "vector")]
+    embedding_coverage_scans: AtomicU64,
     /// Queue of entity keys that need embedding. Populated on upsert, drained
     /// by background workers or explicit `process_embedding_queue` calls.
     /// A [`RecencyQueue`] deduplicates (an entity modified twice only needs one
@@ -2131,6 +2209,37 @@ fn run_save_vector_index_after_detach_hook(graph: &InMemoryGraph) {
 #[cfg(all(not(test), feature = "vector"))]
 fn run_save_vector_index_after_detach_hook(_graph: &InMemoryGraph) {}
 
+#[cfg(all(test, feature = "vector"))]
+thread_local! {
+    static EMBEDDING_COVERAGE_BEFORE_COUNT_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce(&InMemoryGraph)>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(all(test, feature = "vector"))]
+fn set_embedding_coverage_before_count_hook(hook: impl FnOnce(&InMemoryGraph) + 'static) {
+    EMBEDDING_COVERAGE_BEFORE_COUNT_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+/// Observation point at the start of a coverage recount, after the index
+/// handle has been cloned out of the `vector_index` slot.
+///
+/// The recount is the longest thing `embedding_status` does, and holding the
+/// slot across it is what queued the embed worker's `get_vector_index` behind
+/// a status poll. The hook runs on the counting thread and
+/// `parking_lot::Mutex` is not reentrant, so a `try_lock` inside it fails
+/// exactly when the guard is still held.
+#[cfg(all(test, feature = "vector"))]
+fn run_embedding_coverage_before_count_hook(graph: &InMemoryGraph) {
+    let hook = EMBEDDING_COVERAGE_BEFORE_COUNT_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(graph);
+    }
+}
+
+#[cfg(all(not(test), feature = "vector"))]
+fn run_embedding_coverage_before_count_hook(_graph: &InMemoryGraph) {}
+
 impl InMemoryGraph {
     /// Create a new empty in-memory graph (RAM-only text index).
     pub fn new() -> Self {
@@ -2219,6 +2328,11 @@ impl InMemoryGraph {
             embedder: parking_lot::Mutex::new(None),
             #[cfg(feature = "vector")]
             vector_index: parking_lot::Mutex::new(None),
+            truth_epoch: AtomicU64::new(0),
+            #[cfg(feature = "vector")]
+            embedding_coverage: parking_lot::Mutex::new(None),
+            #[cfg(feature = "vector")]
+            embedding_coverage_scans: AtomicU64::new(0),
             #[cfg(feature = "vector")]
             embedding_queue: parking_lot::Mutex::new(RecencyQueue::default()),
             #[cfg(feature = "vector")]
@@ -2617,6 +2731,11 @@ impl InMemoryGraph {
             embedder: parking_lot::Mutex::new(None),
             #[cfg(feature = "vector")]
             vector_index: parking_lot::Mutex::new(None),
+            truth_epoch: AtomicU64::new(0),
+            #[cfg(feature = "vector")]
+            embedding_coverage: parking_lot::Mutex::new(None),
+            #[cfg(feature = "vector")]
+            embedding_coverage_scans: AtomicU64::new(0),
             #[cfg(feature = "vector")]
             embedding_queue: parking_lot::Mutex::new(RecencyQueue::default()),
             #[cfg(feature = "vector")]
@@ -2837,6 +2956,11 @@ impl InMemoryGraph {
             embedder: parking_lot::Mutex::new(None),
             #[cfg(feature = "vector")]
             vector_index: parking_lot::Mutex::new(None),
+            truth_epoch: AtomicU64::new(0),
+            #[cfg(feature = "vector")]
+            embedding_coverage: parking_lot::Mutex::new(None),
+            #[cfg(feature = "vector")]
+            embedding_coverage_scans: AtomicU64::new(0),
             #[cfg(feature = "vector")]
             embedding_queue: parking_lot::Mutex::new(RecencyQueue::default()),
             #[cfg(feature = "vector")]
@@ -3827,6 +3951,18 @@ impl InMemoryGraph {
     pub fn recompute_root_hash(&self) -> crate::storage::merkle::MerkleHash {
         let ent = self.entities.read();
         compute_root_hash_generic(&*ent, None)
+    }
+
+    /// Take the entity write lock through the guard that bumps the truth epoch.
+    ///
+    /// This is the only write path to [`EntityData`] in the engine, which is
+    /// what makes [`InMemoryGraph::truth_epoch`] a complete record of truth
+    /// movement. See [`TruthWriteGuard`].
+    fn entities_write(&self) -> TruthWriteGuard<'_> {
+        TruthWriteGuard {
+            guard: Some(self.entities.write()),
+            epoch: &self.truth_epoch,
+        }
     }
 
     /// Number of entities in the graph.
@@ -6011,6 +6147,57 @@ impl InMemoryGraph {
         0
     }
 
+    /// Exact `(indexed, total)` embedding coverage, served from
+    /// [`InMemoryGraph::embedding_coverage`] whenever neither graph truth nor
+    /// the vector index has moved since it was computed.
+    ///
+    /// Two properties matter more than the caching, because both were how the
+    /// old shape starved the embed worker it was polled to observe:
+    ///
+    /// - the `vector_index` mutex is held only long enough to clone the handle,
+    ///   never across the count, so `get_vector_index` on the embed path is
+    ///   never queued behind a status call;
+    /// - the count itself is one index lock acquisition ([`VectorIndex::count_present`])
+    ///   rather than one per key, so a status call waits for at most one
+    ///   in-flight batch upsert instead of one per key in the graph.
+    ///
+    /// Both tokens are read BEFORE the counts. A mutation that lands while the
+    /// count is running bumps its token past the recorded one, so the entry
+    /// stored here is rejected by the next reader rather than served stale.
+    #[cfg(feature = "vector")]
+    fn embedding_coverage_counts(&self) -> (usize, usize) {
+        let truth_epoch = self.truth_epoch.load(Ordering::Acquire);
+        let index = self.vector_index.lock().clone();
+        let index_token = index.as_ref().map(|vi| vi.key_set_token());
+
+        if let Some(cached) = *self.embedding_coverage.lock() {
+            if cached.truth_epoch == truth_epoch && cached.index_token == index_token {
+                return (cached.indexed, cached.total);
+            }
+        }
+
+        self.embedding_coverage_scans
+            .fetch_add(1, Ordering::Relaxed);
+        run_embedding_coverage_before_count_hook(self);
+        let truth = self.graph_truth_retrievable_keys();
+        let total = truth.len();
+        // No index loaded is not the same as an index holding nothing: the first
+        // has no coverage to report, the second has coverage zero. Both answer
+        // `indexed = 0`; `index_token` is what keeps their cache entries apart.
+        let indexed = index
+            .as_ref()
+            .map(|vi| vi.count_present(&truth))
+            .unwrap_or(0);
+
+        *self.embedding_coverage.lock() = Some(EmbeddingCoverage {
+            truth_epoch,
+            index_token,
+            indexed,
+            total,
+        });
+        (indexed, total)
+    }
+
     /// Get the current embedding status.
     ///
     /// The returned `pending` field is `max(queue_length, total - indexed)` so
@@ -6022,19 +6209,7 @@ impl InMemoryGraph {
         let (queue_len, indexed, total) = {
             let queue_len =
                 self.embedding_queue.lock().len() + self.artifact_embedding_queue.lock().len();
-            let retrievable_keys = self.graph_truth_retrievable_keys();
-            let total = retrievable_keys.len();
-            let indexed = self
-                .vector_index
-                .lock()
-                .as_ref()
-                .map(|vi| {
-                    retrievable_keys
-                        .iter()
-                        .filter(|key| vi.contains_retrievable(key))
-                        .count()
-                })
-                .unwrap_or(0);
+            let (indexed, total) = self.embedding_coverage_counts();
             (queue_len, indexed, total)
         };
         #[cfg(not(feature = "vector"))]
@@ -6054,7 +6229,7 @@ impl InMemoryGraph {
     /// `upsert_entity` in a loop. Index entries are updated incrementally
     /// for each entity (old entries removed, new entries inserted).
     pub fn batch_upsert_entities(&self, entities: &[Entity]) -> Result<(), KinDbError> {
-        let mut ent = self.entities.write();
+        let mut ent = self.entities_write();
         let entity_ids: Vec<EntityId> = entities.iter().map(|entity| entity.id).collect();
         for entity in entities {
             if let Some(old) = ent.entities.remove(&entity.id) {
@@ -6100,7 +6275,7 @@ impl InMemoryGraph {
     /// Removes each entity and its connected relations in one lock
     /// acquisition, avoiding per-entity lock overhead.
     pub fn batch_remove_entities(&self, ids: &[EntityId]) -> Result<(), KinDbError> {
-        let mut ent = self.entities.write();
+        let mut ent = self.entities_write();
         let removed_ids: HashSet<EntityId> = ids.iter().copied().collect();
         let mut affected_neighbors = HashSet::new();
         for id in ids {
@@ -6186,7 +6361,7 @@ impl InMemoryGraph {
     /// Remove all outgoing relations for an entity.
     /// Called during re-linking after file re-parse.
     pub fn remove_outgoing_relations(&self, id: &EntityId) -> Result<(), KinDbError> {
-        let mut ent = self.entities.write();
+        let mut ent = self.entities_write();
         let mut affected = HashSet::new();
         if let Some(rel_ids) = ent.outgoing.remove(id) {
             for rel_id in &rel_ids {
@@ -6213,7 +6388,7 @@ impl InMemoryGraph {
     pub fn delete_shallow_file(&self, file_id: &FilePathId) -> Result<(), KinDbError> {
         let artifact_id = self.require_artifact_id(file_id)?;
 
-        let mut ent = self.entities.write();
+        let mut ent = self.entities_write();
         let old = ent.shallow_files.remove(file_id);
         self.record_shallow_file_delta_remove(old, file_id.clone());
         drop(ent);
@@ -6318,7 +6493,7 @@ impl InMemoryGraph {
     ///
     /// Returns the removed entity IDs.
     pub fn remove_entities_for_file(&self, path: &str) -> Vec<EntityId> {
-        let mut ent = self.entities.write();
+        let mut ent = self.entities_write();
 
         // Find all entity IDs in this file via the file index.
         let entity_ids: Vec<EntityId> = ent.indexes.by_file(path).to_vec();
@@ -7151,7 +7326,7 @@ impl EntityStore for InMemoryGraph {
     // -----------------------------------------------------------------------
 
     fn upsert_entity(&self, entity: &Entity) -> Result<(), KinDbError> {
-        let mut ent = self.entities.write();
+        let mut ent = self.entities_write();
 
         // Delta index update: only touch indexes when indexed fields change.
         if let Some(old) = ent.entities.remove(&entity.id) {
@@ -7192,7 +7367,7 @@ impl EntityStore for InMemoryGraph {
     }
 
     fn upsert_relation(&self, relation: &Relation) -> Result<(), KinDbError> {
-        let mut ent = self.entities.write();
+        let mut ent = self.entities_write();
         let mut affected = HashSet::new();
         let mut merkle_seeds = Vec::new();
 
@@ -7219,7 +7394,7 @@ impl EntityStore for InMemoryGraph {
     }
 
     fn remove_entity(&self, id: &EntityId) -> Result<(), KinDbError> {
-        let mut ent = self.entities.write();
+        let mut ent = self.entities_write();
 
         let mut affected_neighbors = Vec::new();
 
@@ -7289,7 +7464,7 @@ impl EntityStore for InMemoryGraph {
     }
 
     fn remove_entities_batch(&self, ids: &[EntityId]) -> Result<(), KinDbError> {
-        let mut ent = self.entities.write();
+        let mut ent = self.entities_write();
         let id_set: hashbrown::HashSet<EntityId> = ids.iter().copied().collect();
         let mut affected_neighbors = Vec::new();
 
@@ -7372,7 +7547,7 @@ impl EntityStore for InMemoryGraph {
     }
 
     fn remove_relation(&self, id: &RelationId) -> Result<(), KinDbError> {
-        let mut ent = self.entities.write();
+        let mut ent = self.entities_write();
         let mut affected = Vec::new();
 
         if let Some(rel) = ent.relations.remove(id) {
@@ -7461,7 +7636,7 @@ impl EntityStore for InMemoryGraph {
     fn delete_structured_artifact(&self, file_id: &FilePathId) -> Result<(), KinDbError> {
         let artifact_id = self.require_artifact_id(file_id)?;
 
-        let mut ent = self.entities.write();
+        let mut ent = self.entities_write();
         let old = ent.structured_artifacts.remove(file_id);
         self.record_structured_artifact_delta_remove(old, file_id.clone());
         drop(ent);
@@ -7511,7 +7686,7 @@ impl EntityStore for InMemoryGraph {
     fn delete_opaque_artifact(&self, file_id: &FilePathId) -> Result<(), KinDbError> {
         let artifact_id = self.require_artifact_id(file_id)?;
 
-        let mut ent = self.entities.write();
+        let mut ent = self.entities_write();
         let old = ent.opaque_artifacts.remove(file_id);
         self.record_opaque_artifact_delta_remove(old, file_id.clone());
         drop(ent);
@@ -7564,7 +7739,7 @@ impl EntityStore for InMemoryGraph {
     fn delete_file_layout(&self, file_id: &FilePathId) -> Result<(), KinDbError> {
         self.require_artifact_id(file_id)?;
 
-        let mut ent = self.entities.write();
+        let mut ent = self.entities_write();
         let old = ent.file_layouts.remove(file_id);
         self.record_file_layout_delta_remove(old, file_id.clone());
         Ok(())
@@ -7591,7 +7766,7 @@ impl EntityStore for InMemoryGraph {
         let mut retired_artifact_indexes = HashSet::new();
 
         {
-            let mut ent = self.entities.write();
+            let mut ent = self.entities_write();
 
             // Validate the complete identity-bearing tree transition against
             // one parent state before mutating any graph domain. ResolvedTree
@@ -8127,7 +8302,7 @@ impl EntityStore for InMemoryGraph {
         }
 
         let affected = {
-            let mut ent = self.entities.write();
+            let mut ent = self.entities_write();
             let mut all_affected = Vec::with_capacity(entities.len());
 
             for entity in entities {
@@ -8177,7 +8352,7 @@ impl EntityStore for InMemoryGraph {
         }
 
         let affected = {
-            let mut ent = self.entities.write();
+            let mut ent = self.entities_write();
             let mut merkle_seeds = Vec::new();
             let mut affected = HashSet::new();
 
@@ -8238,7 +8413,7 @@ impl EntityStore for InMemoryGraph {
 
         // Step 2: Single write lock — retain non-kind + insert new + rebuild indexes
         let affected = {
-            let mut ent = self.entities.write();
+            let mut ent = self.entities_write();
             let mut merkle_seeds = Vec::new();
             let mut affected = HashSet::new();
 
@@ -8295,7 +8470,7 @@ impl EntityStore for InMemoryGraph {
         }
 
         let affected = {
-            let mut ent = self.entities.write();
+            let mut ent = self.entities_write();
             let mut merkle_seeds = Vec::new();
             let mut affected = HashSet::new();
 
@@ -8404,7 +8579,7 @@ impl ChangeStore for InMemoryGraph {
         let payload = semantic_change_payload(change)?;
         validate_semantic_change(change)?;
         let payload_ms = timer.lap_ms();
-        let mut ent = self.entities.write();
+        let mut ent = self.entities_write();
         let entities_lock_ms = timer.lap_ms();
         let mut chg = self.changes.write();
         let changes_lock_ms = timer.lap_ms();
@@ -8648,7 +8823,7 @@ impl InMemoryGraph {
         // Domain lock order is part of InMemoryGraph's deadlock contract:
         // entities -> changes. Holding both makes a batch appear as one ordered
         // import to readers instead of exposing a partially registered DAG.
-        let mut ent = self.entities.write();
+        let mut ent = self.entities_write();
         let mut chg = self.changes.write();
 
         // Validate every ID before touching revisions, child indexes, live
@@ -9580,7 +9755,7 @@ impl VerificationStore for InMemoryGraph {
     }
 
     fn delete_test_case(&self, id: &TestId) -> Result<(), KinDbError> {
-        let mut ent = self.entities.write();
+        let mut ent = self.entities_write();
         let mut ver = self.verification.write();
         let mut affected = HashSet::new();
         ver.test_cases.remove(id);
@@ -17601,6 +17776,471 @@ mod tests {
             id: EntityId(uuid::Uuid::from_u128(id_seed)),
             ..test_entity(name, "src/main.rs")
         }
+    }
+
+    /// The truth epoch is only a complete record of truth movement while
+    /// [`InMemoryGraph::entities_write`] is the sole writer, and that is a
+    /// property of the source rather than of any runtime state, so it is
+    /// checked here. Exactly one raw acquisition may exist: the one inside the
+    /// guard constructor itself.
+    #[test]
+    fn the_entity_write_guard_is_the_only_writer() {
+        let source =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/engine/graph.rs"))
+                .expect("the engine source must be readable");
+
+        // Both needles are assembled at run time. Spelled as literals they
+        // would occur in this very file and count themselves, which would make
+        // the guard pass on its own text.
+        let guarded = format!("entities{}write()", "_");
+        let raw = format!("entities{}write()", ".");
+
+        assert!(
+            source.matches(guarded.as_str()).count() > 1,
+            "control: the guarded form must be present, or this test is reading the wrong file"
+        );
+        assert_eq!(
+            source.matches(raw.as_str()).count(),
+            1,
+            "every entity write must go through the guard so the truth epoch stays complete"
+        );
+    }
+
+    /// What `embedding_status` would answer if it recomputed from scratch,
+    /// using the per-key probe the maintained counters replaced. Every coverage
+    /// test compares against this, so a counter that drifts from graph truth
+    /// fails here rather than in a two-hour embed.
+    #[cfg(feature = "vector")]
+    fn probe_coverage(graph: &InMemoryGraph) -> (usize, usize) {
+        let truth = graph.graph_truth_retrievable_keys();
+        let guard = graph.vector_index.lock();
+        let indexed = guard
+            .as_ref()
+            .map(|vi| {
+                truth
+                    .iter()
+                    .filter(|key| vi.contains_retrievable(key))
+                    .count()
+            })
+            .unwrap_or(0);
+        (indexed, truth.len())
+    }
+
+    #[cfg(feature = "vector")]
+    fn coverage_fixture(count: u128, indexed: usize) -> (InMemoryGraph, Vec<Entity>) {
+        let graph = InMemoryGraph::new();
+        let entities: Vec<Entity> = (0..count)
+            .map(|i| test_entity_with_id(0x2416_0000 + i, "cov"))
+            .collect();
+        graph.batch_upsert_entities(&entities).unwrap();
+
+        let vi = VectorIndex::new(2).unwrap();
+        for entity in entities.iter().take(indexed) {
+            vi.upsert_retrievable(RetrievalKey::Entity(entity.id), &[1.0, 0.0])
+                .unwrap();
+        }
+        *graph.vector_index.lock() = Some(Arc::new(vi));
+        (graph, entities)
+    }
+
+    /// Coverage must equal the per-key probe it replaced, including the case
+    /// that separates the two possible shortcuts: the index holding a key graph
+    /// truth does not. `indexed` is the intersection, never the index's size.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn embedding_coverage_equals_the_per_key_probe_it_replaced() {
+        let (graph, entities) = coverage_fixture(40, 17);
+        {
+            let vi = graph.vector_index.lock().clone().unwrap();
+            let stranger = test_entity_with_id(0x2416_9999, "orphan");
+            vi.upsert_retrievable(RetrievalKey::Entity(stranger.id), &[0.0, 1.0])
+                .unwrap();
+        }
+
+        let status = graph.embedding_status();
+        assert_eq!((status.indexed, status.total), probe_coverage(&graph));
+        assert_eq!(status.indexed, 17, "only truth keys count as coverage");
+        assert_eq!(status.total, entities.len());
+        assert_eq!(
+            graph.vector_index.lock().as_ref().unwrap().len(),
+            18,
+            "the index holds one more vector than coverage reports"
+        );
+    }
+
+    /// The polled steady state: between two vector batches nothing that can
+    /// change the answer has changed, so repeat polls must be answered from the
+    /// maintained counters instead of rescanning graph truth and the index.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn embedding_status_serves_repeat_polls_without_rescanning() {
+        let (graph, _) = coverage_fixture(40, 17);
+
+        let first = graph.embedding_status();
+        let scans = graph.embedding_coverage_scans.load(Ordering::Relaxed);
+        for _ in 0..16 {
+            let repeat = graph.embedding_status();
+            assert_eq!(repeat.indexed, first.indexed);
+            assert_eq!(repeat.total, first.total);
+        }
+        assert_eq!(
+            graph.embedding_coverage_scans.load(Ordering::Relaxed),
+            scans,
+            "a poll that changed nothing must not rescan"
+        );
+    }
+
+    /// Vectors arriving and being evicted must both move coverage. The eviction
+    /// half is the drift guard: a counter that only ever increments reads as a
+    /// finished embed forever once the index has been pruned under it.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn embedding_status_follows_vectors_into_and_out_of_the_index() {
+        let (graph, entities) = coverage_fixture(40, 17);
+        let before = graph.embedding_status();
+        let scans = graph.embedding_coverage_scans.load(Ordering::Relaxed);
+
+        let vi = graph.vector_index.lock().clone().unwrap();
+        let key = RetrievalKey::Entity(entities[20].id);
+        vi.upsert_retrievable(key, &[1.0, 0.0]).unwrap();
+        let inserted = graph.embedding_status();
+        assert_eq!(inserted.indexed, before.indexed + 1);
+        assert_eq!((inserted.indexed, inserted.total), probe_coverage(&graph));
+
+        vi.remove_retrievable(&key).unwrap();
+        let evicted = graph.embedding_status();
+        assert_eq!(evicted.indexed, before.indexed);
+        assert_eq!((evicted.indexed, evicted.total), probe_coverage(&graph));
+        assert!(
+            graph.embedding_coverage_scans.load(Ordering::Relaxed) > scans,
+            "a key set that moved must have forced a recount"
+        );
+    }
+
+    /// Graph truth moving is the other half. Adding an entity owes a vector that
+    /// does not exist yet, so `total` grows; removing one takes the obligation
+    /// away again.
+    ///
+    /// Deliberately run with NO index loaded. An entity upsert also reaches the
+    /// vector index through `invalidate_entities_for_embedding`, so with an
+    /// index present the index token alone would bust the cache and this test
+    /// would pass whether or not entity writes are tracked at all. With no
+    /// index the truth epoch is the only thing that can notice, which is what
+    /// makes the assertion discriminating.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn embedding_status_follows_graph_truth_moving() {
+        let graph = InMemoryGraph::new();
+        let entities: Vec<Entity> = (0..8u128)
+            .map(|i| test_entity_with_id(0x2416_2000 + i, "cov"))
+            .collect();
+        graph.batch_upsert_entities(&entities).unwrap();
+        assert!(graph.vector_index_stats().is_none());
+
+        let before = graph.embedding_status();
+        assert_eq!(before.total, entities.len());
+
+        let fresh = test_entity_with_id(0x2416_8888, "fresh");
+        graph.batch_upsert_entities(&[fresh.clone()]).unwrap();
+        let grown = graph.embedding_status();
+        assert_eq!(grown.total, before.total + 1);
+        assert_eq!((grown.indexed, grown.total), probe_coverage(&graph));
+
+        graph.batch_remove_entities(&[entities[0].id]).unwrap();
+        let shrunk = graph.embedding_status();
+        assert_eq!(shrunk.total, before.total, "one added, one removed");
+        assert_eq!((shrunk.indexed, shrunk.total), probe_coverage(&graph));
+    }
+
+    /// Re-init mints a fresh revision key for every entity, so a superseded
+    /// generation leaves graph truth the moment the change is applied, long
+    /// before any prune evicts its vector. Coverage has to fall then, not when
+    /// the index is finally reconciled.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn embedding_status_drops_a_superseded_revision_from_coverage() {
+        let graph = InMemoryGraph::new();
+        let e1 = test_entity("foo", "src/a.rs");
+        let (rev_old, rev_new) = two_revision_entity(&graph, &e1);
+
+        let vi = VectorIndex::new(2).unwrap();
+        vi.upsert_retrievable(RetrievalKey::EntityRevision(rev_old), &[1.0, 0.0])
+            .unwrap();
+        vi.upsert_retrievable(RetrievalKey::EntityRevision(rev_new), &[0.0, 1.0])
+            .unwrap();
+        vi.upsert_retrievable(RetrievalKey::Entity(e1.id), &[0.0, 1.0])
+            .unwrap();
+        *graph.vector_index.lock() = Some(Arc::new(vi));
+
+        let before = graph.embedding_status();
+        assert_eq!((before.indexed, before.total), probe_coverage(&graph));
+        let indexed_before = before.indexed;
+
+        let mut changed = e1.clone();
+        changed.signature = "fn foo(x: i64)".to_string();
+        changed.fingerprint.signature_hash = Hash256::from_bytes([9; 32]);
+        apply_init_change(&graph, 0x03, &[changed]);
+
+        let after = graph.embedding_status();
+        assert_eq!((after.indexed, after.total), probe_coverage(&graph));
+        assert!(
+            after.indexed < indexed_before,
+            "the superseded revision must stop counting as coverage: {indexed_before} -> {}",
+            after.indexed
+        );
+    }
+
+    /// `indexed = 0` is structurally zero when no index is loaded, so a cache
+    /// entry minted for that state must never be served to a graph that has
+    /// since loaded one. `vector_index_stats().is_none()` is the test that tells
+    /// the two apart, and it must still tell them apart after the counters land.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn embedding_status_keeps_an_absent_index_distinct_from_an_empty_one() {
+        let graph = InMemoryGraph::new();
+        let entities: Vec<Entity> = (0..8u128)
+            .map(|i| test_entity_with_id(0x2416_1000 + i, "cov"))
+            .collect();
+        graph.batch_upsert_entities(&entities).unwrap();
+
+        let absent = graph.embedding_status();
+        assert_eq!(absent.indexed, 0);
+        assert!(
+            graph.vector_index_stats().is_none(),
+            "no index is loaded, so this zero is structural"
+        );
+
+        *graph.vector_index.lock() = Some(Arc::new(VectorIndex::new(2).unwrap()));
+        let empty = graph.embedding_status();
+        assert_eq!(empty.indexed, 0);
+        assert_eq!(empty.total, absent.total);
+        assert_eq!(
+            graph.vector_index_stats(),
+            Some((2, 0)),
+            "an empty index is loaded, so this zero is a real count"
+        );
+
+        let vi = graph.vector_index.lock().clone().unwrap();
+        vi.upsert_retrievable(RetrievalKey::Entity(entities[0].id), &[1.0, 0.0])
+            .unwrap();
+        assert_eq!(
+            graph.embedding_status().indexed,
+            1,
+            "the absent-index entry must not have been served to the loaded index"
+        );
+    }
+
+    /// The starvation itself. Holding the `vector_index` slot across the count
+    /// is what queued the embed worker's `get_vector_index` behind every status
+    /// poll, so the slot has to be reachable while the count runs. The hook runs
+    /// on the counting thread and `parking_lot::Mutex` is not reentrant, so
+    /// `try_lock` succeeding is exactly the proof that the guard is gone.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn embedding_status_releases_the_index_slot_before_counting() {
+        let (graph, _) = coverage_fixture(40, 17);
+        let observed = Arc::new(AtomicBool::new(false));
+        let free = Arc::new(AtomicBool::new(false));
+        let observed_hook = Arc::clone(&observed);
+        let free_hook = Arc::clone(&free);
+
+        set_embedding_coverage_before_count_hook(move |graph| {
+            observed_hook.store(true, Ordering::SeqCst);
+            free_hook.store(graph.vector_index.try_lock().is_some(), Ordering::SeqCst);
+        });
+
+        let status = graph.embedding_status();
+
+        assert!(
+            observed.load(Ordering::SeqCst),
+            "the observation point must run, or this test proves nothing"
+        );
+        assert!(
+            free.load(Ordering::SeqCst),
+            "the vector index slot must be reachable while coverage counts"
+        );
+        assert_eq!((status.indexed, status.total), probe_coverage(&graph));
+    }
+
+    /// Before/after for FIR-2416, on one host in one process.
+    ///
+    /// Arm A is the shape this fix replaced: materialize graph truth, then probe
+    /// the index once per key while holding the `vector_index` slot. Arm B is
+    /// `embedding_status` recomputing. Arm C is `embedding_status` answering a
+    /// repeat poll from the maintained counters.
+    ///
+    /// The last three arms are the part that actually mattered on the gauntlet:
+    /// how fast the embed persist stage lands batches with nothing else running,
+    /// with arm A polling it, and with the shipped path polling it. The persist
+    /// stage is modelled exactly as `persist_embedded_batch` does it, clone the
+    /// handle out of the slot and batch-upsert, minus the embedder inference
+    /// this test cannot run offline.
+    #[cfg(feature = "vector")]
+    #[test]
+    #[ignore = "perf microbench; run with --ignored --nocapture"]
+    fn embedding_status_scan_vs_counter_microbench() {
+        use std::sync::atomic::AtomicUsize;
+        use std::time::{Duration, Instant};
+
+        const ENTITIES: u128 = 30_000;
+        const BATCH: usize = 512;
+
+        // A fresh graph and a fresh index per arm. The persist loop re-upserts
+        // the same keys, which moves the index's free list, so arms sharing one
+        // fixture measure the state their predecessor left behind rather than
+        // each other.
+        let fixture = || {
+            let graph = InMemoryGraph::new();
+            let entities: Vec<Entity> = (0..ENTITIES)
+                .map(|i| test_entity_with_id(0x2416_0000_0000 + i, "bench"))
+                .collect();
+            graph.batch_upsert_entities(&entities).unwrap();
+
+            let vi = VectorIndex::new(2).unwrap();
+            for chunk in entities.chunks(BATCH) {
+                let batch: Vec<(RetrievalKey, Vec<f32>)> = chunk
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| {
+                        let t = i as f32 / BATCH as f32;
+                        (RetrievalKey::Entity(e.id), vec![t, 1.0 - t])
+                    })
+                    .collect();
+                vi.upsert_retrievable_batch(batch).unwrap();
+            }
+            *graph.vector_index.lock() = Some(Arc::new(vi));
+            (graph, entities)
+        };
+
+        // The replaced shape: materialize truth, then probe the index once per
+        // key with the `vector_index` slot held for the whole loop.
+        let scan = |graph: &InMemoryGraph| {
+            let truth = graph.graph_truth_retrievable_keys();
+            let guard = graph.vector_index.lock();
+            let indexed = guard
+                .as_ref()
+                .map(|vi| {
+                    truth
+                        .iter()
+                        .filter(|key| vi.contains_retrievable(key))
+                        .count()
+                })
+                .unwrap_or(0);
+            (indexed, truth.len())
+        };
+
+        let (graph, entities) = fixture();
+
+        let t = Instant::now();
+        let a = scan(&graph);
+        let arm_a = t.elapsed();
+
+        graph.embedding_coverage.lock().take();
+        let t = Instant::now();
+        let b = graph.embedding_status();
+        let arm_b = t.elapsed();
+
+        let t = Instant::now();
+        let c = graph.embedding_status();
+        let arm_c = t.elapsed();
+
+        assert_eq!(a, (b.indexed, b.total));
+        assert_eq!((b.indexed, b.total), (c.indexed, c.total));
+        eprintln!(
+            "[FIR-2416] quiet host, truth={} indexed={}: A scan-under-slot {arm_a:?} | B recount {arm_b:?} | C cached {arm_c:?}",
+            b.total, b.indexed
+        );
+
+        // The persist stage as `persist_embedded_batch` runs it: clone the
+        // handle out of the slot, batch-upsert, minus the embedder inference
+        // this test cannot run offline.
+        // Returns (batches landed, worst slot acquisition). The slot wait is
+        // the starvation itself: `persist_embedded_batch` reaches the index
+        // through `get_vector_index`, which takes this mutex, and the replaced
+        // status held it for the length of its scan. Batch counts on a shared
+        // host move with whatever else is compiling; a blocked mutex
+        // acquisition does not.
+        let persist_window = |graph: &InMemoryGraph, entities: &[Entity], window: Duration| {
+            let mut landed = 0usize;
+            let mut worst_slot = Duration::ZERO;
+            let start = Instant::now();
+            let mut round = 0u32;
+            while start.elapsed() < window {
+                let slot = Instant::now();
+                let vi = graph.vector_index.lock().clone().unwrap();
+                worst_slot = worst_slot.max(slot.elapsed());
+                let t = round as f32 / 1000.0;
+                let batch: Vec<(RetrievalKey, Vec<f32>)> = entities[..BATCH]
+                    .iter()
+                    .map(|e| (RetrievalKey::Entity(e.id), vec![t, 1.0 - t]))
+                    .collect();
+                vi.upsert_retrievable_batch(batch).unwrap();
+                landed += 1;
+                round += 1;
+            }
+            (landed, worst_slot)
+        };
+
+        let window = Duration::from_secs(10);
+        // One poll per 400 ms against a batch landing in tens of milliseconds
+        // is well above the field's poll-to-batch ratio (a 10 s poll against a
+        // 40 s batch), so this arm asks more of status than the gauntlet does.
+        let cadence = Duration::from_millis(400);
+
+        let arm = |poller: Option<bool>| -> (usize, Duration, usize, Duration, Duration) {
+            let (graph, entities) = fixture();
+            let Some(old) = poller else {
+                let (landed, worst_slot) = persist_window(&graph, &entities, window);
+                return (landed, worst_slot, 0, Duration::ZERO, Duration::ZERO);
+            };
+            let stop = AtomicBool::new(false);
+            let polls = AtomicUsize::new(0);
+            let total_us = AtomicUsize::new(0);
+            let worst_us = AtomicUsize::new(0);
+            let landed = std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    while !stop.load(Ordering::Acquire) {
+                        let t = Instant::now();
+                        if old {
+                            scan(&graph);
+                        } else {
+                            graph.embedding_status();
+                        }
+                        let us = t.elapsed().as_micros() as usize;
+                        total_us.fetch_add(us, Ordering::Relaxed);
+                        worst_us.fetch_max(us, Ordering::Relaxed);
+                        polls.fetch_add(1, Ordering::Relaxed);
+                        std::thread::sleep(cadence);
+                    }
+                });
+                let landed = persist_window(&graph, &entities, window);
+                stop.store(true, Ordering::Release);
+                landed
+            });
+            let n = polls.load(Ordering::Relaxed).max(1);
+            (
+                landed.0,
+                landed.1,
+                polls.load(Ordering::Relaxed),
+                Duration::from_micros((total_us.load(Ordering::Relaxed) / n) as u64),
+                Duration::from_micros(worst_us.load(Ordering::Relaxed) as u64),
+            )
+        };
+
+        let (alone, alone_slot, _, _, _) = arm(None);
+        let (with_old, old_slot, old_polls, old_mean, old_worst) = arm(Some(true));
+        let (with_new, new_slot, new_polls, new_mean, new_worst) = arm(Some(false));
+
+        eprintln!(
+            "[FIR-2416] poll latency under a live persist loop: old mean {old_mean:?} worst {old_worst:?} ({old_polls} polls) | new mean {new_mean:?} worst {new_worst:?} ({new_polls} polls)"
+        );
+        eprintln!(
+            "[FIR-2416] worst wait for the index slot on the persist path: alone {alone_slot:?} | under old poller {old_slot:?} | under new poller {new_slot:?}"
+        );
+        eprintln!(
+            "[FIR-2416] persist batches in {window:?}, one fresh fixture per arm: alone {alone} | under old poller {with_old} | under new poller {with_new} (this host's run-to-run spread swamps the difference; the slot wait above is the low-noise reading)"
+        );
+        let _ = entities;
     }
 
     #[test]
