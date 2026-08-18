@@ -27,7 +27,8 @@ use kin_model::{
     SemanticFingerprint, SourceSpan, Visibility,
 };
 use kin_parser::{
-    CSharpAdapter, ExtractedRelation, JavaAdapter, LanguageAdapter, TypeScriptAdapter,
+    CSharpAdapter, ExtractedRelation, JavaAdapter, JavaScriptAdapter, LanguageAdapter,
+    PythonAdapter, TypeScriptAdapter,
 };
 
 // ---- helpers: direct entity construction (mirrors linker.rs unit-test idiom) ----
@@ -350,5 +351,183 @@ fn simple_name_resolves_but_dotted_receiver_name_does_not() {
         count_calls(&link_cross_file(&dotted)),
         0,
         "a dotted `obj.execute` callee must not resolve — the adapter must narrow it first"
+    );
+}
+
+// ---- (E) same-file receiver-qualified calls ----
+//
+// Every linker tier that matches a BARE method leaf considers cross-file
+// candidates only: the exact-name bucket filters out the calling file, and so
+// does the bare-name receiver tier. Only the same-file exact tier can bind
+// within one file, and it needs the qualified name. So a JavaScript adapter
+// that narrowed `helpers.normalize()` to `normalize` made a sibling call inside
+// one object literal permanently unresolvable, while the SAME call from another
+// file resolved.
+
+/// A call between two methods of the same object literal, in one file, must
+/// produce exactly one edge to the sibling.
+#[test]
+fn javascript_object_literal_sibling_call_resolves_in_one_file() {
+    let files = vec![parse_with(
+        &JavaScriptAdapter,
+        "helpers.js",
+        "const helpers = {\n  normalize(p) { return String(p).trim(); },\n  join(a, b) { return helpers.normalize(a) + '/' + helpers.normalize(b); },\n};\nmodule.exports = helpers;\n",
+    )];
+    let join = entity_id_in(&files, "helpers.js", "helpers.join");
+    let normalize = entity_id_in(&files, "helpers.js", "helpers.normalize");
+
+    let rels = link_cross_file(&files);
+    assert!(
+        has_call(&rels, join, normalize),
+        "`helpers.join` calls `helpers.normalize` in the same file and must link to it"
+    );
+    let sibling_edges = rels
+        .iter()
+        .filter(|r| {
+            r.kind == RelationKind::Calls
+                && r.src == GraphNodeId::Entity(join)
+                && r.dst == GraphNodeId::Entity(normalize)
+        })
+        .count();
+    assert_eq!(
+        sibling_edges, 1,
+        "exactly one edge to the sibling, not one per call site"
+    );
+}
+
+/// The same contract for a `this.` call inside an ES class body, which had the
+/// identical blind spot and no test.
+#[test]
+fn javascript_class_this_call_resolves_in_one_file() {
+    let files = vec![parse_with(
+        &JavaScriptAdapter,
+        "helpers.js",
+        "class Helpers {\n  normalize(p) { return String(p).trim(); }\n  join(a, b) { return this.normalize(a) + this.normalize(b); }\n}\n",
+    )];
+    let join = entity_id_in(&files, "helpers.js", "Helpers.join");
+    let normalize = entity_id_in(&files, "helpers.js", "Helpers.normalize");
+    assert!(
+        has_call(&link_cross_file(&files), join, normalize),
+        "`this.normalize()` inside `Helpers.join` must link to `Helpers.normalize`"
+    );
+}
+
+/// A receiver that is NOT the enclosing owner keeps its bare leaf, so nothing
+/// claims a resolution the syntax does not settle. `this.router.handle(...)` is
+/// a call through a property whose type is unknown; it must not bind to a
+/// same-named method of the enclosing object.
+#[test]
+fn javascript_foreign_receiver_does_not_bind_to_the_enclosing_owner() {
+    let files = vec![parse_with(
+        &JavaScriptAdapter,
+        "application.js",
+        "app.handle = function handle(req, res) {\n  this.router.handle(req, res);\n};\n",
+    )];
+    let handle = entity_id_in(&files, "application.js", "app.handle");
+    let rels = link_cross_file(&files);
+    assert!(
+        !has_call(&rels, handle, handle),
+        "`this.router.handle()` must not be read as `app.handle` calling itself"
+    );
+}
+
+// ---- (F) receiver-method fan-out narrowed by what the calling file can reach ----
+//
+// A call through an object dispatches on the receiver's static type. The
+// bare-name fan-out cannot know that type, so it once linked EVERY same-named
+// method in the repository, minting inbound callers a method provably never
+// had. Narrowing to the candidates the calling file's own imports account for
+// removes those without collapsing a genuine ambiguity to a guess.
+
+fn python_call_fixture(files: &[(&str, &str)]) -> Vec<FileParseData> {
+    files
+        .iter()
+        .map(|(path, src)| parse_with(&PythonAdapter, path, src))
+        .collect()
+}
+
+const ADAPTER_PY: &str = "class Adapter:\n    def send(self, request):\n        return request\n";
+const SESSION_PY: &str = "from .adapter import Adapter\n\n\nclass Session:\n    def __init__(self):\n        self.adapter = Adapter()\n\n    def send(self, request):\n        return self.adapter.send(request)\n";
+
+/// A call through an object must not reach a same-named method whose owning
+/// type the calling file neither binds by name nor imports the module of.
+#[test]
+fn receiver_call_does_not_reach_an_unimportable_owner() {
+    let files = python_call_fixture(&[
+        ("app/adapter.py", ADAPTER_PY),
+        ("app/session.py", SESSION_PY),
+        (
+            "app/pipeline.py",
+            "from .session import Session\n\n\ndef run_all(session):\n    return session.send({})\n",
+        ),
+    ]);
+    let run_all = entity_id_in(&files, "app/pipeline.py", "run_all");
+    let session_send = entity_id_in(&files, "app/session.py", "Session.send");
+    let adapter_send = entity_id_in(&files, "app/adapter.py", "Adapter.send");
+
+    let rels = link_cross_file(&files);
+    assert!(
+        has_call(&rels, run_all, session_send),
+        "`session.send(...)` must still reach `Session.send`, whose type this file imports"
+    );
+    assert!(
+        !has_call(&rels, run_all, adapter_send),
+        "`app/pipeline.py` never names `Adapter`, so `Adapter.send` cannot be this receiver"
+    );
+}
+
+/// A caller whose imports account for none of the candidates has no type
+/// evidence at all, and must keep the whole fan-out rather than lose every
+/// candidate to a rule that could not see any of them.
+#[test]
+fn receiver_call_with_no_import_evidence_still_fans_out() {
+    let files = python_call_fixture(&[
+        (
+            "app/a.py",
+            "class A:\n    def run(self):\n        return 1\n",
+        ),
+        (
+            "app/b.py",
+            "class B:\n    def run(self):\n        return 2\n",
+        ),
+        ("app/c.py", "def go(thing):\n    return thing.run()\n"),
+    ]);
+    let go = entity_id_in(&files, "app/c.py", "go");
+    let a_run = entity_id_in(&files, "app/a.py", "A.run");
+    let b_run = entity_id_in(&files, "app/b.py", "B.run");
+
+    let rels = link_cross_file(&files);
+    assert!(
+        has_call(&rels, go, a_run) && has_call(&rels, go, b_run),
+        "a file naming no candidate owner keeps every dispatch target"
+    );
+}
+
+/// A caller that CAN name both candidate owners is genuinely ambiguous, and the
+/// fan-out must stay ambiguous rather than pick one.
+#[test]
+fn receiver_call_naming_both_owners_keeps_both() {
+    let files = python_call_fixture(&[
+        (
+            "app/a.py",
+            "class A:\n    def run(self):\n        return 1\n",
+        ),
+        (
+            "app/b.py",
+            "class B:\n    def run(self):\n        return 2\n",
+        ),
+        (
+            "app/c.py",
+            "from .a import A\nfrom .b import B\n\n\ndef go(thing):\n    return thing.run()\n",
+        ),
+    ]);
+    let go = entity_id_in(&files, "app/c.py", "go");
+    let a_run = entity_id_in(&files, "app/a.py", "A.run");
+    let b_run = entity_id_in(&files, "app/b.py", "B.run");
+
+    let rels = link_cross_file(&files);
+    assert!(
+        has_call(&rels, go, a_run) && has_call(&rels, go, b_run),
+        "both owners are nameable here, so both stay dispatch candidates"
     );
 }

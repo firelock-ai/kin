@@ -204,7 +204,7 @@ fn extract_js_node(
                     span: span_from_node(node, file_id),
                 });
                 // Extract calls within function body
-                extract_calls_from_context(node, source, &name, relations);
+                extract_calls_from_context(node, source, &name, None, relations);
             }
         }
         "class_declaration" => {
@@ -296,7 +296,7 @@ fn extract_js_node(
                 });
                 if let Some(value_node) = value_node.filter(is_js_function_like_node) {
                     let context_name = name_node.utf8_text(source).unwrap_or("");
-                    extract_calls_from_context(&value_node, source, context_name, relations);
+                    extract_calls_from_context(&value_node, source, context_name, None, relations);
                 }
                 // `const utils = { parse() {}, print: () => {} }` is a namespace
                 // object whose function properties are the methods it owns.
@@ -620,7 +620,7 @@ fn extract_js_assignment_target(
                     dst_name: qualified.clone(),
                     import_source: None,
                 });
-                extract_calls_from_context(value, source, &qualified, relations);
+                extract_calls_from_context(value, source, &qualified, Some(owner), relations);
             }
             return;
         }
@@ -639,7 +639,7 @@ fn extract_js_assignment_target(
                     fingerprint: compute_fingerprint(&function_node, source),
                     span: span_from_node(&function_node, file_id),
                 });
-                extract_calls_from_context(&function_node, source, &property_name, relations);
+                extract_calls_from_context(&function_node, source, &property_name, None, relations);
             }
             return;
         }
@@ -673,7 +673,7 @@ fn extract_js_assignment_target(
         fingerprint: compute_fingerprint(stmt, source),
         span: span_from_node(stmt, file_id),
     });
-    extract_calls_from_context(value, source, &name, relations);
+    extract_calls_from_context(value, source, &name, None, relations);
 }
 
 /// The function-valued properties of an object literal, as
@@ -758,7 +758,7 @@ pub(super) fn extract_js_object_methods(
             dst_name: qualified.clone(),
             import_source: None,
         });
-        extract_calls_from_context(&function_node, source, &qualified, relations);
+        extract_calls_from_context(&function_node, source, &qualified, Some(owner), relations);
     }
 }
 
@@ -862,7 +862,7 @@ fn extract_js_class_like(
             import_source: None,
         });
         // Extract calls within method body
-        extract_calls_from_context(&member, source, &qualified, relations);
+        extract_calls_from_context(&member, source, &qualified, Some(name), relations);
     }
 }
 
@@ -920,17 +920,52 @@ fn extract_preceding_comment(node: &tree_sitter::Node, source: &[u8]) -> Option<
     }
 }
 
+/// Whether a member call's receiver is provably the enclosing owner: `this.m()`
+/// inside one of the owner's own methods, or `Owner.m()` naming the owner's own
+/// binding from inside it.
+///
+/// Both are settled by the syntax rather than guessed, which is what lets the
+/// callee be recorded owner-qualified. Any other receiver is a value that could
+/// hold anything at run time (a parameter, an imported binding, a property chain
+/// such as `this.router.handle`), so it keeps its bare leaf.
+fn js_receiver_is_enclosing_owner(
+    function: &tree_sitter::Node,
+    source: &[u8],
+    owner: &str,
+) -> bool {
+    let Some(object) = function.child_by_field_name("object") else {
+        return false;
+    };
+    match object.kind() {
+        "this" => true,
+        "identifier" => object.utf8_text(source).is_ok_and(|text| text == owner),
+        _ => false,
+    }
+}
+
 /// Extract all function/method calls within a function/method body.
 ///
-/// For a `call_expression`, the `function` field is the callee. We unpack
-/// `member_expression` callees to the rightmost identifier (`a.b()` -> `b`),
-/// so graph edges key on the simple method name rather than the dotted
-/// source text. `new X()` is a `new_expression` (not `call_expression`) and
-/// is intentionally skipped here.
-fn extract_calls_from_context(
+/// For a `call_expression`, the `function` field is the callee. A
+/// `member_expression` callee normally unpacks to the rightmost identifier
+/// (`a.b()` -> `b`), so graph edges key on the simple method name rather than
+/// the dotted source text.
+///
+/// `owner` names the class or receiver object whose method body this is, when
+/// there is one. A call through that same owner is recorded as `Owner.method`,
+/// the same key the adapter gives the method entity itself, which is how a
+/// sibling method in one file becomes reachable: every tier that matches a bare
+/// method leaf considers cross-file candidates only, so only the exact same-file
+/// tier can bind a sibling and it needs the qualified name. Where the qualified
+/// name matches no entity the linker falls back to the bare leaf, so recall
+/// never drops below the unqualified behavior.
+///
+/// `new X()` is a `new_expression` (not `call_expression`) and is intentionally
+/// skipped here.
+pub(super) fn extract_calls_from_context(
     node: &tree_sitter::Node,
     source: &[u8],
     context_name: &str,
+    owner: Option<&str>,
     relations: &mut Vec<ExtractedRelation>,
 ) {
     let mut cursor = node.walk();
@@ -938,14 +973,22 @@ fn extract_calls_from_context(
         if child.kind() == "call_expression" {
             if let Some(function) = child.child_by_field_name("function") {
                 let callee_name = match function.kind() {
-                    "member_expression" => function
-                        .child_by_field_name("property")
-                        .map(|f| f.utf8_text(source).unwrap_or("").to_string())
-                        .unwrap_or_default(),
-                    "identifier" => {
-                        let raw = function.utf8_text(source).unwrap_or("");
-                        raw.strip_prefix("this.").unwrap_or(raw).to_string()
+                    "member_expression" => {
+                        let property = function
+                            .child_by_field_name("property")
+                            .map(|f| f.utf8_text(source).unwrap_or("").to_string())
+                            .unwrap_or_default();
+                        match owner {
+                            Some(owner)
+                                if !property.is_empty()
+                                    && js_receiver_is_enclosing_owner(&function, source, owner) =>
+                            {
+                                format!("{owner}.{property}")
+                            }
+                            _ => property,
+                        }
                     }
+                    "identifier" => function.utf8_text(source).unwrap_or("").to_string(),
                     _ => String::new(),
                 };
                 if is_valid_callee_name(&callee_name) {
@@ -960,7 +1003,7 @@ fn extract_calls_from_context(
                 }
             }
         }
-        extract_calls_from_context(&child, source, context_name, relations);
+        extract_calls_from_context(&child, source, context_name, owner, relations);
     }
 }
 
