@@ -3277,6 +3277,17 @@ fn process_liveness(pid: u32) -> Liveness {
     }
 }
 
+/// Whether `pid` is provably still running.
+///
+/// One-directional in the same sense [`recorded_owner_is_alive`] is: `true` is
+/// positive proof of life, and every other outcome is the absence of proof
+/// rather than proof of death. It exists for readers holding a pid from a
+/// record other than the PID file, such as the open-transaction marker a daemon
+/// killed mid-commit leaves behind.
+pub fn process_is_alive(pid: u32) -> bool {
+    matches!(process_liveness(pid), Liveness::Alive)
+}
+
 /// Whether the daemon recorded for `kin_root` is provably still running.
 ///
 /// [`startup_disposition`] answers this with `Child::try_wait`, which only the

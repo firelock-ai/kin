@@ -173,22 +173,29 @@ enum LostReply {
     Gone,
 }
 
-/// Decide what a lost reply means from the two facts on disk.
+/// Decide what a lost reply means from the facts on disk.
 ///
 /// Separated from the reads so the decision can be tested against every
-/// combination of them, including the one that matters: a receipt present means
-/// landed no matter what the marker says, because a daemon that finished this
-/// commit and went on to another transaction still publishes a marker.
+/// combination of them, including the two that are easy to get wrong. A receipt
+/// means landed no matter what the marker says, because a daemon that finished
+/// this commit and went on to other work still publishes a marker. And a marker
+/// is trusted only while the daemon that wrote it is still running: a daemon
+/// killed mid-commit never retires its marker, and the kernel's OOM killer
+/// leaves no note behind either, so a beat alone would report a dead daemon's
+/// abandoned commit as still in flight.
 fn classify_lost_reply(
     landed: Option<DaemonCommitResult>,
     open: Option<kin_daemon_spawn::OpenTransaction>,
     now_unix: u64,
+    is_alive: impl Fn(u32) -> bool,
 ) -> LostReply {
     if let Some(result) = landed {
         return LostReply::Landed(Box::new(result));
     }
     match open {
-        Some(open) if open.is_beating(now_unix) => LostReply::StillRunning(open.summary()),
+        Some(open) if open.is_beating(now_unix) && is_alive(open.pid) => {
+            LostReply::StillRunning(open.summary())
+        }
         _ => LostReply::Gone,
     }
 }
@@ -223,6 +230,7 @@ fn resolve_commit_after_lost_reply(
         landed,
         kin_daemon_spawn::read_open_transaction(kin_root),
         unix_now(),
+        kin_daemon_spawn::process_is_alive,
     ) {
         LostReply::Landed(result) => {
             if !quiet {
@@ -558,7 +566,12 @@ mod tests {
     /// and moved on to other work is still mid-transaction.
     #[test]
     fn a_lost_reply_whose_operation_reached_authority_is_a_successful_commit() {
-        match classify_lost_reply(Some(landed_result()), Some(open_commit(1_000)), 1_005) {
+        match classify_lost_reply(
+            Some(landed_result()),
+            Some(open_commit(1_000)),
+            1_005,
+            |_| true,
+        ) {
             LostReply::Landed(result) => {
                 assert_eq!(result.change_id, "5b8ca7b7");
                 assert_eq!(result.entity_count, 32);
@@ -574,7 +587,7 @@ mod tests {
     /// is what wrote the empty change.
     #[test]
     fn a_lost_reply_with_a_beating_daemon_is_still_running_rather_than_failed() {
-        match classify_lost_reply(None, Some(open_commit(1_000)), 1_030) {
+        match classify_lost_reply(None, Some(open_commit(1_000)), 1_030, |_| true) {
             LostReply::StillRunning(open) => assert!(
                 open.contains("commit in phase reconcile_workspace_and_commit_authority for 213s"),
                 "the report must name the phase and its age: {open}"
@@ -585,13 +598,26 @@ mod tests {
         let quiet = 1_000 + kin_daemon_spawn::TRANSACTION_BEAT_STALE_AFTER.as_secs() + 5;
         assert!(
             matches!(
-                classify_lost_reply(None, Some(open_commit(1_000)), quiet),
+                classify_lost_reply(None, Some(open_commit(1_000)), quiet, |_| true),
                 LostReply::Gone
             ),
             "a marker that stopped beating proves nothing is in flight"
         );
+        // The shape the reported OOM kills took: the daemon died holding the
+        // marker, and the kernel that killed it wrote no note, so the marker is
+        // the only thing left and it is still beating from seconds ago.
         assert!(
-            matches!(classify_lost_reply(None, None, 1_030), LostReply::Gone),
+            matches!(
+                classify_lost_reply(None, Some(open_commit(1_000)), 1_030, |_| false),
+                LostReply::Gone
+            ),
+            "a marker belonging to a dead daemon is a leftover, not work in flight"
+        );
+        assert!(
+            matches!(
+                classify_lost_reply(None, None, 1_030, |_| true),
+                LostReply::Gone
+            ),
             "no receipt and no marker is a commit that failed, and must still report failure"
         );
     }
