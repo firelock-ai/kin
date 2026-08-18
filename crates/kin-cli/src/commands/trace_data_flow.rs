@@ -471,6 +471,12 @@ pub struct TraceDataFlowResponse {
     /// through. Echoed because it is the parameter a caller reading a
     /// `type_annotation` terminal has to change, and a caller cannot otherwise
     /// tell a walk that had no such edges from one that refused them.
+    ///
+    /// Defaulted on read, because the CLI parses this payload from whatever
+    /// daemon is already running. A daemon started before this parameter
+    /// existed answers without the key, and a required field would turn that
+    /// ordinary upgrade window into a failed call rather than a chain.
+    #[serde(default)]
     pub include_type_edges: bool,
     /// The ordered chain of steps reached from the focal. Already deduplicated
     /// (each entity appears at most once), ordered per node by relevance rather
@@ -690,16 +696,24 @@ pub fn build_trace_data_flow_response_within(
         .flatten();
     let focal_entity_record = entity_record(&focal_entity, focal_record.as_ref());
 
-    // `UsesType` is admitted so an annotation target is a NAMED leaf rather than
-    // a symbol the walk silently never mentions, and so `include_type_edges` has
-    // an edge to open. Whether it is walked through is decided per step, below.
+    // The kinds a data-flow claim actually rests on.
     let reference_kinds = [
         RelationKind::Calls,
         RelationKind::Imports,
         RelationKind::References,
-        RelationKind::UsesType,
     ];
-    let allowed: HashSet<RelationKind> = reference_kinds.iter().copied().collect();
+    // `UsesType` is walkable only in the sense that it can REACH a step:
+    // admitted so an annotation target is a NAMED leaf rather than a symbol the
+    // walk silently never mentions, and so `include_type_edges` has an edge to
+    // open. Whether it is walked THROUGH is decided per step, below. It is kept
+    // out of `reference_kinds` to match the arm in `kin_mcp`, where that array
+    // is also what the coverage observation is measured against and an
+    // annotation edge must not join it.
+    let allowed: HashSet<RelationKind> = reference_kinds
+        .iter()
+        .copied()
+        .chain(std::iter::once(RelationKind::UsesType))
+        .collect();
 
     let mut chain: Vec<TraceStep> = Vec::new();
     let mut visited: HashSet<EntityId> = HashSet::new();
@@ -2745,6 +2759,35 @@ mod tests {
         assert!(response.chain.iter().all(|step| step.terminal.is_none()));
         assert_eq!(response.terminal_annotation_steps, 0);
         assert!(response.include_type_edges);
+    }
+
+    /// The CLI parses this payload from whatever daemon is already running, and
+    /// a daemon started before this parameter existed answers without the key.
+    /// A required field would turn that ordinary upgrade window into a failed
+    /// call rather than a chain.
+    #[test]
+    fn a_payload_from_a_daemon_that_never_had_the_parameter_still_parses() {
+        let graph = InMemoryGraph::new();
+        let focal = make_entity("send", "src/sessions.rs");
+        let focal_id = focal.id;
+        graph.upsert_entity(&focal).unwrap();
+        let mut request = trace_request(&focal_id, 1, TraceDirection::Calls, 5);
+        request.include_body = Some(false);
+        let response = traced(&graph, &request);
+
+        let mut payload = serde_json::to_value(&response).unwrap();
+        payload
+            .as_object_mut()
+            .unwrap()
+            .remove("include_type_edges")
+            .expect("the fixture must carry the key or its removal proves nothing");
+
+        let parsed: TraceDataFlowResponse = serde_json::from_value(payload)
+            .expect("a response without include_type_edges must still deserialize");
+        assert!(
+            !parsed.include_type_edges,
+            "a daemon that never had the parameter never walked a type edge"
+        );
     }
 
     /// An ordinary chain must be untouched by both gates, or the fix would have
