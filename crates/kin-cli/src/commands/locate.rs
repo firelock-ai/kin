@@ -201,6 +201,23 @@ pub struct GraphBodyCoverage {
     /// daemon logging. Capped at [`GRAPH_BODY_GAP_SAMPLE`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sample: Vec<String>,
+    /// Source paths the role filter removed from `source_paths` before any of
+    /// the counters above were taken.
+    ///
+    /// Without this the coverage report is scoped by the same filter it is
+    /// supposed to disclose, so it can never disclose it: a twelve-file
+    /// repository with six test files reported `source_paths: 6` and
+    /// `complete: true`, which is a true statement about a population the
+    /// caller was never told had been narrowed. Zero is serialized away, so a
+    /// repository whose tests were all admitted carries the payload it always
+    /// did.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub withheld_test_paths: usize,
+}
+
+/// Serde predicate for a count that means "nothing to disclose".
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 /// Gap paths named in [`GraphBodyCoverage::sample`]. Enough to recognize a
@@ -213,6 +230,7 @@ impl GraphBodyCoverage {
     /// authority, and the subset it resolved a body for.
     fn observe<'a>(
         source_paths: impl IntoIterator<Item = &'a String>,
+        withheld_test_paths: usize,
         has_body: impl Fn(&str) -> bool,
     ) -> Self {
         let mut total = 0usize;
@@ -237,12 +255,18 @@ impl GraphBodyCoverage {
             with_body,
             gap_paths,
             sample: gaps,
+            withheld_test_paths,
         }
     }
 
     /// Whether ranking ran against an incomplete body set.
     fn has_gap(&self) -> bool {
         self.gap_paths > 0
+    }
+
+    /// Whether the role filter narrowed the population the counters describe.
+    fn withholds_tests(&self) -> bool {
+        self.withheld_test_paths > 0
     }
 }
 
@@ -1651,6 +1675,24 @@ impl SemanticCoverage {
     /// overwritten, since both causes can hold at once and the caller needs to
     /// know which remediation applies.
     pub fn with_graph_bodies(mut self, bodies: GraphBodyCoverage) -> Self {
+        if bodies.withholds_tests() {
+            // Completeness is a claim about the population the caller asked
+            // about, and this one was narrowed before the counters were taken.
+            // Saying `complete: true` over it is the defect: the caller cannot
+            // tell a repository whose every path was covered from one where
+            // half the paths were removed from the question.
+            self.complete = false;
+            let withheld_note = format!(
+                "role filter: {} test-role source path(s) were withheld from ranking and from \
+                 the counters beside this note, so completeness is claimed over source paths \
+                 only; pass include_tests to rank them.",
+                bodies.withheld_test_paths
+            );
+            self.note = Some(match self.note.take() {
+                Some(existing) => format!("{existing} {withheld_note}"),
+                None => withheld_note,
+            });
+        }
         if bodies.has_gap() {
             self.complete = false;
             let gap_note = format!(
@@ -1924,6 +1966,7 @@ fn graph_source_path_set(graph: &kin_db::InMemoryGraph) -> HashSet<String> {
 fn merge_graph_entity_bodies(
     graph: &kin_db::InMemoryGraph,
     source_paths: &HashSet<String>,
+    scope: LocateScope,
     previews: &mut HashMap<String, String>,
 ) {
     let Ok(entities) = graph.query_entities(&EntityFilter::default()) else {
@@ -1934,7 +1977,10 @@ fn merge_graph_entity_bodies(
         let Some(path) = entity.file_origin.as_ref().map(|origin| origin.0.as_str()) else {
             continue;
         };
-        if previews.contains_key(path) || !source_paths.contains(path) || is_test_path(path) {
+        if previews.contains_key(path)
+            || !source_paths.contains(path)
+            || (!scope.include_tests && is_test_path(path))
+        {
             continue;
         }
         let Some(body) = entity
@@ -1969,6 +2015,44 @@ pub struct LocatePaging {
     pub page_size: Option<usize>,
 }
 
+/// Which entity roles a locate is allowed to return.
+///
+/// Test-role entities are demoted, and in several stages excluded outright,
+/// unless the query itself reads as being about tests. That default is right
+/// for the query it was built for ("where does this feature live"), and wrong
+/// for the caller who knows exactly what it is asking for: on a repository
+/// whose test files hold half the entities, `semantic_locate` could not return
+/// one at all, while `kin search` and `kin refs` returned the same entity first
+/// try on the same daemon. A keyword heuristic over the query text
+/// ([`is_test_query`]) is the only thing that lifted the demotion, and a caller
+/// has no way to say "I mean it" to a heuristic.
+///
+/// The default is tests EXCLUDED, so every existing caller keeps the ranking it
+/// has today.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LocateScope {
+    /// Rank test-role entities alongside source, and keep test paths in the
+    /// body set the term loops read.
+    pub include_tests: bool,
+}
+
+impl LocateScope {
+    /// The documented default: tests are withheld from ranking.
+    pub const SOURCE_ONLY: Self = Self {
+        include_tests: false,
+    };
+
+    /// Tests are ranked alongside source, because the caller said so.
+    pub const WITH_TESTS: Self = Self {
+        include_tests: true,
+    };
+
+    /// From a request flag.
+    pub fn with_tests(include_tests: bool) -> Self {
+        Self { include_tests }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     text: &str,
@@ -1980,6 +2064,7 @@ pub async fn run(
     reference: Option<String>,
     snippets: bool,
     paging: LocatePaging,
+    scope: LocateScope,
 ) -> Result<()> {
     let _span = tracing::info_span!(
         "kin.locate",
@@ -2001,6 +2086,7 @@ pub async fn run(
         // entity ranking whether or not it asked for bodies.
         json,
         paging,
+        scope,
     )
     .await?;
     // Persist the paging cursor so `kin locate --next` can fetch the next page
@@ -2028,6 +2114,7 @@ pub async fn capture(
     snippets: bool,
     entity_surface: bool,
     paging: LocatePaging,
+    scope: LocateScope,
 ) -> Result<LocateResult> {
     let layout = crate::commands::require_repository_layout()?;
     if locate_env_bool("KIN_LOCATE_FORCE_LOCAL", false) {
@@ -2047,6 +2134,7 @@ pub async fn capture(
         snippets,
         entity_surface,
         paging,
+        scope,
     )
     .await?;
     record_locate_telemetry(&layout, text, max_files, &result);
@@ -2134,6 +2222,7 @@ async fn try_locate_via_daemon(
     snippets: bool,
     entity_surface: bool,
     paging: LocatePaging,
+    scope: LocateScope,
 ) -> Result<LocateResult> {
     let daemon_url = std::env::var("KIN_DAEMON_URL")
         .ok()
@@ -2155,6 +2244,7 @@ async fn try_locate_via_daemon(
         entity_surface,
         cursor: paging.cursor,
         page_size: paging.page_size,
+        include_tests: scope.include_tests,
     };
     client
         .locate(&request)
@@ -2239,6 +2329,7 @@ pub fn run_with_graph_capture_with_priority_files(
         SnippetOptions::default(),
         None,
         kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+        LocateScope::SOURCE_ONLY,
     )
 }
 
@@ -2255,6 +2346,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     snippet_opts: SnippetOptions,
     repository_authority: Option<&kin_mcp::handlers::RequestRepositoryAuthority>,
     source_scope: kin_mcp::handlers::common::EntitySourceScope,
+    scope: LocateScope,
 ) -> Result<LocateResult> {
     run_with_graph_capture_budgeted(
         graph,
@@ -2268,6 +2360,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         snippet_opts,
         repository_authority,
         source_scope,
+        scope,
         LocateBudget::from_env(),
     )
 }
@@ -2288,6 +2381,35 @@ fn run_with_graph_capture_in_workspace_budgeted(
     max_files_explicit: bool,
     budget: LocateBudget,
 ) -> Result<LocateResult> {
+    run_with_graph_capture_in_workspace_budgeted_scoped(
+        graph,
+        workspace_root,
+        text,
+        explain,
+        max_files,
+        max_files_explicit,
+        LocateScope::SOURCE_ONLY,
+        budget,
+    )
+}
+
+/// The shape above, with the role scope taken by argument.
+///
+/// Separate so the default stays stated once and every existing assertion keeps
+/// running under it, while a test about the scope can vary the one input it is
+/// about.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn run_with_graph_capture_in_workspace_budgeted_scoped(
+    graph: &kin_db::InMemoryGraph,
+    workspace_root: Option<&std::path::Path>,
+    text: &str,
+    explain: bool,
+    max_files: usize,
+    max_files_explicit: bool,
+    scope: LocateScope,
+    budget: LocateBudget,
+) -> Result<LocateResult> {
     run_with_graph_capture_budgeted(
         graph,
         workspace_root,
@@ -2300,6 +2422,7 @@ fn run_with_graph_capture_in_workspace_budgeted(
         SnippetOptions::default(),
         None,
         kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+        scope,
         budget,
     )
 }
@@ -2323,6 +2446,7 @@ fn run_with_graph_capture_budgeted(
     snippet_opts: SnippetOptions,
     repository_authority: Option<&kin_mcp::handlers::RequestRepositoryAuthority>,
     source_scope: kin_mcp::handlers::common::EntitySourceScope,
+    scope: LocateScope,
     mut budget: LocateBudget,
 ) -> Result<LocateResult> {
     let _span = tracing::info_span!(
@@ -2358,7 +2482,11 @@ fn run_with_graph_capture_budgeted(
     // tier some retrieval signals are off, and that must never be silent — nor
     // must a tier that a failed host probe, rather than the host, chose.
     record_capability_tier_degradation(&detection, &mut degradations);
-    let test_query = is_test_query(text);
+    // A caller that asked for tests outranks the keyword heuristic. Folding the
+    // ask into `test_query` is what makes every stage that already respects the
+    // heuristic respect the ask too, rather than adding a second, differently
+    // spelled exemption to each of them.
+    let test_query = scope.include_tests || is_test_query(text);
     let text_lower = text.to_ascii_lowercase();
     let source_text_priority_query = test_query
         || query_mentions_cli_flags(text)
@@ -2499,7 +2627,7 @@ fn run_with_graph_capture_budgeted(
         )
     } else {
         let phase_start = std::time::Instant::now();
-        let result = resolve_entities_to_files(&all_entity_seeds, graph, explain, "text")?;
+        let result = resolve_entities_to_files(&all_entity_seeds, graph, explain, "text", scope)?;
         if phase_start.elapsed().as_secs_f64()
             > budget
                 .phase_budgets
@@ -2544,7 +2672,7 @@ fn run_with_graph_capture_budgeted(
             _embed_signal_scores,
             embed_symbols,
             embed_candidate_stages,
-        ) = resolve_entities_to_files(&embedding_entity_seeds, graph, explain, "vector")?;
+        ) = resolve_entities_to_files(&embedding_entity_seeds, graph, explain, "vector", scope)?;
         if phase_start.elapsed().as_secs_f64()
             > budget
                 .phase_budgets
@@ -2600,7 +2728,7 @@ fn run_with_graph_capture_budgeted(
         HashMap::new()
     } else {
         let phase_start = std::time::Instant::now();
-        let signals = extract_source_text_signals(text, graph)?;
+        let signals = extract_source_text_signals_scoped(text, graph, scope)?;
         if phase_start.elapsed().as_secs_f64()
             > budget
                 .phase_budgets
@@ -2629,6 +2757,24 @@ fn run_with_graph_capture_budgeted(
     // the remediation.
     let semantic_coverage = match graph_body_coverage {
         Some(bodies) => {
+            if bodies.withholds_tests() {
+                record_degradation(
+                    &mut degradations,
+                    RetrievalDegradation {
+                        component: "graph_role_filter".to_string(),
+                        reason: "tests_withheld".to_string(),
+                        detail: format!(
+                            "{} test-role source path(s) were kept out of ranking and out of \
+                             the graph_bodies counters; an entity defined only in one of them \
+                             could not be returned by this query",
+                            bodies.withheld_test_paths
+                        ),
+                        remediation: "pass include_tests to rank test-role entities alongside \
+                                      source, or name the entity in the query"
+                            .to_string(),
+                    },
+                );
+            }
             if bodies.has_gap() {
                 record_degradation(
                     &mut degradations,
@@ -2960,6 +3106,7 @@ fn run_with_graph_capture_budgeted(
             &all_entity_seeds,
             &embedding_entity_seeds,
             graph,
+            scope,
         )?
     } else {
         match track {
@@ -3160,7 +3307,7 @@ fn run_with_graph_capture_budgeted(
         };
         // Re-attach entity identity (dropped at the FileHit/entity→file seam) to
         // resolved files for observability. Read-only; never feeds ranking.
-        let resolve_identity = entity_resolve_identity(&all_entity_seeds, graph)?;
+        let resolve_identity = entity_resolve_identity(&all_entity_seeds, graph, scope)?;
         Some(LocateDebugInfo {
             scoring_track: Some(format!("{track:?}")),
             retrieval_profile: Some(quality.name().to_string()),
@@ -4539,6 +4686,7 @@ pub fn run_with_graph_capture_at_ref(
     max_files: usize,
     max_files_explicit: bool,
     snippet_opts: SnippetOptions,
+    scope: LocateScope,
 ) -> Result<LocateResult> {
     let authority =
         crate::commands::repository_authority::ActiveRepositoryAuthority::open(binding)?;
@@ -4556,6 +4704,7 @@ pub fn run_with_graph_capture_at_ref(
         max_files,
         max_files_explicit,
         snippet_opts,
+        scope,
         LocateBudget::from_env(),
     )
 }
@@ -4571,6 +4720,7 @@ fn run_with_repository_authority_capture_at_ref<B>(
     max_files: usize,
     max_files_explicit: bool,
     snippet_opts: SnippetOptions,
+    scope: LocateScope,
     budget: LocateBudget,
 ) -> Result<LocateResult>
 where
@@ -4600,6 +4750,7 @@ where
         snippet_opts,
         repository_authority,
         kin_mcp::handlers::common::EntitySourceScope::At(*head),
+        scope,
         budget,
     )
 }
@@ -9819,9 +9970,24 @@ struct SourceTextSignals {
     graph_bodies: Option<GraphBodyCoverage>,
 }
 
+/// Source-text signals under the default scope: tests withheld.
+///
+/// The two-argument form every assertion about term hits already uses. Production
+/// takes its scope from the request, so this shape has no caller outside the test
+/// module and is gated accordingly; a test that is about the scope calls
+/// [`extract_source_text_signals_scoped`] directly.
+#[cfg(test)]
 fn extract_source_text_signals(
     text: &str,
     graph: &kin_db::InMemoryGraph,
+) -> Result<SourceTextSignals> {
+    extract_source_text_signals_scoped(text, graph, LocateScope::SOURCE_ONLY)
+}
+
+fn extract_source_text_signals_scoped(
+    text: &str,
+    graph: &kin_db::InMemoryGraph,
+    scope: LocateScope,
 ) -> Result<SourceTextSignals> {
     let _span =
         tracing::info_span!("locate.extract_source_text_signals", text_len = text.len()).entered();
@@ -9849,7 +10015,7 @@ fn extract_source_text_signals(
         .into_iter()
         .filter_map(|artifact| {
             let path = artifact.file_id.0;
-            if !source_paths.contains(&path) || is_test_path(&path) {
+            if !source_paths.contains(&path) || (!scope.include_tests && is_test_path(&path)) {
                 return None;
             }
             let preview = artifact.text_preview?;
@@ -9861,7 +10027,7 @@ fn extract_source_text_signals(
         .filter(|(_, preview)| preview.len() > 1024)
         .map(|(path, _)| path.clone())
         .collect();
-    merge_graph_entity_bodies(graph, &source_paths, &mut source_previews);
+    merge_graph_entity_bodies(graph, &source_paths, scope, &mut source_previews);
     let preview_source_texts: HashMap<String, String> = source_previews
         .iter()
         .map(|(path, preview)| (path.clone(), preview.to_ascii_lowercase()))
@@ -9873,18 +10039,25 @@ fn extract_source_text_signals(
         .collect();
 
     // Measure body coverage here, against exactly the two sets the term loops
-    // below consult. Scope is `source_paths` minus test paths, because
-    // `source_previews` excludes test paths by construction and counting them as
-    // gaps would report a hole the ranking path never had.
+    // below consult, and report separately how many paths were kept out of that
+    // scope. Counting withheld test paths as body GAPS would report a hole the
+    // ranking path never had; counting them nowhere at all is what let a
+    // twelve-file repository answer `source_paths: 6, complete: true` without a
+    // word about the other six. They are two different facts and the payload now
+    // carries both.
     //
     // Every miss the loops take also emits a `kin.locate.graph_gap` warning, one
     // per path per term, which is why a session logs far more warnings than it
     // has body-less paths. This is the same fact stated once, as a number, on
     // the payload.
-    let graph_bodies = GraphBodyCoverage::observe(
-        source_paths.iter().filter(|path| !is_test_path(path)),
-        |path| preview_source_texts.contains_key(path),
-    );
+    let observed_paths: Vec<&String> = source_paths
+        .iter()
+        .filter(|path| scope.include_tests || !is_test_path(path))
+        .collect();
+    let withheld_test_paths = source_paths.len() - observed_paths.len();
+    let graph_bodies = GraphBodyCoverage::observe(observed_paths, withheld_test_paths, |path| {
+        preview_source_texts.contains_key(path)
+    });
     let mut path_term_support: HashMap<String, HashSet<String>> = HashMap::new();
 
     let mut terms = extract_search_terms(text);
@@ -9971,7 +10144,7 @@ fn extract_source_text_signals(
             let Some(path) = file_path_from_retrieval_key(graph, &retrieval_key) else {
                 continue;
             };
-            if !source_paths.contains(&path) || is_test_path(&path) {
+            if !source_paths.contains(&path) || (!scope.include_tests && is_test_path(&path)) {
                 continue;
             }
             if symbolic
@@ -11226,6 +11399,7 @@ fn resolve_entities_to_files(
     graph: &kin_db::InMemoryGraph,
     explain: bool,
     origin: &str,
+    scope: LocateScope,
 ) -> Result<ResolveEntitiesOutput> {
     let _span = tracing::info_span!(
         "locate.resolve_entities_to_files",
@@ -11430,7 +11604,7 @@ fn resolve_entities_to_files(
 
         if let Some(ref fo) = entity.file_origin {
             let path = &fo.0;
-            if entity_is_test && !discovery.exact_name {
+            if entity_is_test && !discovery.exact_name && !scope.include_tests {
                 // Skip direct attribution for test entities the query does not
                 // literally name, but still follow their graph relations below —
                 // tests call the source that needs fixing. An exactly-named
@@ -11873,6 +12047,7 @@ fn resolve_entities_to_files(
 fn entity_resolve_identity(
     seeds: &HashMap<kin_model::EntityId, EntityDiscovery>,
     graph: &kin_db::InMemoryGraph,
+    scope: LocateScope,
 ) -> Result<HashMap<String, kin_model::EntityId>> {
     let mut ordered: Vec<(&kin_model::EntityId, &EntityDiscovery)> = seeds.iter().collect();
     ordered.sort_by(|a, b| a.0.cmp(b.0));
@@ -11884,7 +12059,10 @@ fn entity_resolve_identity(
         let Some(file_origin) = entity.file_origin.as_ref() else {
             continue;
         };
-        if is_test_by_role(&file_origin.0, Some(&entity)) && !discovery.exact_name {
+        if is_test_by_role(&file_origin.0, Some(&entity))
+            && !discovery.exact_name
+            && !scope.include_tests
+        {
             continue;
         }
         let keep = match best.get(file_origin.0.as_str()) {
@@ -11915,6 +12093,7 @@ fn entity_resolve_identity(
 fn entity_seed_keyed(
     seeds: &HashMap<kin_model::EntityId, EntityDiscovery>,
     graph: &kin_db::InMemoryGraph,
+    scope: LocateScope,
 ) -> Result<Vec<(String, String, f32)>> {
     let mut out: Vec<(String, String, f32)> = Vec::new();
     for (entity_id, discovery) in seeds {
@@ -11924,7 +12103,9 @@ fn entity_seed_keyed(
         let Some(file_origin) = entity.file_origin.as_ref() else {
             continue;
         };
-        if (is_test_by_role(&file_origin.0, Some(&entity)) && !discovery.exact_name)
+        if (is_test_by_role(&file_origin.0, Some(&entity))
+            && !discovery.exact_name
+            && !scope.include_tests)
             || is_vendored_path(&file_origin.0)
         {
             continue;
@@ -12038,9 +12219,10 @@ fn entity_granular_fused_files(
     text_seeds: &HashMap<kin_model::EntityId, EntityDiscovery>,
     embedding_seeds: &HashMap<kin_model::EntityId, EntityDiscovery>,
     graph: &kin_db::InMemoryGraph,
+    scope: LocateScope,
 ) -> Result<Vec<(String, f32)>> {
-    let resolve_keyed = entity_seed_keyed(text_seeds, graph)?;
-    let embedding_keyed = entity_seed_keyed(embedding_seeds, graph)?;
+    let resolve_keyed = entity_seed_keyed(text_seeds, graph, scope)?;
+    let embedding_keyed = entity_seed_keyed(embedding_seeds, graph, scope)?;
     let path_keyed = |list: &[(String, f32)]| -> Vec<(String, String, f32)> {
         list.iter()
             .map(|(path, score)| (path.clone(), path.clone(), *score))
@@ -17694,6 +17876,7 @@ mod tests {
             SnippetOptions::enabled(None),
             None,
             kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+            LocateScope::SOURCE_ONLY,
             LocateBudget::unbounded(),
         )
         .unwrap()
@@ -25088,6 +25271,209 @@ mod tests {
         );
     }
 
+    // ── role scope and its disclosure (FIR-2424) ───────────────────────────
+
+    /// Build a graph whose entities are split evenly between a source file and
+    /// a test file, both carrying graph-owned bodies. This is the twelve-file
+    /// shape the ticket reports, at the smallest size that still has both
+    /// populations.
+    fn graph_with_source_and_test_bodies() -> kin_db::InMemoryGraph {
+        let graph = kin_db::InMemoryGraph::new();
+        let mut source = test_entity("resolve_manifest", "src/manifest.py", 10, 40);
+        source.metadata.extra.insert(
+            "embedding_body_preview".to_string(),
+            serde_json::Value::String("resolve manifest authority for a repository".to_string()),
+        );
+        graph.upsert_entity(&source).unwrap();
+
+        let mut covered = test_entity(
+            "test_resolve_manifest_authority",
+            "tests/test_manifest.py",
+            5,
+            25,
+        );
+        covered.role = EntityRole::Test;
+        covered.metadata.extra.insert(
+            "embedding_body_preview".to_string(),
+            serde_json::Value::String(
+                "assert resolve manifest authority for a repository".to_string(),
+            ),
+        );
+        graph.upsert_entity(&covered).unwrap();
+        graph.flush_text_index().unwrap();
+        graph
+    }
+
+    /// The ticket's coverage half. The counters were scoped by the very filter
+    /// they were supposed to disclose, so a repository whose test files hold
+    /// half the entities answered `source_paths: 6, complete: true` and said
+    /// nothing about the other six. Completeness may not be claimed over a
+    /// population the filter narrowed.
+    #[test]
+    fn the_default_scope_discloses_the_test_paths_it_withheld() {
+        let graph = graph_with_source_and_test_bodies();
+        let signals = extract_source_text_signals_scoped(
+            "resolve manifest",
+            &graph,
+            LocateScope::SOURCE_ONLY,
+        )
+        .unwrap();
+        let bodies = signals
+            .graph_bodies
+            .expect("a graph with source paths reports coverage over them");
+
+        assert_eq!(
+            bodies.withheld_test_paths, 1,
+            "the one test path kept out of ranking must be counted: {bodies:?}"
+        );
+        assert_eq!(
+            bodies.source_paths, 1,
+            "the counters still describe only what ranking saw: {bodies:?}"
+        );
+
+        let coverage = fully_embedded_coverage().with_graph_bodies(bodies);
+        assert!(
+            !coverage.complete,
+            "complete must not be claimed over a population the role filter narrowed"
+        );
+        let note = coverage
+            .note
+            .as_deref()
+            .expect("a cleared flag owes a reason");
+        assert!(
+            note.contains("role filter") && note.contains("include_tests"),
+            "the note must name the cause and the parameter that lifts it: {note}"
+        );
+    }
+
+    /// The control the disclosure needs: when the caller asks for tests, there
+    /// is nothing withheld, the counters cover both populations, and
+    /// completeness is decided by the embedding counters alone again.
+    #[test]
+    fn asking_for_tests_widens_the_population_the_counters_describe() {
+        let graph = graph_with_source_and_test_bodies();
+        let signals =
+            extract_source_text_signals_scoped("resolve manifest", &graph, LocateScope::WITH_TESTS)
+                .unwrap();
+        let bodies = signals
+            .graph_bodies
+            .expect("a graph with source paths reports coverage over them");
+
+        assert_eq!(
+            bodies.withheld_test_paths, 0,
+            "nothing is withheld once the caller asked for it: {bodies:?}"
+        );
+        assert_eq!(
+            bodies.source_paths, 2,
+            "both populations are now in scope: {bodies:?}"
+        );
+        assert!(
+            fully_embedded_coverage().with_graph_bodies(bodies).complete,
+            "with nothing withheld and no body gap, completeness stands"
+        );
+    }
+
+    /// The ticket's returnability half, at the stage that closed the last door.
+    /// A test-role entity the query does not literally name is skipped for
+    /// direct file attribution, so nothing downstream can rank it. An explicit
+    /// ask has to open that door; the exact-name escape was the only key and a
+    /// caller cannot hand a key to a heuristic.
+    #[test]
+    fn a_caller_that_asks_for_tests_gets_direct_attribution_for_a_test_entity() {
+        let graph = kin_db::InMemoryGraph::new();
+        let mut test_fn = test_entity(
+            "verifies_manifest_authority",
+            "tests/test_manifest.py",
+            5,
+            25,
+        );
+        test_fn.role = EntityRole::Test;
+        graph.upsert_entity(&test_fn).unwrap();
+
+        let seeds = HashMap::from([(
+            test_fn.id,
+            EntityDiscovery {
+                score: 22.5,
+                signals: vec!["search"],
+                cosine: None,
+                exact_name: false,
+            },
+        )]);
+
+        let (_, _, _, withheld, _) =
+            resolve_entities_to_files(&seeds, &graph, false, "text", LocateScope::SOURCE_ONLY)
+                .unwrap();
+        assert!(
+            !withheld.contains_key("tests/test_manifest.py"),
+            "the default still withholds a test entity the query does not name"
+        );
+
+        let (_, _, _, admitted, _) =
+            resolve_entities_to_files(&seeds, &graph, false, "text", LocateScope::WITH_TESTS)
+                .unwrap();
+        let symbols = admitted
+            .get("tests/test_manifest.py")
+            .expect("an asked-for test entity must reach direct attribution");
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "verifies_manifest_authority"),
+            "the test entity must appear as a symbol of its own file: {symbols:?}"
+        );
+    }
+
+    fn ranked_paths(graph: &kin_db::InMemoryGraph, query: &str, scope: LocateScope) -> Vec<String> {
+        run_with_graph_capture_in_workspace_budgeted_scoped(
+            graph,
+            None,
+            query,
+            false,
+            5,
+            true,
+            scope,
+            LocateBudget::unbounded(),
+        )
+        .unwrap()
+        .files
+        .into_iter()
+        .map(|file| file.path)
+        .collect()
+    }
+
+    /// The whole pipeline, both directions at once. The ticket's claim is that
+    /// `semantic_locate` structurally cannot return a test-role entity, and the
+    /// first assertion here is that claim reproduced: a query whose terms are
+    /// the test's own body returns the source file and nothing else. The second
+    /// is the fix. The third is the direction that decides whether the fix is
+    /// safe, because widening what MAY be returned must not reorder a query
+    /// that was never about tests.
+    #[test]
+    fn asking_for_tests_returns_the_test_file_and_still_ranks_source_first() {
+        let graph = graph_with_source_and_test_bodies();
+
+        for query in ["resolve_manifest", "assert manifest authority repository"] {
+            let default_scope = ranked_paths(&graph, query, LocateScope::SOURCE_ONLY);
+            assert!(
+                !default_scope
+                    .iter()
+                    .any(|path| path == "tests/test_manifest.py"),
+                "the default withholds the test file for {query:?}: {default_scope:?}"
+            );
+
+            let asked = ranked_paths(&graph, query, LocateScope::WITH_TESTS);
+            assert!(
+                asked.iter().any(|path| path == "tests/test_manifest.py"),
+                "a caller that asked for tests must be able to receive one for {query:?}: \
+                 {asked:?}"
+            );
+            assert_eq!(
+                asked.first().map(String::as_str),
+                Some("src/manifest.py"),
+                "source must still rank first for {query:?}: {asked:?}"
+            );
+        }
+    }
+
     /// The uq04/uq05/uq07 gauntlet shape: a `#[test]` fn inside an inline
     /// `mod tests` block carries `EntityRole::Test` inside a Source-role file,
     /// and a bare-name query for it returned NOTHING (rank null) because the
@@ -25117,7 +25503,8 @@ mod tests {
         );
 
         let (_, _, _, file_symbols, _) =
-            resolve_entities_to_files(&seeds, &graph, false, "text").unwrap();
+            resolve_entities_to_files(&seeds, &graph, false, "text", LocateScope::SOURCE_ONLY)
+                .unwrap();
         let syms = file_symbols
             .get("crates/kin-db/src/storage/snapshot.rs")
             .expect("direct attribution must mint the file's symbol list");
@@ -25152,7 +25539,8 @@ mod tests {
             },
         )]);
         let (_, _, _, file_symbols, _) =
-            resolve_entities_to_files(&seeds, &graph, false, "text").unwrap();
+            resolve_entities_to_files(&seeds, &graph, false, "text", LocateScope::SOURCE_ONLY)
+                .unwrap();
         assert!(
             !file_symbols.contains_key("crates/kin-db/src/storage/snapshot.rs"),
             "a test entity the query does not name still skips direct attribution"
@@ -25204,7 +25592,8 @@ mod tests {
         );
 
         let (_, _, _, file_symbols, _) =
-            resolve_entities_to_files(&seeds, &graph, false, "text").unwrap();
+            resolve_entities_to_files(&seeds, &graph, false, "text", LocateScope::SOURCE_ONLY)
+                .unwrap();
         assert!(
             file_symbols
                 .get("crates/kin-db/src/storage/delta.rs")
@@ -25249,7 +25638,7 @@ mod tests {
             },
         );
 
-        let keyed = entity_seed_keyed(&seeds, &graph).unwrap();
+        let keyed = entity_seed_keyed(&seeds, &graph, LocateScope::SOURCE_ONLY).unwrap();
         let keys: Vec<&str> = keyed.iter().map(|(k, _, _)| k.as_str()).collect();
         assert!(
             keys.contains(&format!("entity:{}", named.id).as_str()),
@@ -25352,9 +25741,11 @@ mod tests {
         )]);
 
         let (_, _, signal_scores_without_explain, _, _) =
-            resolve_entities_to_files(&seeds, &graph, false, "text").unwrap();
+            resolve_entities_to_files(&seeds, &graph, false, "text", LocateScope::SOURCE_ONLY)
+                .unwrap();
         let (_, _, signal_scores_with_explain, _, _) =
-            resolve_entities_to_files(&seeds, &graph, true, "text").unwrap();
+            resolve_entities_to_files(&seeds, &graph, true, "text", LocateScope::SOURCE_ONLY)
+                .unwrap();
 
         assert_eq!(
             signal_scores_without_explain, signal_scores_with_explain,
@@ -25435,7 +25826,8 @@ mod tests {
         )]);
 
         let (resolved, _, _, _, _) =
-            resolve_entities_to_files(&seeds, &graph, false, "text").unwrap();
+            resolve_entities_to_files(&seeds, &graph, false, "text", LocateScope::SOURCE_ONLY)
+                .unwrap();
 
         assert!(
             resolved
@@ -25546,7 +25938,7 @@ mod tests {
             let _frontier =
                 kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_RESOLVE_ARTIFACT_FRONTIER", "1")
                     .with("KIN_LOCATE_GRAPH_ONLY_PROJECTION_FLOOR", "0.25");
-            resolve_entities_to_files(&seeds, &graph, true, "text")
+            resolve_entities_to_files(&seeds, &graph, true, "text", LocateScope::SOURCE_ONLY)
         };
         let (resolved, _, _, _, candidate_stages) = result.unwrap();
 
@@ -27178,6 +27570,7 @@ mod tests {
             10,
             true,
             SnippetOptions::default(),
+            LocateScope::SOURCE_ONLY,
             LocateBudget::unbounded(),
         )
         .unwrap();
@@ -27202,6 +27595,7 @@ mod tests {
             10,
             true,
             SnippetOptions::default(),
+            LocateScope::SOURCE_ONLY,
             LocateBudget::unbounded(),
         )
         .unwrap();
@@ -27369,19 +27763,21 @@ mod tests {
             },
         );
 
-        let first = resolve_entities_to_files(&seeds, &graph, false, "test")
-            .unwrap()
-            .0
-            .iter()
-            .map(|(p, _)| p.clone())
-            .collect::<Vec<_>>();
-        for _ in 0..8 {
-            let again = resolve_entities_to_files(&seeds, &graph, false, "test")
+        let first =
+            resolve_entities_to_files(&seeds, &graph, false, "test", LocateScope::SOURCE_ONLY)
                 .unwrap()
                 .0
                 .iter()
                 .map(|(p, _)| p.clone())
                 .collect::<Vec<_>>();
+        for _ in 0..8 {
+            let again =
+                resolve_entities_to_files(&seeds, &graph, false, "test", LocateScope::SOURCE_ONLY)
+                    .unwrap()
+                    .0
+                    .iter()
+                    .map(|(p, _)| p.clone())
+                    .collect::<Vec<_>>();
             assert_eq!(
                 again, first,
                 "resolve projection order must be deterministic"
@@ -27458,7 +27854,7 @@ mod tests {
             (b.id, disc(6.0)),
             (t.id, disc(100.0)),
         ]);
-        let keyed = entity_seed_keyed(&seeds, &graph).unwrap();
+        let keyed = entity_seed_keyed(&seeds, &graph, LocateScope::SOURCE_ONLY).unwrap();
         // Test entity excluded; the other three survive as distinct items.
         assert_eq!(keyed.len(), 3, "test entity must be excluded");
         let shared_items: Vec<&(String, String, f32)> = keyed
@@ -27491,9 +27887,14 @@ mod tests {
             HashMap::from([(a1.id, disc(10.0)), (a2.id, disc(4.0)), (b.id, disc(8.0))]);
         let embedding_seeds: HashMap<kin_model::EntityId, EntityDiscovery> = HashMap::new();
         let ranked_lists: Vec<Vec<(String, f32)>> = vec![Vec::new(); 10];
-        let fused =
-            entity_granular_fused_files(&ranked_lists, &text_seeds, &embedding_seeds, &graph)
-                .unwrap();
+        let fused = entity_granular_fused_files(
+            &ranked_lists,
+            &text_seeds,
+            &embedding_seeds,
+            &graph,
+            LocateScope::SOURCE_ONLY,
+        )
+        .unwrap();
         // Both files present; the two src/a.rs entities collapse to ONE file.
         assert_eq!(
             fused.len(),
@@ -27517,7 +27918,14 @@ mod tests {
             ("src/y.rs".to_string(), 0.5),
             ("vendor/dep/z.rs".to_string(), 9.0),
         ];
-        let fused = entity_granular_fused_files(&ranked_lists, &empty, &empty, &graph).unwrap();
+        let fused = entity_granular_fused_files(
+            &ranked_lists,
+            &empty,
+            &empty,
+            &graph,
+            LocateScope::SOURCE_ONLY,
+        )
+        .unwrap();
         let paths: Vec<&str> = fused.iter().map(|(p, _)| p.as_str()).collect();
         assert!(paths.contains(&"src/x.rs"));
         assert!(paths.contains(&"src/y.rs"));
@@ -27681,7 +28089,8 @@ mod tests {
         .iter()
         .map(|path| (*path).to_string())
         .collect();
-        let bodies = GraphBodyCoverage::observe(paths.iter(), |path| path.ends_with("api.py"));
+        let bodies =
+            GraphBodyCoverage::observe(paths.iter(), 0, |path: &str| path.ends_with("api.py"));
 
         assert_eq!(bodies.source_paths, 4);
         assert_eq!(bodies.with_body, 1);
@@ -27704,7 +28113,7 @@ mod tests {
         let paths: Vec<String> = (0..40)
             .map(|index| format!("src/mod{index:02}.py"))
             .collect();
-        let bodies = GraphBodyCoverage::observe(paths.iter(), |_| false);
+        let bodies = GraphBodyCoverage::observe(paths.iter(), 0, |_| false);
 
         assert_eq!(bodies.gap_paths, 40, "the count must be the whole truth");
         assert_eq!(
@@ -27729,6 +28138,7 @@ mod tests {
                 "src/requests/utils.py".to_string(),
             ]
             .iter(),
+            0,
             |_| false,
         ));
 
@@ -27764,6 +28174,7 @@ mod tests {
     fn full_body_coverage_and_an_unobserved_one_both_leave_complete_alone() {
         let observed = fully_embedded_coverage().with_graph_bodies(GraphBodyCoverage::observe(
             ["src/requests/api.py".to_string()].iter(),
+            0,
             |_| true,
         ));
         assert!(observed.complete, "no gap, so nothing to clear");
@@ -27793,6 +28204,7 @@ mod tests {
         };
         let coverage = partial.with_graph_bodies(GraphBodyCoverage::observe(
             ["src/requests/sessions.py".to_string()].iter(),
+            0,
             |_| false,
         ));
 

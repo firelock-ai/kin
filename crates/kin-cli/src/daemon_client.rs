@@ -437,6 +437,15 @@ pub struct LocateRequest {
     /// (`KIN_LOCATE_ENTITY_CAP` otherwise). Only affects entity paging.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page_size: Option<usize>,
+    /// Rank test-role entities alongside source for this query.
+    ///
+    /// Defaults to false, which is the ranking every caller has today: test-role
+    /// entities are demoted, and at several stages excluded, unless the query
+    /// text itself reads as being about tests. That heuristic is the only thing
+    /// that lifted the demotion, and a caller who knows exactly what it is
+    /// asking for had no way to say so.
+    #[serde(default)]
+    pub include_tests: bool,
 }
 
 /// Resolve the bearer token the daemon expects on non-public routes.

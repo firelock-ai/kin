@@ -342,6 +342,13 @@ enum Command {
         /// (`KIN_LOCATE_ENTITY_CAP` otherwise).
         #[arg(long)]
         page_size: Option<usize>,
+        /// Rank test-role entities alongside source. Off by default: locate
+        /// demotes tests unless the query text itself reads as being about
+        /// them, which is right for "where does this feature live" and wrong
+        /// when you already know you are asking for a test. The response says
+        /// how many test paths a default run withheld.
+        #[arg(long = "include-tests", default_value_t = false)]
+        include_tests: bool,
     },
     /// Debug locate results: show per-signal breakdown, rank gold files,
     /// and diagnose why targets were missed.
@@ -2674,6 +2681,7 @@ fn main() -> Result<()> {
                     next,
                     cursor,
                     page_size,
+                    include_tests,
                 } => {
                     // Inline snippets default ON for the structured/agent `--json`
                     // surface (so an agent gets code on the first locate);
@@ -2730,6 +2738,7 @@ fn main() -> Result<()> {
                             // lean on bodies unless --snippets is explicit.
                             true,
                             paging,
+                            commands::locate::LocateScope::with_tests(include_tests),
                         )
                         .await?;
 
@@ -2851,6 +2860,7 @@ fn main() -> Result<()> {
                             reference,
                             want_snippets,
                             paging,
+                            commands::locate::LocateScope::with_tests(include_tests),
                         )
                         .await
                     }

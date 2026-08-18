@@ -514,6 +514,7 @@ pub async fn run(
         // so it stays on the coordinates-only projection.
         false,
         crate::commands::locate::LocatePaging::default(),
+        crate::commands::locate::LocateScope::SOURCE_ONLY,
     )
     .await?;
 

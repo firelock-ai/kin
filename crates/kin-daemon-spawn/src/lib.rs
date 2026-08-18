@@ -304,9 +304,9 @@ pub fn record_boot_cost(kin_root: &Path, total_ms: u64) {
     let Ok(body) = serde_json::to_string(&DaemonBootCost { total_ms }) else {
         return;
     };
-    let tmp = kin_root.join(format!("{BOOT_COST_FILE_NAME}.tmp"));
-    if fs::write(&tmp, body).is_ok() && fs::rename(&tmp, boot_cost_path(kin_root)).is_err() {
-        let _ = fs::remove_file(&tmp);
+    let staged = kin_root.join(format!("{BOOT_COST_FILE_NAME}.tmp"));
+    if fs::write(&staged, body).is_ok() && fs::rename(&staged, boot_cost_path(kin_root)).is_err() {
+        let _ = fs::remove_file(&staged);
     }
 }
 
@@ -5754,12 +5754,12 @@ mod tests {
     #[test]
     fn the_explanation_names_what_decided_the_window() {
         assert!(cli_idle_window(None).describe().contains("no local daemon"));
-        assert!(cli_idle_window(Some(1_000)).describe().contains("the floor"));
-        assert!(
-            cli_idle_window(Some(600_000))
-                .describe()
-                .contains("the ceiling")
-        );
+        assert!(cli_idle_window(Some(1_000))
+            .describe()
+            .contains("the floor"));
+        assert!(cli_idle_window(Some(600_000))
+            .describe()
+            .contains("the ceiling"));
         let scaled = cli_idle_window(Some(60_000));
         let described = scaled.describe();
         assert!(described.contains("600s"), "{described}");
