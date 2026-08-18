@@ -3764,11 +3764,15 @@ mod tests {
     use kin_spine::SpineBackend as _;
 
     fn make_entity(name: &str, file: &str) -> Entity {
+        make_entity_in(LanguageId::Rust, name, file)
+    }
+
+    fn make_entity_in(language: LanguageId, name: &str, file: &str) -> Entity {
         Entity {
             id: EntityId::new(),
             kind: EntityKind::Function,
             name: name.to_string(),
-            language: LanguageId::Rust,
+            language,
             fingerprint: SemanticFingerprint {
                 algorithm: FingerprintAlgorithm::V1TreeSitter,
                 ast_hash: Hash256::from_bytes([0; 32]),
@@ -4881,6 +4885,105 @@ mod tests {
         assert_eq!(response["negative"]["trust"], "authoritative");
     }
 
+    /// FIR-2404 end to end, on a real store rather than a hand-written payload,
+    /// and on the same daemon authority path as the test above so nothing but the
+    /// language differs. This is the express shape: the linker resolves same-name
+    /// bare calls across files, and the focal is a module's default export every
+    /// consuming file reaches through a `require` nothing in this build can
+    /// resolve, because no language-server adapter is wired for JavaScript.
+    ///
+    /// The pair matters more than either half. The test above certifies an
+    /// absence on an identically-shaped Rust graph, so the only thing separating
+    /// a certified absence from a refused one here is the language's reference
+    /// enrichment, which is the fact FIR-2404 added to the gate.
+    #[tokio::test]
+    async fn a_javascript_export_is_not_certified_absent_when_requires_produce_no_edges() {
+        let graph = InMemoryGraph::new();
+        let target = make_entity_in(
+            LanguageId::JavaScript,
+            "createApplication",
+            "lib/express.js",
+        );
+        // The witness the one-witness rule accepted: two JavaScript entities in
+        // different files joined by a resolved call.
+        let caller = make_entity_in(LanguageId::JavaScript, "handle", "lib/router/index.js");
+        let callee = make_entity_in(LanguageId::JavaScript, "matchLayer", "lib/router/layer.js");
+        graph.upsert_entity(&target).unwrap();
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&callee).unwrap();
+        graph
+            .upsert_relation(&make_relation(caller.id, callee.id, RelationKind::Calls))
+            .unwrap();
+        let registered_root = graph_root(&graph);
+
+        let spine = kin_spine::InMemorySpineBackend::new();
+        spine.register_repo(
+            "express",
+            vec![spine_entry("express", &target)],
+            &registered_root,
+        );
+        spine.refresh_cross_repo_edges("express", &[], &[], &["express".to_string()]);
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let response = parsed_response(&crate::finalize_with_envelope(
+            handle_find_references_with_authority(
+                &args,
+                &graph,
+                FindReferencesAuthority {
+                    repo_id: "express",
+                    graph_root: &registered_root,
+                    spine: Some(&spine),
+                },
+                None,
+            )
+            .await
+            .unwrap(),
+            structurally_ready_envelope(),
+            "find_references",
+        ));
+
+        assert!(response["references"].as_array().unwrap().is_empty());
+        assert_eq!(
+            response["edge_coverage"]["cross_file_classes"],
+            serde_json::json!(["calls"]),
+            "the fixture is the express shape: calls linked, imports not: {}",
+            response["edge_coverage"]
+        );
+        assert_eq!(
+            response["edge_coverage"]["reference_enrichment"], "unsupported",
+            "this build wires no adapter for JavaScript: {}",
+            response["edge_coverage"]
+        );
+        assert_eq!(
+            response["negative"]["safe_to_conclude_absent"], false,
+            "deleting what this called safe to delete deletes express: {}",
+            response["negative"]
+        );
+        assert_eq!(response["negative"]["trust"], "inconclusive");
+        assert!(
+            trust_reason(&response).starts_with("reference_enrichment_unsupported"),
+            "{}",
+            trust_reason(&response)
+        );
+        assert!(
+            trust_reason(&response).contains("JavaScript"),
+            "the reason names the language whose reference edges cannot exist: {}",
+            trust_reason(&response)
+        );
+        assert_eq!(
+            response["negative"]["degraded_signals"],
+            serde_json::json!([
+                "edge_coverage:imports_absent",
+                "edge_coverage:references_absent",
+                "edge_coverage:reference_enrichment_unsupported"
+            ]),
+            "the shortfalls the observation names are disclosed beside the verdict"
+        );
+    }
+
     #[tokio::test]
     async fn filtered_find_references_keeps_unknown_federated_subtype_advisory() {
         let graph = InMemoryGraph::new();
@@ -5508,6 +5611,11 @@ mod tests {
     /// witness that this graph does link references across files for the
     /// language, without which an empty walk is a fact about the graph rather
     /// than about the focal.
+    ///
+    /// A `Calls` edge is the whole witness on purpose. Kin resolves a cross-file
+    /// use into exactly this edge, plus an artifact-level import edge entity
+    /// queries never reach, so a fixture seeding an entity-level `Imports` edge
+    /// would assert authority on a shape no real graph produces.
     fn seed_cross_file_call_witness(store: &InMemoryGraph) {
         let caller = make_entity("witness_caller", "src/witness_caller.rs");
         let callee = make_entity("witness_callee", "src/witness_callee.rs");
