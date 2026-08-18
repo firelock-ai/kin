@@ -179,11 +179,12 @@ fn a_field_annotation_binds_across_the_file_boundary_through_its_import() {
 
 #[test]
 fn an_annotation_does_not_bind_to_a_same_named_class_in_an_unimported_module() {
-    // The precision half, and the falsifier for the import gate. Two modules
-    // define `ParsedNote`; only one is imported. Name alone cannot choose, so
-    // the import must, and the twin must gain nothing. Drop the
-    // defined-or-imported filter in `emit_python_value_references` and this is
-    // the assertion that fails.
+    // The precision half. Two modules define `ParsedNote`; only one is
+    // imported. Name alone cannot choose, so the import must, and the twin must
+    // gain nothing. What holds this is the linker's import tier, which is
+    // reached because the name IS imported here; the extractor's
+    // defined-or-imported gate is what holds the case below, where the name is
+    // not imported at all.
     let mut files = two_file_project();
     files.push(parse_py("legacy.py", "class ParsedNote:\n    pass\n"));
     let relations = link(&files);
@@ -276,5 +277,34 @@ fn an_annotation_resolves_exactly_as_the_same_call_would() {
         annotation_edge,
         Some(IMPORT_RESOLVED_CONFIDENCE),
         "and both bind on the import tier"
+    );
+}
+
+#[test]
+fn an_annotation_naming_a_class_this_file_never_imported_emits_no_edge_at_all() {
+    // The falsifier for the extractor's defined-or-imported gate, and the
+    // ticket's negative case. `Ghost` is named in an annotation, defined in
+    // another file, and imported by nobody. A bare name that reaches the linker
+    // unfiltered lands on the blind cross-file exact-name tier and binds at 0.7
+    // to whatever entity carries that name, which is a fabricated dependency.
+    // Drop the `defined.contains(root) || symbol_bound.contains(root)` filter in
+    // `emit_python_value_references` and this assertion is the one that fails.
+    let files = vec![
+        parse_py(
+            "storage.py",
+            "def upsert_note(note: Ghost) -> int:\n    return 1\n",
+        ),
+        parse_py("legacy.py", "class Ghost:\n    pass\n"),
+    ];
+    let relations = link(&files);
+
+    assert_eq!(
+        reference_confidence(
+            &relations,
+            entity_id_in(&files, "storage.py", "upsert_note"),
+            entity_id_in(&files, "legacy.py", "Ghost"),
+        ),
+        None,
+        "an annotation naming a class this file never imported must emit no edge"
     );
 }

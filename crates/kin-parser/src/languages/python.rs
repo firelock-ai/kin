@@ -2062,6 +2062,9 @@ mod tests {
     fn a_parameter_name_is_still_not_a_reference() {
         // Annotations became references; parameter NAMES did not. A parameter
         // called `note` is a binding, and binding a name is not reading one.
+        // Two independent rules hold this, and it takes breaking both to make
+        // this assertion fail: only the `type` field of a parameter is walked,
+        // and a parameter name is in the shadow set anyway.
         let edges =
             references_in("def note():\n    return 1\n\n\ndef take(note: int):\n    return note\n");
         assert!(
