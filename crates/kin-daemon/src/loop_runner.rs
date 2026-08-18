@@ -4973,7 +4973,8 @@ mod tests {
         };
         let path = PathBuf::from("/repo/Cargo.lock");
 
-        tracing::subscriber::with_default(subscriber, || {
+        {
+            let _capture = crate::capture_events_on_this_thread(subscriber);
             for attempts in 1..=4u32 {
                 report_modified_during_reconcile(
                     &path,
@@ -4984,7 +4985,7 @@ mod tests {
                     },
                 );
             }
-        });
+        }
 
         let events = std::mem::take(&mut captured.lock().unwrap().events);
         let levels = events.iter().map(|(level, _)| *level).collect::<Vec<_>>();
