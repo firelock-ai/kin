@@ -2,6 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::{Context, Result};
+use kin_mcp::handlers::common::entity_presentation_start_line;
 use kin_model::EntityStore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -169,8 +170,15 @@ pub fn build_overview_response(
             lines.push(format!("{} ({}):", kind, ents.len()));
             for e in ents.iter().take(top_n) {
                 let file = e.file_origin.as_ref().map(|f| f.0.as_str()).unwrap_or("?");
-                let line = e.span.as_ref().map(|s| s.start_line).unwrap_or(0);
-                lines.push(format!("  {}  {}:{}", e.name, file, line));
+                // The graph stores tree-sitter rows, which are 0-based; a
+                // `file:line` a reader pastes into an editor is 1-based. An entity
+                // the graph carries no span for names its file alone rather than
+                // the `:0` that used to appear here.
+                let location = match entity_presentation_start_line(e) {
+                    Some(line) => format!("{file}:{line}"),
+                    None => file.to_string(),
+                };
+                lines.push(format!("  {}  {}", e.name, location));
             }
             if ents.len() > top_n {
                 lines.push(format!("  ... and {} more", ents.len() - top_n));
@@ -180,4 +188,106 @@ pub fn build_overview_response(
     }
 
     Ok(OverviewResponse { lines })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_overview_response, OverviewRequest};
+    use kin_db::InMemoryGraph;
+    use kin_model::{
+        Entity, EntityId, EntityKind, EntityMetadata, EntityRole, EntityStore, FilePathId,
+        FingerprintAlgorithm, Hash256, LanguageId, SemanticFingerprint, SourceSpan, Visibility,
+    };
+
+    fn overview_entity(name: &str, path: &str, start_line: Option<u32>) -> Entity {
+        let file = FilePathId::new(path);
+        Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: name.to_string(),
+            language: LanguageId::Python,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([0; 32]),
+                signature_hash: Hash256::from_bytes([1; 32]),
+                behavior_hash: Hash256::from_bytes([2; 32]),
+                equivalence_hash: Hash256::from_bytes([0; 32]),
+                stability_score: 1.0,
+            },
+            span: start_line.map(|start_line| SourceSpan {
+                file: file.clone(),
+                start_byte: 0,
+                end_byte: 1,
+                start_line,
+                start_col: 0,
+                end_line: start_line + 1,
+                end_col: 1,
+            }),
+            file_origin: Some(file),
+            signature: format!("def {name}()"),
+            visibility: Visibility::Public,
+            role: EntityRole::Source,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    /// `kin overview`'s top-entity listing reports the line a human editor shows.
+    ///
+    /// The graph stores tree-sitter rows, which are 0-based, and every
+    /// agent-facing `file:line` is 1-based. This listing printed the raw row, so
+    /// it disagreed with `kin refs` and every MCP read surface about the same
+    /// entity, and a reader acting on it opened the line above the definition.
+    #[test]
+    fn the_top_entity_listing_reports_the_line_a_human_editor_shows() {
+        const SOURCE: &str = "# header\n\n\ndef probe_overview():\n    return 1\n";
+        // What a reader counting lines in an editor would say, derived from the
+        // fixture rather than written down.
+        let human_line = SOURCE
+            .lines()
+            .position(|line| line.contains("def probe_overview"))
+            .map(|index| index + 1)
+            .expect("the fixture declares the function") as u32;
+        let graph_row = human_line - 1;
+
+        let graph = InMemoryGraph::new();
+        graph
+            .upsert_entity(&overview_entity(
+                "probe_overview",
+                "src/probe.py",
+                Some(graph_row),
+            ))
+            .expect("upsert spanned entity");
+        // An entity the graph carries no span for has no line to report.
+        graph
+            .upsert_entity(&overview_entity("probe_spanless", "src/spanless.py", None))
+            .expect("upsert spanless entity");
+
+        let response = build_overview_response(
+            "probe-repo",
+            &graph,
+            &OverviewRequest {
+                json: false,
+                compact: false,
+            },
+        )
+        .expect("build overview");
+        let joined = response.lines.join("\n");
+
+        assert!(
+            joined.contains(&format!("src/probe.py:{human_line}")),
+            "the listing must name line {human_line}: {joined}"
+        );
+        assert!(
+            !joined.contains(&format!("src/probe.py:{graph_row}")),
+            "the raw 0-based row must not reach the reader: {joined}"
+        );
+        assert!(
+            joined.contains("src/spanless.py") && !joined.contains("src/spanless.py:0"),
+            "a spanless entity names its file without a fabricated line: {joined}"
+        );
+    }
 }

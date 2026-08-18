@@ -2967,6 +2967,52 @@ mod tests {
         );
     }
 
+    /// A path whose bytes are not valid UTF-8 keeps its byte-exact spelling.
+    ///
+    /// Dropping `artifact_path` as redundant is only true where a plain path can
+    /// say the same thing. A path Git tracks but Unicode cannot spell has no
+    /// lossless plain form, and there the `bytes_hex` object is the only truth,
+    /// so it stays. Driven through the seam directly rather than end to end,
+    /// because Darwin refuses an ill-formed UTF-8 name at the filesystem
+    /// boundary and this branch has to be covered on every host.
+    #[test]
+    fn a_path_unicode_cannot_spell_keeps_its_byte_exact_form() {
+        let byte_exact = kin_model::RepoPath::from_bytes(b"src/raw-\xff-name.ts".to_vec()).unwrap();
+        assert!(
+            byte_exact.as_utf8().is_none(),
+            "the fixture must be a path no plain string can carry"
+        );
+        let spellable = kin_model::RepoPath::from_utf8("src/plain.ts").unwrap();
+
+        let source_for = |path: kin_model::RepoPath| common::ExactEntitySource {
+            body: "export const probe = 1;".to_string(),
+            provenance: common::SourceProvenance::Committed {
+                change_id: kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes(
+                    [7; 32],
+                )),
+            },
+            span_coherence: common::SpanCoherence::Unverified,
+            artifact_id: kin_model::ArtifactId::new(),
+            path,
+            entry: kin_model::TreeEntry::blob(kin_model::Hash256::from_bytes([3; 32]), false),
+        };
+
+        let raw = common::source_provenance_fields(&source_for(byte_exact.clone()));
+        assert_eq!(
+            raw.get("artifact_path"),
+            Some(&serde_json::to_value(&byte_exact).unwrap()),
+            "a path with no plain spelling must keep the byte-exact one: {raw:?}"
+        );
+
+        // The control that makes the assertion above mean something: the field
+        // is genuinely conditional, not always present.
+        let plain = common::source_provenance_fields(&source_for(spellable));
+        assert!(
+            plain.get("artifact_path").is_none(),
+            "a UTF-8 path is already stated plainly and must not be repeated: {plain:?}"
+        );
+    }
+
     /// Name every `artifact_path` anywhere under `value`.
     fn artifact_path_fields(value: &serde_json::Value, at: &str, found: &mut Vec<String>) {
         match value {
