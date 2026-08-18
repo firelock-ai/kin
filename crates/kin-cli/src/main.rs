@@ -374,6 +374,15 @@ enum Command {
     /// repository authority; `kin embed` adds vectors for graph-owned entities
     /// after semantic enrichment exists.
     ///
+    /// The model is not bundled with any install. The first embed on a machine
+    /// downloads about 523 MB of nomic-embed-text-v1.5 from huggingface.co into
+    /// the Hugging Face hub cache under the home directory
+    /// (`~/.cache/huggingface/hub`), and nothing embeds until that download
+    /// lands. A host with no egress to huggingface.co needs that cache
+    /// pre-seeded from a machine that has it, or KIN_EMBED_MODEL_ID pointed at
+    /// a local model directory. `kin doctor` reports whether the model is
+    /// already here.
+    ///
     /// If a repo was indexed with an older model at a different dimension, pass
     /// `--rebuild` to drop the stale index and re-embed every entity at the
     /// current model's dimension.

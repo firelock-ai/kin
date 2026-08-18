@@ -47,6 +47,14 @@ pub struct EmbedRuntimeState {
     /// to false so an ordinary local store is unaffected.
     #[serde(default)]
     pub embed_persistence_unavailable: bool,
+    /// Where the runtime fetch of the embedding model stands.
+    ///
+    /// The weights are not shipped, so the first embed pass on a fresh machine
+    /// spends several hundred megabytes of egress before it can record a single
+    /// unit. Without this the pass reports working with zero progress for the
+    /// whole download, which is indistinguishable from a wedged pass.
+    #[serde(default)]
+    pub model_fetch: crate::embed_model::EmbedModelFetch,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -611,7 +619,10 @@ fn profile_label(profile: Profile) -> &'static str {
 /// Rendered even when every pass is healthy. The question this answers — what is
 /// this process spending my machine on — is one a user asks while nothing is
 /// visibly wrong, so a surface that only appears on a fault does not answer it.
-fn render_daemon_work_lines(work: &DaemonWorkState) -> Vec<String> {
+fn render_daemon_work_lines(
+    work: &DaemonWorkState,
+    model_fetch: &crate::embed_model::EmbedModelFetch,
+) -> Vec<String> {
     let mut lines = vec![format!(
         "Daemon CPU: {}",
         match work.daemon_cpu_seconds {
@@ -634,10 +645,19 @@ fn render_daemon_work_lines(work: &DaemonWorkState) -> Vec<String> {
         return lines;
     }
     for pass in &work.passes {
-        let detail = match (&pass.stopped_reason, pass.working_seconds) {
-            (Some(reason), _) => format!("stopped — {reason}"),
-            (None, Some(working)) => format!("working {working}s"),
-            (None, None) => "idle".to_string(),
+        // The embedding pass spends its first stretch inside a model download
+        // rather than inside inference, and "working, 0 units" is true of both.
+        // Naming the download where the pass is described is what separates a
+        // fetch in flight from a pass that has stopped recording.
+        let downloading = (pass.name == "embed")
+            .then(|| model_fetch.download_phase())
+            .flatten();
+        let detail = match (&pass.stopped_reason, downloading, pass.working_seconds) {
+            (Some(reason), _, _) => format!("stopped — {reason}"),
+            (None, Some(phase), Some(working)) => format!("{phase}, working {working}s"),
+            (None, Some(phase), None) => phase,
+            (None, None, Some(working)) => format!("working {working}s"),
+            (None, None, None) => "idle".to_string(),
         };
         let progress_age = match pass.progress_age_seconds {
             Some(age) => format!("last advanced {age}s ago"),
@@ -723,8 +743,9 @@ fn render_lines(
         ),
     ];
 
+    lines.push(embed.model_fetch.inspect_line());
     lines.push(profile_selector_line(actual));
-    lines.extend(render_daemon_work_lines(daemon_work));
+    lines.extend(render_daemon_work_lines(daemon_work, &embed.model_fetch));
 
     // The profile selector is reported on its own line above, with who chose it.
     // Listing it here too would read as an operator override even when the
@@ -1200,12 +1221,15 @@ mod tests {
     /// has to be distinguishable from a daemon too old to have the field.
     #[test]
     fn authority_loads_render_only_when_the_daemon_reports_them() {
-        let present = render_daemon_work_lines(&DaemonWorkState {
-            daemon_cpu_seconds: Some(12.0),
-            authority_loads: Some(3),
-            passes: Vec::new(),
-            reconcile: Default::default(),
-        });
+        let present = render_daemon_work_lines(
+            &DaemonWorkState {
+                daemon_cpu_seconds: Some(12.0),
+                authority_loads: Some(3),
+                passes: Vec::new(),
+                reconcile: Default::default(),
+            },
+            &Default::default(),
+        );
         assert!(
             present
                 .iter()
@@ -1213,26 +1237,93 @@ mod tests {
             "a reported count must reach the text surface: {present:?}"
         );
 
-        let zero = render_daemon_work_lines(&DaemonWorkState {
-            daemon_cpu_seconds: Some(12.0),
-            authority_loads: Some(0),
-            passes: Vec::new(),
-            reconcile: Default::default(),
-        });
+        let zero = render_daemon_work_lines(
+            &DaemonWorkState {
+                daemon_cpu_seconds: Some(12.0),
+                authority_loads: Some(0),
+                passes: Vec::new(),
+                reconcile: Default::default(),
+            },
+            &Default::default(),
+        );
         assert!(
             zero.iter().any(|line| line.contains("Authority loads: 0")),
             "zero loads is an answer, not an absence: {zero:?}"
         );
 
-        let absent = render_daemon_work_lines(&DaemonWorkState {
-            daemon_cpu_seconds: Some(12.0),
-            authority_loads: None,
-            passes: Vec::new(),
-            reconcile: Default::default(),
-        });
+        let absent = render_daemon_work_lines(
+            &DaemonWorkState {
+                daemon_cpu_seconds: Some(12.0),
+                authority_loads: None,
+                passes: Vec::new(),
+                reconcile: Default::default(),
+            },
+            &Default::default(),
+        );
         assert!(
             !absent.iter().any(|line| line.contains("Authority loads")),
             "a daemon that reports no count must not have one invented: {absent:?}"
+        );
+    }
+
+    /// A pass working through the first model download must not read as a pass
+    /// that is working and recording nothing.
+    ///
+    /// The progress is injected rather than measured, so this asserts the
+    /// rendering rather than the filesystem, and both directions are asserted:
+    /// the download names itself while it is in flight, and a cached model
+    /// leaves the line exactly as it was before any of this existed.
+    #[test]
+    fn the_embed_pass_names_the_model_download_it_is_inside() {
+        let working_embed = DaemonWorkState {
+            daemon_cpu_seconds: Some(12.0),
+            authority_loads: Some(1),
+            passes: vec![BackgroundPassReport {
+                name: "embed".to_string(),
+                state: "working".to_string(),
+                progress: 0,
+                progress_age_seconds: None,
+                working_seconds: Some(109),
+                deferred_seconds: None,
+                stopped_reason: None,
+            }],
+            reconcile: Default::default(),
+        };
+        let downloading = crate::embed_model::EmbedModelFetch {
+            model_id: crate::embed_model::DEFAULT_EMBED_MODEL_ID.to_string(),
+            cache_dir: Some("/home/dev/.cache/huggingface/hub/models--x".to_string()),
+            present: false,
+            fetched_bytes: 137 * 1024 * 1024,
+            expected_bytes: Some(crate::embed_model::DEFAULT_EMBED_MODEL_BYTES),
+            fetching: true,
+            no_fetch_reason: None,
+            relocated_hf_home: None,
+        };
+
+        let lines = render_daemon_work_lines(&working_embed, &downloading);
+        let pass_line = lines
+            .iter()
+            .find(|line| line.starts_with("Background pass embed:"))
+            .expect("the embed pass still renders");
+        assert_eq!(
+            pass_line,
+            "Background pass embed: downloading embedding model (137 of 523 MB), working 109s, \
+             0 units, no progress yet"
+        );
+
+        let cached = crate::embed_model::EmbedModelFetch {
+            present: true,
+            fetching: false,
+            ..downloading
+        };
+        let plain = render_daemon_work_lines(&working_embed, &cached);
+        let plain_line = plain
+            .iter()
+            .find(|line| line.starts_with("Background pass embed:"))
+            .expect("the embed pass still renders");
+        assert_eq!(
+            plain_line, "Background pass embed: working 109s, 0 units, no progress yet",
+            "a pass that is not inside a download keeps the line it always had"
         );
     }
 

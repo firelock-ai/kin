@@ -598,6 +598,14 @@ fn build_graph_status_response(
                 embeddings_line.push_str(" and coverage has completed on this store before");
             }
         }
+        // Appended after the chain rather than folded into it: every clause
+        // above stays true while the model is arriving, and this names the one
+        // thing standing in front of all of them right now. Without it the
+        // first fill on a fresh machine reports a pending backlog and a worker
+        // with nothing to show for several hundred megabytes of egress.
+        if let Some(clause) = embedding_runtime.model_fetch.status_clause() {
+            embeddings_line.push_str(&clause);
+        }
     }
     lines.push(embeddings_line);
     // A census, not a queue, and the label has to say so.
@@ -2253,6 +2261,83 @@ mod tests {
             "a store with nothing pending renders the plain measured line: {:?}",
             recovered.lines
         );
+    }
+
+    /// A first fill that is waiting on the model download says so beside the
+    /// counters, and stops saying it once the model is cached.
+    ///
+    /// The progress is injected rather than fetched, so this asserts what the
+    /// status renders rather than what a network does. Without the clause the
+    /// line reads as a queue nobody is draining, which is what sent a first
+    /// reader looking for a wedged worker.
+    #[test]
+    fn a_pending_backlog_names_the_model_download_that_is_blocking_it() {
+        let (_temp, binding, graph) = graph_validation_fixture();
+        graph.upsert_entity(&test_entity("beta_transform")).unwrap();
+
+        let downloading = build_graph_status_response(
+            &pinned(&binding),
+            &graph,
+            &Default::default(),
+            &crate::commands::resources::EmbedRuntimeState {
+                model_fetch: kin_cli_model_fetch(137 * 1024 * 1024, true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let embeddings_line = downloading
+            .lines
+            .iter()
+            .find(|line| line.starts_with("Embeddings:"))
+            .expect("the embeddings line still renders");
+        assert!(
+            embeddings_line.contains(
+                "embedding model is still downloading (137 of 523 MB from huggingface.co)"
+            ),
+            "the measured download reaches the counters: {embeddings_line}"
+        );
+        assert!(
+            embeddings_line.contains("nothing can embed until it lands"),
+            "the counters are given their cause: {embeddings_line}"
+        );
+
+        let cached = build_graph_status_response(
+            &pinned(&binding),
+            &graph,
+            &Default::default(),
+            &crate::commands::resources::EmbedRuntimeState {
+                model_fetch: kin_cli_model_fetch(0, false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let cached_line = cached
+            .lines
+            .iter()
+            .find(|line| line.starts_with("Embeddings:"))
+            .expect("the embeddings line still renders");
+        assert!(
+            !cached_line.contains("embedding model"),
+            "a model that is not being fetched must not be named as a blocker: {cached_line}"
+        );
+    }
+
+    /// A model fetch state with everything but the two facts under test held
+    /// fixed, so a rendering difference can only come from those two.
+    fn kin_cli_model_fetch(
+        fetched_bytes: u64,
+        fetching: bool,
+    ) -> crate::embed_model::EmbedModelFetch {
+        crate::embed_model::EmbedModelFetch {
+            model_id: crate::embed_model::DEFAULT_EMBED_MODEL_ID.to_string(),
+            cache_dir: Some("/home/dev/.cache/huggingface/hub/models--x".to_string()),
+            present: !fetching,
+            fetched_bytes,
+            expected_bytes: Some(crate::embed_model::DEFAULT_EMBED_MODEL_BYTES),
+            fetching,
+            no_fetch_reason: None,
+            relocated_hf_home: None,
+        }
     }
 
     #[test]

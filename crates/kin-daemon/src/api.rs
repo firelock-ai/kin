@@ -3326,6 +3326,7 @@ async fn command_resources(
         vector_index_discarded: state.vector_index_discarded().map(str::to_string),
         embedding_coverage_ever_complete: state.embedding_coverage_ever_complete(),
         embed_persistence_unavailable: !state.can_persist_embed_progress_locally(),
+        model_fetch: kin_cli::embed_model::EmbedModelFetch::probe(embed_pass_is_working(&state)),
     };
 
     let actual = kin_cli::commands::resources::ActualResources::capture();
@@ -3427,8 +3428,23 @@ fn graph_status_embedding_runtime(
         vector_index_discarded: state.vector_index_discarded().map(str::to_string),
         embedding_coverage_ever_complete: state.embedding_coverage_ever_complete(),
         embed_persistence_unavailable: !state.can_persist_embed_progress_locally(),
+        model_fetch: kin_cli::embed_model::EmbedModelFetch::probe(embed_pass_is_working(state)),
         ..Default::default()
     }
+}
+
+/// Whether the embedding pass is burning CPU right now.
+///
+/// The one fact the model-fetch probe cannot read for itself. A pass at work
+/// while the weights are absent is a pass inside the download rather than
+/// inside inference, and that is the difference every embedding surface renders
+/// once this is known.
+fn embed_pass_is_working(state: &DaemonState) -> bool {
+    state
+        .background_work
+        .reports(std::time::Instant::now())
+        .iter()
+        .any(|pass| pass.name == crate::background_work::PASS_EMBED && pass.state == "working")
 }
 
 /// POST /commands/graph — render graph CLI commands from daemon-owned graph state.
