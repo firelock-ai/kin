@@ -13,6 +13,180 @@ use crate::extract::{
     ExtractedTest, ExtractedTestKind, FileImport, ImportedName, ParseOutput,
 };
 
+/// Every public name CPython's `builtins` module binds, sorted so
+/// [`is_python_builtin_name`] can binary-search it.
+///
+/// Read off `sorted(n for n in dir(builtins) if not n.startswith("_"))` on
+/// CPython 3.13, plus `WindowsError`, which the language reference documents as
+/// a built-in exception that only a Windows interpreter binds. Transcribing a
+/// remembered dozen would leave the rest of the table resolving by name, and the
+/// names left out are not the obvious ones: `format`, `id`, `filter`, `next` and
+/// `exit` all read like ordinary repository functions.
+///
+/// This is a complete list rather than a heuristic because Python makes it one.
+/// A module-level name is reachable inside a module only when that module
+/// defines it or imports it, so a bare call this file does neither for is a call
+/// into the interpreter, whatever a same-named symbol elsewhere in the
+/// repository looks like.
+pub const PYTHON_BUILTIN_NAMES: &[&str] = &[
+    "ArithmeticError",
+    "AssertionError",
+    "AttributeError",
+    "BaseException",
+    "BaseExceptionGroup",
+    "BlockingIOError",
+    "BrokenPipeError",
+    "BufferError",
+    "BytesWarning",
+    "ChildProcessError",
+    "ConnectionAbortedError",
+    "ConnectionError",
+    "ConnectionRefusedError",
+    "ConnectionResetError",
+    "DeprecationWarning",
+    "EOFError",
+    "Ellipsis",
+    "EncodingWarning",
+    "EnvironmentError",
+    "Exception",
+    "ExceptionGroup",
+    "False",
+    "FileExistsError",
+    "FileNotFoundError",
+    "FloatingPointError",
+    "FutureWarning",
+    "GeneratorExit",
+    "IOError",
+    "ImportError",
+    "ImportWarning",
+    "IndentationError",
+    "IndexError",
+    "InterruptedError",
+    "IsADirectoryError",
+    "KeyError",
+    "KeyboardInterrupt",
+    "LookupError",
+    "MemoryError",
+    "ModuleNotFoundError",
+    "NameError",
+    "None",
+    "NotADirectoryError",
+    "NotImplemented",
+    "NotImplementedError",
+    "OSError",
+    "OverflowError",
+    "PendingDeprecationWarning",
+    "PermissionError",
+    "ProcessLookupError",
+    "PythonFinalizationError",
+    "RecursionError",
+    "ReferenceError",
+    "ResourceWarning",
+    "RuntimeError",
+    "RuntimeWarning",
+    "StopAsyncIteration",
+    "StopIteration",
+    "SyntaxError",
+    "SyntaxWarning",
+    "SystemError",
+    "SystemExit",
+    "TabError",
+    "TimeoutError",
+    "True",
+    "TypeError",
+    "UnboundLocalError",
+    "UnicodeDecodeError",
+    "UnicodeEncodeError",
+    "UnicodeError",
+    "UnicodeTranslateError",
+    "UnicodeWarning",
+    "UserWarning",
+    "ValueError",
+    "Warning",
+    "WindowsError",
+    "ZeroDivisionError",
+    "abs",
+    "aiter",
+    "all",
+    "anext",
+    "any",
+    "ascii",
+    "bin",
+    "bool",
+    "breakpoint",
+    "bytearray",
+    "bytes",
+    "callable",
+    "chr",
+    "classmethod",
+    "compile",
+    "complex",
+    "copyright",
+    "credits",
+    "delattr",
+    "dict",
+    "dir",
+    "divmod",
+    "enumerate",
+    "eval",
+    "exec",
+    "exit",
+    "filter",
+    "float",
+    "format",
+    "frozenset",
+    "getattr",
+    "globals",
+    "hasattr",
+    "hash",
+    "help",
+    "hex",
+    "id",
+    "input",
+    "int",
+    "isinstance",
+    "issubclass",
+    "iter",
+    "len",
+    "license",
+    "list",
+    "locals",
+    "map",
+    "max",
+    "memoryview",
+    "min",
+    "next",
+    "object",
+    "oct",
+    "open",
+    "ord",
+    "pow",
+    "print",
+    "property",
+    "quit",
+    "range",
+    "repr",
+    "reversed",
+    "round",
+    "set",
+    "setattr",
+    "slice",
+    "sorted",
+    "staticmethod",
+    "str",
+    "sum",
+    "super",
+    "tuple",
+    "type",
+    "vars",
+    "zip",
+];
+
+/// Whether a bare Python name is bound by the interpreter itself.
+pub fn is_python_builtin_name(name: &str) -> bool {
+    PYTHON_BUILTIN_NAMES.binary_search(&name).is_ok()
+}
+
 pub struct PythonAdapter;
 
 impl LanguageAdapter for PythonAdapter {
@@ -1273,6 +1447,68 @@ fn extract_py_from_import(node: &tree_sitter::Node, source: &[u8]) -> Option<Fil
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`is_python_builtin_name`] binary-searches the table, which is only
+    /// correct while the table is sorted and holds no duplicate. A hand edit
+    /// that breaks either would make the lookup miss names silently, which
+    /// reads exactly like a name the interpreter does not bind.
+    #[test]
+    fn the_builtin_table_is_sorted_deduped_and_searchable() {
+        let mut sorted = PYTHON_BUILTIN_NAMES.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.as_slice(),
+            PYTHON_BUILTIN_NAMES,
+            "the builtins table must stay sorted and deduped for binary search"
+        );
+        for name in PYTHON_BUILTIN_NAMES {
+            assert!(
+                is_python_builtin_name(name),
+                "every table entry must be findable, missed {name}"
+            );
+        }
+    }
+
+    /// The table is the full `dir(builtins)` surface, not the handful of names
+    /// a reader remembers. The ones checked here are the ones a call-resolution
+    /// gate needs and a hand-typed list omits.
+    #[test]
+    fn the_builtin_table_covers_the_names_a_hand_typed_list_would_miss() {
+        for name in [
+            "open",
+            "print",
+            "len",
+            "range",
+            "str",
+            "list",
+            "format",
+            "id",
+            "filter",
+            "next",
+            "exit",
+            "vars",
+            "aiter",
+            "ValueError",
+            "StopIteration",
+            "NotImplemented",
+        ] {
+            assert!(is_python_builtin_name(name), "{name} must be a builtin");
+        }
+        for name in [
+            "NoteStore",
+            "parse_file",
+            "open_store",
+            "ingest_directory",
+            "os",
+            "",
+        ] {
+            assert!(
+                !is_python_builtin_name(name),
+                "{name} must not be read as a builtin"
+            );
+        }
+    }
 
     /// Depth-first search for the first `call` node in a parsed tree.
     fn first_call_node<'a>(node: tree_sitter::Node<'a>) -> Option<tree_sitter::Node<'a>> {
