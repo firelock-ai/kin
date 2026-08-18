@@ -28,6 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - chore(ci): pin kin-actions v0.1.30 (#885)
 - Model JavaScript and TypeScript receivers, classes and requires as a graph (#864)
 - Report graph-body coverage, and make each status counter name the view it shows (#875)
+- Cache the Rust dependency layer so a source-only push stops recompiling the world (#879)
+- Report 1-indexed lines from kin search and kin overview, and finish the three fixes kin#874 left short (#878)
 
 
 ## [0.5.37] - 2026-08-17
