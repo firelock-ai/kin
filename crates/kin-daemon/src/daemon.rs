@@ -449,14 +449,7 @@ pub(crate) const AUTO_EMBED_ENV: &str = "KIN_DAEMON_AUTO_EMBED";
 /// The falsy set matches `KIN_DAEMON_REQUIRE_TOKEN`, the sibling boolean knob,
 /// so one spelling works across the daemon's env surface.
 pub(crate) fn auto_embed_enabled() -> bool {
-    std::env::var(AUTO_EMBED_ENV)
-        .map(|value| {
-            !matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "no" | "off"
-            )
-        })
-        .unwrap_or(true)
+    kin_daemon_spawn::auto_embed_enabled_from(std::env::var(AUTO_EMBED_ENV).ok().as_deref())
 }
 
 /// Build the background embedding backlog and announce it, or defer the whole

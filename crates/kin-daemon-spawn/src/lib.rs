@@ -68,6 +68,28 @@ pub const MCP_IDLE_TIMEOUT_SECS: &str = "1800";
 /// what the authority scrub happens not to remove.
 pub const DAEMON_AUTO_EMBED_ENV: &str = "KIN_DAEMON_AUTO_EMBED";
 
+/// Whether [`DAEMON_AUTO_EMBED_ENV`] holding `value` lets the background
+/// embedding pass run. Default ON: unset, or any value outside the documented
+/// falsy set, keeps the pass exactly as it was.
+///
+/// Lives here, beside the name, so the daemon that acts on the variable and any
+/// surface that REPORTS on it read one spelling of it. Two copies of this match
+/// would let a report say a pass is coming while the daemon that would run it
+/// has already stood down, and a wrong answer about a lever nobody can see is
+/// indistinguishable from a right one.
+///
+/// The falsy set matches `KIN_DAEMON_REQUIRE_TOKEN`, the sibling boolean knob,
+/// so one spelling works across the daemon's env surface.
+pub fn auto_embed_enabled_from(value: Option<&str>) -> bool {
+    match value {
+        Some(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        None => true,
+    }
+}
+
 /// File the daemon writes its bound port into once it is listening.
 pub const PORT_FILE_NAME: &str = "daemon.port";
 

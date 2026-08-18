@@ -240,14 +240,57 @@ pub fn cosine_to_relevance(cosine: f32) -> f32 {
     ((1.0 + cosine) / 2.0).max(0.0)
 }
 
+/// The three files [`kin_db::embed::rerank::CrossEncoder`] loads for a model,
+/// in the order its own local-directory resolver requires them.
+///
+/// This list is the contract between the probe below and the loader. The loader
+/// takes a directory and fails outright when one of these is missing, so a
+/// probe that reported a directory usable on any weaker test would hand the
+/// loader a directory it cannot read. Weights are `model.safetensors` only:
+/// that is the single weight file the loader asks for.
+const CROSS_ENCODER_ARTIFACTS: [&str; 3] = ["config.json", "tokenizer.json", "model.safetensors"];
+
+/// The resolved snapshot directory for `model_id` at `revision`, or `None` when
+/// this machine cannot serve the model from disk.
+///
+/// This is the path the loader is HANDED, not a path it is trusted to
+/// rediscover. `kin-db` builds its cross-encoder through
+/// `hf_hub::api::sync::Api::new()`, which resolves its root through
+/// `Cache::default()`, which is `dirs::home_dir()/.cache/huggingface/hub` and
+/// never reads `HF_HOME` (`hf-hub-0.5.0/src/lib.rs:203`). The probe here reads
+/// `HF_HOME` first. Two resolvers, two answers, and the disagreement is only
+/// visible when the variable is set: the probe found the model, armed the
+/// reranker, and the loader then found nothing at its own root and downloaded
+/// 1.1 GB inside a query's latency budget, which tripped the budget and
+/// discarded the rerank that download had just paid for.
+///
+/// Handing the loader a resolved directory removes the second resolver rather
+/// than aligning it. `CrossEncoder::new` takes a local directory whenever its
+/// `model_id` names one, so the directory this function returns is read
+/// verbatim and `hf-hub` never runs. Probe and loader cannot disagree about a
+/// path only one of them computes.
+///
+/// `None` keeps today's behavior exactly: the caller passes the bare repo id
+/// and `hf-hub` resolves it as before, which is what an explicit prefetch
+/// (`KIN_LOCATE_CROSS_ENCODER_ENABLED=1` on a cold machine) still needs.
+pub fn cross_encoder_model_snapshot(model_id: &str, revision: &str) -> Option<PathBuf> {
+    snapshot_under_base(resolved_hf_cache_base().as_deref(), model_id, revision)
+}
+
 /// True when the cross-encoder model is already present in the local
 /// Hugging Face hub cache, so constructing it cannot trigger a network
 /// download. Mirrors the `hf-hub` cache layout (`$HF_HOME` or
 /// `~/.cache/huggingface`, `hub/models--{org}--{name}`) without taking the
 /// dependency; a false negative merely means the reranker stays off by
 /// default until the model is fetched explicitly.
-pub fn cross_encoder_model_cached(model_id: &str) -> bool {
-    cached_under_base(resolved_hf_cache_base().as_deref(), model_id)
+///
+/// Answered by the same resolution that produces the loader's directory, so
+/// "cached" now means the exact thing the loader needs and not one byte less.
+/// The looser test it replaces, any entry under `snapshots/`, reported a
+/// pruned or half-downloaded model usable, and a false POSITIVE here is the
+/// expensive direction: it costs a download in the middle of a query.
+pub fn cross_encoder_model_cached(model_id: &str, revision: &str) -> bool {
+    cross_encoder_model_snapshot(model_id, revision).is_some()
 }
 
 /// True when this install has ever fetched `model_id` into the local Hugging
@@ -327,16 +370,6 @@ fn hf_cache_base(
         .map(|home| home.join(".cache").join("huggingface"))
 }
 
-/// Whether `model_id` has a resolved snapshot under an already-resolved cache
-/// root. Split from the root lookup so the layout and the home policy fail
-/// independently.
-fn cached_under_base(base: Option<&Path>, model_id: &str) -> bool {
-    let Some(base) = base else {
-        return false;
-    };
-    snapshot_present(&model_cache_dir(base, model_id))
-}
-
 /// Whether a model cache directory holds a usable entry, which is at least one
 /// resolved snapshot directory.
 pub(crate) fn snapshot_present(model_dir: &Path) -> bool {
@@ -344,6 +377,34 @@ pub(crate) fn snapshot_present(model_dir: &Path) -> bool {
         Ok(mut entries) => entries.any(|entry| entry.is_ok()),
         Err(_) => false,
     }
+}
+
+/// The snapshot directory `model_id`@`revision` resolves to under an
+/// already-resolved cache root, or `None`. Split from the root lookup so the
+/// layout and the home policy fail independently.
+///
+/// Walks the layout `hf-hub` walks: `refs/{revision}` holds the commit hash and
+/// `snapshots/{commit}` holds the files (`hf-hub-0.5.0/src/lib.rs:140-198`).
+/// A missing ref answers `None` rather than guessing at whichever snapshot
+/// happens to be on disk, because `hf-hub` cannot resolve one either. It reads
+/// the same ref and downloads when it is absent.
+///
+/// The commit hash is a single path component by construction. Rejecting
+/// anything else keeps a hand-edited or truncated ref file from resolving
+/// outside the model's own directory, which is a cheap guard on a file this
+/// process did not write.
+fn snapshot_under_base(base: Option<&Path>, model_id: &str, revision: &str) -> Option<PathBuf> {
+    let model_dir = model_cache_dir(base?, model_id);
+    let commit = std::fs::read_to_string(model_dir.join("refs").join(revision)).ok()?;
+    let commit = commit.trim();
+    if commit.is_empty() || Path::new(commit).components().count() != 1 {
+        return None;
+    }
+    let snapshot = model_dir.join("snapshots").join(commit);
+    CROSS_ENCODER_ARTIFACTS
+        .iter()
+        .all(|artifact| snapshot.join(artifact).is_file())
+        .then_some(snapshot)
 }
 
 /// Where `hf-hub` keeps everything it has fetched for `model_id`. Expressed
@@ -558,18 +619,36 @@ mod tests {
         }
     }
 
-    fn stage_cached_model(home: &Path, model_id: &str) {
-        let dir = home
-            .join(".cache")
-            .join("huggingface")
-            .join("hub")
-            .join(format!("models--{}", model_id.replace('/', "--")))
-            .join("snapshots")
-            .join("0123456789abcdef");
-        std::fs::create_dir_all(&dir).unwrap();
+    const CE_MODEL: &str = "cross-encoder/ms-marco-MiniLM-L-6-v2";
+    const CE_REVISION: &str = "main";
+    const CE_COMMIT: &str = "0123456789abcdef";
+
+    /// Stage a complete, resolvable snapshot under a cache ROOT, exactly as a
+    /// finished `hf-hub` download leaves one: a `refs/{revision}` file naming
+    /// the commit, and a `snapshots/{commit}` directory carrying every artifact
+    /// the loader asks for. Returns the snapshot directory.
+    fn stage_cached_snapshot(base: &Path, model_id: &str) -> PathBuf {
+        let model_dir = model_cache_dir(base, model_id);
+        std::fs::create_dir_all(model_dir.join("refs")).unwrap();
+        std::fs::write(model_dir.join("refs").join(CE_REVISION), CE_COMMIT).unwrap();
+        let snapshot = model_dir.join("snapshots").join(CE_COMMIT);
+        std::fs::create_dir_all(&snapshot).unwrap();
+        for artifact in CROSS_ENCODER_ARTIFACTS {
+            std::fs::write(snapshot.join(artifact), b"").unwrap();
+        }
+        snapshot
     }
 
-    const CE_MODEL: &str = "cross-encoder/ms-marco-MiniLM-L-6-v2";
+    /// The same, under the `.cache/huggingface` root a resolved HOME implies.
+    fn stage_cached_model(home: &Path, model_id: &str) {
+        stage_cached_snapshot(&home.join(".cache").join("huggingface"), model_id);
+    }
+
+    /// Whether the reranker model resolves under an already-resolved root.
+    /// Named once so every probe assertion asks the loader's question.
+    fn cached_under_base(base: Option<&Path>, model_id: &str) -> bool {
+        snapshot_under_base(base, model_id, CE_REVISION).is_some()
+    }
 
     /// Windows names the profile root `USERPROFILE` and does not set `HOME`, so
     /// a `HOME`-only lookup reports every model absent no matter what is on
@@ -626,7 +705,7 @@ mod tests {
             !cross_encoder_model_ever_fetched(CE_MODEL),
             "an untouched cache root must read as never fetched"
         );
-        assert!(!cross_encoder_model_cached(CE_MODEL));
+        assert!(!cross_encoder_model_cached(CE_MODEL, CE_REVISION));
 
         std::fs::create_dir_all(model_dir.join("blobs")).unwrap();
         assert!(
@@ -634,13 +713,26 @@ mod tests {
             "a model directory left behind means this install fetched the model once"
         );
         assert!(
-            !cross_encoder_model_cached(CE_MODEL),
+            !cross_encoder_model_cached(CE_MODEL, CE_REVISION),
             "with no resolved snapshot the model is not usable now"
         );
 
-        std::fs::create_dir_all(model_dir.join("snapshots").join("0123456789abcdef")).unwrap();
+        // A ref resolving to an empty snapshot directory is what an interrupted
+        // download leaves, and a snapshot directory alone is the shape the
+        // previous probe called usable. The loader opens files, so a directory
+        // holding none of them must not read as usable here either.
+        std::fs::create_dir_all(model_dir.join("refs")).unwrap();
+        std::fs::write(model_dir.join("refs").join(CE_REVISION), CE_COMMIT).unwrap();
+        std::fs::create_dir_all(model_dir.join("snapshots").join(CE_COMMIT)).unwrap();
         assert!(
-            cross_encoder_model_ever_fetched(CE_MODEL) && cross_encoder_model_cached(CE_MODEL),
+            !cross_encoder_model_cached(CE_MODEL, CE_REVISION),
+            "an empty snapshot directory holds none of the files the loader opens"
+        );
+
+        stage_cached_snapshot(temp.path(), CE_MODEL);
+        assert!(
+            cross_encoder_model_ever_fetched(CE_MODEL)
+                && cross_encoder_model_cached(CE_MODEL, CE_REVISION),
             "a resolved snapshot is both fetched and usable"
         );
     }
@@ -713,14 +805,7 @@ mod tests {
         let hf_home = temp.path().join("hf");
         let profile = temp.path().join("profile");
         std::fs::create_dir_all(&profile).unwrap();
-        std::fs::create_dir_all(
-            hf_home
-                .join("hub")
-                .join(format!("models--{}", CE_MODEL.replace('/', "--")))
-                .join("snapshots")
-                .join("0123456789abcdef"),
-        )
-        .unwrap();
+        stage_cached_snapshot(&hf_home, CE_MODEL);
 
         for windows in [true, false] {
             let base = hf_cache_base(
@@ -755,5 +840,126 @@ mod tests {
             assert_eq!(base, None);
             assert!(!cached_under_base(base.as_deref(), CE_MODEL));
         }
+    }
+
+    /// A relocated cache resolves to the relocated root and to nothing else.
+    ///
+    /// This is the defect stated as an assertion. The probe reads `HF_HOME`;
+    /// `hf-hub`'s `Cache::default()` reads `dirs::home_dir()/.cache/huggingface`
+    /// and never reads `HF_HOME`. With the variable set the two answers differ,
+    /// which is how a probe said "cached" for a model the loader would then
+    /// download inside a query. Handing the loader the resolved directory is
+    /// what removes the disagreement, so the assertion is on the resolved path
+    /// itself rather than on a boolean that hides which root produced it.
+    ///
+    /// The negative control is the same fixture with the weights removed. A
+    /// probe that cannot say no to a half-downloaded snapshot would arm the
+    /// reranker on a directory the loader cannot open.
+    #[test]
+    #[serial_test::serial]
+    fn a_relocated_cache_resolves_under_hf_home_and_never_under_the_home_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let hf_home = temp.path().join("relocated");
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let staged = stage_cached_snapshot(&hf_home, CE_MODEL);
+
+        let _hf = kin_core::test_env::EnvVarGuard::set("HF_HOME", &hf_home);
+        let _home = kin_core::test_env::EnvVarGuard::set("HOME", &home);
+
+        assert_eq!(
+            cross_encoder_model_snapshot(CE_MODEL, CE_REVISION).as_deref(),
+            Some(staged.as_path()),
+            "the resolved snapshot must be the one staged under HF_HOME"
+        );
+        assert!(
+            !staged.starts_with(&home),
+            "the fixture must place the cache away from the home root, or this proves nothing"
+        );
+        assert!(
+            cross_encoder_model_cached(CE_MODEL, CE_REVISION),
+            "a complete relocated snapshot arms the reranker"
+        );
+
+        std::fs::remove_file(staged.join("model.safetensors")).unwrap();
+        assert_eq!(
+            cross_encoder_model_snapshot(CE_MODEL, CE_REVISION),
+            None,
+            "a snapshot missing the weights is not a snapshot the loader can read"
+        );
+        assert!(!cross_encoder_model_cached(CE_MODEL, CE_REVISION));
+    }
+
+    /// A snapshot with no ref pointing at it resolves to nothing.
+    ///
+    /// `hf-hub` addresses a snapshot through `refs/{revision}` and downloads
+    /// when that file is absent, so a probe that answered from the presence of
+    /// a snapshot directory alone would report a model usable that the loader
+    /// would fetch over the network. The second half asks for a revision this
+    /// cache has never resolved, which is the same absence reached from the
+    /// other side.
+    #[test]
+    #[serial_test::serial]
+    fn a_snapshot_without_its_ref_reads_as_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        let _hf = kin_core::test_env::EnvVarGuard::set("HF_HOME", temp.path());
+        stage_cached_snapshot(temp.path(), CE_MODEL);
+        let model_dir = model_cache_dir(temp.path(), CE_MODEL);
+
+        assert!(
+            cross_encoder_model_cached(CE_MODEL, CE_REVISION),
+            "positive control: the staged fixture resolves before the ref is removed"
+        );
+        assert_eq!(
+            cross_encoder_model_snapshot(CE_MODEL, "a-revision-nobody-fetched"),
+            None,
+            "a revision this cache never fetched has no ref to resolve"
+        );
+
+        std::fs::remove_file(model_dir.join("refs").join(CE_REVISION)).unwrap();
+        assert_eq!(
+            cross_encoder_model_snapshot(CE_MODEL, CE_REVISION),
+            None,
+            "with no ref there is no commit to address the snapshot by"
+        );
+    }
+
+    /// The loader reads the directory the probe resolved.
+    ///
+    /// The two halves of this defect were a probe and a loader that resolved
+    /// separately, so an assertion about the probe alone cannot close it. This
+    /// drives `CrossEncoder::new` on the resolved path and reads the error it
+    /// returns: the staged artifacts are empty, so a loader that opened them
+    /// fails parsing the config, while a loader that ignored the directory and
+    /// went to the Hub fails somewhere else entirely. The model id is one that
+    /// does not exist on the Hub, so the wrong branch cannot download anything
+    /// even if it runs.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    #[serial_test::serial]
+    fn the_loader_opens_the_directory_the_probe_resolved() {
+        const ABSENT_FROM_THE_HUB: &str = "kin-test/no-such-reranker";
+
+        let temp = tempfile::tempdir().unwrap();
+        let hf_home = temp.path().join("relocated");
+        let _hf = kin_core::test_env::EnvVarGuard::set("HF_HOME", &hf_home);
+        let staged = stage_cached_snapshot(&hf_home, ABSENT_FROM_THE_HUB);
+
+        let resolved = cross_encoder_model_snapshot(ABSENT_FROM_THE_HUB, CE_REVISION)
+            .expect("the staged snapshot must resolve");
+        assert_eq!(resolved, staged);
+
+        let outcome = kin_db::embed::rerank::CrossEncoder::new(
+            resolved.to_str().expect("a temp path is UTF-8"),
+            CE_REVISION,
+        );
+        let message = match outcome {
+            Ok(_) => panic!("empty artifacts cannot build a cross-encoder"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("failed to parse model config"),
+            "the loader must have opened the resolved directory's own config; got: {message}"
+        );
     }
 }
