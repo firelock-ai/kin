@@ -35,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Derace eight process-lifecycle, lock and runtime tests on their own events (#887)
 - Resolve cross-file relations on the live reconcile path, in both write orders (#870)
 - Resolve a receiver-method call by the receiver's nameable type (#888)
+- Bound every apt install in CI so a stalled mirror fails fast instead of holding the job (#889)
 
 
 ## [0.5.37] - 2026-08-17
