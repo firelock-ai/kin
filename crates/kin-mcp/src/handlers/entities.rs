@@ -610,7 +610,15 @@ selects, and it cannot bound the envelope that content travels in, so read `toke
 which measures the serialized response this call returns, as what the call costs you. \
 `focal_entity.body` in the response IS the focal entity's exact source text, so this one \
 call already answers \"show me the code\": no follow-up read is needed, and it is the body \
-to edit and stage back. If get_entity_source is available to you it is cheaper for a raw \
+to edit and stage back, in compact mode too, which drops the dependency bodies and \
+projection levels but never the focal body. Every dependency row says why it is there: \
+`relation: \"dependency_edge\"` is an edge the graph asserts, and \
+`relation: \"same_file_neighbor\"` means the focal had no dependency edge at all, so the \
+row is a neighbour sharing the focal's file rather than anything the focal depends on. \
+That is the usual shape for a class whose only edges are containment. \
+`dependency_selection` names which of the two filled the list and, for the fallback, how \
+many same-file candidates there were and how many were dropped to fit. \
+If get_entity_source is available to you it is cheaper for a raw \
 body alone; if you need to follow an actual call chain step by step, use trace_data_flow.";
 
 pub fn handle_get_context_pack<G: GraphStore>(
@@ -619,7 +627,9 @@ pub fn handle_get_context_pack<G: GraphStore>(
     sessions: &SessionRegistry,
     repository_authority: Option<&RequestRepositoryAuthority>,
 ) -> Result<ToolCallResult> {
-    use kin_context::{build_context_pack_with_traffic, ContextOptions};
+    use kin_context::{
+        build_context_pack_with_traffic_and_provenance, ContextOptions, DependencyRelation,
+    };
     use kin_model::context::TokenBudget;
 
     let id_str = get_string_param(args, "entity_id")?;
@@ -650,8 +660,9 @@ pub fn handle_get_context_pack<G: GraphStore>(
         vec![]
     };
 
-    let pack = build_context_pack_with_traffic(store, &entity_id, &opts, &nearby_intents)
-        .map_err(|e| McpError::Context(e.to_string()))?;
+    let (pack, selection) =
+        build_context_pack_with_traffic_and_provenance(store, &entity_id, &opts, &nearby_intents)
+            .map_err(|e| McpError::Context(e.to_string()))?;
 
     // Build structured response JSON. The pack still has to have projected a
     // focal entry for the focal entity to be worth serializing, but the body
@@ -665,12 +676,20 @@ pub fn handle_get_context_pack<G: GraphStore>(
     let held = HeldSourceAuthority::new(store, repository_authority);
 
     let focal_json = if let (Some(_), Some(entity)) = (focal_entry, &focal_entity) {
-        focal_context_json_held(&held, entity, compact)?
+        focal_context_json_held(&held, entity)?
     } else {
         serde_json::json!(null)
     };
 
-    let project_dep = |entry: &kin_model::context::ContextEntry| -> Result<serde_json::Value> {
+    // `relation` is what keeps a same-file neighbour from reading as a
+    // dependency. The builder tags the fallback inside `entry.content`, which
+    // this handler does not serialize, so without the selection travelling
+    // alongside the pack the two are indistinguishable on the wire. Rows in the
+    // sections that are not dependencies (transitive, tests, contracts) pass
+    // `None` and carry no relation at all.
+    let project_dep = |entry: &kin_model::context::ContextEntry,
+                       relation: Option<DependencyRelation>|
+     -> Result<serde_json::Value> {
         // Look up the entity for structured fields.
         if let Some(e) = store
             .get_entity(&entry.entity_id)
@@ -686,6 +705,9 @@ pub fn handle_get_context_pack<G: GraphStore>(
                 "start_line": entity_presentation_start_line(&e),
                 "end_line": entity_presentation_end_line(&e),
             });
+            if let Some(relation) = relation {
+                obj["relation"] = serde_json::json!(relation.as_str());
+            }
             if !compact {
                 obj["projection"] = serde_json::json!(format!("{:?}", entry.projection_level));
                 // A dependency whose file the current workspace does not contain
@@ -729,27 +751,43 @@ pub fn handle_get_context_pack<G: GraphStore>(
             }
             Ok(obj)
         } else {
-            Ok(serde_json::json!({
+            let mut obj = serde_json::json!({
                 "id": entry.entity_id.to_string(),
                 "content": entry.content,
-            }))
+            });
+            if let Some(relation) = relation {
+                obj["relation"] = serde_json::json!(relation.as_str());
+            }
+            Ok(obj)
         }
     };
 
     let dependencies: Vec<_> = pack
         .dependency_signatures
         .iter()
-        .map(&project_dep)
+        .map(|entry| project_dep(entry, Some(selection.relation_for(&entry.entity_id))))
         .collect::<Result<Vec<_>>>()?;
     let transitive: Vec<_> = pack
         .transitive_deps
         .iter()
-        .map(&project_dep)
+        .map(|entry| project_dep(entry, None))
         .collect::<Result<Vec<_>>>()?;
 
+    // The cap and the fallback are both invisible in the rows themselves: six
+    // neighbours out of twenty-four look exactly like six dependencies. This
+    // says which selection ran and what it dropped, in every mode, because a
+    // caller deciding whether to ask again needs it most when the answer is
+    // small.
+    let returned = dependencies.len();
     let mut result = serde_json::json!({
         "focal_entity": focal_json,
         "dependencies": dependencies,
+        "dependency_selection": {
+            "source": selection.source().as_str(),
+            "returned": returned,
+            "same_file_candidates": selection.same_file_candidates(),
+            "same_file_dropped": selection.same_file_dropped(),
+        },
         "token_budget": budget.max_tokens(),
         "tokens_used": pack.actual_tokens,
     });
@@ -761,7 +799,7 @@ pub fn handle_get_context_pack<G: GraphStore>(
         let tests: Vec<_> = pack
             .tests
             .iter()
-            .map(&project_dep)
+            .map(|entry| project_dep(entry, None))
             .collect::<Result<Vec<_>>>()?;
         if !tests.is_empty() {
             result["tests"] = serde_json::json!(tests);
@@ -769,7 +807,7 @@ pub fn handle_get_context_pack<G: GraphStore>(
         let contracts: Vec<_> = pack
             .contracts
             .iter()
-            .map(&project_dep)
+            .map(|entry| project_dep(entry, None))
             .collect::<Result<Vec<_>>>()?;
         if !contracts.is_empty() {
             result["contracts"] = serde_json::json!(contracts);
@@ -842,7 +880,8 @@ value is consolidation: instead of looping get_entity_source over each step of a
 — which exhausts your context and round-trips — one call returns everything needed to \
 reason about the flow step by step. By default the focal comes back as a full body and \
 its dependencies as signatures (the shape best suited to trace reasoning); set \
-compact=true for signature-only entries everywhere when you just need the structure. \
+compact=true to drop the dependency bodies when you just need the structure, which \
+leaves the focal body in place. \
 When you specifically want the ordered call chain itself (not a flat neighborhood), \
 trace_data_flow walks the relations directionally and inlines each step.";
 

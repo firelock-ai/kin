@@ -2616,16 +2616,21 @@ pub fn entity_response_json<G: GraphStore>(
 /// `entry.content` is a token-accounting stub, and once it stopped being a body
 /// fallback the parameter only obliged callers to build a value this function
 /// discards.
+///
+/// Takes no `compact` flag either. Compact mode used to drop the focal body
+/// while still paying for the read that produced it, which left the one thing
+/// the pack is for out of the cheaper mode: a caller asking for a bounded pack
+/// spent a whole call learning it had to ask again. Compact now bounds the
+/// dependency rows, and the focal body it serves is already capped at
+/// [`MCP_SOURCE_MAX_LINES`]/[`MCP_SOURCE_MAX_CHARS`].
 pub fn focal_context_json<G: GraphStore>(
     store: &G,
     entity: &Entity,
-    compact: bool,
     repository_authority: Option<&RequestRepositoryAuthority>,
 ) -> Result<serde_json::Value> {
     focal_context_json_held(
         &HeldSourceAuthority::new(store, repository_authority),
         entity,
-        compact,
     )
 }
 
@@ -2635,7 +2640,6 @@ pub fn focal_context_json<G: GraphStore>(
 pub fn focal_context_json_held<G: GraphStore>(
     held: &HeldSourceAuthority<'_, G>,
     entity: &Entity,
-    compact: bool,
 ) -> Result<serde_json::Value> {
     let start_line = entity_presentation_start_line(entity);
     let end_line = entity_presentation_end_line(entity);
@@ -2660,13 +2664,11 @@ pub fn focal_context_json_held<G: GraphStore>(
         "source": source,
     });
 
-    if !compact {
-        match source_excerpt.as_ref() {
-            Some(source) => obj["body"] = serde_json::json!(source.body),
-            None => {
-                obj["body"] = serde_json::Value::Null;
-                obj["body_unavailable"] = serde_json::json!(entity_body_gap_reason(entity));
-            }
+    match source_excerpt.as_ref() {
+        Some(source) => obj["body"] = serde_json::json!(source.body),
+        None => {
+            obj["body"] = serde_json::Value::Null;
+            obj["body_unavailable"] = serde_json::json!(entity_body_gap_reason(entity));
         }
     }
     if let Some(source) = source_excerpt {
