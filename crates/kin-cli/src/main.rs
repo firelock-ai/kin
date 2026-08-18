@@ -3020,7 +3020,10 @@ fn main() -> Result<()> {
                     commands::blame::run(entity, reference).await
                 }
                 Command::Agent { action } => {
-                    let code = match action {
+                    // The agent loop is blocking, and a blocking HTTP client builds and
+                    // drops its own runtime. Dropping one inside an async context panics,
+                    // so the whole command runs on a plain thread outside this runtime.
+                    let code = std::thread::spawn(move || match action {
                         AgentAction::Run {
                             task,
                             model,
@@ -3063,7 +3066,9 @@ fn main() -> Result<()> {
                             api_key_env,
                             tool_profile,
                         ),
-                    }?;
+                    })
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("the agent thread panicked"))??;
                     // The run's own taxonomy is reported through the exit code: 2 budget,
                     // 3 deadline, 4 endpoint, 5 MCP. A caller must be able to tell a task
                     // the agent could not do from an endpoint that was never there.
