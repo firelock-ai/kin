@@ -20,6 +20,7 @@ members = [
     "crates/kin-buildinfo",
     "crates/kin-notify",
     "crates/kin-notifier-macos",
+    "crates/kin-agent",
     "crates/kin-cli",
     "crates/kin-daemon-spawn",
     "crates/kin-daemon",
@@ -141,6 +142,7 @@ kin-migrate = { path = "crates/kin-migrate" }
 kin-runtime = { path = "crates/kin-runtime" }
 kin-buildinfo = { path = "crates/kin-buildinfo" }
 kin-notify = { path = "crates/kin-notify" }
+kin-agent = { path = "crates/kin-agent" }
 kin-cli = { path = "crates/kin-cli", default-features = false }
 kin-daemon = { path = "crates/kin-daemon" }
 kin-daemon-spawn = { path = "crates/kin-daemon-spawn" }
