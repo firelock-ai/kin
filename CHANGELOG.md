@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Count entity body previews as the graph bodies of parsed source paths in locate (#893)
 - Abandon v0.5.38: its frozen install proof fails on a body-coverage gap the tag cannot receive the fix for (#894)
 - Drop the Azure apt mirror on retry so a stalled package download cannot exhaust every attempt (#896)
+- Pin the Linux kin-vfs glibc floor and refuse a release above it (#897)
 
 
 ## [0.5.38] - 2026-08-18
