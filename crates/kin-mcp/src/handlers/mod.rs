@@ -106,7 +106,8 @@ pub async fn handle_tool_call<G: GraphStore>(
             sessions::handle_transaction_begin(arguments, sessions, session_authority_mode).await
         }
         "kin_transaction_stage" => {
-            sessions::handle_transaction_stage(arguments, sessions, session_authority_mode).await
+            sessions::handle_transaction_stage(arguments, store, sessions, session_authority_mode)
+                .await
         }
         "kin_transaction_validate" => {
             sessions::handle_transaction_validate(arguments, sessions, session_authority_mode).await
@@ -4329,7 +4330,7 @@ mod tests {
         stage_args.insert("transaction_id".into(), serde_json::json!(tx_id));
         stage_args.insert("operations".into(), serde_json::json!(vec![op]));
         let stage_res =
-            sessions::handle_transaction_stage(&stage_args, &sessions, session_authority)
+            sessions::handle_transaction_stage(&stage_args, &store, &sessions, session_authority)
                 .await
                 .unwrap();
         let stage_text = match &stage_res.content[0] {
@@ -4473,7 +4474,7 @@ mod tests {
         stage_args.insert("transaction_id".into(), serde_json::json!(tx_id));
         stage_args.insert("operations".into(), serde_json::json!(vec![op]));
         let stage_res =
-            sessions::handle_transaction_stage(&stage_args, &sessions, session_authority)
+            sessions::handle_transaction_stage(&stage_args, &store, &sessions, session_authority)
                 .await
                 .unwrap();
         assert_ne!(
@@ -4537,7 +4538,7 @@ mod tests {
         let mut stage_args = HashMap::new();
         stage_args.insert("transaction_id".into(), serde_json::json!(tx_id));
         stage_args.insert("operations".into(), serde_json::json!(vec![op]));
-        sessions::handle_transaction_stage(&stage_args, &sessions, session_authority)
+        sessions::handle_transaction_stage(&stage_args, &store, &sessions, session_authority)
             .await
             .unwrap();
 
@@ -4606,7 +4607,7 @@ mod tests {
         stage_args.insert("transaction_id".into(), serde_json::json!(tx_id));
         stage_args.insert("operations".into(), serde_json::json!(vec![op]));
         let stage_res =
-            sessions::handle_transaction_stage(&stage_args, &sessions, session_authority)
+            sessions::handle_transaction_stage(&stage_args, &store, &sessions, session_authority)
                 .await
                 .unwrap();
         assert_ne!(
@@ -4963,6 +4964,7 @@ mod tests {
         // dropped at commit. The transaction id here does not exist; validation
         // is expected to reject the operation first.
         use crate::session::{McpMutationOperation, McpMutationPayload};
+        let store = InMemoryGraph::default();
         let sessions = SessionRegistry::new();
         let session_authority = SessionAuthorityMode::OfflineFallback;
 
@@ -4977,12 +4979,61 @@ mod tests {
         stage_args.insert("transaction_id".into(), serde_json::json!("no-such-tx"));
         stage_args.insert("operations".into(), serde_json::json!(vec![op]));
 
-        let err = sessions::handle_transaction_stage(&stage_args, &sessions, session_authority)
-            .await
-            .expect_err("payload-less op must be rejected at stage time");
+        let err =
+            sessions::handle_transaction_stage(&stage_args, &store, &sessions, session_authority)
+                .await
+                .expect_err("payload-less op must be rejected at stage time");
         assert!(matches!(err, McpError::InvalidParams(_)));
         assert!(
             err.to_string().contains("missing payload"),
+            "actionable stage-time message expected, got: {err}"
+        );
+    }
+
+    /// FIR-2417 follow-up: a `create` naming a path the graph already tracks
+    /// is refused at stage time, not just at commit. Before this check existed
+    /// staging such an operation reported `staged_count: 1` and the caller only
+    /// learned the path collided once it committed, after staging whatever else
+    /// it had queued alongside it.
+    #[tokio::test]
+    async fn handle_transaction_stage_rejects_a_create_for_an_already_tracked_path() {
+        use crate::session::McpMutationOperation;
+
+        let store = InMemoryGraph::default();
+        let path = kin_model::RepoPath::from_utf8("src/tracked.py".to_string()).unwrap();
+        store
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                tree_deltas: vec![kin_model::TreeDelta::Added {
+                    artifact_id: kin_model::ArtifactId::new(),
+                    new: kin_model::LocatedEntry::new(
+                        path,
+                        kin_model::TreeEntry::blob(Hash256::from_bytes([1; 32]), false),
+                    ),
+                }],
+                ..kin_model::TransactionDelta::default()
+            })
+            .unwrap();
+        let sessions = SessionRegistry::new();
+        let session_authority = SessionAuthorityMode::OfflineFallback;
+
+        let op = McpMutationOperation {
+            verb: "create".into(),
+            target: "src/tracked.py".into(),
+            payload: None,
+            body: Some("value = 1\n".into()),
+            description: "admit new source src/tracked.py".into(),
+        };
+        let mut stage_args = HashMap::new();
+        stage_args.insert("transaction_id".into(), serde_json::json!("no-such-tx"));
+        stage_args.insert("operations".into(), serde_json::json!(vec![op]));
+
+        let err =
+            sessions::handle_transaction_stage(&stage_args, &store, &sessions, session_authority)
+                .await
+                .expect_err("create over an already-tracked path must be rejected at stage time");
+        assert!(matches!(err, McpError::InvalidParams(_)));
+        assert!(
+            err.to_string().contains("already tracked"),
             "actionable stage-time message expected, got: {err}"
         );
     }
