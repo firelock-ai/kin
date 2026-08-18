@@ -103,6 +103,7 @@ jobs:
           python3 ./scripts/test-npm-automatic-release.py
           python3 ./scripts/test-verify-npm-release.py
           node --test \
+            ./scripts/check-glibc-floor.test.mjs \
             ./scripts/check-release-version.test.mjs \
             ./scripts/extract-release-notes.test.mjs \
             ./scripts/prepare-release.test.mjs \
@@ -112,6 +113,7 @@ jobs:
             ./scripts/release-hold-alarm.test.mjs \
             ./scripts/verify-capability-proof.test.mjs \
             ./scripts/verify-npm-attestation.test.mjs
+          node --check ./scripts/check-glibc-floor.mjs
           node --check ./scripts/read-update-build-identity.cjs
           node --check ./scripts/check-release-version.mjs
           node --check ./scripts/prepare-release.mjs
@@ -948,6 +950,7 @@ jobs:
         run: |
           python3 scripts/test-release-workflow-authority.py
           node --test \
+            scripts/check-glibc-floor.test.mjs \
             scripts/check-kin-vfs-compat.test.mjs \
             scripts/check-release-version.test.mjs \
             scripts/extract-release-notes.test.mjs \

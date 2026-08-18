@@ -65,6 +65,16 @@ ABANDONED_TAGS_POLICY = "scripts/abandoned-release-tags.json"
 TAG_SELECTOR_POLICY = "scripts/select-admissible-release-tag.py"
 ASSERTION_REACHABILITY = ROOT / "scripts" / "test-assertion-reachability.py"
 ASSERTION_REACHABILITY_POLICY = "scripts/test-assertion-reachability.py"
+GLIBC_FLOOR_GUARD = ROOT / "scripts" / "check-glibc-floor.mjs"
+GLIBC_FLOOR_GUARD_POLICY = "scripts/check-glibc-floor.mjs"
+GLIBC_FLOOR_TEST = ROOT / "scripts" / "check-glibc-floor.test.mjs"
+GLIBC_FLOOR_TEST_POLICY = "scripts/check-glibc-floor.test.mjs"
+GLIBC_FLOOR_RELEASE_CHECK = (
+    'run: node scripts/check-glibc-floor.mjs "$ARTIFACT/kin-vfs" "$ARTIFACT/$SHIM_NAME"'
+)
+GLIBC_FLOOR_BUILD_READ = (
+    'floor="$(node "$GITHUB_WORKSPACE/scripts/check-glibc-floor.mjs" --print-floor)"'
+)
 KIN_VFS_COMPAT_GUARD = ROOT / "scripts" / "check-kin-vfs-compat.mjs"
 KIN_VFS_COMPAT_GUARD_POLICY = "scripts/check-kin-vfs-compat.mjs"
 KIN_VFS_COMPAT_TEST = ROOT / "scripts" / "check-kin-vfs-compat.test.mjs"
@@ -3487,6 +3497,76 @@ def assert_assertion_reachability_gate_wired(workflow: str) -> None:
         raise AssertionError(
             f"{ASSERTION_REACHABILITY_POLICY} is missing; the release gates "
             "would no longer prove their own checks run"
+        )
+
+
+def assert_glibc_floor_guard_wired(ci: str, release: str) -> None:
+    """Keep the floor that decides which Linux distributions can start Kin.
+
+    kin and kin-daemon are static musl and carry no glibc floor. The kin-vfs
+    pair is the only glibc-linked thing Kin publishes for Linux, and its floor
+    used to be a property of the runner image rather than of anything under
+    review: Rust std references pidfd_spawnp and pidfd_getpid as weak undefined
+    symbols, the linker binds them to whatever libc the build host exports, and
+    the ubuntu-24.04 images export them at GLIBC_2.39. v0.5.38 shipped a
+    linux-aarch64 kin-vfs that the Debian 12 loader refused outright, while
+    every check in the release stayed green, because nothing read the floor.
+
+    Two halves are required here and neither is sufficient alone. The build
+    must go through the pinned floor, reading it from the guard rather than
+    recording it a second time, or the number the guard enforces and the number
+    the build targets can drift apart. And the release must read the floor back
+    off the packaged bytes, because a pin that quietly stops taking effect
+    looks exactly like a pin that worked.
+    """
+
+    for path, policy in (
+        (GLIBC_FLOOR_GUARD, GLIBC_FLOOR_GUARD_POLICY),
+        (GLIBC_FLOOR_TEST, GLIBC_FLOOR_TEST_POLICY),
+    ):
+        if not path.is_file():
+            raise AssertionError(
+                f"{policy} is missing; the Linux archives could ship a kin-vfs "
+                "no supported distribution can start and nothing would notice"
+            )
+
+    # Match whole invocations rather than searching for the path, which a
+    # commented-out line would still satisfy.
+    release_lines = {line.strip() for line in release.splitlines()}
+    if GLIBC_FLOOR_RELEASE_CHECK not in release_lines:
+        raise AssertionError(
+            "release.yml must run "
+            f"{GLIBC_FLOOR_GUARD_POLICY} against the packaged Linux binaries; "
+            "the build's intent to pin a floor is not the same evidence as the "
+            "floor of the bytes about to be published"
+        )
+    if GLIBC_FLOOR_BUILD_READ not in release_lines:
+        raise AssertionError(
+            "release.yml must read the glibc floor from "
+            f"{GLIBC_FLOOR_GUARD_POLICY}; a build targeting one floor while the "
+            "guard enforces another is worse than no guard"
+        )
+    if 'cargo zigbuild --locked --release --target "${VFS_TARGET}.${floor}"' not in release:
+        raise AssertionError(
+            "release.yml must build the Linux kin-vfs binaries against the "
+            "pinned floor; a plain cargo build takes its floor from the runner "
+            "image, which is what shipped an unloadable v0.5.38 kin-vfs"
+        )
+
+    # The tests are load-bearing rather than decorative: the guard's whole
+    # answer is a parse of readelf output, and a parse that silently found
+    # nothing would be a guard that cannot fail.
+    ci_lines = {line.strip() for line in ci.splitlines()}
+    if not ci_lines & {
+        GLIBC_FLOOR_TEST_POLICY,
+        f"{GLIBC_FLOOR_TEST_POLICY} \\",
+        f"./{GLIBC_FLOOR_TEST_POLICY}",
+        f"./{GLIBC_FLOOR_TEST_POLICY} \\",
+    }:
+        raise AssertionError(
+            "ci.yml must run "
+            f"{GLIBC_FLOOR_TEST_POLICY}; the guard reads a floor out of readelf "
+            "output, and an unproven parse is a gate that cannot fail"
         )
 
 
@@ -10263,6 +10343,53 @@ def main() -> None:
     assert_docs_only_classifier_guard(ci_workflow)
     assert_assertion_reachability_gate_wired(ci_workflow)
     assert_kin_vfs_compat_gate_wired(ci_workflow)
+    assert_glibc_floor_guard_wired(ci_workflow, release)
+    expect_assertion(
+        "release.yml stops reading the glibc floor off the packaged binaries",
+        "release.yml must run",
+        lambda: assert_glibc_floor_guard_wired(
+            ci_workflow,
+            release.replace(GLIBC_FLOOR_RELEASE_CHECK, "run: true"),
+        ),
+    )
+    expect_assertion(
+        "the floor check survives only as a commented-out release.yml step",
+        "release.yml must run",
+        lambda: assert_glibc_floor_guard_wired(
+            ci_workflow,
+            release.replace(
+                GLIBC_FLOOR_RELEASE_CHECK,
+                GLIBC_FLOOR_RELEASE_CHECK.replace("run: ", "run: # "),
+            ),
+        ),
+    )
+    expect_assertion(
+        "the release build stops reading the floor from the guard that enforces it",
+        "must read the glibc floor",
+        lambda: assert_glibc_floor_guard_wired(
+            ci_workflow,
+            release.replace(GLIBC_FLOOR_BUILD_READ, 'floor="2.31"'),
+        ),
+    )
+    expect_assertion(
+        "the Linux kin-vfs build reverts to taking its floor from the runner image",
+        "must build the Linux kin-vfs binaries against the pinned floor",
+        lambda: assert_glibc_floor_guard_wired(
+            ci_workflow,
+            release.replace(
+                'cargo zigbuild --locked --release --target "${VFS_TARGET}.${floor}"',
+                'cargo build --locked --release --target "$VFS_TARGET"',
+            ),
+        ),
+    )
+    expect_assertion(
+        "ci.yml keeps the floor guard but drops the tests proving its parse",
+        "ci.yml must run",
+        lambda: assert_glibc_floor_guard_wired(
+            ci_workflow.replace(GLIBC_FLOOR_TEST_POLICY, "scripts/absent.test.mjs"),
+            release,
+        ),
+    )
     expect_assertion(
         "ci.yml drops the pull-request Kin/kin-vfs compatibility gate",
         "ci.yml must run",
