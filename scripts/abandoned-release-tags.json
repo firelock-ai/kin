@@ -63,6 +63,13 @@
       "reason": "The Public Install Proof frozen at this tag fails on its three gating Unix legs and the tag can receive none of the repairs. The tagged binary never records that an explicit embedding fill completed, because only the background worker publishes the fill-completed marker and it stands down for the duration of an explicit pass, and the tag's health rollup then classifies the backlog on that completed store as lost ground, which blocks the aggregate on ubuntu-latest and macos-15-intel. The tag's proof harness also tees its own capture files into the worktree it measures, and this is the first tag whose watcher admits new non-ignored files as they are written, so the captures become semantic corpus mid-proof and the ubuntu-24.04-arm locate coverage assertion races a store the proof itself is growing. The repairs landed on main only after the tag, and both the proof workflow and the binary resolve from the tag, so no later change to main can reach the failing checks. Both attempts of the cited run failed, the windows leg is non-gating by its own matrix, the only GitHub Release object for this tag is the unpromoted prerelease the workflow publishes before proof, npm was verified untouched at 0.5.17, and the tag never became the finalized Latest release.",
       "superseded_by": "v0.5.19",
       "failed_release_run_id": "31478318322"
+    },
+    {
+      "tag": "v0.5.38",
+      "sha": "fc90646499a26defb95e958d8127337386668403",
+      "reason": "The Public Install Proof frozen at this tag fails on all five platforms at the installed capability validation: the tagged binary's locate coverage counts a graph-owned source path as bodied only when an opaque artifact carries a text preview for it, and no HEAD admission path writes such a record for a parsed source file (the daemon keeps one facet per path and clears opaque records on entity paths), so a fresh install's kin locate reports semantic coverage incomplete with a body gap on every store that holds one parsed source file, and the proof's complete-coverage assertion refuses it. The repair, which reads the entity body previews the graph already holds at HEAD, landed on main only after the tag, and both the proof workflow and the binary resolve from the tag, so no later change to main can reach the failing check. Both attempts of the cited run failed with the same signature on all five legs, the only GitHub Release object for this tag is the unpromoted prerelease the workflow publishes before proof, npm and Homebrew were verified untouched at 0.5.37, and the tag never became the finalized Latest release.",
+      "superseded_by": "v0.5.39",
+      "failed_release_run_id": "32107626360"
     }
   ]
 }
