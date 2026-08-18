@@ -697,13 +697,19 @@ commit the graph-to-file projection writes the body into the entity's working-di
 file. Structured payloads (full entity, relation add/remove) are also accepted. Each \
 operation is validated at stage time: anything the commit path would silently drop (a \
 missing or unknown verb, a missing payload outside the two payload-less source forms, a \
-nameless entity, a relation update/modify, a blob payload, or a new-file path that is \
-absolute, escapes the repository, or names Kin or Git control metadata) is rejected immediately with an actionable error \
-instead of vanishing at commit. This rejection is identical in daemon and in-process \
-modes. Accepted operations are queued and can be validated or committed together.";
+nameless entity, a relation update/modify, a blob payload, a new-file path that is \
+absolute, escapes the repository, or names Kin or Git control metadata, or a 'create' \
+naming a path repository authority already tracks) is rejected immediately with an \
+actionable error instead of vanishing at commit. The already-tracked check reads a \
+snapshot of the graph this call is authoritative over: it catches the ordinary case, but \
+a path another transaction creates between this stage call and your commit is still only \
+caught at commit, which stays the final authority. This rejection is identical in daemon \
+and in-process modes. Accepted operations are queued and can be validated or committed \
+together.";
 
-pub async fn handle_transaction_stage(
+pub async fn handle_transaction_stage<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
+    store: &G,
     sessions: &SessionRegistry,
     session_authority_mode: SessionAuthorityMode,
 ) -> Result<ToolCallResult> {
@@ -722,6 +728,34 @@ pub async fn handle_transaction_stage(
     // both daemon and in-process modes.
     crate::session::validate_staged_operations(&operations)
         .map_err(crate::error::McpError::InvalidParams)?;
+
+    // A new-source-file path is shape-valid at this point but may already be
+    // tracked; only the graph knows that, so it is checked here rather than in
+    // `validate_staged_operations`, which is deliberately graph-free so it
+    // behaves identically offline. Checking it now, against whichever graph
+    // this call is authoritative over, turns a failure `record_new_source_file`
+    // would otherwise raise only at commit into an immediate one, so an agent
+    // staging a path collision finds out before it has staged anything else on
+    // top of it. This is a snapshot check: another transaction can still land a
+    // conflicting create between stage and commit, and commit remains the
+    // authority that catches that race.
+    for (idx, operation) in operations.iter().enumerate() {
+        if !crate::session::is_new_source_file(operation) {
+            continue;
+        }
+        let target = operation.target.trim();
+        let Ok(path) = kin_model::RepoPath::from_utf8(target.to_string()) else {
+            continue;
+        };
+        if store.artifact_id_at_path(&path).is_some() {
+            return Err(crate::error::McpError::InvalidParams(format!(
+                "operation #{idx} ('create'): {target:?} is already tracked by repository \
+                 authority, so it cannot be created; 'create' admits only source the graph has \
+                 never seen. Edit it with verb 'update' naming an entity inside it, or create a \
+                 path that does not exist yet"
+            )));
+        }
+    }
 
     if session_authority_mode.uses_daemon() {
         match crate::daemon_delegate::forward_tool_call("kin_transaction_stage", args).await {
