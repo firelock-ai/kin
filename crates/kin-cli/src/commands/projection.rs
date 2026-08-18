@@ -15,6 +15,9 @@
 //!   on the machine sees graph truth because the kernel serves it, with no
 //!   injection and no shell hook.
 //! * **FUSE mount**: the same property through libfuse, FUSE-T or macFUSE.
+//! * **Windows ProjFS**: the Windows Projected File System, which is the
+//!   Windows path on every SKU including Home. Windows has no injected shim and
+//!   no FUSE, so ProjFS is both its primary and its floor.
 //!
 //! ## The fallback order, and why it is this way
 //!
@@ -23,8 +26,18 @@
 //! the platform's native one comes first: macOS carries an NFS client in the
 //! base system while FUSE there needs FUSE-T or macFUSE installed, and Linux
 //! carries libfuse far more often than it carries a configured NFS client. The
-//! shim is last, and it is a real answer rather than a failure: it is what
-//! makes graph-first adoption work on a host that will mount nothing.
+//! shim is last on those two, and it is a real answer rather than a failure: it
+//! is what makes graph-first adoption work on a host that will mount nothing.
+//!
+//! Windows runs a different order for a different reason. There is no injected
+//! shim to fall back to, so ProjFS leads and is also the floor, and the NFS
+//! client is the documented second choice rather than a compatibility layer:
+//! it ships only on Pro, Enterprise and Education, and it mounts to a drive
+//! letter instead of projecting the repository in place.
+//!
+//! Which mode is possible on which platform, and the exact line that enables a
+//! missing one, live in [`requirement`] and nowhere else. Twelve answers spread
+//! across twelve call sites is how a platform silently loses its remedy.
 //!
 //! ## Prove, do not assert
 //!
@@ -51,7 +64,7 @@ use console::style;
 use crate::commands::health::{
     pinned_vfs_driver, resolve_vfs_driver, vfs_driver_candidates, VfsDriverState,
 };
-use crate::commands::setup::{check_binary_in_path, kin_dir, shim_filename};
+use crate::commands::setup::{check_binary_in_path, home_dir, kin_dir, shim_filename};
 
 /// Every `kin-vfs` subcommand Kin drives, named once.
 ///
@@ -68,6 +81,8 @@ pub(crate) mod driver {
     pub const NFS_START: &str = "nfs-start";
     pub const NFS_STOP: &str = "nfs-stop";
     pub const NFS_STATUS: &str = "nfs-status";
+    /// Admits every write staged through the mount into graph truth now.
+    pub const NFS_SYNC: &str = "nfs-sync";
     pub const WORKSPACES: &str = "workspaces";
     pub const MOUNT: &str = "mount";
     pub const UNMOUNT: &str = "unmount";
@@ -92,6 +107,8 @@ pub(crate) enum ProjectionMode {
     Nfs,
     /// A FUSE mount served by `kin-vfs`.
     Fuse,
+    /// The Windows Projected File System.
+    ProjFs,
 }
 
 impl ProjectionMode {
@@ -101,6 +118,7 @@ impl ProjectionMode {
             Self::Shim => "shim",
             Self::Nfs => "nfs",
             Self::Fuse => "fuse",
+            Self::ProjFs => "projfs",
         }
     }
 
@@ -110,6 +128,7 @@ impl ProjectionMode {
             "shim" => Some(Self::Shim),
             "nfs" => Some(Self::Nfs),
             "fuse" => Some(Self::Fuse),
+            "projfs" => Some(Self::ProjFs),
             _ => None,
         }
     }
@@ -117,7 +136,7 @@ impl ProjectionMode {
     /// Whether this mode presents the repository at a mount point rather than
     /// inside the process that asked.
     pub(crate) fn is_mount(self) -> bool {
-        matches!(self, Self::Nfs | Self::Fuse)
+        matches!(self, Self::Nfs | Self::Fuse | Self::ProjFs)
     }
 
     /// One line on what this projection is, for `kin vfs status` and the docs
@@ -130,6 +149,10 @@ impl ProjectionMode {
             }
             Self::Nfs => "an NFSv3 mount served by kin-vfs; every tool on the host sees it",
             Self::Fuse => "a FUSE mount served by kin-vfs; every tool on the host sees it",
+            Self::ProjFs => {
+                "the Windows Projected File System, which projects the repository in place; \
+                 available on every Windows SKU including Home"
+            }
         }
     }
 }
@@ -158,9 +181,95 @@ pub(crate) fn fallback_order(os: &str) -> Vec<ProjectionMode> {
             ProjectionMode::Nfs,
             ProjectionMode::Shim,
         ],
+        // No injected shim and no FUSE here. ProjFS leads because it is the
+        // only mode present on every SKU, and the NFS client is second rather
+        // than a floor: it ships on Pro, Enterprise and Education alone, and it
+        // mounts to a drive letter instead of projecting in place.
+        "windows" => vec![ProjectionMode::ProjFs, ProjectionMode::Nfs],
         _ => vec![ProjectionMode::Shim],
     }
 }
+
+/// The mode named when nothing on this host is available.
+///
+/// Not simply the last entry of the order. On macOS and Linux the compatibility
+/// answer is the shim, which is last; on Windows the last entry is the NFS
+/// client, which most machines cannot install, and naming it would send a Home
+/// user after a feature their edition does not have. The floor is the mode the
+/// platform's remedy actually points at.
+pub(crate) fn floor_mode(os: &str) -> ProjectionMode {
+    match os {
+        "windows" => ProjectionMode::ProjFs,
+        _ => ProjectionMode::Shim,
+    }
+}
+
+/// What a mode needs on one operating system, and the exact line that supplies
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct Requirement {
+    /// What has to be present for this mode to run here.
+    pub needs: &'static str,
+    /// The exact command or package that provides it, or the reason none is
+    /// needed. Never a paraphrase: this text is what a stranger pastes.
+    pub install: &'static str,
+}
+
+/// The whole per-OS matrix, in one place.
+///
+/// `None` means the mode does not exist on that platform at all, which is a
+/// different answer from "it exists and is not installed" and must not be
+/// reported as something to go and fix. Keeping every cell here is what makes
+/// adding a platform one edit; the previous shape had the macOS and Linux
+/// remedies inlined at their probes, and a Windows row would have had nowhere
+/// to live.
+pub(crate) fn requirement(mode: ProjectionMode, os: &str) -> Option<Requirement> {
+    use ProjectionMode::*;
+    let cell = match (mode, os) {
+        (Shim, "macos") | (Shim, "linux") => Requirement {
+            needs: "the kin-vfs shim library and a kin-vfs driver that runs",
+            install: "reinstall kin: curl -fsSL https://get.kinlab.dev/install | sh",
+        },
+        // Windows has no shim projection: there is no LD_PRELOAD equivalent the
+        // shell hook can inject, and ProjFS is the supported path instead.
+        (Shim, _) => return None,
+
+        (Nfs, "macos") => Requirement {
+            needs: "an NFS client",
+            install: "nothing to install: macOS carries mount_nfs in the base system",
+        },
+        (Nfs, "linux") => Requirement {
+            needs: "an NFS client",
+            install: "install nfs-common (Debian, Ubuntu) or nfs-utils (Fedora, Arch)",
+        },
+        (Nfs, "windows") => Requirement {
+            needs: "the Windows Services for NFS client, on Pro, Enterprise or Education only",
+            install: "Enable-WindowsOptionalFeature -Online -FeatureName ServicesForNFS-ClientOnly",
+        },
+        (Nfs, _) => return None,
+
+        (Fuse, "macos") => Requirement {
+            needs: "FUSE-T or macFUSE",
+            install: "install FUSE-T or macFUSE, then run `kin vfs on` again",
+        },
+        (Fuse, "linux") => Requirement {
+            needs: "libfuse",
+            install: "install your distribution's fuse3 package",
+        },
+        (Fuse, _) => return None,
+
+        (ProjFs, "windows") => Requirement {
+            needs: "the Windows Projected File System optional feature and its PrjFlt filter",
+            install: PROJFS_ENABLE_COMMAND,
+        },
+        (ProjFs, _) => return None,
+    };
+    Some(cell)
+}
+
+/// The one line that enables ProjFS. Named because three surfaces print it.
+pub(crate) const PROJFS_ENABLE_COMMAND: &str =
+    "Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS -NoRestart";
 
 /// What a probe of one mode found.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -286,6 +395,36 @@ pub(crate) fn parse_subcommands(help: &str) -> Option<BTreeSet<String>> {
     found.contains(driver::STATUS).then_some(found)
 }
 
+/// Whether `subcommand` accepts `flag`, read from its own help.
+///
+/// The driver's flags move under the lanes building the mounts, and asking is
+/// how one binary can be driven correctly before and after. `nfs-start --repo`
+/// registers and serves in one step where it exists; where it does not, the
+/// repository has to be registered with `workspaces add` first.
+pub(crate) fn subcommand_supports_flag(path: &Path, subcommand: &str, flag: &str) -> bool {
+    let Ok(output) = Command::new(path)
+        .args([subcommand, "--help"])
+        .stdin(Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    help_lists_flag(&text, flag)
+}
+
+/// Whether a help body offers `flag`. Pure so the match is testable without a
+/// driver, and anchored on a word boundary so `--repo` does not match
+/// `--repository-url`.
+pub(crate) fn help_lists_flag(help: &str, flag: &str) -> bool {
+    help.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        .any(|token| token == flag)
+}
+
 /// The host's NFS client binary, when it has one.
 ///
 /// A mount needs a client in userspace, and the two platforms name it
@@ -332,6 +471,236 @@ fn fuse_availability(path: &Path) -> Option<(bool, String)> {
     Some((line.starts_with("FUSE available"), line.to_string()))
 }
 
+// ---------------------------------------------------------------------------
+// Windows: ProjFS
+// ---------------------------------------------------------------------------
+
+/// The message a user sees when the ProjFS optional feature is not enabled.
+///
+/// Fixed text agreed with the lane that owns the Windows side in `kin-vfs`, so
+/// the two products say the same thing about the same machine. Do not reword.
+pub(crate) const PROJFS_FEATURE_OFF: &str = "\
+Windows filesystem projection is unavailable: the Windows Projected File
+System optional feature is not enabled.
+
+Enable it once, in an elevated PowerShell:
+  Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS -NoRestart
+
+Restart if that command reports RestartNeeded: True, then run kin doctor again.";
+
+/// The message when the feature is on but the filter driver is not loaded.
+/// Fixed text, same agreement as [`PROJFS_FEATURE_OFF`]. Do not reword.
+pub(crate) const PROJFS_FILTER_NOT_RUNNING: &str = "\
+Windows filesystem projection is unavailable: the ProjFS optional feature is
+enabled but its filter driver is not running. Restart Windows, or load it now
+in an elevated PowerShell:
+  fltmc load PrjFlt";
+
+/// The Windows service that actually serves ProjFS callbacks.
+pub(crate) const PROJFS_FILTER_SERVICE: &str = "PrjFlt";
+
+/// The optional feature name ProjFS ships under.
+pub(crate) const PROJFS_FEATURE_NAME: &str = "Client-ProjFS";
+
+/// What one `sc query` said about a service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ServiceState {
+    /// `ERROR_SERVICE_DOES_NOT_EXIST`: the feature was never enabled.
+    Missing,
+    /// Installed and not running.
+    Stopped,
+    /// Installed and running.
+    Running,
+    /// The query answered something this code cannot read.
+    Unreadable(String),
+}
+
+/// The Win32 error a service query returns when the service is not installed.
+const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
+
+/// Read a service query's answer.
+///
+/// Pure over the text and the exit status so both the missing and the stopped
+/// case are testable off Windows, which is the only place this code can be
+/// exercised today. The distinction matters: a missing service means the
+/// optional feature was never enabled, and a stopped one means it was and the
+/// filter is not loaded, and those two states have different remedies.
+pub(crate) fn parse_service_state(text: &str, exit_code: Option<i32>) -> ServiceState {
+    let haystack = text.to_ascii_uppercase();
+    if exit_code == Some(ERROR_SERVICE_DOES_NOT_EXIST)
+        || haystack.contains("DOES NOT EXIST")
+        || haystack.contains("1060")
+    {
+        return ServiceState::Missing;
+    }
+    if let Some(state) = haystack
+        .lines()
+        .find(|line| line.trim_start().starts_with("STATE"))
+    {
+        if state.contains("RUNNING") {
+            return ServiceState::Running;
+        }
+        if state.contains("STOPPED") {
+            return ServiceState::Stopped;
+        }
+    }
+    ServiceState::Unreadable(first_line(text))
+}
+
+/// Read `Get-WindowsOptionalFeature`'s answer for one feature.
+///
+/// Returns whether the feature is enabled, or `None` when the output carries no
+/// state line at all. An unreadable answer is not a disabled feature: reporting
+/// it as one would print an enable command at a user whose feature is already
+/// on, which is the shape of wrong answer this whole surface exists to remove.
+pub(crate) fn parse_optional_feature_state(text: &str) -> Option<bool> {
+    let state = text
+        .lines()
+        .map(str::trim)
+        .find(|line| line.to_ascii_lowercase().starts_with("state"))?;
+    let value = state.split(':').nth(1)?.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "enabled" | "enablepending" => Some(true),
+        "disabled" | "disablepending" => Some(false),
+        _ => None,
+    }
+}
+
+/// What Windows says about ProjFS right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProjFsState {
+    /// The optional feature is not enabled.
+    FeatureOff,
+    /// The feature is enabled and the PrjFlt filter is not running.
+    FilterNotRunning,
+    /// Feature enabled, filter running.
+    Ready,
+    /// Neither query could be read, carrying what was seen.
+    Unknown(String),
+}
+
+/// Decide ProjFS's state from the two queries.
+///
+/// Pure over both answers so every branch is testable off Windows. The service
+/// answer leads: a missing `PrjFlt` is the same fact as a feature that was
+/// never enabled and needs no second process to establish, and the feature
+/// query is what distinguishes "enabled but not loaded" from "never enabled"
+/// when the service is present but stopped.
+pub(crate) fn projfs_state(feature_enabled: Option<bool>, service: &ServiceState) -> ProjFsState {
+    match (service, feature_enabled) {
+        (ServiceState::Missing, _) => ProjFsState::FeatureOff,
+        (_, Some(false)) => ProjFsState::FeatureOff,
+        (ServiceState::Running, _) => ProjFsState::Ready,
+        (ServiceState::Stopped, _) => ProjFsState::FilterNotRunning,
+        (ServiceState::Unreadable(seen), None) => ProjFsState::Unknown(seen.clone()),
+        (ServiceState::Unreadable(seen), Some(true)) => ProjFsState::Unknown(seen.clone()),
+    }
+}
+
+/// Ask Windows for the two facts.
+///
+/// Both queries run as ordinary subprocesses rather than through the service
+/// control manager API. That is deliberate and it is a limitation worth
+/// stating: this code cannot be compiled or run on the machine that wrote it,
+/// and untested `unsafe` FFI against `OpenSCManagerW` would be a worse thing to
+/// ship than two commands whose output parsers are unit-tested here. Neither
+/// command needs elevation. Explicitly NOT probed by loading
+/// `projectedfslib.dll`: a load can succeed on a host where the feature is off,
+/// so it cannot tell absence from presence.
+/// Ask Windows for the two facts.
+///
+/// Both queries run as ordinary subprocesses rather than through the service
+/// control manager API. That is deliberate and it is a limitation worth
+/// stating: this code cannot be compiled or run on the machine that wrote it,
+/// and untested `unsafe` FFI against `OpenSCManagerW` would be a worse thing to
+/// ship than two commands whose output parsers are unit-tested here. Neither
+/// command needs elevation. Explicitly NOT probed by loading
+/// `projectedfslib.dll`: a load can succeed on a host where the feature is off,
+/// so it cannot tell absence from presence.
+///
+/// The platform test is a runtime `cfg!` rather than a `#[cfg]` block, for the
+/// reason `resolve_home_dir` gives for the same choice: behind `#[cfg]` the
+/// parsers below would be compiled, and therefore tested, only on the one
+/// platform this fleet has no host for.
+fn probe_projfs() -> ProjFsState {
+    if !cfg!(windows) {
+        return ProjFsState::Unknown("ProjFS exists only on Windows".to_string());
+    }
+
+    let feature = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!(
+                "Get-WindowsOptionalFeature -Online -FeatureName {PROJFS_FEATURE_NAME} | \
+                 Format-List State"
+            ),
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .ok()
+        .and_then(|out| parse_optional_feature_state(&String::from_utf8_lossy(&out.stdout)));
+
+    let service = match Command::new("sc.exe")
+        .args(["query", PROJFS_FILTER_SERVICE])
+        .stdin(Stdio::null())
+        .output()
+    {
+        Ok(out) => parse_service_state(
+            &format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+            out.status.code(),
+        ),
+        Err(error) => ServiceState::Unreadable(error.to_string()),
+    };
+
+    projfs_state(feature, &service)
+}
+
+/// Build the ProjFS mode row from a probed state.
+///
+/// Split from the probe so all four states are testable on any platform.
+pub(crate) fn projfs_mode_probe(state: &ProjFsState) -> ModeProbe {
+    let (available, evidence, remedy) = match state {
+        ProjFsState::Ready => (
+            true,
+            format!(
+                "the {PROJFS_FEATURE_NAME} optional feature is enabled and the \
+                 {PROJFS_FILTER_SERVICE} filter is running"
+            ),
+            None,
+        ),
+        ProjFsState::FeatureOff => (
+            false,
+            format!("the {PROJFS_FEATURE_NAME} optional feature is not enabled"),
+            Some(PROJFS_FEATURE_OFF.to_string()),
+        ),
+        ProjFsState::FilterNotRunning => (
+            false,
+            format!(
+                "the {PROJFS_FEATURE_NAME} optional feature is enabled but the \
+                 {PROJFS_FILTER_SERVICE} filter is not running"
+            ),
+            Some(PROJFS_FILTER_NOT_RUNNING.to_string()),
+        ),
+        ProjFsState::Unknown(seen) => (
+            false,
+            format!("ProjFS state could not be read: {seen}"),
+            Some(PROJFS_FEATURE_OFF.to_string()),
+        ),
+    };
+    ModeProbe {
+        mode: ProjectionMode::ProjFs,
+        available,
+        evidence,
+        remedy,
+    }
+}
+
 /// Probe every mode against one resolved driver.
 pub(crate) fn probe_modes(driver: &DriverProbe, shim: &ShimPresence) -> Vec<ModeProbe> {
     fallback_order(std::env::consts::OS)
@@ -340,6 +709,7 @@ pub(crate) fn probe_modes(driver: &DriverProbe, shim: &ShimPresence) -> Vec<Mode
             ProjectionMode::Shim => probe_shim_mode(driver, shim),
             ProjectionMode::Nfs => probe_nfs_mode(driver),
             ProjectionMode::Fuse => probe_fuse_mode(driver),
+            ProjectionMode::ProjFs => projfs_mode_probe(&probe_projfs()),
         })
         .collect()
 }
@@ -390,6 +760,13 @@ pub(crate) fn shim_engaged(preload: &str, filename: &str) -> bool {
         .any(|entry| Path::new(entry).file_name().is_some_and(|f| f == filename))
 }
 
+/// This platform's install line for `mode`, or `None` where the mode does not
+/// exist here. Every remedy comes through here so the per-OS table stays the
+/// only place a platform's answer is written down.
+pub(crate) fn install_line(mode: ProjectionMode) -> Option<String> {
+    requirement(mode, std::env::consts::OS).map(|cell| cell.install.to_string())
+}
+
 fn probe_shim_mode(driver: &DriverProbe, shim: &ShimPresence) -> ModeProbe {
     let (available, evidence, remedy) = match (&driver.refusal, shim.installed) {
         (Some(message), _) => (
@@ -410,10 +787,7 @@ fn probe_shim_mode(driver: &DriverProbe, shim: &ShimPresence) -> ModeProbe {
         (None, false) => (
             false,
             format!("no shim library at {}", shim.path.display()),
-            Some(
-                "reinstall kin to restore the shim: curl -fsSL https://get.kinlab.dev/install | sh"
-                    .to_string(),
-            ),
+            install_line(ProjectionMode::Shim),
         ),
         (None, true) => (
             true,
@@ -487,11 +861,7 @@ fn probe_nfs_mode(driver: &DriverProbe) -> ModeProbe {
                 path.display(),
                 driver::NFS_START
             ),
-            remedy: Some(
-                "install this host's NFS client package (nfs-common on Debian and Ubuntu, \
-                 nfs-utils on Fedora and Arch); macOS carries mount_nfs in the base system"
-                    .to_string(),
-            ),
+            remedy: install_line(ProjectionMode::Nfs),
         },
     }
 }
@@ -536,11 +906,7 @@ fn probe_fuse_mode(driver: &DriverProbe) -> ModeProbe {
             mode: ProjectionMode::Fuse,
             available: false,
             evidence: format!("the driver at {} reports: {line}", path.display()),
-            remedy: Some(
-                "install FUSE-T or macFUSE on macOS, or libfuse on Linux, then run `kin vfs on` \
-                 again"
-                    .to_string(),
-            ),
+            remedy: install_line(ProjectionMode::Fuse),
         },
         None => ModeProbe {
             mode: ProjectionMode::Fuse,
@@ -620,7 +986,7 @@ fn first_available(probes: &[ModeProbe]) -> ProjectionMode {
         .iter()
         .find(|probe| probe.available)
         .map(|probe| probe.mode)
-        .unwrap_or(ProjectionMode::Shim)
+        .unwrap_or_else(|| floor_mode(std::env::consts::OS))
 }
 
 // ---------------------------------------------------------------------------
@@ -780,18 +1146,73 @@ pub(crate) fn probe_writable(path: &Path) -> (Tri, String) {
     }
 }
 
-/// The directory the NFS server mounts under.
-pub(crate) fn mount_root(kin_home: &Path) -> PathBuf {
-    kin_home.join("mnt")
+/// The directory mounts appear under when nothing has published one.
+///
+/// `~/Kin`, not `~/.kin/mnt`. It is user-writable without sudo, survives an
+/// unmount, and can be dragged into Finder's sidebar, which a dotted directory
+/// under the toolchain's own home cannot.
+pub(crate) fn mount_root(home: &Path) -> PathBuf {
+    home.join("Kin")
 }
 
-/// Where one repository appears under a mount.
-pub(crate) fn repo_mount_point(kin_home: &Path, repo_root: &Path) -> PathBuf {
+/// Where one repository appears under a mount, when nothing has published a
+/// mount point.
+pub(crate) fn default_repo_mount_point(home: &Path, repo_root: &Path) -> PathBuf {
     let name = repo_root
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "repo".to_string());
-    mount_root(kin_home).join(name)
+    mount_root(home).join(name)
+}
+
+/// The mount point a driver status line published, if it published one.
+///
+/// Read rather than assumed. A probe that assumed a default reported a healthy
+/// mount as not mounted, because the server had published somewhere else, and
+/// the only thing that knows where a mount actually is is the export itself.
+/// Pure over the text so both the published and the silent case are testable.
+pub(crate) fn parse_published_mount_point(status: &str) -> Option<PathBuf> {
+    let line = status
+        .lines()
+        .map(str::trim)
+        .find(|line| line.to_ascii_lowercase().starts_with("mount:"))?;
+    let value = line.split_once(':')?.1.trim();
+    // `nfs-status` renders the mount point followed by a parenthesised state.
+    let value = value.split(" (").next().unwrap_or(value).trim();
+    (!value.is_empty()).then(|| PathBuf::from(value))
+}
+
+/// Where this repository's files appear under `mode`.
+///
+/// Asks the driver first and falls back to the default only when nothing was
+/// published, so a server that chose its own mount point is believed over a
+/// constant in this file.
+pub(crate) fn repo_mount_point(
+    driver: &DriverProbe,
+    mode: ProjectionMode,
+    home: &Path,
+    repo_root: &Path,
+) -> PathBuf {
+    published_mount_point(driver, mode).unwrap_or_else(|| default_repo_mount_point(home, repo_root))
+}
+
+/// Run the driver's status subcommand for `mode` and read the mount point it
+/// publishes.
+fn published_mount_point(driver: &DriverProbe, mode: ProjectionMode) -> Option<PathBuf> {
+    let path = driver.path.as_deref().filter(|_| driver.runs())?;
+    let subcommand = match mode {
+        ProjectionMode::Nfs => driver::NFS_STATUS,
+        _ => return None,
+    };
+    if !driver.carries(subcommand) {
+        return None;
+    }
+    let output = Command::new(path)
+        .arg(subcommand)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    parse_published_mount_point(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// The driver's own account of the mount it is serving.
@@ -806,7 +1227,9 @@ fn driver_mount_report(driver: &DriverProbe, mode: ProjectionMode) -> Option<Str
     let subcommand = match mode {
         ProjectionMode::Nfs => driver::NFS_STATUS,
         ProjectionMode::Fuse => driver::FUSE_STATUS,
-        ProjectionMode::Shim => return None,
+        // ProjFS is served by Windows, not by kin-vfs, so the driver has
+        // nothing to say about it; its own probe is the whole answer.
+        ProjectionMode::Shim | ProjectionMode::ProjFs => return None,
     };
     if !driver.carries(subcommand) {
         return None;
@@ -834,16 +1257,11 @@ fn driver_mount_report(driver: &DriverProbe, mode: ProjectionMode) -> Option<Str
 pub(crate) fn probe_live(
     intent: ProjectionMode,
     mode: ProjectionMode,
-    kin_home: &Path,
-    repo_root: &Path,
+    at: &Path,
     shim: &ShimPresence,
 ) -> LiveProjection {
     let mut evidence = Vec::new();
-    let at = if mode.is_mount() {
-        repo_mount_point(kin_home, repo_root)
-    } else {
-        repo_root.to_path_buf()
-    };
+    let at = at.to_path_buf();
 
     let mounted = if mode.is_mount() {
         let mounted = is_mount_point(&at);
@@ -903,7 +1321,9 @@ pub(crate) fn probe_live(
 
     let mode_failed = match mode {
         ProjectionMode::Shim => !shim.engaged || readable != Tri::Yes,
-        ProjectionMode::Nfs | ProjectionMode::Fuse => mounted != Tri::Yes || readable != Tri::Yes,
+        ProjectionMode::Nfs | ProjectionMode::Fuse | ProjectionMode::ProjFs => {
+            mounted != Tri::Yes || readable != Tri::Yes
+        }
     };
     // Both halves of "not projected" get their own sentence, because they need
     // different things done about them and a reader who is told the wrong one
@@ -1061,7 +1481,8 @@ pub(crate) fn report_for(
     let modes = probe_modes(&driver, &shim);
     let recorded = recorded_mode(kin_home);
     let (intent, mode) = choose_mode(requested, recorded, &modes);
-    let mut live = probe_live(intent, mode, kin_home, repo_root, &shim);
+    let at = projected_path(&driver, mode, repo_root);
+    let mut live = probe_live(intent, mode, &at, &shim);
     if let Some(line) = driver_mount_report(&driver, mode) {
         live.evidence.push(line);
     }
@@ -1156,6 +1577,43 @@ fn first_line(text: &str) -> String {
         .to_string()
 }
 
+/// Where `mode` presents this repository's files.
+///
+/// A mount is wherever its server published, or the default under `~/Kin`; the
+/// shim projects the repository in place. Resolved once per command so every
+/// row, probe and message names the same path.
+pub(crate) fn projected_path(
+    driver: &DriverProbe,
+    mode: ProjectionMode,
+    repo_root: &Path,
+) -> PathBuf {
+    if !mode.is_mount() {
+        return repo_root.to_path_buf();
+    }
+    let home = home_dir().unwrap_or_else(|_| repo_root.to_path_buf());
+    repo_mount_point(driver, mode, &home, repo_root)
+}
+
+/// ProjFS is a Windows feature rather than something kin-vfs starts, so
+/// engaging it is a state check plus the enable line when it is off.
+fn engage_projfs(modes: &[ModeProbe]) -> Result<()> {
+    let Some(probe) = modes
+        .iter()
+        .find(|probe| probe.mode == ProjectionMode::ProjFs)
+    else {
+        anyhow::bail!("ProjFS is not a projection mode on this platform");
+    };
+    if probe.available {
+        println!("{} {}", style("\u{2713}").green(), probe.evidence);
+        return Ok(());
+    }
+    println!("{} {}", style("\u{2717}").red(), probe.evidence);
+    if let Some(remedy) = &probe.remedy {
+        println!("{remedy}");
+    }
+    anyhow::bail!("ProjFS is not available on this host");
+}
+
 /// `kin vfs on`: engage the chosen projection for this repository.
 pub async fn on(mode: Option<String>) -> Result<()> {
     let requested = parse_requested(mode.as_deref())?;
@@ -1187,7 +1645,8 @@ pub async fn on(mode: Option<String>) -> Result<()> {
     match effective {
         ProjectionMode::Shim => engage_shim(&shim, &modes)?,
         ProjectionMode::Nfs => engage_nfs(&driver, &repo_root)?,
-        ProjectionMode::Fuse => engage_fuse(&driver, &kin_home, &repo_root)?,
+        ProjectionMode::Fuse => engage_fuse(&driver, &repo_root)?,
+        ProjectionMode::ProjFs => engage_projfs(&modes)?,
     }
 
     // Record intent, never the fallback: a recorded mode is what the user asked
@@ -1197,7 +1656,12 @@ pub async fn on(mode: Option<String>) -> Result<()> {
     let to_record = requested.or(recorded).unwrap_or(effective);
     record_mode(&kin_home, to_record)?;
 
-    let live = probe_live(intent, effective, &kin_home, &repo_root, &shim);
+    let live = probe_live(
+        intent,
+        effective,
+        &projected_path(&driver, effective, &repo_root),
+        &shim,
+    );
     println!();
     print_live(&live);
     Ok(())
@@ -1228,14 +1692,34 @@ pub async fn off() -> Result<()> {
             let Some(path) = driver.path.as_deref().filter(|_| driver.runs()) else {
                 anyhow::bail!("no kin-vfs driver to stop the NFS mount with");
             };
+            // Admit staged writes before the mount goes away. Unmounting first
+            // would strand whatever was written through it but not yet admitted,
+            // and the whole point of the mount is that those writes reach the
+            // graph.
+            if driver.carries(driver::NFS_SYNC) {
+                match run_driver(path, &[driver::NFS_SYNC]) {
+                    Ok(out) => println!("{} {}", style("\u{2713}").green(), first_line(&out)),
+                    Err(error) => println!(
+                        "{} could not admit staged writes before unmounting: {error}",
+                        style("!").yellow()
+                    ),
+                }
+            }
             let out = run_driver(path, &[driver::NFS_STOP])?;
-            println!("{} {}", style("✓").green(), first_line(&out));
+            println!("{} {}", style("\u{2713}").green(), first_line(&out));
+        }
+        ProjectionMode::ProjFs => {
+            println!(
+                "{} ProjFS is a Windows feature rather than a process Kin starts, so there is \
+                 nothing to stop. Disable the optional feature if you want it off.",
+                style("i").cyan()
+            );
         }
         ProjectionMode::Fuse => {
             let Some(path) = driver.path.as_deref().filter(|_| driver.runs()) else {
                 anyhow::bail!("no kin-vfs driver to unmount with");
             };
-            let point = repo_mount_point(&kin_home, &repo_root);
+            let point = projected_path(&driver, ProjectionMode::Fuse, &repo_root);
             let out = run_driver(
                 path,
                 &[driver::UNMOUNT, "--mount-point", &point.to_string_lossy()],
@@ -1332,28 +1816,41 @@ fn engage_nfs(driver: &DriverProbe, repo_root: &Path) -> Result<()> {
     let Some(path) = driver.path.as_deref().filter(|_| driver.runs()) else {
         anyhow::bail!("no kin-vfs driver to start the NFS mount with");
     };
+    let root = repo_root.to_string_lossy().into_owned();
+
+    // One command where the driver takes a repository: `nfs-start --repo`
+    // registers it on first use and serves it. Registering separately is the
+    // older two-step shape, and doing both would register a repository the
+    // server is about to register again.
+    if subcommand_supports_flag(path, driver::NFS_START, "--repo") {
+        let out = run_driver(path, &[driver::NFS_START, "--repo", &root])?;
+        println!("{} {}", style("\u{2713}").green(), first_line(&out));
+        return Ok(());
+    }
+
     if driver.carries(driver::WORKSPACES) {
-        let out = run_driver(
-            path,
-            &[
-                driver::WORKSPACES,
-                "add",
-                "--path",
-                &repo_root.to_string_lossy(),
-            ],
-        )?;
-        println!("{} {}", style("✓").green(), first_line(&out));
+        let out = run_driver(path, &[driver::WORKSPACES, "add", "--path", &root])?;
+        println!("{} {}", style("\u{2713}").green(), first_line(&out));
     }
     let out = run_driver(path, &[driver::NFS_START])?;
-    println!("{} {}", style("✓").green(), first_line(&out));
+    println!("{} {}", style("\u{2713}").green(), first_line(&out));
     Ok(())
 }
 
-fn engage_fuse(driver: &DriverProbe, kin_home: &Path, repo_root: &Path) -> Result<()> {
+fn engage_fuse(driver: &DriverProbe, repo_root: &Path) -> Result<()> {
     let Some(path) = driver.path.as_deref().filter(|_| driver.runs()) else {
         anyhow::bail!("no kin-vfs driver to mount with");
     };
-    let point = repo_mount_point(kin_home, repo_root);
+    let point = projected_path(driver, ProjectionMode::Fuse, repo_root);
+    // kin-vfs refuses a mount point inside the workspace, because a write
+    // through the mount would land on the workspace path underneath it.
+    if point.starts_with(repo_root) {
+        anyhow::bail!(
+            "the mount point {} is inside the repository; a write through it would land on the \
+             path underneath rather than in the graph",
+            point.display()
+        );
+    }
     std::fs::create_dir_all(&point)
         .with_context(|| format!("failed to create {}", point.display()))?;
     let out = run_driver(
@@ -1570,14 +2067,16 @@ Options:
                 ProjectionMode::Shim
             ]
         );
-        assert_eq!(fallback_order("windows"), vec![ProjectionMode::Shim]);
-        for os in ["macos", "linux", "windows"] {
+        for os in ["macos", "linux"] {
             assert_eq!(
                 fallback_order(os).last(),
                 Some(&ProjectionMode::Shim),
                 "{os} must fall back to the shim"
             );
         }
+        // A platform Kin drives no mount on gets the shim alone. Windows is not
+        // that platform any more and has its own test.
+        assert_eq!(fallback_order("freebsd"), vec![ProjectionMode::Shim]);
     }
 
     fn probes(available: &[ProjectionMode]) -> Vec<ModeProbe> {
@@ -1669,13 +2168,7 @@ Options:
             installed: true,
             engaged: true,
         };
-        let healthy = probe_live(
-            ProjectionMode::Shim,
-            ProjectionMode::Shim,
-            &kin_home,
-            &repo,
-            &engaged,
-        );
+        let healthy = probe_live(ProjectionMode::Shim, ProjectionMode::Shim, &repo, &engaged);
         assert_eq!(healthy.mounted, Tri::NotApplicable);
         assert_eq!(healthy.readable, Tri::Yes);
         assert_eq!(
@@ -1696,13 +2189,7 @@ Options:
             engaged: false,
             ..engaged.clone()
         };
-        let container = probe_live(
-            ProjectionMode::Shim,
-            ProjectionMode::Shim,
-            &kin_home,
-            &repo,
-            &stripped,
-        );
+        let container = probe_live(ProjectionMode::Shim, ProjectionMode::Shim, &repo, &stripped);
         assert!(
             container.degraded,
             "a shim that is not engaged must read degraded: {}",
@@ -1730,7 +2217,6 @@ Options:
         let bare = probe_live(
             ProjectionMode::Shim,
             ProjectionMode::Shim,
-            &kin_home,
             &repo,
             &uninstalled,
         );
@@ -1753,13 +2239,7 @@ Options:
         // A mount mode whose mount point is not a mount: nothing is read or
         // written, and the row says so rather than describing the empty
         // directory underneath.
-        let unmounted = probe_live(
-            ProjectionMode::Nfs,
-            ProjectionMode::Nfs,
-            &kin_home,
-            &repo,
-            &engaged,
-        );
+        let unmounted = probe_live(ProjectionMode::Nfs, ProjectionMode::Nfs, &repo, &engaged);
         assert_eq!(unmounted.mounted, Tri::No);
         assert_eq!(unmounted.readable, Tri::No);
         assert!(unmounted.degraded);
@@ -1775,18 +2255,240 @@ Options:
         assert_ne!(unmounted.row(), container.row());
 
         // A fallback names both modes.
-        let fell_back = probe_live(
-            ProjectionMode::Nfs,
-            ProjectionMode::Shim,
-            &kin_home,
-            &repo,
-            &engaged,
-        );
+        let fell_back = probe_live(ProjectionMode::Nfs, ProjectionMode::Shim, &repo, &engaged);
         assert!(fell_back.degraded);
         assert!(fell_back
             .evidence
             .iter()
             .any(|line| line.contains("nfs was chosen")));
+    }
+
+    /// Every platform gets an order, and Windows gets a different one for a
+    /// different reason: no shim exists there, so ProjFS leads and is also the
+    /// floor, while the NFS client is a second choice most editions cannot
+    /// install.
+    #[test]
+    fn windows_leads_with_projfs_and_floors_on_it() {
+        assert_eq!(
+            fallback_order("windows"),
+            vec![ProjectionMode::ProjFs, ProjectionMode::Nfs]
+        );
+        assert!(
+            !fallback_order("windows").contains(&ProjectionMode::Shim),
+            "Windows has no injected shim to fall back to"
+        );
+        assert_eq!(floor_mode("windows"), ProjectionMode::ProjFs);
+        assert_eq!(floor_mode("macos"), ProjectionMode::Shim);
+        assert_eq!(floor_mode("linux"), ProjectionMode::Shim);
+    }
+
+    /// Every cell of the per-OS matrix has to answer, and a mode that does not
+    /// exist on a platform has to answer differently from one that exists and
+    /// is missing. Reporting ProjFS as installable on macOS would send someone
+    /// after a Windows feature.
+    #[test]
+    fn the_per_os_table_has_a_line_for_every_mode_that_exists() {
+        for (mode, os) in [
+            (ProjectionMode::Shim, "macos"),
+            (ProjectionMode::Shim, "linux"),
+            (ProjectionMode::Nfs, "macos"),
+            (ProjectionMode::Nfs, "linux"),
+            (ProjectionMode::Nfs, "windows"),
+            (ProjectionMode::Fuse, "macos"),
+            (ProjectionMode::Fuse, "linux"),
+            (ProjectionMode::ProjFs, "windows"),
+        ] {
+            let cell = requirement(mode, os)
+                .unwrap_or_else(|| panic!("{mode} on {os} must carry a requirement"));
+            assert!(
+                !cell.needs.is_empty() && !cell.install.is_empty(),
+                "{mode}/{os}"
+            );
+        }
+
+        for (mode, os) in [
+            (ProjectionMode::Shim, "windows"),
+            (ProjectionMode::Fuse, "windows"),
+            (ProjectionMode::ProjFs, "macos"),
+            (ProjectionMode::ProjFs, "linux"),
+        ] {
+            assert!(
+                requirement(mode, os).is_none(),
+                "{mode} does not exist on {os} and must not be offered as installable"
+            );
+        }
+
+        // The exact enable lines the platforms need, so a reworded table is a
+        // failing test rather than a stranger pasting something that does not work.
+        assert_eq!(
+            requirement(ProjectionMode::ProjFs, "windows")
+                .unwrap()
+                .install,
+            "Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS -NoRestart"
+        );
+        assert!(requirement(ProjectionMode::Nfs, "windows")
+            .unwrap()
+            .install
+            .contains("ServicesForNFS-ClientOnly"));
+        assert!(requirement(ProjectionMode::Fuse, "linux")
+            .unwrap()
+            .install
+            .contains("fuse3"));
+        assert!(requirement(ProjectionMode::Nfs, "linux")
+            .unwrap()
+            .install
+            .contains("nfs-common"));
+        assert!(requirement(ProjectionMode::Fuse, "macos")
+            .unwrap()
+            .install
+            .contains("FUSE-T"));
+    }
+
+    /// A missing service and a stopped one are two different machines with two
+    /// different remedies, and the probe has to tell them apart from the text
+    /// Windows actually prints.
+    #[test]
+    fn the_projfs_service_query_tells_missing_from_stopped() {
+        let missing = "[SC] EnumQueryServicesStatus:OpenService FAILED 1060:\n\n                       The specified service does not exist as an installed service.\n";
+        assert_eq!(
+            parse_service_state(missing, Some(1060)),
+            ServiceState::Missing
+        );
+        // The exit code alone is enough, and so is the text alone.
+        assert_eq!(parse_service_state(missing, None), ServiceState::Missing);
+        assert_eq!(
+            parse_service_state("nothing readable", Some(1060)),
+            ServiceState::Missing
+        );
+
+        let running = "SERVICE_NAME: PrjFlt\n        TYPE               : 2  FILE_SYSTEM_DRIVER\n                               STATE              : 4  RUNNING\n";
+        assert_eq!(parse_service_state(running, Some(0)), ServiceState::Running);
+
+        let stopped = "SERVICE_NAME: PrjFlt\n        TYPE               : 2  FILE_SYSTEM_DRIVER\n                               STATE              : 1  STOPPED\n";
+        assert_eq!(parse_service_state(stopped, Some(0)), ServiceState::Stopped);
+
+        assert!(matches!(
+            parse_service_state("something else entirely", Some(0)),
+            ServiceState::Unreadable(_)
+        ));
+    }
+
+    /// An unreadable feature answer is not a disabled feature. Treating it as
+    /// one prints an enable command at a user whose feature is already on.
+    #[test]
+    fn an_unreadable_feature_state_is_not_a_disabled_one() {
+        assert_eq!(
+            parse_optional_feature_state("FeatureName : Client-ProjFS\nState : Enabled\n"),
+            Some(true)
+        );
+        assert_eq!(
+            parse_optional_feature_state("State : Disabled\n"),
+            Some(false)
+        );
+        assert_eq!(
+            parse_optional_feature_state("State : EnablePending\n"),
+            Some(true)
+        );
+        assert_eq!(parse_optional_feature_state("some error text\n"), None);
+        assert_eq!(parse_optional_feature_state(""), None);
+        // A state line Windows prints that this code does not recognise. Without
+        // this case the unrecognised arm is never reached, because every input
+        // above returns early from the missing-line lookup, and changing that
+        // arm to report "disabled" would have gone unnoticed.
+        assert_eq!(parse_optional_feature_state("State : Superseded\n"), None);
+        assert_eq!(parse_optional_feature_state("State :\n"), None);
+    }
+
+    /// The four ProjFS states are four different rows, and the two that have
+    /// fixed message text carry it verbatim, because kin and kin-vfs agreed to
+    /// say the same thing about the same machine.
+    #[test]
+    fn the_projfs_states_are_four_rows_and_two_are_verbatim() {
+        assert_eq!(
+            projfs_state(Some(false), &ServiceState::Stopped),
+            ProjFsState::FeatureOff
+        );
+        assert_eq!(
+            projfs_state(Some(true), &ServiceState::Missing),
+            ProjFsState::FeatureOff,
+            "a missing filter is the same fact as a feature never enabled"
+        );
+        assert_eq!(
+            projfs_state(Some(true), &ServiceState::Stopped),
+            ProjFsState::FilterNotRunning
+        );
+        assert_eq!(
+            projfs_state(Some(true), &ServiceState::Running),
+            ProjFsState::Ready
+        );
+
+        let ready = projfs_mode_probe(&ProjFsState::Ready);
+        assert!(ready.available && ready.remedy.is_none());
+
+        let off = projfs_mode_probe(&ProjFsState::FeatureOff);
+        assert!(!off.available);
+        assert_eq!(off.remedy.as_deref(), Some(PROJFS_FEATURE_OFF));
+        assert!(PROJFS_FEATURE_OFF.contains(
+            "Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS -NoRestart"
+        ));
+        assert!(PROJFS_FEATURE_OFF.contains("RestartNeeded: True"));
+
+        let filter = projfs_mode_probe(&ProjFsState::FilterNotRunning);
+        assert!(!filter.available);
+        assert_eq!(filter.remedy.as_deref(), Some(PROJFS_FILTER_NOT_RUNNING));
+        assert!(PROJFS_FILTER_NOT_RUNNING.contains("fltmc load PrjFlt"));
+
+        let rows = [&ready, &off, &filter];
+        for (i, a) in rows.iter().enumerate() {
+            for b in rows.iter().skip(i + 1) {
+                assert_ne!(
+                    a.evidence, b.evidence,
+                    "each ProjFS state must read differently"
+                );
+            }
+        }
+    }
+
+    /// A mount is wherever its server published, not wherever a constant in
+    /// this file says. Assuming a default reported a healthy mount as not
+    /// mounted, which is the failure this parse exists to prevent.
+    #[test]
+    fn the_published_mount_point_beats_the_default() {
+        let status = "NFS server:  running (PID 4242)\nPort:        2049\n                      Mount:       /Users/x/Kin/repo (mounted)\nWorkspaces:  1 registered\n";
+        assert_eq!(
+            parse_published_mount_point(status),
+            Some(PathBuf::from("/Users/x/Kin/repo"))
+        );
+        // Without the parenthesised state, and with nothing to read at all.
+        assert_eq!(
+            parse_published_mount_point("Mount:       /srv/elsewhere\n"),
+            Some(PathBuf::from("/srv/elsewhere"))
+        );
+        assert_eq!(parse_published_mount_point("NFS server:  stopped\n"), None);
+        assert_eq!(parse_published_mount_point("Mount:\n"), None);
+
+        // The default is under ~/Kin, not ~/.kin/mnt: user-writable, survives an
+        // unmount, and can be dragged into a file manager's sidebar.
+        let home = Path::new("/Users/x");
+        assert_eq!(
+            default_repo_mount_point(home, Path::new("/w/myrepo")),
+            PathBuf::from("/Users/x/Kin/myrepo")
+        );
+        assert_eq!(mount_root(home), PathBuf::from("/Users/x/Kin"));
+    }
+
+    /// A flag probe that matched a prefix would drive the wrong command shape.
+    #[test]
+    fn a_flag_is_matched_whole_rather_than_as_a_prefix() {
+        let help = "Usage: kin-vfs nfs-start [OPTIONS]\n\nOptions:\n      --repo <PATH>\n                          --port <PORT>\n      --read-only\n";
+        assert!(help_lists_flag(help, "--repo"));
+        assert!(help_lists_flag(help, "--read-only"));
+        assert!(!help_lists_flag(help, "--repository"));
+        assert!(
+            !help_lists_flag("Options:\n      --repository-url <URL>\n", "--repo"),
+            "a longer flag must not answer for a shorter one"
+        );
+        assert!(!help_lists_flag("", "--repo"));
     }
 
     /// The mount test must be able to answer both ways on any host, or it is a
@@ -1878,10 +2580,16 @@ Options:
         assert_eq!(recorded_mode(&kin_home), Some(ProjectionMode::Fuse));
         record_mode(&kin_home, ProjectionMode::Shim).unwrap();
         assert_eq!(recorded_mode(&kin_home), Some(ProjectionMode::Shim));
+        record_mode(&kin_home, ProjectionMode::ProjFs).unwrap();
+        assert_eq!(recorded_mode(&kin_home), Some(ProjectionMode::ProjFs));
 
         assert_eq!(ProjectionMode::parse("NFS"), Some(ProjectionMode::Nfs));
-        assert_eq!(ProjectionMode::parse("projfs"), None);
-        assert!(parse_requested(Some("projfs")).is_err());
+        assert_eq!(
+            ProjectionMode::parse("ProjFS"),
+            Some(ProjectionMode::ProjFs)
+        );
+        assert_eq!(ProjectionMode::parse("prjflt"), None);
+        assert!(parse_requested(Some("prjflt")).is_err());
         assert_eq!(parse_requested(None).unwrap(), None);
     }
 }

@@ -615,16 +615,16 @@ fn check_vfs_projection() -> HealthCheck {
             "vfs_projection",
             "VFS projection",
             HealthStatus::Unsupported,
-            "Windows uses ProjFS, which is not shell-auto-injected",
+            "Windows projects through ProjFS rather than an injected shim; see the \
+             Projection in force row",
         )
         .with_platform_note(
-            "Windows projection uses ProjFS (planned), enabled via the optional \
-             feature and started by an explicit daemon init — it is not injected \
-             by the shell hook like the macOS/Linux shim.",
+            "This row is about the shim, which Windows has no equivalent of: there is no \
+             library the shell hook can inject. Windows projection is the Windows Projected \
+             File System, and whether it is enabled and running here is reported by the \
+             Projection in force row rather than guessed at by this one.",
         )
-        .with_manual_fix(
-            "Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS -NoRestart",
-        );
+        .with_manual_fix(crate::commands::projection::PROJFS_ENABLE_COMMAND);
     }
 
     let kin_home = match kin_dir() {
@@ -1063,14 +1063,20 @@ fn check_projection_mode() -> HealthCheck {
         &repo_root,
         None,
     );
-    projection_mode_check_for(&report)
+    projection_mode_check_for(&report, env::consts::OS)
 }
 
 /// Build the projection row from an already-probed report. Split out so all
 /// three fixtures (everything present, no shim, a mount that is not mounted)
 /// are testable without a real `$HOME` or a real mount.
+/// `os` is an argument rather than read from `env::consts::OS` for the reason
+/// [`crate::commands::setup::resolve_home_dir`] gives for the same choice: read
+/// ambiently, the Windows branch below could only ever be exercised on the one
+/// platform this fleet has no host for, and a test written on macOS would take
+/// the macOS branch and prove nothing about Windows while looking like it did.
 fn projection_mode_check_for(
     report: &crate::commands::projection::ProjectionReport,
+    os: &str,
 ) -> HealthCheck {
     use crate::commands::projection::ProjectionMode;
 
@@ -1089,7 +1095,13 @@ fn projection_mode_check_for(
     // produces no available modes and would have read as this same green n/a,
     // which is the exact overclaim this row exists to remove.
     let nothing_installed = report.driver.path.is_none() && !report.shim.installed;
-    if report.recorded.is_none() && !any_available && nothing_installed {
+    // And the absence is only sanctioned where the platform's floor is something
+    // Kin ships and can decline to ship. Windows' floor is ProjFS, an operating
+    // system feature present on every SKU that only needs enabling, so a Windows
+    // machine with no projection is always a machine someone can fix and must
+    // never be told that nothing is missing.
+    let floor_is_kin_shipped = crate::commands::projection::floor_mode(os) == ProjectionMode::Shim;
+    if report.recorded.is_none() && !any_available && nothing_installed && floor_is_kin_shipped {
         return HealthCheck::new(
             "projection_mode",
             "Projection in force",
@@ -3299,6 +3311,15 @@ mod tests {
         DriverProbe, LiveProjection, ModeProbe, ProjectionMode, ProjectionReport, ShimPresence, Tri,
     };
 
+    /// The row as a macOS host reads it. Every fixture below is about a
+    /// macOS/Linux machine, and naming the platform once keeps them from
+    /// silently changing meaning on whichever host runs the suite.
+    fn projection_mode_check_for_macos(
+        report: &crate::commands::projection::ProjectionReport,
+    ) -> HealthCheck {
+        projection_mode_check_for(report, "macos")
+    }
+
     fn mode_probe(mode: ProjectionMode, available: bool) -> ModeProbe {
         ModeProbe {
             mode,
@@ -3362,7 +3383,7 @@ mod tests {
     /// decorative.
     #[test]
     fn the_projection_row_changes_across_the_three_fixtures() {
-        let working = projection_mode_check_for(&report(
+        let working = projection_mode_check_for_macos(&report(
             Some(ProjectionMode::Shim),
             &[ProjectionMode::Shim],
             live(
@@ -3379,7 +3400,7 @@ mod tests {
             working.status
         );
 
-        let nothing = projection_mode_check_for(&report(
+        let nothing = projection_mode_check_for_macos(&report(
             None,
             &[],
             live(
@@ -3397,7 +3418,7 @@ mod tests {
         );
         assert!(!is_failing(&nothing.status));
 
-        let unmounted = projection_mode_check_for(&report(
+        let unmounted = projection_mode_check_for_macos(&report(
             Some(ProjectionMode::Nfs),
             &[ProjectionMode::Shim],
             live(
@@ -3439,7 +3460,7 @@ mod tests {
     /// and would otherwise fail every install that works.
     #[test]
     fn an_installed_but_unengaged_shim_is_visible_without_failing_readiness() {
-        let check = projection_mode_check_for(&report(
+        let check = projection_mode_check_for_macos(&report(
             None,
             &[ProjectionMode::Shim],
             live(
@@ -3487,7 +3508,7 @@ mod tests {
         };
         refused.shim.installed = true;
 
-        let check = projection_mode_check_for(&refused);
+        let check = projection_mode_check_for_macos(&refused);
         assert!(
             is_failing(&check.status),
             "a projection installed and dead must fail, got {:?}",
@@ -3510,10 +3531,77 @@ mod tests {
         );
         assert!(
             matches!(
-                projection_mode_check_for(&bare).status,
+                projection_mode_check_for_macos(&bare).status,
                 HealthStatus::Unsupported
             ),
             "an install that ships without projection stays skipped"
+        );
+    }
+
+    /// Windows has no sanctioned absence. ProjFS ships on every SKU and only
+    /// needs enabling, so a Windows machine with no projection running is
+    /// always one someone can fix, and the row that tells a macOS user nothing
+    /// is missing would be a lie there.
+    #[test]
+    fn windows_never_reports_that_nothing_is_missing() {
+        // The floor decides it, and the floor is the platform's, not a constant.
+        assert_eq!(
+            crate::commands::projection::floor_mode("windows"),
+            ProjectionMode::ProjFs
+        );
+        assert_eq!(
+            crate::commands::projection::floor_mode("macos"),
+            ProjectionMode::Shim
+        );
+
+        // ProjFS off, with the exact remedy a user pastes.
+        let off = crate::commands::projection::projfs_mode_probe(
+            &crate::commands::projection::ProjFsState::FeatureOff,
+        );
+        assert!(!off.available);
+        assert!(off.remedy.as_deref().is_some_and(|remedy| remedy
+            .contains("Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS")));
+
+        // One machine shape, nothing available and nothing recorded, judged as
+        // each platform. macOS keeps the sanctioned skip because the installer
+        // is allowed to ship without projection there. Windows must not have
+        // it, and asserting both from one host is the whole reason the platform
+        // is an argument rather than something this function reads.
+        let bare = report(
+            None,
+            &[],
+            live(
+                ProjectionMode::Shim,
+                ProjectionMode::Shim,
+                Tri::NotApplicable,
+                Tri::Yes,
+                true,
+            ),
+        );
+
+        for os in ["macos", "linux"] {
+            let check = projection_mode_check_for(&bare, os);
+            assert!(
+                matches!(check.status, HealthStatus::Unsupported),
+                "{os} keeps the sanctioned skip, got {:?}",
+                check.status
+            );
+            assert!(!is_failing(&check.status));
+        }
+
+        let windows = projection_mode_check_for(&bare, "windows");
+        assert!(
+            !matches!(windows.status, HealthStatus::Unsupported),
+            "Windows has no sanctioned skip, got {:?}",
+            windows.status
+        );
+        assert!(
+            !windows.detail.contains("none is configured")
+                && windows
+                    .platform_note
+                    .as_deref()
+                    .is_none_or(|note| !note.contains("would need")),
+            "Windows must not be told that nothing is missing: {windows:?}"
         );
     }
 
