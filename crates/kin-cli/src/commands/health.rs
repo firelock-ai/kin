@@ -159,6 +159,7 @@ pub async fn run_health_checks() -> HealthReport {
         check_supervisor_startup_protocol(),
         check_daemon_running().await,
         check_vfs_projection(),
+        check_projection_mode(),
         check_repo_init(),
         check_session_runtime(),
         check_shell_path(),
@@ -640,11 +641,55 @@ fn check_vfs_projection() -> HealthCheck {
     };
     let lib_path = kin_home.join("lib").join(shim_filename());
     let driver = resolve_vfs_driver(&vfs_driver_candidates(
+        pinned_vfs_driver().as_deref(),
         &kin_home,
         env::current_exe().ok().as_deref(),
     ));
 
-    vfs_projection_check_for(&lib_path, &driver)
+    vfs_projection_check_for_recorded(
+        &lib_path,
+        &driver,
+        crate::commands::projection::recorded_mode(&kin_home),
+    )
+}
+
+/// The install check, plus the one thing it cannot know on its own: whether
+/// anyone asked for a projection here.
+///
+/// [`vfs_projection_check_for`] answers "is projection installed", and its
+/// sanctioned outcome on a host that ships without it is a green n/a reading
+/// "nothing is missing". That sentence is true only while nobody has chosen a
+/// projection mode. Once a mode is recorded, the same machine state is a
+/// configured projection that is not installed, and reporting it as nothing
+/// missing is the same class of confident negative FIR-2394 removed from the
+/// row above it.
+fn vfs_projection_check_for_recorded(
+    lib_path: &Path,
+    driver: &VfsDriverState,
+    recorded: Option<crate::commands::projection::ProjectionMode>,
+) -> HealthCheck {
+    let check = vfs_projection_check_for(lib_path, driver);
+    let Some(mode) = recorded else {
+        return check;
+    };
+    if !matches!(check.status, HealthStatus::Unsupported) {
+        return check;
+    }
+    HealthCheck::new(
+        "vfs_projection",
+        "VFS projection",
+        HealthStatus::Missing,
+        format!(
+            "projection mode {mode} is recorded in ~/.kin/config/setup.toml, but no kin-vfs \
+             driver was found beside the kin binary, in ~/.kin/bin, or on PATH, and no shim is \
+             installed at {}",
+            lib_path.display()
+        ),
+    )
+    .with_manual_fix(
+        "reinstall kin to restore projection: curl -fsSL https://get.kinlab.dev/install | sh, or \
+         run `kin vfs status` to see what this host can actually run",
+    )
 }
 
 /// Name of the projection driver binary the installer places beside `kin`.
@@ -656,6 +701,20 @@ fn vfs_binary_filename() -> &'static str {
     }
 }
 
+/// The environment variable that pins the projection driver.
+///
+/// It answers a step the docs otherwise have to ask for: a contributor who has
+/// just built `kin-vfs` with a mount feature should be able to point Kin at
+/// that binary without reordering PATH ahead of the installed one.
+pub(crate) const VFS_DRIVER_ENV: &str = "KIN_VFS_BIN";
+
+/// The pinned driver, when one is named. An empty value is not a pin.
+pub(crate) fn pinned_vfs_driver() -> Option<PathBuf> {
+    env::var_os(VFS_DRIVER_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
 /// Every place the projection driver can be, in resolution order.
 ///
 /// The installer ships `kin-vfs` beside the `kin` binary it installs, and that
@@ -663,7 +722,19 @@ fn vfs_binary_filename() -> &'static str {
 /// puts both somewhere else, so looking in `~/.kin/bin` alone read a driver
 /// sitting next to the running binary as absent, and the check then phrased
 /// that guess as a confident "neither is present here".
-fn vfs_driver_candidates(kin_home: &Path, exe: Option<&Path>) -> Vec<PathBuf> {
+pub(crate) fn vfs_driver_candidates(
+    pinned: Option<&Path>,
+    kin_home: &Path,
+    exe: Option<&Path>,
+) -> Vec<PathBuf> {
+    // A pinned driver is the only candidate. Falling back past it would defeat
+    // the point of pinning: an operator who names a driver and gets a different
+    // one has been told nothing, and a pin that silently resolves elsewhere is
+    // how "I tested my build" becomes "I tested the one already installed".
+    if let Some(pinned) = pinned {
+        return vec![pinned.to_path_buf()];
+    }
+
     fn push_unique(into: &mut Vec<PathBuf>, path: PathBuf) {
         if !into.contains(&path) {
             into.push(path);
@@ -690,7 +761,7 @@ fn vfs_driver_candidates(kin_home: &Path, exe: Option<&Path>) -> Vec<PathBuf> {
 /// real defect, and reporting it as absence tells a user nothing is missing on
 /// a machine where projection is installed and dead.
 #[derive(Debug, PartialEq, Eq)]
-enum VfsDriverState {
+pub(crate) enum VfsDriverState {
     /// No `kin-vfs` beside the running binary, in `~/.kin/bin`, or on PATH.
     Absent,
     /// A driver that runs: probing it reached the driver's own code.
@@ -759,7 +830,7 @@ fn loader_failure_message(stderr: &[u8], status: &std::process::ExitStatus) -> S
 /// A driver that runs wins over one that does not, so a stale copy in one
 /// location cannot hide a working install in another. A candidate that exists
 /// and refuses to run is reported only when nothing else runs.
-fn resolve_vfs_driver(candidates: &[PathBuf]) -> VfsDriverState {
+pub(crate) fn resolve_vfs_driver(candidates: &[PathBuf]) -> VfsDriverState {
     let mut refused: Option<VfsDriverState> = None;
     for candidate in candidates {
         if !candidate.is_file() {
@@ -961,6 +1032,146 @@ fn vfs_projection_check_for(lib_path: &Path, driver: &VfsDriverState) -> HealthC
         .fixable()
         .with_manual_fix(SHIM_REINSTALL_HINT),
     }
+}
+
+/// Report which projection is in force and whether it is actually working.
+///
+/// The row above answers whether projection is installed. This one answers the
+/// question a user standing in a repository is actually asking: is the file I
+/// just edited going through the graph. They are different questions, and a
+/// machine can pass the first and fail the second, which is exactly what a
+/// container does when the loader strips the injected shim: the library is on
+/// disk, the install is intact, and every process is reading raw disk.
+fn check_projection_mode() -> HealthCheck {
+    let kin_home = match kin_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            return HealthCheck::new(
+                "projection_mode",
+                "Projection in force",
+                HealthStatus::Missing,
+                format!("could not resolve ~/.kin: {e}"),
+            );
+        }
+    };
+    let cwd = env::current_dir().unwrap_or_default();
+    let repo_root = kin_core::KinLayout::discover(&cwd)
+        .map(|layout| layout.root().to_path_buf())
+        .unwrap_or(cwd);
+    let report = crate::commands::projection::report_for(
+        &kin_home,
+        env::current_exe().ok().as_deref(),
+        &repo_root,
+        None,
+    );
+    projection_mode_check_for(&report)
+}
+
+/// Build the projection row from an already-probed report. Split out so all
+/// three fixtures (everything present, no shim, a mount that is not mounted)
+/// are testable without a real `$HOME` or a real mount.
+fn projection_mode_check_for(
+    report: &crate::commands::projection::ProjectionReport,
+) -> HealthCheck {
+    use crate::commands::projection::ProjectionMode;
+
+    let live = &report.live;
+    let row = live.row();
+    let evidence = live.evidence.join("; ");
+    let detail = format!("{row}; {evidence}");
+    let any_available = report.modes.iter().any(|probe| probe.available);
+
+    // Nothing chosen and nothing installed is the installer's sanctioned
+    // outcome, not a defect: the CLI and daemon answer from the graph without
+    // any projection at all. It stops being sanctioned the moment someone
+    // records a mode, and it was never sanctioned on a machine that HAS a
+    // driver or a shim. Both extra conditions matter: with only "no mode is
+    // available" as the test, a container whose loader refuses the driver
+    // produces no available modes and would have read as this same green n/a,
+    // which is the exact overclaim this row exists to remove.
+    let nothing_installed = report.driver.path.is_none() && !report.shim.installed;
+    if report.recorded.is_none() && !any_available && nothing_installed {
+        return HealthCheck::new(
+            "projection_mode",
+            "Projection in force",
+            HealthStatus::Unsupported,
+            format!(
+                "no projection is available on this host and none is configured; the CLI and \
+                 daemon are fully functional without one; {evidence}"
+            ),
+        )
+        .with_platform_note(
+            "Run `kin vfs status` for what each of shim, NFS and FUSE would need here.",
+        );
+    }
+
+    if !live.degraded {
+        return HealthCheck::new(
+            "projection_mode",
+            "Projection in force",
+            HealthStatus::Healthy,
+            detail,
+        );
+    }
+
+    // A recorded mode that is not the one running, or one that is running and
+    // failing its own probe, is a configured projection that does not work. It
+    // has to fail: this is the row that must never read "nothing is missing"
+    // for a mode somebody chose.
+    let configured_and_broken = report.recorded.is_some_and(|recorded| {
+        recorded != live.mode || live.readable != crate::commands::projection::Tri::Yes
+    });
+    if configured_and_broken {
+        let remedy = report
+            .modes
+            .iter()
+            .find(|probe| Some(probe.mode) == report.recorded)
+            .and_then(|probe| probe.remedy.clone())
+            .unwrap_or_else(|| "run `kin vfs status` for what this host can run".to_string());
+        return HealthCheck::new(
+            "projection_mode",
+            "Projection in force",
+            HealthStatus::Misconfigured,
+            format!(
+                "{} is recorded but is not what is running; {detail}",
+                report
+                    .recorded
+                    .map(|mode| mode.to_string())
+                    .unwrap_or_default()
+            ),
+        )
+        .with_manual_fix(remedy);
+    }
+
+    // An installed projection that is simply not engaged in this process is
+    // ordinary: the shell hook injects the shim into new shells, and `kin` run
+    // from an editor terminal or a script without the hook is not under it.
+    // Advisory rather than failing, and named so the user can see it, because a
+    // silent green here is what lets someone edit raw disk believing otherwise.
+    // Advisory means "installed and working, just not injected into this
+    // process", which is what running `kin` from a shell without the hook looks
+    // like. A shim mode that failed its own probe is not that, so a refused
+    // driver or a corrupt library cannot borrow the softer status.
+    let shim_usable = report
+        .modes
+        .iter()
+        .any(|probe| probe.mode == ProjectionMode::Shim && probe.available);
+    let advisory = live.mode == ProjectionMode::Shim
+        && shim_usable
+        && live.readable == crate::commands::projection::Tri::Yes;
+    let status = if advisory {
+        HealthStatus::Stale
+    } else {
+        HealthStatus::Misconfigured
+    };
+    HealthCheck::new("projection_mode", "Projection in force", status, detail).with_manual_fix(
+        if advisory {
+            "start a new shell, or run `exec $SHELL -l`, so the hook injects the shim"
+        } else {
+            "run `kin vfs on` to engage a projection, or `kin vfs status` to see why none is \
+             available here"
+        },
+    )
 }
 
 fn check_repo_init() -> HealthCheck {
@@ -2973,6 +3184,287 @@ mod tests {
         assert!(matches!(classify_shim(&path), ShimState::Valid(_)));
     }
 
+    // ---- Projection in force -------------------------------------------
+
+    use crate::commands::projection::{
+        DriverProbe, LiveProjection, ModeProbe, ProjectionMode, ProjectionReport, ShimPresence, Tri,
+    };
+
+    fn mode_probe(mode: ProjectionMode, available: bool) -> ModeProbe {
+        ModeProbe {
+            mode,
+            available,
+            evidence: format!("{mode} fixture probe"),
+            remedy: (!available).then(|| format!("fixture remedy for {mode}")),
+        }
+    }
+
+    fn report(
+        recorded: Option<ProjectionMode>,
+        available: &[ProjectionMode],
+        live: LiveProjection,
+    ) -> ProjectionReport {
+        ProjectionReport {
+            recorded,
+            modes: [
+                ProjectionMode::Nfs,
+                ProjectionMode::Fuse,
+                ProjectionMode::Shim,
+            ]
+            .into_iter()
+            .map(|mode| mode_probe(mode, available.contains(&mode)))
+            .collect(),
+            driver: DriverProbe {
+                path: None,
+                refusal: None,
+                subcommands: None,
+            },
+            shim: ShimPresence {
+                path: PathBuf::from("/home/u/.kin/lib/libkin_vfs_shim.so"),
+                installed: available.contains(&ProjectionMode::Shim),
+                engaged: false,
+            },
+            live,
+        }
+    }
+
+    fn live(
+        intent: ProjectionMode,
+        mode: ProjectionMode,
+        mounted: Tri,
+        readable: Tri,
+        degraded: bool,
+    ) -> LiveProjection {
+        LiveProjection {
+            intent,
+            mode,
+            at: PathBuf::from("/w/repo"),
+            mounted,
+            readable,
+            writable: Tri::NotApplicable,
+            degraded,
+            evidence: vec!["fixture evidence".to_string()],
+        }
+    }
+
+    /// The three fixtures the row exists to tell apart: everything present, no
+    /// shim anywhere, and a configured mount that is not mounted. Each has to
+    /// produce a different status and a different detail, or the row is
+    /// decorative.
+    #[test]
+    fn the_projection_row_changes_across_the_three_fixtures() {
+        let working = projection_mode_check_for(&report(
+            Some(ProjectionMode::Shim),
+            &[ProjectionMode::Shim],
+            live(
+                ProjectionMode::Shim,
+                ProjectionMode::Shim,
+                Tri::NotApplicable,
+                Tri::Yes,
+                false,
+            ),
+        ));
+        assert!(
+            matches!(working.status, HealthStatus::Healthy),
+            "a working projection is healthy, got {:?}",
+            working.status
+        );
+
+        let nothing = projection_mode_check_for(&report(
+            None,
+            &[],
+            live(
+                ProjectionMode::Shim,
+                ProjectionMode::Shim,
+                Tri::NotApplicable,
+                Tri::No,
+                true,
+            ),
+        ));
+        assert!(
+            matches!(nothing.status, HealthStatus::Unsupported),
+            "an install that ships without projection and configures none stays skipped, got {:?}",
+            nothing.status
+        );
+        assert!(!is_failing(&nothing.status));
+
+        let unmounted = projection_mode_check_for(&report(
+            Some(ProjectionMode::Nfs),
+            &[ProjectionMode::Shim],
+            live(
+                ProjectionMode::Nfs,
+                ProjectionMode::Shim,
+                Tri::No,
+                Tri::No,
+                true,
+            ),
+        ));
+        assert!(
+            matches!(unmounted.status, HealthStatus::Misconfigured),
+            "a configured mount that is not running must fail, got {:?}",
+            unmounted.status
+        );
+        assert!(is_failing(&unmounted.status));
+        assert!(
+            unmounted.detail.contains("nfs is recorded"),
+            "the row must name the mode that was configured: {}",
+            unmounted.detail
+        );
+        assert_eq!(
+            unmounted.manual_fix.as_deref(),
+            Some("fixture remedy for nfs"),
+            "the configured mode's own remedy must reach the row"
+        );
+
+        let details = [&working.detail, &nothing.detail, &unmounted.detail];
+        for (i, a) in details.iter().enumerate() {
+            for b in details.iter().skip(i + 1) {
+                assert_ne!(a, b, "each fixture must read differently");
+            }
+        }
+    }
+
+    /// A shim installed and not injected is the container case. It must be
+    /// visible and must not be healthy, and it must not fail readiness either:
+    /// running `kin` from an editor terminal without the shell hook is ordinary
+    /// and would otherwise fail every install that works.
+    #[test]
+    fn an_installed_but_unengaged_shim_is_visible_without_failing_readiness() {
+        let check = projection_mode_check_for(&report(
+            None,
+            &[ProjectionMode::Shim],
+            live(
+                ProjectionMode::Shim,
+                ProjectionMode::Shim,
+                Tri::NotApplicable,
+                Tri::Yes,
+                true,
+            ),
+        ));
+        assert!(
+            matches!(check.status, HealthStatus::Stale),
+            "an unengaged shim is advisory, got {:?}",
+            check.status
+        );
+        assert!(!matches!(check.status, HealthStatus::Healthy));
+        assert!(!is_failing(&check.status));
+        assert!(check
+            .manual_fix
+            .as_deref()
+            .is_some_and(|fix| fix.contains("new shell")));
+    }
+
+    /// The container case, at the row level. A driver the loader refuses
+    /// leaves no mode available, which is the same shape as a machine that
+    /// shipped without projection, and the two must not produce the same row:
+    /// one is fine and the other is every process on the box reading raw disk.
+    #[test]
+    fn a_refused_driver_is_not_a_sanctioned_absence() {
+        let mut refused = report(
+            None,
+            &[],
+            live(
+                ProjectionMode::Shim,
+                ProjectionMode::Shim,
+                Tri::NotApplicable,
+                Tri::Yes,
+                true,
+            ),
+        );
+        refused.driver = DriverProbe {
+            path: Some(PathBuf::from("/opt/kin/kin-vfs")),
+            refusal: Some("GLIBC_2.39 not found".to_string()),
+            subcommands: None,
+        };
+        refused.shim.installed = true;
+
+        let check = projection_mode_check_for(&refused);
+        assert!(
+            is_failing(&check.status),
+            "a projection installed and dead must fail, got {:?}",
+            check.status
+        );
+
+        // Falsification: the same shape with genuinely nothing installed stays
+        // the sanctioned green n/a, so the failure above is about the refusal
+        // and not about there being no available mode.
+        let bare = report(
+            None,
+            &[],
+            live(
+                ProjectionMode::Shim,
+                ProjectionMode::Shim,
+                Tri::NotApplicable,
+                Tri::Yes,
+                true,
+            ),
+        );
+        assert!(
+            matches!(
+                projection_mode_check_for(&bare).status,
+                HealthStatus::Unsupported
+            ),
+            "an install that ships without projection stays skipped"
+        );
+    }
+
+    /// The green n/a on the install row is true only while nobody chose a
+    /// projection. Once a mode is recorded the same machine state is a
+    /// configured projection that is not installed, and "nothing is missing" is
+    /// the confident negative this row keeps producing when nothing checks.
+    #[test]
+    fn a_recorded_mode_turns_the_sanctioned_absence_into_a_defect() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_shim = dir.path().join("no-shim");
+
+        let unconfigured =
+            vfs_projection_check_for_recorded(&missing_shim, &VfsDriverState::Absent, None);
+        assert!(
+            matches!(unconfigured.status, HealthStatus::Unsupported),
+            "with nothing configured the absence stays sanctioned, got {:?}",
+            unconfigured.status
+        );
+        assert!(
+            unconfigured
+                .platform_note
+                .as_deref()
+                .is_some_and(|note| note.contains("nothing is missing")),
+            "the sanctioned row is the one that says nothing is missing"
+        );
+
+        let configured = vfs_projection_check_for_recorded(
+            &missing_shim,
+            &VfsDriverState::Absent,
+            Some(ProjectionMode::Nfs),
+        );
+        assert!(
+            is_failing(&configured.status),
+            "a recorded mode with nothing installed must fail, got {:?}",
+            configured.status
+        );
+        assert!(
+            configured.detail.contains("nfs is recorded"),
+            "the row must name what was configured: {}",
+            configured.detail
+        );
+        assert!(
+            !configured.detail.contains("nothing is missing") && configured.platform_note.is_none(),
+            "the sanctioned wording must not survive a recorded mode: {configured:?}"
+        );
+
+        // A recorded mode does not rewrite a row that already had something to
+        // say: a broken driver stays a broken driver, with the loader's words.
+        let broken = vfs_projection_check_for_recorded(
+            &missing_shim,
+            &VfsDriverState::Unloadable {
+                path: PathBuf::from("/opt/kin/kin-vfs"),
+                message: "GLIBC_2.39 not found".to_string(),
+            },
+            Some(ProjectionMode::Shim),
+        );
+        assert!(broken.detail.contains("GLIBC_2.39"), "{}", broken.detail);
+    }
+
     #[test]
     fn macho_magic_matches_the_shipped_dylib_header() {
         // The v0.2.x macOS shim begins CF FA ED FE (MH_MAGIC_64 little-endian).
@@ -3084,7 +3576,7 @@ mod tests {
         let exe = install.join("kin");
         write_file(&exe, b"kin");
 
-        let candidates = vfs_driver_candidates(&dir.path().join("kin-home"), Some(&exe));
+        let candidates = vfs_driver_candidates(None, &dir.path().join("kin-home"), Some(&exe));
         assert!(
             candidates.contains(&install.join(vfs_binary_filename())),
             "a driver beside the running binary must be probed: {candidates:?}"
@@ -3097,6 +3589,38 @@ mod tests {
                     .join(vfs_binary_filename())
             ),
             "the managed location must still be probed: {candidates:?}"
+        );
+    }
+
+    /// A pinned driver replaces the search rather than joining it. A pin that
+    /// resolved to some other driver when the named one is missing would report
+    /// on a binary the operator did not name, which is the failure a pin exists
+    /// to prevent.
+    #[test]
+    fn a_pinned_driver_is_the_only_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("opt/kin/kin");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        write_file(&exe, b"kin");
+        let pinned = dir.path().join("built/kin-vfs");
+
+        let candidates =
+            vfs_driver_candidates(Some(&pinned), &dir.path().join("kin-home"), Some(&exe));
+        assert_eq!(candidates, vec![pinned.clone()]);
+
+        // Falsification: without the pin the same call searches every location.
+        let searched = vfs_driver_candidates(None, &dir.path().join("kin-home"), Some(&exe));
+        assert!(
+            searched.len() > 1 && !searched.contains(&pinned),
+            "an unpinned search must look in the ordinary places: {searched:?}"
+        );
+
+        // A pin naming a file that is not there is an absent driver, not a
+        // fallback to whatever else the host happens to carry.
+        assert_eq!(
+            resolve_vfs_driver(&candidates),
+            VfsDriverState::Absent,
+            "a pin to a missing file reports absence"
         );
     }
 

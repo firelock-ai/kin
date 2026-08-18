@@ -56,6 +56,7 @@ pub mod notify;
 pub mod overview;
 pub mod pipeline;
 pub mod prepared_state;
+pub mod projection;
 pub mod publish;
 pub mod purge_ignored;
 pub mod reconcile;

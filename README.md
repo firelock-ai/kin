@@ -413,6 +413,15 @@ boundaries:
 | Linux x86_64 and arm64 | `kin` and `kin-daemon` are static musl builds intended to run on glibc and musl distributions. | The public VFS executable and shim are GNU/glibc builds, not musl builds. They are built against a pinned glibc floor of 2.31 and link OpenSSL 3, so a projection host needs both; Debian 12 loads them, and Alpine and other musl distributions are not supported projection hosts. The release refuses to publish a Linux archive whose binaries ask for more glibc than that floor. The arm64 release proof runs on Ubuntu 24.04. |
 | Native Windows x86_64 | Early support: repositories admit and graph and lexical queries answer natively, but MCP and review workflows are not yet covered end to end by the install proof. WSL2 remains the recommended path for full Kin. | Not shipped. Use WSL2 with a Linux distribution that meets the glibc boundary for projection. |
 
+The graph is the authority in every case above. The shim, an NFS mount, and a
+FUSE mount are three ways to see that truth as files, and Kin picks between them
+by probing what this host can run: a mount where one is available, because the
+kernel serves it and no process can have it stripped, and the injected shim as
+the compatibility fallback. `kin vfs on` engages the chosen one, `kin vfs off`
+disengages it, and `kin doctor` carries a row saying which is in force and
+whether it is working. [docs/projection.md](docs/projection.md) has the full
+story, including the mounts' build requirements.
+
 First indexing reads the entire reachable Git history, so `kin init` on a
 large or long-lived repository takes minutes, not seconds, before embedding
 begins. After `init` returns, the daemon continues preparing in the
@@ -426,7 +435,8 @@ embedding. These are observed alpha constraints, not universal sizing promises.
 
 A successful `kin --version` establishes only that the core binary runs. It
 does not establish VFS compatibility or a live graph-backed projection. On a
-supported Unix host, use `kin setup status`, `kin-vfs status --workspace .`, and a real
+supported Unix host, use `kin vfs status`, which probes each projection mode and
+prints what is actually in force, then `kin setup status` and a real
 `kin-vfs exec --workspace . -- <command>` launch. The VFS launcher includes an
 interposition canary and reports when the operating system strips the shim.
 The [kin-vfs README](https://github.com/firelock-ai/kin-vfs#current-platform-and-package-boundaries)

@@ -97,6 +97,14 @@ pub async fn status() -> Result<()> {
         &kin_core::last_admission::read(&layout),
         chrono::Utc::now(),
     );
+    // And which projection is showing that truth as files. Read here rather
+    // than asked of the daemon for the same reason freshness is: the daemon
+    // reports the graph it holds, and whether this host has a mount or an
+    // injected shim is a property of the machine the CLI is standing on.
+    response.lines.push(format!(
+        "ℹ {}",
+        crate::commands::projection::status_line(layout.root())
+    ));
     print_graph_response(response)
 }
 

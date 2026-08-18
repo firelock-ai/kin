@@ -33,6 +33,9 @@ The installer downloads the latest release from GitHub, **verifies its SHA-256 c
 `kin-daemon` binaries into `~/.kin/bin` (and `~/.kin/lib`), updates your shell profile
 (`.zshrc` / `.bashrc`), and then runs the `kin setup` wizard. Where the archive bundles
 them, the optional `kin-vfs` projection client and shim are installed alongside.
+Setup then picks a projection mode for this host, prints what each of the shim,
+NFS and FUSE would need, and records the one it chose. `kin vfs status` shows it
+again later, and `kin vfs on --mode <mode>` changes it.
 `kin-daemon` is mandatory; the installer aborts cleanly rather than leaving a daemon-less
 install. Re-running the installer upgrades an existing install in place and reports the
 version change.
@@ -458,6 +461,7 @@ The checks (IDs as emitted in `--json`):
 | `kin_binary` | The `kin` binary resolved (reports version + path). |
 | `kin_daemon_binary` | `kin-daemon` found beside `kin` or on `PATH`. |
 | `vfs_projection` | The VFS shim is installed and non-zero in `~/.kin/lib`, and the `kin-vfs` driver beside `kin`, in `~/.kin/bin`, or on PATH runs when probed (macOS/Linux). A driver that is present but will not load is **MISCONFIGURED** and the row quotes the loader; no driver and no shim is **n/a**. On native Windows this is **unsupported**; use WSL2. |
+| `projection_mode` | Which projection is in force and whether it works, read `mode/mounted/readable/writable/degraded` from a live probe. **n/a** when no projection is available and none is configured, which is what an install that ships without one looks like. A configured mode that is not running is **MISCONFIGURED**. A shim that is installed but not injected into this process is **STALE**, which is what running `kin` from a shell without the hook looks like. |
 | `repo_init` | The current directory is inside a Kin repository. |
 | `shell_path` | The `kin-vfs` shell hook is installed and sourced from your rc, and the managed `~/.kin/bin` directory is on PATH now or will be after shell restart. On an install that does not create `~/.kin/bin`, such as an archive or Homebrew one, no PATH line is written and the row says so. |
 | `mcp_client_*` (e.g. `mcp_client_claude`) | A detected AI client has the `kin` MCP server with the `agent-default` profile. With no client configs present, a single `mcp_clients` check reports ok when no client is installed either, and **n/a** naming the detected clients that `kin setup` would configure. |
@@ -476,6 +480,8 @@ Each failing/incomplete check prints its own `fix:` line. The most common ones:
   the daemon.
 - **`repo_init` MISSING** → run `kin init .` to initialize a repository here.
 - **`vfs_projection` MISSING** → run `kin setup` to (re)install the shim into `~/.kin/lib`.
+- **`projection_mode` MISCONFIGURED** → run `kin vfs status` for each mode's probe result,
+  then `kin vfs on` to engage one. See [Filesystem projection](projection.md).
 - **`kin_daemon_binary` MISSING** → reinstall Kin so `kin-daemon` lands beside `kin`.
 - **`commit_identity` MISCONFIGURED** → set `git config --global user.name` and
   `git config --global user.email`, or put `default_author = "Your Name <you@example.com>"`
