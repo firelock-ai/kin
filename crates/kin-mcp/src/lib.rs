@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+pub mod budget;
 pub mod daemon_delegate;
 pub mod edge_coverage;
 pub mod envelope;
@@ -13,18 +14,21 @@ pub mod startup_binding;
 pub mod tools;
 pub mod types;
 
+pub use budget::{
+    is_budgeted as is_budgeted_tool, BudgetAccounting, ResponseBudget, RESPONSE_DEFAULT_MAX_CHARS,
+};
 pub use daemon_delegate::note_startup_repository;
 pub use edge_coverage::EDGE_COVERAGE_KEY;
 pub use envelope::{
-    annotate as annotate_with_envelope, finalize as finalize_with_envelope, Envelope, ENVELOPE_KEY,
-    ENVELOPE_VERSION,
+    annotate as annotate_with_envelope, finalize as finalize_with_envelope,
+    finalize_bounded as finalize_with_envelope_bounded, Envelope, ENVELOPE_KEY, ENVELOPE_VERSION,
 };
 pub use error::{McpError, Result};
 pub use handlers::LocalRepositoryAuthorityBinding;
 pub use negative::NEGATIVE_KEY;
 pub use server::{
     process_daemon_message, process_message, run_stdio, run_stdio_daemon, BoundRepo,
-    McpServerConfig, RepoBinder, SessionAuthorityMode,
+    McpServerConfig, RepoBinder, SessionAuthorityMode, WorkspaceBinding,
 };
 pub use session::{
     AssistantSession, CommitRefusal, CommitRefusalCode, CoordinationEnforcementMode,

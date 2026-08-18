@@ -197,6 +197,7 @@ fn registered_tools() -> ToolsListResult {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
+                        "max_chars": { "type": "integer", "description": "Serialized characters this response may occupy (default 30000, clamped 2000..400000). The tool enforces it itself: it sheds ranking explanation, then duplicated hit shapes, then inline source, and only then withholds hits, so a result is never refused for being too large. Any cut is reported in `degradations` and in `_kin.response`, which also carries the size the response had before the budget. Raise it only if your client accepts a larger tool result.", "default": 30000, "minimum": 2000, "maximum": 400000 },
                         "query": { "type": "string", "description": "Name pattern to search for" },
                         "kind": { "type": "string", "description": "Entity kind filter (function, class, etc.)" },
                         "language": { "type": "string", "description": "Language filter (rust, typescript, etc.)" },
@@ -213,6 +214,8 @@ fn registered_tools() -> ToolsListResult {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
+                        "max_chars": { "type": "integer", "description": "Serialized characters this response may occupy (default 30000, clamped 2000..400000). The tool enforces it itself: it sheds ranking explanation, then duplicated hit shapes, then inline source, and only then withholds hits, so a result is never refused for being too large. Any cut is reported in `degradations` and in `_kin.response`, which also carries the size the response had before the budget. Raise it only if your client accepts a larger tool result.", "default": 30000, "minimum": 2000, "maximum": 400000 },
+                        "compact": { "type": "boolean", "description": "If true (default), omit ranking explanation and per-signal breakdowns and return one shape per hit. Pass false (or explain: true) to get the breakdowns back.", "default": true },
                         "query": { "type": "string", "description": "Natural-language description of the code to find. Optional when paging with `cursor`." },
                         "queries": {
                             "type": "array",
@@ -325,6 +328,7 @@ fn registered_tools() -> ToolsListResult {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
+                        "max_chars": { "type": "integer", "description": "Serialized characters this response may occupy (default 30000, clamped 2000..400000). The tool enforces it itself: it sheds ranking explanation, then duplicated hit shapes, then inline source, and only then withholds hits, so a result is never refused for being too large. Any cut is reported in `degradations` and in `_kin.response`, which also carries the size the response had before the budget. Raise it only if your client accepts a larger tool result.", "default": 30000, "minimum": 2000, "maximum": 400000 },
                         "entity_id": { "type": "string", "description": "Focal entity UUID" },
                         "token_budget": { "type": "integer", "description": "Token budget (8000, 16000, or 32000)", "default": 16000 },
                         "depth": { "type": "integer", "description": "Dependency traversal depth", "default": 2 },
@@ -341,6 +345,7 @@ fn registered_tools() -> ToolsListResult {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
+                        "max_chars": { "type": "integer", "description": "Serialized characters this response may occupy (default 30000, clamped 2000..400000). The tool enforces it itself: it sheds ranking explanation, then duplicated hit shapes, then inline source, and only then withholds hits, so a result is never refused for being too large. Any cut is reported in `degradations` and in `_kin.response`, which also carries the size the response had before the budget. Raise it only if your client accepts a larger tool result.", "default": 30000, "minimum": 2000, "maximum": 400000 },
                         "entity_id": { "type": "string", "description": "Focal entity UUID. Required if `query` is not given." },
                         "query": { "type": "string", "description": "Exact entity name to resolve to a focal entity. Required if `entity_id` is not given." },
                         "depth": { "type": "integer", "description": "Dependency traversal depth across the trace neighborhood", "default": 3 },
@@ -377,8 +382,15 @@ fn registered_tools() -> ToolsListResult {
                         },
                         "max_response_chars": {
                             "type": "integer",
-                            "description": "Serialized characters this response may occupy (default 80000). The tool enforces it itself, dropping bodies before edges and reporting the cut in degradations, so a result is never refused for size.",
-                            "default": 80000,
+                            "description": "Serialized characters this response may occupy (default 30000, the same default every retrieval tool answers under). The tool enforces it itself, dropping bodies before edges and reporting the cut in degradations, so a result is never refused for size. `max_chars` is the same parameter under the name the other retrieval tools use.",
+                            "default": 30000,
+                            "minimum": 2000,
+                            "maximum": 400000
+                        },
+                        "max_chars": {
+                            "type": "integer",
+                            "description": "Alias for max_response_chars, the spelling shared with the other retrieval tools.",
+                            "default": 30000,
                             "minimum": 2000,
                             "maximum": 400000
                         }
@@ -393,12 +405,19 @@ fn registered_tools() -> ToolsListResult {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
+                        "max_chars": { "type": "integer", "description": "Serialized characters this response may occupy (default 30000, clamped 2000..400000). The tool enforces it itself: it sheds ranking explanation, then duplicated hit shapes, then inline source, and only then withholds hits, so a result is never refused for being too large. Any cut is reported in `degradations` and in `_kin.response`, which also carries the size the response had before the budget. Raise it only if your client accepts a larger tool result.", "default": 30000, "minimum": 2000, "maximum": 400000 },
+                        "compact": { "type": "boolean", "description": "If true (default), omit ranking explanation and per-signal breakdowns and return one shape per hit. Pass false (or explain: true) to get the breakdowns back.", "default": true },
                         "entity_id": { "type": "string", "description": "Exact entity UUID. Optional if query is provided." },
                         "query": { "type": "string", "description": "Exact symbol name to resolve. Optional if entity_id is provided." },
                         "relation_kinds": {
                             "type": "array",
                             "description": "Filter relation kinds. Supported values: calls, imports, references. Defaults to all three.",
                             "items": { "type": "string" }
+                        },
+                        "include_snippets": {
+                            "type": "boolean",
+                            "description": "If true, each row also carries the referencing entity's signature and a bounded body excerpt. Off by default, because one row is one caller and bodies would then scale with the number of callers. Every row still carries entity_id, which drills to the full body via get_entity_source.",
+                            "default": false
                         }
                     }
                 }),
@@ -410,6 +429,7 @@ fn registered_tools() -> ToolsListResult {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
+                        "max_chars": { "type": "integer", "description": "Serialized characters this response may occupy (default 30000, clamped 2000..400000). The tool enforces it itself: it sheds ranking explanation, then duplicated hit shapes, then inline source, and only then withholds hits, so a result is never refused for being too large. Any cut is reported in `degradations` and in `_kin.response`, which also carries the size the response had before the budget. Raise it only if your client accepts a larger tool result.", "default": 30000, "minimum": 2000, "maximum": 400000 },
                         "entity_ids": {
                             "type": "array",
                             "description": "Entity UUIDs to classify. Minimum 1, maximum 200.",
@@ -439,6 +459,8 @@ fn registered_tools() -> ToolsListResult {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
+                        "max_chars": { "type": "integer", "description": "Serialized characters this response may occupy (default 30000, clamped 2000..400000). The tool enforces it itself: it sheds ranking explanation, then duplicated hit shapes, then inline source, and only then withholds hits, so a result is never refused for being too large. Any cut is reported in `degradations` and in `_kin.response`, which also carries the size the response had before the budget. Raise it only if your client accepts a larger tool result.", "default": 30000, "minimum": 2000, "maximum": 400000 },
+                        "compact": { "type": "boolean", "description": "If true (default), omit ranking explanation and per-signal breakdowns and return one shape per hit. Pass false (or explain: true) to get the breakdowns back.", "default": true },
                         "base": { "type": "string", "description": "Base semantic change ID (hex)" },
                         "head": { "type": "string", "description": "Head semantic change ID (hex)" },
                         "entity_ids": { "type": "array", "items": { "type": "string" }, "description": "Entity UUIDs to analyze impact for" },
@@ -520,6 +542,8 @@ fn registered_tools() -> ToolsListResult {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
+                        "max_chars": { "type": "integer", "description": "Serialized characters this response may occupy (default 30000, clamped 2000..400000). The tool enforces it itself: it sheds ranking explanation, then duplicated hit shapes, then inline source, and only then withholds hits, so a result is never refused for being too large. Any cut is reported in `degradations` and in `_kin.response`, which also carries the size the response had before the budget. Raise it only if your client accepts a larger tool result.", "default": 30000, "minimum": 2000, "maximum": 400000 },
+                        "compact": { "type": "boolean", "description": "If true (default), omit ranking explanation and per-signal breakdowns and return one shape per hit. Pass false (or explain: true) to get the breakdowns back.", "default": true },
                         "query": {
                             "type": "string",
                             "description": "Search query — concept or partial name to seed candidates"
@@ -554,6 +578,8 @@ fn registered_tools() -> ToolsListResult {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
+                        "max_chars": { "type": "integer", "description": "Serialized characters this response may occupy (default 30000, clamped 2000..400000). The tool enforces it itself: it sheds ranking explanation, then duplicated hit shapes, then inline source, and only then withholds hits, so a result is never refused for being too large. Any cut is reported in `degradations` and in `_kin.response`, which also carries the size the response had before the budget. Raise it only if your client accepts a larger tool result.", "default": 30000, "minimum": 2000, "maximum": 400000 },
+                        "compact": { "type": "boolean", "description": "If true (default), omit ranking explanation and per-signal breakdowns and return one shape per hit. Pass false (or explain: true) to get the breakdowns back.", "default": true },
                         "entity_id": { "type": "string", "description": "Entity UUID" },
                         "depth": { "type": "integer", "description": "Traversal depth", "default": 2 },
                         "limit": { "type": "integer", "description": "Max entities to return (default 30)", "default": 30 },

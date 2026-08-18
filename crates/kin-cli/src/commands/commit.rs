@@ -67,10 +67,7 @@ async fn run_daemon_commit(
         .await?
         .ok_or_else(|| crate::daemon_client::daemon_required_error("commit", layout))?;
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .connect_timeout(std::time::Duration::from_millis(500))
-        .build()?;
+    let client = build_commit_client(commit_reply_deadline())?;
     // Create these once per CLI invocation so transport retry logic can reuse
     // the byte-identical repository transaction.
     let operation_id = kin_model::OperationId::new();
@@ -98,25 +95,224 @@ async fn run_daemon_commit(
     let response = match response {
         Ok(response) => response,
         Err(error) => {
-            // A transport error names a socket. When the daemon was killed with
-            // this request in flight, the socket is the symptom and the killer
-            // left the cause in the repository.
-            return match daemon_death_explanation(&kin_root) {
-                Some(cause) => Err(anyhow::Error::new(error).context(cause)),
-                None => Err(anyhow::Error::new(error))
-                    .context("send daemon-owned native commit request"),
-            };
+            return resolve_commit_after_lost_reply(layout, &kin_root, operation_id, error, quiet);
         }
     };
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
+        if let Some(refusal) = commit_refusal_message(&body) {
+            anyhow::bail!(refusal);
+        }
         anyhow::bail!("daemon native commit failed (HTTP {status}): {body}");
     }
     response
         .json()
         .await
         .context("decode daemon native commit response")
+}
+
+/// How long the CLI waits for the daemon to answer a commit.
+///
+/// `None`, and that is the fix. The client used to carry a fixed 120-second
+/// deadline, which is shorter than a one-file commit on a converted repository
+/// of any size: on a psf/requests store the phases behind one docstring edit ran
+/// for 213 seconds. Nothing about the deadline expiring cancelled the commit.
+/// The daemon kept going, published the change minutes later, and the person who
+/// had already read `operation timed out` retried, which is how a store ends up
+/// carrying an empty change stacked on the real one.
+///
+/// A deadline can only be right if the CLI knows how long the work should take,
+/// and it cannot: the cost is a property of the store. What the CLI can do is
+/// show the phases the daemon is in, which it does for the whole wait, so a
+/// commit that is working and a commit that is wedged no longer look the same.
+/// A daemon that really is wedged is ended by the supervisor's reaper, and that
+/// arrives here as a transport error carrying the reaper's own note.
+fn commit_reply_deadline() -> Option<std::time::Duration> {
+    None
+}
+
+/// The HTTP client a commit is sent with.
+///
+/// The connect timeout stays: refusing to connect is an immediate, local fact
+/// about a daemon that is not listening, and waiting on it forever would trade
+/// one bad failure mode for another. Only the reply deadline is the caller's to
+/// choose, and production chooses none.
+fn build_commit_client(deadline: Option<std::time::Duration>) -> reqwest::Result<reqwest::Client> {
+    let mut builder =
+        reqwest::Client::builder().connect_timeout(std::time::Duration::from_millis(500));
+    if let Some(deadline) = deadline {
+        builder = builder.timeout(deadline);
+    }
+    builder.build()
+}
+
+/// The one-line refusal a daemon body carries, when it carries one.
+///
+/// A refusal the daemon states in words is worth exactly those words. Wrapping
+/// it in `daemon native commit failed (HTTP 409): {"error":...}` buries the
+/// sentence a person needs inside a serialized envelope they have to read past.
+fn commit_refusal_message(body: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
+    if parsed.get("error")? != "nothing_to_commit" {
+        return None;
+    }
+    Some(parsed.get("message")?.as_str()?.to_string())
+}
+
+/// What the CLI can still learn about a commit whose reply never arrived.
+#[derive(Debug)]
+enum LostReply {
+    /// The operation is in repository authority. The commit landed and the
+    /// reply is the only thing that was lost.
+    Landed(Box<DaemonCommitResult>),
+    /// No receipt yet, and the daemon is still beating on an open transaction.
+    /// The commit is running; it has not failed.
+    StillRunning(String),
+    /// No receipt, and nothing proves any work is still in flight.
+    Gone,
+}
+
+/// Decide what a lost reply means from the facts on disk.
+///
+/// Separated from the reads so the decision can be tested against every
+/// combination of them, including the two that are easy to get wrong. A receipt
+/// means landed no matter what the marker says, because a daemon that finished
+/// this commit and went on to other work still publishes a marker. And a marker
+/// is trusted only while the daemon that wrote it is still running: a daemon
+/// killed mid-commit never retires its marker, and the kernel's OOM killer
+/// leaves no note behind either, so a beat alone would report a dead daemon's
+/// abandoned commit as still in flight.
+fn classify_lost_reply(
+    landed: Option<DaemonCommitResult>,
+    open: Option<kin_daemon_spawn::OpenTransaction>,
+    now_unix: u64,
+    is_alive: impl Fn(u32) -> bool,
+) -> LostReply {
+    if let Some(result) = landed {
+        return LostReply::Landed(Box::new(result));
+    }
+    match open {
+        Some(open) if open.is_beating(now_unix) && is_alive(open.pid) => {
+            LostReply::StillRunning(open.summary())
+        }
+        _ => LostReply::Gone,
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0)
+}
+
+/// Report a commit whose reply was lost, by asking authority what happened.
+///
+/// The transport error is the last thing consulted rather than the first. A
+/// commit is recorded by the repository transaction, not by the response that
+/// describes it, so the honest question after a lost reply is whether this
+/// operation reached authority. When it did, the commit succeeded and says so;
+/// when it did not but the daemon is still beating on an open transaction, the
+/// commit is still running and says that instead of reporting a failure that has
+/// not happened.
+fn resolve_commit_after_lost_reply(
+    layout: &kin_core::KinLayout,
+    kin_root: &std::path::Path,
+    operation_id: kin_model::OperationId,
+    error: reqwest::Error,
+    quiet: bool,
+) -> Result<DaemonCommitResult> {
+    let lookup = landed_commit_for_operation(layout, operation_id);
+    let unreadable_authority = lookup.as_ref().err().map(|error| format!("{error:#}"));
+    let landed = lookup.unwrap_or(None);
+    match classify_lost_reply(
+        landed,
+        kin_daemon_spawn::read_open_transaction(kin_root),
+        unix_now(),
+        kin_daemon_spawn::process_is_alive,
+    ) {
+        LostReply::Landed(result) => {
+            if !quiet {
+                eprintln!(
+                    "The daemon's reply was lost, and repository authority holds this commit \
+                     (operation {operation_id}). Reporting the change it recorded."
+                );
+            }
+            Ok(*result)
+        }
+        LostReply::StillRunning(open) => anyhow::bail!(
+            "the daemon is still committing ({open}) and this commit has not failed. \
+             Operation {operation_id} appears in `kin log` when it lands; a `kin commit` \
+             run before then waits for it and is refused rather than recorded."
+        ),
+        LostReply::Gone => {
+            // A transport error names a socket. When the daemon was killed with
+            // this request in flight, the socket is the symptom and the killer
+            // left the cause in the repository.
+            let error = match daemon_death_explanation(kin_root) {
+                Some(cause) => anyhow::Error::new(error).context(cause),
+                None => {
+                    anyhow::Error::new(error).context("send daemon-owned native commit request")
+                }
+            };
+            Err(match unreadable_authority {
+                Some(why) => error.context(format!(
+                    "repository authority could not be read to check whether operation \
+                     {operation_id} landed: {why}"
+                )),
+                None => error.context(format!(
+                    "repository authority holds no receipt for operation {operation_id}: \
+                     the change was not recorded"
+                )),
+            })
+        }
+    }
+}
+
+/// The change this operation id published, read from repository authority.
+///
+/// The same lookup the daemon performs to recover its own interrupted commits,
+/// run from the CLI over the durable store rather than over a daemon that may no
+/// longer be answering. It is deliberately not a daemon request: the state this
+/// exists to report on is exactly the state in which the daemon cannot answer.
+fn landed_commit_for_operation(
+    layout: &kin_core::KinLayout,
+    operation_id: kin_model::OperationId,
+) -> Result<Option<DaemonCommitResult>> {
+    let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(layout)?;
+    let authority = super::repository_authority::ActiveRepositoryAuthority::open(&binding)?;
+    let lease = authority.manager().read_authority();
+    let Some(receipt) = lease
+        .metadata()
+        .receipts
+        .iter()
+        .find(|receipt| receipt.operation_id == operation_id)
+    else {
+        return Ok(None);
+    };
+    let Some((branch, change_id)) = receipt.operation.ref_mutations.iter().find_map(|mutation| {
+        match mutation.new_target.as_ref() {
+            Some(kin_model::RefTarget::Change { change_id }) => {
+                Some((mutation.name.clone(), *change_id))
+            }
+            _ => None,
+        }
+    }) else {
+        return Ok(None);
+    };
+    let change = lease.snapshot().changes.get(&change_id).ok_or_else(|| {
+        anyhow::anyhow!(
+            "repository receipt for operation {operation_id} references missing change {change_id}"
+        )
+    })?;
+    Ok(Some(DaemonCommitResult {
+        change_id: change_id.to_string(),
+        branch: branch.to_string(),
+        entity_count: change.entity_deltas.len(),
+        relation_count: change.relation_deltas.len(),
+        file_count: change.tree_deltas.len(),
+    }))
 }
 
 /// Await `work`, printing the phases the daemon reaches while it runs.
@@ -245,6 +441,206 @@ mod tests {
                 "phase {phase} reached the caller only after the reply: {seen:?}"
             );
         }
+    }
+
+    fn commit_body() -> serde_json::Value {
+        serde_json::json!({
+            "operation_id": kin_model::OperationId::new(),
+            "timestamp": kin_model::Timestamp::now(),
+            "message": "publish one docstring edit",
+            "author": "Ada Lovelace <ada@example.com>",
+        })
+    }
+
+    fn landed_result() -> DaemonCommitResult {
+        DaemonCommitResult {
+            change_id: "5b8ca7b7".to_string(),
+            branch: "refs/heads/main".to_string(),
+            entity_count: 32,
+            relation_count: 4,
+            file_count: 1,
+        }
+    }
+
+    fn open_commit(beat_unix: u64) -> kin_daemon_spawn::OpenTransaction {
+        kin_daemon_spawn::OpenTransaction {
+            pid: std::process::id(),
+            operation: "commit".to_string(),
+            phase: Some("reconcile_workspace_and_commit_authority".to_string()),
+            elapsed_secs: 213,
+            phase_elapsed_secs: 60,
+            beat_unix,
+        }
+    }
+
+    /// A daemon stand-in that answers a commit only after `delay`.
+    ///
+    /// A real 120-second wait is not what this needs to prove. The defect is a
+    /// client deadline shorter than the daemon's work, and any two durations in
+    /// that order reproduce it.
+    async fn slow_commit_daemon(
+        delay: std::time::Duration,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let serving = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+                    let mut request = [0u8; 4096];
+                    let _ = socket.read(&mut request).await;
+                    tokio::time::sleep(delay).await;
+                    let body = serde_json::to_string(&serde_json::json!({
+                        "change_id": "5b8ca7b7",
+                        "branch": "refs/heads/main",
+                        "entity_count": 32,
+                        "relation_count": 4,
+                        "file_count": 1,
+                    }))
+                    .unwrap();
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.flush().await;
+                });
+            }
+        });
+        (url, serving)
+    }
+
+    /// The reported defect, in the only two durations it needs.
+    ///
+    /// The shipped client carried a fixed 120-second deadline and a one-file
+    /// commit on a converted psf/requests store ran for 213 seconds, so the CLI
+    /// reported `operation timed out` for a commit that landed. Both arms run
+    /// against the same daemon: the deadlined client proves this daemon really
+    /// is slower than a deadline, and the production client proves the reply
+    /// still arrives. Falsify by giving `build_commit_client` back a fixed
+    /// timeout shorter than the work; the second arm then fails the same way
+    /// the first one is asserted to.
+    #[tokio::test]
+    async fn a_commit_slower_than_a_client_deadline_still_reports_its_change() {
+        let work = std::time::Duration::from_millis(600);
+        let deadline = std::time::Duration::from_millis(150);
+        let (url, serving) = slow_commit_daemon(work).await;
+        let endpoint = format!("{url}/commands/commit");
+
+        let expired = build_commit_client(Some(deadline))
+            .unwrap()
+            .post(&endpoint)
+            .json(&commit_body())
+            .send()
+            .await
+            .expect_err("a deadline shorter than the daemon's work must expire");
+        assert!(
+            expired.is_timeout(),
+            "the control must fail on the deadline, not on the transport: {expired}"
+        );
+
+        assert!(
+            commit_reply_deadline().is_none(),
+            "a commit must not carry a deadline the CLI cannot justify"
+        );
+        let response = build_commit_client(commit_reply_deadline())
+            .unwrap()
+            .post(&endpoint)
+            .json(&commit_body())
+            .send()
+            .await
+            .expect("a commit with no reply deadline waits for the daemon");
+        let result: DaemonCommitResult = response.json().await.unwrap();
+        assert_eq!(result.change_id, "5b8ca7b7");
+        assert_eq!(render_commit_summary(&result).lines().count(), 2);
+
+        serving.abort();
+    }
+
+    /// A reply that never arrived says nothing about whether the commit did.
+    ///
+    /// Authority is what records a commit, so a receipt for this operation means
+    /// the commit succeeded and only its reply was lost. That holds even while
+    /// the daemon publishes a marker, because a daemon that finished this commit
+    /// and moved on to other work is still mid-transaction.
+    #[test]
+    fn a_lost_reply_whose_operation_reached_authority_is_a_successful_commit() {
+        match classify_lost_reply(
+            Some(landed_result()),
+            Some(open_commit(1_000)),
+            1_005,
+            |_| true,
+        ) {
+            LostReply::Landed(result) => {
+                assert_eq!(result.change_id, "5b8ca7b7");
+                assert_eq!(result.entity_count, 32);
+            }
+            other => panic!("a receipt is a landed commit, not {other:?}"),
+        }
+    }
+
+    /// A commit still running is reported as running, never as failed.
+    ///
+    /// The stranger read `operation timed out`, concluded the edit was
+    /// uncommitted, and retried. Both halves of that were wrong, and the retry
+    /// is what wrote the empty change.
+    #[test]
+    fn a_lost_reply_with_a_beating_daemon_is_still_running_rather_than_failed() {
+        match classify_lost_reply(None, Some(open_commit(1_000)), 1_030, |_| true) {
+            LostReply::StillRunning(open) => assert!(
+                open.contains("commit in phase reconcile_workspace_and_commit_authority for 213s"),
+                "the report must name the phase and its age: {open}"
+            ),
+            other => panic!("a beating daemon is still committing, not {other:?}"),
+        }
+
+        let quiet = 1_000 + kin_daemon_spawn::TRANSACTION_BEAT_STALE_AFTER.as_secs() + 5;
+        assert!(
+            matches!(
+                classify_lost_reply(None, Some(open_commit(1_000)), quiet, |_| true),
+                LostReply::Gone
+            ),
+            "a marker that stopped beating proves nothing is in flight"
+        );
+        // The shape the reported OOM kills took: the daemon died holding the
+        // marker, and the kernel that killed it wrote no note, so the marker is
+        // the only thing left and it is still beating from seconds ago.
+        assert!(
+            matches!(
+                classify_lost_reply(None, Some(open_commit(1_000)), 1_030, |_| false),
+                LostReply::Gone
+            ),
+            "a marker belonging to a dead daemon is a leftover, not work in flight"
+        );
+        assert!(
+            matches!(
+                classify_lost_reply(None, None, 1_030, |_| true),
+                LostReply::Gone
+            ),
+            "no receipt and no marker is a commit that failed, and must still report failure"
+        );
+    }
+
+    /// A refusal the daemon states in words reaches the caller as those words.
+    #[test]
+    fn a_nothing_to_commit_refusal_is_reported_as_its_own_sentence() {
+        let body = serde_json::json!({
+            "error": "nothing_to_commit",
+            "change_id": "5b8ca7b7",
+            "message": "nothing to commit: this tree is already committed as 5b8ca7b7",
+        })
+        .to_string();
+        assert_eq!(
+            commit_refusal_message(&body).as_deref(),
+            Some("nothing to commit: this tree is already committed as 5b8ca7b7")
+        );
+        assert!(
+            commit_refusal_message(&serde_json::json!({"error": "lease_conflict"}).to_string())
+                .is_none(),
+            "another refusal keeps the envelope its own reader parses"
+        );
+        assert!(commit_refusal_message("daemon is starting").is_none());
     }
 
     /// `kin commit` is not a git commit and nothing said so, while `git status`

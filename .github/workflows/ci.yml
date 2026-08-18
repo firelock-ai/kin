@@ -1486,3 +1486,157 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           slug: firelock-ai/kin
           fail_ci_if_error: false
+
+  # The public install proof is what caught v0.5.38, and it caught it on the
+  # tag, after the version was cut and the archives were built and published,
+  # because nothing before the tag ran it. These three jobs run that same
+  # reusable proof against the binaries this pull request builds, so the break
+  # is a red pull request instead of a burned tag.
+  install-proof-pr-build:
+    name: Install Proof (PR) Build
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The release builds the Linux core against musl and links it static, so
+      # one archive runs on every distribution. Building the same target here is
+      # what makes these bytes the release's bytes rather than a near-miss whose
+      # libc coupling the proof would never see.
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install the musl C toolchain
+        run: scripts/ci-apt-install.sh musl-tools
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # The build stamps its own source identity, and `kin bench-meta` reports
+      # it to the proof, which refuses a dirty build. Assert the tree here so
+      # that refusal names the cause instead of surfacing as an opaque
+      # capability failure three jobs later.
+      - name: Assert a clean source tree before compiling
+        run: |
+          set -euo pipefail
+          dirty="$(git status --porcelain --untracked-files=all)"
+          if [ -n "$dirty" ]; then
+            printf '%s\n' "$dirty" >&2
+            echo "::error::install-proof build tree is not clean before compilation"
+            exit 1
+          fi
+
+      - name: Build the release binaries this pull request would ship
+        run: |
+          cargo build --locked --release \
+            --target x86_64-unknown-linux-musl -p kin-cli -p kin-daemon
+
+      # Assembled exactly as the release assembles it, down to the archive name,
+      # the single top-level directory, and the shasum-format sidecar, so the
+      # installer takes its ordinary path over these bytes. kin-vfs and its shim
+      # are absent on purpose: they are built from a separate repository at a
+      # commit the release pins, and a pull request produces no such bytes.
+      # The shape helper the release publishes with is what judges the result.
+      - name: Package the release archive layout
+        run: |
+          set -euo pipefail
+          artifact=kin-linux-x86_64
+          stage="$RUNNER_TEMP/install-proof-pr"
+          release=target/x86_64-unknown-linux-musl/release
+          mkdir -p "$stage/$artifact"
+          cp "$release/kin" "$release/kin-daemon" "$stage/$artifact/"
+          tar czf "$stage/$artifact.tar.gz" -C "$stage" "$artifact"
+          ( cd "$stage" && shasum -a 256 "$artifact.tar.gz" > "$artifact.tar.gz.sha256" )
+          ARCHIVE="$stage/$artifact.tar.gz" ARTIFACT="$artifact" node -e '
+            const { execFileSync } = require("node:child_process");
+            const { assertReleaseArchiveMemberPaths } = require("./scripts/release-archive-shape.cjs");
+            const listing = execFileSync("tar", ["-tzf", process.env.ARCHIVE], { encoding: "utf8" })
+              .split("\n")
+              .filter((line) => line !== "");
+            assertReleaseArchiveMemberPaths(listing, {
+              artifact: process.env.ARTIFACT,
+              target: "x86_64-unknown-linux-musl",
+            });
+          '
+          # The proof binds installed bytes to a public release tag, its commit,
+          # and the Cargo.lock at that commit. A pull request has no tag, so it
+          # states the same three facts about itself and the proof binds to
+          # those instead: the version the binaries stamp, the commit they were
+          # compiled at, and the digest of the lockfile they were compiled with.
+          "$stage/$artifact/kin" --version | awk '{print $2}' > "$stage/expected-version.txt"
+          git rev-parse HEAD > "$stage/expected-commit.txt"
+          sha256sum Cargo.lock | cut -d' ' -f1 > "$stage/expected-lock-sha.txt"
+          # The proof runs with no checkout, so the installer it must exercise
+          # travels with the archive.
+          cp scripts/install.sh "$stage/install.sh"
+          cat "$stage/expected-version.txt" "$stage/expected-commit.txt" \
+            "$stage/expected-lock-sha.txt" "$stage/$artifact.tar.gz.sha256"
+
+      - name: Upload the pull request release archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: install-proof-pr-binaries
+          if-no-files-found: error
+          retention-days: 3
+          path: |
+            ${{ runner.temp }}/install-proof-pr/kin-linux-x86_64.tar.gz
+            ${{ runner.temp }}/install-proof-pr/kin-linux-x86_64.tar.gz.sha256
+            ${{ runner.temp }}/install-proof-pr/expected-version.txt
+            ${{ runner.temp }}/install-proof-pr/expected-commit.txt
+            ${{ runner.temp }}/install-proof-pr/expected-lock-sha.txt
+            ${{ runner.temp }}/install-proof-pr/install.sh
+
+  install-proof-pr:
+    name: Install Proof (PR)
+    needs: [changes, install-proof-pr-build]
+    if: >-
+      ${{ !cancelled()
+      && needs.changes.outputs.docs_only != 'true'
+      && needs.install-proof-pr-build.result == 'success' }}
+    uses: ./.github/workflows/install-proof.yml
+    with:
+      release_tag: ""
+      expected_vfs_commit: ""
+      local_artifact: install-proof-pr-binaries
+    permissions:
+      contents: read
+      attestations: read
+
+  # A reusable-workflow call publishes its checks as `<caller> / <leg>`, and a
+  # caller that skips publishes no such check at all, so those names cannot be
+  # the required context: a documentation-only pull request would wait forever
+  # on a check nothing will ever report. This job always reports, under one
+  # stable name, and is the context to require.
+  install-proof-pr-gate:
+    name: Install Proof (PR) Gate
+    needs: [changes, install-proof-pr-build, install-proof-pr]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require the pull request install proof
+        env:
+          DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
+          BUILD_RESULT: ${{ needs.install-proof-pr-build.result }}
+          PROOF_RESULT: ${{ needs.install-proof-pr.result }}
+        run: |
+          set -euo pipefail
+          if [ "$DOCS_ONLY" = "true" ]; then
+            echo "documentation-only diff: no binaries changed, so the install proof has nothing to install"
+            exit 0
+          fi
+          if [ "$BUILD_RESULT" != "success" ]; then
+            echo "::error::install proof binaries did not build ($BUILD_RESULT); the pull request install proof never ran"
+            exit 1
+          fi
+          if [ "$PROOF_RESULT" != "success" ]; then
+            echo "::error::the install proof failed against this pull request's binaries ($PROOF_RESULT); the same proof gates every release tag"
+            exit 1
+          fi
+          echo "install proof passed against this pull request's binaries"

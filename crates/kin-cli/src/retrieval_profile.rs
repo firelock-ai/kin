@@ -334,9 +334,13 @@ fn cached_under_base(base: Option<&Path>, model_id: &str) -> bool {
     let Some(base) = base else {
         return false;
     };
-    // A usable cache entry has at least one resolved snapshot directory.
-    let snapshots = model_cache_dir(base, model_id).join("snapshots");
-    match std::fs::read_dir(&snapshots) {
+    snapshot_present(&model_cache_dir(base, model_id))
+}
+
+/// Whether a model cache directory holds a usable entry, which is at least one
+/// resolved snapshot directory.
+pub(crate) fn snapshot_present(model_dir: &Path) -> bool {
+    match std::fs::read_dir(model_dir.join("snapshots")) {
         Ok(mut entries) => entries.any(|entry| entry.is_ok()),
         Err(_) => false,
     }
@@ -345,7 +349,7 @@ fn cached_under_base(base: Option<&Path>, model_id: &str) -> bool {
 /// Where `hf-hub` keeps everything it has fetched for `model_id`. Expressed
 /// once so the has-ever-been-fetched and is-usable-now probes cannot drift onto
 /// different layouts.
-fn model_cache_dir(base: &Path, model_id: &str) -> PathBuf {
+pub(crate) fn model_cache_dir(base: &Path, model_id: &str) -> PathBuf {
     base.join("hub")
         .join(format!("models--{}", model_id.replace('/', "--")))
 }

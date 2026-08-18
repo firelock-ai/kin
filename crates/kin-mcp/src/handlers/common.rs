@@ -409,33 +409,37 @@ pub use kin_ranking::entity_ranking::{
 /// lines from a 777-entity repository and the client refused the whole result,
 /// so the caller got neither the chain nor a way to ask for less.
 ///
-/// Sized against the tool-result ceilings agent clients actually apply, which
-/// are counted in tokens; at roughly 3.5 characters per token of JSON-wrapped
-/// source this leaves headroom under a 25k-token cap for the envelope the MCP
-/// path wraps around this payload.
+/// This is now an alias for [`crate::budget::RESPONSE_DEFAULT_MAX_CHARS`], the
+/// one default every retrieval tool is served under, rather than a number of its
+/// own. It had one, 80,000, chosen against the same client ceiling this is
+/// chosen against, and a `trace_data_flow` that came in at 79,278 characters,
+/// inside that budget, was refused by the client anyway. A per-tool budget that
+/// the tool alone believes in is how a bound reports success while the caller
+/// gets a file to read, so there is one number and every retrieval tool answers
+/// under it.
 ///
-/// Defined here rather than beside either walk because BOTH walks serve this one
-/// tool — the generic-store arm in `handlers::entities` and the body-inlining
-/// arm in `kin_cli::commands::trace_data_flow`, which reads these through this
-/// module. Two definitions would let one arm promise a bound the other does not
-/// keep.
-pub const TRACE_DEFAULT_MAX_RESPONSE_CHARS: usize = 80_000;
+/// Defined through this module rather than beside either walk because BOTH walks
+/// serve this one tool - the generic-store arm in `handlers::entities` and the
+/// body-inlining arm in `kin_cli::commands::trace_data_flow`, which reads these
+/// through here. Two definitions would let one arm promise a bound the other
+/// does not keep.
+pub const TRACE_DEFAULT_MAX_RESPONSE_CHARS: usize = crate::budget::RESPONSE_DEFAULT_MAX_CHARS;
 
 /// Floor for a caller-supplied budget. Below this the envelope alone does not
 /// fit, so a smaller number could only be honoured by returning nothing.
-pub const TRACE_MIN_MAX_RESPONSE_CHARS: usize = 2_000;
+pub const TRACE_MIN_MAX_RESPONSE_CHARS: usize = crate::budget::RESPONSE_MIN_MAX_CHARS;
 
 /// Ceiling for a caller-supplied budget. A caller with a larger window may raise
 /// the bound, but not to unbounded: the daemon serving this has other callers,
 /// and a response nothing can read is not worth building.
-pub const TRACE_MAX_MAX_RESPONSE_CHARS: usize = 400_000;
+pub const TRACE_MAX_MAX_RESPONSE_CHARS: usize = crate::budget::RESPONSE_MAX_MAX_CHARS;
 
 /// Characters held back from the budget for the disclosure a cut adds.
 ///
 /// A response cut to exactly its ceiling and then told to explain the cut is
 /// over its ceiling again, by the length of the explanation. Reserving the room
 /// first is what makes the bound hold for the payload that actually ships.
-pub const TRACE_DISCLOSURE_RESERVE_CHARS: usize = 1_500;
+pub const TRACE_DISCLOSURE_RESERVE_CHARS: usize = crate::budget::RESPONSE_DISCLOSURE_RESERVE_CHARS;
 
 /// The budget a trace request asks for, clamped to what this tool will serve.
 pub fn trace_response_budget(requested: Option<usize>) -> usize {
@@ -1048,8 +1052,19 @@ pub struct ReferenceRow {
     /// and it compounds any staleness in the definition's own span. The reference
     /// site is a graph fact, so it is served as one. Empty when the parser
     /// recorded no span for any contributing edge, which is honest absence rather
-    /// than a derived guess.
+    /// than a derived guess -- and `reference_lines_absent` then names which
+    /// absence it is.
     pub reference_lines: Vec<u32>,
+    /// Why this row carries no `reference_lines`, and `None` when it carries
+    /// some.
+    ///
+    /// An empty list on a returned reference is the quiet-partial failure in
+    /// miniature (FIR-2357 item 3): the row proves a caller exists while saying
+    /// nothing about why its site could not be located, so a reader cannot tell
+    /// a parser gap from a bug. The row is still reported, because dropping a
+    /// caller whose site was never recorded would understate blast radius, but
+    /// the reason is stated rather than left to inference.
+    pub reference_lines_absent: Option<ReferenceLinesAbsent>,
     pub signature: Option<String>,
     /// Bounded inline body excerpt of the referencing entity, projected from the
     /// same content-addressed, hash-verified graph body that backs
@@ -1067,6 +1082,47 @@ pub struct ReferenceRow {
     pub resolution: Option<RelationResolution>,
 }
 
+/// Why a reference row carries no site lines.
+///
+/// Each variant is one measured condition, not a label chosen for how it reads.
+/// A consumer that wants to edit every call site needs to know whether the sites
+/// are unknown because the parser recorded none, because the ones recorded
+/// belong to another file, or because the edge lives in a graph this response
+/// has no authority over -- those are three different follow-ups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferenceLinesAbsent {
+    /// No edge behind this row carried a `RelationEvidence::source_span`: the
+    /// relation was recorded without the syntax position that produced it.
+    NoEvidenceSpan,
+    /// Edges carried spans, but every one named a file other than the caller's.
+    /// Reporting them under this row's `file_path` would print lines of one file
+    /// as lines of another, so they are dropped and the drop is declared.
+    SpanOutsideCallerFile,
+    /// A federated cross-repository xref: the resolving edge and its span live in
+    /// the other repository's graph.
+    FederatedXref,
+}
+
+impl ReferenceLinesAbsent {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoEvidenceSpan => "no_evidence_span",
+            Self::SpanOutsideCallerFile => "span_outside_caller_file",
+            Self::FederatedXref => "federated_xref",
+        }
+    }
+}
+
+/// One row per REFERENCING ENTITY that reaches `entity_id` over an allowed
+/// relation kind.
+///
+/// Rows are keyed on the caller's entity id. They were keyed on the caller's
+/// FILE path, which collapsed every caller in one file into a single row that
+/// kept the first caller's id, name and signature, and left `total_upstream`
+/// reporting the number of distinct files: a function with eleven callers across
+/// two files answered "2" with both completeness flags true (FIR-2398). Keying
+/// on the entity also makes this agree with the shared CLI collector
+/// (`kin refs`), which has always counted distinct referencing entities.
 pub fn collect_graph_reference_rows<G: GraphStore>(
     store: &G,
     entity_id: &EntityId,
@@ -1074,7 +1130,12 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
     repository_authority: Option<&RequestRepositoryAuthority>,
 ) -> Result<Vec<ReferenceRow>> {
     let allowed: std::collections::HashSet<_> = relation_kinds.iter().copied().collect();
-    let mut grouped: HashMap<String, ReferenceRow> = HashMap::new();
+    let mut grouped: HashMap<EntityId, ReferenceRow> = HashMap::new();
+    // Spans a row's edges carried that named some other file, counted so an
+    // empty `reference_lines` can say which absence it is instead of collapsing
+    // "the parser recorded nothing" and "what it recorded was unusable here"
+    // into one silent empty list.
+    let mut spans_outside_caller_file: HashMap<EntityId, usize> = HashMap::new();
 
     // One held authority for the whole reference set. This projects a body per
     // REFERENCING entity, so it is the same multi-entity shape the retrieval
@@ -1092,6 +1153,13 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
         if rel.dst != GraphNodeId::Entity(*entity_id) || !allowed.contains(&rel.kind) {
             continue;
         }
+        // A self/recursive edge does not make an entity its own upstream caller.
+        // The shared CLI collector has always excluded it, so counting it here
+        // would leave `kin refs` and `find_references` one apart on every
+        // recursive function.
+        if source_entity_id == *entity_id {
+            continue;
+        }
         let Some(entity) = store
             .get_entity(&source_entity_id)
             .map_err(McpError::graph)?
@@ -1100,7 +1168,6 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
         };
 
         let file_path = entity.file_origin.as_ref().map(|path| path.0.clone());
-        let key = reference_row_key(file_path.as_deref(), &entity.name);
         // A referencing entity the current workspace does not contain is a
         // reference from history, not a caller of this code today, so it is not
         // reported as one. Failing the whole reference set over it -- the shape
@@ -1115,21 +1182,24 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
             Err(error) if is_absent_at_generation(&error) => continue,
             Err(error) => return Err(error),
         };
-        let entry = grouped.entry(key).or_insert_with(|| ReferenceRow {
-            entity_id: Some(source_entity_id.to_string()),
-            name: entity.name.clone(),
-            kind: Some(format!("{:?}", entity.kind)),
-            file_path: file_path.clone(),
-            start_line: entity_presentation_start_line(&entity),
-            reference_lines: Vec::new(),
-            signature: Some(entity.signature.clone()),
-            // Project the caller's bounded body once, where the entity is in
-            // hand, so `find_references` hands back act-on-able code per caller
-            // without a follow-up id→body round-trip.
-            snippet,
-            relation_kinds: Vec::new(),
-            resolution: None,
-        });
+        let entry = grouped
+            .entry(source_entity_id)
+            .or_insert_with(|| ReferenceRow {
+                entity_id: Some(source_entity_id.to_string()),
+                name: entity.name.clone(),
+                kind: Some(format!("{:?}", entity.kind)),
+                file_path: file_path.clone(),
+                start_line: entity_presentation_start_line(&entity),
+                reference_lines: Vec::new(),
+                reference_lines_absent: None,
+                signature: Some(entity.signature.clone()),
+                // Project the caller's bounded body once, where the entity is in
+                // hand, so `find_references` hands back act-on-able code per caller
+                // without a follow-up id→body round-trip.
+                snippet,
+                relation_kinds: Vec::new(),
+                resolution: None,
+            });
         if entry.file_path.is_none() {
             entry.file_path = file_path;
         }
@@ -1139,14 +1209,16 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
         if entry.signature.is_none() {
             entry.signature = Some(entity.signature.clone());
         }
-        // Every edge contributing to this row carries its own site span, so a row
-        // that collapses several call sites reports all of them rather than the
-        // first. Only spans inside the referencing entity's own file are taken: a
-        // cross-file evidence span would be a line number the row's `file_path`
-        // does not explain.
-        entry
-            .reference_lines
-            .extend(relation_reference_lines(&rel, entity.file_origin.as_ref()));
+        // Every edge contributing to this row carries its own site span, so a
+        // caller that references the target several times reports all of its
+        // sites rather than the first. Only spans inside the referencing
+        // entity's own file are taken: a cross-file evidence span would be a
+        // line number the row's `file_path` does not explain.
+        let tally = relation_reference_lines(&rel, entity.file_origin.as_ref());
+        entry.reference_lines.extend(tally.lines);
+        *spans_outside_caller_file
+            .entry(source_entity_id)
+            .or_default() += tally.outside_caller_file;
         push_reference_kind(&mut entry.relation_kinds, rel.kind);
         let resolution = RelationResolution::of(&rel);
         entry.resolution = Some(match entry.resolution {
@@ -1155,13 +1227,34 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
         });
     }
 
-    let mut rows = grouped.into_values().collect::<Vec<_>>();
-    for row in &mut rows {
+    let mut rows = Vec::with_capacity(grouped.len());
+    for (source_entity_id, mut row) in grouped {
         row.relation_kinds.sort_by_key(relation_kind_rank);
         row.reference_lines.sort_unstable();
         row.reference_lines.dedup();
+        row.reference_lines_absent = if !row.reference_lines.is_empty() {
+            None
+        } else if spans_outside_caller_file
+            .get(&source_entity_id)
+            .is_some_and(|dropped| *dropped > 0)
+        {
+            Some(ReferenceLinesAbsent::SpanOutsideCallerFile)
+        } else {
+            Some(ReferenceLinesAbsent::NoEvidenceSpan)
+        };
+        rows.push(row);
     }
     Ok(rows)
+}
+
+/// What one relation's evidence says about where its reference sites are.
+struct RelationSpanTally {
+    /// 1-based site lines inside the referencing entity's own file.
+    lines: Vec<u32>,
+    /// Spans that named a different file and were therefore not reportable under
+    /// this row. Counted rather than discarded so an empty `lines` can be
+    /// explained.
+    outside_caller_file: usize,
 }
 
 /// 1-based reference-site lines a single relation records, restricted to the
@@ -1172,23 +1265,28 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
 /// rather than something a consumer has to reconstruct. Evidence carrying no span
 /// contributes nothing; a span in some other file is dropped because the row
 /// reports one `file_path` and a line from a different file would read as a line
-/// in that one.
+/// in that one. Both kinds of miss are counted, because an empty result that
+/// cannot say why is the defect this reports around.
 fn relation_reference_lines(
     rel: &kin_model::relation::Relation,
     caller_file: Option<&kin_model::ids::FilePathId>,
-) -> Vec<u32> {
-    rel.evidence
+) -> RelationSpanTally {
+    let mut tally = RelationSpanTally {
+        lines: Vec::new(),
+        outside_caller_file: 0,
+    };
+    for span in rel
+        .evidence
         .iter()
         .filter_map(|evidence| evidence.source_span.as_ref())
-        .filter(|span| caller_file.is_none_or(|file| &span.file == file))
-        .map(|span| presentation_line(span.start_line))
-        .collect()
-}
-
-pub fn reference_row_key(file_path: Option<&str>, name: &str) -> String {
-    file_path
-        .map(|path| path.to_string())
-        .unwrap_or_else(|| format!("name:{name}"))
+    {
+        if caller_file.is_none_or(|file| &span.file == file) {
+            tally.lines.push(presentation_line(span.start_line));
+        } else {
+            tally.outside_caller_file += 1;
+        }
+    }
+    tally
 }
 
 pub const MCP_SOURCE_MAX_LINES: usize = 40;
@@ -2518,16 +2616,21 @@ pub fn entity_response_json<G: GraphStore>(
 /// `entry.content` is a token-accounting stub, and once it stopped being a body
 /// fallback the parameter only obliged callers to build a value this function
 /// discards.
+///
+/// Takes no `compact` flag either. Compact mode used to drop the focal body
+/// while still paying for the read that produced it, which left the one thing
+/// the pack is for out of the cheaper mode: a caller asking for a bounded pack
+/// spent a whole call learning it had to ask again. Compact now bounds the
+/// dependency rows, and the focal body it serves is already capped at
+/// [`MCP_SOURCE_MAX_LINES`]/[`MCP_SOURCE_MAX_CHARS`].
 pub fn focal_context_json<G: GraphStore>(
     store: &G,
     entity: &Entity,
-    compact: bool,
     repository_authority: Option<&RequestRepositoryAuthority>,
 ) -> Result<serde_json::Value> {
     focal_context_json_held(
         &HeldSourceAuthority::new(store, repository_authority),
         entity,
-        compact,
     )
 }
 
@@ -2537,7 +2640,6 @@ pub fn focal_context_json<G: GraphStore>(
 pub fn focal_context_json_held<G: GraphStore>(
     held: &HeldSourceAuthority<'_, G>,
     entity: &Entity,
-    compact: bool,
 ) -> Result<serde_json::Value> {
     let start_line = entity_presentation_start_line(entity);
     let end_line = entity_presentation_end_line(entity);
@@ -2562,13 +2664,11 @@ pub fn focal_context_json_held<G: GraphStore>(
         "source": source,
     });
 
-    if !compact {
-        match source_excerpt.as_ref() {
-            Some(source) => obj["body"] = serde_json::json!(source.body),
-            None => {
-                obj["body"] = serde_json::Value::Null;
-                obj["body_unavailable"] = serde_json::json!(entity_body_gap_reason(entity));
-            }
+    match source_excerpt.as_ref() {
+        Some(source) => obj["body"] = serde_json::json!(source.body),
+        None => {
+            obj["body"] = serde_json::Value::Null;
+            obj["body_unavailable"] = serde_json::json!(entity_body_gap_reason(entity));
         }
     }
     if let Some(source) = source_excerpt {
