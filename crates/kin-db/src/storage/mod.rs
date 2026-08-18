@@ -2,6 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 pub mod authority;
+pub mod authority_frame;
 pub mod backend;
 pub(crate) mod change_validation;
 pub mod delta;
@@ -23,6 +24,7 @@ pub use authority::{
     AuthorityCommitDecision, AuthorityPublication, AuthorityReadLease, DurableAuthorityPersistence,
     PersistOutcome, VersionedAuthorityState,
 };
+pub use authority_frame::AuthorityFrame;
 pub use backend::{
     load_recovered_snapshot, AuthorityPayloadStats, Generation, LocalFileBackend,
     LocalNamespaceIdentityFault, LocalNamespaceProbe, PersistedDelta,

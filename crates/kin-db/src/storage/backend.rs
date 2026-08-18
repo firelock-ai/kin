@@ -1889,10 +1889,28 @@ pub struct RecoveredSnapshot {
     /// SHA-256 recomputed here over the exact base snapshot bytes that were
     /// deserialized, never copied from a backend's own claim about them.
     pub snapshot_sha256: String,
-    /// Backend claim that the base snapshot already passed complete open-time
-    /// validation. Cleared once any delta is applied, because the recovered
-    /// state is then no longer the bytes the claim names.
+    /// Backend claim that the recovered state already passed complete
+    /// open-time validation. Cleared once an incremental graph delta is
+    /// applied, because the recovered state is then no longer the bytes the
+    /// claim names. Kept when authority frames were applied and the claim
+    /// names exactly that base and that acknowledged chain.
     pub history_validation: Option<HistoryValidationProof>,
+    /// Digest of the acknowledged authority-frame chain that was applied over
+    /// the base, `None` when no frame was applied. Together with
+    /// `snapshot_sha256` this names the exact durable bytes the recovered
+    /// state was reconstructed from.
+    pub journal_sha256: Option<String>,
+}
+
+impl RecoveredSnapshot {
+    /// The digest that names the exact durable authority this state came
+    /// from: the base digest for journal-free authority, the journal digest
+    /// once frames were applied over the base.
+    pub fn authority_sha256(&self) -> &str {
+        self.journal_sha256
+            .as_deref()
+            .unwrap_or(&self.snapshot_sha256)
+    }
 }
 
 pub(crate) struct RecoveredRepositoryAuthority {
@@ -1947,7 +1965,33 @@ fn load_recovered_snapshot_inner<B: StorageBackend + ?Sized>(
             raw_deltas.len()
         )));
     };
+    recover_snapshot_from_state(repo_id, &authority, &raw_deltas, expected_validator_version)
+        .map(Some)
+}
 
+/// Which decoder owns the acknowledged journal of one recovery.
+///
+/// A repository-authority base is extended only by authority frames, and a
+/// plain graph base only by incremental graph deltas. The base decides, and a
+/// journal entry of the other kind refuses by name rather than being decoded
+/// by the wrong reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JournalKind {
+    GraphDeltas,
+    AuthorityFrames,
+}
+
+/// Reconstruct one authority head from a coherent `(authority, journal)` view.
+///
+/// This is the shared recovery core behind [`load_recovered_snapshot`] and the
+/// local freeze path: both read the state under a lock and hand it here, so a
+/// frozen authority is put back together by exactly the code an open uses.
+pub(crate) fn recover_snapshot_from_state(
+    repo_id: &str,
+    authority: &SnapshotAuthority,
+    raw_deltas: &[PersistedDelta],
+    expected_validator_version: Option<u32>,
+) -> Result<RecoveredRepositoryAuthority, KinDbError> {
     if authority.snapshot_generation > authority.head_generation {
         return Err(KinDbError::StorageError(format!(
             "repo {repo_id} snapshot base generation {} exceeds acknowledged head {}",
@@ -1958,23 +2002,36 @@ fn load_recovered_snapshot_inner<B: StorageBackend + ?Sized>(
     let snapshot_payload_bytes = authority.snapshot_bytes.len();
     let snapshot_sha256 = hex::encode(Sha256::digest(&authority.snapshot_bytes));
     let deltas_seen = raw_deltas.len();
-    let reused_complete_validation = expected_validator_version.is_some_and(|expected| {
-        authority.snapshot_generation == authority.head_generation
-            && raw_deltas.is_empty()
-            && authority.history_validation.as_ref().is_some_and(|proof| {
+
+    // Journal-free authority: the proof, when it verifies, names exactly the
+    // base bytes, and the base is the head.
+    if authority.snapshot_generation == authority.head_generation {
+        let reused_complete_validation = expected_validator_version.is_some_and(|expected| {
+            authority.history_validation.as_ref().is_some_and(|proof| {
                 proof.validator_version == expected
                     && proof.repository_id == repo_id
                     && proof.generation == authority.head_generation
                     && proof.snapshot_sha256 == snapshot_sha256
+                    && proof.journal_sha256.is_none()
             })
-    });
-    let mut snapshot = if reused_complete_validation {
-        let _span = tracing::info_span!("kindb.snapshot.reuse_exact_complete_validation").entered();
-        GraphSnapshot::from_bytes_reusing_exact_validation(&authority.snapshot_bytes)?
-    } else {
-        GraphSnapshot::from_bytes(&authority.snapshot_bytes)?
-    };
-    if authority.snapshot_generation == authority.head_generation {
+        });
+        for (bytes, generation) in raw_deltas {
+            if *generation > authority.head_generation {
+                warn_unacknowledged_journal_entry(
+                    repo_id,
+                    bytes,
+                    *generation,
+                    authority.head_generation,
+                );
+            }
+        }
+        let snapshot = if reused_complete_validation {
+            let _span =
+                tracing::info_span!("kindb.snapshot.reuse_exact_complete_validation").entered();
+            GraphSnapshot::from_bytes_reusing_exact_validation(&authority.snapshot_bytes)?
+        } else {
+            GraphSnapshot::from_bytes(&authority.snapshot_bytes)?
+        };
         let payload_stats = AuthorityPayloadStats::from_recovery(
             authority.snapshot_generation,
             authority.head_generation,
@@ -1982,28 +2039,32 @@ fn load_recovered_snapshot_inner<B: StorageBackend + ?Sized>(
             0,
             0,
         )?;
-        return Ok(Some(RecoveredRepositoryAuthority {
+        return Ok(RecoveredRepositoryAuthority {
             recovered: RecoveredSnapshot {
                 snapshot,
                 generation: authority.head_generation,
                 deltas_applied: 0,
                 deltas_seen,
                 snapshot_sha256,
-                history_validation: authority.history_validation,
+                history_validation: authority.history_validation.clone(),
+                journal_sha256: None,
             },
             reused_complete_validation,
             payload_stats,
-        }));
+        });
     }
+
+    // Walk the journal once: order, gaps, and the past-head skip are decided
+    // on generations alone, before any entry is decoded, and every acknowledged
+    // entry is classified by its magic so the wrong decoder never sees it.
+    let mut acknowledged: Vec<(&[u8], Generation)> = Vec::new();
     let mut expected_generation = checked_next_generation(
         authority.snapshot_generation,
         &format!("repo {repo_id} recovery"),
     )?;
-    let mut recovered_generation = authority.snapshot_generation;
-    let mut applied = 0usize;
-    let mut acknowledged_delta_bytes = 0u64;
     let mut previous_generation = None;
     for (bytes, generation) in raw_deltas {
+        let generation = *generation;
         if generation == GENERATION_INIT {
             return Err(KinDbError::StorageError(format!(
                 "repo {repo_id} delta journal contains reserved generation 0"
@@ -2018,9 +2079,15 @@ fn load_recovered_snapshot_inner<B: StorageBackend + ?Sized>(
         previous_generation = Some(generation);
 
         if generation > authority.head_generation {
-            // A delta staged before an authority-commit crash is not durable
-            // authority. It may be overwritten by a retry at the same
+            // A delta or frame staged before an authority-commit crash is not
+            // durable authority. It may be overwritten by a retry at the same
             // generation and must never be attached speculatively.
+            warn_unacknowledged_journal_entry(
+                repo_id,
+                bytes,
+                generation,
+                authority.head_generation,
+            );
             continue;
         }
         if generation != expected_generation {
@@ -2028,15 +2095,39 @@ fn load_recovered_snapshot_inner<B: StorageBackend + ?Sized>(
                 "repo {repo_id} delta chain is incomplete: expected generation {expected_generation}, found {generation}"
             )));
         }
-        let delta = crate::storage::delta::GraphSnapshotDelta::from_bytes(&bytes)?;
-        let expected_base = generation - 1;
-        if delta.base_generation != expected_base {
-            return Err(KinDbError::StorageError(format!(
-                "repo {repo_id} delta generation {generation} declares base {}, expected {expected_base}",
-                delta.base_generation
-            )));
+        acknowledged.push((bytes.as_slice(), generation));
+        if generation < authority.head_generation {
+            expected_generation =
+                checked_next_generation(generation, &format!("repo {repo_id} recovery"))?;
         }
-        crate::storage::delta::apply_graph_delta(&mut snapshot, &delta)?;
+    }
+    let recovered_generation = acknowledged
+        .last()
+        .map_or(authority.snapshot_generation, |(_, generation)| *generation);
+    if recovered_generation != authority.head_generation {
+        return Err(KinDbError::StorageError(format!(
+            "repo {repo_id} delta chain ended at generation {recovered_generation}, acknowledged head is {}",
+            authority.head_generation
+        )));
+    }
+
+    let kind = if acknowledged
+        .iter()
+        .all(|(bytes, _)| crate::storage::authority_frame::AuthorityFrame::is_frame_bytes(bytes))
+    {
+        JournalKind::AuthorityFrames
+    } else if acknowledged.iter().all(|(bytes, _)| {
+        bytes.len() >= 4 && bytes[0..4] == crate::storage::delta::GraphSnapshotDelta::MAGIC
+    }) {
+        JournalKind::GraphDeltas
+    } else {
+        return Err(KinDbError::StorageError(format!(
+            "repo {repo_id} acknowledged journal mixes authority frames with incremental graph deltas; recovery is fail-closed"
+        )));
+    };
+
+    let mut acknowledged_delta_bytes = 0u64;
+    for (bytes, generation) in &acknowledged {
         let delta_bytes = u64::try_from(bytes.len()).map_err(|_| {
             KinDbError::StorageError(format!(
                 "repo {repo_id} acknowledged delta generation {generation} byte length does not fit u64"
@@ -2049,46 +2140,138 @@ fn load_recovered_snapshot_inner<B: StorageBackend + ?Sized>(
                     "repo {repo_id} acknowledged delta payload byte count overflows u64"
                 ))
             })?;
-        applied = applied.checked_add(1).ok_or_else(|| {
-            KinDbError::StorageError(format!(
-                "repo {repo_id} acknowledged delta count overflows usize"
-            ))
-        })?;
-        recovered_generation = generation;
-        if generation < authority.head_generation {
-            expected_generation =
-                checked_next_generation(generation, &format!("repo {repo_id} recovery"))?;
-        }
     }
-
-    if recovered_generation != authority.head_generation {
-        return Err(KinDbError::StorageError(format!(
-            "repo {repo_id} delta chain ended at generation {recovered_generation}, acknowledged head is {}",
-            authority.head_generation
-        )));
-    }
-
     let payload_stats = AuthorityPayloadStats::from_recovery(
         authority.snapshot_generation,
         authority.head_generation,
         snapshot_payload_bytes,
-        applied,
+        acknowledged.len(),
         acknowledged_delta_bytes,
     )?;
-    Ok(Some(RecoveredRepositoryAuthority {
-        recovered: RecoveredSnapshot {
-            snapshot,
-            generation: authority.head_generation,
-            deltas_applied: applied,
-            deltas_seen,
-            snapshot_sha256,
-            // The recovered state is the base snapshot plus a delta chain, so no
-            // claim about the base bytes describes it any more.
-            history_validation: None,
-        },
-        reused_complete_validation: false,
-        payload_stats,
-    }))
+
+    match kind {
+        JournalKind::GraphDeltas => {
+            let mut snapshot = GraphSnapshot::from_bytes(&authority.snapshot_bytes)?;
+            if snapshot.repository_authority.is_some() {
+                return Err(KinDbError::StorageError(format!(
+                    "repo {repo_id} repository authority is followed by an incremental graph delta at generation {}; repository authority advances only through full snapshots and authority frames",
+                    acknowledged[0].1
+                )));
+            }
+            for (bytes, generation) in &acknowledged {
+                let delta = crate::storage::delta::GraphSnapshotDelta::from_bytes(bytes)?;
+                let expected_base = generation - 1;
+                if delta.base_generation != expected_base {
+                    return Err(KinDbError::StorageError(format!(
+                        "repo {repo_id} delta generation {generation} declares base {}, expected {expected_base}",
+                        delta.base_generation
+                    )));
+                }
+                crate::storage::delta::apply_graph_delta(&mut snapshot, &delta)?;
+            }
+            Ok(RecoveredRepositoryAuthority {
+                recovered: RecoveredSnapshot {
+                    snapshot,
+                    generation: authority.head_generation,
+                    deltas_applied: acknowledged.len(),
+                    deltas_seen,
+                    snapshot_sha256,
+                    // The recovered state is the base snapshot plus a delta
+                    // chain, so no claim about the base bytes describes it.
+                    history_validation: None,
+                    journal_sha256: None,
+                },
+                reused_complete_validation: false,
+                payload_stats,
+            })
+        }
+        JournalKind::AuthorityFrames => {
+            let frame_digests: Vec<String> = acknowledged
+                .iter()
+                .map(|(bytes, _)| hex::encode(Sha256::digest(bytes)))
+                .collect();
+            let journal_sha256 = crate::storage::authority_frame::journal_sha256(
+                &snapshot_sha256,
+                frame_digests.iter(),
+            )?;
+            let reused_complete_validation = expected_validator_version.is_some_and(|expected| {
+                authority.history_validation.as_ref().is_some_and(|proof| {
+                    proof.validator_version == expected
+                        && proof.repository_id == repo_id
+                        && proof.generation == authority.head_generation
+                        && proof.snapshot_sha256 == snapshot_sha256
+                        && proof.journal_sha256.as_deref() == Some(journal_sha256.as_str())
+                })
+            });
+            // The base is decoded checksum-verified without the semantic
+            // admission pass in both arms. With a proof, that pass was already
+            // reached about exactly these bytes. Without one, the caller
+            // validates the reconstructed head, and every base change and every
+            // envelope entry the frames carry forward is inside that head, so a
+            // separate pass over the base would prove nothing more.
+            let mut snapshot = {
+                let _span = tracing::info_span!("kindb.snapshot.decode_journal_base").entered();
+                GraphSnapshot::from_bytes_reusing_exact_validation(&authority.snapshot_bytes)?
+            };
+            if snapshot.repository_authority.is_none() {
+                return Err(KinDbError::StorageError(format!(
+                    "repo {repo_id} graph snapshot is followed by an authority frame at generation {}; only repository authority advances through authority frames",
+                    acknowledged[0].1
+                )));
+            }
+            for (bytes, generation) in &acknowledged {
+                let frame = crate::storage::authority_frame::AuthorityFrame::from_bytes(bytes)
+                    .map_err(|error| {
+                        KinDbError::StorageError(format!(
+                            "repo {repo_id} authority frame at generation {generation} is unreadable: {error}"
+                        ))
+                    })?;
+                frame.apply(&mut snapshot).map_err(|error| {
+                    KinDbError::StorageError(format!(
+                        "repo {repo_id} authority frame at generation {generation} does not apply: {error}"
+                    ))
+                })?;
+            }
+            if !reused_complete_validation {
+                let _span = tracing::info_span!("kindb.snapshot.validate_journal_head").entered();
+                snapshot.validate_storage_admission()?;
+            }
+            Ok(RecoveredRepositoryAuthority {
+                recovered: RecoveredSnapshot {
+                    snapshot,
+                    generation: authority.head_generation,
+                    deltas_applied: acknowledged.len(),
+                    deltas_seen,
+                    snapshot_sha256,
+                    history_validation: reused_complete_validation
+                        .then(|| authority.history_validation.clone())
+                        .flatten(),
+                    journal_sha256: Some(journal_sha256),
+                },
+                reused_complete_validation,
+                payload_stats,
+            })
+        }
+    }
+}
+
+fn warn_unacknowledged_journal_entry(
+    repo_id: &str,
+    bytes: &[u8],
+    generation: Generation,
+    head_generation: Generation,
+) {
+    let kind = if crate::storage::authority_frame::AuthorityFrame::is_frame_bytes(bytes) {
+        "authority frame"
+    } else {
+        "incremental delta"
+    };
+    tracing::warn!(
+        repo_id,
+        generation,
+        head_generation,
+        "ignoring an unacknowledged {kind} staged past the authority head; the writer that staged it did not commit, and the next writer replaces or discards it"
+    );
 }
 
 /// Pluggable storage backend for graph snapshots and overlay state.
@@ -2155,6 +2338,63 @@ pub trait StorageBackend: Send + Sync {
         validator_version: u32,
     ) -> Result<bool, KinDbError> {
         let _ = (repo_id, generation, snapshot_sha256, validator_version);
+        Ok(false)
+    }
+
+    /// Whether this backend appends repository-authority frames durably and
+    /// with compare-and-swap semantics. Backends must opt in; callers otherwise
+    /// persist every authority successor as a full snapshot.
+    fn supports_authority_frames(&self) -> bool {
+        false
+    }
+
+    /// Append one authority frame as the successor of the acknowledged head.
+    ///
+    /// `frame` is the serialized [`AuthorityFrame`](crate::storage::AuthorityFrame)
+    /// bytes. `expected` is the cursor of the head the frame extends; a backend
+    /// refuses when its head has moved. `history_validator_version` is `Some`
+    /// only when the caller has just validated the exact successor the frame
+    /// reconstructs, and a backend with a durable place for that record binds it
+    /// to the resulting head, base plus acknowledged chain.
+    ///
+    /// The default refuses; a caller then persists a full snapshot instead.
+    fn save_authority_frame(
+        &self,
+        repo_id: &str,
+        frame: &[u8],
+        expected: SnapshotCursor,
+        history_validator_version: Option<u32>,
+    ) -> SnapshotSaveOutcome {
+        let _ = (frame, expected, history_validator_version);
+        SnapshotSaveOutcome::NotCommitted(KinDbError::StorageError(format!(
+            "repo {repo_id}: authority frames are not supported by this backend"
+        )))
+    }
+
+    /// Bind a validation record to a journal head the repository already
+    /// holds, without rewriting anything.
+    ///
+    /// The journal counterpart of [`record_history_validation`](Self::record_history_validation):
+    /// the backend must verify that its durable head is exactly `head_generation`,
+    /// that its base digests to `snapshot_sha256`, and that its acknowledged
+    /// authority-frame chain digests to `journal_sha256`, before binding.
+    ///
+    /// `Ok(false)` means the backend has no durable place for the record.
+    fn record_journal_history_validation(
+        &self,
+        repo_id: &str,
+        head_generation: Generation,
+        snapshot_sha256: &str,
+        journal_sha256: &str,
+        validator_version: u32,
+    ) -> Result<bool, KinDbError> {
+        let _ = (
+            repo_id,
+            head_generation,
+            snapshot_sha256,
+            journal_sha256,
+            validator_version,
+        );
         Ok(false)
     }
 
@@ -2519,6 +2759,9 @@ impl<B: StorageBackend + ?Sized> VerifiedSourceBlobBatch for DefaultVerifiedSour
 /// ```text
 /// {base_path}/{repo_id}/authority.json      — atomic base/head authority
 /// {base_path}/{repo_id}/snapshots/GEN.kndb  — immutable snapshot versions
+/// {base_path}/{repo_id}/deltas/GEN.kndd     — acknowledged journal entries: incremental
+///                                             graph deltas (KNDD) for a plain graph, or
+///                                             authority frames (KNAF) for repository authority
 /// {base_path}/{repo_id}/source-blobs/sha256/HH/HASH — immutable exact source bytes
 /// {base_path}/{repo_id}/overlays/{session_id}.bin — overlay state
 /// {base_path}/{repo_id}/prepared/{workspace_id}.kpqg — prepared query graph
@@ -3348,12 +3591,19 @@ struct LocalRepositoryLock {
 pub(crate) struct LocalAuthorityFreezeLock {
     repo_id: String,
     authority: SnapshotAuthority,
+    /// Acknowledged authority frames between the snapshot base and the head,
+    /// read and digest-verified under the same lock hold as `authority`.
+    frames: Vec<PersistedDelta>,
     lock: LocalRepositoryLock,
 }
 
 impl LocalAuthorityFreezeLock {
     pub(crate) fn authority(&self) -> &SnapshotAuthority {
         &self.authority
+    }
+
+    pub(crate) fn frames(&self) -> &[PersistedDelta] {
+        &self.frames
     }
 
     fn require_repository(&self, repo_id: &str) -> Result<(), KinDbError> {
@@ -3372,7 +3622,18 @@ impl LocalAuthorityFreezeLock {
     }
 }
 
-const LOCAL_AUTHORITY_VERSION: u32 = 3;
+pub(crate) const LOCAL_AUTHORITY_VERSION: u32 = 3;
+
+/// Record version while the acknowledged journal consists of repository
+/// authority frames rather than incremental graph deltas.
+///
+/// A record moves to this value on the first frame append and back to
+/// [`LOCAL_AUTHORITY_VERSION`] when a full snapshot promotion empties the
+/// journal. Readers that predate authority frames refuse this value at the
+/// record, before decoding any snapshot, so they can neither misread a frame
+/// nor serve the stale base as the head; and a compacted store is readable by
+/// them again.
+pub(crate) const LOCAL_AUTHORITY_FRAME_JOURNAL_VERSION: u32 = 4;
 
 /// Durable record that one exact snapshot already passed complete open-time
 /// validation.
@@ -3392,6 +3653,16 @@ pub struct HistoryValidationProof {
     pub repository_id: String,
     pub generation: Generation,
     pub snapshot_sha256: String,
+    /// Digest of the acknowledged authority-frame chain the proof also
+    /// stands for, computed by [`journal_sha256`] over the base digest and
+    /// every acknowledged frame digest in generation order.
+    ///
+    /// `None` names journal-free authority, which is every record written
+    /// before frames existed and every record a full snapshot promotion
+    /// writes. A proof naming a journal head is valid only while the record's
+    /// acknowledged chain still digests to this value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_sha256: Option<String>,
 }
 
 /// One durable prepared query-graph artifact for a workspace.
@@ -5256,18 +5527,68 @@ impl LocalFileBackend {
                     "repo {repo_id} has no existing local snapshot authority to freeze"
                 ))
             })?;
-        if authority.snapshot_generation != authority.head_generation {
-            return Err(KinDbError::StorageError(format!(
-                "repo {repo_id} has incremental journal authority at generation {} above snapshot {}; repository freeze requires one complete full snapshot",
-                authority.head_generation, authority.snapshot_generation
-            )));
-        }
+        let frames = if authority.snapshot_generation != authority.head_generation {
+            let record = self
+                .read_authority_record_unlocked(&lock.namespace)?
+                .ok_or_else(|| {
+                    KinDbError::StorageError(format!(
+                        "repo {repo_id} has no existing local snapshot authority to freeze"
+                    ))
+                })?;
+            if record.version != LOCAL_AUTHORITY_FRAME_JOURNAL_VERSION {
+                return Err(KinDbError::StorageError(format!(
+                    "repo {repo_id} has incremental journal authority at generation {} above snapshot {}; repository freeze requires one complete full snapshot or an authority frame chain",
+                    authority.head_generation, authority.snapshot_generation
+                )));
+            }
+            self.capture_delta_identities_unlocked(
+                &lock.namespace,
+                &record.acknowledged_deltas,
+                true,
+            )?
+        } else {
+            Vec::new()
+        };
         self.confirm_existing_lock_visible(&lock.namespace)?;
         Ok(LocalAuthorityFreezeLock {
             repo_id: repo_id.to_string(),
             authority,
+            frames,
             lock,
         })
+    }
+
+    /// Remove the frames a full snapshot promotion retired, under a lock the
+    /// caller already holds.
+    ///
+    /// This is the frozen counterpart of [`StorageBackend::clear_deltas`]: a
+    /// freezing publication keeps the repository lock after its commit, so it
+    /// cannot take it again, and the retired bytes are cleaned through the
+    /// retained capability instead. Best effort by construction; a leftover
+    /// is quarantined and finalized on the next open.
+    pub(crate) fn clear_retired_deltas_while_frozen(
+        &self,
+        freeze: &LocalAuthorityFreezeLock,
+    ) -> Result<(), KinDbError> {
+        let namespace = freeze.namespace();
+        let repo_id = &namespace.repo_id;
+        let Some(record) = self.read_authority_record_unlocked(namespace)? else {
+            return Ok(());
+        };
+        if record.snapshot_generation != record.head_generation {
+            return Err(KinDbError::StorageError(format!(
+                "refusing to clear authoritative deltas for repo {repo_id}: snapshot generation {}, head {}",
+                record.snapshot_generation, record.head_generation
+            )));
+        }
+        let captured =
+            self.capture_delta_identities_unlocked(namespace, &record.retired_deltas, false)?;
+        if !self.clear_exact_captured_deltas_unlocked(namespace, &captured) {
+            return Err(KinDbError::StorageError(format!(
+                "repo {repo_id} delta cleanup left residual journal artifacts; recovery remains fail-closed"
+            )));
+        }
+        Ok(())
     }
 
     pub(crate) fn load_source_blob_bounded_while_frozen(
@@ -5736,6 +6057,67 @@ impl LocalFileBackend {
         Ok(())
     }
 
+    /// Remove authority frames staged past the acknowledged head.
+    ///
+    /// A frame append installs its file and then its record under one hold of
+    /// the repository lock, so while this writer holds that lock no other
+    /// writer can be between the two steps: a frame past head is the leftover
+    /// of a writer that died before its record rename, and it was never
+    /// authority. Recovery already ignores it and a frame append at the same
+    /// generation replaces it; a full promotion cannot leave it behind, because
+    /// after promotion its generation would sit at or below the new base and
+    /// read as an unbound residual, so it is discarded here first. Incremental
+    /// graph deltas past head keep their existing refusal: their writers stage
+    /// outside this lock discipline.
+    fn discard_stale_authority_frames_unlocked(
+        &self,
+        namespace: &LocalRepositoryCapability,
+        record: Option<&LocalAuthorityRecord>,
+    ) -> Result<(), KinDbError> {
+        let repo_id = &namespace.repo_id;
+        let head_generation = record.map_or(GENERATION_INIT, |record| record.head_generation);
+        let Some(deltas) = namespace.surface(Self::deltas_surface_name(), false)? else {
+            return Ok(());
+        };
+        let staged = self.load_deltas_since_unlocked(namespace, head_generation)?;
+        let mut discarded = false;
+        for (bytes, generation) in staged {
+            if !crate::storage::authority_frame::AuthorityFrame::is_frame_bytes(&bytes) {
+                continue;
+            }
+            let leaf = Self::delta_leaf(generation);
+            deltas.directory.remove_file(&leaf).map_err(|error| {
+                KinDbError::StorageError(format!(
+                    "failed to discard the stale authority frame {} staged past head {head_generation}: {error}",
+                    deltas.display(&leaf).display()
+                ))
+            })?;
+            tracing::warn!(
+                repo_id,
+                generation,
+                head_generation,
+                "discarded an authority frame staged past the authority head before full promotion; the writer that staged it did not commit"
+            );
+            discarded = true;
+        }
+        if discarded {
+            deltas.sync(&Self::delta_leaf(head_generation))?;
+        }
+        namespace.confirm_surface_visible(&deltas)?;
+        Ok(())
+    }
+
+    /// Digest naming the record's head: its base plus its acknowledged chain.
+    fn record_journal_sha256(record: &LocalAuthorityRecord) -> Result<String, KinDbError> {
+        crate::storage::authority_frame::journal_sha256(
+            &record.snapshot_sha256,
+            record
+                .acknowledged_deltas
+                .iter()
+                .map(|identity| identity.sha256.as_str()),
+        )
+    }
+
     fn reject_unbound_staged_deltas_unlocked(
         &self,
         namespace: &LocalRepositoryCapability,
@@ -5954,9 +6336,20 @@ impl LocalFileBackend {
                 path.display()
             ))
         })?;
-        if record.version != LOCAL_AUTHORITY_VERSION {
+        if record.version != LOCAL_AUTHORITY_VERSION
+            && record.version != LOCAL_AUTHORITY_FRAME_JOURNAL_VERSION
+        {
             return Err(KinDbError::StorageError(format!(
                 "unsupported local authority version {} in {}",
+                record.version,
+                path.display()
+            )));
+        }
+        if record.version == LOCAL_AUTHORITY_FRAME_JOURNAL_VERSION
+            && record.acknowledged_deltas.is_empty()
+        {
+            return Err(KinDbError::StorageError(format!(
+                "local authority version {} in {} acknowledges no authority frame",
                 record.version,
                 path.display()
             )));
@@ -6325,6 +6718,7 @@ impl LocalFileBackend {
                 return Ok(record.head_generation);
             }
         }
+        self.discard_stale_authority_frames_unlocked(namespace, current_record.as_ref())?;
         self.reject_unbound_staged_deltas_unlocked(namespace, current_record.as_ref())?;
         if current_gen != expected_gen {
             return Err(KinDbError::StorageError(format!(
@@ -6396,6 +6790,7 @@ impl LocalFileBackend {
                     repository_id: repo_id.clone(),
                     generation: new_gen,
                     snapshot_sha256: requested_digest,
+                    journal_sha256: None,
                 }
             }),
         };
@@ -6438,6 +6833,138 @@ impl LocalFileBackend {
         )
     }
 
+    /// Append one authority frame while the caller holds this repository's
+    /// exclusive local authority lock.
+    ///
+    /// The frame file is installed and verified first and the record rename
+    /// acknowledges it second, which is the same commit discipline a full
+    /// snapshot promotion follows. The base snapshot bytes are not re-read
+    /// here: installed files are immutable, the record binds the base by
+    /// digest, and every open verifies that binding before it trusts the base.
+    fn save_authority_frame_unlocked(
+        &self,
+        namespace: &LocalRepositoryCapability,
+        frame_data: &[u8],
+        expected_gen: Generation,
+        history_validator_version: Option<u32>,
+    ) -> Result<Generation, KinDbError> {
+        let repo_id = &namespace.repo_id;
+        let Some(mut record) = self.read_authority_record_unlocked(namespace)? else {
+            return Err(KinDbError::StorageError(format!(
+                "repo {repo_id} has no atomic local snapshot authority; persist a full snapshot before authority frames"
+            )));
+        };
+        if record.version != LOCAL_AUTHORITY_FRAME_JOURNAL_VERSION
+            && !record.acknowledged_deltas.is_empty()
+        {
+            return Err(KinDbError::StorageError(format!(
+                "repo {repo_id} journal carries incremental graph deltas; authority frames cannot extend it"
+            )));
+        }
+        let current_gen = record.head_generation;
+        let requested_digest = Self::snapshot_digest(frame_data);
+        if expected_gen.checked_add(1) == Some(current_gen)
+            && record.acknowledged_deltas.last().is_some_and(|identity| {
+                identity.generation == current_gen && identity.sha256 == requested_digest
+            })
+        {
+            let deltas = namespace
+                .surface(Self::deltas_surface_name(), false)
+                .map_err(|error| {
+                    KinDbError::SnapshotPersistenceIndeterminate(format!(
+                        "repo {repo_id} exact authority frame retry refers to committed generation {current_gen}, but its retained delta surface could not be confirmed: {error}"
+                    ))
+                })?
+                .ok_or_else(|| {
+                    KinDbError::SnapshotPersistenceIndeterminate(format!(
+                        "repo {repo_id} acknowledged committed authority frame {current_gen} but its retained surface is missing"
+                    ))
+                })?;
+            let installed = deltas
+                .read_regular(
+                    &Self::delta_leaf(current_gen),
+                    "idempotent local authority frame retry",
+                )
+                .map_err(|error| {
+                    KinDbError::SnapshotPersistenceIndeterminate(format!(
+                        "repo {repo_id} committed authority frame {current_gen} could not be verified for an exact retry: {error}"
+                    ))
+                })?;
+            if installed == frame_data {
+                namespace
+                    .sync_parent(Self::authority_relative_path())
+                    .map_err(|error| {
+                        KinDbError::SnapshotPersistenceIndeterminate(format!(
+                            "repo {repo_id} committed authority frame {current_gen} is installed but authority durability remains unconfirmed: {error}"
+                        ))
+                    })?;
+                if let Err(error) = namespace
+                    .confirm_surface_visible(&deltas)
+                    .and_then(|()| self.confirm_repository_visible(namespace))
+                {
+                    return Err(KinDbError::SnapshotPersistenceIndeterminate(format!(
+                        "repo {repo_id} exact authority frame retry refers to committed generation {current_gen}, but final namespace confirmation failed: {error}"
+                    )));
+                }
+                return Ok(current_gen);
+            }
+        }
+        if current_gen != expected_gen {
+            return Err(KinDbError::StorageError(format!(
+                "authority frame base generation mismatch for repo {repo_id}: expected {expected_gen}, found {current_gen} (another writer committed since last load)"
+            )));
+        }
+        crate::storage::authority_frame::AuthorityFrame::verify_frame_bytes(frame_data)?;
+
+        let new_gen = checked_next_generation(current_gen, "local authority frame")?;
+        let deltas = namespace
+            .surface(Self::deltas_surface_name(), true)?
+            .ok_or_else(|| {
+                KinDbError::StorageError(format!(
+                    "delta surface disappeared while writing repo {repo_id}"
+                ))
+            })?;
+        let frame_leaf = Self::delta_leaf(new_gen);
+        deltas.atomic_write(&frame_leaf, frame_data)?;
+        #[cfg(test)]
+        if let Some(hook) = self.delta_before_authority_commit_hook.lock().take() {
+            hook();
+        }
+        record.version = LOCAL_AUTHORITY_FRAME_JOURNAL_VERSION;
+        record
+            .retired_deltas
+            .retain(|identity| identity.generation != new_gen);
+        record.acknowledged_deltas.push(LocalDeltaIdentity {
+            generation: new_gen,
+            sha256: requested_digest,
+        });
+        record.head_generation = new_gen;
+        // The proof names the head this append produces: the unchanged base
+        // plus the acknowledged chain including this frame. A caller that did
+        // not validate the successor leaves the head unproven.
+        record.history_validation = match history_validator_version {
+            Some(validator_version) => Some(HistoryValidationProof {
+                validator_version,
+                repository_id: repo_id.clone(),
+                generation: new_gen,
+                snapshot_sha256: record.snapshot_sha256.clone(),
+                journal_sha256: Some(Self::record_journal_sha256(&record)?),
+            }),
+            None => None,
+        };
+        namespace.confirm_surface_visible(&deltas)?;
+        self.write_authority_unlocked(namespace, &record)?;
+        if let Err(error) = namespace
+            .confirm_surface_visible(&deltas)
+            .and_then(|()| self.confirm_repository_visible(namespace))
+        {
+            return Err(KinDbError::SnapshotPersistenceIndeterminate(format!(
+                "repo {repo_id} authority frame committed generation {new_gen}, but post-commit namespace confirmation failed: {error}"
+            )));
+        }
+        Ok(new_gen)
+    }
+
     /// Persist a local full-snapshot CAS and return the same still-held
     /// repository lock that protected its commit point.
     pub(crate) fn save_snapshot_and_freeze(
@@ -6470,6 +6997,7 @@ impl LocalFileBackend {
                     repository_id: repo_id.to_string(),
                     generation,
                     snapshot_sha256: hex::encode(Sha256::digest(data)),
+                    journal_sha256: None,
                 }
             }),
         };
@@ -6478,6 +7006,7 @@ impl LocalFileBackend {
             LocalAuthorityFreezeLock {
                 repo_id: repo_id.to_string(),
                 authority,
+                frames: Vec::new(),
                 lock,
             },
         ))
@@ -6543,7 +7072,10 @@ impl LocalFileBackend {
     }
 
     #[cfg(test)]
-    fn set_delta_before_authority_commit_hook(&self, hook: impl FnOnce() + Send + 'static) {
+    pub(crate) fn set_delta_before_authority_commit_hook(
+        &self,
+        hook: impl FnOnce() + Send + 'static,
+    ) {
         *self.delta_before_authority_commit_hook.lock() = Some(Box::new(hook));
     }
 
@@ -7222,6 +7754,81 @@ impl StorageBackend for LocalFileBackend {
             repository_id: repo_id.to_string(),
             generation,
             snapshot_sha256: snapshot_sha256.to_string(),
+            journal_sha256: None,
+        };
+        if record.history_validation.as_ref() == Some(&proof) {
+            return Ok(true);
+        }
+        record.history_validation = Some(proof);
+        self.write_authority_unlocked(namespace, &record)?;
+        self.confirm_repository_visible(namespace)?;
+        Ok(true)
+    }
+
+    fn supports_authority_frames(&self) -> bool {
+        true
+    }
+
+    fn save_authority_frame(
+        &self,
+        repo_id: &str,
+        frame: &[u8],
+        expected: SnapshotCursor,
+        history_validator_version: Option<u32>,
+    ) -> SnapshotSaveOutcome {
+        let lock = match self.acquire_existing_lock(repo_id) {
+            Ok(lock) => lock,
+            Err(error) => return SnapshotSaveOutcome::NotCommitted(error),
+        };
+        match self.save_authority_frame_unlocked(
+            &lock.namespace,
+            frame,
+            expected.backend_generation(),
+            history_validator_version,
+        ) {
+            Ok(generation) => SnapshotSaveOutcome::Committed {
+                cursor: SnapshotCursor::from_backend_generation(generation),
+            },
+            Err(error @ KinDbError::SnapshotPersistenceIndeterminate(_)) => {
+                SnapshotSaveOutcome::Indeterminate(error)
+            }
+            Err(error) => SnapshotSaveOutcome::NotCommitted(error),
+        }
+    }
+
+    fn record_journal_history_validation(
+        &self,
+        repo_id: &str,
+        head_generation: Generation,
+        snapshot_sha256: &str,
+        journal_sha256: &str,
+        validator_version: u32,
+    ) -> Result<bool, KinDbError> {
+        let lock = self.acquire_existing_lock(repo_id)?;
+        let namespace = &lock.namespace;
+        let Some(mut record) = self.read_authority_record_raw_unlocked(namespace)? else {
+            return Err(KinDbError::StorageError(format!(
+                "repo {repo_id} has no authority record to bind a history validation to"
+            )));
+        };
+        // Bind only to the exact durable head that was validated: the same
+        // base, the same acknowledged chain, at the same head generation.
+        if record.version != LOCAL_AUTHORITY_FRAME_JOURNAL_VERSION
+            || record.head_generation != head_generation
+            || record.snapshot_sha256 != snapshot_sha256
+            || Self::record_journal_sha256(&record)? != journal_sha256
+        {
+            return Err(KinDbError::StorageError(format!(
+                "repo {repo_id} authority moved to generation {} while binding a journal history validation for generation {head_generation}",
+                record.head_generation
+            )));
+        }
+        let proof = HistoryValidationProof {
+            validator_version,
+            repository_id: repo_id.to_string(),
+            generation: head_generation,
+            snapshot_sha256: snapshot_sha256.to_string(),
+            journal_sha256: Some(journal_sha256.to_string()),
         };
         if record.history_validation.as_ref() == Some(&proof) {
             return Ok(true);
@@ -7246,6 +7853,11 @@ impl StorageBackend for LocalFileBackend {
                 "repo {repo_id} has no atomic local snapshot authority; persist a full snapshot before deltas"
             )));
         };
+        if record.version == LOCAL_AUTHORITY_FRAME_JOURNAL_VERSION {
+            return Err(KinDbError::StorageError(format!(
+                "repo {repo_id} journal carries repository authority frames; incremental graph deltas cannot extend it"
+            )));
+        }
         let current_gen = record.head_generation;
         let requested_digest = Self::snapshot_digest(delta_data);
         if base_gen.checked_add(1) == Some(current_gen)
@@ -12300,5 +12912,362 @@ mod tests {
         let lock_path = dir.path().join("test-repo").join(".lock");
         assert!(lock_path.exists(), "lock file should be created");
         // Lock is released when _lock is dropped
+    }
+
+    // ---------------------------------------------------------------------
+    // Authority frame appends at the storage boundary.
+    //
+    // Storage verifies a frame's header and checksum and never decodes its
+    // body, so these fixtures carry arbitrary bodies under a valid header.
+    // ---------------------------------------------------------------------
+
+    fn frame_bytes_with_body(body: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&crate::storage::authority_frame::AuthorityFrame::MAGIC);
+        buf.extend_from_slice(
+            &crate::storage::authority_frame::AuthorityFrame::CURRENT_VERSION.to_le_bytes(),
+        );
+        buf.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        buf.extend_from_slice(body);
+        buf.extend_from_slice(&Sha256::digest(body));
+        buf
+    }
+
+    fn committed_cursor(outcome: SnapshotSaveOutcome) -> SnapshotCursor {
+        match outcome {
+            SnapshotSaveOutcome::Committed { cursor } => cursor,
+            SnapshotSaveOutcome::NotCommitted(error) => {
+                panic!("expected a committed frame, got not committed: {error}")
+            }
+            SnapshotSaveOutcome::Indeterminate(error) => {
+                panic!("expected a committed frame, got indeterminate: {error}")
+            }
+        }
+    }
+
+    fn not_committed_error(outcome: SnapshotSaveOutcome) -> String {
+        match outcome {
+            SnapshotSaveOutcome::NotCommitted(error) => error.to_string(),
+            SnapshotSaveOutcome::Committed { cursor } => panic!(
+                "expected a refusal, but the frame committed at {}",
+                cursor.backend_generation()
+            ),
+            SnapshotSaveOutcome::Indeterminate(error) => {
+                panic!("expected a refusal, got indeterminate: {error}")
+            }
+        }
+    }
+
+    fn record_at(dir: &TempDir, repo_id: &str) -> serde_json::Value {
+        serde_json::from_slice(
+            &std::fs::read(dir.path().join(repo_id).join("authority.json")).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn frame_appends_extend_only_the_acknowledged_head_and_bind_a_journal_proof() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let repo_id = "frames-cas";
+        let base = GraphSnapshot::empty().to_bytes().unwrap();
+        let head = backend
+            .save_snapshot(repo_id, &base, GENERATION_INIT)
+            .unwrap();
+        let first = frame_bytes_with_body(b"first frame");
+        let second = frame_bytes_with_body(b"second frame");
+
+        let stale = not_committed_error(backend.save_authority_frame(
+            repo_id,
+            &first,
+            SnapshotCursor::from_backend_generation(head + 1),
+            Some(7),
+        ));
+        assert!(stale.contains("base generation mismatch"), "{stale}");
+        assert!(
+            !dir.path().join(repo_id).join("deltas").exists()
+                || std::fs::read_dir(dir.path().join(repo_id).join("deltas"))
+                    .unwrap()
+                    .next()
+                    .is_none(),
+            "a refused append installs nothing"
+        );
+
+        let cursor = committed_cursor(backend.save_authority_frame(
+            repo_id,
+            &first,
+            SnapshotCursor::from_backend_generation(head),
+            Some(7),
+        ));
+        assert_eq!(cursor.backend_generation(), head + 1);
+        let record = record_at(&dir, repo_id);
+        assert_eq!(
+            record["version"],
+            serde_json::json!(LOCAL_AUTHORITY_FRAME_JOURNAL_VERSION)
+        );
+        assert_eq!(record["snapshot_generation"], serde_json::json!(head));
+        assert_eq!(record["head_generation"], serde_json::json!(head + 1));
+        assert_eq!(
+            record["acknowledged_deltas"][0]["sha256"],
+            serde_json::json!(hex::encode(Sha256::digest(&first)))
+        );
+        let expected_journal = crate::storage::authority_frame::journal_sha256(
+            &hex::encode(Sha256::digest(&base)),
+            [hex::encode(Sha256::digest(&first))],
+        )
+        .unwrap();
+        assert_eq!(
+            record["history_validation"]["validator_version"],
+            serde_json::json!(7)
+        );
+        assert_eq!(
+            record["history_validation"]["generation"],
+            serde_json::json!(head + 1)
+        );
+        assert_eq!(
+            record["history_validation"]["snapshot_sha256"],
+            serde_json::json!(hex::encode(Sha256::digest(&base)))
+        );
+        assert_eq!(
+            record["history_validation"]["journal_sha256"],
+            serde_json::json!(expected_journal)
+        );
+
+        // The same bytes at the same cursor are an idempotent retry; different
+        // bytes at a stale cursor are a refusal.
+        let retry = committed_cursor(backend.save_authority_frame(
+            repo_id,
+            &first,
+            SnapshotCursor::from_backend_generation(head),
+            Some(7),
+        ));
+        assert_eq!(retry.backend_generation(), head + 1);
+        let displaced = not_committed_error(backend.save_authority_frame(
+            repo_id,
+            &second,
+            SnapshotCursor::from_backend_generation(head),
+            Some(7),
+        ));
+        assert!(
+            displaced.contains("base generation mismatch"),
+            "{displaced}"
+        );
+
+        // A second frame without a validator leaves the head unproven.
+        let cursor = committed_cursor(backend.save_authority_frame(
+            repo_id,
+            &second,
+            SnapshotCursor::from_backend_generation(head + 1),
+            None,
+        ));
+        assert_eq!(cursor.backend_generation(), head + 2);
+        let record = record_at(&dir, repo_id);
+        assert!(record["history_validation"].is_null());
+        assert_eq!(record["acknowledged_deltas"].as_array().unwrap().len(), 2);
+
+        // Storage refuses a frame it cannot vouch for by its own header.
+        let mut torn = frame_bytes_with_body(b"third frame");
+        torn.truncate(torn.len() - 1);
+        let refused = not_committed_error(backend.save_authority_frame(
+            repo_id,
+            &torn,
+            SnapshotCursor::from_backend_generation(head + 2),
+            None,
+        ));
+        assert!(refused.contains("truncated"), "{refused}");
+    }
+
+    #[test]
+    fn journals_of_one_kind_refuse_entries_of_the_other() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let base = GraphSnapshot::empty().to_bytes().unwrap();
+
+        let generic = "generic-journal";
+        let head = backend
+            .save_snapshot(generic, &base, GENERATION_INIT)
+            .unwrap();
+        let delta = crate::storage::delta::GraphSnapshotDelta::empty(head)
+            .to_bytes()
+            .unwrap();
+        backend.save_delta(generic, &delta, head).unwrap();
+        let refused = not_committed_error(backend.save_authority_frame(
+            generic,
+            &frame_bytes_with_body(b"frame"),
+            SnapshotCursor::from_backend_generation(head + 1),
+            None,
+        ));
+        assert!(
+            refused.contains("carries incremental graph deltas"),
+            "{refused}"
+        );
+
+        let framed = "frame-journal";
+        let head = backend
+            .save_snapshot(framed, &base, GENERATION_INIT)
+            .unwrap();
+        committed_cursor(backend.save_authority_frame(
+            framed,
+            &frame_bytes_with_body(b"frame"),
+            SnapshotCursor::from_backend_generation(head),
+            None,
+        ));
+        let delta = crate::storage::delta::GraphSnapshotDelta::empty(head + 1)
+            .to_bytes()
+            .unwrap();
+        let error = backend
+            .save_delta(framed, &delta, head + 1)
+            .expect_err("a graph delta must not extend a frame journal");
+        assert!(
+            error
+                .to_string()
+                .contains("carries repository authority frames"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_frame_journal_record_that_acknowledges_nothing_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let repo_id = "empty-frame-journal";
+        let base = GraphSnapshot::empty().to_bytes().unwrap();
+        backend
+            .save_snapshot(repo_id, &base, GENERATION_INIT)
+            .unwrap();
+        let path = dir.path().join(repo_id).join("authority.json");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        record["version"] = serde_json::json!(LOCAL_AUTHORITY_FRAME_JOURNAL_VERSION);
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let error = backend
+            .load_snapshot_authority(repo_id)
+            .expect_err("a frame journal record must acknowledge at least one frame");
+        assert!(
+            error
+                .to_string()
+                .contains("acknowledges no authority frame"),
+            "{error}"
+        );
+        record["version"] = serde_json::json!(LOCAL_AUTHORITY_FRAME_JOURNAL_VERSION + 1);
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let error = backend
+            .load_snapshot_authority(repo_id)
+            .expect_err("an unknown record version is refused");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported local authority version"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_journal_history_validation_binds_only_the_exact_head_and_chain() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let repo_id = "journal-proof";
+        let base = GraphSnapshot::empty().to_bytes().unwrap();
+        let head = backend
+            .save_snapshot(repo_id, &base, GENERATION_INIT)
+            .unwrap();
+        let frame = frame_bytes_with_body(b"frame");
+        committed_cursor(backend.save_authority_frame(
+            repo_id,
+            &frame,
+            SnapshotCursor::from_backend_generation(head),
+            None,
+        ));
+        let base_sha = hex::encode(Sha256::digest(&base));
+        let journal = crate::storage::authority_frame::journal_sha256(
+            &base_sha,
+            [hex::encode(Sha256::digest(&frame))],
+        )
+        .unwrap();
+
+        let moved = backend
+            .record_journal_history_validation(repo_id, head, &base_sha, &journal, 7)
+            .expect_err("a proof for another head must not bind");
+        assert!(moved.to_string().contains("authority moved"), "{moved}");
+        let other_chain = backend
+            .record_journal_history_validation(
+                repo_id,
+                head + 1,
+                &base_sha,
+                &hex::encode(Sha256::digest(b"another chain")),
+                7,
+            )
+            .expect_err("a proof for another chain must not bind");
+        assert!(
+            other_chain.to_string().contains("authority moved"),
+            "{other_chain}"
+        );
+        let journal_free = backend
+            .record_history_validation(repo_id, head + 1, &base_sha, 7)
+            .expect_err("the journal-free binding refuses a journal head");
+        assert!(
+            journal_free.to_string().contains("authority moved"),
+            "{journal_free}"
+        );
+
+        assert!(backend
+            .record_journal_history_validation(repo_id, head + 1, &base_sha, &journal, 7)
+            .unwrap());
+        let record = record_at(&dir, repo_id);
+        assert_eq!(
+            record["history_validation"]["journal_sha256"],
+            serde_json::json!(journal)
+        );
+        assert_eq!(
+            record["history_validation"]["generation"],
+            serde_json::json!(head + 1)
+        );
+    }
+
+    #[test]
+    fn a_full_promotion_discards_a_stale_frame_past_head_but_keeps_refusing_a_stale_delta() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let base = GraphSnapshot::empty().to_bytes().unwrap();
+
+        let framed = "stale-frame";
+        let head = backend
+            .save_snapshot(framed, &base, GENERATION_INIT)
+            .unwrap();
+        LocalFileBackend::atomic_write(
+            &backend.delta_path(framed, head + 1),
+            &frame_bytes_with_body(b"staged by a writer that died"),
+        )
+        .unwrap();
+        let promoted = backend
+            .save_snapshot(framed, &base, head)
+            .expect("a stale authority frame past head must not block a full promotion");
+        assert_eq!(promoted, head + 1);
+        assert!(
+            !backend.delta_path(framed, head + 1).exists(),
+            "the stale frame is discarded before the promotion commits"
+        );
+        let recovered = load_recovered_snapshot(&backend, framed).unwrap().unwrap();
+        assert_eq!(recovered.generation, head + 1);
+        assert_eq!(recovered.deltas_seen, 0);
+
+        let generic = "stale-delta";
+        let head = backend
+            .save_snapshot(generic, &base, GENERATION_INIT)
+            .unwrap();
+        LocalFileBackend::atomic_write(
+            &backend.delta_path(generic, head + 1),
+            &crate::storage::delta::GraphSnapshotDelta::empty(head)
+                .to_bytes()
+                .unwrap(),
+        )
+        .unwrap();
+        let error = backend
+            .save_snapshot(generic, &base, head)
+            .expect_err("a staged graph delta keeps its racing-writer refusal");
+        assert!(
+            error.to_string().contains("staged unacknowledged delta"),
+            "{error}"
+        );
     }
 }

@@ -35,7 +35,13 @@ pub trait DurableAuthorityPersistence<S>: Send + Sync + 'static
 where
     S: VersionedAuthorityState,
 {
-    fn persist(&self, expected_generation: Generation, next: &S) -> PersistOutcome;
+    /// Persist `next` as the exact successor of `current`, the state published
+    /// when the candidate was prepared.
+    ///
+    /// Both states are handed over because a persistence that journals only
+    /// what changed needs the predecessor to say what that was; a persistence
+    /// that writes complete states may ignore `current` beyond its generation.
+    fn persist(&self, current: &S, next: &S) -> PersistOutcome;
 
     /// Reconcile a candidate retained after an indeterminate persistence
     /// result.
@@ -43,8 +49,8 @@ where
     /// The default retries the exact candidate. Backends that can inspect
     /// installed authority should override this to confirm exact bytes before
     /// attempting another conditional write.
-    fn reconcile(&self, expected_generation: Generation, next: &S) -> PersistOutcome {
-        self.persist(expected_generation, next)
+    fn reconcile(&self, current: &S, next: &S) -> PersistOutcome {
+        self.persist(current, next)
     }
 }
 
@@ -153,6 +159,11 @@ where
         AuthorityReadLease(Arc::clone(&self.current.read()))
     }
 
+    #[cfg(test)]
+    pub(crate) fn persistence(&self) -> &P {
+        &self.persistence
+    }
+
     /// Commit one complete authority successor.
     ///
     /// `prepare` runs while all writers are serialized and receives the exact
@@ -170,10 +181,9 @@ where
         // candidate. No later operation may prepare a different successor
         // until that uncertainty is resolved.
         if let Some(pending) = writer.pending.as_ref().map(Arc::clone) {
-            let expected_generation = current.generation();
             match self
                 .persistence
-                .reconcile(expected_generation, pending.as_ref())
+                .reconcile(current.as_ref(), pending.as_ref())
             {
                 PersistOutcome::Committed => {
                     *self.current.write() = Arc::clone(&pending);
@@ -207,7 +217,7 @@ where
                 // Allocate before the durable boundary. After persist returns
                 // success there must be no fallible work before publication.
                 let next = Arc::new(next);
-                match self.persistence.persist(expected_generation, next.as_ref()) {
+                match self.persistence.persist(current.as_ref(), next.as_ref()) {
                     PersistOutcome::Committed => {
                         *self.current.write() = next;
                         Ok(output)
@@ -234,7 +244,7 @@ where
         &self,
         prepare: impl FnOnce(&S) -> Result<AuthorityCommitDecision<S, O>, KinDbError>,
         retain_current: impl FnOnce(&P, &S) -> Result<R, KinDbError>,
-        persist_and_retain: impl FnOnce(&P, Generation, &S) -> RetainedPersistOutcome<R>,
+        persist_and_retain: impl FnOnce(&P, &S, &S) -> RetainedPersistOutcome<R>,
     ) -> Result<(O, R), KinDbError> {
         let mut writer = self.writer.lock();
         let mut current = Arc::clone(&self.current.read());
@@ -243,10 +253,9 @@ where
         // later successor. A resolved operation may become the idempotent
         // replay handled below, where its exact installed state is frozen.
         if let Some(pending) = writer.pending.as_ref().map(Arc::clone) {
-            let expected_generation = current.generation();
             match self
                 .persistence
-                .reconcile(expected_generation, pending.as_ref())
+                .reconcile(current.as_ref(), pending.as_ref())
             {
                 PersistOutcome::Committed => {
                     *self.current.write() = Arc::clone(&pending);
@@ -284,7 +293,7 @@ where
                 // the infallible pointer publication and is returned to the
                 // caller still holding the backend exclusion capability.
                 let next = Arc::new(next);
-                match persist_and_retain(&self.persistence, expected_generation, next.as_ref()) {
+                match persist_and_retain(&self.persistence, current.as_ref(), next.as_ref()) {
                     RetainedPersistOutcome::Committed { retained } => {
                         *self.current.write() = next;
                         Ok((output, retained))
@@ -327,7 +336,8 @@ mod tests {
     }
 
     impl DurableAuthorityPersistence<TestState> for TestPersistence {
-        fn persist(&self, expected_generation: Generation, next: &TestState) -> PersistOutcome {
+        fn persist(&self, current: &TestState, next: &TestState) -> PersistOutcome {
+            let expected_generation = current.generation;
             if self.fail_next.swap(false, Ordering::SeqCst) {
                 return PersistOutcome::NotCommitted(KinDbError::StorageError(
                     "injected authority persistence failure".to_string(),
@@ -430,7 +440,8 @@ mod tests {
     }
 
     impl DurableAuthorityPersistence<TestState> for IndeterminatePersistence {
-        fn persist(&self, expected_generation: Generation, next: &TestState) -> PersistOutcome {
+        fn persist(&self, current: &TestState, next: &TestState) -> PersistOutcome {
+            let expected_generation = current.generation;
             self.attempts.lock().unwrap().push((
                 expected_generation,
                 next.generation,
@@ -524,7 +535,7 @@ mod tests {
     }
 
     impl DurableAuthorityPersistence<TestState> for ReconcileRejectionPersistence {
-        fn persist(&self, _expected_generation: Generation, _next: &TestState) -> PersistOutcome {
+        fn persist(&self, _current: &TestState, _next: &TestState) -> PersistOutcome {
             match self.attempts.fetch_add(1, Ordering::SeqCst) {
                 0 => PersistOutcome::Indeterminate(KinDbError::SnapshotPersistenceIndeterminate(
                     "first result is unknown".to_string(),
@@ -592,7 +603,8 @@ mod tests {
     }
 
     impl DurableAuthorityPersistence<TestState> for SerializedPersistence {
-        fn persist(&self, expected_generation: Generation, next: &TestState) -> PersistOutcome {
+        fn persist(&self, current: &TestState, next: &TestState) -> PersistOutcome {
+            let expected_generation = current.generation;
             let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_active.fetch_max(active, Ordering::SeqCst);
             std::thread::sleep(Duration::from_millis(20));
@@ -656,7 +668,7 @@ mod tests {
     }
 
     impl DurableAuthorityPersistence<TestState> for BlockingPersistence {
-        fn persist(&self, _expected_generation: Generation, _next: &TestState) -> PersistOutcome {
+        fn persist(&self, _current: &TestState, _next: &TestState) -> PersistOutcome {
             let (entered, entered_cv) = self.entered.as_ref();
             *entered.lock().unwrap() = true;
             entered_cv.notify_one();
