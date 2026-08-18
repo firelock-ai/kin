@@ -164,7 +164,11 @@ impl Provider {
 
     /// One turn. `tools` empty means a tool-free turn, which is how the forced final
     /// answer is asked for: the model is given nothing to call.
-    pub fn complete(&self, messages: &[Value], tools: &[Value]) -> Result<Completion, ProviderError> {
+    pub fn complete(
+        &self,
+        messages: &[Value],
+        tools: &[Value],
+    ) -> Result<Completion, ProviderError> {
         let url = self.config.chat_url();
         let mut body = json!({
             "model": self.config.model,
@@ -221,7 +225,10 @@ impl Provider {
         })
     }
 
-    fn request(&self, builder: reqwest::blocking::RequestBuilder) -> reqwest::blocking::RequestBuilder {
+    fn request(
+        &self,
+        builder: reqwest::blocking::RequestBuilder,
+    ) -> reqwest::blocking::RequestBuilder {
         match self.config.api_key.as_deref() {
             Some(key) => builder.bearer_auth(key),
             None => builder,

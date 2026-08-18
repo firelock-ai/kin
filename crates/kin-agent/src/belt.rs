@@ -351,7 +351,11 @@ pub fn run_edit(repo: &Path, arguments: &Value) -> LocalOutcome {
         text: format!(
             "Edited `{raw_path}`: replaced {} occurrence{} ({} bytes before, {} after).",
             if replace_all { occurrences } else { 1 },
-            if replace_all && occurrences != 1 { "s" } else { "" },
+            if replace_all && occurrences != 1 {
+                "s"
+            } else {
+                ""
+            },
             original.len(),
             updated.len()
         ),

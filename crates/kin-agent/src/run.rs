@@ -132,11 +132,7 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
     });
 
     // Connect to Kin first. A run that could not attach must be loud, not quietly scored.
-    let mut mcp = match McpClient::start(
-        &config.mcp_command,
-        &config.repo,
-        config.mcp_timeout,
-    ) {
+    let mut mcp = match McpClient::start(&config.mcp_command, &config.repo, config.mcp_timeout) {
         Ok(client) => client,
         Err(err) => {
             let message = err.to_string();
@@ -431,11 +427,7 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                                                 "is_error": true,
                                                 "transport_error": err.to_string(),
                                             }))?;
-                                            writer.tool_result(
-                                                &call.id,
-                                                &err.to_string(),
-                                                true,
-                                            )?;
+                                            writer.tool_result(&call.id, &err.to_string(), true)?;
                                             status = ExitStatus::McpError;
                                             stop_reason = "mcp_transport".into();
                                             final_text = err.to_string();
@@ -568,7 +560,12 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
         }
     }
 
-    end_kin_session(&mut mcp, kin_session.as_deref(), &server_tool_names, &mut writer)?;
+    end_kin_session(
+        &mut mcp,
+        kin_session.as_deref(),
+        &server_tool_names,
+        &mut writer,
+    )?;
     finish(
         writer,
         &config,
@@ -583,7 +580,11 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
 
 /// Append what Kin said about its own answer, so an untrusted absence cannot be read as
 /// an absence and a degraded graph is stated once rather than silently.
-fn annotate(outcome: &ToolOutcome, counters: &mut Counters, surfaced_degraded: &mut bool) -> String {
+fn annotate(
+    outcome: &ToolOutcome,
+    counters: &mut Counters,
+    surfaced_degraded: &mut bool,
+) -> String {
     let mut text = outcome.text.clone();
     if outcome.safe_to_conclude_absent() == Some(false) {
         counters.unsafe_absence_events += 1;
@@ -784,7 +785,10 @@ fn begin_transaction(
             reason: Some("no Kin session was open".into()),
         });
     };
-    if !server_tools.iter().any(|name| name == "kin_transaction_begin") {
+    if !server_tools
+        .iter()
+        .any(|name| name == "kin_transaction_begin")
+    {
         return Ok(Bracket {
             transaction_id: None,
             reason: Some("the server does not expose kin_transaction_begin".into()),

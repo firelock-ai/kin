@@ -174,15 +174,13 @@ impl McpClient {
     /// Spawn the server and complete `initialize`.
     pub fn start(argv: &[String], cwd: &Path, timeout: Duration) -> Result<Self, McpError> {
         let command = argv.join(" ");
-        let (program, args) = argv
-            .split_first()
-            .ok_or_else(|| McpError::Spawn {
-                command: command.clone(),
-                source: std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "the MCP command was empty",
-                ),
-            })?;
+        let (program, args) = argv.split_first().ok_or_else(|| McpError::Spawn {
+            command: command.clone(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the MCP command was empty",
+            ),
+        })?;
         let mut child = Command::new(program)
             .args(args)
             .current_dir(cwd)
