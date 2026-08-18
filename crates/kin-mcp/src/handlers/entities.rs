@@ -123,7 +123,13 @@ the graph, so get_entity_source, get_context_pack, graph_neighborhood, and find_
 all take it. `id_space: \"artifact\"` means the hit is an artifact-level embedding — a \
 tracked file the parsers produced no entities for — so it carries `artifact_path` and NO \
 `entity_id`, and those tools will refuse it; read it with kin_artifact_read instead. Do \
-not synthesize an entity id from an artifact hit's path.";
+not synthesize an entity id from an artifact hit's path. The response bounds its own size \
+(max_chars, default 30000 serialized characters) so it is never refused by a client for being \
+too large: it is compact by default, meaning no per-signal `match_evidence` breakdown unless you \
+ask with explain=true or compact=false, and under pressure it sheds the per-file symbol roll-up, \
+then inline snippets, and only then withholds hits from the end of the page. Any cut is reported \
+in `degradations` and in `_kin.response`, which carries the budget applied and what the response \
+measured before it, and the rest of the ranking stays reachable through `next_cursor`.";
 
 /// Offline/generic dispatch arm for `semantic_locate`.
 ///
@@ -903,7 +909,11 @@ binding, a declared import, or a resolved dispatch class), `import_scoped` (the 
 module was known and the symbol selected inside it), or `name_only` (a bare same-name \
 match across the repo, with nothing at the reference site proving it). A `name_only` row \
 is a candidate, not a fact; do not count it as use, and do not conclude something is \
-unused from the absence of anything but `name_only` rows without confirming.";
+unused from the absence of anything but `name_only` rows without confirming. \
+The response bounds its own size (max_chars, default 30000 serialized characters): a symbol \
+with hundreds of call sites sheds its inline snippets before it withholds any row, and any cut \
+is reported in `degradations` and in `_kin.response` with the size the response had before the \
+budget, so a short answer is never mistaken for a complete one.";
 
 fn normalize_cross_repo_repo_id(raw: Option<&str>) -> std::result::Result<String, String> {
     raw.map(str::trim)
@@ -5888,5 +5898,336 @@ mod tests {
         assert_eq!(result.is_error, Some(true));
         let crate::types::ContentBlock::Text { text } = &result.content[0];
         assert!(text.contains("requires the Kin daemon"), "{text}");
+    }
+
+    // ---------------------------------------------------------------------
+    // FIR-2396: the response budget, one test per retrieval tool.
+    //
+    // Each builds a fixture large enough to overflow the shared default, then
+    // asserts the FINAL annotated text -- the bytes a client actually counts,
+    // envelope and negative included -- stays under it. The control in every
+    // case is the same call served at the clamp ceiling, which proves the
+    // fixture overflows and that the bound, rather than the fixture, is what
+    // shrank it.
+    // ---------------------------------------------------------------------
+
+    use crate::budget::{ResponseBudget, RESPONSE_DEFAULT_MAX_CHARS, RESPONSE_MAX_MAX_CHARS};
+
+    /// The text a client receives for one tool result: the payload with `_kin`
+    /// and `negative` attached, rendered exactly as the stdio path renders it.
+    fn client_text(result: ToolCallResult, tool: &str, budget: &ResponseBudget) -> String {
+        let enveloped =
+            crate::envelope::finalize_bounded(result, crate::Envelope::offline(), tool, budget);
+        let crate::types::ContentBlock::Text { text } = enveloped
+            .content
+            .into_iter()
+            .next()
+            .expect("one content block");
+        text
+    }
+
+    /// A budget that cannot bind, for the control arm.
+    fn unbounded() -> ResponseBudget {
+        ResponseBudget {
+            max_chars: RESPONSE_MAX_MAX_CHARS,
+            compact: false,
+            explicit_max_chars: true,
+        }
+    }
+
+    /// Assert one tool's overflow and its bound in the one unit the refusal was
+    /// ever reported in, and hand back both numbers and the bounded payload.
+    fn assert_bounded(
+        tool: &str,
+        unbounded_text: String,
+        bounded_text: String,
+    ) -> (usize, usize, serde_json::Value) {
+        let before = unbounded_text.len();
+        let after = bounded_text.len();
+        assert!(
+            before > RESPONSE_DEFAULT_MAX_CHARS,
+            "{tool}: the fixture must overflow the default budget, or the bound is untested: \
+             {before} chars"
+        );
+        assert!(
+            after <= RESPONSE_DEFAULT_MAX_CHARS,
+            "{tool}: the response a client receives must fit its budget: {after} chars against \
+             {RESPONSE_DEFAULT_MAX_CHARS}"
+        );
+        let bounded: serde_json::Value = serde_json::from_str(&bounded_text)
+            .unwrap_or_else(|error| panic!("{tool}: a bounded response is still JSON: {error}"));
+        assert_eq!(
+            bounded["_kin"]["response"]["max_chars"],
+            serde_json::json!(RESPONSE_DEFAULT_MAX_CHARS),
+            "{tool}: the applied budget is recorded on the envelope"
+        );
+        let chars_before = bounded["_kin"]["response"]["chars_before_budget"]
+            .as_u64()
+            .expect("the pre-truncation size is recorded") as usize;
+        assert!(
+            chars_before > 0,
+            "{tool}: the envelope reports the size the response had before the budget"
+        );
+        // Bounded SOMEWHERE, and the response says where. The envelope stage
+        // reports its own cut on `_kin`; a tool that enforces the same budget
+        // inside its own walk has already fit by the time the envelope sees it,
+        // and discloses that cut through `degradations` instead. Accepting only
+        // the first reading would make this assertion fail on exactly the tool
+        // that bounds itself best.
+        let envelope_cut = bounded["_kin"]["response"]["bounded"] == serde_json::json!(true);
+        let handler_cut = bounded["degradations"].as_array().is_some_and(|cuts| {
+            cuts.iter()
+                .any(|cut| cut["component"] == serde_json::json!("response_budget"))
+        });
+        assert!(
+            envelope_cut || handler_cut,
+            "{tool}: a response that was cut has to say so: {bounded}"
+        );
+        assert!(
+            !envelope_cut || chars_before > RESPONSE_DEFAULT_MAX_CHARS,
+            "{tool}: the envelope stage cuts only what was over its budget, and reports the size \
+             it was over by: {chars_before} chars"
+        );
+        eprintln!("FIR-2396 {tool}: {before} chars unbounded, {after} chars bounded");
+        (before, after, bounded)
+    }
+
+    fn wide_store(callers: usize) -> (InMemoryGraph, EntityId) {
+        let store = InMemoryGraph::new();
+        let focal = make_entity("resolve_redirects", "src/sessions.rs");
+        let focal_id = focal.id;
+        store.upsert_entity(&focal).unwrap();
+        for index in 0..callers {
+            let mut caller = make_entity(
+                &format!("caller_number_{index}_with_a_realistic_symbol_name"),
+                &format!("src/module_{index}/handler.rs"),
+            );
+            caller.doc_summary = Some(
+                "Resolves the redirect chain for one request and replays the body when the \
+                 method survives the hop."
+                    .to_string(),
+            );
+            store.upsert_entity(&caller).unwrap();
+            store
+                .upsert_relation(&make_relation(caller.id, focal_id, RelationKind::Calls))
+                .unwrap();
+        }
+        (store, focal_id)
+    }
+
+    #[test]
+    fn semantic_search_response_fits_the_budget() {
+        let (store, _) = wide_store(400);
+        let args = |compact: bool| -> HashMap<String, serde_json::Value> {
+            HashMap::from([
+                ("query".to_string(), serde_json::json!("caller")),
+                ("limit".to_string(), serde_json::json!(200)),
+                ("compact".to_string(), serde_json::json!(compact)),
+            ])
+        };
+        let before = client_text(
+            handle_semantic_search(&args(false), &store).unwrap(),
+            "semantic_search",
+            &unbounded(),
+        );
+        let after = client_text(
+            handle_semantic_search(&args(true), &store).unwrap(),
+            "semantic_search",
+            &ResponseBudget::default(),
+        );
+        assert_bounded("semantic_search", before, after);
+    }
+
+    #[tokio::test]
+    async fn find_references_response_fits_the_budget() {
+        let (store, focal_id) = wide_store(400);
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(focal_id.to_string()),
+        )]);
+        let before = client_text(
+            handle_find_references(&args, &store, None).await.unwrap(),
+            "find_references",
+            &unbounded(),
+        );
+        let after = client_text(
+            handle_find_references(&args, &store, None).await.unwrap(),
+            "find_references",
+            &ResponseBudget::default(),
+        );
+        let (_, _, bounded) = assert_bounded("find_references", before, after);
+        // The full count is still reported, so a caller reading a shortened list
+        // can tell it from a complete one without comparing runs.
+        assert_eq!(bounded["total_upstream"], serde_json::json!(400));
+    }
+
+    #[test]
+    fn graph_neighborhood_response_fits_the_budget() {
+        let (store, focal_id) = wide_store(400);
+        let args = HashMap::from([
+            (
+                "entity_id".to_string(),
+                serde_json::json!(focal_id.to_string()),
+            ),
+            ("limit".to_string(), serde_json::json!(400)),
+            ("depth".to_string(), serde_json::json!(2)),
+        ]);
+        let before = client_text(
+            handle_graph_neighborhood(&args, &store).unwrap(),
+            "graph_neighborhood",
+            &unbounded(),
+        );
+        let after = client_text(
+            handle_graph_neighborhood(&args, &store).unwrap(),
+            "graph_neighborhood",
+            &ResponseBudget::default(),
+        );
+        assert_bounded("graph_neighborhood", before, after);
+    }
+
+    #[test]
+    fn trace_data_flow_response_fits_the_budget() {
+        let store = InMemoryGraph::new();
+        let focal = make_entity("Session_request", "src/sessions.rs");
+        let focal_id = focal.id;
+        store.upsert_entity(&focal).unwrap();
+        let mut previous = vec![focal_id];
+        for depth in 0..4 {
+            let mut next = Vec::new();
+            for (parent_index, parent) in previous.iter().enumerate() {
+                for index in 0..5 {
+                    let callee = make_entity(
+                        &format!("step_{depth}_{parent_index}_{index}_resolve_redirect_target"),
+                        &format!("src/adapters/level_{depth}/module_{index}.rs"),
+                    );
+                    store.upsert_entity(&callee).unwrap();
+                    store
+                        .upsert_relation(&make_relation(*parent, callee.id, RelationKind::Calls))
+                        .unwrap();
+                    next.push(callee.id);
+                }
+            }
+            previous = next;
+        }
+        let args = HashMap::from([
+            ("focal".to_string(), serde_json::json!(focal_id.to_string())),
+            ("direction".to_string(), serde_json::json!("calls")),
+            ("depth".to_string(), serde_json::json!(4)),
+            ("limit_per_step".to_string(), serde_json::json!(15)),
+            ("include_body".to_string(), serde_json::json!(false)),
+        ]);
+        let mut wide = args.clone();
+        wide.insert(
+            "max_response_chars".to_string(),
+            serde_json::json!(RESPONSE_MAX_MAX_CHARS),
+        );
+        let before = client_text(
+            handle_trace_data_flow(&wide, &store).unwrap(),
+            "trace_data_flow",
+            &unbounded(),
+        );
+        let after = client_text(
+            handle_trace_data_flow(&args, &store).unwrap(),
+            "trace_data_flow",
+            &ResponseBudget::default(),
+        );
+        let (_, _, bounded) = assert_bounded("trace_data_flow", before, after);
+        // This tool bounds itself inside its own walk, so the number it enforces
+        // has to BE the shared default rather than merely sit under it. A
+        // per-tool budget of its own is what let a 79,278-character response
+        // report success while the client refused it.
+        assert_eq!(
+            bounded["max_response_chars"],
+            serde_json::json!(RESPONSE_DEFAULT_MAX_CHARS),
+            "trace_data_flow answers under the one shared default, not a budget of its own"
+        );
+    }
+
+    #[test]
+    fn get_context_pack_response_fits_the_budget() {
+        let (store, focal_id) = wide_store(0);
+        for index in 0..300 {
+            let dep = make_entity(
+                &format!("dependency_{index}_rebuild_auth_and_replay_body"),
+                &format!("src/deps/module_{index}/inner.rs"),
+            );
+            store.upsert_entity(&dep).unwrap();
+            store
+                .upsert_relation(&make_relation(focal_id, dep.id, RelationKind::Calls))
+                .unwrap();
+        }
+        let sessions = SessionRegistry::new();
+        let args = HashMap::from([
+            (
+                "entity_id".to_string(),
+                serde_json::json!(focal_id.to_string()),
+            ),
+            ("token_budget".to_string(), serde_json::json!(2_000_000u64)),
+            ("depth".to_string(), serde_json::json!(2)),
+        ]);
+        let before = client_text(
+            handle_get_context_pack(&args, &store, &sessions, None).unwrap(),
+            "get_context_pack",
+            &unbounded(),
+        );
+        let after = client_text(
+            handle_get_context_pack(&args, &store, &sessions, None).unwrap(),
+            "get_context_pack",
+            &ResponseBudget::default(),
+        );
+        assert_bounded("get_context_pack", before, after);
+    }
+
+    #[test]
+    fn bulk_check_references_response_fits_the_budget() {
+        let (store, focal_id) = wide_store(200);
+        let ids: Vec<serde_json::Value> = store
+            .list_all_entities()
+            .unwrap()
+            .iter()
+            .take(200)
+            .map(|entity| serde_json::json!(entity.id.to_string()))
+            .collect();
+        let _ = focal_id;
+        let args = |compact: bool| -> HashMap<String, serde_json::Value> {
+            HashMap::from([
+                ("entity_ids".to_string(), serde_json::json!(ids)),
+                ("compact".to_string(), serde_json::json!(compact)),
+            ])
+        };
+        let before = client_text(
+            handle_bulk_check_references(&args(false), &store).unwrap(),
+            "bulk_check_references",
+            &unbounded(),
+        );
+        let after = client_text(
+            handle_bulk_check_references(&args(true), &store).unwrap(),
+            "bulk_check_references",
+            &ResponseBudget::default(),
+        );
+        assert_bounded("bulk_check_references", before, after);
+    }
+
+    /// The envelope and the confidence-qualified negative are what a caller
+    /// reads to know how far a shortened answer can be trusted, so they are the
+    /// two things the budget may never take.
+    #[test]
+    fn the_budget_never_cuts_the_envelope_or_the_negative() {
+        let (store, _) = wide_store(400);
+        let args = HashMap::from([
+            ("query".to_string(), serde_json::json!("caller")),
+            ("limit".to_string(), serde_json::json!(200)),
+        ]);
+        let text = client_text(
+            handle_semantic_search(&args, &store).unwrap(),
+            "semantic_search",
+            &ResponseBudget::default(),
+        );
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["_kin"]["envelope_version"], serde_json::json!(1));
+        assert_eq!(
+            value["_kin"]["degraded"]["offline_fallback"],
+            serde_json::json!(true)
+        );
     }
 }

@@ -34,6 +34,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
+use crate::budget::ResponseBudget;
 use crate::types::{ContentBlock, ToolCallResult};
 
 /// Current envelope schema version. Bump on any breaking field change so
@@ -236,6 +237,13 @@ pub struct Envelope {
     /// Degraded-state flags (always present; individual flags omitted when not
     /// observed).
     pub degraded: Degraded,
+    /// What the response budget did to this payload: the budget applied and what
+    /// the response measured before it. Present only on the retrieval tools the
+    /// budget governs, and written by [`finalize_bounded`] AFTER this struct is
+    /// serialized, because the number it reports is a property of the bytes the
+    /// envelope itself rides in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<crate::budget::BudgetAccounting>,
 }
 
 impl Envelope {
@@ -252,6 +260,7 @@ impl Envelope {
                 offline_fallback: Some(true),
                 ..Degraded::default()
             },
+            response: None,
         }
     }
 
@@ -266,6 +275,7 @@ impl Envelope {
             graph_as_of: None,
             graph_state: GraphState::default(),
             degraded: Degraded::default(),
+            response: None,
         }
     }
 
@@ -321,6 +331,7 @@ impl Envelope {
                 daemon_unreachable: Some(true),
                 ..Degraded::default()
             },
+            response: None,
         }
     }
 
@@ -495,7 +506,7 @@ impl Envelope {
 ///
 /// `is_error` and any non-text content blocks are preserved unchanged.
 pub fn annotate(result: ToolCallResult, envelope: &Envelope) -> ToolCallResult {
-    annotate_inner(result, envelope, None)
+    annotate_inner(result, envelope, None, "", &ResponseBudget::default())
 }
 
 /// Like [`annotate`], but also attaches a confidence-qualified `negative` object
@@ -506,12 +517,14 @@ fn annotate_inner(
     result: ToolCallResult,
     envelope: &Envelope,
     negative: Option<&Value>,
+    tool_name: &str,
+    budget: &ResponseBudget,
 ) -> ToolCallResult {
     let envelope_value = envelope.to_value();
     let content = result
         .content
         .into_iter()
-        .map(|block| annotate_block(block, &envelope_value, negative))
+        .map(|block| annotate_block(block, &envelope_value, negative, tool_name, budget))
         .collect();
     ToolCallResult {
         content,
@@ -552,6 +565,26 @@ fn first_message_text(result: &ToolCallResult) -> Option<&str> {
 /// resolved answer from the same tool carried a full negative. That asymmetry
 /// is the one an agent cannot see, so the miss is qualified here too.
 pub fn finalize(result: ToolCallResult, base: Envelope, tool_name: &str) -> ToolCallResult {
+    finalize_bounded(result, base, tool_name, &ResponseBudget::default())
+}
+
+/// [`finalize`] under the size contract the CALL asked for.
+///
+/// This is the last point at which the bytes a client receives are known, so it
+/// is where the budget has to hold. The envelope and the `negative` object are
+/// part of those bytes and are attached here, which is why the payload cannot
+/// bound itself alone: a handler that cut to exactly its ceiling would go back
+/// over it the moment this function wrapped the result.
+///
+/// The budget never touches `_kin` or `negative`. Those are the fields that say
+/// how far the answer can be trusted, and an answer that was shortened is
+/// exactly when a caller needs them most.
+pub fn finalize_bounded(
+    result: ToolCallResult,
+    base: Envelope,
+    tool_name: &str,
+    budget: &ResponseBudget,
+) -> ToolCallResult {
     let payload = first_payload_value(&result);
     let envelope = match &payload {
         Some(payload) => base.with_payload_metadata(payload),
@@ -564,13 +597,15 @@ pub fn finalize(result: ToolCallResult, base: Envelope, tool_name: &str) -> Tool
         }),
         None => None,
     };
-    annotate_inner(result, &envelope, negative.as_ref())
+    annotate_inner(result, &envelope, negative.as_ref(), tool_name, budget)
 }
 
 fn annotate_block(
     block: ContentBlock,
     envelope_value: &Value,
     negative: Option<&Value>,
+    tool_name: &str,
+    budget: &ResponseBudget,
 ) -> ContentBlock {
     let ContentBlock::Text { text } = block;
     let annotated = match serde_json::from_str::<Value>(&text) {
@@ -602,9 +637,48 @@ fn annotate_block(
             Value::Object(map)
         }
     };
+    let mut annotated = annotated;
+    apply_response_budget(&mut annotated, tool_name, budget);
     let rendered =
         serde_json::to_string_pretty(&annotated).unwrap_or_else(|_| annotated.to_string());
     ContentBlock::Text { text: rendered }
+}
+
+/// Bound the fully annotated payload and record what that cost under
+/// `_kin.response`.
+///
+/// The accounting stanza is written BEFORE the cut as well as after it. The
+/// number it carries is a property of the object it sits inside, so a stanza
+/// added afterwards would push a response that had just been cut to fit back
+/// over its ceiling by its own length. Writing it first means the ladder
+/// measures the bytes that actually ship. `chars_before` is then restored to the
+/// first measurement, which is the one taken before anything was removed.
+fn apply_response_budget(annotated: &mut Value, tool_name: &str, budget: &ResponseBudget) {
+    if !crate::budget::is_budgeted(tool_name) {
+        return;
+    }
+    let chars_before = crate::budget::measure(annotated);
+    let mut accounting = crate::budget::BudgetAccounting {
+        max_chars: budget.max_chars,
+        chars_before,
+        bounded: false,
+        compact: budget.compact,
+    };
+    write_response_accounting(annotated, &accounting);
+    if let Some(applied) = crate::budget::enforce(annotated, tool_name, budget) {
+        accounting = applied;
+        accounting.chars_before = chars_before;
+    }
+    write_response_accounting(annotated, &accounting);
+}
+
+fn write_response_accounting(annotated: &mut Value, accounting: &crate::budget::BudgetAccounting) {
+    if let Some(envelope) = annotated
+        .get_mut(ENVELOPE_KEY)
+        .and_then(Value::as_object_mut)
+    {
+        envelope.insert("response".to_string(), accounting.to_value());
+    }
 }
 
 #[cfg(test)]

@@ -409,33 +409,37 @@ pub use kin_ranking::entity_ranking::{
 /// lines from a 777-entity repository and the client refused the whole result,
 /// so the caller got neither the chain nor a way to ask for less.
 ///
-/// Sized against the tool-result ceilings agent clients actually apply, which
-/// are counted in tokens; at roughly 3.5 characters per token of JSON-wrapped
-/// source this leaves headroom under a 25k-token cap for the envelope the MCP
-/// path wraps around this payload.
+/// This is now an alias for [`crate::budget::RESPONSE_DEFAULT_MAX_CHARS`], the
+/// one default every retrieval tool is served under, rather than a number of its
+/// own. It had one, 80,000, chosen against the same client ceiling this is
+/// chosen against, and a `trace_data_flow` that came in at 79,278 characters,
+/// inside that budget, was refused by the client anyway. A per-tool budget that
+/// the tool alone believes in is how a bound reports success while the caller
+/// gets a file to read, so there is one number and every retrieval tool answers
+/// under it.
 ///
-/// Defined here rather than beside either walk because BOTH walks serve this one
-/// tool — the generic-store arm in `handlers::entities` and the body-inlining
-/// arm in `kin_cli::commands::trace_data_flow`, which reads these through this
-/// module. Two definitions would let one arm promise a bound the other does not
-/// keep.
-pub const TRACE_DEFAULT_MAX_RESPONSE_CHARS: usize = 80_000;
+/// Defined through this module rather than beside either walk because BOTH walks
+/// serve this one tool - the generic-store arm in `handlers::entities` and the
+/// body-inlining arm in `kin_cli::commands::trace_data_flow`, which reads these
+/// through here. Two definitions would let one arm promise a bound the other
+/// does not keep.
+pub const TRACE_DEFAULT_MAX_RESPONSE_CHARS: usize = crate::budget::RESPONSE_DEFAULT_MAX_CHARS;
 
 /// Floor for a caller-supplied budget. Below this the envelope alone does not
 /// fit, so a smaller number could only be honoured by returning nothing.
-pub const TRACE_MIN_MAX_RESPONSE_CHARS: usize = 2_000;
+pub const TRACE_MIN_MAX_RESPONSE_CHARS: usize = crate::budget::RESPONSE_MIN_MAX_CHARS;
 
 /// Ceiling for a caller-supplied budget. A caller with a larger window may raise
 /// the bound, but not to unbounded: the daemon serving this has other callers,
 /// and a response nothing can read is not worth building.
-pub const TRACE_MAX_MAX_RESPONSE_CHARS: usize = 400_000;
+pub const TRACE_MAX_MAX_RESPONSE_CHARS: usize = crate::budget::RESPONSE_MAX_MAX_CHARS;
 
 /// Characters held back from the budget for the disclosure a cut adds.
 ///
 /// A response cut to exactly its ceiling and then told to explain the cut is
 /// over its ceiling again, by the length of the explanation. Reserving the room
 /// first is what makes the bound hold for the payload that actually ships.
-pub const TRACE_DISCLOSURE_RESERVE_CHARS: usize = 1_500;
+pub const TRACE_DISCLOSURE_RESERVE_CHARS: usize = crate::budget::RESPONSE_DISCLOSURE_RESERVE_CHARS;
 
 /// The budget a trace request asks for, clamped to what this tool will serve.
 pub fn trace_response_budget(requested: Option<usize>) -> usize {
