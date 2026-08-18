@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.39] - 2026-08-18
+
+### Changed
+
+- Update h2 to 0.4.16 for RUSTSEC-2026-0258 (#895)
+- Count entity body previews as the graph bodies of parsed source paths in locate (#893)
+- Abandon v0.5.38: its frozen install proof fails on a body-coverage gap the tag cannot receive the fix for (#894)
+- Drop the Azure apt mirror on retry so a stalled package download cannot exhaust every attempt (#896)
+
+
 ## [0.5.38] - 2026-08-18
 
 ### Changed
