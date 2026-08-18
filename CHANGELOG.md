@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Choose, probe and report the filesystem projection across shim, NFS and FUSE (#930)
 - Make every dead-code surface answer one question and say what it did not check (#924)
 - Give the MCP belt a call that admits new source into the graph (#931)
+- Add Windows ProjFS as a fourth projection, and ship the mount features (#932)
 
 
 ## [0.5.40] - 2026-08-18
