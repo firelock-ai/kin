@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.38] - 2026-08-18
+
+### Changed
+
+- Stand the ambient reconcile tick down for a commit already inside the daemon (#860)
+- Install Rust toolchains from the runner's rustup instead of a downloaded action (#881)
+- Reuse the first Git source proof, draw admission progress on the phase line, and serve graph status from the daemon's cached authority (#873)
+- Exclude the store at init, report 1-based lines from kin refs, and make the context pack's cost honest (#874)
+- Re-resolve the spine's repository root on demand instead of once at startup (#880)
+- Gate absence authority on the cross-file edge classes a query reads (#872)
+- Pin kin-db 0.7.31 (#863)
+- Bind the release retry timeout test to its invariant, not an attempt count (#883)
+- Stop the supervisor reaping a daemon that has a commit in flight (#871)
+- Resolve a real commit identity or refuse, instead of stamping "Author: unknown" (#876)
+- Resolve call edges by receiver scope and role, and mark what each edge proved (#868)
+- Synchronise the exited-child reaper test on the exit itself (#884)
+- Read one reference collector for dead code and gate the delete list on measured edge coverage (#866)
+- Bound trace_data_flow's own response, order its fan-out by relevance, and give every step one shape (#867)
+- chore(ci): pin kin-actions v0.1.30 (#885)
+- Model JavaScript and TypeScript receivers, classes and requires as a graph (#864)
+- Report graph-body coverage, and make each status counter name the view it shows (#875)
+- Cache the Rust dependency layer so a source-only push stops recompiling the world (#879)
+- Report 1-indexed lines from kin search and kin overview, and finish the three fixes kin#874 left short (#878)
+- Emit and resolve a reference edge when a Python symbol is used as a value (#877)
+- Derace the session-registry idle-window and default-TTL tests (#886)
+- Derace eight process-lifecycle, lock and runtime tests on their own events (#887)
+- Resolve cross-file relations on the live reconcile path, in both write orders (#870)
+- Resolve a receiver-method call by the receiver's nameable type (#888)
+- Bound every apt install in CI so a stalled mirror fails fast instead of holding the job (#889)
+- Assert the daemon clock tests on their own stamps instead of adjacent clock reads (#890)
+- Scope the admission progress ladder to the thread that installs it (#891)
+
+
 ## [0.5.37] - 2026-08-17
 
 ### Changed

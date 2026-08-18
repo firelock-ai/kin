@@ -282,12 +282,32 @@ fn swift_method_call_emits_rightmost_name() {
 
 #[test]
 fn go_function_value_argument_emits_reference() {
-    // Go is the only adapter that turns a bare function passed as a value into a
-    // graph edge: `register(plain)` yields a References edge to `plain`.
+    // Go and Python turn a bare function passed as a value into a graph edge:
+    // `register(plain)` yields a References edge to `plain`. TypeScript, Java
+    // and Ruby still do not, which is what the ignored cases below record.
     let out = extract(
         &GoAdapter,
         "s.go",
         "package main\nfunc plain() {}\nfunc run() { register(plain) }\n",
+    );
+    assert!(
+        has_edge(&out, RelationKind::References, "run", "plain"),
+        "expected References run -> plain, got {:?}",
+        out.relations
+            .iter()
+            .map(|r| (r.kind, r.src_name.as_str(), r.dst_name.as_str()))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn python_function_value_argument_emits_reference() {
+    // The argparse shape: `set_defaults(func=cmd_ingest)` never calls
+    // `cmd_ingest`, so the References edge is the only one it can own.
+    let out = extract(
+        &PythonAdapter,
+        "s.py",
+        "def plain():\n    return 1\n\ndef run():\n    register(func=plain)\n",
     );
     assert!(
         has_edge(&out, RelationKind::References, "run", "plain"),

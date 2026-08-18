@@ -340,11 +340,25 @@ fn resolve_against(base: &Path, target: &str) -> PathBuf {
 
 /// Whether some rule Git already reads keeps the store out of `git status`.
 ///
-/// Checked against both places a rule can already live for this repository:
-/// the local excludes this command writes, and the tracked `.gitignore` a
-/// project may have adopted on its own. Either one makes writing a second rule
-/// pure noise.
+/// Git is asked for the rules it actually resolves, which is the only answer
+/// that matches what the author will see. That covers a rule living in a
+/// `core.excludesFile` outside the repository, and it reads a later `!.kin`
+/// negation as Git reads it, where matching exclude-file lines against a fixed
+/// set of spellings would call the store excluded when `git status` still names
+/// it.
+///
+/// The line scan below stands in only when the question cannot be put to Git at
+/// all, which is a directory carrying a `.git` that is not an openable
+/// repository. Nothing there resolves ignore rules either, so the two files a
+/// rule can be written into are the whole of what a reader could consult.
 fn store_already_excluded(working_dir: &Path, common_dir: &Path) -> Result<bool> {
+    match kin_git::kin_store_is_git_ignored(working_dir) {
+        Ok(excluded) => return Ok(excluded),
+        Err(error) => tracing::debug!(
+            %error,
+            "Git could not resolve ignore rules here; reading the exclude files directly"
+        ),
+    }
     for candidate in [
         common_dir.join("info").join("exclude"),
         working_dir.join(".gitignore"),
@@ -1006,6 +1020,45 @@ mod tests {
                 "{name} must be untouched"
             );
         }
+    }
+
+    /// A rule Git resolves from outside the repository is honored.
+    ///
+    /// `core.excludesFile` names a file that is neither the local exclude nor
+    /// the tracked ignore file, so reading those two alone reports the store as
+    /// visible and writes a rule Git already had. The fixture proves Git itself
+    /// agrees before the decision is asked for: the store is on disk and absent
+    /// from `git status`.
+    #[test]
+    fn a_rule_resolved_from_outside_the_repository_is_honored() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        let excludes = dir.path().join("global-excludes");
+        std::fs::write(&excludes, "/.kin/\n").unwrap();
+        git(
+            &repo,
+            &["config", "core.excludesFile", excludes.to_str().unwrap()],
+        );
+        write_store(&repo);
+
+        let status = git_status(&repo);
+        assert!(
+            !status.contains(".kin"),
+            "the fixture must start with the store already hidden: {status:?}"
+        );
+
+        assert!(
+            exclude_store_from_git(&repo).unwrap().is_none(),
+            "a rule Git already resolves must not be restated locally"
+        );
+        let info_exclude = std::fs::read_to_string(repo.join(".git").join("info").join("exclude"))
+            .unwrap_or_default();
+        assert!(
+            !info_exclude.contains(".kin"),
+            "no second rule may be written: {info_exclude:?}"
+        );
     }
 
     /// A directory Git does not own is not this command's to write into.

@@ -14058,27 +14058,32 @@ mod tests {
         let first = ProjectionRoot::open(root.path()).unwrap();
 
         let contender_root = root.path().to_path_buf();
+        // Unbounded, so the send never blocks the contender and cannot inflate
+        // the wait it is about to measure. The stamp precedes the send, which is
+        // what puts the contender's clock ahead of the hold rather than after
+        // however long the OS took to schedule the thread.
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
         let contender = std::thread::spawn(move || {
             let started = std::time::Instant::now();
+            ready_tx.send(()).unwrap();
             let opened = ProjectionRoot::open_with_projection_lock_deadline(
                 &contender_root,
-                std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(60),
             );
             (opened.map(|_| ()), started.elapsed())
         });
 
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        ready_rx.recv().unwrap();
+        let hold_began = std::time::Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let held_for = hold_began.elapsed();
         drop(first);
 
         let (opened, waited) = contender.join().unwrap();
         opened.expect("the contender must acquire once the holder releases");
         assert!(
-            waited >= std::time::Duration::from_millis(250),
-            "the contender should have genuinely waited, waited {waited:?}"
-        );
-        assert!(
-            waited < std::time::Duration::from_secs(10),
-            "the contender must not burn the full deadline once the lock frees"
+            waited >= held_for,
+            "the contender must wait out the whole hold, held {held_for:?} but waited {waited:?}"
         );
     }
 

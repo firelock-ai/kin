@@ -599,7 +599,9 @@ response with the token accounting included. Reach for it when a question is abo
 unit of code in context (\"what does X do and what does it touch?\") rather than a single \
 isolated body. Its value is that it replaces an open-ended chain of \
 get_entity_source / find_references calls — which burns round-trips and easily blows \
-your context window — with one budgeted call that stays within the limit you set. \
+your context window — with one budgeted call. `token_budget` bounds the content the pack \
+selects, and it cannot bound the envelope that content travels in, so read `tokens_used`, \
+which measures the serialized response this call returns, as what the call costs you. \
 `focal_entity.body` in the response IS the focal entity's exact source text, so this one \
 call already answers \"show me the code\": no follow-up read is needed, and it is the body \
 to edit and stage back. If get_entity_source is available to you it is cheaper for a raw \

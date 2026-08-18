@@ -2217,6 +2217,14 @@ impl DaemonState {
         phases.record("lkg_seed", || {
             reconciler.seed_lkg_entities_from_graph(graph.as_ref())
         });
+        // Index the cross-file linker's entity universe from the same snapshot.
+        // Without it every live reconcile resolves against an empty universe,
+        // reports every destination missing, and the graph keeps intra-file
+        // edges only. One pass here; every write after it is bounded by the
+        // edited file rather than by repository size.
+        phases.record("cross_file_seed", || {
+            reconciler.seed_cross_file_linker_from_graph(graph.as_ref())
+        });
 
         // Wire the traffic checker so reconcile mutations are gated by active
         // intents/leases. Without this, check_scopes() in the reconciler
@@ -2443,6 +2451,7 @@ impl DaemonState {
         let vector_index_discarded = Self::load_validated_vector_index(&layout, graph.as_ref());
         let mut reconciler = Reconciler::new(layout.working_dir().to_path_buf());
         reconciler.seed_lkg_entities_from_graph(graph.as_ref());
+        reconciler.seed_cross_file_linker_from_graph(graph.as_ref());
 
         let traffic_checker =
             crate::traffic_adapter::CoordinatorTrafficChecker::new(Arc::clone(&graph));
@@ -6147,10 +6156,48 @@ mod tests {
         let repo_dir = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo_dir.path()).unwrap();
         let state = test_state(init.layout, repo_dir.path());
+        let seeded = *state
+            .last_mutation
+            .lock()
+            .expect("a fresh daemon state has an unpoisoned mutation clock");
+        let epoch_before = state.mutation_epoch.load(Ordering::SeqCst);
+
         std::thread::sleep(Duration::from_millis(25));
-        assert!(state.time_since_mutation() >= Duration::from_millis(20));
+        let before = state.time_since_mutation();
+        assert!(
+            before >= Duration::from_millis(20),
+            "the mutation clock must count from construction until the first mark_dirty, got {before:?}"
+        );
+
+        let t0 = Instant::now();
         state.mark_dirty();
-        assert!(state.time_since_mutation() < Duration::from_millis(20));
+        let t1 = Instant::now();
+
+        let advanced = *state
+            .last_mutation
+            .lock()
+            .expect("a fresh daemon state has an unpoisoned mutation clock");
+        assert!(
+            advanced > seeded,
+            "mark_dirty must advance the mutation clock: seeded={seeded:?} advanced={advanced:?}"
+        );
+        assert!(
+            advanced >= t0 && advanced <= t1,
+            "mark_dirty must restart the quiescence window from the moment of the call, not from an older instant: the call spanned {:?}",
+            t1 - t0
+        );
+        assert_eq!(
+            state.mutation_epoch.load(Ordering::SeqCst),
+            epoch_before + 1,
+            "mark_dirty must record exactly one mutation"
+        );
+
+        let since = state.time_since_mutation();
+        let stamp_age = advanced.elapsed();
+        assert!(
+            since <= stamp_age,
+            "time_since_mutation must be measured from the advanced stamp, not an earlier clock: since={since:?} stamp_age={stamp_age:?}"
+        );
     }
 
     #[test]
@@ -8060,6 +8107,11 @@ mod tests {
         // `last_activity_ms` is seeded to 0, so before any activity the idle
         // clock counts from `started_at`. Let real time pass, then confirm the
         // idle duration has grown.
+        assert_eq!(
+            state.last_activity_ms.load(Ordering::SeqCst),
+            0,
+            "the activity marker must start unset so the idle clock counts from startup"
+        );
         tokio::time::sleep(Duration::from_millis(30)).await;
         let before = state.idle_duration();
         assert!(
@@ -8068,13 +8120,17 @@ mod tests {
         );
 
         // The idle monitor calls touch_activity() when it starts so the idle
-        // window begins from readiness, not process construction. Confirm the
-        // clock resets back toward zero.
+        // window begins from readiness, not process construction.
         state.touch_activity();
+        let credited_ms = state.last_activity_ms.load(Ordering::SeqCst);
+        assert!(
+            credited_ms >= 20,
+            "touch_activity must stamp the marker with the uptime it observed, got {credited_ms}ms"
+        );
         let after = state.idle_duration();
         assert!(
-            after < before,
-            "touch_activity must reset the idle clock: before={before:?} after={after:?}"
+            after + Duration::from_millis(credited_ms) <= state.started_at.elapsed(),
+            "idle_duration must count from the activity marker, not from startup: after={after:?} credited={credited_ms}ms"
         );
     }
 

@@ -17,8 +17,8 @@ use crate::extract::{
 // nodes in both grammars. Sharing them keeps the two adapters from drifting into
 // different answers for the same source.
 use super::javascript::{
-    collect_js_require_imports, extract_js_assignment_function, extract_js_object_methods,
-    js_heritage_name, js_require_target, JsOwners,
+    collect_js_require_imports, extract_calls_from_context, extract_js_assignment_function,
+    extract_js_object_methods, js_heritage_name, js_require_target, JsOwners,
 };
 
 pub struct TypeScriptAdapter;
@@ -151,7 +151,7 @@ fn extract_ts_node(
                     span: span_from_node(node, file_id),
                 });
                 // Extract calls within function body
-                extract_calls_from_context(node, source, &name, relations);
+                extract_calls_from_context(node, source, &name, None, relations);
             }
         }
         "class_declaration" => {
@@ -313,6 +313,7 @@ fn extract_ts_node(
                                 &value_node,
                                 source,
                                 context_name,
+                                None,
                                 relations,
                             );
                         }
@@ -441,7 +442,7 @@ fn extract_ts_class_member(
                     import_source: None,
                 });
                 // Extract calls within method body
-                extract_calls_from_context(node, source, &qualified, relations);
+                extract_calls_from_context(node, source, &qualified, Some(class_name), relations);
             }
         }
         _ => {}
@@ -683,62 +684,6 @@ fn extract_preceding_comment(node: &tree_sitter::Node, source: &[u8]) -> Option<
     } else {
         None
     }
-}
-
-/// Extract all function/method calls within a function/method body.
-/// The `context_name` parameter is the name of the containing function or qualified method name.
-/// This identifies cross-file references (unresolved function names from AST).
-///
-/// For a `call_expression`, the `function` field is the callee. We unpack
-/// `member_expression` callees to the rightmost identifier (`a.b()` -> `b`),
-/// so graph edges key on the simple method name rather than the dotted
-/// source text. `new X()` is a `new_expression` (not `call_expression`) and
-/// is intentionally skipped here.
-fn extract_calls_from_context(
-    node: &tree_sitter::Node,
-    source: &[u8],
-    context_name: &str,
-    relations: &mut Vec<ExtractedRelation>,
-) {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == "call_expression" {
-            if let Some(function) = child.child_by_field_name("function") {
-                let callee_name = match function.kind() {
-                    "member_expression" => function
-                        .child_by_field_name("property")
-                        .map(|f| f.utf8_text(source).unwrap_or("").to_string())
-                        .unwrap_or_default(),
-                    "identifier" => {
-                        let raw = function.utf8_text(source).unwrap_or("");
-                        raw.strip_prefix("this.").unwrap_or(raw).to_string()
-                    }
-                    _ => String::new(),
-                };
-                if is_valid_callee_name(&callee_name) {
-                    relations.push(ExtractedRelation {
-                        receiver: None,
-                        call_shape: None,
-                        kind: kin_model::RelationKind::Calls,
-                        src_name: context_name.to_string(),
-                        dst_name: callee_name,
-                        import_source: None,
-                    });
-                }
-            }
-        }
-        // Recurse into child nodes
-        extract_calls_from_context(&child, source, context_name, relations);
-    }
-}
-
-/// Check if a callee name is valid (not a literal, not empty).
-fn is_valid_callee_name(name: &str) -> bool {
-    !name.is_empty()
-        && !name.starts_with('"')
-        && !name.starts_with('\'')
-        && !name.starts_with('`')
-        && !name.chars().all(|c| c.is_numeric())
 }
 
 /// Extract import-like file context from import and re-export statements.

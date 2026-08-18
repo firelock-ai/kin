@@ -121,7 +121,7 @@ pub struct UnresolvedRelation {
 }
 
 /// Data for a single parsed file, used for cross-file linking.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FileParseData {
     /// Relative file path (e.g., "src/app/api/chat/route.ts").
     pub file_path: String,
@@ -283,11 +283,13 @@ fn entity_link_order(a: &Entity, b: &Entity) -> std::cmp::Ordering {
 /// The bare (unqualified) leaf of an entity name: the part after the final
 /// `::` or `.` separator, or the whole name when it carries no qualifier.
 ///
-/// Shared by the batch [`link_cross_file`] entity index and the
-/// [`IncrementalLinker`] bare-name index so both derive receiver-method leaf
-/// names identically — a divergence here would resolve the same call to
-/// different entities across the two linkers.
-fn bare_entity_name(name: &str) -> &str {
+/// Shared by the batch [`link_cross_file`] entity index, the
+/// [`IncrementalLinker`] bare-name index, and the live reconcile path's
+/// destination-name evidence so all three derive receiver-method leaf names
+/// identically. A divergence here would resolve the same call to different
+/// entities across the two linkers, or let a reconcile retire an edge whose
+/// destination the file still names under its qualified spelling.
+pub fn bare_entity_name(name: &str) -> &str {
     match name.rfind("::") {
         Some(idx) => &name[idx + 2..],
         None => match name.rfind('.') {
@@ -1082,18 +1084,39 @@ fn resolve_one_file(
             && !unresolvable_name_ambiguity
             && !bare_candidates.is_empty()
         {
-            let mut distinct_targets: HashSet<EntityId> = HashSet::new();
-            for &(fp, dst_id) in bare_candidates {
-                if fp != file.file_path.as_str()
-                    && blind_inference_target_allowed(src_id, dst_id, &ctx.entity_language_by_id)
-                {
-                    distinct_targets.insert(dst_id);
-                }
-            }
-            let distinct_targets =
-                prune_ids_by_arity(distinct_targets, call_arity, &ctx.entity_arity_by_id);
-            let distinct_targets =
-                narrow_candidates_by_role(src_id, distinct_targets, &ctx.entity_role_by_id);
+            let candidates: Vec<(&str, EntityId)> = bare_candidates
+                .iter()
+                .copied()
+                .filter(|&(fp, dst_id)| {
+                    fp != file.file_path.as_str()
+                        && blind_inference_target_allowed(
+                            src_id,
+                            dst_id,
+                            &ctx.entity_language_by_id,
+                        )
+                })
+                .collect();
+            let candidates = prune_pairs_by_arity(candidates, call_arity, &ctx.entity_arity_by_id);
+            let candidates = narrow_pairs_by_role(src_id, candidates, &ctx.entity_role_by_id);
+            let candidates = if receiver_is_object {
+                let owner_bound = owner_bound_targets(
+                    dst_lookup,
+                    ctx.import_map.get(file.file_path.as_str()),
+                    |key, bound| {
+                        if let Some(named) = ctx.entity_by_name.get(key) {
+                            bound.extend(named.iter().map(|&(_, id)| id));
+                        }
+                    },
+                );
+                let targets = caller_import_targets.get_or_insert_with(|| {
+                    resolve_caller_import_targets(&file.file_path, &file.imports, &ctx.known_files)
+                });
+                narrow_pairs_by_receiver_reach(candidates, targets, &owner_bound)
+            } else {
+                candidates
+            };
+            let distinct_targets: HashSet<EntityId> =
+                candidates.into_iter().map(|(_, id)| id).collect();
             if (1..=AMBIGUOUS_CALL_FANOUT_CAP).contains(&distinct_targets.len()) {
                 for dst_id in sorted_fanout_targets(distinct_targets) {
                     accumulate_relation(
@@ -2802,6 +2825,63 @@ fn narrow_pairs_by_role<'a>(
         .collect()
 }
 
+/// The receiver-method candidates whose owning type the calling file binds by
+/// name.
+///
+/// A method entity is keyed `Owner.method` or `Owner::method`, so a file's
+/// import bindings name candidate owners directly: for each local name an
+/// import introduces, the two owner-qualified spellings of the call's leaf
+/// select exactly the methods that name's type defines. `named_ids` is the
+/// caller's exact-name index, consulted once per import binding rather than
+/// once per candidate.
+fn owner_bound_targets(
+    leaf: &str,
+    file_imports: Option<&HashMap<&str, (&str, &str)>>,
+    mut named_ids: impl FnMut(&str, &mut HashSet<EntityId>),
+) -> HashSet<EntityId> {
+    let mut bound = HashSet::new();
+    let Some(file_imports) = file_imports else {
+        return bound;
+    };
+    for local_name in file_imports.keys() {
+        for key in receiver_method_keys(local_name, leaf) {
+            named_ids(&key, &mut bound);
+        }
+    }
+    bound
+}
+
+/// Narrow a receiver-method fan-out to the candidates the calling file can
+/// reach.
+///
+/// A call through an object dispatches on the receiver's static type, and a
+/// file that neither binds that type by name nor imports the module defining it
+/// cannot be holding one. Such a candidate is a same-named method of a type
+/// this file never sees, so it is not a dispatch target here however many other
+/// files do reach it.
+///
+/// Narrowing happens only when at least one candidate IS reached. A file whose
+/// imports account for none of them has no type evidence to narrow on, so it
+/// fans out exactly as before rather than losing every candidate to a rule that
+/// could not see any of them.
+fn narrow_pairs_by_receiver_reach<'a>(
+    candidates: Vec<(&'a str, EntityId)>,
+    import_target_files: &HashSet<String>,
+    owner_bound: &HashSet<EntityId>,
+) -> Vec<(&'a str, EntityId)> {
+    let reached: Vec<(&str, EntityId)> = candidates
+        .iter()
+        .copied()
+        .filter(|(file_path, id)| {
+            import_target_files.contains(*file_path) || owner_bound.contains(id)
+        })
+        .collect();
+    if reached.is_empty() {
+        return candidates;
+    }
+    reached
+}
+
 /// Confidence for a call through a receiver the file's own imports bind to a
 /// repo-local module, resolved inside that module. The module is known and the
 /// symbol was selected within it, so this is import-scoped: the same band as
@@ -3874,6 +3954,7 @@ fn resolve_default_export(target_file: &str, universe_entities: &[&Entity]) -> O
 ///
 /// Keeps entity indices in-memory to avoid O(N) universe cloning and map rebuilding
 /// per commit during history hydration.
+#[derive(Debug)]
 pub struct IncrementalLinker {
     /// Graph-assigned artifact identity for every known repository path.
     artifact_ids: ArtifactIdentityMap,
@@ -4902,7 +4983,7 @@ fn resolve_one_file_incremental(
         if name_fallback_allowed && !unresolvable_name_ambiguity && rel.kind == RelationKind::Calls
         {
             if let Some(bare_candidates) = linker.entity_by_bare_name.get(dst_lookup) {
-                let distinct_targets: HashSet<EntityId> = bare_candidates
+                let candidates: Vec<(&str, EntityId)> = bare_candidates
                     .iter()
                     .filter(|(fp, dst_id)| {
                         fp != &file.file_path
@@ -4912,12 +4993,35 @@ fn resolve_one_file_incremental(
                                 &linker.entity_language_by_id,
                             )
                     })
-                    .map(|(_, id)| *id)
+                    .map(|(fp, id)| (fp.as_str(), *id))
                     .collect();
-                let distinct_targets =
-                    prune_ids_by_arity(distinct_targets, call_arity, &linker.entity_arity_by_id);
-                let distinct_targets =
-                    narrow_candidates_by_role(src_id, distinct_targets, &linker.entity_role_by_id);
+                let candidates =
+                    prune_pairs_by_arity(candidates, call_arity, &linker.entity_arity_by_id);
+                let candidates =
+                    narrow_pairs_by_role(src_id, candidates, &linker.entity_role_by_id);
+                let candidates = if receiver_is_object {
+                    let owner_bound = owner_bound_targets(
+                        dst_lookup,
+                        import_map.get(file.file_path.as_str()),
+                        |key, bound| {
+                            if let Some(named) = linker.entity_by_name.get(key) {
+                                bound.extend(named.iter().map(|(_, id)| *id));
+                            }
+                        },
+                    );
+                    let targets = caller_import_targets.get_or_insert_with(|| {
+                        resolve_caller_import_targets(
+                            &file.file_path,
+                            &file.imports,
+                            &linker.known_files,
+                        )
+                    });
+                    narrow_pairs_by_receiver_reach(candidates, targets, &owner_bound)
+                } else {
+                    candidates
+                };
+                let distinct_targets: HashSet<EntityId> =
+                    candidates.into_iter().map(|(_, id)| id).collect();
                 if (1..=AMBIGUOUS_CALL_FANOUT_CAP).contains(&distinct_targets.len()) {
                     for dst_id in sorted_fanout_targets(distinct_targets) {
                         accumulate_relation(

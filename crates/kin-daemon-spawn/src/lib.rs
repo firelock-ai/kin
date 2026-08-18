@@ -3787,6 +3787,9 @@ mod tests {
     const ESCAPE_GROUP_ENV: &str = "KIN_INTERNAL_TEST_ESCAPE_GROUP";
 
     #[cfg(unix)]
+    const ESCAPE_GROUP_REPORT_ENV: &str = "KIN_INTERNAL_TEST_ESCAPE_GROUP_REPORT";
+
+    #[cfg(unix)]
     const OWNER_DEATH_DRIVER_ENV: &str = "KIN_INTERNAL_TEST_GUARDIAN_OWNER_DEATH_DRIVER";
 
     #[cfg(unix)]
@@ -3843,6 +3846,18 @@ mod tests {
         if std::env::var_os(ESCAPE_GROUP_ENV).is_some() {
             assert_ne!(unsafe { libc::setsid() }, -1, "escape target process group");
         }
+        // Read outside the branch above, never inside it. A successful setsid
+        // makes the caller its own group leader, so a value sampled inside that
+        // branch is this process's own pid by construction and can never equal
+        // the guardian's group, which would make the reader's assertion hold in
+        // every reachable path. Sampling here is what lets that assertion fail
+        // when the escape did not happen.
+        if let Some(report) = std::env::var_os(ESCAPE_GROUP_REPORT_ENV) {
+            publish_test_report(
+                &PathBuf::from(report),
+                format!("{}\n", unsafe { libc::getpgid(0) }),
+            );
+        }
         loop {
             unsafe {
                 libc::pause();
@@ -3876,6 +3891,9 @@ mod tests {
             .stderr(Stdio::null());
         if std::env::var_os(LATE_RELAY_ESCAPE_CHILD_ENV).is_some() {
             child.env(ESCAPE_GROUP_ENV, "1");
+            if let Some(escape_report) = std::env::var_os(ESCAPE_GROUP_REPORT_ENV) {
+                child.env(ESCAPE_GROUP_REPORT_ENV, escape_report);
+            }
         }
         let child = child.spawn().expect("spawn late inherited member");
         let child_id = child.id();
@@ -4676,7 +4694,8 @@ mod tests {
         wait_for_test_pid_gone(late_member_pid, Duration::from_secs(5));
     }
 
-    #[cfg(unix)]
+    // Same platform reasoning as the direct twin below.
+    #[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
     #[test]
     fn deliberate_late_setsid_escape_is_outside_the_guardian_contract() {
         use std::process::Stdio;
@@ -4685,12 +4704,14 @@ mod tests {
         let readiness_path = root.path().join("guardian.ready");
         let trigger_path = root.path().join("late-escape.trigger");
         let report_path = root.path().join("late-escape.report");
+        // A stem distinct from `late-escape.report`, because
+        // `publish_test_report` stages through `with_extension`.
+        let escape_report_path = root.path().join("late-escape-group.report");
         let executable = std::env::current_exe().unwrap();
         let launcher = ProcessGroupGuardianLauncher::exact_test(
             &executable,
             "tests::process_group_guardian_worker",
-        )
-        .with_cleanup_timeout(Duration::from_millis(150));
+        );
         let mut guardian = launcher
             .spawn_with(
                 &readiness_path,
@@ -4706,6 +4727,7 @@ mod tests {
             .env(LATE_RELAY_TRIGGER_ENV, &trigger_path)
             .env(LATE_RELAY_REPORT_ENV, &report_path)
             .env(LATE_RELAY_ESCAPE_CHILD_ENV, "1")
+            .env(ESCAPE_GROUP_REPORT_ENV, &escape_report_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -4719,20 +4741,27 @@ mod tests {
         .parse::<libc::pid_t>()
         .unwrap();
         assert!(relay.wait().unwrap().success());
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while unsafe { libc::getpgid(late_member_pid) } == target_group {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "late inherited member did not escape the target group"
-            );
-            std::thread::sleep(PROCESS_GROUP_GUARDIAN_POLL_INTERVAL);
-        }
+        let escaped_group =
+            wait_for_test_report_fields(&escape_report_path, 1, Duration::from_secs(10))[0]
+                .parse::<libc::pid_t>()
+                .unwrap();
+        assert_ne!(
+            escaped_group, target_group,
+            "late inherited member did not escape the target group"
+        );
 
         guardian.request_cleanup();
         guardian
-            .reap_until(std::time::Instant::now() + Duration::from_secs(2))
+            .reap_until(std::time::Instant::now() + Duration::from_secs(5))
             .expect("detached child is explicitly outside the cooperative group contract");
-        assert_eq!(unsafe { libc::kill(late_member_pid, 0) }, 0);
+        // This escapee is a reparented grandchild that init reaps, so a cleared
+        // slot makes `kill(pid, 0)` fail for a reason unrelated to the claim,
+        // and a zombie makes it succeed for one. Ask the product's own liveness
+        // primitive instead.
+        assert!(
+            !process_has_exited(late_member_pid).expect("poll the escaped late member"),
+            "watcher falsely claimed success by killing an out-of-group member"
+        );
 
         assert_eq!(unsafe { libc::kill(late_member_pid, libc::SIGKILL) }, 0);
         wait_for_test_pid_gone(late_member_pid, Duration::from_secs(5));
@@ -4965,19 +4994,25 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    // `process_has_exited` answers `Unsupported` outside macOS and Linux, and
+    // `process_group_containment` is `Indeterminate` there, so this test cannot
+    // pass on a third unix regardless of the product's behavior.
+    #[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
     #[test]
     fn deliberate_direct_setsid_escape_is_outside_the_guardian_contract() {
         use std::process::Stdio;
 
         let root = tempfile::tempdir().unwrap();
         let readiness_path = root.path().join("guardian.ready");
+        // A stem of its own: `publish_test_report` derives its staging name with
+        // `with_extension`, so two reports sharing a stem stage to names that
+        // differ only by pid.
+        let escape_report_path = root.path().join("direct-escape-group.report");
         let executable = std::env::current_exe().unwrap();
         let launcher = ProcessGroupGuardianLauncher::exact_test(
             &executable,
             "tests::process_group_guardian_worker",
-        )
-        .with_cleanup_timeout(Duration::from_millis(150));
+        );
         let mut guardian = launcher
             .spawn_with(
                 &readiness_path,
@@ -4995,27 +5030,29 @@ mod tests {
             ])
             .env(INERT_GROUP_MEMBER_ENV, "1")
             .env(ESCAPE_GROUP_ENV, "1")
+            .env(ESCAPE_GROUP_REPORT_ENV, &escape_report_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let mut escaped = guardian.spawn(escaped_command).unwrap();
-        let escaped_pid = libc::pid_t::try_from(escaped.id()).unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while unsafe { libc::getpgid(escaped_pid) } == target_group {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "escaped worker did not leave the target group"
-            );
-            std::thread::sleep(PROCESS_GROUP_GUARDIAN_POLL_INTERVAL);
-        }
+        let escaped_group =
+            wait_for_test_report_fields(&escape_report_path, 1, Duration::from_secs(10))[0]
+                .parse::<libc::pid_t>()
+                .unwrap();
+        assert_ne!(
+            escaped_group, target_group,
+            "escaped worker did not leave the target group"
+        );
 
         guardian.request_cleanup();
         guardian
-            .reap_until(std::time::Instant::now() + Duration::from_secs(2))
+            .reap_until(std::time::Instant::now() + Duration::from_secs(5))
             .expect("detached child is explicitly outside the cooperative group contract");
-        assert_eq!(
-            unsafe { libc::kill(escaped_pid, 0) },
-            0,
+        assert!(
+            escaped
+                .try_wait()
+                .expect("poll the escaped member")
+                .is_none(),
             "watcher falsely claimed success by killing an out-of-group member"
         );
 
