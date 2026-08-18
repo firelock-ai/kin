@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Paint the refs rows the product composes, and pin the fixture Git scope an admission proof reads (#925)
 - Move the kin registry pins to kin-db 0.7.35, kin-model 0.7.9, and kin-vector 0.1.12 (#926)
 - Resolve a Rust method call by its receiver and refuse a bare prelude call (#923)
+- Prove each configured MCP client with a real tool call before setup claims it works (#928)
+- Choose, probe and report the filesystem projection across shim, NFS and FUSE (#930)
 
 
 ## [0.5.40] - 2026-08-18
