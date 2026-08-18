@@ -27,6 +27,9 @@ RELEASE_RECOVERY = WORKFLOWS / "release-recovery.yml"
 RELEASE_TAG = WORKFLOWS / "release-tag.yml"
 RELEASE_TRAIN = WORKFLOWS / "release-train.yml"
 RELEASE_SENTINEL = WORKFLOWS / "release-sentinel.yml"
+SAST = WORKFLOWS / "sast.yml"
+ADVISORY_SWEEP = WORKFLOWS / "advisory-sweep.yml"
+ADVISORY_SWEEP_SCRIPT = ROOT / "scripts" / "advisory-sweep.mjs"
 HOLD_ALARM = ROOT / "scripts" / "release-hold-alarm.mjs"
 HOLD_ALARM_POLICY = "scripts/release-hold-alarm.mjs"
 INSTALL_PROOF_CANARY = WORKFLOWS / "install-proof-canary.yml"
@@ -140,6 +143,16 @@ BASE_IMAGE_PINS = WORKFLOWS / "base-image-pins.yml"
 RUST_CACHE_ACTION = "Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4"
 MAIN_ONLY_CACHE_SAVE = "save-if: ${{ github.ref == 'refs/heads/main' }}"
 MAIN_ONLY_CACHE_SAVE_VALUE = "${{ github.ref == 'refs/heads/main' }}"
+# A job that reads the cache entry another job writes, and must never write it
+# itself, saves on no ref at all. That is strictly narrower than the main-only
+# scalar and never broader, so it cannot become the way an untrusted ref
+# poisons a cache. These two values are the whole allowlist and anything else
+# is still rejected. Nothing here has to re-prove that a saver still exists:
+# the falsification below pins the check job's own main-only save by count.
+RESTORE_ONLY_CACHE_SAVE_VALUE = "false"
+CACHE_SAVE_VALUES = frozenset(
+    {MAIN_ONLY_CACHE_SAVE_VALUE, RESTORE_ONLY_CACHE_SAVE_VALUE}
+)
 RUST_CACHE_REFERENCE = re.compile(r"Swatinem/rust-cache@", re.IGNORECASE)
 CANONICAL_STEP_FIELDS = frozenset(
     {
@@ -288,6 +301,9 @@ jobs:
 REQUIRED_RELEASE_CHECKS = (
     "Check & Test (ubuntu-latest)",
     "Check & Test (macos-latest)",
+    "Falsify guards",
+    "Feature permutation tests (ubuntu-latest)",
+    "Feature permutation tests (macos-latest)",
     "DCO Sign-off",
     "cargo-deny",
     "gitleaks (full history)",
@@ -493,9 +509,26 @@ CI_JOB_DISPLAY_NAMES = {
     "changes": "Classify diff scope",
     "check-docs-only": "Check & Test",
     "check": "Check & Test",
+    # Both were steps inside `check` and are jobs so they stop sitting on the
+    # merge queue's critical path. Neither is a required context until the
+    # branch ruleset names it, so each is listed here to be reviewed as a
+    # producer, and the ruleset is what makes it block.
+    "falsify-guards": "Falsify guards",
+    "feature-tests-docs-only": "Feature permutation tests",
+    "feature-tests": "Feature permutation tests",
     "coverage": "Code Coverage",
+    "install-proof-pr-build": "Install Proof (PR) Build",
+    "install-proof-pr": "Install Proof (PR)",
+    "install-proof-pr-gate": "Install Proof (PR) Gate",
 }
 EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
+    # The scheduled advisory sweep. It publishes no required context and runs on
+    # no pull-request or merge-group event, so it can never claim one; it is
+    # registered here because this census is what would otherwise let a new
+    # job's NAME appear unreviewed.
+    ".github/workflows/advisory-sweep.yml": {
+        "sweep": "Sweep advisories",
+    },
     ".github/workflows/approve-to-merge.yml": {
         "gate": None,
     },
@@ -621,7 +654,7 @@ EXPECTED_DYNAMIC_JOB_CONTEXT_SHA256 = {
     (
         ".github/workflows/install-proof.yml",
         "install-proof",
-    ): "91bbe7dd412df4ade467a53be2618eb8199bc746b682ae5f27552649009446b4",
+    ): "44b510d0d82f7b56b525b08f38a3f84916243c30e9c365b340718670f95af1ca",
     (
         ".github/workflows/release.yml",
         "build",
@@ -640,6 +673,13 @@ REQUIRED_CHECK_JOB_PRODUCERS = {
         (".github/workflows/ci.yml", "check-docs-only"),
         (".github/workflows/ci.yml", "check"),
     },
+    "Falsify guards": {
+        (".github/workflows/ci.yml", "falsify-guards"),
+    },
+    "Feature permutation tests": {
+        (".github/workflows/ci.yml", "feature-tests-docs-only"),
+        (".github/workflows/ci.yml", "feature-tests"),
+    },
     "DCO Sign-off": {
         (".github/workflows/ci.yml", "dco"),
     },
@@ -652,6 +692,14 @@ REQUIRED_CHECK_JOB_PRODUCERS = {
     "Windows installer + vector release build": {
         (".github/workflows/ci.yml", "windows-installer"),
     },
+    # The pull-request install proof's required context is this gate rather
+    # than the reusable call's per-leg checks. A reusable-workflow call
+    # publishes `<caller> / <leg>`, and a caller that skips publishes nothing
+    # under that name at all, so requiring a leg would hang every
+    # documentation-only pull request on a check that will never report.
+    "Install Proof (PR) Gate": {
+        (".github/workflows/ci.yml", "install-proof-pr-gate"),
+    },
 }
 # Durable workflow IDs are GitHub's repository-scoped identity, while `path`
 # makes that identity reviewable in source. These values are also exercised
@@ -663,6 +711,17 @@ REQUIRED_RELEASE_CHECK_PROVENANCE = {
         "push",
     ),
     "Check & Test (macos-latest)": (
+        245_803_170,
+        ".github/workflows/ci.yml",
+        "push",
+    ),
+    "Falsify guards": (245_803_170, ".github/workflows/ci.yml", "push"),
+    "Feature permutation tests (ubuntu-latest)": (
+        245_803_170,
+        ".github/workflows/ci.yml",
+        "push",
+    ),
+    "Feature permutation tests (macos-latest)": (
         245_803_170,
         ".github/workflows/ci.yml",
         "push",
@@ -2577,6 +2636,154 @@ def assert_install_proof_embedding_settles_before_measurement(embedding: str) ->
             )
 
 
+INSTALL_PROOF_MATRIX_PATTERN = re.compile(
+    r"^include: \$\{\{ fromJSON\(inputs\.local_artifact "
+    r"&& '(?P<pull_request>\[.*?\])' \|\| '(?P<release>\[.*?\])'\) \}\}$"
+)
+
+
+def install_proof_matrix_rows(install_job: str) -> tuple[
+    list[dict[str, object]], list[dict[str, object]]
+]:
+    """Decode both reviewed install-proof matrices from their one expression.
+
+    The release matrix is the default and the pull-request matrix is the
+    override, and the job carries exactly one line that can produce either.
+    Decoding it here is what lets the posture assertions below judge rows
+    rather than YAML text, so neither list can gain a platform, lose one, or
+    grow a second tolerated leg without this failing. A matrix built any other
+    way (a second expression, a literal include, a computed list) is refused
+    outright rather than read past.
+    """
+
+    strategy_lines = active_lines(dynamic_job_context_source(install_job))
+    includes = [line for line in strategy_lines if line.startswith("include:")]
+    if len(includes) != 1:
+        raise AssertionError(
+            "install-proof must declare exactly one matrix include line; "
+            f"found {includes}"
+        )
+    match = INSTALL_PROOF_MATRIX_PATTERN.fullmatch(includes[0])
+    if match is None:
+        raise AssertionError(
+            "install-proof matrix must be the reviewed release-or-pull-request "
+            f"expression; found `{includes[0]}`"
+        )
+    try:
+        release = json.loads(match.group("release"))
+        pull_request = json.loads(match.group("pull_request"))
+    except json.JSONDecodeError as error:
+        raise AssertionError(
+            f"install-proof matrix does not decode as JSON: {error}"
+        ) from error
+    return release, pull_request
+
+
+INSTALL_PROOF_PULL_REQUEST_ARTIFACT = "install-proof-pr-binaries"
+INSTALL_PROOF_PULL_REQUEST_JOBS = (
+    "install-proof-pr-build",
+    "install-proof-pr",
+    "install-proof-pr-gate",
+)
+
+
+def assert_install_proof_runs_on_pull_requests(ci: str, install_proof: str) -> None:
+    """Require the release install proof to run before a tag exists.
+
+    v0.5.38 was versioned, built, published, and only then refused, on an
+    assertion no pull-request check ran: `kin locate` had to report complete
+    semantic coverage over a freshly installed probe repository, and the only
+    place that ran was the public install proof, which the release workflow
+    calls after publishing. The remedy is not a second copy of that assertion,
+    which would drift from the one the release enforces. It is the same
+    reusable proof, called from CI against binaries the pull request built.
+
+    So this pins the three properties that make that true and keeps each one
+    falsifiable. The proof must reach the reviewed reusable workflow rather
+    than a lookalike; the binaries it installs must be the ones the pull
+    request compiled and packaged in the release archive layout; and none of
+    the three jobs may exclude the pull request or the merge queue, which is
+    exactly how a heavy leg gets quietly moved back to main and how this class
+    of break returns. The semantic-coverage assertion itself is pinned last:
+    the step producing its capture stays on the ordinary Unix path, so a
+    pull-request run reaches it rather than skipping it as an optional extra.
+    """
+
+    jobs = workflow_job_blocks(ci)
+    missing = [job for job in INSTALL_PROOF_PULL_REQUEST_JOBS if job not in jobs]
+    if missing:
+        raise AssertionError(
+            "the install proof must run at pull-request time; CI lost "
+            f"{missing}"
+        )
+    build, call, gate = (jobs[job] for job in INSTALL_PROOF_PULL_REQUEST_JOBS)
+
+    call_lines = active_lines(call)
+    for policy in (
+        "uses: ./.github/workflows/install-proof.yml",
+        f"local_artifact: {INSTALL_PROOF_PULL_REQUEST_ARTIFACT}",
+    ):
+        if policy not in call_lines:
+            raise AssertionError(
+                "the pull-request install proof must call the reviewed reusable "
+                f"proof with the built artifact; missing `{policy}`"
+            )
+    build_lines = active_lines(build)
+    for policy in (
+        f"name: {INSTALL_PROOF_PULL_REQUEST_ARTIFACT}",
+        "--target x86_64-unknown-linux-musl -p kin-cli -p kin-daemon",
+        'tar czf "$stage/$artifact.tar.gz" -C "$stage" "$artifact"',
+        "assertReleaseArchiveMemberPaths(listing, {",
+        'cp scripts/install.sh "$stage/install.sh"',
+    ):
+        if policy not in build_lines:
+            raise AssertionError(
+                "the pull-request install proof must install release-layout "
+                f"binaries built by this pull request; missing `{policy}`"
+            )
+
+    for job_id, job in zip(INSTALL_PROOF_PULL_REQUEST_JOBS, (build, call, gate)):
+        for line in active_lines(job):
+            if "event_name" in line:
+                raise AssertionError(
+                    f"{job_id} must not exclude an event: the install proof "
+                    "exists to run on pull requests and merge groups, and a "
+                    f"job-level event filter silently returns it to the tag: {line}"
+                )
+
+    gate_lines = active_lines(gate)
+    for policy in (
+        'if [ "$BUILD_RESULT" != "success" ]; then',
+        'if [ "$PROOF_RESULT" != "success" ]; then',
+        "exit 1",
+    ):
+        if policy not in gate_lines:
+            raise AssertionError(
+                "the pull-request install proof gate must fail closed on a "
+                f"proof that did not pass; missing `{policy}`"
+            )
+
+    embedding = install_proof_step(
+        install_proof, "Unix embedding and semantic retrieval proof"
+    )
+    embedding_lines = active_lines(embedding)
+    conditioned = [line for line in embedding_lines if line.startswith("if:")]
+    if conditioned != ["if: runner.os != 'Windows'"]:
+        raise AssertionError(
+            "the semantic retrieval proof admits exactly the Unix condition, so "
+            "a pull-request run reaches the assertion that refused v0.5.38; "
+            f"found {conditioned}"
+        )
+    if (
+        'kin locate hello --json --explain --max-files 5 | tee "$captures/kin-semantic-locate.json"'
+        not in embedding_lines
+    ):
+        raise AssertionError(
+            "the semantic retrieval proof lost the locate capture the "
+            "capability validator reads"
+        )
+
+
 def assert_install_proof_windows_experimental_posture(install_proof: str) -> None:
     """Pin the declared experimental scope of the install-proof matrix.
 
@@ -2618,25 +2825,25 @@ def assert_install_proof_windows_experimental_posture(install_proof: str) -> Non
             "job-level matrix experimental guard; a step-level tolerance "
             f"would spare every leg; found {tolerance_mentions}"
         )
-    strategy_lines = active_lines(dynamic_job_context_source(install_job))
-    current_row: str | None = None
-    experimental_rows: list[str] = []
-    for line in strategy_lines:
-        if line.startswith("- os:"):
-            current_row = line.removeprefix("- os:").strip()
-        elif line == "experimental: true" and current_row is not None:
-            experimental_rows.append(current_row)
-        elif line.startswith("experimental"):
+    release_rows, pull_request_rows = install_proof_matrix_rows(install_job)
+    for label, rows in (("release", release_rows), ("pull request", pull_request_rows)):
+        experimental_rows = []
+        for row in rows:
+            if "experimental" not in row:
+                continue
+            if row["experimental"] is not True:
+                raise AssertionError(
+                    f"install-proof {label} matrix rows admit only a literal "
+                    f"`experimental: true`; found {row['experimental']!r} under "
+                    f"{row.get('os')}"
+                )
+            experimental_rows.append(row.get("os"))
+        expected = ["windows-latest"] if label == "release" else []
+        if experimental_rows != expected:
             raise AssertionError(
-                "install-proof matrix rows admit only a literal "
-                f"`experimental: true`; found `{line}` under "
-                f"{current_row or 'no row'}"
+                f"install-proof {label} experimental rows must be exactly "
+                f"{expected}; found {experimental_rows}"
             )
-    if experimental_rows != ["windows-latest"]:
-        raise AssertionError(
-            "install-proof experimental rows must be exactly "
-            f"['windows-latest']; found {experimental_rows}"
-        )
 
 
 def assert_install_proof_repo_steps_cover_windows(install_proof: str) -> None:
@@ -2669,8 +2876,7 @@ def assert_install_proof_repo_steps_cover_windows(install_proof: str) -> None:
             f"found runs-on={runs_on}"
         )
 
-    strategy = dynamic_job_context_source(install_job)
-    strategy_lines = active_lines(strategy)
+    strategy_lines = active_lines(dynamic_job_context_source(install_job))
     if any(
         line == "exclude:" or line.startswith("exclude:")
         for line in strategy_lines
@@ -2678,10 +2884,12 @@ def assert_install_proof_repo_steps_cover_windows(install_proof: str) -> None:
         raise AssertionError(
             "native Windows release proof matrix must not exclude a reviewed OS row"
         )
-    if strategy_lines.count("- os: windows-latest") != 1:
+    release_rows, _ = install_proof_matrix_rows(install_job)
+    windows_rows = [row for row in release_rows if row.get("os") == "windows-latest"]
+    if len(windows_rows) != 1:
         raise AssertionError(
             "native Windows release proof matrix must contain exactly one "
-            "windows-latest row"
+            f"windows-latest row; found {len(windows_rows)}"
         )
 
     for step in (
@@ -2988,6 +3196,163 @@ def workflow_job_blocks(workflow: str) -> dict[str, str]:
         end = matches[index + 1].start() if index + 1 < len(matches) else len(jobs)
         blocks[job] = jobs[match.start() : end].rstrip()
     return blocks
+
+
+# The full cargo-deny check set, spelled once. A merge group that ran a subset
+# of this would stop reading the advisory database on the one event that reads
+# the merged tree, which is the fix that was tried and refused: see the step's
+# own comment in sast.yml.
+CARGO_DENY_FULL_CHECK = (
+    "cargo deny --log-level warn --manifest-path ./Cargo.toml --all-features check"
+)
+
+
+def workflow_step_shell(job: str, name: str) -> str:
+    """Return one named step's active shell body, dedented and comment-free.
+
+    Unlike workflow_step_source this resolves a step that is the last one in
+    its job, which is where the cargo-deny gate sits.
+    """
+
+    anchor = f"      - name: {name}\n"
+    if job.count(anchor) != 1:
+        raise AssertionError(f"job must declare exactly one step named {name}")
+    lines = job[job.index(anchor) :].splitlines()
+    try:
+        run_block = lines.index("        run: |")
+    except ValueError as error:
+        raise AssertionError(
+            f"step {name} must carry one literal shell run block"
+        ) from error
+    body: list[str] = []
+    for line in lines[run_block + 1 :]:
+        if not line.strip():
+            continue
+        if len(line) - len(line.lstrip()) <= 8:
+            break
+        body.append(line.rstrip())
+    source = textwrap.dedent("\n".join(body))
+    return "\n".join(
+        line for line in source.splitlines() if not line.lstrip().startswith("#")
+    )
+
+
+def assert_cargo_deny_reads_every_advisory(sast: str) -> None:
+    """Keep advisories in every cargo-deny run, and make a merge group say why.
+
+    Skipping `advisories` inside `merge_group` stops a freshly published
+    advisory from ejecting an innocent pull request, and it also stops the one
+    gate that reads the merged tree from reading the advisory database at all.
+    The sweep closes that window by landing the bump on a schedule instead, so
+    this check stays whole and only its failure message changes.
+    """
+
+    job = workflow_job_blocks(sast).get("cargo-deny")
+    if job is None:
+        raise AssertionError("SAST must declare the cargo-deny job")
+    shell = workflow_step_shell(job, "Run cargo-deny")
+    # Continuations joined first, so a wrapped invocation is judged whole, and
+    # the shell grammar around it stripped, so `if cargo deny ...; then` reads
+    # as the invocation it is.
+    joined = re.sub(r"\\\n\s*", " ", shell)
+    gating = []
+    for line in joined.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("if "):
+            stripped = stripped[3:]
+        if stripped.endswith("; then"):
+            stripped = stripped[: -len("; then")]
+        if stripped.startswith("cargo deny"):
+            gating.append(re.sub(r"\s+", " ", stripped).strip())
+    if not gating or gating[0] != CARGO_DENY_FULL_CHECK:
+        raise AssertionError(
+            "the cargo-deny gate must run the whole default check set, advisories "
+            f"included, on every event (first invocation: {gating[0] if gating else 'none'})"
+        )
+    narrowed = f"{CARGO_DENY_FULL_CHECK} bans licenses sources"
+    if narrowed in re.sub(r"\s+", " ", joined):
+        raise AssertionError(
+            "the cargo-deny gate must not narrow its check set: dropping advisories "
+            "inside a merge group stops the one run that reads the merged tree from "
+            "reading the advisory database"
+        )
+    if "--annotate-merge-group" not in shell:
+        raise AssertionError(
+            "a merge-group cargo-deny failure must name the advisory and its bump "
+            "command, or the queue ejects an entry with no cause recorded anywhere"
+        )
+    if not shell.rstrip().endswith("exit 1"):
+        raise AssertionError(
+            "a merge-group cargo-deny failure must still fail: the advisory is real "
+            "and only its message changes"
+        )
+
+
+def assert_advisory_sweep_authority(sweep: str, release_train: str) -> None:
+    """Pin what lets the sweep write to the repository unattended."""
+
+    header = sweep.split("\njobs:", maxsplit=1)[0]
+    if "\n  schedule:\n" not in header:
+        raise AssertionError("the advisory sweep must run on a schedule, not on demand only")
+    if "types: [advisory-sweep]" not in header:
+        raise AssertionError(
+            "the advisory sweep's manual path must be a repository dispatch pinned to "
+            "one action, which always resolves this workflow file from the default branch"
+        )
+    if "ALLOWED_ACTORS: |" not in sweep:
+        raise AssertionError(
+            "the advisory sweep's manual path must be gated to the reviewed actor set"
+        )
+    for pin, label in (
+        (
+            "actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1",
+            "release App token minter",
+        ),
+        (
+            "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+            "checkout",
+        ),
+    ):
+        if pin not in sweep:
+            raise AssertionError(
+                f"the advisory sweep must pin its {label} to the reviewed object"
+            )
+        if pin not in release_train:
+            raise AssertionError(
+                f"the advisory sweep's {label} pin no longer matches release-train.yml"
+            )
+    if "environment: release-tag" not in sweep:
+        raise AssertionError(
+            "the advisory sweep must declare the environment its App credentials are "
+            "scoped to, or it silently falls back to repository-scoped copies"
+        )
+    for needle, label in (
+        ("cargo metadata --locked", "prove the hand-written lock is one cargo would produce"),
+        (
+            "cargo deny --log-level warn --manifest-path ./Cargo.toml --all-features check advisories",
+            "prove the advisory the bump exists for is actually gone",
+        ),
+        ('if [ "$changed" != "Cargo.lock" ]', "refuse a bump that touched anything but the lock"),
+        ("git diff --numstat -- Cargo.lock", "refuse a bump that moved more lock lines than it named"),
+    ):
+        if needle not in sweep:
+            raise AssertionError(
+                f"the advisory sweep must {label} before it opens a pull request"
+            )
+    for job_step, gate in (
+        ("Open or update the bump pull request", "steps.plan.outputs.bumps != '0'"),
+        ("Arm protected auto-merge", "steps.plan.outputs.bumps != '0'"),
+        ("Open or update the unfixable-advisory issue", "steps.plan.outputs.unfixable != '0'"),
+    ):
+        anchor = f"      - name: {job_step}\n"
+        if anchor not in sweep:
+            raise AssertionError(f"the advisory sweep must declare the {job_step} step")
+        block = sweep[sweep.index(anchor) : sweep.index(anchor) + 400]
+        if f"if: {gate}" not in block:
+            raise AssertionError(
+                f"the advisory sweep's {job_step} step must be gated on {gate}, so a "
+                "clean sweep opens nothing"
+            )
 
 
 WINDOWS_DAEMON_SIBLING_BUILD = (
@@ -4388,10 +4753,10 @@ def assert_rust_cache_steps(workflows: dict[Path, str]) -> None:
                 )
             _, save_value = save
             save_value = save_value.split(" #", 1)[0].rstrip()
-            if save_value != MAIN_ONLY_CACHE_SAVE_VALUE:
+            if save_value not in CACHE_SAVE_VALUES:
                 raise AssertionError(
                     f"{workflow.name} rust-cache save-if must be the exact "
-                    "main-only scalar"
+                    "main-only scalar or the exact restore-only scalar"
                 )
 
         for action in canonical_job_action_uses(workflow, content):
@@ -7210,6 +7575,8 @@ def main() -> None:
     release_tag = RELEASE_TAG.read_text(encoding="utf-8")
     release_train = RELEASE_TRAIN.read_text(encoding="utf-8")
     release_sentinel = RELEASE_SENTINEL.read_text(encoding="utf-8")
+    sast = SAST.read_text(encoding="utf-8")
+    advisory_sweep = ADVISORY_SWEEP.read_text(encoding="utf-8")
     hold_alarm = HOLD_ALARM.read_text(encoding="utf-8")
     release_bot_doc = RELEASE_BOT_DOC.read_text(encoding="utf-8")
     install_proof = INSTALL_PROOF.read_text(encoding="utf-8")
@@ -7359,20 +7726,16 @@ def main() -> None:
 
     install_proof_workflow = WORKFLOWS / "install-proof.yml"
     dynamic_context_spoof = dict(workflow_sources)
-    if (
-        dynamic_context_spoof[install_proof_workflow].count(
-            "          - os: ubuntu-latest"
-        )
-        != 1
-    ):
+    matrix_row = '{"os":"ubuntu-latest","setup-shell":"bash"}'
+    if dynamic_context_spoof[install_proof_workflow].count(matrix_row) != 2:
         raise AssertionError(
             "workflow census falsification could not identify install-proof matrix"
         )
     dynamic_context_spoof[install_proof_workflow] = dynamic_context_spoof[
         install_proof_workflow
     ].replace(
-        "          - os: ubuntu-latest",
-        "          - os: Check & Test (ubuntu-latest)",
+        matrix_row,
+        '{"os":"Check & Test (ubuntu-latest)","setup-shell":"bash"}',
         1,
     )
     expect_assertion(
@@ -7967,7 +8330,10 @@ def main() -> None:
                 f"release recovery contains forbidden authority or retry state: {forbidden}"
             )
 
-    pinned_readme_version = re.search(r"\bv?\d+\.\d+\.\d+\b", readme)
+    # A dotted quad is not a version. `\b\d+\.\d+\.\d+\b` matches "127.0.0" inside
+    # "127.0.0.1", so documenting a loopback endpoint tripped this guard with a message
+    # about pinning a release. Refuse a match that has a digit or dot on either side.
+    pinned_readme_version = re.search(r"(?<![\d.])v?\d+\.\d+\.\d+(?![\d.])", readme)
     if pinned_readme_version:
         raise AssertionError(
             "README must follow the proven latest release instead of pinning "
@@ -8536,14 +8902,15 @@ def main() -> None:
         ),
         (
             "the Windows matrix row disappears",
-            "          - os: windows-latest\n            setup-shell: powershell\n",
+            ',{"os":"windows-latest","setup-shell":"powershell","experimental":true}',
             "",
             "windows-latest row",
         ),
         (
             "a matrix exclusion removes Windows after retaining its include row",
-            "        include:\n",
-            "        exclude:\n          - os: windows-latest\n        include:\n",
+            "        include: ${{ fromJSON(",
+            "        exclude:\n          - os: windows-latest\n"
+            "        include: ${{ fromJSON(",
             "must not exclude",
         ),
     ):
@@ -8563,10 +8930,9 @@ def main() -> None:
     for label, original, mutation, expected in (
         (
             "the experimental flag spreads to a Unix matrix row",
-            "          - os: ubuntu-latest\n            setup-shell: bash\n",
-            "          - os: ubuntu-latest\n            setup-shell: bash\n"
-            "            experimental: true\n",
-            "exactly ['windows-latest']",
+            '{"os":"ubuntu-latest","setup-shell":"bash"}',
+            '{"os":"ubuntu-latest","setup-shell":"bash","experimental":true}',
+            "experimental rows must be exactly",
         ),
         (
             "the install proof tolerates every leg unconditionally",
@@ -8576,14 +8942,14 @@ def main() -> None:
         ),
         (
             "the tolerance guard survives while the Windows flag disappears",
-            "            experimental: true\n",
+            ',"experimental":true',
             "",
             "exactly ['windows-latest']",
         ),
         (
             "an experimental value other than a literal true appears",
-            "            experimental: true\n",
-            "            experimental: yes\n",
+            '"experimental":true',
+            '"experimental":"yes"',
             "literal `experimental: true`",
         ),
         (
@@ -8617,6 +8983,103 @@ def main() -> None:
             expected,
             lambda mutated=install_proof.replace(original, mutation, 1): (
                 assert_install_proof_windows_experimental_posture(mutated)
+            ),
+        )
+
+    assert_install_proof_runs_on_pull_requests(ci_workflow, install_proof)
+    pull_request_gate = workflow_job_blocks(ci_workflow)["install-proof-pr-gate"]
+    for label, source, original, mutation, expected in (
+        (
+            "the pull-request install proof gate is deleted outright",
+            ci_workflow,
+            pull_request_gate,
+            "",
+            "CI lost",
+        ),
+        (
+            "the pull-request proof calls a lookalike workflow",
+            ci_workflow,
+            "uses: ./.github/workflows/install-proof.yml",
+            "uses: ./.github/workflows/daemon-smoke.yml",
+            "reviewed reusable",
+        ),
+        (
+            "the pull-request proof installs a released archive instead",
+            ci_workflow,
+            f"      local_artifact: {INSTALL_PROOF_PULL_REQUEST_ARTIFACT}\n",
+            '      local_artifact: ""\n',
+            "reviewed reusable",
+        ),
+        (
+            "the built binaries are uploaded under another name",
+            ci_workflow,
+            f"          name: {INSTALL_PROOF_PULL_REQUEST_ARTIFACT}\n",
+            "          name: install-proof-pr-other\n",
+            "built by this pull request",
+        ),
+        (
+            "the proof stops building the release target",
+            ci_workflow,
+            "--target x86_64-unknown-linux-musl -p kin-cli -p kin-daemon",
+            "-p kin-cli -p kin-daemon",
+            "built by this pull request",
+        ),
+        (
+            "the archive is no longer judged by the release shape contract",
+            ci_workflow,
+            "            assertReleaseArchiveMemberPaths(listing, {\n",
+            "            void listing && ((_) => {})({\n",
+            "built by this pull request",
+        ),
+        (
+            "the proof is moved off the pull request the way a slow leg was",
+            ci_workflow,
+            "  install-proof-pr-gate:\n    name: Install Proof (PR) Gate\n",
+            "  install-proof-pr-gate:\n    name: Install Proof (PR) Gate\n"
+            "    if: ${{ github.event_name != 'pull_request' }}\n",
+            "must not exclude an event",
+        ),
+        (
+            "the gate stops failing on a proof that did not pass",
+            ci_workflow,
+            '          if [ "$PROOF_RESULT" != "success" ]; then\n',
+            '          if false; then\n',
+            "fail closed",
+        ),
+        (
+            "the semantic retrieval proof becomes release-only",
+            install_proof,
+            "      - name: Unix embedding and semantic retrieval proof\n"
+            "        if: runner.os != 'Windows'\n",
+            "      - name: Unix embedding and semantic retrieval proof\n"
+            "        if: runner.os != 'Windows' && inputs.local_artifact == ''\n",
+            "exactly the Unix condition",
+        ),
+        (
+            "the locate capture the validator reads disappears",
+            install_proof,
+            '          kin locate hello --json --explain --max-files 5 '
+            '| tee "$captures/kin-semantic-locate.json"\n',
+            "",
+            "lost the locate capture",
+        ),
+    ):
+        if original not in source:
+            raise AssertionError(
+                "pull-request install proof falsification lost fixture for "
+                f"{label}: {original!r}"
+            )
+        mutated_ci = ci_workflow
+        mutated_proof = install_proof
+        if source is ci_workflow:
+            mutated_ci = ci_workflow.replace(original, mutation, 1)
+        else:
+            mutated_proof = install_proof.replace(original, mutation, 1)
+        expect_assertion(
+            label,
+            expected,
+            lambda ci=mutated_ci, proof=mutated_proof: (
+                assert_install_proof_runs_on_pull_requests(ci, proof)
             ),
         )
 
@@ -10342,6 +10805,120 @@ def main() -> None:
     classifier = ci_workflow[classifier_start:classifier_end]
     assert_docs_only_classifier_guard(ci_workflow)
     assert_assertion_reachability_gate_wired(ci_workflow)
+    assert_cargo_deny_reads_every_advisory(sast)
+    assert_advisory_sweep_authority(advisory_sweep, release_train)
+    for label, source, original, replacement, expected, check in (
+        (
+            "the gate stops running the whole default check set",
+            sast,
+            f"{CARGO_DENY_FULL_CHECK}; then",
+            f"{CARGO_DENY_FULL_CHECK} advisories; then",
+            "must run the whole default check set",
+            "sast",
+        ),
+        (
+            "a merge group narrows the check set back to the refused subset",
+            sast,
+            "            --annotate-merge-group\n",
+            "            --annotate-merge-group\n"
+            f"          {CARGO_DENY_FULL_CHECK} bans licenses sources\n",
+            "must not narrow its check set",
+            "sast",
+        ),
+        (
+            "a merge-group failure stops naming the advisory that caused it",
+            sast,
+            "--annotate-merge-group",
+            "--dry-run",
+            "must name the advisory and its bump command",
+            "sast",
+        ),
+        (
+            "a merge-group advisory failure is downgraded to a pass",
+            sast,
+            "            --annotate-merge-group\n          exit 1\n",
+            "            --annotate-merge-group\n          exit 0\n",
+            "must still fail",
+            "sast",
+        ),
+        (
+            "the sweep loses its schedule and runs only when asked",
+            advisory_sweep,
+            "on:\n  schedule:\n",
+            "on:\n  # schedule removed\n",
+            "must run on a schedule",
+            "sweep",
+        ),
+        (
+            "the sweep's manual path stops being pinned to one dispatch action",
+            advisory_sweep,
+            "types: [advisory-sweep]",
+            "types: [anything]",
+            "pinned to one action",
+            "sweep",
+        ),
+        (
+            "the sweep stops gating its manual path on the reviewed actors",
+            advisory_sweep,
+            "ALLOWED_ACTORS: |",
+            "UNUSED_ACTORS: |",
+            "gated to the reviewed actor set",
+            "sweep",
+        ),
+        (
+            "the sweep stops proving the hand-written lock is coherent",
+            advisory_sweep,
+            "cargo metadata --locked",
+            "cargo metadata",
+            "prove the hand-written lock",
+            "sweep",
+        ),
+        (
+            "the sweep stops proving the advisory it bumped for is gone",
+            advisory_sweep,
+            "--all-features check advisories\n\n      - name: Publish",
+            "--all-features check\n\n      - name: Publish",
+            "prove the advisory the bump exists for is actually gone",
+            "sweep",
+        ),
+        (
+            "the sweep stops refusing a bump that escaped the lockfile",
+            advisory_sweep,
+            'if [ "$changed" != "Cargo.lock" ]',
+            'if [ "$changed" = "never" ]',
+            "refuse a bump that touched anything but the lock",
+            "sweep",
+        ),
+        (
+            "a clean sweep opens a pull request anyway",
+            advisory_sweep,
+            "      - name: Arm protected auto-merge\n        if: steps.plan.outputs.bumps != '0'\n",
+            "      - name: Arm protected auto-merge\n        if: always()\n",
+            "must be gated on steps.plan.outputs.bumps != '0'",
+            "sweep",
+        ),
+        (
+            "an unfixable advisory opens a pull request instead of an issue",
+            advisory_sweep,
+            "      - name: Open or update the unfixable-advisory issue\n        if: steps.plan.outputs.unfixable != '0'\n",
+            "      - name: Open or update the unfixable-advisory issue\n        if: always()\n",
+            "must be gated on steps.plan.outputs.unfixable != '0'",
+            "sweep",
+        ),
+    ):
+        mutant = replace_exactly_once(source, original, replacement, label)
+        if check == "sast":
+            expect_assertion(
+                label,
+                expected,
+                lambda mutant=mutant: assert_cargo_deny_reads_every_advisory(mutant),
+            )
+        else:
+            expect_assertion(
+                label,
+                expected,
+                lambda mutant=mutant: assert_advisory_sweep_authority(mutant, release_train),
+            )
     assert_kin_vfs_compat_gate_wired(ci_workflow)
     assert_glibc_floor_guard_wired(ci_workflow, release)
     expect_assertion(
@@ -11719,7 +12296,10 @@ def main() -> None:
 
     ci_path = WORKFLOWS / "ci.yml"
     check_start = ci_workflow.index("\n  check:")
-    check_end = ci_workflow.index("\n  coverage:", check_start)
+    # `falsify-guards` and `feature-tests` sit between `check` and `coverage`,
+    # so slicing to `coverage:` would hand this falsification three jobs and
+    # count save lines that are not the check job's.
+    check_end = ci_workflow.index("\n  falsify-guards:", check_start)
     check_job = ci_workflow[check_start:check_end]
     save_line = f"          {MAIN_ONLY_CACHE_SAVE}\n"
     if check_job.count(save_line) != 1:

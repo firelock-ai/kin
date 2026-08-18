@@ -70,6 +70,7 @@ serde_json = { workspace = true }
 semver = { workspace = true }
 chrono = { workspace = true }
 filetime = { workspace = true }
+kin-agent = { workspace = true }
 reqwest = { workspace = true, features = ["blocking", "json"] }
 hex = { workspace = true }
 sha2.workspace = true
@@ -91,7 +92,7 @@ toml_edit = "0.25"
 tempfile = { workspace = true }
 unicode-normalization = "0.1"
 unicode-ident = "1"
-kin-spine = { version = "0.5.38", path = "../kin-spine" }
+kin-spine = { version = "0.5.39", path = "../kin-spine" }
 
 [dev-dependencies]
 kin-core = { workspace = true, features = ["test-support"] }

@@ -103,7 +103,7 @@ pub async fn start(
     // the shared handle at each invocation.
     let binder_startup = std::sync::Arc::clone(&startup);
     let repo_binder: Option<kin_mcp::RepoBinder> = Some(Box::new(
-        move |roots: Vec<PathBuf>| -> Pin<Box<dyn Future<Output = Option<kin_mcp::BoundRepo>> + Send>> {
+        move |roots: Vec<PathBuf>| -> Pin<Box<dyn Future<Output = kin_mcp::WorkspaceBinding> + Send>> {
             let startup = std::sync::Arc::clone(&binder_startup);
             Box::pin(async move {
                 bind_first_kin_repo(roots, startup.pinned_by_operator()).await
@@ -519,18 +519,25 @@ async fn bind_from_registry(startup: &kin_mcp::StartupDaemonBinding) -> Option<k
 /// binding answers every later tool call from a repository the user has left.
 /// When the roots still contain the bound repository this is a no-op that keeps
 /// the running daemon; when they name a different one it repoints the process at
-/// it; when nothing there can be bound it returns `None`, which the stdio server
-/// turns into an explicit refusal.
+/// it; when the repositories they name cannot be served it reports
+/// `OtherRepository`, which the stdio server turns into an explicit refusal.
+///
+/// Roots that resolve to no Kin repository at all are reported as
+/// `Unresolvable`, which is a different fact and gets different treatment. This
+/// process may be reached through `docker exec` or over a remote boundary, where
+/// the client's roots are host paths that do not exist in this namespace: they
+/// are not evidence that the client left the repository this server serves, and
+/// a server that has one of its own keeps it.
 ///
 /// `pinned_by_operator` marks a binding that came from an explicit
 /// `--repo`/`KIN_MCP_REPO`. That pin is never repointed by the client — it is a
 /// deliberate choice about which repository this server serves — so a workspace
-/// that names a different repository returns `None` and fails loud instead of
-/// following the client or, worse, answering from the pinned repository anyway.
+/// that names a different repository fails loud instead of following the client
+/// or, worse, answering from the pinned repository anyway.
 async fn bind_first_kin_repo(
     roots: Vec<PathBuf>,
     pinned_by_operator: bool,
-) -> Option<kin_mcp::BoundRepo> {
+) -> kin_mcp::WorkspaceBinding {
     bind_first_kin_repo_against(roots, bound_repo_working_dir(), pinned_by_operator).await
 }
 
@@ -542,16 +549,26 @@ async fn bind_first_kin_repo_against(
     roots: Vec<PathBuf>,
     bound_repo: Option<PathBuf>,
     pinned_by_operator: bool,
-) -> Option<kin_mcp::BoundRepo> {
-    // Force the real upward walk. `KinLayout::discover` short-circuits to
-    // `<start>/.kin` whenever `KIN_DAEMON_URL` is set, so once a repository is
-    // bound it would accept any directory — including one with no `.kin/` at
-    // all — as the client's new repository.
+) -> kin_mcp::WorkspaceBinding {
+    // `KinLayout::discover` is filesystem-rooted: it walks up from each root and
+    // finds a `.kin/` or nothing, regardless of which daemon this process is
+    // pinned to. A root that resolves to no layout is a root this server cannot
+    // see, which is the distinction the two failure verdicts below rest on.
     let candidates: Vec<PathBuf> = roots
         .iter()
         .filter_map(|root| kin_core::KinLayout::discover(root))
         .map(|layout| canonical_path(layout.working_dir()))
         .collect();
+
+    if candidates.is_empty() {
+        // Nothing the client named resolves to a Kin repository this process can
+        // see. That is what a host path looks like from inside a container, and
+        // what a remote registration looks like from the server side, so it says
+        // nothing about which repository this server should serve. The stdio
+        // server decides whether its current binding has authority of its own.
+        return kin_mcp::WorkspaceBinding::Unresolvable;
+    }
+
     let bound_repo_still_open = bound_repo.as_deref().is_some_and(|bound| {
         candidates
             .iter()
@@ -562,9 +579,15 @@ async fn bind_first_kin_repo_against(
         // The client still has the bound repository open — anywhere in its
         // workspace, not merely first. Keep the running daemon rather than
         // churning it because another folder happens to sort ahead of it.
-        return bound_repo
-            .zip(current_daemon_url())
-            .map(|(root, daemon_url)| kin_mcp::BoundRepo { root, daemon_url });
+        return match bound_repo.zip(current_daemon_url()) {
+            Some((root, daemon_url)) => {
+                kin_mcp::WorkspaceBinding::Bound(kin_mcp::BoundRepo { root, daemon_url })
+            }
+            // The bound repository is derived from the pinned daemon URL, so
+            // losing the URL here means this process serves nothing the client
+            // named after all.
+            None => kin_mcp::WorkspaceBinding::OtherRepository(candidates),
+        };
     }
 
     if pinned_by_operator {
@@ -576,7 +599,7 @@ async fn bind_first_kin_repo_against(
             "Kin MCP: the repository pinned by --repo/KIN_MCP_REPO is not among the client's \
              workspace roots; refusing tool calls until the workspace and the pin agree."
         );
-        return None;
+        return kin_mcp::WorkspaceBinding::OtherRepository(candidates);
     }
 
     if bound_repo.is_some() {
@@ -588,8 +611,8 @@ async fn bind_first_kin_repo_against(
         std::env::remove_var("KIN_DAEMON_URL");
     }
 
-    for working_dir in candidates {
-        let Ok(url) = bind_daemon_for_repo_dir(&working_dir).await else {
+    for working_dir in candidates.iter() {
+        let Ok(url) = bind_daemon_for_repo_dir(working_dir).await else {
             continue;
         };
         // Point the process at the bound repo so the daemon delegate resolves
@@ -597,7 +620,7 @@ async fn bind_first_kin_repo_against(
         // exactly as the --repo startup path does (it set_current_dir's first).
         // Without this, tool-call forwarding sends no bearer token and the
         // daemon replies 401 even though the repo bound correctly.
-        if let Err(err) = std::env::set_current_dir(&working_dir) {
+        if let Err(err) = std::env::set_current_dir(working_dir) {
             eprintln!(
                 "Kin MCP: bound {url} but could not switch cwd to {} ({err}); \
                  tool auth will fall back to KIN_DAEMON_AUTH_TOKEN if set.",
@@ -609,12 +632,16 @@ async fn bind_first_kin_repo_against(
             "Kin MCP: bound repo daemon at {url} from workspace root {}",
             working_dir.display()
         );
-        return Some(kin_mcp::BoundRepo {
-            root: working_dir,
+        return kin_mcp::WorkspaceBinding::Bound(kin_mcp::BoundRepo {
+            root: working_dir.clone(),
             daemon_url: url,
         });
     }
-    None
+    // The client named Kin repositories this process can see and none of their
+    // daemons could be resolved. That is still a repository disagreement rather
+    // than an invisible namespace, so the server refuses instead of serving the
+    // repository the client left.
+    kin_mcp::WorkspaceBinding::OtherRepository(candidates)
 }
 
 /// The repository this process is bound to, or `None` when it is not bound.
@@ -990,6 +1017,13 @@ mod tests {
         tmp
     }
 
+    fn expect_bound(binding: kin_mcp::WorkspaceBinding, context: &str) -> kin_mcp::BoundRepo {
+        match binding {
+            kin_mcp::WorkspaceBinding::Bound(bound) => bound,
+            other => panic!("{context}, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     #[serial]
     async fn roots_naming_the_bound_repo_keep_the_running_daemon() {
@@ -999,13 +1033,15 @@ mod tests {
         let repo = kin_repo_fixture();
         let repo_dir = std::fs::canonicalize(repo.path()).unwrap();
 
-        let bound = bind_first_kin_repo_against(
-            vec![repo.path().to_path_buf()],
-            Some(repo_dir.clone()),
-            false,
-        )
-        .await
-        .expect("the bound repository still being open must stay bound");
+        let bound = expect_bound(
+            bind_first_kin_repo_against(
+                vec![repo.path().to_path_buf()],
+                Some(repo_dir.clone()),
+                false,
+            )
+            .await,
+            "the bound repository still being open must stay bound",
+        );
 
         assert_eq!(bound.root, repo_dir);
         assert_eq!(bound.daemon_url, "http://127.0.0.1:4242");
@@ -1037,8 +1073,9 @@ mod tests {
         .await;
 
         assert!(
-            bound.is_none(),
-            "an unresolvable new repository must not report a successful bind"
+            matches!(bound, kin_mcp::WorkspaceBinding::OtherRepository(_)),
+            "a real repository whose daemon will not resolve is another repository, \
+             not an unseeable root: {bound:?}"
         );
         assert_eq!(
             std::env::var("KIN_DAEMON_URL").ok().as_deref(),
@@ -1058,13 +1095,15 @@ mod tests {
         let bound = kin_repo_fixture();
         let bound_dir = std::fs::canonicalize(bound.path()).unwrap();
 
-        let result = bind_first_kin_repo_against(
-            vec![other.path().to_path_buf(), bound.path().to_path_buf()],
-            Some(bound_dir.clone()),
-            false,
-        )
-        .await
-        .expect("the bound repository being open anywhere must keep the binding");
+        let result = expect_bound(
+            bind_first_kin_repo_against(
+                vec![other.path().to_path_buf(), bound.path().to_path_buf()],
+                Some(bound_dir.clone()),
+                false,
+            )
+            .await,
+            "the bound repository being open anywhere must keep the binding",
+        );
 
         assert_eq!(result.root, bound_dir);
         assert_eq!(result.daemon_url, "http://127.0.0.1:4242");
@@ -1090,8 +1129,9 @@ mod tests {
         .await;
 
         assert!(
-            bound.is_none(),
-            "a pinned server must report failure for a workspace it does not serve"
+            matches!(bound, kin_mcp::WorkspaceBinding::OtherRepository(_)),
+            "a pinned server must report the workspace it does not serve as another \
+             repository: {bound:?}"
         );
         assert_eq!(
             std::env::var("KIN_DAEMON_URL").ok().as_deref(),
@@ -1107,13 +1147,15 @@ mod tests {
         let pinned = kin_repo_fixture();
         let pinned_dir = std::fs::canonicalize(pinned.path()).unwrap();
 
-        let bound = bind_first_kin_repo_against(
-            vec![pinned.path().to_path_buf()],
-            Some(pinned_dir.clone()),
-            true,
-        )
-        .await
-        .expect("roots naming the pinned repository must stay bound");
+        let bound = expect_bound(
+            bind_first_kin_repo_against(
+                vec![pinned.path().to_path_buf()],
+                Some(pinned_dir.clone()),
+                true,
+            )
+            .await,
+            "roots naming the pinned repository must stay bound",
+        );
 
         assert_eq!(bound.root, pinned_dir);
         assert_eq!(bound.daemon_url, "http://127.0.0.1:4242");
@@ -1126,10 +1168,52 @@ mod tests {
         // No autostart: this test must never spawn a daemon process.
         let _no_daemon_guard = EnvVarGuard::set("KIN_NO_DAEMON", "1");
         let plain = tempfile::tempdir().unwrap();
+        assert_eq!(
+            bind_first_kin_repo_against(vec![plain.path().to_path_buf()], None, false).await,
+            kin_mcp::WorkspaceBinding::Unresolvable,
+        );
+    }
+
+    /// FIR-2405. A server registered as `docker exec -i -w /work/express ... kin
+    /// mcp start` serves a container path while the client announces a host path
+    /// that never exists in this namespace. Reporting that as a repository
+    /// switch is what made every call after the first refuse: the root can never
+    /// become bindable, so the refusal was permanent for the life of a process
+    /// the client owns.
+    #[tokio::test]
+    #[serial]
+    async fn a_root_this_server_cannot_see_is_unresolvable_not_another_repository() {
+        let _daemon_guard = EnvVarGuard::set("KIN_DAEMON_URL", "http://127.0.0.1:4242");
+        // No autostart: this test must never spawn a daemon process.
+        let _no_daemon_guard = EnvVarGuard::set("KIN_NO_DAEMON", "1");
+        let served = kin_repo_fixture();
+        let served_dir = std::fs::canonicalize(served.path()).unwrap();
+        // A path that exists on no filesystem this process can reach, standing
+        // in for the client's host path.
+        let host_namespace = tempfile::tempdir().unwrap();
+        let host_only = host_namespace.path().join("private/tmp/brown/work");
         assert!(
-            bind_first_kin_repo_against(vec![plain.path().to_path_buf()], None, false)
-                .await
-                .is_none()
+            !host_only.exists(),
+            "the stand-in host path must really be absent"
+        );
+
+        assert_eq!(
+            bind_first_kin_repo_against(vec![host_only], Some(served_dir.clone()), false).await,
+            kin_mcp::WorkspaceBinding::Unresolvable,
+            "a root that resolves to no Kin repository here must not be reported as a switch"
+        );
+
+        // Falsification: the same call with a root this server CAN see, holding
+        // a repository it does not serve, reports the switch it really is. The
+        // verdict tracks what the filesystem says rather than always answering
+        // `Unresolvable`.
+        let other = kin_repo_fixture();
+        let moved =
+            bind_first_kin_repo_against(vec![other.path().to_path_buf()], Some(served_dir), false)
+                .await;
+        assert!(
+            matches!(moved, kin_mcp::WorkspaceBinding::OtherRepository(_)),
+            "a visible second repository must be reported as another repository: {moved:?}"
         );
     }
 

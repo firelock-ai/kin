@@ -81,6 +81,11 @@ struct InitResultPayload<'a> {
     /// what was admitted. Absent when the source carried none.
     #[serde(skip_serializing_if = "Option::is_none")]
     uncommitted_worktree: Option<UncommittedWorktreePayload>,
+    /// The embedding model the first embed pass will need, and whether this
+    /// machine already has it. Additive to this schema version: a consumer that
+    /// does not read it is unaffected, and one that does can tell a fresh
+    /// machine's pending download from a warm cache before it schedules work.
+    embedding_model: crate::embed_model::EmbedModelFetch,
 }
 
 /// The uncommitted delta initialization saw and did not admit.
@@ -427,6 +432,7 @@ fn print_json_result(
         exact_reachable_git_history: boundary == InitBoundary::ExactGit,
         store_footprint: StoreFootprint::measure(&result.layout),
         uncommitted_worktree: uncommitted_worktree_payload(&result.workspace_divergence),
+        embedding_model: crate::embed_model::EmbedModelFetch::probe(false),
     };
     emit(&format!("{}\n", serde_json::to_string_pretty(&payload)?))
 }
@@ -536,6 +542,11 @@ fn render_human_result(
     }
     writeln!(
         out,
+        "  {}",
+        embedding_model_notice(&crate::embed_model::EmbedModelFetch::probe(false))
+    )?;
+    writeln!(
+        out,
         "  Store size: {}",
         StoreFootprint::measure(&result.layout).render()
     )?;
@@ -544,6 +555,42 @@ fn render_human_result(
         writeln!(out, "{line}")?;
     }
     Ok(out)
+}
+
+/// What this command owes a reader about the embedding model.
+///
+/// No install ships the weights, so a converted repository that has never
+/// embedded is one large download away from its first vector, and admission
+/// finishes long before that download starts. Said here because this is the
+/// last thing a fresh install reads before the daemon begins the fetch, and
+/// because every counter published during it reports a pass that is working
+/// and recording nothing.
+fn embedding_model_notice(fetch: &crate::embed_model::EmbedModelFetch) -> String {
+    if let Some(reason) = fetch.no_fetch_reason.as_deref() {
+        return format!("Embedding model: {} ({reason})", fetch.model_id);
+    }
+    let location = match fetch.cache_dir.as_deref() {
+        Some(dir) => format!(" at {dir}"),
+        None => String::new(),
+    };
+    if fetch.present {
+        return format!(
+            "Embedding model: {} is already cached{location}, so the first embed pass downloads \
+             nothing",
+            fetch.model_id
+        );
+    }
+    format!(
+        "Embedding model: {} is not on this machine yet; the first embed pass fetches {} \
+         from {}{}, which needs egress and runs before any vector exists",
+        fetch.model_id,
+        fetch.expected_download(),
+        crate::embed_model::endpoint_host(),
+        match fetch.cache_dir.as_deref() {
+            Some(dir) => format!(" into {dir}"),
+            None => String::new(),
+        }
+    )
 }
 
 /// Paths listed by name before the rest are counted rather than named.
@@ -1119,5 +1166,58 @@ mod tests {
 
         let after = git_status(&linked);
         assert!(!after.contains(".kin"), "store must be excluded: {after:?}");
+    }
+
+    /// A machine that does not have the weights is told the download is coming
+    /// before this command returns, with the model, the size, the source and
+    /// the destination, and a machine that has them is told nothing is owed.
+    #[test]
+    #[serial_test::serial]
+    fn init_states_the_model_download_a_fresh_machine_still_owes() {
+        let _endpoint = kin_core::test_env::EnvVarGuard::unset("HF_ENDPOINT");
+        let absent = crate::embed_model::EmbedModelFetch {
+            model_id: crate::embed_model::DEFAULT_EMBED_MODEL_ID.to_string(),
+            cache_dir: Some("/home/dev/.cache/huggingface/hub/models--x".to_string()),
+            present: false,
+            fetched_bytes: 0,
+            expected_bytes: Some(crate::embed_model::DEFAULT_EMBED_MODEL_BYTES),
+            fetching: false,
+            no_fetch_reason: None,
+            relocated_hf_home: None,
+        };
+        let notice = embedding_model_notice(&absent);
+        assert!(
+            notice.contains("nomic-ai/nomic-embed-text-v1.5")
+                && notice.contains("about 523 MB")
+                && notice.contains("huggingface.co")
+                && notice.contains("/home/dev/.cache/huggingface/hub/models--x"),
+            "the model, the size, the source and the destination are all named: {notice}"
+        );
+
+        let cached = crate::embed_model::EmbedModelFetch {
+            present: true,
+            ..absent
+        };
+        let cached_notice = embedding_model_notice(&cached);
+        assert!(
+            cached_notice.contains("already cached") && !cached_notice.contains("523"),
+            "a machine that has the model is not warned about a download: {cached_notice}"
+        );
+
+        let overridden = crate::embed_model::EmbedModelFetch {
+            model_id: "acme/private-embed".to_string(),
+            expected_bytes: None,
+            present: false,
+            ..cached
+        };
+        let overridden_notice = embedding_model_notice(&overridden);
+        assert!(
+            !overridden_notice.contains("523"),
+            "a model this build never measured is given no size: {overridden_notice}"
+        );
+        assert!(
+            overridden_notice.contains("fetches the model from huggingface.co"),
+            "the fetch is still named without a size: {overridden_notice}"
+        );
     }
 }

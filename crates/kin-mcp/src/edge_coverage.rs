@@ -29,6 +29,7 @@
 //!   "requested_classes": ["calls", "imports", "references"],
 //!   "classes": { "calls": "present", "imports": "present", "references": "absent" },
 //!   "cross_file_classes": ["calls", "imports"],
+//!   "reference_enrichment": "unknown",
 //!   "budget_exhausted": false,
 //!   "entities_examined": 3
 //! }
@@ -40,6 +41,10 @@
 //! before it could say. A consumer that cannot find this object must treat
 //! coverage as unknown rather than assuming either verdict.
 //!
+//! `reference_enrichment` carries the one fact the scan cannot observe from the
+//! graph: whether this BUILD can produce reference edges for the language at
+//! all. See [`reference_enrichment`].
+//!
 //! The single-focal tools attach it to an EMPTY answer only, since that is the
 //! only answer whose trust depends on it: one that returned rows proved the
 //! edges exist by returning them. The batch tool attaches it always, because its
@@ -48,9 +53,10 @@
 
 use serde_json::{json, Map, Value};
 
+use kin_core::cross_file_coverage::{ReferenceEnrichment, ENRICHABLE_LANGUAGES};
 use kin_model::entity::Entity;
 use kin_model::graph::{EntityFilter, EntityStore};
-use kin_model::ids::{EntityId, FilePathId};
+use kin_model::ids::{EntityId, FilePathId, LanguageId};
 use kin_model::relation::RelationKind;
 
 /// Reserved, additive payload key carrying the cross-file edge-class
@@ -196,9 +202,40 @@ pub fn observe_cross_file_reference_coverage_for_languages<S: EntityStore>(
             .collect::<Vec<_>>(),
         "classes": Value::Object(classes),
         "cross_file_classes": cross_file,
+        "reference_enrichment": reference_enrichment(&observed_languages),
         "budget_exhausted": any_budget_exhausted,
         "entities_examined": examined_total,
     })
+}
+
+/// Whether this build can produce cross-file reference and override edges for
+/// the observed languages at all.
+///
+/// `Calls` and `Imports` fall out of a single-file parse plus the linker, so the
+/// witness scan above can say whether this graph holds them. `References` cannot
+/// be derived that way: it needs a resolved program from a language server, and
+/// this build wires an adapter for exactly [`ENRICHABLE_LANGUAGES`]. For every
+/// other language the class can never exist no matter what the host has
+/// installed, which is a different fact from "the scan found none" and one the
+/// trust gate has to be able to read: an absence over a language whose reference
+/// edges are unproducible cannot be certified by any amount of scanning.
+///
+/// Only the unsupported half is published as a verdict. Whether an installed
+/// server actually backs a wired adapter is a HOST fact this observation does not
+/// probe (the CLI's status path does, through `which`), so a wired language
+/// reports `unknown` rather than claiming an availability nothing here checked.
+/// The weakest language governs, matching how the class states above merge: one
+/// unsupported language in a batch makes the batch's reference evidence
+/// unproducible.
+fn reference_enrichment(languages: &[LanguageId]) -> Value {
+    if languages
+        .iter()
+        .any(|language| !ENRICHABLE_LANGUAGES.contains(language))
+    {
+        json!(ReferenceEnrichment::Unsupported)
+    } else {
+        json!("unknown")
+    }
 }
 
 /// The reference classes among `kinds`, in the order given. Other relation kinds
@@ -467,6 +504,38 @@ mod tests {
         let python =
             observe_cross_file_reference_coverage(&store, &python_target, &[RelationKind::Calls]);
         assert_eq!(python["classes"]["calls"], json!("absent"));
+    }
+
+    /// The build fact the scan cannot see. JavaScript has no language-server
+    /// adapter in this build, so its reference edges are unproducible rather
+    /// than merely unobserved, and the observation has to say so or the trust
+    /// gate reads an unproducible class as a scanned-and-empty one.
+    #[test]
+    fn a_language_with_no_adapter_reports_reference_enrichment_unsupported() {
+        let store = InMemoryGraph::new();
+        let target = entity(
+            "createApplication",
+            "lib/express.js",
+            LanguageId::JavaScript,
+        );
+        store.upsert_entity(&target).unwrap();
+
+        let coverage =
+            observe_cross_file_reference_coverage(&store, &target, &[RelationKind::References]);
+        assert_eq!(coverage["reference_enrichment"], json!("unsupported"));
+
+        // Positive control: a language this build DOES wire an adapter for must
+        // not be reported unsupported, or the field says the same thing about
+        // every language and gates nothing.
+        let python = entity("parse_note", "nk/parsing.py", LanguageId::Python);
+        store.upsert_entity(&python).unwrap();
+        let coverage =
+            observe_cross_file_reference_coverage(&store, &python, &[RelationKind::References]);
+        assert_eq!(
+            coverage["reference_enrichment"],
+            json!("unknown"),
+            "a wired adapter's server is a host fact this scan does not probe"
+        );
     }
 
     /// An intra-file edge is not a witness. Without this the FIR-2353 graph,

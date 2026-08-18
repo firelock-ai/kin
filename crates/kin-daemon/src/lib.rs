@@ -183,3 +183,57 @@ pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
+
+/// Capture `tracing` events emitted on this thread, holding the process-global
+/// callsite cache open for as long as the capture lives.
+///
+/// `tracing` caches one `Interest` per `event!` callsite for the whole process,
+/// and the first thread to reach an unregistered callsite is the one that fills
+/// that cache. `tracing_core`'s registry takes a shortcut whenever exactly one
+/// dispatcher is registered: it resolves the interest against
+/// `dispatcher::get_default()` on the *calling* thread rather than against the
+/// dispatcher that is actually registered. A thread-local capture subscriber is
+/// one dispatcher, so a test running in parallel that reaches the callsite first
+/// resolves it against its own absent subscriber, `NoSubscriber` answers
+/// `Interest::never()`, and every later thread short-circuits on that cached
+/// answer, including the one doing the capturing. That is how the commit-phase
+/// capture once collected the two phases emitted through one timing helper and
+/// none of the eight emitted through the other.
+///
+/// Registering a second dispatcher for the life of the capture takes the
+/// shortcut off the table. Registration then unions the live dispatchers, the
+/// capture is always one of them, and interests that disagree settle at
+/// `Interest::sometimes()`, which asks the emitting thread's own subscriber once
+/// per event: this thread answers yes and every other thread answers no, so a
+/// test running in parallel neither gains nor loses a line. Building the capture
+/// dispatcher second also repairs a callsite an earlier test already cached as
+/// never, because registering a dispatcher rebuilds every registered callsite
+/// against the live set.
+///
+/// This is a test seam only. The daemon installs its subscriber as the global
+/// default, which `get_default()` returns on every thread, so the shortcut
+/// resolves against the real subscriber in a running daemon.
+#[cfg(test)]
+pub(crate) fn capture_events_on_this_thread<S>(subscriber: S) -> EventCapture
+where
+    S: tracing::Subscriber + Send + Sync + 'static,
+{
+    let pinned = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+    let capture = tracing::Dispatch::new(subscriber);
+    let default = tracing::dispatcher::set_default(&capture);
+    EventCapture {
+        _default: default,
+        _capture: capture,
+        _pinned: pinned,
+    }
+}
+
+/// A live capture from [`capture_events_on_this_thread`]. Dropping it restores
+/// the thread's previous subscriber and then releases the pinned dispatcher, in
+/// that order.
+#[cfg(test)]
+pub(crate) struct EventCapture {
+    _default: tracing::subscriber::DefaultGuard,
+    _capture: tracing::Dispatch,
+    _pinned: tracing::Dispatch,
+}

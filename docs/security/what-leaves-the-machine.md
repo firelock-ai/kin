@@ -38,9 +38,12 @@ Requests carry the version ask and nothing else; no repository data is attached.
 **Embedding model weights.** The default embedding provider is `local`: embedding and
 reranking run in-process on your hardware. The first time the embedder needs a model it
 does not already hold, it fetches the weights for `KIN_EMBED_MODEL_ID` (default
-`nomic-ai/nomic-embed-text-v1.5`) from Hugging Face through the standard `hf_hub` cache,
-which honors `HF_HOME`. After that fetch, inference is fully local. The download sends
-nothing outbound but the fetch itself; entity text never rides along.
+`nomic-ai/nomic-embed-text-v1.5`, about 523 MB) from `huggingface.co` into the standard
+`hf_hub` cache. That cache is the home-directory root, `~/.cache/huggingface/hub`: the
+embedder builds its hub client with `hf_hub`'s default constructor, which does not read
+`HF_HOME`, so setting that variable relocates neither the download nor the lookup. After
+the fetch, inference is fully local. The download sends nothing outbound but the fetch
+itself; entity text never rides along.
 
 **Hosted login and remote surfaces (opt-in).** `kin auth login` speaks to the host you
 name (default `https://kinlab.ai`). Credentials are stored in the OS keyring, or in an

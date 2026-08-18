@@ -229,6 +229,112 @@ impl Default for ContextOptions {
 /// Subgraph size at or above which the per-entity projection/token work is
 /// precomputed in parallel. Below it, rayon's fan-out overhead outweighs the
 /// gain, so the sequential path runs. Either path produces identical output.
+/// How many same-file neighbours the fallback keeps.
+///
+/// The cap is what makes a twenty-four-method class come back as six rows, so
+/// it is reported rather than applied silently: [`DependencySelection`] carries
+/// the candidate total beside the kept count.
+pub const SAME_FILE_FALLBACK_MAX: usize = 6;
+
+/// Why a row is in a pack's dependency section.
+///
+/// The two are not interchangeable. An edge row is a dependency the graph
+/// asserts; a same-file row is a neighbour the builder reached for because the
+/// focal had no dependency edge at all. A class whose only edges are `Contains`
+/// produces same-file rows, and without this distinction a caller reads them as
+/// the class's dependencies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DependencyRelation {
+    /// The entity reaches the focal over a real dependency edge.
+    DependencyEdge,
+    /// The focal carried no dependency edge, so this row is an entity that
+    /// shares the focal's file. Not a dependency.
+    SameFileNeighbor,
+}
+
+impl DependencyRelation {
+    /// The wire spelling shared by `kin context` and the `get_context_pack` MCP
+    /// tool, so one name means one thing on both surfaces.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DependencyRelation::DependencyEdge => "dependency_edge",
+            DependencyRelation::SameFileNeighbor => "same_file_neighbor",
+        }
+    }
+}
+
+/// Where a pack's dependency section came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DependencySource {
+    /// Every row rides a dependency edge to the focal.
+    DependencyEdges,
+    /// The focal had no dependency edge, so the section holds same-file
+    /// neighbours instead.
+    SameFileFallback,
+}
+
+impl DependencySource {
+    /// The wire spelling shared by `kin context` and the `get_context_pack` MCP
+    /// tool.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DependencySource::DependencyEdges => "dependency_edges",
+            DependencySource::SameFileFallback => "same_file_fallback",
+        }
+    }
+}
+
+/// How a pack's dependency section was filled, and what filling it left out.
+///
+/// These are selection facts only the builder holds: whether the same-file
+/// fallback ran, how many neighbours it had to choose from, and how many
+/// [`SAME_FILE_FALLBACK_MAX`] and the token budget dropped. None of it is
+/// recoverable from [`ContextPack`] alone, which is why the pack's dependency
+/// rows used to reach an agent with no way to tell an edge from a neighbour.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DependencySelection {
+    fallback: bool,
+    same_file_candidates: usize,
+    same_file_neighbors: Vec<EntityId>,
+}
+
+impl DependencySelection {
+    /// Where the rows in `dependency_signatures` came from.
+    pub fn source(&self) -> DependencySource {
+        if self.fallback {
+            DependencySource::SameFileFallback
+        } else {
+            DependencySource::DependencyEdges
+        }
+    }
+
+    /// Why one dependency row is in the pack.
+    pub fn relation_for(&self, entity_id: &EntityId) -> DependencyRelation {
+        if self.same_file_neighbors.contains(entity_id) {
+            DependencyRelation::SameFileNeighbor
+        } else {
+            DependencyRelation::DependencyEdge
+        }
+    }
+
+    /// Same-file neighbours the fallback had to choose from, before the cap and
+    /// the token budget. Zero when the fallback did not run.
+    pub fn same_file_candidates(&self) -> usize {
+        self.same_file_candidates
+    }
+
+    /// Same-file neighbours that actually reached the pack.
+    pub fn same_file_kept(&self) -> usize {
+        self.same_file_neighbors.len()
+    }
+
+    /// Same-file neighbours the cap or the budget dropped.
+    pub fn same_file_dropped(&self) -> usize {
+        self.same_file_candidates
+            .saturating_sub(self.same_file_neighbors.len())
+    }
+}
+
 const PARALLEL_ASSEMBLY_MIN_ENTITIES: usize = 64;
 
 /// Which pack section a non-focal subgraph entity projects into.
@@ -337,6 +443,25 @@ pub fn build_context_pack<G>(
 where
     G: GraphStore,
 {
+    build_context_pack_with_provenance(graph, focal_id, opts).map(|(pack, _)| pack)
+}
+
+/// Build a context pack and report how its dependency section was selected.
+///
+/// The pack itself cannot carry that: `dependency_signatures` is a flat list of
+/// entries whose provenance lived only in a `// same-file neighbor` comment
+/// inside `entry.content`, which the MCP boundary does not serialize. Callers
+/// that render dependencies for an agent take the [`DependencySelection`] with
+/// them and label every row, so a same-file neighbour is never read as an edge.
+pub fn build_context_pack_with_provenance<G>(
+    graph: &G,
+    focal_id: &EntityId,
+    opts: &ContextOptions,
+) -> Result<(ContextPack, DependencySelection)>
+where
+    G: GraphStore,
+{
+    let mut selection = DependencySelection::default();
     let budget_max = opts.budget.max_tokens();
     let mut total_tokens = 0;
 
@@ -578,7 +703,12 @@ where
     }
 
     if dep_entries.is_empty() && !same_file_fallback_entities.is_empty() {
-        for entity in same_file_fallback_entities.iter().take(6) {
+        selection.fallback = true;
+        selection.same_file_candidates = same_file_fallback_entities.len();
+        for entity in same_file_fallback_entities
+            .iter()
+            .take(SAME_FILE_FALLBACK_MAX)
+        {
             let mut content = format!("// same-file neighbor\n{}", project_signature_only(entity));
             if opts.assistant_hint == Some(AssistantHint::GeminiCli) {
                 if let Some(ref origin) = entity.file_origin {
@@ -588,6 +718,7 @@ where
             let tokens = estimate_tokens(&content);
             if total_tokens + tokens <= budget_max {
                 total_tokens += tokens;
+                selection.same_file_neighbors.push(entity.id);
                 dep_entries.push(ContextEntry {
                     entity_id: entity.id,
                     projection_level: ProjectionLevel::SignatureOnly,
@@ -656,19 +787,22 @@ where
         "built context pack"
     );
 
-    Ok(ContextPack {
-        focal_entities: vec![focal_entry],
-        dependency_signatures: dep_entries,
-        transitive_deps: transitive_entries,
-        contracts: contract_entries,
-        tests: test_entries,
-        work_items: work_entries,
-        annotations: annotation_entries,
-        traffic: vec![],
-        supporting_artifacts: vec![],
-        token_budget: opts.budget,
-        actual_tokens: total_tokens,
-    })
+    Ok((
+        ContextPack {
+            focal_entities: vec![focal_entry],
+            dependency_signatures: dep_entries,
+            transitive_deps: transitive_entries,
+            contracts: contract_entries,
+            tests: test_entries,
+            work_items: work_entries,
+            annotations: annotation_entries,
+            traffic: vec![],
+            supporting_artifacts: vec![],
+            token_budget: opts.budget,
+            actual_tokens: total_tokens,
+        },
+        selection,
+    ))
 }
 
 /// Build a context pack from an explicit retrieval plan handoff.
@@ -732,10 +866,26 @@ pub fn build_context_pack_with_traffic<G>(
 where
     G: GraphStore,
 {
-    let mut pack = build_context_pack(graph, focal_id, opts)?;
+    build_context_pack_with_traffic_and_provenance(graph, focal_id, opts, nearby_intents)
+        .map(|(pack, _)| pack)
+}
+
+/// [`build_context_pack_with_traffic`], reporting how the dependency section was
+/// selected. See [`build_context_pack_with_provenance`] for why the pack cannot
+/// carry that itself.
+pub fn build_context_pack_with_traffic_and_provenance<G>(
+    graph: &G,
+    focal_id: &EntityId,
+    opts: &ContextOptions,
+    nearby_intents: &[IntentSummary],
+) -> Result<(ContextPack, DependencySelection)>
+where
+    G: GraphStore,
+{
+    let (mut pack, selection) = build_context_pack_with_provenance(graph, focal_id, opts)?;
 
     if !opts.include_traffic || nearby_intents.is_empty() {
-        return Ok(pack);
+        return Ok((pack, selection));
     }
 
     // Classify each intent by proximity to the focal entity.
@@ -793,7 +943,7 @@ where
         "added traffic metadata to context pack"
     );
 
-    Ok(pack)
+    Ok((pack, selection))
 }
 
 fn collect_supporting_file_ids<G>(graph: &G, plan: &ContextPlan) -> Result<Vec<FilePathId>>
@@ -1623,6 +1773,104 @@ mod tests {
         assert!(
             first.contains("_safeParse"),
             "closest same-file companion should be ranked first"
+        );
+    }
+
+    /// The fallback is a different answer to a different question, and the pack
+    /// alone cannot say which one a caller got: `dependency_signatures` is the
+    /// same field either way, and the cap turns a twenty-four-member class into
+    /// six rows with nothing reporting the other eighteen.
+    #[test]
+    fn same_file_fallback_reports_its_source_and_what_the_cap_dropped() {
+        let store = kin_db::InMemoryGraph::new();
+
+        let focal = make_file_entity("NoteStore", EntityKind::Class, "src/notes.py");
+        store.upsert_entity(&focal).unwrap();
+        for index in 0..9 {
+            let neighbor = make_file_entity(
+                &format!("NoteStore.method{index}"),
+                EntityKind::Method,
+                "src/notes.py",
+            );
+            store.upsert_entity(&neighbor).unwrap();
+        }
+
+        let (pack, selection) =
+            build_context_pack_with_provenance(&store, &focal.id, &ContextOptions::default())
+                .unwrap();
+
+        assert_eq!(selection.source(), DependencySource::SameFileFallback);
+        assert_eq!(
+            pack.dependency_signatures.len(),
+            SAME_FILE_FALLBACK_MAX,
+            "the cap is what makes a nine-neighbour file answer with six rows"
+        );
+        assert_eq!(selection.same_file_candidates(), 9);
+        assert_eq!(selection.same_file_kept(), SAME_FILE_FALLBACK_MAX);
+        assert_eq!(selection.same_file_dropped(), 3);
+        for entry in &pack.dependency_signatures {
+            assert_eq!(
+                selection.relation_for(&entry.entity_id),
+                DependencyRelation::SameFileNeighbor,
+                "every fallback row must be reported as a neighbour, not an edge"
+            );
+        }
+    }
+
+    /// The other half of the same guard: a focal that really does have
+    /// dependency edges must not be reported as a fallback, or the marker means
+    /// nothing.
+    #[test]
+    fn dependency_edge_rows_are_not_reported_as_same_file_neighbors() {
+        use kin_model::relation::{Relation, RelationKind, RelationOrigin};
+
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_file_entity("read_notes", EntityKind::Function, "src/reader.py");
+        let link_record = make_file_entity("LinkRecord", EntityKind::Class, "src/records.py");
+        let note_record = make_file_entity("NoteRecord", EntityKind::Class, "src/records.py");
+        // A neighbour in the focal's own file, which the fallback would have
+        // reached for had the edges below not existed.
+        let sibling = make_file_entity("read_note", EntityKind::Function, "src/reader.py");
+        store.upsert_entity(&focal).unwrap();
+        store.upsert_entity(&link_record).unwrap();
+        store.upsert_entity(&note_record).unwrap();
+        store.upsert_entity(&sibling).unwrap();
+
+        for callee in [&link_record, &note_record] {
+            store
+                .upsert_relation(&Relation {
+                    id: kin_model::ids::RelationId::new(),
+                    kind: RelationKind::Calls,
+                    src: GraphNodeId::Entity(focal.id),
+                    dst: GraphNodeId::Entity(callee.id),
+                    confidence: 1.0,
+                    origin: RelationOrigin::Parsed,
+                    created_in: None,
+                    import_source: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        }
+
+        let (pack, selection) =
+            build_context_pack_with_provenance(&store, &focal.id, &ContextOptions::default())
+                .unwrap();
+
+        assert_eq!(selection.source(), DependencySource::DependencyEdges);
+        assert_eq!(selection.same_file_candidates(), 0);
+        assert_eq!(selection.same_file_dropped(), 0);
+        assert_eq!(pack.dependency_signatures.len(), 2);
+        for entry in &pack.dependency_signatures {
+            assert_eq!(
+                selection.relation_for(&entry.entity_id),
+                DependencyRelation::DependencyEdge
+            );
+        }
+        assert!(
+            pack.dependency_signatures
+                .iter()
+                .all(|entry| entry.entity_id != sibling.id),
+            "a same-file sibling must not join a pack that has real edges"
         );
     }
 

@@ -111,6 +111,7 @@ jobs:
             ./scripts/release-archive-shape.test.cjs \
             ./scripts/release-order.test.mjs \
             ./scripts/release-hold-alarm.test.mjs \
+            ./scripts/advisory-sweep.test.mjs \
             ./scripts/verify-capability-proof.test.mjs \
             ./scripts/verify-npm-attestation.test.mjs
           node --check ./scripts/check-glibc-floor.mjs
@@ -119,6 +120,7 @@ jobs:
           node --check ./scripts/prepare-release.mjs
           node --check ./scripts/release-order.mjs
           node --check ./scripts/release-hold-alarm.mjs
+          node --check ./scripts/advisory-sweep.mjs
           node --check ./scripts/verify-capability-proof.mjs
           node --check ./scripts/verify-npm-attestation.mjs
           bash -n ./scripts/publish-npm-release.sh
@@ -1009,111 +1011,6 @@ jobs:
       - name: Check Zero File-Search Invariant (answer modules)
         run: bash scripts/zero_file_search_guard.sh
 
-      - name: Falsify Zero File-Search guards
-        # Both guards above still run on both platforms. Only this meta-proof,
-        # that the guards are not vacuous, is single-legged. Falsifiability is
-        # a property of the guards' logic, and neither the Python checker nor
-        # the shell guard branches on platform: they carry no `sys.platform` /
-        # `os.name` / `darwin` / `linux` test and no GNU-only shell construct.
-        # The harness is self-contained, poisoning a `mktemp -d` copy of
-        # `crates` and `scripts` rather than the checkout, so skipping it
-        # leaves no state for later steps and does not reorder them. It costs
-        # 5.9 min of the macOS leg, which is the merge queue's critical path.
-        if: runner.os == 'Linux'
-        run: |
-          set -euo pipefail
-          poisoned="$(mktemp -d)"
-          trap 'rm -rf "$poisoned"' EXIT
-          cp -a crates scripts "$poisoned/"
-
-          fail_expected() {
-            local label="$1" want="$2"; shift 2
-            local out rc=0
-            out="$("$@" 2>&1)" || rc=$?
-            if [[ $rc -eq 0 ]]; then
-              echo "::error::falsification failed. $label passed when it should have failed"; echo "$out"; exit 1
-            fi
-            if ! grep -qF "$want" <<<"$out"; then
-              echo "::error::falsification failed. $label failed but never named '$want'"
-              echo "$out"; exit 1
-            fi
-            echo "  ok: $label"
-          }
-
-          # [1/3] Every answer module, poisoned at several sites including
-          # end-of-file, against both guards. This step used to plant one probe
-          # in one module, at the top of a file it had truncated to three lines.
-          # That proved the guards worked at that spot and nowhere else, and it
-          # passed for as long as a comment-tracking desync left the last third
-          # of the largest answer module unscanned.
-          #
-          # The harness also probes the two ways an EXEMPTION can lose scope
-          # rather than a pattern losing a site: a brace inside a literal or a
-          # comment planted in an allowlisted function body, which a raw brace
-          # counter reads as an unclosed body and silently excuses to end of
-          # file, and a counted pin paid for by a rename in test code the guard
-          # never reads. Both are the same failure as [2/3] reached through the
-          # exemption mechanism instead of a stale pin.
-          echo "[1/3] every answer module, every probe site, both guards"
-          python3 scripts/falsify-zero-file-search.py "$poisoned"
-
-          # [2/3] A broken pin must not hide the scan. Allowlist validation used
-          # to exit before the walk, so a stale pin reported itself and nothing
-          # else; two stale pins once masked ten real violations in a newly
-          # covered crate, which made a red allowlist useless as a measure of
-          # remaining work. Break one pin's count deliberately and require the
-          # run to report the violations that pin was masking AS WELL AS the pin
-          # error. Runs before [3/3], which mutates the allowlist irreversibly.
-          echo "[2/3] a broken pin must not hide the scan"
-          python3 - "$poisoned/scripts/zero-file-search-allowlist.json" <<'PY'
-          import json, sys
-          path = sys.argv[1]
-          data = json.load(open(path))
-          target = "crates/kin-daemon/src/repository_branch.rs"
-          for entry in data["allowlist"]:
-              if entry["file"] == target:
-                  entry["allow_match"] = [{"expr": ".metadata()", "count": 999}]
-                  break
-          else:
-              raise SystemExit(f"::error::falsification setup: no pin on {target}")
-          json.dump(data, open(path, "w"))
-          PY
-          out=""; rc=0
-          out="$(python3 "$poisoned/scripts/verify-zero-file-search.py" "$poisoned" 2>&1)" || rc=$?
-          for want in \
-            "[VIOLATION] crates/kin-daemon/src/repository_branch.rs" \
-            "want 999" \
-            "Scanned "; do
-            if ! grep -qF "$want" <<<"$out"; then
-              echo "::error::falsification failed: a broken pin hid the scan (missing '$want')"
-              echo "$out"; exit 1
-            fi
-          done
-          if [[ $rc -eq 0 ]]; then
-            echo "::error::falsification failed: a broken pin did not fail the guard"
-            echo "$out"; exit 1
-          fi
-          echo "  ok: broken pin reported its masked violations and still failed"
-          # Restore the real policy; [3/3] starts from an unbroken allowlist.
-          cp scripts/zero-file-search-allowlist.json "$poisoned/scripts/"
-
-          echo "[3/3] allowlist entry naming a path that no longer exists"
-          python3 - "$poisoned/scripts/zero-file-search-allowlist.json" <<'PY'
-          import json, sys
-          path = sys.argv[1]
-          data = json.load(open(path))
-          data["allowlist"].append({
-              "file": "crates/kin-core/src/text_refs.rs",
-              "reason": "resurrected stale exemption",
-              "owner": "ci-falsification",
-              "expiration": "2026-12-31",
-          })
-          json.dump(data, open(path, "w"))
-          PY
-          fail_expected "python guard" "text_refs.rs" python3 "$poisoned/scripts/verify-zero-file-search.py" "$poisoned"
-
-          echo "Zero File-Search guards are falsifiable: every probe was caught."
-
       # Deep history is a PROJECTION re-authored at ingest, not a stored fact:
       # a merge change's entity/relation deltas are discarded and recomputed by
       # the replay algorithm. Editing that algorithm changes what Kin reports
@@ -1279,9 +1176,215 @@ jobs:
         # nextest does not run doctests; keep them covered explicitly.
         run: cargo test --doc --locked
 
-      # `gcs` is a non-default feature, so the passes above never execute the
-      # hosted-storage code it gates, and Clippy's `--all-features` pass only
-      # type-checks it. Without this step a behavioral regression in the
+  # Two sets of steps used to run inside Check & Test and gate nothing that
+  # needed them to be there. Both sat on the merge queue's critical path: five
+  # merge_group runs sampled on 2026-08-18 spent 9.9 min of the average ubuntu
+  # leg falsifying the Zero File-Search guards, and 15.7 min of the average
+  # macOS leg on the three feature permutations. Neither set consumes anything
+  # Check & Test builds. The falsification harness runs no cargo at all, and
+  # each feature permutation resolves its own feature set, so it recompiles the
+  # workspace crates whether it runs here or there. Running them beside Check &
+  # Test rather than behind it changes when they run and nothing about what
+  # they assert.
+  falsify-guards:
+    name: Falsify guards
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      # The harness and both guards it drives locate a function body textually,
+      # by the indentation of its declaration and the matching closing brace.
+      # scripts/falsify-zero-file-search.py and scripts/zero_file_search_guard.sh
+      # each record `cargo fmt --check` running in the same CI job as the reason
+      # that location is reliable, so this job carries that obligation with the
+      # harness rather than inheriting it from a job it no longer shares. An
+      # unformatted tree could otherwise move a probe site, leave the harness
+      # nothing to probe, and let it report success having proved nothing.
+      # It needs no cache and no registry index: `cargo fmt -- --check` resolves
+      # no dependencies and runs against an empty CARGO_HOME.
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Falsify Zero File-Search guards
+        # Both guards still run on both platforms in Check & Test. Only this
+        # meta-proof, that the guards are not vacuous, is single-legged.
+        # Falsifiability is a property of the guards' logic, and neither the
+        # Python checker nor the shell guard branches on platform: they carry no
+        # `sys.platform` / `os.name` / `darwin` / `linux` test and no GNU-only
+        # shell construct. The harness is self-contained, poisoning a
+        # `mktemp -d` copy of `crates` and `scripts` rather than the checkout.
+        run: |
+          set -euo pipefail
+          poisoned="$(mktemp -d)"
+          trap 'rm -rf "$poisoned"' EXIT
+          cp -a crates scripts "$poisoned/"
+
+          fail_expected() {
+            local label="$1" want="$2"; shift 2
+            local out rc=0
+            out="$("$@" 2>&1)" || rc=$?
+            if [[ $rc -eq 0 ]]; then
+              echo "::error::falsification failed. $label passed when it should have failed"; echo "$out"; exit 1
+            fi
+            if ! grep -qF "$want" <<<"$out"; then
+              echo "::error::falsification failed. $label failed but never named '$want'"
+              echo "$out"; exit 1
+            fi
+            echo "  ok: $label"
+          }
+
+          # [1/3] Every answer module, poisoned at several sites including
+          # end-of-file, against both guards. This step used to plant one probe
+          # in one module, at the top of a file it had truncated to three lines.
+          # That proved the guards worked at that spot and nowhere else, and it
+          # passed for as long as a comment-tracking desync left the last third
+          # of the largest answer module unscanned.
+          #
+          # The harness also probes the two ways an EXEMPTION can lose scope
+          # rather than a pattern losing a site: a brace inside a literal or a
+          # comment planted in an allowlisted function body, which a raw brace
+          # counter reads as an unclosed body and silently excuses to end of
+          # file, and a counted pin paid for by a rename in test code the guard
+          # never reads. Both are the same failure as [2/3] reached through the
+          # exemption mechanism instead of a stale pin.
+          echo "[1/3] every answer module, every probe site, both guards"
+          python3 scripts/falsify-zero-file-search.py "$poisoned"
+
+          # [2/3] A broken pin must not hide the scan. Allowlist validation used
+          # to exit before the walk, so a stale pin reported itself and nothing
+          # else; two stale pins once masked ten real violations in a newly
+          # covered crate, which made a red allowlist useless as a measure of
+          # remaining work. Break one pin's count deliberately and require the
+          # run to report the violations that pin was masking AS WELL AS the pin
+          # error. Runs before [3/3], which mutates the allowlist irreversibly.
+          echo "[2/3] a broken pin must not hide the scan"
+          python3 - "$poisoned/scripts/zero-file-search-allowlist.json" <<'PY'
+          import json, sys
+          path = sys.argv[1]
+          data = json.load(open(path))
+          target = "crates/kin-daemon/src/repository_branch.rs"
+          for entry in data["allowlist"]:
+              if entry["file"] == target:
+                  entry["allow_match"] = [{"expr": ".metadata()", "count": 999}]
+                  break
+          else:
+              raise SystemExit(f"::error::falsification setup: no pin on {target}")
+          json.dump(data, open(path, "w"))
+          PY
+          out=""; rc=0
+          out="$(python3 "$poisoned/scripts/verify-zero-file-search.py" "$poisoned" 2>&1)" || rc=$?
+          for want in \
+            "[VIOLATION] crates/kin-daemon/src/repository_branch.rs" \
+            "want 999" \
+            "Scanned "; do
+            if ! grep -qF "$want" <<<"$out"; then
+              echo "::error::falsification failed: a broken pin hid the scan (missing '$want')"
+              echo "$out"; exit 1
+            fi
+          done
+          if [[ $rc -eq 0 ]]; then
+            echo "::error::falsification failed: a broken pin did not fail the guard"
+            echo "$out"; exit 1
+          fi
+          echo "  ok: broken pin reported its masked violations and still failed"
+          # Restore the real policy; [3/3] starts from an unbroken allowlist.
+          cp scripts/zero-file-search-allowlist.json "$poisoned/scripts/"
+
+          echo "[3/3] allowlist entry naming a path that no longer exists"
+          python3 - "$poisoned/scripts/zero-file-search-allowlist.json" <<'PY'
+          import json, sys
+          path = sys.argv[1]
+          data = json.load(open(path))
+          data["allowlist"].append({
+              "file": "crates/kin-core/src/text_refs.rs",
+              "reason": "resurrected stale exemption",
+              "owner": "ci-falsification",
+              "expiration": "2026-12-31",
+          })
+          json.dump(data, open(path, "w"))
+          PY
+          fail_expected "python guard" "text_refs.rs" python3 "$poisoned/scripts/verify-zero-file-search.py" "$poisoned"
+
+          echo "Zero File-Search guards are falsifiable: every probe was caught."
+  # A skipped matrix job never expands, so its per-leg context names do not
+  # appear at all rather than appearing skipped. `check-docs-only` exists for
+  # exactly that reason and this is its counterpart: once the branch ruleset
+  # requires `Feature permutation tests (ubuntu-latest)` and its macOS leg, a
+  # documentation-only diff would otherwise wait forever for two contexts that
+  # were never going to be created. Both legs run here on one ubuntu runner
+  # because the point is the name, not the work.
+  feature-tests-docs-only:
+    name: Feature permutation tests
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only == 'true' }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Report the documentation-only fast path
+        run: echo "documentation-only diff; feature permutation tests not applicable"
+
+  feature-tests:
+    name: Feature permutation tests
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    # Same bounds as Check & Test: the feature permutations compile the same
+    # workspace and would otherwise retain more than a hosted runner's
+    # available disk in incremental objects and debug symbols.
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+
+      - name: Verify kin cargo registry config
+        run: |
+          test -f .cargo/config.toml
+          grep -q '^\[registries\.kin\]' .cargo/config.toml
+          if grep -q '^\[patch\.kin\]' .cargo/config.toml; then echo "::error::[patch.kin] git pins must be removed. kin-* resolve from the Kin registry"; exit 1; fi
+
+      # `shared-key: check` is the key Check & Test's own cache already writes,
+      # so these permutations start from that warm third-party dependency graph
+      # instead of compiling it from nothing. Only the workspace crates rebuild
+      # for the changed feature set, which is what they cost inside Check & Test
+      # too. `save-if: false` because this job must never write that entry: it
+      # resolves a different feature set, and a save from here would hand
+      # Check & Test a target directory missing the artifacts its steps expect.
+      # A rename of the `check` job silently costs this job its warm start, so
+      # the cache-hit line in this step's log is the thing to read if it slows.
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: check
+          save-if: false
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      # `gcs` is a non-default feature, so the default-feature passes in Check &
+      # Test never execute the hosted-storage code it gates, and the
+      # `--all-features` Clippy pass there only type-checks it. Without this
+      # step a behavioral regression in the
       # GCS-mode startup admission path compiles clean and reaches main with a
       # green required context. The whole package runs rather than just the
       # binary target: the feature gates only `bin/kin-daemon.rs` today, and
@@ -1385,3 +1488,157 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           slug: firelock-ai/kin
           fail_ci_if_error: false
+
+  # The public install proof is what caught v0.5.38, and it caught it on the
+  # tag, after the version was cut and the archives were built and published,
+  # because nothing before the tag ran it. These three jobs run that same
+  # reusable proof against the binaries this pull request builds, so the break
+  # is a red pull request instead of a burned tag.
+  install-proof-pr-build:
+    name: Install Proof (PR) Build
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The release builds the Linux core against musl and links it static, so
+      # one archive runs on every distribution. Building the same target here is
+      # what makes these bytes the release's bytes rather than a near-miss whose
+      # libc coupling the proof would never see.
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install the musl C toolchain
+        run: scripts/ci-apt-install.sh musl-tools
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # The build stamps its own source identity, and `kin bench-meta` reports
+      # it to the proof, which refuses a dirty build. Assert the tree here so
+      # that refusal names the cause instead of surfacing as an opaque
+      # capability failure three jobs later.
+      - name: Assert a clean source tree before compiling
+        run: |
+          set -euo pipefail
+          dirty="$(git status --porcelain --untracked-files=all)"
+          if [ -n "$dirty" ]; then
+            printf '%s\n' "$dirty" >&2
+            echo "::error::install-proof build tree is not clean before compilation"
+            exit 1
+          fi
+
+      - name: Build the release binaries this pull request would ship
+        run: |
+          cargo build --locked --release \
+            --target x86_64-unknown-linux-musl -p kin-cli -p kin-daemon
+
+      # Assembled exactly as the release assembles it, down to the archive name,
+      # the single top-level directory, and the shasum-format sidecar, so the
+      # installer takes its ordinary path over these bytes. kin-vfs and its shim
+      # are absent on purpose: they are built from a separate repository at a
+      # commit the release pins, and a pull request produces no such bytes.
+      # The shape helper the release publishes with is what judges the result.
+      - name: Package the release archive layout
+        run: |
+          set -euo pipefail
+          artifact=kin-linux-x86_64
+          stage="$RUNNER_TEMP/install-proof-pr"
+          release=target/x86_64-unknown-linux-musl/release
+          mkdir -p "$stage/$artifact"
+          cp "$release/kin" "$release/kin-daemon" "$stage/$artifact/"
+          tar czf "$stage/$artifact.tar.gz" -C "$stage" "$artifact"
+          ( cd "$stage" && shasum -a 256 "$artifact.tar.gz" > "$artifact.tar.gz.sha256" )
+          ARCHIVE="$stage/$artifact.tar.gz" ARTIFACT="$artifact" node -e '
+            const { execFileSync } = require("node:child_process");
+            const { assertReleaseArchiveMemberPaths } = require("./scripts/release-archive-shape.cjs");
+            const listing = execFileSync("tar", ["-tzf", process.env.ARCHIVE], { encoding: "utf8" })
+              .split("\n")
+              .filter((line) => line !== "");
+            assertReleaseArchiveMemberPaths(listing, {
+              artifact: process.env.ARTIFACT,
+              target: "x86_64-unknown-linux-musl",
+            });
+          '
+          # The proof binds installed bytes to a public release tag, its commit,
+          # and the Cargo.lock at that commit. A pull request has no tag, so it
+          # states the same three facts about itself and the proof binds to
+          # those instead: the version the binaries stamp, the commit they were
+          # compiled at, and the digest of the lockfile they were compiled with.
+          "$stage/$artifact/kin" --version | awk '{print $2}' > "$stage/expected-version.txt"
+          git rev-parse HEAD > "$stage/expected-commit.txt"
+          sha256sum Cargo.lock | cut -d' ' -f1 > "$stage/expected-lock-sha.txt"
+          # The proof runs with no checkout, so the installer it must exercise
+          # travels with the archive.
+          cp scripts/install.sh "$stage/install.sh"
+          cat "$stage/expected-version.txt" "$stage/expected-commit.txt" \
+            "$stage/expected-lock-sha.txt" "$stage/$artifact.tar.gz.sha256"
+
+      - name: Upload the pull request release archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: install-proof-pr-binaries
+          if-no-files-found: error
+          retention-days: 3
+          path: |
+            ${{ runner.temp }}/install-proof-pr/kin-linux-x86_64.tar.gz
+            ${{ runner.temp }}/install-proof-pr/kin-linux-x86_64.tar.gz.sha256
+            ${{ runner.temp }}/install-proof-pr/expected-version.txt
+            ${{ runner.temp }}/install-proof-pr/expected-commit.txt
+            ${{ runner.temp }}/install-proof-pr/expected-lock-sha.txt
+            ${{ runner.temp }}/install-proof-pr/install.sh
+
+  install-proof-pr:
+    name: Install Proof (PR)
+    needs: [changes, install-proof-pr-build]
+    if: >-
+      ${{ !cancelled()
+      && needs.changes.outputs.docs_only != 'true'
+      && needs.install-proof-pr-build.result == 'success' }}
+    uses: ./.github/workflows/install-proof.yml
+    with:
+      release_tag: ""
+      expected_vfs_commit: ""
+      local_artifact: install-proof-pr-binaries
+    permissions:
+      contents: read
+      attestations: read
+
+  # A reusable-workflow call publishes its checks as `<caller> / <leg>`, and a
+  # caller that skips publishes no such check at all, so those names cannot be
+  # the required context: a documentation-only pull request would wait forever
+  # on a check nothing will ever report. This job always reports, under one
+  # stable name, and is the context to require.
+  install-proof-pr-gate:
+    name: Install Proof (PR) Gate
+    needs: [changes, install-proof-pr-build, install-proof-pr]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require the pull request install proof
+        env:
+          DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
+          BUILD_RESULT: ${{ needs.install-proof-pr-build.result }}
+          PROOF_RESULT: ${{ needs.install-proof-pr.result }}
+        run: |
+          set -euo pipefail
+          if [ "$DOCS_ONLY" = "true" ]; then
+            echo "documentation-only diff: no binaries changed, so the install proof has nothing to install"
+            exit 0
+          fi
+          if [ "$BUILD_RESULT" != "success" ]; then
+            echo "::error::install proof binaries did not build ($BUILD_RESULT); the pull request install proof never ran"
+            exit 1
+          fi
+          if [ "$PROOF_RESULT" != "success" ]; then
+            echo "::error::the install proof failed against this pull request's binaries ($PROOF_RESULT); the same proof gates every release tag"
+            exit 1
+          fi
+          echo "install proof passed against this pull request's binaries"

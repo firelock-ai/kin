@@ -31,6 +31,19 @@
       "expiration": "2026-12-31"
     },
     {
+      "file": "crates/kin-cli/src/embed_model.rs",
+      "reason": "Config/capability IO over the local embedding-model cache, the same root retrieval_profile.rs probes for the reranker. This module mirrors the loader's own cache layout to say whether the runtime embedding-model download has happened, is in flight, or will never happen: it tests whether a KIN_EMBED_MODEL_ID names a local directory, because such an id short-circuits the hub fetch and reporting it as a pending download would announce egress that never happens, and it walks the model's cache directory to sum the bytes already there, skipping symlinked snapshot entries so a resolved snapshot is never counted twice and bounded by a fixed entry budget. Those bytes are the numerator of a progress line on init, resources inspect, graph status and doctor; nothing here reads repository content and no result of it feeds locate, search, context, trace, review, xref, or rename. Pinned by exact expression so any newly added filesystem primitive in this module fails the guard until it is re-justified.",
+      "owner": "kin-cli",
+      "expiration": "2026-12-31",
+      "allow_match": [
+        "if Path::new(model_id).is_dir() {",
+        "let Ok(entries) = std::fs::read_dir(dir) else {",
+        "if file_type.is_symlink() {",
+        "if file_type.is_dir() {",
+        "} else if let Ok(metadata) = entry.metadata() {"
+      ]
+    },
+    {
       "file": "crates/kin-cli/src/commands/locate.rs",
       "reason": "Telemetry consent boundary: the only filesystem touch in the locate authority path is the presence of the consent marker, which gates telemetry and never contributes to the ranked answer. Pinned so any other filesystem primitive in this module fails the guard",
       "owner": "kin-cli",
@@ -65,7 +78,7 @@
     },
     {
       "file": "crates/kin-cli/src/commands/health.rs",
-      "reason": "Install-diagnostic boundary: kin health reports on the local installation, so the environment is its subject rather than a source of semantic answers. The line this pin enforces is that environment probes are a diagnostic boundary while repo-content reads are not, and every pinned expression was checked against it individually. Four classes: (1) install artifacts — the kin-daemon binary beside the current exe or in the cargo target dir, the VFS shim's metadata and its four-byte object header, the shell hook, the editor extensions directory; (2) environment config — the shell rc, and the AI-client MCP configs for Claude, Cursor, Codex and Antigravity, which are read to check the kin server entry and never for their surrounding content; (3) repo binding — the layout-discovered repository root is compared against the repository argument recorded in client config, and that root is first resolved to its canonical form, because the config writers record the canonicalized path and an unresolved root makes the check reject setup's own write wherever the two forms differ, which is every Windows install (the \\?\\ verbatim prefix) and any symlinked ancestor. The resolution takes a path already produced by layout discovery, reads no repository content, and its result is only ever compared, never returned as an answer. The setup-ledger fingerprint check belongs to this same class: it re-reads the client config bytes setup itself wrote to prove the on-disk entry is still the recorded one, and probes the recorded repository's existence before trusting the record, both feeding a comparison and never an answer; (4) a projection audit — read_dir over .kin/runs listing session workspaces left materialized. That last one is a filesystem read by necessity rather than by shortcut: it detects materialized state that reconcile has not reclaimed, and a graph that believed those sessions closed would report nothing, which is the exact failure the check exists to catch, so the traversal audits the projection against graph truth instead of standing in for it. Semantic readiness itself comes from daemon-owned embedding state, not sidecar presence. A fifth class, host assessment: two absolute-path subprocess probes (pgrep for the syspolicyd pid, ps for its CPU share) sample the macOS binary-assessment daemon so a saturated assessor is named as the cause of machine-wide launch stalls instead of surfacing as random tool hangs; they read scheduler state about the host, never repository content, and no output feeds a semantic answer. A sixth class, severity discrimination: four probes that decide whether a check reports a failure or reports nothing wrong, each testing for the presence of an artifact rather than reading one. The kin-vfs driver beside the managed binaries separates a shim the installer deliberately removed on a host that cannot run projection from a shim missing where projection is installed. The repository's daemon endpoint record separates a repository no daemon has ever started for from one whose daemon left its record behind unreachable. A .kin entry the layout already refused separates a partial or corrupt repository from a directory that simply is not one, and it is a probe for the marker directory, never a read of anything inside it; the layout, not this probe, decides what a repository is, and it has already answered before the probe runs. The fourth resolves two paths to their canonical form so the managed toolchain directory can be recognized as itself rather than as a repository someone failed to initialize, which is the same comparison-only use as class (3) and returns no answer. None of the four reads repository source content, and each exists so a correct install stops being reported as broken. No pinned expression reads repository source content. Pinned rather than whole-file so this module is falsifiable at every site and any newly added filesystem primitive fails the guard",
+      "reason": "Install-diagnostic boundary: kin health reports on the local installation, so the environment is its subject rather than a source of semantic answers. The line this pin enforces is that environment probes are a diagnostic boundary while repo-content reads are not, and every pinned expression was checked against it individually. Four classes: (1) install artifacts — the kin-daemon binary beside the current exe or in the cargo target dir, the VFS shim's metadata and its four-byte object header, the shell hook, the editor extensions directory; (2) environment config — the shell rc, and the AI-client MCP configs for Claude, Cursor, Codex and Antigravity, which are read to check the kin server entry and never for their surrounding content; (3) repo binding — the layout-discovered repository root is compared against the repository argument recorded in client config, and that root is first resolved to its canonical form, because the config writers record the canonicalized path and an unresolved root makes the check reject setup's own write wherever the two forms differ, which is every Windows install (the \\?\\ verbatim prefix) and any symlinked ancestor. The resolution takes a path already produced by layout discovery, reads no repository content, and its result is only ever compared, never returned as an answer. The setup-ledger fingerprint check belongs to this same class: it re-reads the client config bytes setup itself wrote to prove the on-disk entry is still the recorded one, and probes the recorded repository's existence before trusting the record, both feeding a comparison and never an answer; (4) a projection audit — read_dir over .kin/runs listing session workspaces left materialized. That last one is a filesystem read by necessity rather than by shortcut: it detects materialized state that reconcile has not reclaimed, and a graph that believed those sessions closed would report nothing, which is the exact failure the check exists to catch, so the traversal audits the projection against graph truth instead of standing in for it. Semantic readiness itself comes from daemon-owned embedding state, not sidecar presence. A fifth class, host assessment: two absolute-path subprocess probes (pgrep for the syspolicyd pid, ps for its CPU share) sample the macOS binary-assessment daemon so a saturated assessor is named as the cause of machine-wide launch stalls instead of surfacing as random tool hangs; they read scheduler state about the host, never repository content, and no output feeds a semantic answer. A sixth class, severity discrimination: four probes that decide whether a check reports a failure or reports nothing wrong, each testing for the presence of an artifact rather than reading one. The kin-vfs driver beside the managed binaries separates a shim the installer deliberately removed on a host that cannot run projection from a shim missing where projection is installed. The repository's daemon endpoint record separates a repository no daemon has ever started for from one whose daemon left its record behind unreachable. A .kin entry the layout already refused separates a partial or corrupt repository from a directory that simply is not one, and it is a probe for the marker directory, never a read of anything inside it; the layout, not this probe, decides what a repository is, and it has already answered before the probe runs. The fourth resolves two paths to their canonical form so the managed toolchain directory can be recognized as itself rather than as a repository someone failed to initialize, which is the same comparison-only use as class (3) and returns no answer. None of the four reads repository source content, and each exists so a correct install stops being reported as broken. No pinned expression reads repository source content. Pinned rather than whole-file so this module is falsifiable at every site and any newly added filesystem primitive fails the guard A seventh class, driver loadability: the kin-vfs driver is resolved beside the running binary, in the managed bin directory and on PATH, and the one candidate that is a regular file is executed with --help, stdin closed, and judged on whether the process reached its own code rather than on a zero exit, because the shipped driver takes a subcommand and exits 2 on a healthy install while a loader refusal exits 127 or dies at spawn. Existence is not loadability: an archive has shipped a driver needing a newer glibc than the host carries, and only running it produces the loader's message, which doctor then reports verbatim. The probe runs a binary that is part of Kin's own install, reads nothing from any repository, and its result decides between absent, loadable and unloadable rows. The managed bin directory's presence is tested for the same diagnostic reason: doctor --fix writes a PATH line for that directory only when it exists, so the check reports which of the two cases the install is in instead of promising a PATH entry for a directory nothing populated.",
       "owner": "kin-cli",
       "expiration": "2026-12-31",
       "allow_match": [
@@ -92,7 +105,12 @@
         "let pgrep = std::process::Command::new(\"/usr/bin/pgrep\")",
         "let ps = std::process::Command::new(\"/bin/ps\")",
         "if endpoint_record.exists() {",
-        "kin_home.join(\"bin\").join(vfs_binary_filename()).exists()",
+        "use std::process::{Command, Stdio};",
+        "match Command::new(path)",
+        "fn driver_ran(status: &std::process::ExitStatus) -> bool {",
+        "fn loader_failure_message(stderr: &[u8], status: &std::process::ExitStatus) -> String {",
+        "if !candidate.is_file() {",
+        "bin_dir_present: bin_dir.is_dir(),",
         "if local_kin.exists() && !is_managed_toolchain {",
         "match (left.canonicalize(), right.canonicalize()) {"
       ]
@@ -154,7 +172,7 @@
     },
     {
       "file": "crates/kin-daemon-spawn/src/lib.rs",
-      "reason": "Daemon process lifecycle boundary with zero answer-authority surface. The exact expression pins cover process construction, readiness records, port records, PID records, and Linux process-table inspection; each reaches or supervises the daemon that owns graph truth and never derives a semantic answer. The PID record is read to establish that a daemon is still running, which is a liveness question about a process rather than a question about repository content: it can only withhold a restart, never produce or repair an answer. ManagedInstallSpawnFence::acquire is separately function-pinned because it is an install-mutation boundary: it binds the configured executable and update lock, rejects replaced or retired install roots, and serializes daemon spawn against uninstall. It reads only install/process identity metadata and cannot answer locate, search, context, trace, review, xref, or rename. The rest of this single-module crate remains scanned, and exact pin counts make any added occurrence fail closed. The death note and the daemon-log append are the same boundary read in the other direction: a daemon ended from outside cannot log its own cause, because the reaper's SIGTERM grace is shorter than the daemon's shutdown and the SIGKILL that follows lands while the arm that would print a shutdown line is still unpolled. These write that cause into the repository the daemon served and read it back, so a failed request can name a killed daemon instead of quoting a socket error. They carry process lifecycle facts only and answer no question about repository content.",
+      "reason": "Daemon process lifecycle boundary with zero answer-authority surface. The exact expression pins cover process construction, readiness records, port records, PID records, and Linux process-table inspection; each reaches or supervises the daemon that owns graph truth and never derives a semantic answer. The PID record is read to establish that a daemon is still running, which is a liveness question about a process rather than a question about repository content: it can only withhold a restart, never produce or repair an answer. ManagedInstallSpawnFence::acquire is separately function-pinned because it is an install-mutation boundary: it binds the configured executable and update lock, rejects replaced or retired install roots, and serializes daemon spawn against uninstall. It reads only install/process identity metadata and cannot answer locate, search, context, trace, review, xref, or rename. The rest of this single-module crate remains scanned, and exact pin counts make any added occurrence fail closed. The death note and the daemon-log append are the same boundary read in the other direction: a daemon ended from outside cannot log its own cause, because the reaper's SIGTERM grace is shorter than the daemon's shutdown and the SIGKILL that follows lands while the arm that would print a shutdown line is still unpolled. These write that cause into the repository the daemon served and read it back, so a failed request can name a killed daemon instead of quoting a socket error. They carry process lifecycle facts only and answer no question about repository content. The open-transaction marker is the third instance of the same lifecycle boundary: the daemon publishes the phase and last beat of a write transaction it has open into .kin/daemon.transaction, the reaper reads it to tell a busy daemon from a wedged one, and the CLI reads it, together with the durable authority receipt, to classify a commit whose reply was lost as landed, still running, or gone. The four expressions pinned for it write, read and retire that one marker; the temporary-file removal is shared with the death note, which is why its count is two. They carry process lifecycle facts only, and none of them reads repository content or feeds a semantic answer.",
       "owner": "kin-daemon-spawn",
       "expiration": "2026-12-31",
       "allow_fn": [
@@ -198,10 +216,16 @@
           "count": 2
         },
         "if fs::write(&tmp, body).is_ok() && fs::rename(&tmp, kin_root.join(DEATH_FILE_NAME)).is_err() {",
-        "let _ = fs::remove_file(&tmp);",
+        {
+          "expr": "let _ = fs::remove_file(&tmp);",
+          "count": 2
+        },
         "let raw = fs::read_to_string(kin_root.join(DEATH_FILE_NAME)).ok()?;",
         "let _ = fs::remove_file(kin_root.join(DEATH_FILE_NAME));",
-        ".open(kin_root.join(\"daemon.log\"))"
+        ".open(kin_root.join(\"daemon.log\"))",
+        "if fs::write(&tmp, body).is_ok()",
+        "let raw = fs::read_to_string(kin_root.join(TRANSACTION_FILE_NAME)).ok()?;",
+        "let _ = fs::remove_file(kin_root.join(TRANSACTION_FILE_NAME));"
       ]
     },
     {
@@ -522,15 +546,54 @@
     },
     {
       "file": "crates/kin-daemon/src/commit_liveness.rs",
-      "reason": "Process liveness boundary with zero answer-authority surface. This module publishes one fact about the daemon process — that it currently has a write transaction open, which phase is running, and when it last beat — into .kin/daemon.transaction, and reads that file back so the supervisor's reaper can tell a busy daemon from a wedged one. It exists because the reaper's only other liveness question is GET /health, which a daemon doing synchronous commit work on a runtime worker cannot answer, so the guard that refuses to reap a working daemon could not fire for the one state it protects; a 172-second commit was SIGKILLed as a result. Every expression here writes or reads that single marker plus this process's own pid. Nothing in it reaches repository content, and it can only withhold a kill, never produce, rank, fill, or repair an answer to locate, search, context, trace, review, xref, or rename. Pinned by exact expression so any newly added filesystem primitive in this module fails the guard until it is re-justified.",
+      "reason": "Process liveness boundary with zero answer-authority surface. This module publishes one fact about the daemon process, that it currently has a write transaction open, which phase is running, and when it last beat, into .kin/daemon.transaction, and reads that file back so the supervisor's reaper can tell a busy daemon from a wedged one. It exists because the reaper's only other liveness question is GET /health, which a daemon doing synchronous commit work on a runtime worker cannot answer, so the guard that refuses to reap a working daemon could not fire for the one state it protects; a 172-second commit was SIGKILLed as a result. The marker's file reads and writes now live in kin-daemon-spawn, which both the daemon and the CLI depend on, so a lost commit reply can be classified from the same record the reaper reads; that crate's entry pins them. What remains here is this process's own pid, recorded into the marker so a reader can tell whether the daemon that opened it is still alive. Nothing in it reaches repository content, and it can only withhold a kill, never produce, rank, fill, or repair an answer to locate, search, context, trace, review, xref, or rename. Pinned by exact expression so any newly added filesystem primitive in this module fails the guard until it is re-justified.",
       "owner": "kin-daemon",
       "expiration": "2026-12-31",
       "allow_match": [
-        "let Ok(raw) = std::fs::read_to_string(transaction_path(repo_root)) else {",
-        "pid: std::process::id(),",
-        "if std::fs::write(&tmp, body).is_ok() && std::fs::rename(&tmp, &path).is_err() {",
-        "let _ = std::fs::remove_file(&tmp);",
-        "let _ = std::fs::remove_file(self.kin_root.join(TRANSACTION_FILE_NAME));"
+        "pid: std::process::id(),"
+      ]
+    },
+    {
+      "file": "crates/kin-agent/src/belt.rs",
+      "reason": "kin-agent is a CLIENT of graph authority, never a source of it. It reaches Kin only through the MCP server over stdio, so every tool result it hands a model comes from the graph, and it deliberately ships no file-read, file-search or shell tool for a model to call. The filesystem and subprocess touches here are the two explicit boundaries the zero-file-search rule allows: materializing an edit the model asked for, and writing the run's own transcript. This module is the write boundary. `edit_file` reads the one file it is about to change so a find-and-replace can be exact and can refuse an ambiguous match, and `write_file` writes the one file it was given; both resolve the path inside the repository first and refuse any escape. Neither answers a question: the model has already been told where the code is by `mcp__kin__semantic_locate` and what it says by `mcp__kin__get_entity_source`, and nothing derived from these reads reaches a tool result. Pinned rather than whole-file so a newly added filesystem primitive in this module fails the guard, which is exactly what should happen if anyone ever adds a read or search tool to the belt.",
+      "owner": "kin-agent",
+      "expiration": "2026-12-31",
+      "allow_match": [
+        "std::fs::read_to_string(&path)",
+        "std::fs::write(&path, &updated)",
+        "std::fs::create_dir_all(parent)",
+        "path.exists()",
+        "std::fs::write(&path, content)"
+      ]
+    },
+    {
+      "file": "crates/kin-agent/src/mcp.rs",
+      "reason": "kin-agent is a CLIENT of graph authority, never a source of it. It reaches Kin only through the MCP server over stdio, so every tool result it hands a model comes from the graph, and it deliberately ships no file-read, file-search or shell tool for a model to call. The filesystem and subprocess touches here are the two explicit boundaries the zero-file-search rule allows: materializing an edit the model asked for, and writing the run's own transcript. This module is the transport that reaches authority rather than a substitute for it: it spawns the MCP server as a child process and speaks JSON-RPC to it over stdio. The subprocess is the graph, so forbidding it here would forbid consulting the graph at all. It touches no path of its own. Pinned so any filesystem primitive added to this module fails the guard.",
+      "owner": "kin-agent",
+      "expiration": "2026-12-31",
+      "allow_match": [
+        "std::process::{Child, ChildStdin, ChildStdout, Command, Stdio}",
+        "Command::new(program)"
+      ]
+    },
+    {
+      "file": "crates/kin-agent/src/run.rs",
+      "reason": "kin-agent is a CLIENT of graph authority, never a source of it. It reaches Kin only through the MCP server over stdio, so every tool result it hands a model comes from the graph, and it deliberately ships no file-read, file-search or shell tool for a model to call. The filesystem and subprocess touches here are the two explicit boundaries the zero-file-search rule allows: materializing an edit the model asked for, and writing the run's own transcript. Two touches in the loop itself. `std::process::id()` is this agent's own pid, reported to `kin_session_start` so the graph's session record names the process that made the change; it spawns nothing. The `std::fs::write` emits `result.json`, the run's terminal record, into the output directory the caller named. Pinned so any retrieval-shaped filesystem call added to the loop fails the guard.",
+      "owner": "kin-agent",
+      "expiration": "2026-12-31",
+      "allow_match": [
+        "std::process::id()",
+        "std::fs::write("
+      ]
+    },
+    {
+      "file": "crates/kin-agent/src/transcript.rs",
+      "reason": "kin-agent is a CLIENT of graph authority, never a source of it. It reaches Kin only through the MCP server over stdio, so every tool result it hands a model comes from the graph, and it deliberately ships no file-read, file-search or shell tool for a model to call. The filesystem and subprocess touches here are the two explicit boundaries the zero-file-search rule allows: materializing an edit the model asked for, and writing the run's own transcript. This module only writes. It creates the output directory and the two output files, `transcript.jsonl` and `kin-trace.jsonl`, and reads nothing at all. A transcript is a record of a run, never an input to an answer. Pinned so a read added to this module fails the guard.",
+      "owner": "kin-agent",
+      "expiration": "2026-12-31",
+      "allow_match": [
+        "std::fs::File",
+        "std::fs::create_dir_all(out_dir)"
       ]
     }
   ]

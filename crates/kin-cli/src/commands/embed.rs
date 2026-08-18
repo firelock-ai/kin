@@ -192,8 +192,9 @@ fn format_duration_secs(total: u64) -> String {
     }
 }
 
-/// The embedding model `kin embed` downloads on first use.
-const EMBED_MODEL_ID: &str = "nomic-ai/nomic-embed-text-v1.5";
+/// The embedding model `kin embed` downloads on first use. Named once, in the
+/// module that also owns where the download lands and how far along it is.
+const EMBED_MODEL_ID: &str = crate::embed_model::DEFAULT_EMBED_MODEL_ID;
 
 /// What that download costs, as the model host reports it. Carried as the
 /// published figure rather than as a byte count, so the number a caller sees is

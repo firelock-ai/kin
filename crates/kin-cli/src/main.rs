@@ -374,6 +374,15 @@ enum Command {
     /// repository authority; `kin embed` adds vectors for graph-owned entities
     /// after semantic enrichment exists.
     ///
+    /// The model is not bundled with any install. The first embed on a machine
+    /// downloads about 523 MB of nomic-embed-text-v1.5 from huggingface.co into
+    /// the Hugging Face hub cache under the home directory
+    /// (`~/.cache/huggingface/hub`), and nothing embeds until that download
+    /// lands. A host with no egress to huggingface.co needs that cache
+    /// pre-seeded from a machine that has it, or KIN_EMBED_MODEL_ID pointed at
+    /// a local model directory. `kin doctor` reports whether the model is
+    /// already here.
+    ///
     /// If a repo was indexed with an older model at a different dimension, pass
     /// `--rebuild` to drop the stale index and re-embed every entity at the
     /// current model's dimension.
@@ -616,6 +625,17 @@ enum Command {
     Mcp {
         #[command(subcommand)]
         action: McpAction,
+    },
+    /// Run a task through Kin's own agent loop, or check that it can start.
+    ///
+    /// The agent answers repository questions from the Kin graph over MCP and has no
+    /// shell, no grep and no file-reading tool, so it cannot fall back to raw file
+    /// search. Its only writes are edit_file and write_file, and each one runs inside a
+    /// Kin transaction under a Kin session, so the change carries provenance naming the
+    /// agent rather than landing as an anonymous file write.
+    Agent {
+        #[command(subcommand)]
+        action: AgentAction,
     },
     /// Authenticate with KinLab for native remotes
     Auth {
@@ -1724,8 +1744,87 @@ enum StashAction {
 }
 
 #[derive(Subcommand)]
+enum AgentAction {
+    /// Run one task to completion against an OpenAI-compatible endpoint
+    Run {
+        /// The task: a path to a file holding it, or the text itself
+        #[arg(long, value_name = "FILE|TEXT")]
+        task: String,
+        /// Model id as the endpoint names it
+        #[arg(long, value_name = "ID")]
+        model: String,
+        /// OpenAI-compatible base URL, with or without a trailing /v1
+        #[arg(long = "base-url", value_name = "URL")]
+        base_url: String,
+        /// Name of an environment variable holding the API key. The key itself is never
+        /// accepted on the command line, so it cannot land in a process listing.
+        #[arg(long = "api-key-env", value_name = "NAME")]
+        api_key_env: Option<String>,
+        /// Repository to work in (default: the current directory)
+        #[arg(long, value_name = "PATH")]
+        repo: Option<PathBuf>,
+        /// Override the MCP server command (default: this binary serving --repo)
+        #[arg(long = "mcp-command", value_name = "CMD")]
+        mcp_command: Option<String>,
+        /// Directory for the transcript, the Kin trace and the result record
+        #[arg(long, value_name = "DIR")]
+        out: Option<PathBuf>,
+        /// Tool-call budget before the agent is asked for a final answer
+        #[arg(long = "max-tool-calls", value_name = "N")]
+        max_tool_calls: Option<u32>,
+        /// Wall-clock deadline in seconds
+        #[arg(long, value_name = "S")]
+        deadline: Option<u64>,
+        /// File holding a system prompt that replaces the built-in one
+        #[arg(long, value_name = "FILE")]
+        system: Option<PathBuf>,
+        /// Sampling temperature passed through to the endpoint
+        #[arg(long, value_name = "F")]
+        temperature: Option<f32>,
+        /// Tool surface the MCP server should serve
+        #[arg(long = "tool-profile", value_name = "PROFILE")]
+        tool_profile: Option<String>,
+    },
+    /// Check that the model endpoint and the Kin MCP server both answer
+    Doctor {
+        /// OpenAI-compatible base URL
+        #[arg(long = "base-url", value_name = "URL")]
+        base_url: String,
+        /// Model id to look for in the endpoint's list
+        #[arg(long, value_name = "ID")]
+        model: Option<String>,
+        /// Repository to serve (default: the current directory)
+        #[arg(long, value_name = "PATH")]
+        repo: Option<PathBuf>,
+        /// Override the MCP server command
+        #[arg(long = "mcp-command", value_name = "CMD")]
+        mcp_command: Option<String>,
+        /// Name of an environment variable holding the API key
+        #[arg(long = "api-key-env", value_name = "NAME")]
+        api_key_env: Option<String>,
+        /// Tool surface the MCP server should serve
+        #[arg(long = "tool-profile", value_name = "PROFILE")]
+        tool_profile: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum McpAction {
     /// Start the MCP stdio server
+    ///
+    /// The server binds one Kin repository: the one named by --repo or
+    /// KIN_MCP_REPO, otherwise the one containing its working directory,
+    /// otherwise whatever the MCP client's workspace roots point at.
+    ///
+    /// A server that bound a repository of its own keeps serving it and ignores
+    /// client workspace roots it cannot resolve to a Kin repository. That is
+    /// what makes a container or remote registration work: with
+    /// `docker exec -i -w /work/repo <container> kin mcp start`, the client
+    /// announces host paths that do not exist inside the container, and treating
+    /// them as a workspace change would refuse every call. Roots that do name a
+    /// Kin repository this server can see, and does not serve, are still a real
+    /// disagreement and are refused rather than answered from the wrong
+    /// repository.
     Start {
         /// Run in global mode, serving all registered repos from ~/.kin/registry.toml
         #[arg(long)]
@@ -1733,7 +1832,8 @@ enum McpAction {
         /// Bind this server to a specific Kin repository instead of relying on
         /// the launching process's working directory. Overrides KIN_MCP_REPO.
         /// Use this for a global agent-CLI MCP entry that may launch outside
-        /// any Kin repository (e.g. an umbrella workspace root).
+        /// any Kin repository (e.g. an umbrella workspace root). The pin is
+        /// never repointed by the client's workspace roots.
         #[arg(long, value_name = "PATH")]
         repo: Option<PathBuf>,
         /// Tool surface to serve: `agent-default` (the curated agent belt, and
@@ -2942,6 +3042,64 @@ fn main() -> Result<()> {
                 },
                 Command::Blame { entity, reference } => {
                     commands::blame::run(entity, reference).await
+                }
+                Command::Agent { action } => {
+                    // The agent loop is blocking, and a blocking HTTP client builds and
+                    // drops its own runtime. Dropping one inside an async context panics,
+                    // so the whole command runs on a plain thread outside this runtime.
+                    let code = std::thread::spawn(move || match action {
+                        AgentAction::Run {
+                            task,
+                            model,
+                            base_url,
+                            api_key_env,
+                            repo,
+                            mcp_command,
+                            out,
+                            max_tool_calls,
+                            deadline,
+                            system,
+                            temperature,
+                            tool_profile,
+                        } => commands::agent::run(commands::agent::RunArgs {
+                            task,
+                            model,
+                            base_url,
+                            api_key_env,
+                            repo,
+                            mcp_command,
+                            out,
+                            max_tool_calls,
+                            deadline,
+                            system,
+                            temperature,
+                            tool_profile,
+                        }),
+                        AgentAction::Doctor {
+                            base_url,
+                            model,
+                            repo,
+                            mcp_command,
+                            api_key_env,
+                            tool_profile,
+                        } => commands::agent::doctor(
+                            base_url,
+                            model,
+                            repo,
+                            mcp_command,
+                            api_key_env,
+                            tool_profile,
+                        ),
+                    })
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("the agent thread panicked"))??;
+                    // The run's own taxonomy is reported through the exit code: 2 budget,
+                    // 3 deadline, 4 endpoint, 5 MCP. A caller must be able to tell a task
+                    // the agent could not do from an endpoint that was never there.
+                    if code != 0 {
+                        std::process::exit(code);
+                    }
+                    Ok(())
                 }
                 Command::Mcp { action } => match action {
                     McpAction::Start {
@@ -4483,6 +4641,50 @@ mod tests {
                      an open gate"
                 );
             }
+        });
+    }
+
+    /// A server reached through `docker exec` or over a remote boundary can
+    /// never bind the host paths its client announces, so it holds the
+    /// repository it was started with instead. An operator registering that
+    /// shape has to be able to learn it from the command itself rather than from
+    /// a refusal mid-session, which is why the behavior is documented where the
+    /// registration is written.
+    #[test]
+    fn mcp_start_help_documents_that_a_bound_server_holds_unresolvable_client_roots() {
+        on_cli_test_stack(|| {
+            let command = Cli::command();
+            let start = command
+                .get_subcommands()
+                .find(|subcommand| subcommand.get_name() == "mcp")
+                .expect("kin mcp must exist")
+                .get_subcommands()
+                .find(|subcommand| subcommand.get_name() == "start")
+                .expect("kin mcp start must exist")
+                .clone();
+            let help = start
+                .get_long_about()
+                .or_else(|| start.get_about())
+                .expect("kin mcp start must carry help text")
+                .to_string();
+            let flattened = help.split_whitespace().collect::<Vec<_>>().join(" ");
+
+            assert!(
+                flattened.contains("ignores client workspace roots it cannot resolve"),
+                "help must state that a bound server ignores roots it cannot resolve: {flattened}"
+            );
+            assert!(
+                flattened.contains("docker exec"),
+                "help must name the container registration this supports: {flattened}"
+            );
+
+            // Falsification: a phrase that was never written must be absent, so
+            // a `contains` that passes on anything cannot be what made the two
+            // assertions above green.
+            assert!(
+                !flattened.contains("ignores client workspace roots entirely"),
+                "the check must be able to fail: {flattened}"
+            );
         });
     }
 

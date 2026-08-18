@@ -123,7 +123,13 @@ the graph, so get_entity_source, get_context_pack, graph_neighborhood, and find_
 all take it. `id_space: \"artifact\"` means the hit is an artifact-level embedding — a \
 tracked file the parsers produced no entities for — so it carries `artifact_path` and NO \
 `entity_id`, and those tools will refuse it; read it with kin_artifact_read instead. Do \
-not synthesize an entity id from an artifact hit's path.";
+not synthesize an entity id from an artifact hit's path. The response bounds its own size \
+(max_chars, default 30000 serialized characters) so it is never refused by a client for being \
+too large: it is compact by default, meaning no per-signal `match_evidence` breakdown unless you \
+ask with explain=true or compact=false, and under pressure it sheds the per-file symbol roll-up, \
+then inline snippets, and only then withholds hits from the end of the page. Any cut is reported \
+in `degradations` and in `_kin.response`, which carries the budget applied and what the response \
+measured before it, and the rest of the ranking stays reachable through `next_cursor`.";
 
 /// Offline/generic dispatch arm for `semantic_locate`.
 ///
@@ -604,7 +610,15 @@ selects, and it cannot bound the envelope that content travels in, so read `toke
 which measures the serialized response this call returns, as what the call costs you. \
 `focal_entity.body` in the response IS the focal entity's exact source text, so this one \
 call already answers \"show me the code\": no follow-up read is needed, and it is the body \
-to edit and stage back. If get_entity_source is available to you it is cheaper for a raw \
+to edit and stage back, in compact mode too, which drops the dependency bodies and \
+projection levels but never the focal body. Every dependency row says why it is there: \
+`relation: \"dependency_edge\"` is an edge the graph asserts, and \
+`relation: \"same_file_neighbor\"` means the focal had no dependency edge at all, so the \
+row is a neighbour sharing the focal's file rather than anything the focal depends on. \
+That is the usual shape for a class whose only edges are containment. \
+`dependency_selection` names which of the two filled the list and, for the fallback, how \
+many same-file candidates there were and how many were dropped to fit. \
+If get_entity_source is available to you it is cheaper for a raw \
 body alone; if you need to follow an actual call chain step by step, use trace_data_flow.";
 
 pub fn handle_get_context_pack<G: GraphStore>(
@@ -613,7 +627,9 @@ pub fn handle_get_context_pack<G: GraphStore>(
     sessions: &SessionRegistry,
     repository_authority: Option<&RequestRepositoryAuthority>,
 ) -> Result<ToolCallResult> {
-    use kin_context::{build_context_pack_with_traffic, ContextOptions};
+    use kin_context::{
+        build_context_pack_with_traffic_and_provenance, ContextOptions, DependencyRelation,
+    };
     use kin_model::context::TokenBudget;
 
     let id_str = get_string_param(args, "entity_id")?;
@@ -644,8 +660,9 @@ pub fn handle_get_context_pack<G: GraphStore>(
         vec![]
     };
 
-    let pack = build_context_pack_with_traffic(store, &entity_id, &opts, &nearby_intents)
-        .map_err(|e| McpError::Context(e.to_string()))?;
+    let (pack, selection) =
+        build_context_pack_with_traffic_and_provenance(store, &entity_id, &opts, &nearby_intents)
+            .map_err(|e| McpError::Context(e.to_string()))?;
 
     // Build structured response JSON. The pack still has to have projected a
     // focal entry for the focal entity to be worth serializing, but the body
@@ -659,12 +676,20 @@ pub fn handle_get_context_pack<G: GraphStore>(
     let held = HeldSourceAuthority::new(store, repository_authority);
 
     let focal_json = if let (Some(_), Some(entity)) = (focal_entry, &focal_entity) {
-        focal_context_json_held(&held, entity, compact)?
+        focal_context_json_held(&held, entity)?
     } else {
         serde_json::json!(null)
     };
 
-    let project_dep = |entry: &kin_model::context::ContextEntry| -> Result<serde_json::Value> {
+    // `relation` is what keeps a same-file neighbour from reading as a
+    // dependency. The builder tags the fallback inside `entry.content`, which
+    // this handler does not serialize, so without the selection travelling
+    // alongside the pack the two are indistinguishable on the wire. Rows in the
+    // sections that are not dependencies (transitive, tests, contracts) pass
+    // `None` and carry no relation at all.
+    let project_dep = |entry: &kin_model::context::ContextEntry,
+                       relation: Option<DependencyRelation>|
+     -> Result<serde_json::Value> {
         // Look up the entity for structured fields.
         if let Some(e) = store
             .get_entity(&entry.entity_id)
@@ -680,6 +705,9 @@ pub fn handle_get_context_pack<G: GraphStore>(
                 "start_line": entity_presentation_start_line(&e),
                 "end_line": entity_presentation_end_line(&e),
             });
+            if let Some(relation) = relation {
+                obj["relation"] = serde_json::json!(relation.as_str());
+            }
             if !compact {
                 obj["projection"] = serde_json::json!(format!("{:?}", entry.projection_level));
                 // A dependency whose file the current workspace does not contain
@@ -723,27 +751,43 @@ pub fn handle_get_context_pack<G: GraphStore>(
             }
             Ok(obj)
         } else {
-            Ok(serde_json::json!({
+            let mut obj = serde_json::json!({
                 "id": entry.entity_id.to_string(),
                 "content": entry.content,
-            }))
+            });
+            if let Some(relation) = relation {
+                obj["relation"] = serde_json::json!(relation.as_str());
+            }
+            Ok(obj)
         }
     };
 
     let dependencies: Vec<_> = pack
         .dependency_signatures
         .iter()
-        .map(&project_dep)
+        .map(|entry| project_dep(entry, Some(selection.relation_for(&entry.entity_id))))
         .collect::<Result<Vec<_>>>()?;
     let transitive: Vec<_> = pack
         .transitive_deps
         .iter()
-        .map(&project_dep)
+        .map(|entry| project_dep(entry, None))
         .collect::<Result<Vec<_>>>()?;
 
+    // The cap and the fallback are both invisible in the rows themselves: six
+    // neighbours out of twenty-four look exactly like six dependencies. This
+    // says which selection ran and what it dropped, in every mode, because a
+    // caller deciding whether to ask again needs it most when the answer is
+    // small.
+    let returned = dependencies.len();
     let mut result = serde_json::json!({
         "focal_entity": focal_json,
         "dependencies": dependencies,
+        "dependency_selection": {
+            "source": selection.source().as_str(),
+            "returned": returned,
+            "same_file_candidates": selection.same_file_candidates(),
+            "same_file_dropped": selection.same_file_dropped(),
+        },
         "token_budget": budget.max_tokens(),
         "tokens_used": pack.actual_tokens,
     });
@@ -755,7 +799,7 @@ pub fn handle_get_context_pack<G: GraphStore>(
         let tests: Vec<_> = pack
             .tests
             .iter()
-            .map(&project_dep)
+            .map(|entry| project_dep(entry, None))
             .collect::<Result<Vec<_>>>()?;
         if !tests.is_empty() {
             result["tests"] = serde_json::json!(tests);
@@ -763,7 +807,7 @@ pub fn handle_get_context_pack<G: GraphStore>(
         let contracts: Vec<_> = pack
             .contracts
             .iter()
-            .map(&project_dep)
+            .map(|entry| project_dep(entry, None))
             .collect::<Result<Vec<_>>>()?;
         if !contracts.is_empty() {
             result["contracts"] = serde_json::json!(contracts);
@@ -836,7 +880,8 @@ value is consolidation: instead of looping get_entity_source over each step of a
 — which exhausts your context and round-trips — one call returns everything needed to \
 reason about the flow step by step. By default the focal comes back as a full body and \
 its dependencies as signatures (the shape best suited to trace reasoning); set \
-compact=true for signature-only entries everywhere when you just need the structure. \
+compact=true to drop the dependency bodies when you just need the structure, which \
+leaves the focal body in place. \
 When you specifically want the ordered call chain itself (not a flat neighborhood), \
 trace_data_flow walks the relations directionally and inlines each step.";
 
@@ -884,15 +929,24 @@ pub fn handle_trace_computation<G: GraphStore>(
 }
 
 pub const FIND_REFERENCES_DESC: &str = "\
-Find who depends on an entity — its direct upstream callers, importers, and references. \
+Find who depends on an entity: its direct upstream callers, importers, and references. \
 Give it an entity_id or an exact symbol name (it resolves the best-matching canonical \
-definition) and it returns one row per upstream site with the relation kind, file path, \
-line, and signature. Use it to answer \"who calls / imports / uses this?\" before you \
+definition) and it returns ONE ROW PER REFERENCING ENTITY, with that caller's entity id, \
+name, kind, file path, its own definition line (start_line), and every line inside it \
+that references the focal (reference_lines). Two callers in one file are two rows, and \
+`total_upstream` is the number of referencing entities, the same unit `kin refs` prints. \
+The `counts` object states the unit outright and adds `files` and `reference_sites`, so \
+a count is never read against the wrong unit. `reference_sites` is null when some row's \
+sites could not be located, with `known_reference_sites` the lower bound and each such \
+row naming why under `reference_lines_absent_reason`. Rows omit the caller's body by \
+default to keep the response small; pass include_snippets=true for the signature and a \
+bounded body excerpt, or drill to any row's entity_id with get_entity_source. \
+Use it to answer \"who calls / imports / uses this?\" before you \
 change or remove something, to gauge blast radius, or to navigate from a definition out \
 to its usages. Filter with relation_kinds (calls, imports, references) when you only \
 care about one kind of edge; it defaults to all three. When you need this answer for \
 many entities at once (e.g. classifying a whole set as used vs. unused), don't loop \
-this call per entity — bulk_check_references does the batch in one shot. \
+this call per entity, because bulk_check_references does the batch in one shot. \
 When no references come back, the additive `negative` object's `safe_to_conclude_absent` \
 flag says whether \"nothing depends on this\" is authoritative (daemon-owned graph, \
 complete coverage, no degraded signals) or merely \"not indexed yet\" — consult it \
@@ -903,7 +957,11 @@ binding, a declared import, or a resolved dispatch class), `import_scoped` (the 
 module was known and the symbol selected inside it), or `name_only` (a bare same-name \
 match across the repo, with nothing at the reference site proving it). A `name_only` row \
 is a candidate, not a fact; do not count it as use, and do not conclude something is \
-unused from the absence of anything but `name_only` rows without confirming.";
+unused from the absence of anything but `name_only` rows without confirming. \
+The response bounds its own size (max_chars, default 30000 serialized characters): a symbol \
+with hundreds of call sites sheds its inline snippets before it withholds any row, and any cut \
+is reported in `degradations` and in `_kin.response` with the size the response had before the \
+budget, so a short answer is never mistaken for a complete one.";
 
 fn normalize_cross_repo_repo_id(raw: Option<&str>) -> std::result::Result<String, String> {
     raw.map(str::trim)
@@ -1011,8 +1069,10 @@ fn spine_reference_rows(
             kind: source.map(|entity| format!("{:?}", entity.kind)),
             file_path: Some(file_path),
             start_line: None,
-            // A federated xref carries no site span from the other repo's graph.
+            // A federated xref carries no site span from the other repo's graph,
+            // and says so rather than leaving an unexplained empty list.
             reference_lines: Vec::new(),
+            reference_lines_absent: Some(ReferenceLinesAbsent::FederatedXref),
             signature: source.map(|entity| entity.signature.clone()),
             snippet: None,
             // CrossRepoEdge proves a dependency but does not retain whether
@@ -1033,8 +1093,53 @@ fn reference_filter_covers_unknown_subtypes(relation_kinds: &[RelationKind]) -> 
         && defaults.iter().all(|kind| relation_kinds.contains(kind))
 }
 
-fn reference_row_json(row: ReferenceRow) -> serde_json::Value {
+/// What a reference answer counted, stated rather than left to be inferred.
+///
+/// `total_upstream` is a bare number, and a reader who does not know its unit
+/// cannot tell an under-count from a small repository. It counted distinct FILES
+/// until FIR-2398, which is how eleven callers across two files were served as
+/// "2" beside two flags that read complete.
+///
+/// The site total follows the rule `bulk_check_references` already uses: a
+/// number is emitted only when it is complete, and the lower bound is named as a
+/// bound otherwise. A row whose site lines the graph does not carry makes the
+/// site total a floor, never a fact.
+///
+/// `reference_sites_complete` is about the rows that came back: it says every
+/// returned reference could be located at a line. Whether the row SET itself is
+/// complete is the `negative` object's question for an empty answer and
+/// `edge_coverage`'s for the classes the query read; this field does not restate
+/// either, and on an empty answer it describes an empty set.
+fn reference_counts(rows: &[ReferenceRow]) -> serde_json::Value {
+    let known_reference_sites: usize = rows.iter().map(|row| row.reference_lines.len()).sum();
+    let reference_sites_complete = rows.iter().all(|row| !row.reference_lines.is_empty());
+    let files = rows
+        .iter()
+        .filter_map(|row| row.file_path.as_deref())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
     serde_json::json!({
+        "counted": "referencing_entities",
+        "referencing_entities": rows.len(),
+        "files": files,
+        "reference_sites": reference_sites_complete.then_some(known_reference_sites),
+        "known_reference_sites": known_reference_sites,
+        "reference_sites_complete": reference_sites_complete,
+    })
+}
+
+/// Project one reference row.
+///
+/// `include_snippets` adds the caller's bounded body and signature. They are off
+/// by default because the row count is now the caller count rather than the file
+/// count, and each body runs to [`RETRIEVAL_SNIPPET_MAX_CHARS`]: the case that
+/// motivated the row change went from two rows to eleven, so bodies scale with
+/// callers where they used to scale with files. The identifying fields an agent
+/// navigates by (entity id, name, kind, file, caller line, site lines, relation
+/// kinds, resolution) are always present, and `entity_id` still drills straight
+/// to the body on demand.
+fn reference_row_json(row: ReferenceRow, include_snippets: bool) -> serde_json::Value {
+    let mut value = serde_json::json!({
         "entity_id": row.entity_id,
         "name": row.name,
         "kind": row.kind,
@@ -1044,8 +1149,15 @@ fn reference_row_json(row: ReferenceRow) -> serde_json::Value {
         // agent never has to count forward from a definition to find a call site.
         "start_line": row.start_line,
         "reference_lines": row.reference_lines,
-        "signature": row.signature,
-        "snippet": row.snippet,
+        "reference_line_count": row.reference_lines.len(),
+        // Why `reference_lines` is empty, when it is: `no_evidence_span` (the
+        // parser recorded the edge without a position), `span_outside_caller_file`
+        // (the spans it recorded name another file), or `federated_xref` (the
+        // edge lives in another repository's graph). Null when site lines came
+        // back, so an empty list is never an unexplained silence.
+        "reference_lines_absent_reason": row
+            .reference_lines_absent
+            .map(ReferenceLinesAbsent::as_str),
         "relation_kinds": row
             .relation_kinds
             .into_iter()
@@ -1057,7 +1169,12 @@ fn reference_row_json(row: ReferenceRow) -> serde_json::Value {
         // candidate rather than a fact. Absent only for a federated row, whose
         // edge lives in another repository's graph.
         "resolution": row.resolution.map(RelationResolution::as_str),
-    })
+    });
+    if include_snippets {
+        value["signature"] = serde_json::json!(row.signature);
+        value["snippet"] = serde_json::json!(row.snippet);
+    }
+    value
 }
 
 /// Machine-readable codes a spine unavailability can carry, each the name of one
@@ -1218,6 +1335,7 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     authority_source: FindReferencesAuthoritySource<'_>,
     repository_authority: Option<&RequestRepositoryAuthority>,
 ) -> Result<ToolCallResult> {
+    let include_snippets = get_optional_bool(args, "include_snippets", false);
     let relation_kinds = if let Some(raw_kinds) = get_optional_string_array(args, "relation_kinds")
     {
         if raw_kinds.is_empty() {
@@ -1291,7 +1409,7 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
                 };
                 let federated_references = federated_rows
                     .into_iter()
-                    .map(reference_row_json)
+                    .map(|row| reference_row_json(row, include_snippets))
                     .collect::<Vec<_>>();
                 let authority_complete = body.authority_complete_for(&repo_id, &target.id);
                 serde_json::json!({
@@ -1320,15 +1438,27 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
         },
     };
 
+    // Same order as the shared CLI collector, entity id included: rows come off
+    // a hash map, and several callers can share a file and a name, so without
+    // the last key the order of two such rows is whatever the map iterated.
     rows.sort_by(|left, right| {
         left.file_path
             .cmp(&right.file_path)
             .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.entity_id.cmp(&right.entity_id))
     });
+
+    // What this answer counted, computed before the rows are projected. One row
+    // is one referencing entity, so `referencing_entities` is the row count and
+    // `files` is what the pre-FIR-2398 `total_upstream` was reporting.
+    let counts = reference_counts(&rows);
 
     // `entity_id` remains the local drill-through keystone. Federated rows use
     // repo-qualified paths and carry no local entity id.
-    let references = rows.into_iter().map(reference_row_json).collect::<Vec<_>>();
+    let references = rows
+        .into_iter()
+        .map(|row| reference_row_json(row, include_snippets))
+        .collect::<Vec<_>>();
 
     // What the graph can structurally answer over the edge classes this query
     // reads. An empty reference list is only evidence about the code when the
@@ -1356,7 +1486,13 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
             .copied()
             .map(relation_kind_name)
             .collect::<Vec<_>>(),
+        // One referencing entity per unit, which is what `kin refs` prints as
+        // "referenced by N entities". It counted distinct FILES until FIR-2398.
+        // `counts.counted` names the unit in the payload so no reader has to
+        // infer it, and `counts.reference_sites` carries the finer number when
+        // every row could be located.
         "total_upstream": references.len(),
+        "counts": counts,
         "references": references,
         "cross_repo": cross_repo,
     });
@@ -3535,6 +3671,7 @@ impl GraphStatusReport {
             || envelope.degraded.embed_worker_failed.is_some()
             || envelope.degraded.mass_deletion_blocked.is_some()
             || envelope.degraded.offline_fallback.is_some()
+            || envelope.degraded.workspace_mismatch.is_some()
         {
             return Err(
                 "_kin carries unscoped daemon health alongside selected-graph status".to_string(),
@@ -3660,15 +3797,21 @@ mod tests {
     };
     use kin_model::graph::EntityStore as _;
     use kin_model::ids::{EntityId, FilePathId, Hash256, LanguageId, RelationId};
-    use kin_model::relation::{GraphNodeId, Relation, RelationKind, RelationOrigin};
+    use kin_model::relation::{
+        GraphNodeId, Relation, RelationEvidence, RelationKind, RelationOrigin,
+    };
     use kin_spine::SpineBackend as _;
 
     fn make_entity(name: &str, file: &str) -> Entity {
+        make_entity_in(LanguageId::Rust, name, file)
+    }
+
+    fn make_entity_in(language: LanguageId, name: &str, file: &str) -> Entity {
         Entity {
             id: EntityId::new(),
             kind: EntityKind::Function,
             name: name.to_string(),
-            language: LanguageId::Rust,
+            language,
             fingerprint: SemanticFingerprint {
                 algorithm: FingerprintAlgorithm::V1TreeSitter,
                 ast_hash: Hash256::from_bytes([0; 32]),
@@ -4210,9 +4353,280 @@ mod tests {
         // The keystone: each reference carries the caller's graph entity_id so an
         // agent can drill straight to its body with no name re-resolution.
         assert_eq!(refs[0]["entity_id"], caller_id.to_string());
-        // `snippet` is always present in the shape (null here: the fixture has no
+        // Bodies are opt-in, so the default row carries neither the excerpt nor
+        // the signature. `entity_id` above is what reaches the body.
+        assert!(!refs[0].as_object().unwrap().contains_key("snippet"));
+        assert!(!refs[0].as_object().unwrap().contains_key("signature"));
+
+        args.insert("include_snippets".to_string(), serde_json::json!(true));
+        let verbose = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+        let verbose_refs = verbose["references"].as_array().unwrap();
+        // Present in the shape when asked for (null here: the fixture has no
         // blob-backed body to project).
-        assert!(refs[0].as_object().unwrap().contains_key("snippet"));
+        assert!(verbose_refs[0].as_object().unwrap().contains_key("snippet"));
+        assert_eq!(verbose_refs[0]["signature"], "fn caller()");
+    }
+
+    /// One row per REFERENCING ENTITY, and `total_upstream` counting those
+    /// entities rather than the files they sit in.
+    ///
+    /// Rows were keyed on the caller's file path, so every caller in one file
+    /// collapsed into a single row keeping the first caller's id and name, and
+    /// `total_upstream` reported the number of distinct files. That is how
+    /// FIR-2398's `to_dot`, with eleven callers across two files, was answered
+    /// with "2" beside `authority_complete` and `relation_subtype_complete` both
+    /// true. The tool's stated job is blast radius, so an agent renaming or
+    /// deleting on that answer saw a fifth of the work.
+    ///
+    /// The fixture is deliberately lopsided: three callers in one file and one
+    /// in another. A balanced fixture would let the file count and the caller
+    /// count coincide, and the assertion could not fail.
+    #[tokio::test]
+    async fn find_references_reports_every_caller_not_one_row_per_file() {
+        let store = InMemoryGraph::new();
+        let target = make_entity("to_dot", "src/linkgraph.rs");
+        store.upsert_entity(&target).unwrap();
+
+        let shared_file_callers = ["draws_nodes", "draws_edges", "draws_dashed"]
+            .map(|name| make_entity(name, "tests/test_linkgraph.rs"));
+        let other_file_caller = make_entity("cmd_graph", "src/cli.rs");
+        for caller in shared_file_callers.iter().chain([&other_file_caller]) {
+            store.upsert_entity(caller).unwrap();
+            store
+                .upsert_relation(&make_relation(caller.id, target.id, RelationKind::Calls))
+                .unwrap();
+        }
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+
+        let refs = body["references"].as_array().unwrap();
+        assert_eq!(
+            refs.len(),
+            4,
+            "four callers are four rows, whatever files they share: {body:#}"
+        );
+        assert_eq!(
+            body["total_upstream"], 4,
+            "total_upstream counts referencing entities, not the 2 files: {body:#}"
+        );
+
+        // Every caller present by identity, so a row cannot stand in for the
+        // callers it collapsed. Names are distinct here only to make a failure
+        // readable; the ids are the assertion that matters.
+        let returned_ids = refs
+            .iter()
+            .map(|row| row["entity_id"].as_str().unwrap().to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        for caller in shared_file_callers.iter().chain([&other_file_caller]) {
+            assert!(
+                returned_ids.contains(&caller.id.to_string()),
+                "caller {} is missing from the answer: {body:#}",
+                caller.name
+            );
+        }
+
+        // The unit is named in the payload, and the file count is still
+        // available beside it rather than being what `total_upstream` means.
+        assert_eq!(body["counts"]["counted"], "referencing_entities");
+        assert_eq!(body["counts"]["referencing_entities"], 4);
+        assert_eq!(body["counts"]["files"], 2);
+    }
+
+    /// A returned reference with no site lines says why, and the answer says
+    /// whether any site could be located at all.
+    ///
+    /// FIR-2357 item 3: an empty `reference_lines` on a row that DID come back
+    /// is the quiet-partial failure in miniature. No production ingest path
+    /// populates `RelationEvidence::source_span` today (measured and asserted at
+    /// zero by `kin-index`'s `relation_evidence_span_coverage`), so this is what
+    /// every real answer looks like, and saying so is the difference between a
+    /// caller that knows the sites are unavailable and one that reads `[]` as
+    /// "no sites".
+    #[tokio::test]
+    async fn find_references_says_why_a_row_carries_no_site_lines() {
+        let store = InMemoryGraph::new();
+        let caller = make_entity("caller", "src/a.rs");
+        let target = make_entity("target", "src/b.rs");
+        store.upsert_entity(&caller).unwrap();
+        store.upsert_entity(&target).unwrap();
+        store
+            .upsert_relation(&make_relation(caller.id, target.id, RelationKind::Calls))
+            .unwrap();
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+        let row = &body["references"].as_array().unwrap()[0];
+
+        assert_eq!(row["reference_lines"], serde_json::json!([]));
+        assert_eq!(row["reference_line_count"], 0);
+        assert_eq!(
+            row["reference_lines_absent_reason"], "no_evidence_span",
+            "an empty site list must name its cause, not stay silent: {body:#}"
+        );
+        // The row is still reported. Dropping a caller whose site the graph does
+        // not carry would understate blast radius, which is the defect this
+        // whole surface is being fixed for.
+        assert_eq!(body["total_upstream"], 1);
+
+        assert_eq!(
+            body["counts"]["reference_sites"],
+            serde_json::Value::Null,
+            "a site total that cannot be completed is not emitted as a number: {body:#}"
+        );
+        assert_eq!(body["counts"]["known_reference_sites"], 0);
+        assert_eq!(body["counts"]["reference_sites_complete"], false);
+    }
+
+    /// The completeness signal must be able to say "complete".
+    ///
+    /// FIR-2357 item 4 names the lazy regression directly: a fix that marks
+    /// every answer uncertain is not a fix. This is the same surface as the test
+    /// above with the one input changed that should flip the verdict, so a
+    /// hardcoded `false` fails here and a hardcoded `true` fails there.
+    #[tokio::test]
+    async fn find_references_reports_complete_sites_when_the_graph_carries_spans() {
+        let store = InMemoryGraph::new();
+        let caller_file = FilePathId::new("src/a.rs");
+        let caller = make_entity("caller", "src/a.rs");
+        let target = make_entity("target", "src/b.rs");
+        store.upsert_entity(&caller).unwrap();
+        store.upsert_entity(&target).unwrap();
+
+        // Two call sites inside one caller, graph rows 11 and 41, which the
+        // agent-facing surface reports 1-based as 12 and 42.
+        let site_span = |row: u32| kin_model::entity::SourceSpan {
+            file: caller_file.clone(),
+            start_byte: 0,
+            end_byte: 1,
+            start_line: row,
+            start_col: 0,
+            end_line: row,
+            end_col: 1,
+        };
+        let mut relation = make_relation(caller.id, target.id, RelationKind::Calls);
+        relation.evidence = vec![11, 41]
+            .into_iter()
+            .map(|row| RelationEvidence {
+                source_span: Some(site_span(row)),
+                ..RelationEvidence::default()
+            })
+            .collect();
+        store.upsert_relation(&relation).unwrap();
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+        let row = &body["references"].as_array().unwrap()[0];
+
+        assert_eq!(
+            row["reference_lines"],
+            serde_json::json!([12, 42]),
+            "both sites, 1-based, ascending: {body:#}"
+        );
+        assert_eq!(row["reference_line_count"], 2);
+        assert_eq!(
+            row["reference_lines_absent_reason"],
+            serde_json::Value::Null,
+            "a row with sites has no absence to explain: {body:#}"
+        );
+        // One caller, two sites: the counts object distinguishes them, which is
+        // the whole point of naming the unit.
+        assert_eq!(body["total_upstream"], 1);
+        assert_eq!(body["counts"]["referencing_entities"], 1);
+        assert_eq!(body["counts"]["reference_sites"], 2);
+        assert_eq!(body["counts"]["known_reference_sites"], 2);
+        assert_eq!(body["counts"]["reference_sites_complete"], true);
+    }
+
+    /// A span the parser recorded against some other file is dropped, and the
+    /// drop is declared rather than looking like a parser that recorded nothing.
+    ///
+    /// The two absences call for different follow-ups, so collapsing them into
+    /// one empty list would hide which one held.
+    #[tokio::test]
+    async fn find_references_distinguishes_a_dropped_span_from_a_missing_one() {
+        let store = InMemoryGraph::new();
+        let caller = make_entity("caller", "src/a.rs");
+        let target = make_entity("target", "src/b.rs");
+        store.upsert_entity(&caller).unwrap();
+        store.upsert_entity(&target).unwrap();
+
+        let mut relation = make_relation(caller.id, target.id, RelationKind::Calls);
+        relation.evidence = vec![RelationEvidence {
+            source_span: Some(kin_model::entity::SourceSpan {
+                file: FilePathId::new("src/somewhere_else.rs"),
+                start_byte: 0,
+                end_byte: 1,
+                start_line: 7,
+                start_col: 0,
+                end_line: 7,
+                end_col: 1,
+            }),
+            ..RelationEvidence::default()
+        }];
+        store.upsert_relation(&relation).unwrap();
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+        let row = &body["references"].as_array().unwrap()[0];
+
+        assert_eq!(
+            row["reference_lines"],
+            serde_json::json!([]),
+            "line 8 of another file is not a line of src/a.rs: {body:#}"
+        );
+        assert_eq!(
+            row["reference_lines_absent_reason"], "span_outside_caller_file",
+            "the reason must name the condition that held: {body:#}"
+        );
+    }
+
+    /// A recursive edge is not an upstream caller, on either surface.
+    ///
+    /// The shared CLI collector has always excluded self edges, so counting them
+    /// here would put `kin refs` and `find_references` one apart on every
+    /// recursive function while both looked internally consistent.
+    #[tokio::test]
+    async fn find_references_excludes_a_self_edge() {
+        let store = InMemoryGraph::new();
+        let caller = make_entity("caller", "src/a.rs");
+        let target = make_entity("recurse", "src/b.rs");
+        store.upsert_entity(&caller).unwrap();
+        store.upsert_entity(&target).unwrap();
+        store
+            .upsert_relation(&make_relation(target.id, target.id, RelationKind::Calls))
+            .unwrap();
+        store
+            .upsert_relation(&make_relation(caller.id, target.id, RelationKind::Calls))
+            .unwrap();
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+
+        assert_eq!(
+            body["total_upstream"], 1,
+            "the recursive edge is not a second caller: {body:#}"
+        );
+        assert_eq!(
+            body["references"][0]["entity_id"],
+            caller.id.to_string(),
+            "the one row must be the external caller: {body:#}"
+        );
     }
 
     #[tokio::test]
@@ -4508,6 +4922,105 @@ mod tests {
             response["negative"]
         );
         assert_eq!(response["negative"]["trust"], "authoritative");
+    }
+
+    /// FIR-2404 end to end, on a real store rather than a hand-written payload,
+    /// and on the same daemon authority path as the test above so nothing but the
+    /// language differs. This is the express shape: the linker resolves same-name
+    /// bare calls across files, and the focal is a module's default export every
+    /// consuming file reaches through a `require` nothing in this build can
+    /// resolve, because no language-server adapter is wired for JavaScript.
+    ///
+    /// The pair matters more than either half. The test above certifies an
+    /// absence on an identically-shaped Rust graph, so the only thing separating
+    /// a certified absence from a refused one here is the language's reference
+    /// enrichment, which is the fact FIR-2404 added to the gate.
+    #[tokio::test]
+    async fn a_javascript_export_is_not_certified_absent_when_requires_produce_no_edges() {
+        let graph = InMemoryGraph::new();
+        let target = make_entity_in(
+            LanguageId::JavaScript,
+            "createApplication",
+            "lib/express.js",
+        );
+        // The witness the one-witness rule accepted: two JavaScript entities in
+        // different files joined by a resolved call.
+        let caller = make_entity_in(LanguageId::JavaScript, "handle", "lib/router/index.js");
+        let callee = make_entity_in(LanguageId::JavaScript, "matchLayer", "lib/router/layer.js");
+        graph.upsert_entity(&target).unwrap();
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&callee).unwrap();
+        graph
+            .upsert_relation(&make_relation(caller.id, callee.id, RelationKind::Calls))
+            .unwrap();
+        let registered_root = graph_root(&graph);
+
+        let spine = kin_spine::InMemorySpineBackend::new();
+        spine.register_repo(
+            "express",
+            vec![spine_entry("express", &target)],
+            &registered_root,
+        );
+        spine.refresh_cross_repo_edges("express", &[], &[], &["express".to_string()]);
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let response = parsed_response(&crate::finalize_with_envelope(
+            handle_find_references_with_authority(
+                &args,
+                &graph,
+                FindReferencesAuthority {
+                    repo_id: "express",
+                    graph_root: &registered_root,
+                    spine: Some(&spine),
+                },
+                None,
+            )
+            .await
+            .unwrap(),
+            structurally_ready_envelope(),
+            "find_references",
+        ));
+
+        assert!(response["references"].as_array().unwrap().is_empty());
+        assert_eq!(
+            response["edge_coverage"]["cross_file_classes"],
+            serde_json::json!(["calls"]),
+            "the fixture is the express shape: calls linked, imports not: {}",
+            response["edge_coverage"]
+        );
+        assert_eq!(
+            response["edge_coverage"]["reference_enrichment"], "unsupported",
+            "this build wires no adapter for JavaScript: {}",
+            response["edge_coverage"]
+        );
+        assert_eq!(
+            response["negative"]["safe_to_conclude_absent"], false,
+            "deleting what this called safe to delete deletes express: {}",
+            response["negative"]
+        );
+        assert_eq!(response["negative"]["trust"], "inconclusive");
+        assert!(
+            trust_reason(&response).starts_with("reference_enrichment_unsupported"),
+            "{}",
+            trust_reason(&response)
+        );
+        assert!(
+            trust_reason(&response).contains("JavaScript"),
+            "the reason names the language whose reference edges cannot exist: {}",
+            trust_reason(&response)
+        );
+        assert_eq!(
+            response["negative"]["degraded_signals"],
+            serde_json::json!([
+                "edge_coverage:imports_absent",
+                "edge_coverage:references_absent",
+                "edge_coverage:reference_enrichment_unsupported"
+            ]),
+            "the shortfalls the observation names are disclosed beside the verdict"
+        );
     }
 
     #[tokio::test]
@@ -5137,6 +5650,11 @@ mod tests {
     /// witness that this graph does link references across files for the
     /// language, without which an empty walk is a fact about the graph rather
     /// than about the focal.
+    ///
+    /// A `Calls` edge is the whole witness on purpose. Kin resolves a cross-file
+    /// use into exactly this edge, plus an artifact-level import edge entity
+    /// queries never reach, so a fixture seeding an entity-level `Imports` edge
+    /// would assert authority on a shape no real graph produces.
     fn seed_cross_file_call_witness(store: &InMemoryGraph) {
         let caller = make_entity("witness_caller", "src/witness_caller.rs");
         let callee = make_entity("witness_callee", "src/witness_callee.rs");
@@ -5888,5 +6406,336 @@ mod tests {
         assert_eq!(result.is_error, Some(true));
         let crate::types::ContentBlock::Text { text } = &result.content[0];
         assert!(text.contains("requires the Kin daemon"), "{text}");
+    }
+
+    // ---------------------------------------------------------------------
+    // FIR-2396: the response budget, one test per retrieval tool.
+    //
+    // Each builds a fixture large enough to overflow the shared default, then
+    // asserts the FINAL annotated text -- the bytes a client actually counts,
+    // envelope and negative included -- stays under it. The control in every
+    // case is the same call served at the clamp ceiling, which proves the
+    // fixture overflows and that the bound, rather than the fixture, is what
+    // shrank it.
+    // ---------------------------------------------------------------------
+
+    use crate::budget::{ResponseBudget, RESPONSE_DEFAULT_MAX_CHARS, RESPONSE_MAX_MAX_CHARS};
+
+    /// The text a client receives for one tool result: the payload with `_kin`
+    /// and `negative` attached, rendered exactly as the stdio path renders it.
+    fn client_text(result: ToolCallResult, tool: &str, budget: &ResponseBudget) -> String {
+        let enveloped =
+            crate::envelope::finalize_bounded(result, crate::Envelope::offline(), tool, budget);
+        let crate::types::ContentBlock::Text { text } = enveloped
+            .content
+            .into_iter()
+            .next()
+            .expect("one content block");
+        text
+    }
+
+    /// A budget that cannot bind, for the control arm.
+    fn unbounded() -> ResponseBudget {
+        ResponseBudget {
+            max_chars: RESPONSE_MAX_MAX_CHARS,
+            compact: false,
+            explicit_max_chars: true,
+        }
+    }
+
+    /// Assert one tool's overflow and its bound in the one unit the refusal was
+    /// ever reported in, and hand back both numbers and the bounded payload.
+    fn assert_bounded(
+        tool: &str,
+        unbounded_text: String,
+        bounded_text: String,
+    ) -> (usize, usize, serde_json::Value) {
+        let before = unbounded_text.len();
+        let after = bounded_text.len();
+        assert!(
+            before > RESPONSE_DEFAULT_MAX_CHARS,
+            "{tool}: the fixture must overflow the default budget, or the bound is untested: \
+             {before} chars"
+        );
+        assert!(
+            after <= RESPONSE_DEFAULT_MAX_CHARS,
+            "{tool}: the response a client receives must fit its budget: {after} chars against \
+             {RESPONSE_DEFAULT_MAX_CHARS}"
+        );
+        let bounded: serde_json::Value = serde_json::from_str(&bounded_text)
+            .unwrap_or_else(|error| panic!("{tool}: a bounded response is still JSON: {error}"));
+        assert_eq!(
+            bounded["_kin"]["response"]["max_chars"],
+            serde_json::json!(RESPONSE_DEFAULT_MAX_CHARS),
+            "{tool}: the applied budget is recorded on the envelope"
+        );
+        let chars_before = bounded["_kin"]["response"]["chars_before_budget"]
+            .as_u64()
+            .expect("the pre-truncation size is recorded") as usize;
+        assert!(
+            chars_before > 0,
+            "{tool}: the envelope reports the size the response had before the budget"
+        );
+        // Bounded SOMEWHERE, and the response says where. The envelope stage
+        // reports its own cut on `_kin`; a tool that enforces the same budget
+        // inside its own walk has already fit by the time the envelope sees it,
+        // and discloses that cut through `degradations` instead. Accepting only
+        // the first reading would make this assertion fail on exactly the tool
+        // that bounds itself best.
+        let envelope_cut = bounded["_kin"]["response"]["bounded"] == serde_json::json!(true);
+        let handler_cut = bounded["degradations"].as_array().is_some_and(|cuts| {
+            cuts.iter()
+                .any(|cut| cut["component"] == serde_json::json!("response_budget"))
+        });
+        assert!(
+            envelope_cut || handler_cut,
+            "{tool}: a response that was cut has to say so: {bounded}"
+        );
+        assert!(
+            !envelope_cut || chars_before > RESPONSE_DEFAULT_MAX_CHARS,
+            "{tool}: the envelope stage cuts only what was over its budget, and reports the size \
+             it was over by: {chars_before} chars"
+        );
+        eprintln!("FIR-2396 {tool}: {before} chars unbounded, {after} chars bounded");
+        (before, after, bounded)
+    }
+
+    fn wide_store(callers: usize) -> (InMemoryGraph, EntityId) {
+        let store = InMemoryGraph::new();
+        let focal = make_entity("resolve_redirects", "src/sessions.rs");
+        let focal_id = focal.id;
+        store.upsert_entity(&focal).unwrap();
+        for index in 0..callers {
+            let mut caller = make_entity(
+                &format!("caller_number_{index}_with_a_realistic_symbol_name"),
+                &format!("src/module_{index}/handler.rs"),
+            );
+            caller.doc_summary = Some(
+                "Resolves the redirect chain for one request and replays the body when the \
+                 method survives the hop."
+                    .to_string(),
+            );
+            store.upsert_entity(&caller).unwrap();
+            store
+                .upsert_relation(&make_relation(caller.id, focal_id, RelationKind::Calls))
+                .unwrap();
+        }
+        (store, focal_id)
+    }
+
+    #[test]
+    fn semantic_search_response_fits_the_budget() {
+        let (store, _) = wide_store(400);
+        let args = |compact: bool| -> HashMap<String, serde_json::Value> {
+            HashMap::from([
+                ("query".to_string(), serde_json::json!("caller")),
+                ("limit".to_string(), serde_json::json!(200)),
+                ("compact".to_string(), serde_json::json!(compact)),
+            ])
+        };
+        let before = client_text(
+            handle_semantic_search(&args(false), &store).unwrap(),
+            "semantic_search",
+            &unbounded(),
+        );
+        let after = client_text(
+            handle_semantic_search(&args(true), &store).unwrap(),
+            "semantic_search",
+            &ResponseBudget::default(),
+        );
+        assert_bounded("semantic_search", before, after);
+    }
+
+    #[tokio::test]
+    async fn find_references_response_fits_the_budget() {
+        let (store, focal_id) = wide_store(400);
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(focal_id.to_string()),
+        )]);
+        let before = client_text(
+            handle_find_references(&args, &store, None).await.unwrap(),
+            "find_references",
+            &unbounded(),
+        );
+        let after = client_text(
+            handle_find_references(&args, &store, None).await.unwrap(),
+            "find_references",
+            &ResponseBudget::default(),
+        );
+        let (_, _, bounded) = assert_bounded("find_references", before, after);
+        // The full count is still reported, so a caller reading a shortened list
+        // can tell it from a complete one without comparing runs.
+        assert_eq!(bounded["total_upstream"], serde_json::json!(400));
+    }
+
+    #[test]
+    fn graph_neighborhood_response_fits_the_budget() {
+        let (store, focal_id) = wide_store(400);
+        let args = HashMap::from([
+            (
+                "entity_id".to_string(),
+                serde_json::json!(focal_id.to_string()),
+            ),
+            ("limit".to_string(), serde_json::json!(400)),
+            ("depth".to_string(), serde_json::json!(2)),
+        ]);
+        let before = client_text(
+            handle_graph_neighborhood(&args, &store).unwrap(),
+            "graph_neighborhood",
+            &unbounded(),
+        );
+        let after = client_text(
+            handle_graph_neighborhood(&args, &store).unwrap(),
+            "graph_neighborhood",
+            &ResponseBudget::default(),
+        );
+        assert_bounded("graph_neighborhood", before, after);
+    }
+
+    #[test]
+    fn trace_data_flow_response_fits_the_budget() {
+        let store = InMemoryGraph::new();
+        let focal = make_entity("Session_request", "src/sessions.rs");
+        let focal_id = focal.id;
+        store.upsert_entity(&focal).unwrap();
+        let mut previous = vec![focal_id];
+        for depth in 0..4 {
+            let mut next = Vec::new();
+            for (parent_index, parent) in previous.iter().enumerate() {
+                for index in 0..5 {
+                    let callee = make_entity(
+                        &format!("step_{depth}_{parent_index}_{index}_resolve_redirect_target"),
+                        &format!("src/adapters/level_{depth}/module_{index}.rs"),
+                    );
+                    store.upsert_entity(&callee).unwrap();
+                    store
+                        .upsert_relation(&make_relation(*parent, callee.id, RelationKind::Calls))
+                        .unwrap();
+                    next.push(callee.id);
+                }
+            }
+            previous = next;
+        }
+        let args = HashMap::from([
+            ("focal".to_string(), serde_json::json!(focal_id.to_string())),
+            ("direction".to_string(), serde_json::json!("calls")),
+            ("depth".to_string(), serde_json::json!(4)),
+            ("limit_per_step".to_string(), serde_json::json!(15)),
+            ("include_body".to_string(), serde_json::json!(false)),
+        ]);
+        let mut wide = args.clone();
+        wide.insert(
+            "max_response_chars".to_string(),
+            serde_json::json!(RESPONSE_MAX_MAX_CHARS),
+        );
+        let before = client_text(
+            handle_trace_data_flow(&wide, &store).unwrap(),
+            "trace_data_flow",
+            &unbounded(),
+        );
+        let after = client_text(
+            handle_trace_data_flow(&args, &store).unwrap(),
+            "trace_data_flow",
+            &ResponseBudget::default(),
+        );
+        let (_, _, bounded) = assert_bounded("trace_data_flow", before, after);
+        // This tool bounds itself inside its own walk, so the number it enforces
+        // has to BE the shared default rather than merely sit under it. A
+        // per-tool budget of its own is what let a 79,278-character response
+        // report success while the client refused it.
+        assert_eq!(
+            bounded["max_response_chars"],
+            serde_json::json!(RESPONSE_DEFAULT_MAX_CHARS),
+            "trace_data_flow answers under the one shared default, not a budget of its own"
+        );
+    }
+
+    #[test]
+    fn get_context_pack_response_fits_the_budget() {
+        let (store, focal_id) = wide_store(0);
+        for index in 0..300 {
+            let dep = make_entity(
+                &format!("dependency_{index}_rebuild_auth_and_replay_body"),
+                &format!("src/deps/module_{index}/inner.rs"),
+            );
+            store.upsert_entity(&dep).unwrap();
+            store
+                .upsert_relation(&make_relation(focal_id, dep.id, RelationKind::Calls))
+                .unwrap();
+        }
+        let sessions = SessionRegistry::empty_for_test();
+        let args = HashMap::from([
+            (
+                "entity_id".to_string(),
+                serde_json::json!(focal_id.to_string()),
+            ),
+            ("token_budget".to_string(), serde_json::json!(2_000_000u64)),
+            ("depth".to_string(), serde_json::json!(2)),
+        ]);
+        let before = client_text(
+            handle_get_context_pack(&args, &store, &sessions, None).unwrap(),
+            "get_context_pack",
+            &unbounded(),
+        );
+        let after = client_text(
+            handle_get_context_pack(&args, &store, &sessions, None).unwrap(),
+            "get_context_pack",
+            &ResponseBudget::default(),
+        );
+        assert_bounded("get_context_pack", before, after);
+    }
+
+    #[test]
+    fn bulk_check_references_response_fits_the_budget() {
+        let (store, focal_id) = wide_store(200);
+        let ids: Vec<serde_json::Value> = store
+            .list_all_entities()
+            .unwrap()
+            .iter()
+            .take(200)
+            .map(|entity| serde_json::json!(entity.id.to_string()))
+            .collect();
+        let _ = focal_id;
+        let args = |compact: bool| -> HashMap<String, serde_json::Value> {
+            HashMap::from([
+                ("entity_ids".to_string(), serde_json::json!(ids)),
+                ("compact".to_string(), serde_json::json!(compact)),
+            ])
+        };
+        let before = client_text(
+            handle_bulk_check_references(&args(false), &store).unwrap(),
+            "bulk_check_references",
+            &unbounded(),
+        );
+        let after = client_text(
+            handle_bulk_check_references(&args(true), &store).unwrap(),
+            "bulk_check_references",
+            &ResponseBudget::default(),
+        );
+        assert_bounded("bulk_check_references", before, after);
+    }
+
+    /// The envelope and the confidence-qualified negative are what a caller
+    /// reads to know how far a shortened answer can be trusted, so they are the
+    /// two things the budget may never take.
+    #[test]
+    fn the_budget_never_cuts_the_envelope_or_the_negative() {
+        let (store, _) = wide_store(400);
+        let args = HashMap::from([
+            ("query".to_string(), serde_json::json!("caller")),
+            ("limit".to_string(), serde_json::json!(200)),
+        ]);
+        let text = client_text(
+            handle_semantic_search(&args, &store).unwrap(),
+            "semantic_search",
+            &ResponseBudget::default(),
+        );
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["_kin"]["envelope_version"], serde_json::json!(1));
+        assert_eq!(
+            value["_kin"]["degraded"]["offline_fallback"],
+            serde_json::json!(true)
+        );
     }
 }

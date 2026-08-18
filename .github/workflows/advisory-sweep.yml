@@ -1,0 +1,324 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+name: Advisory Sweep
+
+# Land the lock bump for a freshly published RustSec advisory before a merge
+# group ever sees the advisory.
+#
+# cargo-deny's advisories check is resolved against the RustSec database it
+# fetches at run time, so it is the one required context whose verdict is not a
+# function of the merge candidate. An advisory that publishes between a pull
+# request's own SAST run and its merge-group run turns the group red, and the
+# hosted queue then drops an entry that introduced neither the dependency nor
+# the advisory while marking nothing on it. RUSTSEC-2026-0258 (h2 0.4.15) did
+# that to kin#893 on 2026-08-18, 87 seconds after admission, during the v0.5.39
+# release, and the fix was a lockfile-only bump that had to land first.
+#
+# Weakening the merge-group check was the obvious alternative and is refused in
+# sast.yml, because it is the one gate that reads the merged tree. Closing the
+# window instead of the eye is what this workflow is for.
+on:
+  schedule:
+    # Every three hours at :13, which is off the release train (:07,:22,:37,:52),
+    # recovery (:03,:18,:33,:48), sentinel (:11,:41) and mint (:11,:26,:41,:56)
+    # minutes, so the sweep never contends with a release cycle for the runner
+    # or for the branch it writes.
+    - cron: "13 */3 * * *"
+  # `repository_dispatch` rather than `workflow_dispatch`, and not by taste. A
+  # workflow_dispatch caller selects the ref, and GitHub resolves the workflow
+  # FILE from that ref, so any branch could rewrite this file and run it while
+  # holding the release App key. No guard written inside the file can close
+  # that, because the guard would be on the attacker's branch too. This repo
+  # already refuses the combination: test-release-workflow-authority.py fails
+  # any workflow that pairs a branch-selectable dispatch trigger with a
+  # KIN_*_APP_ID or private key, and it matches that trigger as a literal
+  # string, so naming it here would trip the guard this workflow obeys.
+  # which is why release-tag.yml takes its manual path the same way. Trigger a
+  # sweep by hand with:
+  #   gh api repos/firelock-ai/kin/dispatches -f event_type=advisory-sweep
+  repository_dispatch:
+    types: [advisory-sweep]
+
+permissions:
+  contents: read
+
+# Never two sweeps at once. Both would resolve the same advisory and race to
+# force-update one branch, and the loser would push a lock built from a tree
+# the winner had already moved.
+concurrency:
+  group: kin-advisory-sweep
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    name: Sweep advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # The kin-release-bot App credentials are scoped to this environment, and a
+    # job only resolves them when it declares it. Same binding release-tag.yml
+    # and release-train.yml use, and the same deployment branch policy, which
+    # admits main only.
+    environment: release-tag
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Guard trigger authority
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          ACTOR: ${{ github.actor }}
+          REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          # Same reviewed actor set release-tag.yml admits for its manual path.
+          ALLOWED_ACTORS: |
+            troyjr4103
+            kin-release-bot[bot]
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = schedule ]; then
+            echo "trusted automatic trigger: $EVENT_NAME"
+            exit 0
+          fi
+          if [ "$EVENT_NAME" != repository_dispatch ]; then
+            echo "::error::unsupported trigger '$EVENT_NAME'"
+            exit 1
+          fi
+          if [ "$EVENT_ACTION" != advisory-sweep ]; then
+            echo "::error::unsupported repository dispatch action '$EVENT_ACTION'"
+            exit 1
+          fi
+          if [ "$DEFAULT_BRANCH" != main ]; then
+            echo "::error::advisory-sweep requires main as the repository default branch (got '$DEFAULT_BRANCH')"
+            exit 1
+          fi
+          if [ "$REF" != "refs/heads/$DEFAULT_BRANCH" ]; then
+            echo "::error::advisory-sweep dispatch must execute from the default branch (got '$REF')"
+            exit 1
+          fi
+          authorized=0
+          while IFS= read -r allowed; do
+            [ -z "$allowed" ] && continue
+            [ "$allowed" = "$ACTOR" ] && authorized=1
+          done <<< "$ALLOWED_ACTORS"
+          if [ "$authorized" -ne 1 ]; then
+            echo "::error::actor '$ACTOR' is not authorized to run the advisory sweep"
+            exit 1
+          fi
+          echo "authorized actor=$ACTOR action=$EVENT_ACTION ref=$REF"
+
+      - name: Mint repository-scoped bump branch token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.KIN_RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.KIN_RELEASE_BOT_PRIVATE_KEY }}
+          owner: firelock-ai
+          repositories: kin
+
+      - name: Checkout trusted main with bump-branch authority
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2.85.5
+        with:
+          tool: cargo-deny@0.20.2
+
+      - name: Read the advisory database against main's lock
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          set -uo pipefail
+          # A nonzero exit here is the ordinary case: it means an advisory hit.
+          # The diagnostics are the product, so the status is deliberately not
+          # the gate.
+          cargo deny --format json --log-level warn --manifest-path ./Cargo.toml \
+            --all-features check advisories > "$RUNNER_TEMP/advisories.json" 2>&1 || true
+          test -s "$RUNNER_TEMP/advisories.json"
+
+      - name: Plan the bump
+        id: plan
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          node scripts/advisory-sweep.mjs \
+            --deny-json "$RUNNER_TEMP/advisories.json" \
+            --lock ./Cargo.lock \
+            --dry-run \
+            --plan-out "$RUNNER_TEMP/plan.json" \
+            > /dev/null
+          bumps="$(jq -r '.bumps | length' "$RUNNER_TEMP/plan.json")"
+          unfixable="$(jq -r '.unfixable | length' "$RUNNER_TEMP/plan.json")"
+          echo "bumps=$bumps" >> "$GITHUB_OUTPUT"
+          echo "unfixable=$unfixable" >> "$GITHUB_OUTPUT"
+          jq -r '.' "$RUNNER_TEMP/plan.json"
+
+      - name: Apply the bump and prove it moved only the named entries
+        id: apply
+        if: steps.plan.outputs.bumps != '0'
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+          BUMPS: ${{ steps.plan.outputs.bumps }}
+        run: |
+          set -euo pipefail
+          node scripts/advisory-sweep.mjs \
+            --deny-json "$RUNNER_TEMP/advisories.json" \
+            --lock ./Cargo.lock \
+            > /dev/null
+          # Two lines per bump, the version and the checksum, and no other file.
+          changed="$(git diff --name-only)"
+          if [ -z "$changed" ]; then
+            # The plan named a bump and the tree did not move, so the plan was
+            # built against a lock that is not the one checked out here. Silence
+            # would publish an empty branch and an empty pull request.
+            echo "::error::advisory bump changed nothing; the plan does not match the checked-out lock"
+            exit 1
+          fi
+          if [ "$changed" != "Cargo.lock" ]; then
+            echo "::error::advisory bump touched more than Cargo.lock: $changed"
+            exit 1
+          fi
+          expected=$(( BUMPS * 2 ))
+          read -r added removed _ < <(git diff --numstat -- Cargo.lock)
+          if [ "$added" != "$expected" ] || [ "$removed" != "$expected" ]; then
+            echo "::error::advisory bump moved ${added}/${removed} lock lines, expected ${expected}/${expected}"
+            git --no-pager diff -- Cargo.lock
+            exit 1
+          fi
+          # A hand-written lock that cargo would not have produced fails here
+          # rather than in somebody's build. `--locked` refuses to rewrite.
+          cargo metadata --locked --format-version 1 > /dev/null
+          # And the advisory has to actually be gone, which is the only reason
+          # the bump exists.
+          cargo deny --log-level warn --manifest-path ./Cargo.toml --all-features check advisories
+
+      - name: Publish the bump branch
+        id: branch
+        if: steps.plan.outputs.bumps != '0'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          branch=automation/advisory-bump
+          ids="$(jq -r '[.bumps[].advisories[]] | unique | join(", ")' "$RUNNER_TEMP/plan.json")"
+          git config user.name "kin-release-bot[bot]"
+          git config user.email "kin-release-bot[bot]@users.noreply.github.com"
+          git checkout -B "$branch"
+          git add Cargo.lock
+          git commit --signoff -m "Bump advisory-affected lock entries for ${ids}"
+          # Force, because the branch is automation-owned and single-purpose:
+          # each cycle rebuilds it from main so it never accumulates a stale
+          # bump that main has already resolved another way.
+          git push --force origin "HEAD:refs/heads/${branch}"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "ids=$ids" >> "$GITHUB_OUTPUT"
+
+      - name: Open or update the bump pull request
+        id: pr
+        if: steps.plan.outputs.bumps != '0'
+        env:
+          # Opened as the release App rather than GITHUB_TOKEN, for the same two
+          # reasons release-train.yml gives: the organization withholds pull
+          # request creation from workflow tokens, and only an App-authored pull
+          # request emits the events that start its own protected checks.
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          RUNNER_TEMP: ${{ runner.temp }}
+          BRANCH: ${{ steps.branch.outputs.branch }}
+          IDS: ${{ steps.branch.outputs.ids }}
+        run: |
+          set -euo pipefail
+          title="Bump advisory-affected lock entries for ${IDS}"
+          node scripts/advisory-sweep.mjs \
+            --plan-in "$RUNNER_TEMP/plan.json" \
+            --render pr-body > "$RUNNER_TEMP/pr-body.md"
+          pr="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --head "$BRANCH" \
+            --json number --jq '.[0].number // ""')"
+          if [ -z "$pr" ]; then
+            gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$BRANCH" \
+              --title "$title" --body-file "$RUNNER_TEMP/pr-body.md" > /dev/null
+            pr="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --head "$BRANCH" \
+              --json number --jq '.[0].number // ""')"
+          else
+            gh pr edit "$pr" --repo "$GITHUB_REPOSITORY" \
+              --title "$title" --body-file "$RUNNER_TEMP/pr-body.md" > /dev/null
+          fi
+          # A number parsed out of a failed create is an error fragment, and a
+          # ledger that admits one can never reach a terminal state.
+          case "$pr" in
+            ''|*[!0-9]*)
+              echo "::error::advisory bump pull request could not be resolved to a number"
+              exit 1
+              ;;
+          esac
+          echo "number=$pr" >> "$GITHUB_OUTPUT"
+
+      - name: Arm protected auto-merge
+        if: steps.plan.outputs.bumps != '0'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR: ${{ steps.pr.outputs.number }}
+        run: |
+          set -euo pipefail
+          head_sha="$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)"
+          [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]]
+          # Reported rather than fatal: an unarmed pull request is still an open
+          # pull request a human can merge, and a sweep that failed here would
+          # discard the bump it just proved.
+          if gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --auto --squash \
+            --match-head-commit "$head_sha"; then
+            echo "auto-merge armed on #$PR"
+          else
+            echo "::warning::auto-merge could not be armed on #$PR; it is open and mergeable by hand"
+          fi
+
+      - name: Open or update the unfixable-advisory issue
+        if: steps.plan.outputs.unfixable != '0'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          gh label create "advisory-sweep" --repo "$GITHUB_REPOSITORY" \
+            --color "B60205" \
+            --description "Advisories with no semver-compatible bump, found by the scheduled sweep" \
+            --force
+          node scripts/advisory-sweep.mjs \
+            --plan-in "$RUNNER_TEMP/plan.json" \
+            --render issue-body > "$RUNNER_TEMP/issue-body.md"
+          ids="$(jq -r '[.unfixable[].id] | unique | join(", ")' "$RUNNER_TEMP/plan.json")"
+          title="Advisories with no semver-compatible bump: ${ids}"
+          issue="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --label "advisory-sweep" --json number --jq '.[0].number // ""')"
+          if [ -z "$issue" ]; then
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" \
+              --label "advisory-sweep" --body-file "$RUNNER_TEMP/issue-body.md" > /dev/null
+          else
+            gh issue edit "$issue" --repo "$GITHUB_REPOSITORY" --title "$title" \
+              --body-file "$RUNNER_TEMP/issue-body.md" > /dev/null
+          fi
+
+      - name: Summarize
+        if: always()
+        env:
+          BUMPS: ${{ steps.plan.outputs.bumps }}
+          UNFIXABLE: ${{ steps.plan.outputs.unfixable }}
+          PR: ${{ steps.pr.outputs.number }}
+        run: |
+          {
+            echo "## Advisory sweep"
+            echo ""
+            echo "- lock entries bumped: ${BUMPS:-unknown}"
+            echo "- advisories with no compatible bump: ${UNFIXABLE:-unknown}"
+            echo "- pull request: ${PR:-none}"
+          } >> "$GITHUB_STEP_SUMMARY"
