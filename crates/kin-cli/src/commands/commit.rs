@@ -170,7 +170,21 @@ enum LostReply {
     /// The commit is running; it has not failed.
     StillRunning(String),
     /// No receipt, and nothing proves any work is still in flight.
-    Gone,
+    Gone {
+        /// The marker the daemon left behind, when one is there.
+        ///
+        /// A daemon that is killed never retires its own marker, so this is
+        /// the last thing it managed to say about the work it was doing: the
+        /// phase it was in, how long it had been there, and how much memory it
+        /// was holding. It is carried out of the classification rather than
+        /// dropped because it is the entire evidence base for the sentence the
+        /// caller gets.
+        abandoned: Option<Box<kin_daemon_spawn::OpenTransaction>>,
+        /// Whether the pid that published `abandoned` is still running. A dead
+        /// pid is a process that stopped; a live one whose beat went quiet is a
+        /// daemon that is wedged, and the two need different sentences.
+        daemon_alive: bool,
+    },
 }
 
 /// Decide what a lost reply means from the facts on disk.
@@ -192,11 +206,15 @@ fn classify_lost_reply(
     if let Some(result) = landed {
         return LostReply::Landed(Box::new(result));
     }
+    let daemon_alive = open.as_ref().is_some_and(|open| is_alive(open.pid));
     match open {
-        Some(open) if open.is_beating(now_unix) && is_alive(open.pid) => {
+        Some(open) if open.is_beating(now_unix) && daemon_alive => {
             LostReply::StillRunning(open.summary())
         }
-        _ => LostReply::Gone,
+        abandoned => LostReply::Gone {
+            abandoned: abandoned.map(Box::new),
+            daemon_alive,
+        },
     }
 }
 
@@ -246,11 +264,29 @@ fn resolve_commit_after_lost_reply(
              Operation {operation_id} appears in `kin log` when it lands; a `kin commit` \
              run before then waits for it and is refused rather than recorded."
         ),
-        LostReply::Gone => {
+        LostReply::Gone {
+            abandoned,
+            daemon_alive,
+        } => {
             // A transport error names a socket. When the daemon was killed with
             // this request in flight, the socket is the symptom and the killer
             // left the cause in the repository.
-            let error = match daemon_death_explanation(kin_root) {
+            //
+            // Two killers leave two different traces. A reaper writes a death
+            // note, so that is read first and quoted as the killer's own words.
+            // The kernel's OOM killer writes nothing at all, which is why the
+            // reported failure named only HTTP: the daemon's own abandoned
+            // marker and this host's memory accounting are the only evidence
+            // that death leaves, and they are what the second reading uses.
+            let cause = daemon_death_explanation(kin_root).or_else(|| {
+                super::commit_progress::daemon_loss_explanation(
+                    abandoned.as_deref(),
+                    daemon_alive,
+                    unix_now(),
+                    &crate::capability::memory_evidence(),
+                )
+            });
+            let error = match cause {
                 Some(cause) => anyhow::Error::new(error).context(cause),
                 None => {
                     anyhow::Error::new(error).context("send daemon-owned native commit request")
@@ -470,6 +506,46 @@ mod tests {
             elapsed_secs: 213,
             phase_elapsed_secs: 60,
             beat_unix,
+            rss_bytes: None,
+            peak_rss_bytes: None,
+        }
+    }
+
+    /// The marker a dead daemon leaves is the only evidence of what it was
+    /// doing, so the classification must carry it out rather than drop it.
+    ///
+    /// Falsify by returning `abandoned: None` from the `Gone` arm of
+    /// [`classify_lost_reply`]: this fails, and with it every memory sentence
+    /// the caller can produce, because there is then nothing left to read.
+    #[test]
+    fn a_dead_daemons_marker_is_carried_out_of_the_classification() {
+        match classify_lost_reply(None, Some(open_commit(1_000)), 1_030, |_| false) {
+            LostReply::Gone {
+                abandoned,
+                daemon_alive,
+            } => {
+                assert!(!daemon_alive, "the pid probe said this daemon is gone");
+                let marker = abandoned.expect("the marker the daemon left must survive");
+                assert_eq!(
+                    marker.phase.as_deref(),
+                    Some("reconcile_workspace_and_commit_authority")
+                );
+                assert_eq!(marker.elapsed_secs, 213);
+            }
+            other => panic!("a dead daemon's commit is gone, not {other:?}"),
+        }
+        match classify_lost_reply(None, None, 1_030, |_| true) {
+            LostReply::Gone {
+                abandoned,
+                daemon_alive,
+            } => {
+                assert!(abandoned.is_none(), "no marker means no evidence to carry");
+                assert!(
+                    !daemon_alive,
+                    "with no marker there is no pid to have found alive"
+                );
+            }
+            other => panic!("no receipt and no marker is gone, not {other:?}"),
         }
     }
 
@@ -599,7 +675,7 @@ mod tests {
         assert!(
             matches!(
                 classify_lost_reply(None, Some(open_commit(1_000)), quiet, |_| true),
-                LostReply::Gone
+                LostReply::Gone { .. }
             ),
             "a marker that stopped beating proves nothing is in flight"
         );
@@ -609,14 +685,14 @@ mod tests {
         assert!(
             matches!(
                 classify_lost_reply(None, Some(open_commit(1_000)), 1_030, |_| false),
-                LostReply::Gone
+                LostReply::Gone { .. }
             ),
             "a marker belonging to a dead daemon is a leftover, not work in flight"
         );
         assert!(
             matches!(
                 classify_lost_reply(None, None, 1_030, |_| true),
-                LostReply::Gone
+                LostReply::Gone { .. }
             ),
             "no receipt and no marker is a commit that failed, and must still report failure"
         );

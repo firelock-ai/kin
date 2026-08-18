@@ -174,6 +174,7 @@ pub async fn run_health_checks() -> HealthReport {
     checks.push(check_reference_edge_coverage().await);
     checks.push(check_background_work().await);
     checks.push(check_embedding_model().await);
+    checks.push(check_commit_memory_headroom());
     checks.push(check_retrieval_profile());
     checks.push(check_update_policy());
     checks.push(check_binary_assessment_load());
@@ -2914,6 +2915,144 @@ const LANGUAGE_SERVER_FIX: &str =
 /// Report the active retrieval quality profile and the effective lever set,
 /// so an operator can see at a glance whether they are getting full
 /// retrieval capability — and why not, when a lever is off.
+/// One commit peak measured on a real converted repository.
+struct MeasuredCommitPeak {
+    repository: &'static str,
+    store_bytes: u64,
+    peak_bytes: u64,
+}
+
+const MIB: u64 = 1024 * 1024;
+
+/// Commit peaks measured on converted repositories, smallest store first.
+///
+/// Every row is one observation, not a fitted curve, and the check below never
+/// interpolates or extrapolates between them. It quotes the largest row whose
+/// store is no larger than the store in front of it, so what a reader is told
+/// is always a repository that has actually been measured rather than a
+/// prediction about theirs. Below the smallest row nothing is claimed at all.
+///
+/// The two rows are why a curve would be wrong: a store less than half the size
+/// of the other peaked within 12% of it, because a commit prepares the whole
+/// repository successor in memory and the fixed part of that dominates. Both
+/// were measured in the same 5 CPU / 12 GiB container on `kin 0.5.40`.
+const MEASURED_COMMIT_PEAKS: &[MeasuredCommitPeak] = &[
+    MeasuredCommitPeak {
+        repository: "expressjs/express",
+        store_bytes: 437 * MIB,
+        peak_bytes: 10809 * MIB,
+    },
+    MeasuredCommitPeak {
+        repository: "psf/requests",
+        store_bytes: 922 * MIB,
+        peak_bytes: 12283 * MIB,
+    },
+];
+
+/// Report whether this machine has the memory a commit on this store has been
+/// measured to need.
+///
+/// A commit that runs out of memory is reported to the person running it as a
+/// closed socket, and the store size that decides it is knowable before any
+/// commit is attempted. This is that reading, published where a user looks
+/// before they are surprised rather than after.
+///
+/// It is advisory by construction and can only ever be `Stale`, never a
+/// failure. A ceiling below a measured peak is a fact about a machine, not a
+/// broken install, and a check that failed readiness on it would fail every
+/// correct install on a small host.
+fn check_commit_memory_headroom() -> HealthCheck {
+    let cwd = env::current_dir().unwrap_or_default();
+    let Some(layout) = kin_core::KinLayout::discover(&cwd) else {
+        return HealthCheck::new(
+            "commit_memory_headroom",
+            "Commit memory headroom",
+            HealthStatus::Unsupported,
+            "not in a Kin repository, so there is no store to measure a commit against",
+        );
+    };
+    let footprint = crate::commands::store_footprint::StoreFootprint::measure(&layout);
+    commit_memory_headroom_check_for(&footprint, &crate::capability::memory_evidence())
+}
+
+/// Core of [`check_commit_memory_headroom`] with both readings as inputs, so
+/// every branch is testable on any host.
+fn commit_memory_headroom_check_for(
+    footprint: &crate::commands::store_footprint::StoreFootprint,
+    evidence: &crate::capability::MemoryEvidence,
+) -> HealthCheck {
+    const ID: &str = "commit_memory_headroom";
+    const LABEL: &str = "Commit memory headroom";
+    let Some(store) = footprint.store.as_ref() else {
+        return HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Unsupported,
+            "the store could not be measured, so nothing here can be compared against it",
+        );
+    };
+    let available = format_health_bytes(evidence.limit_bytes);
+    let measured = MEASURED_COMMIT_PEAKS
+        .iter()
+        .rev()
+        .find(|point| store.bytes >= point.store_bytes);
+    let Some(measured) = measured else {
+        return HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Healthy,
+            format!(
+                "{} of memory available; this {} store is smaller than any store a commit peak \
+                 has been measured on, so no headroom claim is made about it",
+                available,
+                format_health_bytes(store.bytes)
+            ),
+        );
+    };
+    let needed = format_health_bytes(measured.peak_bytes);
+    if evidence.limit_bytes >= measured.peak_bytes {
+        return HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Healthy,
+            format!(
+                "{available} of memory available; a commit on {} ({} store) was measured peaking \
+                 at {needed}, and this {} store is at least that size",
+                measured.repository,
+                format_health_bytes(measured.store_bytes),
+                format_health_bytes(store.bytes)
+            ),
+        );
+    }
+    HealthCheck::new(
+        ID,
+        LABEL,
+        HealthStatus::Stale,
+        format!(
+            "only {available} of memory is available here, and a commit on {} ({} store) was \
+             measured peaking at {needed}; this store is {}, so a commit can be killed \
+             mid-transaction and report a closed connection. {}",
+            measured.repository,
+            format_health_bytes(measured.store_bytes),
+            format_health_bytes(store.bytes),
+            crate::commands::commit_progress::COMMIT_MEMORY_REMEDY,
+        ),
+    )
+    .with_manual_fix(
+        "Run the commit on a machine or container with more memory, or raise this container's \
+         memory limit.",
+    )
+}
+
+fn format_health_bytes(bytes: u64) -> String {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else {
+        format!("{} MiB", bytes / MIB)
+    }
+}
+
 fn check_retrieval_profile() -> HealthCheck {
     let profile = crate::retrieval_profile::RetrievalProfile::from_env();
     let ce_model = env::var("KIN_LOCATE_CROSS_ENCODER_MODEL")
@@ -3015,6 +3154,120 @@ mod tests {
     use super::*;
     use kin_core::test_env::EnvVarGuard;
     use serial_test::serial;
+
+    fn footprint(store_bytes: u64) -> crate::commands::store_footprint::StoreFootprint {
+        crate::commands::store_footprint::StoreFootprint {
+            store: Some(crate::commands::store_footprint::TreeBytes {
+                bytes: store_bytes,
+                unreadable_entries: 0,
+            }),
+            git_objects: None,
+            unmeasured_reason: None,
+        }
+    }
+
+    fn memory(limit_bytes: u64) -> crate::capability::MemoryEvidence {
+        crate::capability::MemoryEvidence {
+            limit_bytes,
+            cgroup_oom_kills: None,
+        }
+    }
+
+    /// The reading a user needed BEFORE the commit that killed their daemon.
+    ///
+    /// A one-file commit on a 922 MiB store peaked at 12283 MiB against a
+    /// 12288 MiB ceiling, and the only warning anyone got was a closed socket
+    /// afterward. The store size that decides it is knowable the whole time.
+    ///
+    /// Falsify by comparing against `store.bytes` instead of the measured peak,
+    /// or by returning `Healthy` unconditionally: the constrained arm then
+    /// passes silently, which is the state this check exists to end.
+    #[test]
+    fn doctor_warns_when_this_machines_ceiling_is_below_a_measured_commit_peak() {
+        let check =
+            commit_memory_headroom_check_for(&footprint(922 * MIB), &memory(8 * 1024 * MIB));
+        assert!(
+            matches!(check.status, HealthStatus::Stale),
+            "a ceiling under a measured peak needs attention: {:?}",
+            check.status
+        );
+        assert!(
+            check.detail.contains("psf/requests") && check.detail.contains("12.0 GiB"),
+            "the warning must quote the repository and peak it was measured on: {}",
+            check.detail
+        );
+        assert!(
+            check.manual_fix.is_some(),
+            "a warning a reader cannot act on is noise"
+        );
+    }
+
+    /// A machine with the headroom is told so, quoting the same measurement.
+    #[test]
+    fn doctor_reports_headroom_as_healthy_against_the_same_measured_peak() {
+        let check =
+            commit_memory_headroom_check_for(&footprint(922 * MIB), &memory(64 * 1024 * MIB));
+        assert!(
+            matches!(check.status, HealthStatus::Healthy),
+            "64 GiB clears every measured peak: {:?}",
+            check.status
+        );
+        assert!(check.detail.contains("psf/requests"), "{}", check.detail);
+    }
+
+    /// Below the smallest measured store nothing is claimed at all.
+    ///
+    /// The two measured points do not scale with each other, so there is no
+    /// curve to run down. A check that invented one would warn every small
+    /// repository on a small machine about a cost nobody has measured there.
+    #[test]
+    fn doctor_makes_no_headroom_claim_about_a_store_smaller_than_any_measurement() {
+        let check = commit_memory_headroom_check_for(&footprint(64 * MIB), &memory(2 * 1024 * MIB));
+        assert!(
+            matches!(check.status, HealthStatus::Healthy),
+            "an unmeasured size is not a warning: {:?}",
+            check.status
+        );
+        assert!(
+            check.detail.contains("no headroom claim is made"),
+            "silence must be stated rather than implied: {}",
+            check.detail
+        );
+        assert!(
+            !check.detail.contains("psf/requests"),
+            "a measurement that does not apply must not be quoted: {}",
+            check.detail
+        );
+    }
+
+    /// The middle band quotes the smaller measurement, not the larger one.
+    #[test]
+    fn doctor_quotes_the_largest_measurement_the_store_actually_reaches() {
+        let check =
+            commit_memory_headroom_check_for(&footprint(500 * MIB), &memory(8 * 1024 * MIB));
+        assert!(
+            check.detail.contains("expressjs/express"),
+            "a 500 MiB store has passed the express point and not the requests one: {}",
+            check.detail
+        );
+        assert!(!check.detail.contains("psf/requests"), "{}", check.detail);
+    }
+
+    /// A store that could not be measured produces no verdict about it.
+    #[test]
+    fn doctor_reports_an_unmeasurable_store_as_unsupported_rather_than_as_healthy() {
+        let unmeasured = crate::commands::store_footprint::StoreFootprint {
+            store: None,
+            git_objects: None,
+            unmeasured_reason: Some("permission denied".to_string()),
+        };
+        let check = commit_memory_headroom_check_for(&unmeasured, &memory(1024 * MIB));
+        assert!(
+            matches!(check.status, HealthStatus::Unsupported),
+            "an unread store is not a passed check: {:?}",
+            check.status
+        );
+    }
 
     /// A host with no language server must be told which language lost which
     /// edge class, and told it in words rather than as a low relation count.

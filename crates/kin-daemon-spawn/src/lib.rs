@@ -198,6 +198,25 @@ pub struct OpenTransaction {
     pub phase_elapsed_secs: u64,
     /// Unix seconds at the last beat. Freshness is decided against this.
     pub beat_unix: u64,
+    /// Resident set of the publishing daemon at the last beat, in bytes.
+    ///
+    /// Published here rather than asked for later because the reader that needs
+    /// it most is reading after the process is gone: a daemon the kernel
+    /// OOM-kills answers no request and leaves no note, so the only memory
+    /// figure that survives it is one it wrote down while it was still running.
+    /// `None` means the beat could not sample it, never that the daemon was
+    /// using nothing.
+    #[serde(default)]
+    pub rss_bytes: Option<u64>,
+    /// The largest resident set any beat saw while this transaction was open.
+    ///
+    /// Kept beside the last sample because the two answer different questions.
+    /// The last sample says where the daemon was when it stopped beating; the
+    /// high-water mark says how close it ever came to the ceiling. A beat every
+    /// five seconds can miss the top of a fast climb, so this is a floor under
+    /// the real peak and is reported as one.
+    #[serde(default)]
+    pub peak_rss_bytes: Option<u64>,
 }
 
 impl OpenTransaction {
