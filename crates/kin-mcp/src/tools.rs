@@ -220,7 +220,7 @@ fn registered_tools() -> ToolsListResult {
                         "queries": {
                             "type": "array",
                             "items": { "type": "string" },
-                            "description": "Optional additional query variants for multi-query fan-out. When present, `query` plus each variant are retrieved independently and their rankings RRF-fused into one deduped result, with each hit's `match_evidence.matched_variants` naming the variants that surfaced it. Diverse variants (identifiers, behavior, subsystem) recover more relevant hits than any single phrasing. Requires the fused pipeline (automatic when set)."
+                            "description": "Optional additional query variants for multi-query fan-out. When present, `query` plus each variant are retrieved independently and their rankings RRF-fused into one deduped result. The response echoes the fan-out once under `queries`, and each hit's `matched_variant_indexes` gives the positions in that list of the variants that surfaced it. Diverse variants (identifiers, behavior, subsystem) recover more relevant hits than any single phrasing. Requires the fused pipeline (automatic when set)."
                         },
                         "limit": { "type": "integer", "description": "Max ranked entities per page (page size). Default 20.", "default": 20 },
                         "page_size": { "type": "integer", "description": "Entities per page; overrides `limit` for paging when set." },
@@ -233,8 +233,13 @@ fn registered_tools() -> ToolsListResult {
                         },
                         "include_snippet": {
                             "type": "boolean",
-                            "description": "Attach a bounded inline source snippet to each entity hit, projected from graph-owned content. Read it from the hit's `snippet` field (the fused pipeline also carries the same text as `body` for locate-schema parity). Entity granularity only: a file hit has no single entity body. A hit with no graph-owned body carries no snippet rather than a placeholder.",
+                            "description": "Attach a bounded inline source excerpt to each entity hit, projected from graph-owned content. Read it from `body` on the fused pipeline (routing `fused-v1`, the default) and from `snippet` on the cosine pipeline (routing `cosine-v0`); `routing` on the response says which answered. Each hit carries the text once. Entity granularity only: a file hit has no single entity body. A hit with no graph-owned body carries no excerpt rather than a placeholder.",
                             "default": true
+                        },
+                        "snippet_alias": {
+                            "type": "boolean",
+                            "description": "Repeat each fused hit's `body` under a second `snippet` key, for a consumer that reads that name. Off by default: the repeat doubles the most expensive field on every hit and, under the response budget, evicts real hits to make room for copies. Prefer reading `body` on the fused pipeline. No effect on the cosine pipeline, whose text is already `snippet`.",
+                            "default": false
                         },
                         "pipeline": {
                             "type": "string",

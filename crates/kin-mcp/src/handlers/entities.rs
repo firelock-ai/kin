@@ -87,7 +87,10 @@ when you are looking for \"where is the code that does X\" and you only have a \
 description of the behavior, not an exact symbol name. Unlike semantic_search (which \
 matches declarations by name/kind/language and ignores the query for ranking), \
 semantic_locate ranks by query relevance and returns act-on-able hits: entity_id, file, \
-line span, kind, score, and a bounded inline snippet. Set granularity to \"entity\" \
+line span, kind, score, and a bounded inline source excerpt. Each hit carries that text \
+ONCE: read it from `body` on the fused pipeline (the default) and from `snippet` on the \
+cosine pipeline, and read `routing` if you need to know which answered. Set \
+granularity to \"entity\" \
 (default) for ranked declarations or \"file\" to roll results up to the most relevant \
 files. Two pipelines can answer. The default on every profile is the full fused \
 retrieval pipeline `kin locate` serves: vector similarity, lexical search, and \
@@ -101,11 +104,12 @@ produced it, the score source, whether the query matched the entity name, and th
 ranking signals that applied — derived from graph-owned retrieval data, never a \
 working-tree read. Pass an optional `queries` array of additional query variants to fan \
 out: `query` plus each variant are retrieved independently and their rankings RRF-fused \
-into one deduped result, with each hit's `match_evidence.matched_variants` naming the \
-variants that surfaced it (diverse variants — identifiers, behavior, subsystem — recover \
+into one deduped result. The fan-out is echoed once under `queries` and each hit's \
+`matched_variant_indexes` gives the positions in that list of the variants \
+that surfaced it (diverse variants, meaning identifiers, behavior and subsystem, recover \
 more than any single phrasing); multi-query fusion always uses the fused pipeline. Both \
-pipelines report semantic_coverage — the fraction of the graph \
-that has embeddings indexed; the fused arm additionally reports a `degradations` array \
+pipelines report semantic_coverage as one counter object (indexed, total, pending, \
+complete), the same shape `_kin.semantic_coverage` carries; the fused arm additionally reports a `degradations` array \
 naming any retrieval capability that could not fully run (empty vector index, reranker \
 model not cached, …), so a thin result set is attributable instead of silent. Requires \
 the Kin daemon: retrieval runs against the daemon's live graph, so this tool returns an \

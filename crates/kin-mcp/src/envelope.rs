@@ -408,14 +408,15 @@ impl Envelope {
     /// daemon already computed them, so they live in one predictable place on the
     /// envelope. Absent fields stay unknown.
     ///
-    /// Two keys are read for coverage because two arms of `semantic_locate`
-    /// publish it differently: the fused arm's `semantic_coverage` is the full
-    /// counter object, while the cosine arm's is a bare `indexed / total` float
-    /// that no envelope field can be built from. That float is not an object, so
-    /// the lift used to skip it and the negative beside it reported coverage
-    /// unknown next to a coverage figure the same response had just printed.
-    /// `semantic_coverage_detail` carries the counters on both arms and is read
-    /// as the fallback.
+    /// One name is emitted and two are read. Every current retrieval payload
+    /// publishes coverage as the counter object under `semantic_coverage`, on
+    /// both `semantic_locate` arms, which is the same name and type this envelope
+    /// carries. `semantic_coverage_detail` is read only as a compatibility path
+    /// for a payload minted before that settle, when the cosine arm published a
+    /// bare `indexed / total` float under the shared name and the counters under
+    /// this second one. A stdio shim can be newer than the daemon it forwards to,
+    /// so the older shape still lifts rather than reporting coverage unknown next
+    /// to a coverage figure the same response had just printed.
     pub fn with_payload_metadata(mut self, payload: &Value) -> Self {
         if self.semantic_coverage.is_none() {
             if let Some(coverage) = ["semantic_coverage", "semantic_coverage_detail"]
@@ -848,11 +849,14 @@ mod tests {
 
     #[test]
     fn with_payload_metadata_lifts_counters_beside_a_bare_coverage_float() {
-        // FIR-2216. The cosine `semantic_locate` arm publishes coverage as a
-        // bare `indexed / total` float, which carries no counts to build an
-        // envelope field from, so the lift skipped it and the negative reported
-        // coverage unknown next to a coverage figure the same payload printed.
-        // The counters ride alongside under the key the fused arm already uses.
+        // The compatibility path, for a payload minted before FIR-2415 settled
+        // coverage on one name and one type. The cosine `semantic_locate` arm
+        // used to publish a bare `indexed / total` float under the shared name,
+        // which carries no counts to build an envelope field from, so the lift
+        // skipped it and the negative reported coverage unknown next to a
+        // coverage figure the same payload printed; the counters rode alongside
+        // under a second name. A stdio shim can be newer than the daemon it
+        // forwards to, so that older shape must still lift.
         let payload = serde_json::json!({
             "results": [],
             "semantic_coverage": 1.0,
@@ -869,8 +873,8 @@ mod tests {
 
     #[test]
     fn with_payload_metadata_prefers_the_coverage_object_over_the_detail_key() {
-        // The fused arm publishes the counters under `semantic_coverage`
-        // itself. That is the tool's own field and stays authoritative; the
+        // Both arms now publish the counters under `semantic_coverage` itself.
+        // That is the tool's own field and stays authoritative; the legacy
         // detail key is only consulted when it is not an object.
         let payload = serde_json::json!({
             "semantic_coverage": {
