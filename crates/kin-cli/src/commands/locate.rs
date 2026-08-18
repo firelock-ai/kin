@@ -1570,8 +1570,7 @@ impl SemanticCoverage {
             self.complete = false;
             let gap_note = format!(
                 "graph body gap: {} of {} graph-owned source paths carry no body, so entity \
-                 ranking over them falls back to text matching. Run `kin reconcile` (or re-run \
-                 `kin init`) to admit the missing bodies.",
+                 ranking over them falls back to text matching; graph_bodies.sample names them.",
                 bodies.gap_paths, bodies.source_paths
             );
             self.note = Some(match self.note.take() {
@@ -1785,6 +1784,44 @@ fn graph_source_path_set(graph: &kin_db::InMemoryGraph) -> HashSet<String> {
         }
     }
     source_paths
+}
+
+/// Bodies the graph holds for entity-bearing source paths without an opaque
+/// preview: the body preview the parser attaches to every entity at admission,
+/// which the text index and the embedder already read.
+fn merge_graph_entity_bodies(
+    graph: &kin_db::InMemoryGraph,
+    source_paths: &HashSet<String>,
+    previews: &mut HashMap<String, String>,
+) {
+    let Ok(entities) = graph.query_entities(&EntityFilter::default()) else {
+        return;
+    };
+    let mut bodies: HashMap<String, String> = HashMap::new();
+    for entity in entities {
+        let Some(path) = entity.file_origin.as_ref().map(|origin| origin.0.as_str()) else {
+            continue;
+        };
+        if previews.contains_key(path) || !source_paths.contains(path) || is_test_path(path) {
+            continue;
+        }
+        let Some(body) = entity
+            .metadata
+            .extra
+            .get(kin_parser::extract::EMBEDDING_BODY_PREVIEW_KEY)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|body| !body.is_empty())
+        else {
+            continue;
+        };
+        let text = bodies.entry(path.to_string()).or_default();
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(body);
+    }
+    previews.extend(bodies);
 }
 
 // ---------------------------------------------------------------------------
@@ -2470,7 +2507,9 @@ fn run_with_graph_capture_budgeted(
                              rank on text fallback only",
                             bodies.gap_paths, bodies.source_paths
                         ),
-                        remediation: "run `kin reconcile` to admit the missing source bodies"
+                        remediation: "graph_bodies.sample names the paths; a change the daemon \
+                                      admits to one re-derives its entities with bodies, while a \
+                                      binary or empty source-like file has no text to admit"
                             .to_string(),
                     },
                 );
@@ -9658,7 +9697,7 @@ fn extract_source_text_signals(
         });
     }
 
-    let source_previews: HashMap<String, String> = graph
+    let mut source_previews: HashMap<String, String> = graph
         .list_opaque_artifacts()
         .unwrap_or_default()
         .into_iter()
@@ -9671,17 +9710,19 @@ fn extract_source_text_signals(
             Some((path, preview))
         })
         .collect();
+    let full_source_paths: HashSet<String> = source_previews
+        .iter()
+        .filter(|(_, preview)| preview.len() > 1024)
+        .map(|(path, _)| path.clone())
+        .collect();
+    merge_graph_entity_bodies(graph, &source_paths, &mut source_previews);
     let preview_source_texts: HashMap<String, String> = source_previews
         .iter()
         .map(|(path, preview)| (path.clone(), preview.to_ascii_lowercase()))
         .collect();
     let full_source_texts: HashMap<String, String> = preview_source_texts
         .iter()
-        .filter(|(path, _)| {
-            source_previews
-                .get(*path)
-                .is_some_and(|preview| preview.len() > 1024)
-        })
+        .filter(|(path, _)| full_source_paths.contains(*path))
         .map(|(path, preview)| (path.clone(), preview.clone()))
         .collect();
 
@@ -25836,6 +25877,80 @@ mod tests {
         assert_eq!(healed.gap_paths, 0);
         assert_eq!(healed.with_body, 2);
         assert!(healed.sample.is_empty());
+    }
+
+    /// The shape every admitted store has at HEAD: parsed source paths carry
+    /// entities whose bodies live in `embedding_body_preview`, and no opaque
+    /// artifact at all. Those bodies are graph-owned and must count as such and
+    /// feed the term scan; a path whose entities carry no body stays a gap.
+    #[test]
+    fn entity_body_previews_are_the_graph_bodies_of_parsed_source_paths() {
+        let graph = kin_db::InMemoryGraph::new();
+        let mut hello = test_entity("hello", "probe.py", 1, 2);
+        hello.metadata.extra.insert(
+            "embedding_body_preview".to_string(),
+            serde_json::Value::String("def hello(): return greet_target()".to_string()),
+        );
+        graph.upsert_entity(&hello).unwrap();
+        graph
+            .upsert_entity(&test_entity("bare", "src/bare.py", 1, 2))
+            .unwrap();
+        graph.flush_text_index().unwrap();
+
+        let signals = extract_source_text_signals("where is greet_target called", &graph).unwrap();
+        let bodies = signals.graph_bodies.expect("observed");
+        assert_eq!(bodies.source_paths, 2);
+        assert_eq!(bodies.with_body, 1);
+        assert_eq!(bodies.gap_paths, 1);
+        assert_eq!(bodies.sample, vec!["src/bare.py".to_string()]);
+        assert!(
+            signals
+                .hits
+                .get("probe.py")
+                .is_some_and(|hits| hits.iter().any(|hit| hit.score >= 120.0)),
+            "a symbolic term inside an entity body must reach the source-text scan; hits: {:?}",
+            signals.hits.keys().collect::<Vec<_>>()
+        );
+
+        let mut bare = test_entity("bare", "src/bare.py", 1, 2);
+        bare.metadata.extra.insert(
+            "embedding_body_preview".to_string(),
+            serde_json::Value::String("def bare(): pass".to_string()),
+        );
+        graph.upsert_entity(&bare).unwrap();
+        graph.flush_text_index().unwrap();
+        let healed = extract_source_text_signals("where is greet_target called", &graph)
+            .unwrap()
+            .graph_bodies
+            .expect("observed");
+        assert_eq!(healed.gap_paths, 0);
+        assert_eq!(healed.with_body, 2);
+    }
+
+    /// An entity body preview is bounded and whitespace-collapsed, so it never
+    /// stands in as a full source text: a symbolic hit the text index found is
+    /// kept even when the term is absent from the composed entity bodies.
+    #[test]
+    fn entity_bodies_do_not_filter_symbolic_text_index_hits_as_full_source_would() {
+        let graph = kin_db::InMemoryGraph::new();
+        let mut entity = test_entity("snapshot_builtin", "src/builtin.c", 1, 20);
+        entity.doc_summary = Some("writes files when JQ_ENABLE_SNAPSHOT is set".to_string());
+        entity.metadata.extra.insert(
+            "embedding_body_preview".to_string(),
+            serde_json::Value::String(format!(
+                "{} static int snapshot_builtin(void)",
+                "x ".repeat(600)
+            )),
+        );
+        graph.upsert_entity(&entity).unwrap();
+        graph.flush_text_index().unwrap();
+
+        let signals = extract_source_text_signals("JQ_ENABLE_SNAPSHOT env var", &graph).unwrap();
+        assert!(
+            signals.hits.contains_key("src/builtin.c"),
+            "the text-index hit on the doc summary must survive; hits: {:?}",
+            signals.hits.keys().collect::<Vec<_>>()
+        );
     }
 
     #[test]
