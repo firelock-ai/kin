@@ -1554,6 +1554,19 @@ jobs:
           kin doctor --json | tee "$captures/kin-embedded-doctor.json"
           kin search hello --semantic --json | tee "$captures/kin-semantic-search.json"
           kin locate hello --json --explain --max-files 5 | tee "$captures/kin-semantic-locate.json"
+          # FALSIFICATION ONLY, NEVER TO MERGE. Rewrite the capture into the
+          # exact shape v0.5.38 produced, so this branch answers whether the
+          # pull-request proof can actually fail on it.
+          CAPTURE="$captures/kin-semantic-locate.json" node -e '
+            const fs = require("fs");
+            const file = process.env.CAPTURE;
+            const locate = JSON.parse(fs.readFileSync(file, "utf8"));
+            locate.semantic_coverage.complete = false;
+            locate.semantic_coverage.graph_bodies.with_body = 0;
+            locate.semantic_coverage.graph_bodies.gap_paths = 1;
+            fs.writeFileSync(file, JSON.stringify(locate));
+          '
+          cat "$captures/kin-semantic-locate.json"
 
       - name: Restore captured proof reports into the proof repository
         # Every assertion that reads the store has run by now, so the captures
