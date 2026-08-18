@@ -44,7 +44,9 @@ impl TranscriptWriter {
     fn write_stream(&mut self, mut record: Value) -> std::io::Result<()> {
         if let Some(object) = record.as_object_mut() {
             object.insert("session_id".into(), Value::String(self.session_id.clone()));
-            object.entry("timestamp").or_insert_with(|| Value::String(now_iso()));
+            object
+                .entry("timestamp")
+                .or_insert_with(|| Value::String(now_iso()));
         }
         writeln!(self.stream, "{record}")?;
         self.stream.flush()
@@ -169,7 +171,9 @@ impl TranscriptWriter {
     /// One sidecar row.
     pub fn trace(&mut self, mut row: Value) -> std::io::Result<()> {
         if let Some(object) = row.as_object_mut() {
-            object.entry("ts").or_insert_with(|| Value::String(now_iso()));
+            object
+                .entry("ts")
+                .or_insert_with(|| Value::String(now_iso()));
             object.insert("session_id".into(), Value::String(self.session_id.clone()));
         }
         writeln!(self.trace, "{row}")?;
