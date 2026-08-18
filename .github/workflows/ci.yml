@@ -1009,111 +1009,6 @@ jobs:
       - name: Check Zero File-Search Invariant (answer modules)
         run: bash scripts/zero_file_search_guard.sh
 
-      - name: Falsify Zero File-Search guards
-        # Both guards above still run on both platforms. Only this meta-proof,
-        # that the guards are not vacuous, is single-legged. Falsifiability is
-        # a property of the guards' logic, and neither the Python checker nor
-        # the shell guard branches on platform: they carry no `sys.platform` /
-        # `os.name` / `darwin` / `linux` test and no GNU-only shell construct.
-        # The harness is self-contained, poisoning a `mktemp -d` copy of
-        # `crates` and `scripts` rather than the checkout, so skipping it
-        # leaves no state for later steps and does not reorder them. It costs
-        # 5.9 min of the macOS leg, which is the merge queue's critical path.
-        if: runner.os == 'Linux'
-        run: |
-          set -euo pipefail
-          poisoned="$(mktemp -d)"
-          trap 'rm -rf "$poisoned"' EXIT
-          cp -a crates scripts "$poisoned/"
-
-          fail_expected() {
-            local label="$1" want="$2"; shift 2
-            local out rc=0
-            out="$("$@" 2>&1)" || rc=$?
-            if [[ $rc -eq 0 ]]; then
-              echo "::error::falsification failed. $label passed when it should have failed"; echo "$out"; exit 1
-            fi
-            if ! grep -qF "$want" <<<"$out"; then
-              echo "::error::falsification failed. $label failed but never named '$want'"
-              echo "$out"; exit 1
-            fi
-            echo "  ok: $label"
-          }
-
-          # [1/3] Every answer module, poisoned at several sites including
-          # end-of-file, against both guards. This step used to plant one probe
-          # in one module, at the top of a file it had truncated to three lines.
-          # That proved the guards worked at that spot and nowhere else, and it
-          # passed for as long as a comment-tracking desync left the last third
-          # of the largest answer module unscanned.
-          #
-          # The harness also probes the two ways an EXEMPTION can lose scope
-          # rather than a pattern losing a site: a brace inside a literal or a
-          # comment planted in an allowlisted function body, which a raw brace
-          # counter reads as an unclosed body and silently excuses to end of
-          # file, and a counted pin paid for by a rename in test code the guard
-          # never reads. Both are the same failure as [2/3] reached through the
-          # exemption mechanism instead of a stale pin.
-          echo "[1/3] every answer module, every probe site, both guards"
-          python3 scripts/falsify-zero-file-search.py "$poisoned"
-
-          # [2/3] A broken pin must not hide the scan. Allowlist validation used
-          # to exit before the walk, so a stale pin reported itself and nothing
-          # else; two stale pins once masked ten real violations in a newly
-          # covered crate, which made a red allowlist useless as a measure of
-          # remaining work. Break one pin's count deliberately and require the
-          # run to report the violations that pin was masking AS WELL AS the pin
-          # error. Runs before [3/3], which mutates the allowlist irreversibly.
-          echo "[2/3] a broken pin must not hide the scan"
-          python3 - "$poisoned/scripts/zero-file-search-allowlist.json" <<'PY'
-          import json, sys
-          path = sys.argv[1]
-          data = json.load(open(path))
-          target = "crates/kin-daemon/src/repository_branch.rs"
-          for entry in data["allowlist"]:
-              if entry["file"] == target:
-                  entry["allow_match"] = [{"expr": ".metadata()", "count": 999}]
-                  break
-          else:
-              raise SystemExit(f"::error::falsification setup: no pin on {target}")
-          json.dump(data, open(path, "w"))
-          PY
-          out=""; rc=0
-          out="$(python3 "$poisoned/scripts/verify-zero-file-search.py" "$poisoned" 2>&1)" || rc=$?
-          for want in \
-            "[VIOLATION] crates/kin-daemon/src/repository_branch.rs" \
-            "want 999" \
-            "Scanned "; do
-            if ! grep -qF "$want" <<<"$out"; then
-              echo "::error::falsification failed: a broken pin hid the scan (missing '$want')"
-              echo "$out"; exit 1
-            fi
-          done
-          if [[ $rc -eq 0 ]]; then
-            echo "::error::falsification failed: a broken pin did not fail the guard"
-            echo "$out"; exit 1
-          fi
-          echo "  ok: broken pin reported its masked violations and still failed"
-          # Restore the real policy; [3/3] starts from an unbroken allowlist.
-          cp scripts/zero-file-search-allowlist.json "$poisoned/scripts/"
-
-          echo "[3/3] allowlist entry naming a path that no longer exists"
-          python3 - "$poisoned/scripts/zero-file-search-allowlist.json" <<'PY'
-          import json, sys
-          path = sys.argv[1]
-          data = json.load(open(path))
-          data["allowlist"].append({
-              "file": "crates/kin-core/src/text_refs.rs",
-              "reason": "resurrected stale exemption",
-              "owner": "ci-falsification",
-              "expiration": "2026-12-31",
-          })
-          json.dump(data, open(path, "w"))
-          PY
-          fail_expected "python guard" "text_refs.rs" python3 "$poisoned/scripts/verify-zero-file-search.py" "$poisoned"
-
-          echo "Zero File-Search guards are falsifiable: every probe was caught."
-
       # Deep history is a PROJECTION re-authored at ingest, not a stored fact:
       # a merge change's entity/relation deltas are discarded and recomputed by
       # the replay algorithm. Editing that algorithm changes what Kin reports
@@ -1279,9 +1174,215 @@ jobs:
         # nextest does not run doctests; keep them covered explicitly.
         run: cargo test --doc --locked
 
-      # `gcs` is a non-default feature, so the passes above never execute the
-      # hosted-storage code it gates, and Clippy's `--all-features` pass only
-      # type-checks it. Without this step a behavioral regression in the
+  # Two sets of steps used to run inside Check & Test and gate nothing that
+  # needed them to be there. Both sat on the merge queue's critical path: five
+  # merge_group runs sampled on 2026-08-18 spent 9.9 min of the average ubuntu
+  # leg falsifying the Zero File-Search guards, and 15.7 min of the average
+  # macOS leg on the three feature permutations. Neither set consumes anything
+  # Check & Test builds. The falsification harness runs no cargo at all, and
+  # each feature permutation resolves its own feature set, so it recompiles the
+  # workspace crates whether it runs here or there. Running them beside Check &
+  # Test rather than behind it changes when they run and nothing about what
+  # they assert.
+  falsify-guards:
+    name: Falsify guards
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      # The harness and both guards it drives locate a function body textually,
+      # by the indentation of its declaration and the matching closing brace.
+      # scripts/falsify-zero-file-search.py and scripts/zero_file_search_guard.sh
+      # each record `cargo fmt --check` running in the same CI job as the reason
+      # that location is reliable, so this job carries that obligation with the
+      # harness rather than inheriting it from a job it no longer shares. An
+      # unformatted tree could otherwise move a probe site, leave the harness
+      # nothing to probe, and let it report success having proved nothing.
+      # It needs no cache and no registry index: `cargo fmt -- --check` resolves
+      # no dependencies and runs against an empty CARGO_HOME.
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Falsify Zero File-Search guards
+        # Both guards still run on both platforms in Check & Test. Only this
+        # meta-proof, that the guards are not vacuous, is single-legged.
+        # Falsifiability is a property of the guards' logic, and neither the
+        # Python checker nor the shell guard branches on platform: they carry no
+        # `sys.platform` / `os.name` / `darwin` / `linux` test and no GNU-only
+        # shell construct. The harness is self-contained, poisoning a
+        # `mktemp -d` copy of `crates` and `scripts` rather than the checkout.
+        run: |
+          set -euo pipefail
+          poisoned="$(mktemp -d)"
+          trap 'rm -rf "$poisoned"' EXIT
+          cp -a crates scripts "$poisoned/"
+
+          fail_expected() {
+            local label="$1" want="$2"; shift 2
+            local out rc=0
+            out="$("$@" 2>&1)" || rc=$?
+            if [[ $rc -eq 0 ]]; then
+              echo "::error::falsification failed. $label passed when it should have failed"; echo "$out"; exit 1
+            fi
+            if ! grep -qF "$want" <<<"$out"; then
+              echo "::error::falsification failed. $label failed but never named '$want'"
+              echo "$out"; exit 1
+            fi
+            echo "  ok: $label"
+          }
+
+          # [1/3] Every answer module, poisoned at several sites including
+          # end-of-file, against both guards. This step used to plant one probe
+          # in one module, at the top of a file it had truncated to three lines.
+          # That proved the guards worked at that spot and nowhere else, and it
+          # passed for as long as a comment-tracking desync left the last third
+          # of the largest answer module unscanned.
+          #
+          # The harness also probes the two ways an EXEMPTION can lose scope
+          # rather than a pattern losing a site: a brace inside a literal or a
+          # comment planted in an allowlisted function body, which a raw brace
+          # counter reads as an unclosed body and silently excuses to end of
+          # file, and a counted pin paid for by a rename in test code the guard
+          # never reads. Both are the same failure as [2/3] reached through the
+          # exemption mechanism instead of a stale pin.
+          echo "[1/3] every answer module, every probe site, both guards"
+          python3 scripts/falsify-zero-file-search.py "$poisoned"
+
+          # [2/3] A broken pin must not hide the scan. Allowlist validation used
+          # to exit before the walk, so a stale pin reported itself and nothing
+          # else; two stale pins once masked ten real violations in a newly
+          # covered crate, which made a red allowlist useless as a measure of
+          # remaining work. Break one pin's count deliberately and require the
+          # run to report the violations that pin was masking AS WELL AS the pin
+          # error. Runs before [3/3], which mutates the allowlist irreversibly.
+          echo "[2/3] a broken pin must not hide the scan"
+          python3 - "$poisoned/scripts/zero-file-search-allowlist.json" <<'PY'
+          import json, sys
+          path = sys.argv[1]
+          data = json.load(open(path))
+          target = "crates/kin-daemon/src/repository_branch.rs"
+          for entry in data["allowlist"]:
+              if entry["file"] == target:
+                  entry["allow_match"] = [{"expr": ".metadata()", "count": 999}]
+                  break
+          else:
+              raise SystemExit(f"::error::falsification setup: no pin on {target}")
+          json.dump(data, open(path, "w"))
+          PY
+          out=""; rc=0
+          out="$(python3 "$poisoned/scripts/verify-zero-file-search.py" "$poisoned" 2>&1)" || rc=$?
+          for want in \
+            "[VIOLATION] crates/kin-daemon/src/repository_branch.rs" \
+            "want 999" \
+            "Scanned "; do
+            if ! grep -qF "$want" <<<"$out"; then
+              echo "::error::falsification failed: a broken pin hid the scan (missing '$want')"
+              echo "$out"; exit 1
+            fi
+          done
+          if [[ $rc -eq 0 ]]; then
+            echo "::error::falsification failed: a broken pin did not fail the guard"
+            echo "$out"; exit 1
+          fi
+          echo "  ok: broken pin reported its masked violations and still failed"
+          # Restore the real policy; [3/3] starts from an unbroken allowlist.
+          cp scripts/zero-file-search-allowlist.json "$poisoned/scripts/"
+
+          echo "[3/3] allowlist entry naming a path that no longer exists"
+          python3 - "$poisoned/scripts/zero-file-search-allowlist.json" <<'PY'
+          import json, sys
+          path = sys.argv[1]
+          data = json.load(open(path))
+          data["allowlist"].append({
+              "file": "crates/kin-core/src/text_refs.rs",
+              "reason": "resurrected stale exemption",
+              "owner": "ci-falsification",
+              "expiration": "2026-12-31",
+          })
+          json.dump(data, open(path, "w"))
+          PY
+          fail_expected "python guard" "text_refs.rs" python3 "$poisoned/scripts/verify-zero-file-search.py" "$poisoned"
+
+          echo "Zero File-Search guards are falsifiable: every probe was caught."
+  # A skipped matrix job never expands, so its per-leg context names do not
+  # appear at all rather than appearing skipped. `check-docs-only` exists for
+  # exactly that reason and this is its counterpart: once the branch ruleset
+  # requires `Feature permutation tests (ubuntu-latest)` and its macOS leg, a
+  # documentation-only diff would otherwise wait forever for two contexts that
+  # were never going to be created. Both legs run here on one ubuntu runner
+  # because the point is the name, not the work.
+  feature-tests-docs-only:
+    name: Feature permutation tests
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only == 'true' }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Report the documentation-only fast path
+        run: echo "documentation-only diff; feature permutation tests not applicable"
+
+  feature-tests:
+    name: Feature permutation tests
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    # Same bounds as Check & Test: the feature permutations compile the same
+    # workspace and would otherwise retain more than a hosted runner's
+    # available disk in incremental objects and debug symbols.
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+
+      - name: Verify kin cargo registry config
+        run: |
+          test -f .cargo/config.toml
+          grep -q '^\[registries\.kin\]' .cargo/config.toml
+          if grep -q '^\[patch\.kin\]' .cargo/config.toml; then echo "::error::[patch.kin] git pins must be removed. kin-* resolve from the Kin registry"; exit 1; fi
+
+      # `shared-key: check` is the key Check & Test's own cache already writes,
+      # so these permutations start from that warm third-party dependency graph
+      # instead of compiling it from nothing. Only the workspace crates rebuild
+      # for the changed feature set, which is what they cost inside Check & Test
+      # too. `save-if: false` because this job must never write that entry: it
+      # resolves a different feature set, and a save from here would hand
+      # Check & Test a target directory missing the artifacts its steps expect.
+      # A rename of the `check` job silently costs this job its warm start, so
+      # the cache-hit line in this step's log is the thing to read if it slows.
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: check
+          save-if: false
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      # `gcs` is a non-default feature, so the default-feature passes in Check &
+      # Test never execute the hosted-storage code it gates, and the
+      # `--all-features` Clippy pass there only type-checks it. Without this
+      # step a behavioral regression in the
       # GCS-mode startup admission path compiles clean and reaches main with a
       # green required context. The whole package runs rather than just the
       # binary target: the feature gates only `bin/kin-daemon.rs` today, and
