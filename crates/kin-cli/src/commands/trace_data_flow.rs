@@ -465,6 +465,18 @@ pub struct TraceDataFlowResponse {
     pub bodies_omitted: usize,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub steps_omitted: usize,
+    /// Steps this response reached through a `name_only` edge, out of
+    /// `total_steps`.
+    ///
+    /// A chain that lists three callees looks equally complete whether all three
+    /// were proven or all three were guessed from a bare name, and a reader who
+    /// does not scan every step's `resolution` cannot tell. The count says it
+    /// once, at the top, so a chain narrowed by a resolution gate is not mistaken
+    /// for a complete proven one. Zero — and omitted — when every hop was
+    /// proven, which is the only case where the chain is a claim about what runs
+    /// rather than about what might.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unproven_steps: usize,
     /// File-less duplicates of a symbol the graph also holds with a file, merged
     /// into the located record so one symbol carries one identity in one
     /// response. Zero — and omitted — when no name arrived both ways.
@@ -923,12 +935,48 @@ pub fn build_trace_data_flow_response_within(
         clipped_steps,
         bodies_omitted: 0,
         steps_omitted: 0,
+        unproven_steps: 0,
         external_identities_merged,
         max_response_chars: request.budget_chars(),
         degradations,
     };
     enforce_response_budget(&mut response);
+    record_unproven_steps(&mut response);
     Ok(response)
+}
+
+/// Count the hops this response rests on that were matched by name alone, and
+/// disclose the count rather than leaving it to be inferred per step.
+///
+/// Run after the response budget has cut whatever it cuts, so the number
+/// describes the chain the caller actually receives. A resolution gate that
+/// refuses an edge makes the chain shorter without saying so anywhere; this is
+/// what keeps a shortened chain from reading as a proven one.
+fn record_unproven_steps(response: &mut TraceDataFlowResponse) {
+    let name_only = RelationResolution::NameOnly.as_str();
+    response.unproven_steps = response
+        .chain
+        .iter()
+        .filter(|step| step.resolution == name_only)
+        .count();
+    if response.unproven_steps == 0 {
+        return;
+    }
+    let total = response.chain.len();
+    record_degradation(
+        &mut response.degradations,
+        RetrievalDegradation {
+            component: "call_resolution".to_string(),
+            reason: "name_only_steps".to_string(),
+            detail: format!(
+                "{} of {total} steps were reached through an edge matched by name alone, so the flow each claims may not exist",
+                response.unproven_steps
+            ),
+            remediation:
+                "read each step's `resolution` field, and treat a `name_only` hop as a candidate rather than a call"
+                    .to_string(),
+        },
+    );
 }
 
 /// One node of the walk, carrying the file and directory its fan-out is scored
@@ -2085,6 +2133,7 @@ mod tests {
             clipped_steps: Vec::new(),
             bodies_omitted: 0,
             steps_omitted: 0,
+            unproven_steps: 0,
             external_identities_merged: 0,
             max_response_chars: DEFAULT_MAX_RESPONSE_CHARS,
             degradations: Vec::new(),

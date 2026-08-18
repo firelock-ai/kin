@@ -10,7 +10,11 @@
 //! uses — probed for what the adapter *actually* emits.
 //!
 //! GREEN cells are locked as regression tests, including the rightmost-name
-//! narrowing of dotted method calls in every adapter. Several callback shapes
+//! narrowing of dotted method calls in every adapter. Rust's `self.` call is
+//! the deliberate exception: the receiver is settled by the syntax, so it is
+//! folded into an owner-qualified `Type::method` destination rather than left
+//! as a bare leaf. That destination is still simple and index-matchable, which
+//! is the property this matrix exists to lock. Several callback shapes
 //! are not wired to edges; those cells are written and `#[ignore]`d with the
 //! observed behavior named on the reason line.
 
@@ -211,14 +215,27 @@ fn go_selector_call_emits_rightmost_name() {
     no_dotted_call_dst(&out);
 }
 
+/// Rust is the one cell in this matrix that does not narrow to the bare
+/// rightmost name, because `self` settles the receiver. Inside `impl S`,
+/// `self.helper()` can only reach `S`'s own `helper`, and `S::helper` is the
+/// exact key that method entity is stored under, so folding the receiver into
+/// the callee resolves the call to its definition. The bare leaf is what let a
+/// `self.` call match every same-named method in the repository. The matrix
+/// invariant that matters is unchanged: the destination is still simple and
+/// index-matchable, and still never the dotted `self.helper` form. FIR-1581.
 #[test]
-fn rust_self_method_call_emits_rightmost_name() {
+fn rust_self_method_call_folds_the_receiver_into_the_owner() {
     let out = extract(
         &RustAdapter,
         "s.rs",
         "struct S;\nimpl S {\n    fn run(&self) { self.helper(); }\n    fn helper(&self) {}\n}\n",
     );
-    assert!(has_edge(&out, RelationKind::Calls, "S::run", "helper"));
+    assert!(has_edge(&out, RelationKind::Calls, "S::run", "S::helper"));
+    assert!(
+        !has_edge(&out, RelationKind::Calls, "S::run", "helper"),
+        "the bare leaf is what made a `self.` call ambiguous across crates"
+    );
+    no_dotted_call_dst(&out);
 }
 
 #[test]
