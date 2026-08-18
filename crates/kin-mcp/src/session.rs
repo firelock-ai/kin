@@ -2522,8 +2522,15 @@ mod target_body_update_tests {
 
     #[test]
     fn target_body_update_requires_verb_target_and_body() {
-        let wrong_verb = target_op("create", "resolve_binary", Some("x"));
+        // "create" used to be a wrong verb for this shape; it now names the
+        // new-source-file operation (`is_new_source_file`), so a payload-less
+        // "create" with a target and body is a valid create, not a rejected
+        // update. "upsert" stays wrong on purpose: it is deliberately not one
+        // of the create verbs (see `is_new_source_file`), so it still matches
+        // neither payload-less shape and must still fail closed.
+        let wrong_verb = target_op("upsert", "resolve_binary", Some("x"));
         assert!(!is_target_body_update(&wrong_verb));
+        assert!(!is_new_source_file(&wrong_verb));
         assert!(validate_staged_operations(std::slice::from_ref(&wrong_verb)).is_err());
 
         let no_target = target_op("update", "", Some("x"));
