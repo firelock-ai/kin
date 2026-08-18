@@ -7,7 +7,7 @@ This document defines the write-authority model for the Kin ecosystem: how chang
 The intended end-state of the Kin ecosystem is **graph-authoritative** with hard enforcement. In this model, the semantic graph is the primary system of record, and the filesystem is a projection. 
 
 At this stage, the graph exercises a **veto** at the write boundary:
-- **Write-Notify Interception**: Filesystem operations are intercepted at `/vfs/write-notify`.
+- **Write Interception**: Filesystem operations are intercepted at the projection boundary and evaluated before they reach graph truth. The `/vfs/write-notify` and `/vfs/file-changed` routes that once carried this are gone: they were pre-v6 and the daemon answers 404 for both. What acknowledges a write today is the watcher backstop plus an explicit admission, `POST /commands/admit` for an exact-tree admission and `POST /commands/commit` for the seam `kin commit` uses. A mount admits through the latter, so a write through a mounted projection reaches graph truth and `kin log` carries it.
 - **Hard Intents and Contracts**: Before any overlay is applied to the graph or projected back to the filesystem, the proposed changes are evaluated against hard intents and semantic contracts (e.g., breaking type signatures, violating downstream dependencies, or conflicting with another agent's reserved intent scope).
 - **Governance Enforcement**: If a change violates an established intent, fails semantic review, or introduces a conflict, the write is rejected at the VFS layer.
 

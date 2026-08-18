@@ -5,14 +5,31 @@ Kin's graph, and that is what `kin` and the daemon answer from. A projection is
 how you see that truth as ordinary files, so your editor, your compiler and your
 build system keep working without knowing anything changed.
 
-Kin has three projections. They differ in how the files reach your tools, not in
+Kin has four projections. They differ in how the files reach your tools, not in
 where the truth comes from.
 
-| Mode | How files reach your tools | What it needs |
-| --- | --- | --- |
-| `shim` | `libkin_vfs_shim` is injected into each process by the shell hook, so intercepted libc calls answer from the graph. | Nothing beyond the Kin install. |
-| `nfs` | `kin-vfs` runs an NFSv3 server and the kernel mounts it. | An NFS client on the host, and a `kin-vfs` built with the `nfs` feature. |
-| `fuse` | `kin-vfs` serves a FUSE filesystem the kernel mounts. | FUSE-T or macFUSE on macOS, libfuse on Linux, and a `kin-vfs` built with the `fuse` feature. |
+| Mode | How files reach your tools |
+| --- | --- |
+| `shim` | `libkin_vfs_shim` is injected into each process by the shell hook, so intercepted libc calls answer from the graph. |
+| `nfs` | `kin-vfs` runs an NFSv3 server and the kernel mounts it. |
+| `fuse` | `kin-vfs` serves a FUSE filesystem the kernel mounts. |
+| `projfs` | Windows projects the repository in place through the Windows Projected File System. |
+
+## What each one needs, per platform
+
+An empty cell means that mode does not exist on that platform at all, which is
+different from a mode you could install and have not.
+
+| | macOS | Linux | Windows |
+| --- | --- | --- | --- |
+| `shim` | ships with Kin | ships with Kin | |
+| `nfs` | `mount_nfs`, already in the base system | `nfs-common` (Debian, Ubuntu) or `nfs-utils` (Fedora, Arch) | `Enable-WindowsOptionalFeature -Online -FeatureName ServicesForNFS-ClientOnly`, on Pro, Enterprise and Education only, and it mounts to a drive letter rather than projecting in place |
+| `fuse` | FUSE-T or macFUSE | your distribution's `fuse3` package | |
+| `projfs` | | | `Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS -NoRestart`, on every SKU including Home |
+
+`kin vfs status` prints this per mode for the machine you are on, with the
+literal result of each probe. The table lives in one place in the code, so what
+the CLI tells you and what this page says cannot drift.
 
 ## Which one you get
 
@@ -21,6 +38,7 @@ run here:
 
 - macOS: `nfs`, then `fuse`, then `shim`
 - Linux: `fuse`, then `nfs`, then `shim`
+- Windows: `projfs`, then `nfs`
 - everywhere else: `shim`
 
 A mount beats the shim because a mount cannot be taken away from a process. The
@@ -36,8 +54,18 @@ NFS client in the base system while FUSE there needs FUSE-T or macFUSE
 installed. Linux carries libfuse far more widely than it carries a configured
 NFS client.
 
-The shim is last and it is a real answer, not a failure. It is what makes
-graph-first adoption work on a host that will mount nothing.
+On macOS and Linux the shim is last, and it is a real answer rather than a
+failure: it is what makes graph-first adoption work on a host that will mount
+nothing.
+
+Windows runs a different order for a different reason. There is no shim to fall
+back to, because there is no library the shell hook can inject, so ProjFS both
+leads and is the floor. The NFS client is second rather than a compatibility
+layer: it ships only on Pro, Enterprise and Education, and it mounts to a drive
+letter instead of projecting the repository where it already is. That is also
+why `kin doctor` on Windows never reports that nothing is missing when no
+projection is running. ProjFS is present on every SKU and only needs enabling,
+so an unavailable projection there is always something you can fix.
 
 ## Turning it on and off
 
@@ -48,6 +76,12 @@ kin vfs off                     # disengage it
 kin vfs status                  # what is in force, probed live
 kin vfs status --json           # the same, machine-readable
 ```
+
+Mounts appear under `~/Kin` by default, which is user-writable without sudo,
+survives an unmount, and can be dragged into a file manager's sidebar. Kin reads
+the mount point a running server actually published rather than assuming that
+default, because a server that chose somewhere else would otherwise be reported
+as not mounted.
 
 `kin setup` also picks a mode and records it in `~/.kin/config/setup.toml` under
 `[projection] mode`. A mode you asked for is what gets recorded. If it cannot
@@ -83,6 +117,19 @@ where admission picks them up. Nothing about writing is the shim's to decide,
 and probing it anyway would mean creating and deleting a file inside your
 repository every time you ran `kin status`.
 
+## What happens to a write
+
+A write through a mount stages into the served repository's working copy, and
+every staged path is admitted into graph truth through the same seam
+`kin commit` uses, so `kin log` carries it. That is what makes "the graph is the
+authority" literally true for a mounted projection rather than an aspiration.
+`kin vfs off` admits whatever is staged before it unmounts, so turning the
+projection off does not strand work.
+
+Under the shim, writes land on disk and reach the graph through admission. The
+old `/vfs/write-notify` and `/vfs/file-changed` routes that used to acknowledge
+a write are gone, and the daemon answers 404 for both.
+
 `degraded` is `yes` when the mode running is not the mode you asked for, or when
 the mode running failed one of its own probes.
 
@@ -96,11 +143,12 @@ directory underneath it and report a healthy projection that is not there.
 
 ## When a mount is not available
 
-The `kin-vfs` binary shipped with Kin today is built without the `nfs` and
-`fuse` features, so neither mount is available from a stock install. Kin asks
-the driver which subcommands it carries rather than assuming, reports the
-absence, and falls back to the shim with a message. To get one, build a driver
-that has it:
+Kin's release workflow now builds the shipped `kin-vfs` with `--features nfs` on
+macOS and `--features fuse` on Linux, so a stock install carries its platform's
+mount. Kin still asks the driver which subcommands it carries rather than
+assuming, because an older install predates those flags; where a mount feature
+is absent it reports that and falls back to the shim with a message. To build a
+driver with the other platform's feature, or to test an unreleased one:
 
 ```
 cargo build --release -p kin-vfs-cli --features nfs

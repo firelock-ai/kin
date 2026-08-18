@@ -645,8 +645,19 @@ jobs:
           # libc-specific: on Linux it builds against gnu (VFS_TARGET) so it can
           # preload into the host distro's glibc programs. macOS/Windows have no
           # vfs_target, so VFS_TARGET falls back to the core target there.
+          # The mount features are what make the shipped driver able to serve a
+          # projection the operating system mounts, rather than only the
+          # injected shim. macOS gets nfs because it carries an NFS client in
+          # the base system; Linux gets fuse below because it carries libfuse
+          # far more widely than a configured NFS client. Neither flag moves the
+          # glibc floor or adds a runtime dependency: building the same tree
+          # with and without them yields an identical shared-library set and an
+          # identical set of referenced GLIBC symbol versions, and fuser links
+          # no library because it mounts through the fusermount3 helper.
+          # --locked still holds: nfsserve and fuser are already in kin-vfs's
+          # tracked lock at the pinned ref.
           if [ "$RUNNER_OS" != "Linux" ]; then
-            cargo build --locked --release --target "$VFS_TARGET" -p kin-vfs-cli
+            cargo build --locked --release --target "$VFS_TARGET" -p kin-vfs-cli --features nfs
             cargo build --locked --release --target "$VFS_TARGET" -p kin-vfs-shim
             exit 0
           fi
@@ -665,7 +676,7 @@ jobs:
           upper="$(printf '%s' "$scoped" | tr '[:lower:]' '[:upper:]')"
           export "CFLAGS_${scoped}=-I/usr/include/${multiarch}"
           export "CARGO_TARGET_${upper}_RUSTFLAGS=-L native=/usr/lib/${multiarch}"
-          cargo zigbuild --locked --release --target "${VFS_TARGET}.${floor}" -p kin-vfs-cli
+          cargo zigbuild --locked --release --target "${VFS_TARGET}.${floor}" -p kin-vfs-cli --features fuse
           cargo zigbuild --locked --release --target "${VFS_TARGET}.${floor}" -p kin-vfs-shim
         env:
           VFS_TARGET: ${{ matrix.vfs_target || matrix.target }}
