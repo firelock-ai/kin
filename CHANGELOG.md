@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Prove each configured MCP client with a real tool call before setup claims it works (#928)
 - Choose, probe and report the filesystem projection across shim, NFS and FUSE (#930)
 - Make every dead-code surface answer one question and say what it did not check (#924)
+- Give the MCP belt a call that admits new source into the graph (#931)
 
 
 ## [0.5.40] - 2026-08-18
