@@ -593,17 +593,80 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
 
+      # kin and kin-daemon are static musl and carry no glibc floor at all. The
+      # VFS pair is the only glibc-linked thing Kin publishes for Linux, and
+      # until now its floor was a property of the runner image: Rust std
+      # references pidfd_spawnp and pidfd_getpid as weak undefined symbols, the
+      # linker binds them to whatever libc the build host exports, and the
+      # ubuntu-24.04 images export them at GLIBC_2.39. v0.5.38 shipped a
+      # linux-aarch64 kin-vfs the Debian 12 loader refused outright for exactly
+      # that reason. Zig ships glibc headers for every version, so building
+      # through it pins the floor to a number under review here rather than to
+      # whichever image the runner label resolves to this month.
+      - name: Install the pinned glibc floor toolchain (Linux)
+        if: ${{ runner.os == 'Linux' && !matrix.cross && !matrix.skip_vfs }}
+        shell: bash
+        env:
+          ZIG_VERSION: "0.13.0"
+          CARGO_ZIGBUILD_VERSION: "0.19.8"
+          # Published by ziglang.org/download/index.json for these exact
+          # tarballs. A release input must be immutable, so the download is
+          # checked rather than trusted.
+          ZIG_SHA256_X86_64: d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea
+          ZIG_SHA256_AARCH64: 041ac42323837eb5624068acd8b00cd5777dac4cf91179e8dad7a7e90dd0c556
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64) zig_arch=x86_64; zig_sha="$ZIG_SHA256_X86_64" ;;
+            aarch64) zig_arch=aarch64; zig_sha="$ZIG_SHA256_AARCH64" ;;
+            *)
+              echo "::error::no pinned zig tarball for Linux $(uname -m); the release cannot pin its glibc floor on this host"
+              exit 1
+              ;;
+          esac
+          tarball="$RUNNER_TEMP/zig-${ZIG_VERSION}.tar.xz"
+          curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused \
+            --location --silent --show-error --fail \
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-${zig_arch}-${ZIG_VERSION}.tar.xz" \
+            --output "$tarball"
+          echo "${zig_sha}  ${tarball}" | sha256sum --check --strict -
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$tarball" -C "$RUNNER_TEMP/zig" --strip-components=1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+          cargo install cargo-zigbuild --locked --version "$CARGO_ZIGBUILD_VERSION"
+
       - name: Build kin-vfs (native)
         if: ${{ !matrix.cross && !matrix.skip_vfs }}
         working-directory: kin-vfs
         shell: bash
         run: |
+          set -euo pipefail
           # The VFS shim is an LD_PRELOAD libc interceptor and is therefore
           # libc-specific: on Linux it builds against gnu (VFS_TARGET) so it can
           # preload into the host distro's glibc programs. macOS/Windows have no
           # vfs_target, so VFS_TARGET falls back to the core target there.
-          cargo build --locked --release --target "$VFS_TARGET" -p kin-vfs-cli
-          cargo build --locked --release --target "$VFS_TARGET" -p kin-vfs-shim
+          if [ "$RUNNER_OS" != "Linux" ]; then
+            cargo build --locked --release --target "$VFS_TARGET" -p kin-vfs-cli
+            cargo build --locked --release --target "$VFS_TARGET" -p kin-vfs-shim
+            exit 0
+          fi
+          # The floor is read out of the guard rather than written here as
+          # well. A build targeting one floor while the guard enforces another
+          # is worse than no guard, and the two drifting apart is exactly the
+          # shape that survives review.
+          floor="$(node "$GITHUB_WORKSPACE/scripts/check-glibc-floor.mjs" --print-floor)"
+          # zig cc does not search Debian/Ubuntu multiarch directories, and the
+          # OpenSSL that kin-vfs-daemon links through reqwest lives in them:
+          # the headers under /usr/include/<multiarch> and the link libraries
+          # under /usr/lib/<multiarch>. Both Linux legs build natively, so the
+          # multiarch triple is the VFS target's architecture.
+          multiarch="${VFS_TARGET%%-*}-linux-gnu"
+          scoped="$(printf '%s' "$VFS_TARGET" | tr - _)"
+          upper="$(printf '%s' "$scoped" | tr '[:lower:]' '[:upper:]')"
+          export "CFLAGS_${scoped}=-I/usr/include/${multiarch}"
+          export "CARGO_TARGET_${upper}_RUSTFLAGS=-L native=/usr/lib/${multiarch}"
+          cargo zigbuild --locked --release --target "${VFS_TARGET}.${floor}" -p kin-vfs-cli
+          cargo zigbuild --locked --release --target "${VFS_TARGET}.${floor}" -p kin-vfs-shim
         env:
           VFS_TARGET: ${{ matrix.vfs_target || matrix.target }}
 
@@ -913,6 +976,21 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
           VFS_TARGET: ${{ matrix.vfs_target || matrix.target }}
+          ARTIFACT: ${{ matrix.artifact }}
+          SHIM_NAME: ${{ matrix.shim_name }}
+
+      # Read the floor back off the bytes that were just packaged. The build
+      # above pins it, and a pin goes quiet the day it stops taking effect,
+      # which is how v0.5.38 published a kin-vfs that no Debian 12 could start
+      # while every check in this workflow stayed green. This step is the half
+      # that cannot pass by accident: it names the highest GLIBC requirement in
+      # each shipped dynamic binary and the symbols that set it, and refuses the
+      # release above the floor.
+      - name: Verify the packaged Linux binaries meet the published glibc floor
+        if: ${{ runner.os == 'Linux' && !matrix.skip_vfs }}
+        shell: bash
+        run: node scripts/check-glibc-floor.mjs "$ARTIFACT/kin-vfs" "$ARTIFACT/$SHIM_NAME"
+        env:
           ARTIFACT: ${{ matrix.artifact }}
           SHIM_NAME: ${{ matrix.shim_name }}
 
