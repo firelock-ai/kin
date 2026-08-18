@@ -18,7 +18,8 @@ repository, and walks the everyday loop end to end. Once Kin is running, the
 5. **[`kin agent`](cli-reference.md#kin-agent)** is Kin's own agent and the path
    we recommend for agent work. It drives any OpenAI-compatible endpoint, local
    or hosted, answers only from the graph, and records every run as a transcript
-   plus a Kin trace.
+   plus a Kin trace. It reads and modifies entities the graph already knows; getting a
+   brand new file into graph truth is FIR-2417 and not yet possible.
 
 ## Reference
 

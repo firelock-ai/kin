@@ -19,7 +19,7 @@ pub struct RunArgs {
     pub base_url: String,
     pub api_key_env: Option<String>,
     pub repo: Option<PathBuf>,
-    pub mcp_command: Option<String>,
+    pub mcp_command: Vec<String>,
     pub out: Option<PathBuf>,
     pub max_tool_calls: Option<u32>,
     pub deadline: Option<u64>,
@@ -64,11 +64,7 @@ pub fn run(args: RunArgs) -> Result<i32> {
         request_timeout: Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_S),
     };
 
-    let mcp_command = resolve_mcp_command(
-        args.mcp_command.as_deref(),
-        &repo,
-        args.tool_profile.as_deref(),
-    );
+    let mcp_commands = resolve_mcp_commands(&args.mcp_command, &repo, args.tool_profile.as_deref());
 
     let config = AgentConfig {
         task,
@@ -76,7 +72,7 @@ pub fn run(args: RunArgs) -> Result<i32> {
         repo: repo.clone(),
         out_dir: out.clone(),
         provider,
-        mcp_command,
+        mcp_commands,
         mcp_timeout: Duration::from_secs(DEFAULT_MCP_TIMEOUT_S),
         max_tool_calls: args.max_tool_calls.unwrap_or(DEFAULT_MAX_TOOL_CALLS),
         deadline: Duration::from_secs(args.deadline.unwrap_or(DEFAULT_DEADLINE_S)),
@@ -116,7 +112,7 @@ pub fn doctor(
     base_url: String,
     model: Option<String>,
     repo: Option<PathBuf>,
-    mcp_command: Option<String>,
+    mcp_command: Vec<String>,
     api_key_env: Option<String>,
     tool_profile: Option<String>,
 ) -> Result<i32> {
@@ -159,30 +155,31 @@ pub fn doctor(
             }
         };
 
-    let command = resolve_mcp_command(mcp_command.as_deref(), &repo, tool_profile.as_deref());
-    println!("mcp: {}", command.join(" "));
-    let mcp_ok = match kin_agent::run::probe_mcp(
-        &command,
-        &repo,
-        Duration::from_secs(DEFAULT_MCP_TIMEOUT_S),
-    ) {
-        Ok(tools) => {
-            let exposed = tools
-                .iter()
-                .filter(|name| !kin_agent::belt::is_harness_owned(name))
-                .count();
-            println!(
-                "  initialize and tools/list answered: {} tool(s), {} exposed to the model",
-                tools.len(),
-                exposed
-            );
-            true
+    let commands = resolve_mcp_commands(&mcp_command, &repo, tool_profile.as_deref());
+    let mut mcp_ok = true;
+    for command in &commands {
+        println!("mcp: {}", command.join(" "));
+        match kin_agent::run::probe_mcp(command, &repo, Duration::from_secs(DEFAULT_MCP_TIMEOUT_S))
+        {
+            Ok(tools) => {
+                let exposed = tools
+                    .iter()
+                    .filter(|name| !kin_agent::belt::is_harness_owned(name))
+                    .count();
+                println!(
+                    "  initialize and tools/list answered: {} tool(s), {} exposed to the model",
+                    tools.len(),
+                    exposed
+                );
+            }
+            Err(err) => {
+                println!("  FAILED: {err}");
+                // Every named server must answer. A partial belt is worse than none,
+                // because the model cannot tell it apart from a complete one.
+                mcp_ok = false;
+            }
         }
-        Err(err) => {
-            println!("  FAILED: {err}");
-            false
-        }
-    };
+    }
 
     if !provider_ok {
         return Ok(ExitStatus::EndpointError.code());
@@ -206,18 +203,33 @@ fn read_task(value: &str) -> Result<String> {
     Ok(value.to_string())
 }
 
-/// The MCP command: an override split on whitespace, or this binary serving the repo.
-fn resolve_mcp_command(
-    override_command: Option<&str>,
+/// The MCP commands: one per `--mcp-command`, each split on whitespace, or a single
+/// default of this binary serving `--repo`.
+///
+/// `--mcp-command` is repeatable so one run can hold several repositories' servers, which
+/// a task spanning a repository set needs. Each entry becomes its own named server and its
+/// tools stay distinguishable in the transcript.
+fn resolve_mcp_commands(
+    overrides: &[String],
     repo: &Path,
     tool_profile: Option<&str>,
-) -> Vec<String> {
-    if let Some(raw) = override_command {
-        let parts: Vec<String> = raw.split_whitespace().map(ToString::to_string).collect();
-        if !parts.is_empty() {
-            return parts;
-        }
+) -> Vec<Vec<String>> {
+    let explicit: Vec<Vec<String>> = overrides
+        .iter()
+        .map(|raw| {
+            raw.split_whitespace()
+                .map(ToString::to_string)
+                .collect::<Vec<String>>()
+        })
+        .filter(|parts| !parts.is_empty())
+        .collect();
+    if !explicit.is_empty() {
+        return explicit;
     }
+    vec![default_mcp_command(repo, tool_profile)]
+}
+
+fn default_mcp_command(repo: &Path, tool_profile: Option<&str>) -> Vec<String> {
     // Prefer this exact binary over whatever `kin` resolves to on PATH, so a run cannot
     // silently drive a different build than the one the operator launched.
     let program = std::env::current_exe()

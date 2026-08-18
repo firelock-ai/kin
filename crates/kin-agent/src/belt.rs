@@ -19,14 +19,37 @@ pub const WRITE_FILE: &str = "write_file";
 
 /// Prefix that marks a Kin tool in the model's belt and in the transcript. `usage.py`
 /// classifies `mcp__<server>__<tool>` as an MCP call, so this is what makes a Kin call
-/// countable by the analyzers the fleet already runs.
+/// countable by the analyzers the fleet already runs. A single-server run keeps the plain
+/// `mcp__kin__` names the contract documents.
 pub const KIN_TOOL_PREFIX: &str = "mcp__kin__";
+
+/// The default server name, and the only one a single-server run uses.
+pub const DEFAULT_SERVER: &str = "kin";
+
+/// The transcript name for a tool on a named server.
+pub fn qualified_tool_name(server: &str, tool: &str) -> String {
+    format!("mcp__{server}__{tool}")
+}
+
+/// Split `mcp__<server>__<tool>` into its two halves. The split is on the first `__` after
+/// the prefix, so a tool name carrying underscores stays intact and a server name never
+/// swallows one.
+pub fn split_qualified(name: &str) -> Option<(&str, &str)> {
+    let rest = name.strip_prefix("mcp__")?;
+    let sep = rest.find("__")?;
+    let server = &rest[..sep];
+    let tool = &rest[sep + 2..];
+    if server.is_empty() || tool.is_empty() {
+        return None;
+    }
+    Some((server, tool))
+}
 
 /// Where a routed call goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Route {
-    /// A Kin tool, named without the transcript prefix.
-    Kin(String),
+    /// A Kin tool: which server serves it, and its bare name there.
+    Kin { server: String, tool: String },
     /// One of the two local tools.
     Local(LocalTool),
     /// Not in the belt. Carries the refusal the model is told.
@@ -42,16 +65,17 @@ pub enum LocalTool {
 /// The belt: every name the model may call this run.
 #[derive(Debug, Clone)]
 pub struct Belt {
-    kin_tools: Vec<(String, Value)>,
+    /// (server, bare tool name, input schema), in the order the servers were given.
+    kin_tools: Vec<(String, String, Value)>,
     names: BTreeSet<String>,
 }
 
 impl Belt {
-    /// Build the belt from what the MCP server declared, plus the two local tools.
-    pub fn new(kin_tools: Vec<(String, Value)>) -> Self {
+    /// Build the belt from what every MCP server declared, plus the two local tools.
+    pub fn new(kin_tools: Vec<(String, String, Value)>) -> Self {
         let mut names: BTreeSet<String> = kin_tools
             .iter()
-            .map(|(name, _)| format!("{KIN_TOOL_PREFIX}{name}"))
+            .map(|(server, tool, _)| qualified_tool_name(server, tool))
             .collect();
         names.insert(EDIT_FILE.to_string());
         names.insert(WRITE_FILE.to_string());
@@ -65,12 +89,12 @@ impl Belt {
 
     /// The schema a named tool declares, for argument validation.
     pub fn schema_for(&self, name: &str) -> Option<Value> {
-        if let Some(bare) = name.strip_prefix(KIN_TOOL_PREFIX) {
+        if let Some((server, bare)) = split_qualified(name) {
             return self
                 .kin_tools
                 .iter()
-                .find(|(tool, _)| tool == bare)
-                .map(|(_, schema)| schema.clone());
+                .find(|(srv, tool, _)| srv == server && tool == bare)
+                .map(|(_, _, schema)| schema.clone());
         }
         match name {
             EDIT_FILE => Some(edit_file_schema()),
@@ -81,9 +105,16 @@ impl Belt {
 
     /// Route a name the model produced.
     pub fn route(&self, name: &str) -> Route {
-        if let Some(bare) = name.strip_prefix(KIN_TOOL_PREFIX) {
-            if self.kin_tools.iter().any(|(tool, _)| tool == bare) {
-                return Route::Kin(bare.to_string());
+        if let Some((server, bare)) = split_qualified(name) {
+            if self
+                .kin_tools
+                .iter()
+                .any(|(srv, tool, _)| srv == server && tool == bare)
+            {
+                return Route::Kin {
+                    server: server.to_string(),
+                    tool: bare.to_string(),
+                };
             }
         }
         match name {
@@ -93,9 +124,10 @@ impl Belt {
         }
         // A bare Kin tool name is a near miss worth naming precisely, because the model
         // very likely meant the prefixed one and a generic refusal would not say so.
-        if self.kin_tools.iter().any(|(tool, _)| tool == name) {
+        if let Some((server, _, _)) = self.kin_tools.iter().find(|(_, tool, _)| tool == name) {
+            let qualified = qualified_tool_name(server, name);
             return Route::Refused(format!(
-                "There is no tool named `{name}`. The Kin tool is called `{KIN_TOOL_PREFIX}{name}`. \
+                "There is no tool named `{name}`. The Kin tool is called `{qualified}`. \
                  Call it by that exact name."
             ));
         }
@@ -108,18 +140,18 @@ impl Belt {
     }
 
     /// The `tools` array sent to the chat endpoint.
-    pub fn to_specs(&self, descriptions: &[(String, String)]) -> Vec<Value> {
+    pub fn to_specs(&self, descriptions: &[(String, String, String)]) -> Vec<Value> {
         let mut specs = Vec::new();
-        for (name, schema) in &self.kin_tools {
+        for (server, name, schema) in &self.kin_tools {
             let description = descriptions
                 .iter()
-                .find(|(tool, _)| tool == name)
-                .map(|(_, text)| text.clone())
+                .find(|(srv, tool, _)| srv == server && tool == name)
+                .map(|(_, _, text)| text.clone())
                 .unwrap_or_default();
             specs.push(json!({
                 "type": "function",
                 "function": {
-                    "name": format!("{KIN_TOOL_PREFIX}{name}"),
+                    "name": qualified_tool_name(server, name),
                     "description": description,
                     "parameters": schema,
                 }

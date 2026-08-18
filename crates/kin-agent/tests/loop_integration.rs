@@ -228,7 +228,7 @@ fn config(repo: &Path, out: &Path, base_url: &str, mcp_command: Vec<String>) -> 
             temperature: None,
             request_timeout: Duration::from_secs(20),
         },
-        mcp_command,
+        mcp_commands: vec![mcp_command],
         mcp_timeout: Duration::from_secs(60),
         max_tool_calls: 10,
         deadline: Duration::from_secs(120),

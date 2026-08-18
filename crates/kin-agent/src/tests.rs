@@ -202,6 +202,7 @@ fn well_formed_arguments_are_not_reported_as_malformed() {
 
 fn test_belt() -> Belt {
     Belt::new(vec![(
+        "kin".to_string(),
         "semantic_locate".to_string(),
         json!({
             "type": "object",
@@ -243,7 +244,10 @@ fn the_router_routes_what_is_on_the_belt() {
     let belt = test_belt();
     assert_eq!(
         belt.route("mcp__kin__semantic_locate"),
-        Route::Kin("semantic_locate".into())
+        Route::Kin {
+            server: "kin".into(),
+            tool: "semantic_locate".into()
+        }
     );
     assert_eq!(belt.route("edit_file"), Route::Local(LocalTool::Edit));
     assert_eq!(belt.route("write_file"), Route::Local(LocalTool::Write));
@@ -515,4 +519,74 @@ fn a_named_api_key_variable_that_is_unset_fails_loudly() {
     // Silently sending no key would surface later as a 401 that reads like a bad model id.
     assert!(ProviderConfig::api_key_from_env(Some("KIN_AGENT_KEY_THAT_IS_NOT_SET")).is_err());
     assert_eq!(ProviderConfig::api_key_from_env(None).unwrap(), None);
+}
+
+#[test]
+fn a_qualified_tool_name_splits_back_into_its_halves() {
+    assert_eq!(
+        belt::split_qualified("mcp__kin__semantic_locate"),
+        Some(("kin", "semantic_locate"))
+    );
+    // A tool name carrying underscores survives, because the split is on the FIRST `__`
+    // after the prefix rather than the last.
+    assert_eq!(
+        belt::split_qualified("mcp__nk-agent__kin_transaction_stage"),
+        Some(("nk-agent", "kin_transaction_stage"))
+    );
+    // Controls: nothing that is not a qualified name splits.
+    assert_eq!(belt::split_qualified("edit_file"), None);
+    assert_eq!(belt::split_qualified("mcp__kin"), None);
+    assert_eq!(belt::split_qualified("mcp____tool"), None);
+}
+
+#[test]
+fn two_servers_keep_their_tools_distinguishable() {
+    let belt = Belt::new(vec![
+        (
+            "green".to_string(),
+            "semantic_locate".to_string(),
+            json!({ "type": "object" }),
+        ),
+        (
+            "brown".to_string(),
+            "semantic_locate".to_string(),
+            json!({ "type": "object" }),
+        ),
+    ]);
+    // Same tool on two servers is two callable names, and each routes to its own server.
+    assert_eq!(
+        belt.route("mcp__green__semantic_locate"),
+        Route::Kin {
+            server: "green".into(),
+            tool: "semantic_locate".into()
+        }
+    );
+    assert_eq!(
+        belt.route("mcp__brown__semantic_locate"),
+        Route::Kin {
+            server: "brown".into(),
+            tool: "semantic_locate".into()
+        }
+    );
+    // A server nobody attached is refused, not silently routed to the other one.
+    assert!(matches!(
+        belt.route("mcp__other__semantic_locate"),
+        Route::Refused(_)
+    ));
+    // The belt the MODEL sees must carry both names too, not just the router. These are
+    // separate structures and a break in one would otherwise pass on the other's evidence.
+    let names: Vec<&str> = belt.names().iter().map(String::as_str).collect();
+    assert!(
+        names.contains(&"mcp__green__semantic_locate"),
+        "the green server's tool must be offered: {names:?}"
+    );
+    assert!(
+        names.contains(&"mcp__brown__semantic_locate"),
+        "the brown server's tool must be offered: {names:?}"
+    );
+    assert_eq!(
+        names.iter().filter(|n| n.starts_with("mcp__")).count(),
+        2,
+        "two servers means two distinct Kin tool names: {names:?}"
+    );
 }

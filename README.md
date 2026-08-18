@@ -293,6 +293,12 @@ kin agent run --task "Find where the retry backoff is computed and document it" 
   --model qwen/qwen3.6-35b-a3b --base-url http://localhost:1234/v1
 ```
 
+What it does today is navigate, read and modify code the graph already knows. It
+cannot introduce a new file yet: no call turns freshly written source into graph
+truth, so a new file stays outside the graph and outside `kin log`. That gap is
+tracked as FIR-2417, and until it lands, treat `kin agent` as a reader and editor of
+existing entities rather than a way to build new code.
+
 What makes it different from pointing another agent at the MCP server is that the
 rule is enforced inside the agent rather than borrowed from a vendor's permission
 layer. It has Kin's tools plus exactly two local ones, `edit_file` and

@@ -75,7 +75,9 @@ pub struct AgentConfig {
     pub repo: PathBuf,
     pub out_dir: PathBuf,
     pub provider: ProviderConfig,
-    pub mcp_command: Vec<String>,
+    /// One argv per MCP server. A run may hold several, which is what lets one task cover
+    /// a repository set rather than a single repository.
+    pub mcp_commands: Vec<Vec<String>>,
     pub mcp_timeout: Duration,
     pub max_tool_calls: u32,
     pub deadline: Duration,

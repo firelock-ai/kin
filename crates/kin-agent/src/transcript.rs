@@ -77,6 +77,33 @@ impl TranscriptWriter {
         }))
     }
 
+    /// The init record for a run with one or more attached servers, each named.
+    pub fn init_servers(
+        &mut self,
+        model: &str,
+        cwd: &Path,
+        tools: &[String],
+        servers: &[String],
+        mcp_errors: &[String],
+        agent_meta: Value,
+    ) -> std::io::Result<()> {
+        let entries: Vec<Value> = servers
+            .iter()
+            .map(|name| json!({ "name": name, "status": "connected" }))
+            .collect();
+        self.write_stream(json!({
+            "type": "system",
+            "subtype": "init",
+            "model": model,
+            "cwd": cwd.display().to_string(),
+            "permissionMode": "kin-agent",
+            "tools": tools,
+            "mcp_servers": entries,
+            "mcp_server_errors": mcp_errors,
+            "kin_agent": agent_meta,
+        }))
+    }
+
     /// One model turn: its prose and the tool calls it asked for.
     pub fn assistant(
         &mut self,

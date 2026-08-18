@@ -1754,9 +1754,10 @@ enum AgentAction {
         /// Repository to work in (default: the current directory)
         #[arg(long, value_name = "PATH")]
         repo: Option<PathBuf>,
-        /// Override the MCP server command (default: this binary serving --repo)
+        /// Override the MCP server command (default: this binary serving --repo).
+        /// Repeatable: pass it once per repository so one run can hold several servers.
         #[arg(long = "mcp-command", value_name = "CMD")]
-        mcp_command: Option<String>,
+        mcp_command: Vec<String>,
         /// Directory for the transcript, the Kin trace and the result record
         #[arg(long, value_name = "DIR")]
         out: Option<PathBuf>,
@@ -1787,9 +1788,9 @@ enum AgentAction {
         /// Repository to serve (default: the current directory)
         #[arg(long, value_name = "PATH")]
         repo: Option<PathBuf>,
-        /// Override the MCP server command
+        /// Override the MCP server command. Repeatable, once per repository.
         #[arg(long = "mcp-command", value_name = "CMD")]
-        mcp_command: Option<String>,
+        mcp_command: Vec<String>,
         /// Name of an environment variable holding the API key
         #[arg(long = "api-key-env", value_name = "NAME")]
         api_key_env: Option<String>,

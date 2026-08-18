@@ -1147,6 +1147,14 @@ told the answer is unknown and given the named gap rather than being allowed to 
 the thing does not exist. Every edit runs inside a Kin transaction under a Kin session,
 so the change carries provenance naming the agent.
 
+What it can do today is bounded, and worth stating rather than discovering. It
+navigates, reads and modifies entities the graph already knows. It cannot introduce a
+new file: nothing in the belt turns freshly written source into graph truth, so a new
+file stays outside the graph and never reaches `kin log`, even when the bytes land on
+disk. That is FIR-2417. Until it lands, `kin agent` is a reader and editor of existing
+code rather than a way to build new code, and `write_file` is for a file that does not
+need to become an entity.
+
 Working with Claude Code, Codex, Cursor and Gemini stays first class; `kin setup
 --intent agent` still configures every client it detects.
 

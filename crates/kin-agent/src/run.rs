@@ -43,6 +43,73 @@ naming this agent.
 Work in small steps. Call one or two tools, read what came back, then decide. When you have \
 the answer, say it in plain text without calling a tool.";
 
+/// One attached MCP server, its declared tools, and the session the harness opened on it.
+struct Server {
+    name: String,
+    client: McpClient,
+    tools: Vec<crate::mcp::McpTool>,
+    tool_names: Vec<String>,
+    session: Option<String>,
+}
+
+impl Server {
+    fn has(&self, tool: &str) -> bool {
+        self.tool_names.iter().any(|name| name == tool)
+    }
+}
+
+/// Derive one distinguishable name per MCP command.
+///
+/// A single server keeps the plain `kin` name the contract documents, so a one-repo run's
+/// transcript is byte-identical to before. With several, the name comes from the `--repo`
+/// argument's last path component when there is one, because that is what a reader of the
+/// transcript actually wants to tell apart, and falls back to a position. Collisions get a
+/// numeric suffix rather than silently merging two repositories' tools under one name.
+fn server_names(commands: &[Vec<String>]) -> Vec<String> {
+    if commands.len() == 1 {
+        return vec![belt::DEFAULT_SERVER.to_string()];
+    }
+    let mut names: Vec<String> = Vec::new();
+    for (index, argv) in commands.iter().enumerate() {
+        let derived = argv
+            .iter()
+            .position(|arg| arg == "--repo")
+            .and_then(|at| argv.get(at + 1))
+            .and_then(|path| {
+                std::path::Path::new(path)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+            })
+            .map(|name| sanitize_server_name(&name))
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| format!("kin{}", index + 1));
+        let mut candidate = derived.clone();
+        let mut suffix = 2;
+        while names.contains(&candidate) {
+            candidate = format!("{derived}{suffix}");
+            suffix += 1;
+        }
+        names.push(candidate);
+    }
+    names
+}
+
+/// A server name has to survive being embedded in `mcp__<server>__<tool>`, so it may not
+/// carry the separator or anything that would make the split ambiguous.
+fn sanitize_server_name(raw: &str) -> String {
+    raw.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
+}
+
 struct Counters {
     tool_calls: u32,
     kin_calls: u32,
@@ -116,9 +183,95 @@ impl Counters {
 }
 
 /// Run one task to completion.
+///
+/// A panic anywhere in the loop still closes the transcript. The contract promises a
+/// terminal `result` record on every exit, and a run whose transcript stops after the init
+/// record is unmeasurable in exactly the way that matters: it looks like a run that never
+/// started rather than one that died. That case has already been hit for real.
 pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
     let started = Instant::now();
     let session_id = uuid::Uuid::new_v4().to_string();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_inner(&config, &session_id, started)
+    }));
+    match outcome {
+        Ok(result) => result,
+        Err(payload) => {
+            // The writer went down with the unwind, so the record is appended directly.
+            // The default panic hook has already printed the panic to stderr; this is
+            // about leaving the transcript measurable, not about hiding the failure.
+            seal_panicked_run(&config, &session_id, started, &panic_message(&payload))
+        }
+    }
+}
+
+/// Read whatever a panic payload actually carried, rather than defaulting it to a shrug.
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        return (*text).to_string();
+    }
+    if let Some(text) = payload.downcast_ref::<String>() {
+        return text.clone();
+    }
+    "a panic with a payload this harness could not read".to_string()
+}
+
+/// Append the terminal record to a transcript whose writer is gone.
+fn seal_panicked_run(
+    config: &AgentConfig,
+    session_id: &str,
+    started: Instant,
+    message: &str,
+) -> anyhow::Result<RunOutcome> {
+    let transcript_path = config.out_dir.join("transcript.jsonl");
+    let trace_path = config.out_dir.join("kin-trace.jsonl");
+    let record = json!({
+        "type": "result",
+        "subtype": ExitStatus::HarnessError.subtype(),
+        "is_error": true,
+        "num_turns": 0,
+        "duration_ms": started.elapsed().as_millis() as u64,
+        "duration_api_ms": 0,
+        "result": format!("the agent panicked: {message}"),
+        "total_cost_usd": Value::Null,
+        "session_id": session_id,
+        "timestamp": now_iso(),
+        "kin_agent": {
+            "exit_code": ExitStatus::HarnessError.code(),
+            "stop_reason": "panic",
+            "panic": message,
+        },
+    });
+    // Append rather than create: the init record and any turns already written are the
+    // most useful part of a panicked run and must not be truncated away.
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&transcript_path)
+    {
+        use std::io::Write as _;
+        let _ = writeln!(file, "{record}");
+    }
+    let _ = std::fs::write(
+        config.out_dir.join("result.json"),
+        serde_json::to_string_pretty(&record).unwrap_or_default(),
+    );
+    Ok(RunOutcome {
+        status: ExitStatus::HarnessError,
+        final_text: format!("the agent panicked: {message}"),
+        transcript_path,
+        trace_path,
+        result: record,
+    })
+}
+
+fn run_inner(
+    config: &AgentConfig,
+    session_id: &str,
+    started: Instant,
+) -> anyhow::Result<RunOutcome> {
+    let config = config.clone();
+    let session_id = session_id.to_string();
     let mut writer = TranscriptWriter::create(&config.out_dir, &session_id)?;
     let mut counters = Counters::new();
 
@@ -128,83 +281,87 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
         "deadline_s": config.deadline.as_secs(),
         "tool_profile": config.tool_profile.clone().unwrap_or_else(|| "server-default".into()),
         "policy": "no-shell-no-file-search",
-        "mcp_command": config.mcp_command.join(" "),
+        "mcp_commands": config
+            .mcp_commands
+            .iter()
+            .map(|argv| argv.join(" "))
+            .collect::<Vec<_>>(),
     });
 
-    // Connect to Kin first. A run that could not attach must be loud, not quietly scored.
-    let mut mcp = match McpClient::start(&config.mcp_command, &config.repo, config.mcp_timeout) {
-        Ok(client) => client,
-        Err(err) => {
-            let message = err.to_string();
-            writer.init(
-                &config.provider.model,
-                &config.repo,
-                &[],
-                "failed",
-                std::slice::from_ref(&message),
-                agent_meta,
-            )?;
-            return finish(
-                writer,
-                &config,
-                ExitStatus::McpError,
-                "the MCP server did not start",
-                &message,
-                counters,
-                started,
-                None,
-            );
+    // Connect to Kin first. A run that could not attach must be loud, not quietly scored,
+    // so a single failing server fails the run rather than leaving the model a partial
+    // belt it cannot tell apart from a complete one.
+    let names = server_names(&config.mcp_commands);
+    let mut servers: Vec<Server> = Vec::new();
+    let mut mcp_errors: Vec<String> = Vec::new();
+    for (name, argv) in names.iter().zip(config.mcp_commands.iter()) {
+        match McpClient::start(argv, &config.repo, config.mcp_timeout) {
+            Ok(mut client) => match client.list_tools() {
+                Ok(tools) => servers.push(Server {
+                    name: name.clone(),
+                    client,
+                    tool_names: tools.iter().map(|tool| tool.name.clone()).collect(),
+                    tools,
+                    session: None,
+                }),
+                Err(err) => mcp_errors.push(format!("{name}: {err}")),
+            },
+            Err(err) => mcp_errors.push(format!("{name}: {err}")),
         }
-    };
+    }
+    if !mcp_errors.is_empty() {
+        writer.init(
+            &config.provider.model,
+            &config.repo,
+            &[],
+            "failed",
+            &mcp_errors,
+            agent_meta,
+        )?;
+        let message = mcp_errors.join("; ");
+        return finish(
+            writer,
+            &config,
+            ExitStatus::McpError,
+            "an MCP server did not answer",
+            &message,
+            counters,
+            started,
+            None,
+        );
+    }
 
-    let declared = match mcp.list_tools() {
-        Ok(tools) => tools,
-        Err(err) => {
-            let message = err.to_string();
-            writer.init(
-                &config.provider.model,
-                &config.repo,
-                &[],
-                "failed",
-                std::slice::from_ref(&message),
-                agent_meta,
-            )?;
-            return finish(
-                writer,
-                &config,
-                ExitStatus::McpError,
-                "the MCP server did not list its tools",
-                &message,
-                counters,
-                started,
-                None,
-            );
+    let mut belt_entries: Vec<(String, String, Value)> = Vec::new();
+    let mut descriptions: Vec<(String, String, String)> = Vec::new();
+    for server in &servers {
+        for tool in &server.tools {
+            if belt::is_harness_owned(&tool.name) {
+                continue;
+            }
+            belt_entries.push((
+                server.name.clone(),
+                tool.name.clone(),
+                tool.input_schema.clone(),
+            ));
+            descriptions.push((
+                server.name.clone(),
+                tool.name.clone(),
+                tool.description.clone(),
+            ));
         }
-    };
-
-    let server_tool_names: Vec<String> = declared.iter().map(|tool| tool.name.clone()).collect();
-    let exposed: Vec<_> = declared
-        .iter()
-        .filter(|tool| !belt::is_harness_owned(&tool.name))
-        .collect();
-    let belt = Belt::new(
-        exposed
-            .iter()
-            .map(|tool| (tool.name.clone(), tool.input_schema.clone()))
-            .collect(),
-    );
-    let descriptions: Vec<(String, String)> = exposed
-        .iter()
-        .map(|tool| (tool.name.clone(), tool.description.clone()))
-        .collect();
+    }
+    let belt = Belt::new(belt_entries);
     let specs = belt.to_specs(&descriptions);
     let tool_names: Vec<String> = belt.names().iter().cloned().collect();
 
-    writer.init(
+    writer.init_servers(
         &config.provider.model,
         &config.repo,
         &tool_names,
-        "connected",
+        &servers
+            .iter()
+            .map(|server| server.name.clone())
+            .collect::<Vec<_>>(),
         &[],
         agent_meta,
     )?;
@@ -214,7 +371,9 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
     // Open a Kin session so every mutation this run makes names this agent rather than an
     // anonymous file write. A server without the tool is not an error; it just means the
     // provenance bracket is unavailable and the trace says so.
-    let kin_session = start_kin_session(&mut mcp, &config, &server_tool_names, &mut writer)?;
+    for server in servers.iter_mut() {
+        server.session = start_kin_session(server, &config, &mut writer)?;
+    }
 
     let system_prompt = config
         .system_prompt
@@ -390,7 +549,7 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                             }))?;
                             (message, true)
                         }
-                        Route::Kin(name) => {
+                        Route::Kin { server, tool: name } => {
                             match check_arguments(&belt, &call.name, &call.arguments) {
                                 Err(problem) => {
                                     counters.repairs += 1;
@@ -414,7 +573,12 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                                     )
                                 }
                                 Ok(()) => {
-                                    let outcome = mcp.call_tool(&name, &call.arguments);
+                                    let index = servers
+                                        .iter()
+                                        .position(|candidate| candidate.name == server)
+                                        .expect("the router only routes to attached servers");
+                                    let outcome =
+                                        servers[index].client.call_tool(&name, &call.arguments);
                                     match outcome {
                                         Err(err) => {
                                             // The server died or stopped answering. Nothing
@@ -498,9 +662,7 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                                     counters.local_calls += 1;
                                     let started_call = Instant::now();
                                     let bracket = begin_transaction(
-                                        &mut mcp,
-                                        kin_session.as_deref(),
-                                        &server_tool_names,
+                                        &mut servers,
                                         &call.arguments,
                                         &mut writer,
                                     )?;
@@ -513,7 +675,7 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                                         }
                                     };
                                     let provenance = close_transaction(
-                                        &mut mcp,
+                                        &mut servers,
                                         bracket,
                                         !outcome.is_error,
                                         &mut writer,
@@ -561,12 +723,9 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
         }
     }
 
-    end_kin_session(
-        &mut mcp,
-        kin_session.as_deref(),
-        &server_tool_names,
-        &mut writer,
-    )?;
+    for server in servers.iter_mut() {
+        end_kin_session(server, &mut writer)?;
+    }
     finish(
         writer,
         &config,
@@ -693,15 +852,15 @@ fn complete_with_retry(
 }
 
 fn start_kin_session(
-    mcp: &mut McpClient,
+    server: &mut Server,
     config: &AgentConfig,
-    server_tools: &[String],
     writer: &mut TranscriptWriter,
 ) -> anyhow::Result<Option<String>> {
-    if !server_tools.iter().any(|name| name == "kin_session_start") {
+    if !server.has("kin_session_start") {
         writer.trace(json!({
             "surface": "policy",
             "policy": "allowed",
+            "server": server.name,
             "event": "session_unavailable",
             "detail": "the server does not expose kin_session_start; edits will carry no session provenance",
         }))?;
@@ -715,11 +874,12 @@ fn start_kin_session(
         "cwd": config.repo.display().to_string(),
         "capabilities": { "can_read": true, "can_write": true, "can_commit": true },
     });
-    match mcp.call_tool("kin_session_start", &arguments) {
+    match server.client.call_tool("kin_session_start", &arguments) {
         Ok(outcome) => {
             let session = extract_id(&outcome, &["session_id", "id"]);
             writer.trace(json!({
                 "surface": "kin",
+                "server": server.name,
                 "tool": "kin_session_start",
                 "policy": "allowed",
                 "event": "session_start",
@@ -732,6 +892,7 @@ fn start_kin_session(
         Err(err) => {
             writer.trace(json!({
                 "surface": "kin",
+                "server": server.name,
                 "tool": "kin_session_start",
                 "policy": "allowed",
                 "event": "session_start",
@@ -743,21 +904,19 @@ fn start_kin_session(
     }
 }
 
-fn end_kin_session(
-    mcp: &mut McpClient,
-    session: Option<&str>,
-    server_tools: &[String],
-    writer: &mut TranscriptWriter,
-) -> anyhow::Result<()> {
-    let Some(session) = session else {
+fn end_kin_session(server: &mut Server, writer: &mut TranscriptWriter) -> anyhow::Result<()> {
+    let Some(session) = server.session.clone() else {
         return Ok(());
     };
-    if !server_tools.iter().any(|name| name == "kin_session_end") {
+    if !server.has("kin_session_end") {
         return Ok(());
     }
-    let outcome = mcp.call_tool("kin_session_end", &json!({ "session_id": session }));
+    let outcome = server
+        .client
+        .call_tool("kin_session_end", &json!({ "session_id": session }));
     writer.trace(json!({
         "surface": "kin",
+        "server": server.name,
         "tool": "kin_session_end",
         "policy": "allowed",
         "event": "session_end",
@@ -771,36 +930,42 @@ fn end_kin_session(
 struct Bracket {
     transaction_id: Option<String>,
     reason: Option<String>,
+    /// Index into `servers` of the server the transaction was opened on.
+    server: Option<usize>,
 }
 
 fn begin_transaction(
-    mcp: &mut McpClient,
-    session: Option<&str>,
-    server_tools: &[String],
+    servers: &mut [Server],
     arguments: &Value,
     writer: &mut TranscriptWriter,
 ) -> anyhow::Result<Bracket> {
-    let Some(session) = session else {
+    // The first server that has both an open session and the transaction tools owns the
+    // bracket. With one server that is the only server. With several this is a real limit
+    // worth naming rather than hiding: the edit's provenance lands on one repository's
+    // graph, not on whichever repository the edited path actually belongs to.
+    let Some(index) = servers
+        .iter()
+        .position(|server| server.session.is_some() && server.has("kin_transaction_begin"))
+    else {
         return Ok(Bracket {
             transaction_id: None,
-            reason: Some("no Kin session was open".into()),
+            reason: Some(
+                "no attached server offered both a session and kin_transaction_begin".into(),
+            ),
+            server: None,
         });
     };
-    if !server_tools
-        .iter()
-        .any(|name| name == "kin_transaction_begin")
-    {
-        return Ok(Bracket {
-            transaction_id: None,
-            reason: Some("the server does not expose kin_transaction_begin".into()),
-        });
-    }
+    let session = servers[index]
+        .session
+        .clone()
+        .expect("the position check required a session");
     let scope = arguments
         .get("path")
         .and_then(Value::as_str)
         .unwrap_or("repository")
         .to_string();
-    match mcp.call_tool(
+    let server_name = servers[index].name.clone();
+    match servers[index].client.call_tool(
         "kin_transaction_begin",
         &json!({ "session_id": session, "scope": scope }),
     ) {
@@ -808,6 +973,7 @@ fn begin_transaction(
             let transaction_id = extract_id(&outcome, &["transaction_id", "id"]);
             writer.trace(json!({
                 "surface": "kin",
+                "server": server_name,
                 "tool": "kin_transaction_begin",
                 "policy": "allowed",
                 "event": "transaction_begin",
@@ -821,11 +987,13 @@ fn begin_transaction(
                     .is_none()
                     .then(|| "the server returned no transaction id".to_string()),
                 transaction_id,
+                server: Some(index),
             })
         }
         Ok(outcome) => {
             writer.trace(json!({
                 "surface": "kin",
+                "server": server_name,
                 "tool": "kin_transaction_begin",
                 "policy": "allowed",
                 "event": "transaction_begin",
@@ -836,11 +1004,13 @@ fn begin_transaction(
             Ok(Bracket {
                 transaction_id: None,
                 reason: Some(truncate(&outcome.text, 200)),
+                server: None,
             })
         }
         Err(err) => Ok(Bracket {
             transaction_id: None,
             reason: Some(err.to_string()),
+            server: None,
         }),
     }
 }
@@ -848,12 +1018,12 @@ fn begin_transaction(
 /// Close the bracket. The recorded provenance says what actually happened, including a
 /// refusal, so a run never claims a provenance it did not get.
 fn close_transaction(
-    mcp: &mut McpClient,
+    servers: &mut [Server],
     bracket: Bracket,
     succeeded: bool,
     writer: &mut TranscriptWriter,
 ) -> anyhow::Result<Value> {
-    let Some(transaction_id) = bracket.transaction_id else {
+    let (Some(transaction_id), Some(index)) = (bracket.transaction_id, bracket.server) else {
         return Ok(json!({
             "bracketed": false,
             "reason": bracket.reason,
@@ -864,13 +1034,17 @@ fn close_transaction(
     } else {
         "kin_transaction_abort"
     };
-    let outcome = mcp.call_tool(tool, &json!({ "transaction_id": transaction_id }));
+    let server_name = servers[index].name.clone();
+    let outcome = servers[index]
+        .client
+        .call_tool(tool, &json!({ "transaction_id": transaction_id }));
     let (is_error, detail) = match &outcome {
         Ok(outcome) => (outcome.is_error, truncate(&outcome.text, 300)),
         Err(err) => (true, err.to_string()),
     };
     writer.trace(json!({
         "surface": "kin",
+        "server": server_name,
         "tool": tool,
         "policy": "allowed",
         "event": if succeeded { "transaction_commit" } else { "transaction_abort" },
@@ -880,6 +1054,7 @@ fn close_transaction(
     }))?;
     Ok(json!({
         "bracketed": true,
+        "server": server_name,
         "transaction_id": transaction_id,
         "closed_with": tool,
         "closed_cleanly": !is_error,
