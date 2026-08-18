@@ -228,7 +228,7 @@ async fn dropping_a_direct_daemon_child_terminates_its_containment() {
         let child = spawn_daemon_test_command(command, "direct contained child")
             .expect("spawn direct contained child");
         let pid = child.id().expect("spawned contained child pid");
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + READINESS_TIMEOUT;
         while !marker.is_file() && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -290,11 +290,18 @@ async fn dropping_containment_terminates_a_late_descendant() {
         .env(CONTAINMENT_TREE_PARENT, &descendant_marker)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let child = spawn_daemon_test_command(command, "direct-containment tree")
+    let mut child = spawn_daemon_test_command(command, "direct-containment tree")
         .expect("spawn direct-containment tree");
     let parent_pid = child.id().expect("contained parent pid");
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + READINESS_TIMEOUT;
     while !descendant_marker.is_file() && Instant::now() < deadline {
+        assert!(
+            child
+                .try_wait()
+                .expect("poll direct-containment tree")
+                .is_none(),
+            "direct-containment tree exited before descendant readiness"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(
@@ -345,7 +352,7 @@ async fn explicit_cleanup_proves_quiescence_before_releasing_containment() {
     let mut child = spawn_daemon_test_command(command, "explicit-cleanup tree")
         .expect("spawn explicit-cleanup tree");
     let parent_pid = child.id().expect("contained parent pid");
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + READINESS_TIMEOUT;
     while !descendant_marker.is_file() && Instant::now() < deadline {
         assert!(
             child

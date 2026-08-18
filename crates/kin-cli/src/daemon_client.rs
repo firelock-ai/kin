@@ -9927,12 +9927,22 @@ mod tests {
         // the preceding no-endpoint and PID-only slices.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        // Nothing here asserts patience expiry; that invariant belongs to
+        // `unpublished_daemon_singleton_owner_forbids_spawn` and to
+        // `a_health_probe_that_never_answers_is_not_evidence_against_the_daemon`,
+        // which set deliberately tiny patiences. Putting it out of reach is what
+        // keeps a slow machine from turning a followed owner into `LiveNotReady`.
+        const FOLLOW_PATIENCE: Duration = Duration::from_secs(600);
+        // Strictly smaller than the patience it wraps, so a hang is reported as
+        // this test hanging rather than as the waiter giving up.
+        const HANG_GUARD: Duration = Duration::from_secs(60);
+
         let waiter_root = root.clone();
         let waiter = tokio::spawn(async move {
             wait_for_existing_daemon_within(
                 &waiter_root,
                 Duration::from_millis(20),
-                Duration::from_secs(3),
+                FOLLOW_PATIENCE,
             )
             .await
         });
@@ -9949,14 +9959,23 @@ mod tests {
             "PID-only publication must be followed, not rejected"
         );
         std::fs::write(root.join("daemon.port"), port.to_string()).unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Synchronise on a value the code owns rather than on a sleep: the
+        // waiter's own probe connection is the proof it read the published
+        // endpoint. Dropping the accepted socket is safe by the probe's
+        // documented contract, which records an unanswered health connection as
+        // no evidence either way, so it retries into the real server below.
+        let probe = tokio::time::timeout(HANG_GUARD, listener.accept())
+            .await
+            .expect("the waiter must probe the endpoint it was told about")
+            .expect("accept the waiter's probe connection");
         assert!(
             !waiter.is_finished(),
             "a complete endpoint that has not served yet must remain owned"
         );
+        drop(probe);
 
         let server = serve_repo_daemon_health(listener, repo.path());
-        let outcome = tokio::time::timeout(Duration::from_secs(2), waiter)
+        let outcome = tokio::time::timeout(HANG_GUARD, waiter)
             .await
             .expect("waiter must follow endpoint publication")
             .expect("waiter task");
