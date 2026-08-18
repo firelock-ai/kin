@@ -72,7 +72,10 @@ pub async fn list() -> Result<()> {
 
     if registry.repos.is_empty() {
         println!("No registered repositories.");
-        println!("hint: no shipped command writes a registry entry yet; the registry lists and cleans only");
+        println!(
+            "hint: `kin init` registers a repository when it runs; a repository initialized \
+             before this build predates that and has no entry"
+        );
         return Ok(());
     }
 
