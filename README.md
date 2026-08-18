@@ -283,9 +283,32 @@ add local vector similarity over them, and confirm coverage with
 
 ## Works with your agent
 
-Kin ships an MCP server, so any agent that speaks MCP can read the graph.
-`kin setup --intent agent` configures every client it detects in one pass. These
-are the per-client one-liners when you would rather install Kin directly.
+Kin ships its own agent, and it is the path we recommend for agent work. `kin
+agent run` drives any OpenAI-compatible endpoint, so a local model in LM Studio,
+Ollama, llama.cpp or vLLM works from the same flags as a hosted one, and it
+reaches the graph over the same MCP server every other client uses.
+
+```sh
+kin agent run --task "Find where the retry backoff is computed and document it" \
+  --model qwen/qwen3.6-35b-a3b --base-url http://127.0.0.1:1234/v1
+```
+
+What makes it different from pointing another agent at the MCP server is that the
+rule is enforced inside the agent rather than borrowed from a vendor's permission
+layer. It has Kin's tools plus exactly two local ones, `edit_file` and
+`write_file`. There is no shell, no grep and no file-reading tool, so it cannot
+answer a repository question from raw file search, and a tool it invents is
+refused by name. When Kin reports that an empty result cannot be trusted, the
+agent is told the answer is unknown and given the named gap instead of concluding
+the thing does not exist. Every edit runs inside a Kin transaction under a Kin
+session, so the change carries provenance naming the agent. Run `kin agent doctor
+--base-url <url>` first to check both halves answer. See
+[the CLI reference](docs/cli-reference.md#kin-agent) for the full surface.
+
+Working with Claude Code, Codex, Cursor, Gemini and anything else that speaks MCP
+stays first class. `kin setup --intent agent` configures every client it detects
+in one pass. These are the per-client one-liners when you would rather install Kin
+directly.
 
 Claude Code, from inside a session:
 
