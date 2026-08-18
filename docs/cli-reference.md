@@ -2666,22 +2666,23 @@ install and every process reading raw disk.
 Engage, disengage, or report the filesystem projection for this repository.
 
 The graph is the authority. A projection is how that truth reaches your tools as
-ordinary files, and Kin has three: the injected shim, an NFS mount, and a FUSE
-mount. Kin prefers a mount where one is available, because the kernel serves it
-and no process can have it stripped, and falls back to the shim. See
-[Filesystem projection](projection.md) for the full order and what each mode
-needs.
+ordinary files, and Kin has four: the injected shim, an NFS mount, a FUSE mount,
+and Windows ProjFS. Kin prefers a mount where one is available, because the
+kernel serves it and no process can have it stripped. macOS and Linux fall back
+to the shim; Windows has no shim and leads with ProjFS, which ships on every
+SKU. See [Filesystem projection](projection.md) for the full order and the
+per-platform table of what each mode needs.
 
 ```
-kin vfs on [--mode <shim|nfs|fuse>]
+kin vfs on [--mode <shim|nfs|fuse|projfs>]
 kin vfs off
 kin vfs status [--json]
 ```
 
 | Subcommand | Description |
 | --- | --- |
-| `on` | Engage the projection for this repository. `--mode` forces one; without it Kin uses the recorded mode, or picks by the fallback order. A mode that cannot run here falls back with a message naming what is missing, and never reports a mount that is not running. |
-| `off` | Disengage the projection. A mount is unmounted. The shim is injected per process, so it cannot be withdrawn from a running shell; the command says so and names `KIN_VFS_DISABLE=1`. |
+| `on` | Engage the projection for this repository. `--mode` forces one; without it Kin uses the recorded mode, or picks by the fallback order. A mode that cannot run here falls back with a message naming what is missing and the exact line that installs or enables it, and never reports a mount that is not running. |
+| `off` | Disengage the projection. An NFS mount admits whatever is staged through it before unmounting, so turning the projection off strands nothing. The shim is injected per process, so it cannot be withdrawn from a running shell; the command says so and names `KIN_VFS_DISABLE=1`. ProjFS is a Windows feature rather than a process Kin starts, so there is nothing to stop. |
 | `status` | Print each mode's live probe result and what is in force, as `mode/mounted/readable/writable/degraded`. |
 
 ### `kin update`
