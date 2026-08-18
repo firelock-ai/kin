@@ -104,4 +104,43 @@ jobs:
         # no subset still runs advisories, bans, licenses, and sources, and
         # `--all-features` keeps resolving the full feature graph rather than
         # the narrower one deny.toml's [graph] section would select.
-        run: cargo deny --log-level warn --manifest-path ./Cargo.toml --all-features check
+        #
+        # `advisories` is the one check whose verdict is not a function of the
+        # merge candidate, because cargo-deny resolves it against the RustSec
+        # database it fetches at run time. An advisory that publishes between a
+        # pull request's own run and its merge-group run therefore turns this
+        # required context red inside the queue, and the queue drops an entry
+        # that introduced neither the dependency nor the advisory while marking
+        # nothing on it. RUSTSEC-2026-0258 (h2 0.4.15) did exactly that to
+        # kin#893 on 2026-08-18 in run 32117079527, 87 seconds after admission,
+        # during the v0.5.39 release.
+        #
+        # The advisory is still real, so the group still fails. What changes is
+        # that it no longer fails anonymously: advisory-sweep.yml lands the lock
+        # bump on a schedule so a group should never see the advisory at all,
+        # and when the race still happens this step names the advisory and the
+        # exact bump command, so the ejection notice carries a cause instead of
+        # a bare red check. Ignoring advisories here was considered and refused:
+        # it would let a vulnerable lock through the one gate that reads the
+        # merged tree.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          set -uo pipefail
+          if cargo deny --log-level warn --manifest-path ./Cargo.toml --all-features check; then
+            exit 0
+          fi
+          if [ "$EVENT_NAME" != "merge_group" ]; then
+            exit 1
+          fi
+          # Failure path only. The advisory database is already fetched by the
+          # run above, so this second pass costs a metadata resolve and buys the
+          # ids and the bump command that name what actually blocked the group.
+          cargo deny --format json --log-level warn --manifest-path ./Cargo.toml \
+            --all-features check advisories > "$RUNNER_TEMP/advisories.json" 2>&1 || true
+          node scripts/advisory-sweep.mjs \
+            --deny-json "$RUNNER_TEMP/advisories.json" \
+            --lock ./Cargo.lock \
+            --annotate-merge-group
+          exit 1
