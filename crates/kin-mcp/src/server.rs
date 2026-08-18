@@ -1321,8 +1321,13 @@ fn finalize_daemon_graph_status(result: ToolCallResult, base_env: Envelope) -> T
             );
         }
     };
-    let selected_env =
-        base_env.with_selected_graph_observation(entity_count, indexed, pending, total);
+    let selected_env = base_env.with_selected_graph_observation(
+        entity_count,
+        indexed,
+        pending,
+        total,
+        report.durable_entity_count,
+    );
     let enveloped = envelope::finalize(result, selected_env, "kin_graph_status");
     if let Err(error) = daemon_delegate::parse_graph_status_report(&enveloped) {
         return envelope::finalize(

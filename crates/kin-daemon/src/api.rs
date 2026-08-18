@@ -662,6 +662,17 @@ pub struct HealthResponse {
     pub version: String,
     pub uptime_seconds: u64,
     pub graph_entity_count: Option<usize>,
+    /// Entities durable repository authority carried when this daemon last
+    /// levelled its query graph with authority (FIR-2421).
+    ///
+    /// `graph_entity_count` above is the LIVE count, and the daemon admits host
+    /// content into that graph continuously without recording any of it, so the
+    /// two differ by exactly the work a daemon exit would lose. Absent, never
+    /// zero, when this daemon has never levelled: an unknown durable count and
+    /// an empty durable authority are different answers, and only one of them
+    /// means the live graph is entirely uncommitted.
+    #[serde(default)]
+    pub durable_entity_count: Option<u64>,
     pub graph_loaded: bool,
     pub reconciliation_status: String,
     pub repo_id: String,
@@ -2060,6 +2071,12 @@ async fn mcp_graph_status_with_stable_authority(
                     // a store whose every vector points at a retired entity reads
                     // as fully embedded with nothing pending.
                     embedding_index_keys: selected_graph_index_population(selected_graph),
+                    // Read under the same fence as the live counters above, so
+                    // the pair a reader subtracts describes one instant
+                    // (FIR-2421). The daemon levels this with authority only at
+                    // open and at commit, and neither can run while this fence
+                    // is held.
+                    durable_entity_count: state.durable_entity_count(),
                 }
             }
             Err(std::sync::TryLockError::WouldBlock) => {
@@ -2609,6 +2626,7 @@ async fn health(
         version: env!("CARGO_PKG_VERSION").to_string(),
         uptime_seconds,
         graph_entity_count: Some(entity_count),
+        durable_entity_count: state.durable_entity_count(),
         graph_loaded,
         reconciliation_status: state.reconciliation_status_str().to_string(),
         repo_id: primary_repo_id(&state),
@@ -4865,6 +4883,12 @@ fn command_commit_after_admission(
         graph.create_change(&committed.change)
     })
     .map_err(internal_error)?;
+    // The plan above was derived from this live graph under the coordination
+    // gate, and the transaction published it, so the two are level here and
+    // this is the count durable authority now carries (FIR-2421). Read from the
+    // live graph rather than from the plan, because a plan's `entity_count` is
+    // the size of its delta and this is the size of the whole.
+    state.record_durable_entity_count(graph.entity_count() as u64);
     state.bump_version();
     state.emit_event(DaemonEvent::GraphRootChanged {
         old_root_hash: None,

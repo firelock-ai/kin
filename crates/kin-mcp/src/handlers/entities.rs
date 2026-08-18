@@ -3616,6 +3616,18 @@ pub struct GraphStatusReport {
     /// repository generation and not stable across daemon restarts.
     pub authority_epoch: u64,
     pub entity_count: usize,
+    /// Entities durable repository authority carried when the daemon last
+    /// levelled this graph with authority (FIR-2421).
+    ///
+    /// Beside `entity_count` because that is where it is misread. The live
+    /// count above is what the daemon can answer from right now, and a daemon
+    /// admits host content into that graph continuously without recording any
+    /// of it, so a populated `entity_count` says nothing about whether the work
+    /// survives this process. The difference between the two is what a daemon
+    /// exit would lose; `_kin.durability` states it as a sentence. Absent, not
+    /// zero, when the daemon has never levelled with durable authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_entity_count: Option<u64>,
     pub relation_count: usize,
     pub embedding_source: GraphStatusEmbeddingSource,
     pub embeddings_indexed: usize,
@@ -3656,6 +3668,8 @@ struct GraphStatusReportWire {
     sampling: GraphStatusSampling,
     authority_epoch: u64,
     entity_count: usize,
+    #[serde(default)]
+    durable_entity_count: Option<u64>,
     relation_count: usize,
     embedding_source: GraphStatusEmbeddingSource,
     embeddings_indexed: usize,
@@ -3685,6 +3699,7 @@ impl<'de> Deserialize<'de> for GraphStatusReport {
             sampling: wire.sampling,
             authority_epoch: wire.authority_epoch,
             entity_count: wire.entity_count,
+            durable_entity_count: wire.durable_entity_count,
             relation_count: wire.relation_count,
             embedding_source: wire.embedding_source,
             embeddings_indexed: wire.embeddings_indexed,
@@ -3854,6 +3869,10 @@ pub struct GraphStatusObservation {
     /// Vectors resident in the selected graph's index, sampled under the same
     /// fence as the counters above. `None` when there is no index to measure.
     pub embedding_index_keys: Option<usize>,
+    /// Entities durable repository authority carried when the daemon last
+    /// levelled this graph with authority (FIR-2421). `None` when it never has,
+    /// which is not zero.
+    pub durable_entity_count: Option<u64>,
 }
 
 pub fn handle_daemon_graph_status_observation(
@@ -3868,6 +3887,7 @@ pub fn handle_daemon_graph_status_observation(
         sampling: GraphStatusSampling::PointInTimeSelectedGraph,
         authority_epoch: observation.authority_epoch,
         entity_count: observation.entity_count,
+        durable_entity_count: observation.durable_entity_count,
         relation_count: observation.relation_count,
         embedding_source: GraphStatusEmbeddingSource::SelectedGraph,
         embeddings_indexed: observation.embeddings_indexed,
@@ -6441,6 +6461,7 @@ mod tests {
             embeddings_pending: embeddings.pending,
             embeddings_total: embeddings.total,
             embedding_index_keys: None,
+            durable_entity_count: None,
         };
         let result =
             handle_daemon_graph_status_observation(GraphStatusScope::TemporalSession, observation)
@@ -6481,6 +6502,7 @@ mod tests {
                 embeddings_pending: 0,
                 embeddings_total: 2,
                 embedding_index_keys: None,
+                durable_entity_count: None,
             },
         )
         .expect_err("the direct daemon boundary must reject impossible coverage");
@@ -6511,6 +6533,7 @@ mod tests {
                 embeddings_pending: 0,
                 embeddings_total: 49,
                 embedding_index_keys: Some(89),
+                durable_entity_count: None,
             },
         )
         .expect("a stale-but-covered graph is a reportable observation");
@@ -6531,6 +6554,7 @@ mod tests {
                 embeddings_pending: 0,
                 embeddings_total: 49,
                 embedding_index_keys: Some(49),
+                durable_entity_count: None,
             },
         )
         .unwrap();
@@ -6549,6 +6573,7 @@ mod tests {
                 embeddings_pending: 12,
                 embeddings_total: 12,
                 embedding_index_keys: None,
+                durable_entity_count: None,
             },
         )
         .unwrap();
@@ -6575,6 +6600,7 @@ mod tests {
                 embeddings_pending: 0,
                 embeddings_total: 10,
                 embedding_index_keys: Some(9),
+                durable_entity_count: None,
             },
         )
         .expect_err("an index below its own covered keys is not a reportable observation");
