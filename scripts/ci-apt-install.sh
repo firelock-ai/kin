@@ -23,7 +23,28 @@ APT_OPTS=(
 UPDATE_BOUND=${CI_APT_UPDATE_BOUND:-120}
 INSTALL_BOUND=${CI_APT_INSTALL_BOUND:-240}
 
+# On the second attempt onward, stop asking the runner's Azure mirror. The
+# hosted mirrorlist puts azure.archive.ubuntu.com first, and a stall there
+# trickles bytes slowly enough that no per-fetch timeout fires; the primary
+# archive answers the same packages. The rewrite is idempotent and only
+# touches the mirror lines the runner image ships.
+drop_azure_mirror() {
+  local f
+  for f in /etc/apt/apt-mirrors.txt /etc/apt/sources.list; do
+    [ -f "$f" ] || continue
+    sudo sed -i 's|http://azure\.archive\.ubuntu\.com/ubuntu|http://archive.ubuntu.com/ubuntu|g' "$f"
+  done
+  if [ -d /etc/apt/sources.list.d ]; then
+    sudo find /etc/apt/sources.list.d -type f \( -name '*.list' -o -name '*.sources' \) \
+      -exec sed -i 's|http://azure\.archive\.ubuntu\.com/ubuntu|http://archive.ubuntu.com/ubuntu|g' {} +
+  fi
+}
+
 for attempt in 1 2 3; do
+  if [ "$attempt" -ge 2 ]; then
+    echo "apt attempt $attempt: dropping the azure mirror in favour of archive.ubuntu.com" >&2
+    drop_azure_mirror
+  fi
   if timeout "$UPDATE_BOUND" sudo apt-get "${APT_OPTS[@]}" update \
     && timeout "$INSTALL_BOUND" sudo apt-get "${APT_OPTS[@]}" install --yes "$@"; then
     exit 0
