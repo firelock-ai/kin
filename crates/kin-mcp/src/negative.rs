@@ -176,6 +176,18 @@ fn spec_for(tool: &str) -> Option<RetrievalSpec> {
     Some(spec)
 }
 
+/// Which substrate's completeness gates this tool, or `None` for a tool that is
+/// not negative-capable retrieval.
+///
+/// The one reader outside this module is [`crate::envelope::Completeness`],
+/// which needs the same per-tool substrate answer to say what "complete" means
+/// for an answer. Serving it from [`spec_for`] keeps one registry: a retrieval
+/// tool declares what it reads once and both the absence verdict and the
+/// completeness signal follow from that declaration.
+pub(crate) fn negative_class_for(tool: &str) -> Option<NegativeClass> {
+    spec_for(tool).map(|spec| spec.class)
+}
+
 /// The cross-file edge classes each tool's ABSENCE claim depends on: the
 /// per-tool dependency map, in code, so authority can only be granted for a
 /// substrate the tool actually reads.
@@ -202,7 +214,7 @@ fn spec_for(tool: &str) -> Option<RetrievalSpec> {
 /// A tool absent from the map contributes no classes, so a new retrieval tool
 /// starts with no edge-derived authority to inherit and has to declare what it
 /// reads to earn one.
-fn absence_cross_file_classes(tool: &str, payload: &Value) -> Vec<String> {
+pub(crate) fn absence_cross_file_classes(tool: &str, payload: &Value) -> Vec<String> {
     match tool {
         "find_references" | "bulk_check_references" => payload
             .get("relation_kinds")
@@ -260,7 +272,7 @@ fn reference_classes() -> Vec<String> {
 /// A query that asked for no load-bearing class falls back to the classes it did
 /// ask for, so an `imports`-only or `references`-only query is still gated on
 /// what it actually read rather than on nothing.
-fn load_bearing_classes(requested: &[String]) -> Vec<String> {
+pub(crate) fn load_bearing_classes(requested: &[String]) -> Vec<String> {
     let load_bearing: Vec<String> = requested
         .iter()
         .filter(|class| class.as_str() == "calls")
@@ -427,7 +439,7 @@ fn classes_in_state<'a>(
 /// `edge_coverage:references_absent` beside it is saying something exact: the
 /// graph links calls and imports across files, it holds no reference edges, and
 /// the claim rests on the first fact rather than the second.
-fn edge_coverage_degradation_labels(tool: &str, payload: &Value) -> Vec<String> {
+pub(crate) fn edge_coverage_degradation_labels(tool: &str, payload: &Value) -> Vec<String> {
     let requested = absence_cross_file_classes(tool, payload);
     if requested.is_empty() {
         return Vec::new();
