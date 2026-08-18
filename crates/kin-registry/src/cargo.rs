@@ -2048,10 +2048,11 @@ kin-blobs = { version = "0.1.0", registry = "kin", features = ["schema"] }
         *state
             .blob_commit_gate
             .lock()
-            .expect("a fresh registry state has an unpoisoned commit gate") = Some(BlobCommitGate {
-            entered: entered_tx,
-            release: release_rx,
-        });
+            .expect("a fresh registry state has an unpoisoned commit gate") =
+            Some(BlobCommitGate {
+                entered: entered_tx,
+                release: release_rx,
+            });
 
         let publisher = tokio::spawn(publish(
             Arc::clone(&state),

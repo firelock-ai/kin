@@ -4741,13 +4741,10 @@ mod tests {
         .parse::<libc::pid_t>()
         .unwrap();
         assert!(relay.wait().unwrap().success());
-        let escaped_group = wait_for_test_report_fields(
-            &escape_report_path,
-            1,
-            Duration::from_secs(10),
-        )[0]
-            .parse::<libc::pid_t>()
-            .unwrap();
+        let escaped_group =
+            wait_for_test_report_fields(&escape_report_path, 1, Duration::from_secs(10))[0]
+                .parse::<libc::pid_t>()
+                .unwrap();
         assert_ne!(
             escaped_group, target_group,
             "late inherited member did not escape the target group"
@@ -5038,13 +5035,10 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let mut escaped = guardian.spawn(escaped_command).unwrap();
-        let escaped_group = wait_for_test_report_fields(
-            &escape_report_path,
-            1,
-            Duration::from_secs(10),
-        )[0]
-            .parse::<libc::pid_t>()
-            .unwrap();
+        let escaped_group =
+            wait_for_test_report_fields(&escape_report_path, 1, Duration::from_secs(10))[0]
+                .parse::<libc::pid_t>()
+                .unwrap();
         assert_ne!(
             escaped_group, target_group,
             "escaped worker did not leave the target group"
