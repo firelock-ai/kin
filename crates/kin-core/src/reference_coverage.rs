@@ -989,6 +989,9 @@ mod tests {
         assert!(
             line.contains("imports 1/4 (25%), 3 name a module outside this repository"),
             "{line}"
+        );
+    }
+
     /// The Python shape, reproduced from the parser's own behaviour: a file
     /// whose call extraction was incomplete removes its call count, and a file
     /// with no calls at all keeps one that reads zero. So the only files
