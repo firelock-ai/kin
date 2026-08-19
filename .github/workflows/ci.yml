@@ -333,6 +333,16 @@ jobs:
             "init::tests" \
             --locked --target x86_64-pc-windows-msvc \
             -p kin-core --lib
+          # The capture lease is the only thing that stops one init's reap from
+          # deleting a sibling init's capture directory, and every clause of it
+          # is a Windows sharing rule rather than Kin's code: that a locked file
+          # can be renamed at all, that the lock follows it, and that a second
+          # opener is then refused. None of that is observable from a Unix run,
+          # and until this leg existed no Windows run touched the module.
+          run_required_filter "kin-core Git capture lease" \
+            "init_staging::tests" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-core --lib
           run_required_filter "managed-install spawn fence" \
             "managed_spawn_fence" \
             --locked --target x86_64-pc-windows-msvc \

@@ -137,7 +137,7 @@ impl AdmittedFileEvent {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EnrichmentFacet {
+pub(crate) enum EnrichmentFacet {
     EntitySource,
     ShallowSyntax,
     StructuredArtifact,
@@ -146,8 +146,8 @@ enum EnrichmentFacet {
 }
 
 #[derive(Debug, Default)]
-struct FacetCleanup {
-    removed_entities: Vec<EntityId>,
+pub(crate) struct FacetCleanup {
+    pub(crate) removed_entities: Vec<EntityId>,
     changed: bool,
 }
 
@@ -1147,38 +1147,51 @@ fn clear_incompatible_facets(
     file_id: &FilePathId,
     keep: EnrichmentFacet,
 ) -> Result<FacetCleanup> {
+    clear_incompatible_facets_in(state.graph.as_ref(), file_id, keep)
+}
+
+/// The same cleanup against a graph named outright rather than reached through
+/// the daemon's live state.
+///
+/// The MCP transaction planner needs it against the PROSPECTIVE graph it is
+/// building, which is not the live one and must not be, because a transaction
+/// that fails to plan may not have touched anything a query can see. Naming the
+/// graph is what lets one definition of "retire this file's enrichment" serve
+/// both the watcher seam and the planner, so the two cannot drift into
+/// disagreeing about what a retirement takes with it.
+pub(crate) fn clear_incompatible_facets_in(
+    graph: &kin_db::InMemoryGraph,
+    file_id: &FilePathId,
+    keep: EnrichmentFacet,
+) -> Result<FacetCleanup> {
     let mut cleanup = FacetCleanup::default();
 
     if keep != EnrichmentFacet::EntitySource {
-        let entities = state.graph.query_entities(&EntityFilter {
+        let entities = graph.query_entities(&EntityFilter {
             file_path: Some(file_id.clone()),
             ..Default::default()
         })?;
         cleanup.removed_entities = entities.into_iter().map(|entity| entity.id).collect();
-        state
-            .graph
-            .remove_entities_batch(&cleanup.removed_entities)?;
+        graph.remove_entities_batch(&cleanup.removed_entities)?;
         cleanup.changed |= !cleanup.removed_entities.is_empty();
-        if state.graph.get_file_layout(file_id)?.is_some() {
-            state.graph.delete_file_layout(file_id)?;
+        if graph.get_file_layout(file_id)?.is_some() {
+            graph.delete_file_layout(file_id)?;
             cleanup.changed = true;
         }
     }
 
-    if keep != EnrichmentFacet::ShallowSyntax && state.graph.get_shallow_file(file_id)?.is_some() {
-        state.graph.delete_shallow_file(file_id)?;
+    if keep != EnrichmentFacet::ShallowSyntax && graph.get_shallow_file(file_id)?.is_some() {
+        graph.delete_shallow_file(file_id)?;
         cleanup.changed = true;
     }
     if keep != EnrichmentFacet::StructuredArtifact
-        && state.graph.get_structured_artifact(file_id)?.is_some()
+        && graph.get_structured_artifact(file_id)?.is_some()
     {
-        state.graph.delete_structured_artifact(file_id)?;
+        graph.delete_structured_artifact(file_id)?;
         cleanup.changed = true;
     }
-    if keep != EnrichmentFacet::OpaqueArtifact
-        && state.graph.get_opaque_artifact(file_id)?.is_some()
-    {
-        state.graph.delete_opaque_artifact(file_id)?;
+    if keep != EnrichmentFacet::OpaqueArtifact && graph.get_opaque_artifact(file_id)?.is_some() {
+        graph.delete_opaque_artifact(file_id)?;
         cleanup.changed = true;
     }
 
