@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.43] - 2026-08-19
+
+### Changed
+
+- chore(ci): pin kin-actions v0.1.32 (#963)
+
+
 ## [0.5.42] - 2026-08-19
 
 ### Changed
