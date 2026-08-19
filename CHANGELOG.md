@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Wait on the daemon's own record instead of a 60s ambient-admission bound (#969)
 - Wire JavaScript and TypeScript reference enrichment, provision the servers, and stop certifying an absence over a language nothing resolved (#967)
 - Key the release mint off the merge-group-proven sha (#962)
+- Never certify absence of a thing from absence of a match (#957)
 
 
 ## [0.5.42] - 2026-08-19
