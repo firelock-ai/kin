@@ -12,7 +12,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-    uses: firelock-ai/kin-actions/.github/workflows/cargo-dependency-wave.yml@v0.1.31
+    uses: firelock-ai/kin-actions/.github/workflows/cargo-dependency-wave.yml@v0.1.32
     with:
       manifests: Cargo.toml
       test-command: cargo test
