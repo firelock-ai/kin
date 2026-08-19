@@ -1041,6 +1041,52 @@ mod tests {
         );
     }
 
+    /// The same rule where the partial sum is not zero, which is the case a
+    /// zero denominator cannot stand in for.
+    ///
+    /// A sum of 5 call sites read from one of three files, against call edges
+    /// counted over all three, would divide cleanly and print a percentage
+    /// comparing two different populations. That number is worse than the
+    /// missing one, because it looks answerable.
+    #[test]
+    fn a_nonzero_partial_sum_still_publishes_no_percentage() {
+        let graph = InMemoryGraph::new();
+        let caller = entity("resolve", "requests/sessions.py", None, Some(4));
+        let callee = entity("send", "requests/adapters.py", None, Some(3));
+        let counted = entity("helper", "requests/utils.py", Some(5), Some(1));
+        for e in [&caller, &callee, &counted] {
+            graph.upsert_entity(e).unwrap();
+        }
+        graph.upsert_relation(&calls(caller.id, callee.id)).unwrap();
+
+        let coverage = collect_reference_edge_coverage(&graph).unwrap();
+        let python = coverage
+            .languages
+            .iter()
+            .find(|l| l.language == "python")
+            .expect("python row");
+
+        assert_eq!(python.parsed_call_sites, Some(5));
+        assert_eq!(python.call_sites_measured_files, 1);
+        assert_eq!(python.files, 3);
+        assert_eq!(python.call_site_measurement(), CallSiteMeasurement::Partial);
+        assert_eq!(
+            python.call_percent(),
+            None,
+            "1 resolved edge over 5 sites read from one of three files is not 20% of anything"
+        );
+
+        let rendered = coverage.summary_lines().join("\n");
+        assert!(
+            rendered.contains("parse side measured on 1 of 3 files (5 sites there)"),
+            "the partial denominator and its scope must both be named: {rendered}"
+        );
+        assert!(
+            !rendered.contains("calls 1/5"),
+            "a ratio between two populations must not be printed: {rendered}"
+        );
+    }
+
     /// The founding shape: every resolved call edge is intra-file, the files
     /// import across modules, and no cross-file edge exists, so absence must
     /// not be concluded.

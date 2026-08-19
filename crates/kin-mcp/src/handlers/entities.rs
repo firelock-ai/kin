@@ -4987,6 +4987,56 @@ mod tests {
         assert_eq!(verbose_refs[0]["signature"], "fn caller()");
     }
 
+    /// A bare name that matches several entities is resolved to one of them and
+    /// says so.
+    ///
+    /// A repository holding both `Database.resolve` and `LinkGraph.resolve`
+    /// answered `find_references(query: "resolve")` with one of them and its
+    /// reference list, and nothing in the response mentioned that the other
+    /// existed. The answer was correct; a rename driven by it on a colliding
+    /// name is a rename driven by an unannounced guess.
+    #[tokio::test]
+    async fn find_references_reports_an_ambiguous_name_resolution() {
+        let store = InMemoryGraph::new();
+        let one = make_entity("resolve", "src/database.rs");
+        let two = make_entity("resolve", "src/link_graph.rs");
+        store.upsert_entity(&one).unwrap();
+        store.upsert_entity(&two).unwrap();
+
+        let mut args = HashMap::new();
+        args.insert("query".to_string(), serde_json::json!("resolve"));
+        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+
+        assert_eq!(body["focal_resolution"]["addressed_by"], "name");
+        assert_eq!(
+            body["focal_resolution"]["same_name_candidates"], 2,
+            "two entities carry this name and the response must say so: {body}"
+        );
+        let degradations = body["degradations"]
+            .as_array()
+            .unwrap_or_else(|| panic!("an ambiguous resolution must degrade: {body}"));
+        assert!(
+            degradations
+                .iter()
+                .any(|entry| entry["reason"] == "ambiguous_name"),
+            "the ambiguity must be named, not left to focal_entity: {body}"
+        );
+
+        // Addressing the same entity by id is not ambiguous and must not
+        // degrade: the caller already pinned the choice.
+        let mut pinned = HashMap::new();
+        pinned.insert(
+            "entity_id".to_string(),
+            serde_json::json!(one.id.to_string()),
+        );
+        let exact = parsed_response(&handle_find_references(&pinned, &store, None).await.unwrap());
+        assert_eq!(exact["focal_resolution"]["addressed_by"], "entity_id");
+        assert!(
+            exact.get("degradations").is_none(),
+            "pinning by id resolves nothing and must not degrade: {exact}"
+        );
+    }
+
     /// One row per REFERENCING ENTITY, and `total_upstream` counting those
     /// entities rather than the files they sit in.
     ///
