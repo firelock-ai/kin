@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::path::VfsName;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VirtualStat {
     pub size: u64,
     pub is_file: bool,
@@ -75,7 +75,7 @@ impl VirtualStat {
 }
 
 /// One directory entry with its byte-exact name.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirEntry {
     pub name: VfsName,
     pub file_type: FileType,

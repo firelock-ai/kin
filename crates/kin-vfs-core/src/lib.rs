@@ -18,6 +18,7 @@ pub mod protocol;
 pub mod provider;
 pub mod stat;
 pub mod tree;
+pub mod writer;
 
 pub use canary::{CanaryRegistry, InterposeStatus};
 pub use error::{VfsError, VfsResult};
@@ -25,3 +26,4 @@ pub use path::{VfsName, VfsPath, VfsPathError};
 pub use provider::{AsyncContentProvider, ContentProvider};
 pub use stat::{DirEntry, FileType, VirtualStat};
 pub use tree::VirtualFileTree;
+pub use writer::{Admission, ContentWriter, NoWrites, Staged, WriteHealth, WriteThroughProvider};
