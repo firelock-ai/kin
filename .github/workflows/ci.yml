@@ -1202,6 +1202,15 @@ jobs:
         with:
           tool: nextest
 
+      # Without a language server on PATH the reference-enrichment proof in
+      # crates/kin-daemon/tests/lsp_reference_enrichment.rs skips, so this step
+      # is what makes it run. It warns and exits 0 on a registry failure rather
+      # than failing the gate, and the skip is annotated on the run summary and
+      # printed per test, so it is never silent.
+      - name: Install language servers for the enrichment proof
+        if: runner.os == 'Linux'
+        run: bash scripts/ci-install-language-servers.sh
+
       - name: Test
         run: cargo nextest run --locked
 
