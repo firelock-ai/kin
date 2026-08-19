@@ -161,6 +161,25 @@ fn spec_for(tool: &str) -> Option<RetrievalSpec> {
             always: false,
             class: NegativeClass::Structural,
         },
+        // The whole output is used/unused verdicts, so like the batch below it
+        // always qualifies rather than qualifying an empty page. An
+        // `entity_impacts` row carrying `consumer_count: 0` IS the verdict a
+        // caller reads before changing or deleting something, and it is read off
+        // the same cross-file reference edges `find_references` reads, so it can
+        // be wrong for the same reason and now says so.
+        //
+        // This was the last retrieval surface without the rail, which put the
+        // tool with the highest blast radius per wrong absence outside the gate
+        // every smaller one passes. Its declarations in
+        // [`absence_cross_file_classes`] and [`absence_is_language_scoped`] were
+        // already written and were waiting for this row.
+        "impact_analysis" => RetrievalSpec {
+            field: "entity_impacts",
+            kind: "impact_verdicts",
+            subject: "per-changed-entity downstream impact verdicts",
+            always: true,
+            class: NegativeClass::Structural,
+        },
         // Batch reachability never returns an empty `results` on success (it
         // errors on empty input), but its `has_references: false` rows ARE the
         // negatives a "safe to delete?" sweep depends on — so always qualify.
@@ -204,7 +223,7 @@ pub(crate) fn negative_class_for(tool: &str) -> Option<NegativeClass> {
 /// | `find_references` | the query's own `relation_kinds` (default calls, imports, references) | its rows ARE those edges |
 /// | `bulk_check_references` | the query's own `relation_kinds` | one `has_references: false` row per entity, read off the same edges |
 /// | `trace_data_flow` | calls, imports, references | the walk expands exactly those kinds |
-/// | `impact_analysis` | calls, imports, references | downstream impact is those edges transitively; it has no absence spec today, and this entry is what stops one inheriting authority if it gains one |
+/// | `impact_analysis` | calls, imports, references | downstream impact is those edges transitively, and every `consumer_count: 0` verdict is read off them |
 /// | `graph_neighborhood` | none | the merged walk includes containment edges, which are intra-file by construction, so an empty neighborhood is not evidence about cross-file coverage; its absence is gated instead by focal-not-in-graph and depth-zero |
 /// | `semantic_locate` | none | ranks entities from embeddings and never traverses an edge |
 /// | `semantic_search` | none | filters declarations by name/kind/language and never traverses an edge |
@@ -462,6 +481,55 @@ pub(crate) fn absence_coverage_gap(tool: &str, payload: &Value) -> Option<String
         ));
     }
 
+    // The name filter's own side, and the one gate that can see a match the
+    // narrowing filters removed. Every other gate here reads the substrate, so
+    // on a healthy store they all correctly report nothing, which is exactly how
+    // `semantic_search(query: "request", kind: "method")` on psf/requests
+    // certified `safe_to_conclude_absent: true` about a name the graph resolves.
+    // A nonzero candidate count is proof the name matched declarations, so what
+    // this answer observed is absence of a MATCH under those filters and never
+    // absence of the thing.
+    //
+    // Reported only when the answer measured it. A query that applied no
+    // narrowing filter carries no observation here and is unaffected, which is
+    // what keeps a genuinely absent name on a healthy store certifiable.
+    if let Some(name_filter) = coverage
+        .get(crate::edge_coverage::NAME_FILTER_KEY)
+        .and_then(Value::as_object)
+    {
+        let candidates = name_filter
+            .get("candidates")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if candidates > 0 {
+            let narrowed = name_filter
+                .get("narrowed_by")
+                .and_then(Value::as_array)
+                .map(|applied| {
+                    applied
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .filter(|narrowed| !narrowed.is_empty())
+                .unwrap_or_else(|| "the filters".to_string());
+            let declarations = if candidates == 1 {
+                "1 declaration".to_string()
+            } else {
+                format!("{candidates} declarations")
+            };
+            gaps.push(format!(
+                "name_filter_narrowed_to_zero: this query's name pattern selects {declarations} \
+                 on its own and the {narrowed} filter removed every one of them, so this answer \
+                 observed that no candidate survived those filters rather than that the \
+                 repository holds no such declaration; the name resolves, so do not read this as \
+                 the target being absent, and re-run without the narrowing filter to see what it \
+                 matched"
+            ));
+        }
+    }
+
     // Independent of what any scan measured. A language this build cannot
     // resolve is not one that happened to come back empty, and no amount of
     // scanning or re-indexing will ever move it.
@@ -606,6 +674,19 @@ pub(crate) fn edge_coverage_degradation_labels(tool: &str, payload: &Value) -> V
         Some("unsupported") | Some("no_language_server")
     ) {
         labels.push("edge_coverage:reference_enrichment_unsupported".to_string());
+    }
+    // Disclosed on the same terms as the two above: what the verdict rests on is
+    // named in the signals beside it, so a reader never has to parse the reason
+    // sentence to learn that the name matched and a narrowing filter is what
+    // emptied the answer.
+    if coverage
+        .get(crate::edge_coverage::NAME_FILTER_KEY)
+        .and_then(Value::as_object)
+        .and_then(|name_filter| name_filter.get("candidates"))
+        .and_then(Value::as_u64)
+        .is_some_and(|candidates| candidates > 0)
+    {
+        labels.push("absence_coverage:name_filter_narrowed".to_string());
     }
     labels
 }
@@ -1104,7 +1185,20 @@ fn build_advice(
 /// instruction for every structural gap: a missing cross-file call edge is not
 /// waiting on an embedding, and a reader who follows that advice re-runs the
 /// query unchanged and gets the identical unusable answer.
-fn absence_consequence(always: bool, trustworthy: bool) -> &'static str {
+fn absence_consequence(tool: &str, always: bool, trustworthy: bool) -> &'static str {
+    // A certified name/kind filter is a statement about DECLARATIONS, and this
+    // tool reads the entity index and traverses no edge at all
+    // ([`absence_cross_file_classes`] gives it no class for exactly that
+    // reason), so it has no basis for the word "unused". The generic sentence
+    // supplied one anyway, and a stranger run quoted it back verbatim as the
+    // thing it believed. Scoping it costs no authority: the verdict stays
+    // authoritative and the fixture that must keep certifying still does.
+    if tool == "semantic_search" && !always && trustworthy {
+        return "Absence is authoritative for this filter: no declaration in the index carries \
+                this name under it. That is a statement about declarations, not about use, \
+                because this filter reads the entity index and traverses no edge; settle whether \
+                anything references the name with find_references.";
+    }
     match (always, trustworthy) {
         (true, true) => {
             "A `has_references: false` row here is an authoritative negative — safe to treat that entity as unreferenced."
@@ -1126,8 +1220,13 @@ fn absence_consequence(always: bool, trustworthy: bool) -> &'static str {
 /// isolated-install report quoted the advice line verbatim as the thing it
 /// believed, so an advice line that states the consequence and leaves the cause
 /// in a neighbouring field is one field away from being acted on blind.
-fn absence_advice_consequence(always: bool, trustworthy: bool, trust_reason: &str) -> String {
-    let consequence = absence_consequence(always, trustworthy);
+fn absence_advice_consequence(
+    tool: &str,
+    always: bool,
+    trustworthy: bool,
+    trust_reason: &str,
+) -> String {
+    let consequence = absence_consequence(tool, always, trustworthy);
     if trustworthy {
         consequence.to_string()
     } else {
@@ -1540,7 +1639,7 @@ pub fn negative_for(
     let consequence = if ranking_names_nothing {
         unnamed_ranking_consequence().to_string()
     } else {
-        absence_advice_consequence(spec.always, trustworthy, &trust_reason)
+        absence_advice_consequence(tool, spec.always, trustworthy, &trust_reason)
     };
 
     let degraded_signals = degraded_signals(tool, payload, envelope);
@@ -2099,6 +2198,178 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("structural_authoritative"));
+    }
+
+    /// A narrowing filter that removed every candidate the name DID match
+    /// (FIR-2452). This is the residual kin#935 left: every gate that existed
+    /// reads the substrate, and on this payload the substrate is healthy, so all
+    /// of them correctly report nothing and the answer certified.
+    #[test]
+    fn a_name_filter_narrowed_to_zero_certifies_nothing() {
+        // The shape the stranger run hit on psf/requests, which is a fully
+        // enriched Python store: `semantic_search(query: "request", kind:
+        // "method")` answered zero and reported `safe_to_conclude_absent: true`
+        // with "safe to treat the target as genuinely absent/unused", about a
+        // name the graph resolves. The scope held every method in the
+        // repository, Python is a language this build enriches, and the tool
+        // traverses no edge, so the class gate, the scope gate and the
+        // enrichment gate all read healthy. Only the name's own side can see it.
+        let mut scope = resolvable_language_scope(Some(256));
+        scope["name_filter"] = json!({ "narrowed_by": ["kind"], "candidates": 1 });
+        let payload = empty_search_page(scope);
+
+        let negative = negative_for("semantic_search", &payload, &structural_ready_envelope())
+            .expect("empty results yields a negative");
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(false),
+            "the name matched a declaration and a kind filter removed it, so this \
+             observed absence of a match: {negative}"
+        );
+        assert_eq!(negative["trust"], json!("inconclusive"));
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            reason.starts_with("name_filter_narrowed_to_zero"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("selects 1 declaration on its own"),
+            "the count it measured is in the reason: {reason}"
+        );
+        assert!(
+            reason.contains("kind filter removed every one of them"),
+            "the filter that emptied it is named rather than left unattributed: {reason}"
+        );
+        assert!(
+            negative["degraded_signals"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("absence_coverage:name_filter_narrowed")),
+            "the shortfall the verdict rests on is disclosed: {negative}"
+        );
+
+        // Positive control on the same payload shape: the name matched nothing
+        // on its own, so the narrowing filter removed nothing and the absence is
+        // the name's, not the filter's. The gate reads the count.
+        let mut matched_nothing = resolvable_language_scope(Some(256));
+        matched_nothing["name_filter"] = json!({ "narrowed_by": ["kind"], "candidates": 0 });
+        let negative = negative_for(
+            "semantic_search",
+            &empty_search_page(matched_nothing),
+            &structural_ready_envelope(),
+        )
+        .expect("empty results yields a negative");
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(true),
+            "a kind-filtered query whose name matched nothing at all still certifies: {negative}"
+        );
+    }
+
+    /// The other half of the FIR-2452 rule, on the answer that still certifies.
+    /// A tool that traverses no edge cannot speak about use, and the generic
+    /// sentence supplied the word anyway.
+    #[test]
+    fn a_certified_search_absence_states_no_verdict_about_use() {
+        let payload = empty_search_page(resolvable_language_scope(Some(29)));
+        let negative = negative_for("semantic_search", &payload, &structural_ready_envelope())
+            .expect("empty results yields a negative");
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(true),
+            "the authority is unchanged: {negative}"
+        );
+        let advice = negative["advice"].as_str().unwrap();
+        assert!(
+            !advice.contains("genuinely absent/unused"),
+            "a name filter reads the entity index and traverses no edge, so it has no \
+             basis for a verdict about use: {advice}"
+        );
+        assert!(
+            advice.contains("Absence is authoritative for this filter"),
+            "{advice}"
+        );
+        assert!(
+            advice.contains("not about use"),
+            "it says which question it answered: {advice}"
+        );
+
+        // The sibling that DOES read those edges keeps the sentence, so scoping
+        // one tool did not quietly disarm the others.
+        let references = negative_for(
+            "find_references",
+            &authoritative_empty_references("function"),
+            &structural_ready_envelope(),
+        )
+        .expect("empty references yields a negative");
+        assert!(
+            references["advice"]
+                .as_str()
+                .unwrap()
+                .contains("genuinely absent/unused"),
+            "find_references reads the edges, so its verdict about use stands: {references}"
+        );
+    }
+
+    /// FIR-2452 clause 2. The tool whose entire output is used/unused verdicts
+    /// was the only retrieval surface with no `negative` object at all, so the
+    /// one with the highest blast radius per wrong absence sat outside the gate
+    /// every smaller one passes.
+    #[test]
+    fn impact_verdicts_carry_the_rail_and_pass_the_same_gate() {
+        // Populated, and still qualified: like batch reachability, an impact
+        // report's rows ARE the negatives, so a zero consumer count beside a
+        // full blast radius is exactly the verdict that needs calibrating.
+        let mut payload = json!({
+            "changed_ids": ["00000000-0000-0000-0000-000000000001"],
+            "affected_callers": [],
+            "entity_impacts": [{
+                "entity_id": "00000000-0000-0000-0000-000000000001",
+                "consumer_count": 0,
+                "proven_consumer_count": 0,
+            }],
+        });
+        payload["edge_coverage"] = cross_file_edges_observed();
+
+        let negative = negative_for("impact_analysis", &payload, &structural_ready_envelope())
+            .expect("impact verdicts are always qualified");
+        assert_eq!(negative["kind"], json!("impact_verdicts"));
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(true),
+            "a graph that links calls across files for this language can certify: {negative}"
+        );
+
+        // The same gate the sibling reference surfaces pass. A graph holding no
+        // cross-file calls answers every impact query with an empty blast radius
+        // no matter how healthy it looks, so the verdict cannot be certified.
+        let mut absent = payload.clone();
+        absent["edge_coverage"]["classes"]["calls"] = json!("absent");
+        let negative = negative_for("impact_analysis", &absent, &structural_ready_envelope())
+            .expect("impact verdicts are always qualified");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert!(
+            negative["trust_reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("cross_file_edges_absent"),
+            "{negative}"
+        );
+
+        // And an answer that published no observation at all is the unknown
+        // case, never the healthy one.
+        let mut unreported = payload.clone();
+        unreported.as_object_mut().unwrap().remove("edge_coverage");
+        let negative = negative_for("impact_analysis", &unreported, &structural_ready_envelope())
+            .expect("impact verdicts are always qualified");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert!(
+            negative["trust_reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("edge_coverage_unreported"),
+            "{negative}"
+        );
     }
 
     #[test]
