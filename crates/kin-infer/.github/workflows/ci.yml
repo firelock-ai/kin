@@ -3,9 +3,17 @@
 
 name: CI
 
+# There is deliberately no `push:` trigger on main. The hosted merge queue
+# builds and tests the exact commit it then lands, so a push run on main
+# repeats a suite that already passed on that sha and gates nothing: it is not
+# a required context and no landing waits for it.
+#
+# Two situations need the push leg back, and only those: a workflow newly wired
+# into the queue, which has no merge_group run of its own yet, and any period
+# where main can take a commit the queue did not build. Both were checked here
+# against the run history before this trigger was dropped, over every main
+# commit in the fourteen days to 2026-08-19.
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
   merge_group:
