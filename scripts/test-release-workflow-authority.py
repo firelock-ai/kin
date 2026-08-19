@@ -674,7 +674,7 @@ EXPECTED_DYNAMIC_JOB_CONTEXT_SHA256 = {
     (
         ".github/workflows/release.yml",
         "build",
-    ): "ffde401b1343930965ae6a2a89ca3a81b2996af5821b332f65de7eba874e2be2",
+    ): "7375c7f0f82227e8695aea7fc290631a9d3667dc6674dca10830c53e0a0f4564",
     (
         ".github/workflows/release.yml",
         "verify_npm_published",

@@ -429,7 +429,33 @@ jobs:
             cross: false
           # Use an Intel host so this archive is executed before packaging;
           # building x86_64 on an arm64 runner would leave it unproven.
-          - os: macos-15-intel
+          #
+          # The host is Intel, and larger. This row was the release's critical
+          # path: 40m03s on v0.5.40 against 24m46s for the aarch64 row, and
+          # 34m15s of it was the one `cargo build --release` step, which is
+          # 9m20s on linux-aarch64. The workflow treats both macOS rows
+          # identically, so the gap was the runner. macos-15-intel is 4 vCPU and
+          # 14 GB; macos-15-large is the same macOS 15 on Intel with 12 vCPU and
+          # 30 GB, at $0.077 a minute against $0.062, so it is three times the
+          # cores for 1.24 times the rate and a shorter job costs less than the
+          # one it replaces.
+          #
+          # Cross-compiling x86_64 from the faster Apple Silicon host was the
+          # other candidate and is refused, on provenance rather than on
+          # signing. codesign and notarytool never execute the binary, so both
+          # work fine on a cross-built artifact. "Verify native release build
+          # provenance" does execute it, and its `case "$RUNNER_ARCH:$TARGET"`
+          # declines a cross-architecture artifact and returns before writing
+          # kin-build-meta.json, which "Generate artifact provenance manifest"
+          # then reads unconditionally. Making that path work means either
+          # running the x86_64 binary under Rosetta on the arm64 host, which the
+          # macos-15-arm64 runner image does not list among its software, or
+          # dropping the execution proof for a shipped archive: the version-line
+          # commit match, the dirty refusal, the embedded Cargo.lock provenance,
+          # and the vector/embeddings/metal feature assertions all stop running.
+          # Staying on Intel keeps RUNNER_ARCH X64, so that guard's X64:x86_64-*
+          # arm still matches and nothing else in the job moves.
+          - os: macos-15-large
             target: x86_64-apple-darwin
             artifact: kin-macos-x86_64
             shim_name: libkin_vfs_shim.dylib
