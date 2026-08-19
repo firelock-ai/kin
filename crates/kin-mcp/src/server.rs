@@ -1057,9 +1057,12 @@ const SUPPORTED_PROTOCOL_VERSION: &str = "2024-11-05";
 const SERVER_INSTRUCTIONS: &str = "Kin answers repository questions from a semantic graph rather than raw file search. \
 Prefer semantic_locate to find symbols and behavior by meaning, get_context_pack for a structured context bundle \
 around an entity or file, and trace_data_flow for cross-file data lineage; reach for grep only when no graph-backed \
-tool answers the question. Every tool response carries a `_kin` envelope reporting graph freshness and coverage. An \
-empty retrieval result also carries a `negative` object whose `safe_to_conclude_absent` field says whether the \
-absence can be trusted; when it is false, treat the answer as unknown rather than absent.";
+tool answers the question. Every tool response carries a `_kin` envelope reporting graph freshness and coverage. \
+Read `_kin.verdict` first: it is the ONE verdict for the response, computed from every block that qualifies the \
+answer, with the most pessimistic input winning. When its `state` is `inconclusive`, treat the counts as a lower \
+bound and do not act on an absence in the answer, whatever any single count or block says on its own; \
+`limiting_factor` names what stopped it. `negative` and `_kin.completeness` beside it are the evidence that verdict \
+was computed from, never independent answers.";
 
 fn handle_initialize(
     id: Option<serde_json::Value>,
@@ -1672,7 +1675,10 @@ mod tests {
         // The spec's instructions field must reach the wire with usable content.
         let instructions = result["instructions"].as_str().unwrap();
         assert!(instructions.contains("semantic_locate"));
-        assert!(instructions.contains("safe_to_conclude_absent"));
+        // The one verdict has to be named on the wire, or an agent learns the
+        // contract from whichever block it happens to read first.
+        assert!(instructions.contains("_kin.verdict"));
+        assert!(instructions.contains("most pessimistic input"));
     }
 
     #[tokio::test]

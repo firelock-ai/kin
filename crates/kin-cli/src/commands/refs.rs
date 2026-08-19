@@ -233,13 +233,31 @@ pub fn build_refs_response(
         ));
     };
 
+    // FIR-2463. The count and the held rows are one reading, so they are printed
+    // as one line. A reader who stops at "No resolved incoming calls relations."
+    // and never reaches the candidates paragraph below has read a zero the same
+    // response is contradicting, which is the shape that made an MCP
+    // `total_upstream: 0` deletable while the one real caller sat in the payload
+    // beside it.
+    let unconfirmed = if candidates.is_empty() {
+        String::new()
+    } else {
+        format!(
+            ", plus {} unconfirmed candidate{} not in that count",
+            candidates.len(),
+            if candidates.len() == 1 { "" } else { "s" }
+        )
+    };
     if resolved.is_empty() {
         lines.push(format!(
-            "No resolved incoming {} relations.",
+            "No resolved incoming {} relations{unconfirmed}.",
             relation_kinds_label(&relation_kinds)
         ));
     } else {
-        lines.push(format!("referenced by {} entities:", resolved.len()));
+        lines.push(format!(
+            "referenced by {} entities{unconfirmed}:",
+            resolved.len()
+        ));
         for entry in &resolved {
             render(&mut lines, entry);
         }

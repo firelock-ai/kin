@@ -1022,6 +1022,11 @@ module was known and the symbol selected inside it), or `name_only` (a bare same
 match across the repo, with nothing at the reference site proving it). A `name_only` row \
 is a candidate, not a fact; do not count it as use, and do not conclude something is \
 unused from the absence of anything but `name_only` rows without confirming. \
+`name_only` rows are held out of `total_upstream` and travel in `candidates`, and \
+`unconfirmed_candidates` beside the headline says how many were held, so a \
+`total_upstream` of 0 with `unconfirmed_candidates` above 0 means this answer is holding \
+rows it could not confirm and the zero may not be read alone. \
+`_kin.verdict` is the one verdict for the whole response and outranks every count in it. \
 The response bounds its own size (max_chars, default 30000 serialized characters): a symbol \
 with hundreds of call sites sheds its inline snippets before it withholds any row, and any cut \
 is reported in `degradations` and in `_kin.response` with the size the response had before the \
@@ -1693,6 +1698,19 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
         // infer it, and `counts.reference_sites` carries the finer number when
         // every row could be located.
         "total_upstream": references.len(),
+        // FIR-2463. The headline may not be readable alone when the same
+        // response is holding evidence that contradicts it. `HTTPAdapter.send`
+        // on psf/requests answered `total_upstream: 0` while carrying its one
+        // real caller, `Session.send` at `sessions.py:784`, in `candidates`: a
+        // reader of the number deletes working code and a reader of the array
+        // keeps it, off one response. This is the same withheld count
+        // `counts.receiver_name_candidates` and
+        // `_kin.completeness.counted.withheld_candidates` publish, from the same
+        // partition, placed where a reader of the headline cannot miss it rather
+        // than as a fourth accounting of it. Emitted at zero as well, because a
+        // field that appears only when it is nonzero is one no reader learns to
+        // look for.
+        "unconfirmed_candidates": candidates.len(),
         "counts": counts,
         "references": references,
         // Same row shape as `references`, held apart because these are not
@@ -4653,9 +4671,13 @@ mod tests {
             coverage["scope_entities"], 1,
             "the kind-filtered absence states the coverage of that kind: {coverage}"
         );
-        let negative =
-            crate::negative::negative_for("semantic_search", &empty, &ready_daemon_envelope(2))
-                .expect("an empty search carries a negative");
+        let negative = crate::negative::negative_for(
+            "semantic_search",
+            &empty,
+            &ready_daemon_envelope(2),
+            &[],
+        )
+        .expect("an empty search carries a negative");
         assert_eq!(negative["safe_to_conclude_absent"], false);
         assert_eq!(negative["trust"], "inconclusive");
         assert!(
@@ -4698,9 +4720,13 @@ mod tests {
         assert_eq!(coverage["language"], "Python");
         assert_eq!(coverage["reference_enrichment"], "unknown");
         assert_eq!(coverage["scope_entities"], 2);
-        let negative =
-            crate::negative::negative_for("semantic_search", &absent, &ready_daemon_envelope(2))
-                .expect("an empty search carries a negative");
+        let negative = crate::negative::negative_for(
+            "semantic_search",
+            &absent,
+            &ready_daemon_envelope(2),
+            &[],
+        )
+        .expect("an empty search carries a negative");
         assert_eq!(negative["safe_to_conclude_absent"], true);
         assert_eq!(negative["trust"], "authoritative");
     }
@@ -4726,9 +4752,13 @@ mod tests {
             0,
             "this graph holds no module entity at all: {empty}"
         );
-        let negative =
-            crate::negative::negative_for("semantic_search", &empty, &ready_daemon_envelope(1))
-                .expect("an empty search carries a negative");
+        let negative = crate::negative::negative_for(
+            "semantic_search",
+            &empty,
+            &ready_daemon_envelope(1),
+            &[],
+        )
+        .expect("an empty search carries a negative");
         assert_eq!(negative["safe_to_conclude_absent"], false);
         assert!(
             negative["trust_reason"]
@@ -4768,9 +4798,13 @@ mod tests {
             coverage.get("scope_entities").is_none(),
             "a walk counts no region, so it publishes no count: {coverage}"
         );
-        let negative =
-            crate::negative::negative_for("graph_neighborhood", &walked, &ready_daemon_envelope(1))
-                .expect("an empty walk carries a negative");
+        let negative = crate::negative::negative_for(
+            "graph_neighborhood",
+            &walked,
+            &ready_daemon_envelope(1),
+            &[],
+        )
+        .expect("an empty walk carries a negative");
         assert_eq!(negative["safe_to_conclude_absent"], false);
 
         let mut missing = HashMap::new();
@@ -4787,6 +4821,7 @@ mod tests {
             "graph_neighborhood",
             &unresolved,
             &ready_daemon_envelope(1),
+            &[],
         )
         .expect("an unresolved focal carries a negative");
         assert!(
@@ -5962,6 +5997,161 @@ mod tests {
             response["negative"]
         );
         assert_eq!(response["negative"]["trust"], "authoritative");
+
+        // FIR-2463 case (b). The collapse must not degrade into refusing
+        // everything: where every input agrees, the one verdict certifies, and a
+        // hardcoded `inconclusive` in the verdict fails right here.
+        assert_eq!(
+            response["_kin"]["verdict"]["state"], "certified",
+            "every input agreed, so the one verdict certifies: {}",
+            response["_kin"]["verdict"]
+        );
+        assert_eq!(
+            response["_kin"]["verdict"]["safe_to_conclude_absent"], true,
+            "{}",
+            response["_kin"]["verdict"]
+        );
+        assert_eq!(
+            response["_kin"]["verdict"]["limiting_factor"],
+            serde_json::Value::Null,
+            "a certified verdict names no limiting factor: {}",
+            response["_kin"]["verdict"]
+        );
+        assert!(
+            response["_kin"]["verdict"]["inputs"]
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|state| state == "certified" || state == "not_applicable"),
+            "certification requires every input that spoke to agree: {}",
+            response["_kin"]["verdict"]
+        );
+        assert_eq!(response["_kin"]["completeness"]["bound"], "exact");
+        assert!(
+            crate::verdict::disagreements(&response).is_empty(),
+            "{:?}",
+            crate::verdict::disagreements(&response)
+        );
+    }
+
+    /// FIR-2463 case (a), the shape a stranger hit on shipped v0.5.42 bytes.
+    ///
+    /// `find_references(HTTPAdapter.send)` on psf/requests answered
+    /// `total_upstream: 0` and `counts.referencing_entities: 0` while the same
+    /// payload carried the one real caller, `Session.send` at
+    /// `sessions.py:784`, in `candidates` as `resolution: name_only`. A reader
+    /// of the headline deletes working code and a reader of the array keeps it,
+    /// off one response.
+    ///
+    /// The fixture is Rust on a graph that links calls across files, so the
+    /// coverage gate and the enrichment gate both clear and the WITHHELD ROW is
+    /// the only thing left that can move the verdict. That is what makes this
+    /// discriminating rather than a fixture that is inconclusive for four
+    /// reasons at once.
+    #[tokio::test]
+    async fn a_withheld_caller_refuses_the_zero_it_was_held_out_of() {
+        let store = InMemoryGraph::new();
+        let target = make_entity("send", "src/requests/adapters.rs");
+        let caller = make_entity("Session.send", "src/requests/sessions.rs");
+        store.upsert_entity(&target).unwrap();
+        store.upsert_entity(&caller).unwrap();
+
+        let mut relation = make_relation_at(
+            caller.id,
+            target.id,
+            RelationKind::Calls,
+            kin_index::resolution::RECEIVER_NAME_FANOUT_CONFIDENCE,
+        );
+        relation.evidence = vec![RelationEvidence {
+            source_span: Some(kin_model::entity::SourceSpan {
+                file: FilePathId::new("src/requests/sessions.rs"),
+                start_byte: 0,
+                end_byte: 1,
+                start_line: 783,
+                start_col: 0,
+                end_line: 783,
+                end_col: 1,
+            }),
+            ..RelationEvidence::default()
+        }];
+        store.upsert_relation(&relation).unwrap();
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let response = parsed_response(&crate::finalize_with_envelope(
+            handle_find_references(&args, &store, None).await.unwrap(),
+            structurally_ready_envelope(),
+            "find_references",
+        ));
+
+        assert_eq!(
+            response["total_upstream"], 0,
+            "the headline still counts only what resolved: {response:#}"
+        );
+        assert_eq!(response["counts"]["referencing_entities"], 0);
+        let candidates = response["candidates"].as_array().unwrap();
+        assert_eq!(candidates.len(), 1, "{response:#}");
+        assert_eq!(
+            candidates[0]["reference_lines"],
+            serde_json::json!([784]),
+            "the held row carries the real call site: {response:#}"
+        );
+
+        // The count may not be read alone.
+        assert_eq!(
+            response["unconfirmed_candidates"], 1,
+            "the zero has to name the row it is holding, at the count: {response:#}"
+        );
+        assert_eq!(response["counts"]["receiver_name_candidates"], 1);
+        assert_eq!(
+            response["_kin"]["completeness"]["counted"]["withheld_candidates"], 1,
+            "one withheld number, three placements: {}",
+            response["_kin"]["completeness"]
+        );
+
+        // And the one verdict refuses.
+        assert_eq!(
+            response["_kin"]["verdict"]["state"], "inconclusive",
+            "{}",
+            response["_kin"]["verdict"]
+        );
+        assert_eq!(
+            response["_kin"]["verdict"]["safe_to_conclude_absent"], false,
+            "{}",
+            response["_kin"]["verdict"]
+        );
+        assert_eq!(
+            response["_kin"]["verdict"]["inputs"]["withheld_candidates"], "inconclusive",
+            "the withheld row is the input that decided: {}",
+            response["_kin"]["verdict"]
+        );
+        assert_eq!(response["negative"]["safe_to_conclude_absent"], false);
+        assert_eq!(response["negative"]["trust"], "inconclusive");
+        assert_eq!(
+            response["_kin"]["completeness"]["bound"], "at_least",
+            "{}",
+            response["_kin"]["completeness"]
+        );
+        assert_eq!(
+            response["_kin"]["completeness"]["counted"]["exact"], false,
+            "{}",
+            response["_kin"]["completeness"]
+        );
+        assert!(
+            !response["_kin"]["completeness"]["note"]
+                .as_str()
+                .unwrap()
+                .contains("the whole set"),
+            "no block may call this the whole set: {}",
+            response["_kin"]["completeness"]
+        );
+        assert!(
+            crate::verdict::disagreements(&response).is_empty(),
+            "{:?}",
+            crate::verdict::disagreements(&response)
+        );
     }
 
     /// FIR-2404 end to end, on a real store rather than a hand-written payload,

@@ -13,6 +13,7 @@ pub mod session;
 pub mod startup_binding;
 pub mod tools;
 pub mod types;
+pub mod verdict;
 
 pub use budget::{
     is_budgeted as is_budgeted_tool, BudgetAccounting, ResponseBudget, RESPONSE_DEFAULT_MAX_CHARS,
@@ -42,3 +43,4 @@ pub use tools::{
 pub use types::{
     ContentBlock, JsonRpcRequest, JsonRpcResponse, ToolCallParams, ToolCallResult, ToolDefinition,
 };
+pub use verdict::{disagreements as verdict_disagreements, Verdict, VERDICT_KEY};
