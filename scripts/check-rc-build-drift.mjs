@@ -59,22 +59,6 @@ export const ADDED_STEPS = [
 // steps; an anchor that stops matching is itself drift and fails below.
 export const DELTAS = [
   {
-    label: "checkout-ref",
-    from: `      - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          persist-credentials: false
-`,
-    to: `      - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          # DELTA(ref): an empty string leaves actions/checkout on the
-          # dispatching ref, so the default input builds what was dispatched.
-          ref: \${{ inputs.ref }}
-          persist-credentials: false
-`,
-  },
-  {
     label: "apt",
     from: `        run: sudo apt-get update && sudo apt-get install -y musl-tools
 `,

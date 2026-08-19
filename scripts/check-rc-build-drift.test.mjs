@@ -171,11 +171,15 @@ test("rc-build.yml grants no permission beyond contents: read", () => {
 });
 
 test("rc-build.yml writes to no Actions cache", () => {
-  // A dispatch builds whatever ref it is handed, so a cache write here would
-  // poison what CI and release builds restore from, and would put unreviewed
-  // cache contents into the bytes under proof.
-  assert.equal(rc.match(/actions\/cache/g), null);
-  assert.equal(rc.match(/rust-cache/g), null);
+  // A candidate archive is the bytes under proof, so it must not be assembled
+  // partly from cache contents nobody reviewed. Read the `uses:` values rather
+  // than the file text: the header names the CodeQL rule, and a guard that
+  // matched prose would fire on its own explanation.
+  const uses = [...rc.matchAll(/^\s*uses:\s*(\S+)/gm)].map((match) => match[1]);
+  assert.ok(uses.length > 0, "rc-build.yml uses no actions at all, so this guard cannot fire");
+  for (const action of uses) {
+    assert.ok(!/cache/i.test(action), `rc-build.yml uses a caching action: ${action}`);
+  }
 });
 
 test("rc-build.yml publishes nothing", () => {
@@ -184,9 +188,15 @@ test("rc-build.yml publishes nothing", () => {
   }
 });
 
-test("rc-build.yml is dispatch-only", () => {
-  const triggers = /\non:\n((?:(?: {2}\S.*| {4}.*|)\n)+?)(?=\npermissions:)/.exec(rc);
-  assert.ok(triggers, "could not read rc-build.yml triggers");
-  const topLevel = triggers[1].split("\n").filter((line) => /^ {2}\S/.test(line));
-  assert.deepEqual(topLevel, ["  workflow_dispatch:"]);
+test("rc-build.yml is dispatch-only, and takes no ref input", () => {
+  const block = /\non:\n([\s\S]*?)(?=\npermissions:)/.exec(rc);
+  assert.ok(block, "could not read rc-build.yml triggers");
+  const triggers = block[1]
+    .split("\n")
+    .filter((line) => /^ {2}[^#\s]/.test(line));
+  assert.deepEqual(triggers, ["  workflow_dispatch:"]);
+  // A ref INPUT is what makes a run started from the default branch check out
+  // untrusted code while holding that branch's scope. `--ref` on the dispatch
+  // carries no such hazard, because the run resolves everything from that ref.
+  assert.equal(/^\s*inputs:/m.test(block[1]), false, "rc-build.yml declares a dispatch input");
 });

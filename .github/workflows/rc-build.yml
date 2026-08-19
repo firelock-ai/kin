@@ -16,7 +16,8 @@ name: RC Build
 # produce a linux-aarch64 archive.
 #
 # This workflow closes that gap. It builds the same archive layouts release.yml
-# builds, for an arbitrary ref, and uploads them as artifacts. It creates no
+# builds, for the branch or tag it is dispatched on, and uploads them as
+# artifacts. It creates no
 # tag, publishes no release, publishes to no registry, and touches no promotion
 # state. It holds no credential: it declares no environment and reads no secret,
 # which is what keeps a dispatch of branch-controlled workflow code away from the
@@ -49,13 +50,15 @@ name: RC Build
 #     stay in release.yml alone until something reads them here.
 
 on:
+  # No ref input. `gh workflow run --ref <branch>` already names the ref, and the
+  # run then resolves this workflow, the code it builds, and its cache scope from
+  # that ref, the way a tag run resolves everything from its tag. Taking a ref as
+  # an INPUT instead means a run started from the default branch checks out
+  # arbitrary code while holding the default branch's scope, which is the cache
+  # poisoning shape CodeQL flags as actions/cache-poisoning/poisonable-step.
+  # The cost is that a candidate must be a branch or tag: the dispatch API does
+  # not accept a bare sha.
   workflow_dispatch:
-    inputs:
-      ref:
-        description: >-
-          Commit sha, branch or tag to build. Defaults to the dispatching ref.
-        required: false
-        default: ""
 
 permissions:
   contents: read
@@ -63,7 +66,7 @@ permissions:
 # A candidate build is disposable, so a newer dispatch for the same ref
 # supersedes an older one rather than queueing behind it.
 concurrency:
-  group: kin-rc-build-${{ github.event.inputs.ref || github.ref }}
+  group: kin-rc-build-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -118,9 +121,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          # DELTA(ref): an empty string leaves actions/checkout on the
-          # dispatching ref, so the default input builds what was dispatched.
-          ref: ${{ inputs.ref }}
           persist-credentials: false
 
       # ADDED: a candidate has no tag to take a version from, and both the macOS
