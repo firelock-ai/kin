@@ -144,6 +144,27 @@ pub fn reset_product_selected_for_tests() {
 mod tests {
     use super::*;
 
+    /// A `KIN_*` name this code sets must be in the central registry, or every
+    /// kin invocation warns that it is probably a typo.
+    ///
+    /// Nothing connects a `set_var` to the registry at compile time, and the
+    /// registry's own doc-drift test only compares the registry against the
+    /// generated doc, so an unregistered name is invisible to every local gate.
+    /// It surfaces only when a real binary runs: the audit warning went to the
+    /// output of `kin ... --json`, and the install proof failed parsing it with
+    /// "Unexpected non-whitespace character after JSON at position 4". This test
+    /// is the connection that was missing.
+    #[test]
+    fn the_provenance_marker_is_a_registered_environment_variable() {
+        for name in [RESOURCE_PROFILE_ENV, RESOURCE_PROFILE_PRODUCT_DEFAULT_ENV] {
+            assert!(
+                kin_core::env_registry::is_known(name),
+                "{name} is set by this module but is not in the env registry, so every kin \
+                 invocation will warn that it is probably a typo and corrupt any JSON output"
+            );
+        }
+    }
+
     #[test]
     fn an_inherited_marker_naming_the_active_value_is_kins_own_default() {
         // The shape a spawned daemon sees: the CLI wrote both, and the child
