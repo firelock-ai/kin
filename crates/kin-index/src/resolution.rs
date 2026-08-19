@@ -106,6 +106,35 @@ impl RelationResolution {
     }
 }
 
+/// Confidence the receiver-method fan-out tier persists.
+///
+/// The tier resolves `x.m(...)` where nothing settles the receiver's type, so
+/// its destination is the weakest thing the linker emits: a method that shares
+/// the leaf name. It is named here rather than written as a literal because
+/// [`is_receiver_name_guess`] recovers the tier from it, and a second copy of
+/// the number is how the two would come apart.
+pub const RECEIVER_NAME_FANOUT_CONFIDENCE: f32 = 0.3;
+
+/// Whether this edge is a receiver-method call the linker matched on the bare
+/// leaf name alone.
+///
+/// `name_only` covers four tiers, and they are not equally weak. A callee
+/// written `Error::msg` that matches exactly one entity in the repository is
+/// stamped `name_only` too, and demoting it would take ordinary cross-file
+/// calls out of every count that reads this. What FIR-1552 is about is
+/// narrower: the tier that answered `find_references(HTTPAdapter.send)` with 33
+/// rows for a method two lines call. This predicate names that tier and nothing
+/// else.
+///
+/// A language server or a hand-authored edge is proven whatever its confidence,
+/// matching [`RelationResolution::of`], so neither can be read as a guess here.
+pub fn is_receiver_name_guess(relation: &Relation) -> bool {
+    !matches!(
+        relation.origin,
+        RelationOrigin::Lsp | RelationOrigin::Manual
+    ) && relation.confidence.to_bits() == RECEIVER_NAME_FANOUT_CONFIDENCE.to_bits()
+}
+
 /// The linker's resolution tiers, as (persisted confidence, what that tier
 /// proved). Kept beside the enum so a new tier has one obvious place to
 /// declare what it proved, and tested in `linker.rs` against the constants the
@@ -128,7 +157,10 @@ pub const RESOLUTION_TIER_LADDER: &[(f32, RelationResolution)] = &[
     // A path-qualified callee reduced by dropping its module prefix.
     (0.6, RelationResolution::NameOnly),
     // Receiver-method fan-out: every same-named method in the repo.
-    (0.3, RelationResolution::NameOnly),
+    (
+        RECEIVER_NAME_FANOUT_CONFIDENCE,
+        RelationResolution::NameOnly,
+    ),
     // Cross-repo placeholder: the destination is not in this repo at all.
     (0.2, RelationResolution::NameOnly),
 ];
@@ -199,6 +231,38 @@ mod tests {
         assert!(!RelationResolution::NameOnly.is_proven());
         assert!(RelationResolution::ImportScoped.is_proven());
         assert!(RelationResolution::TypeResolved.is_proven());
+    }
+
+    #[test]
+    fn only_the_receiver_fanout_tier_reads_as_a_receiver_name_guess() {
+        assert!(is_receiver_name_guess(&relation(
+            RECEIVER_NAME_FANOUT_CONFIDENCE,
+            RelationOrigin::Inferred
+        )));
+        // The other three `name_only` tiers are not this one. An exact-name
+        // match with a single candidate in particular is an ordinary cross-file
+        // call, and counting it as a guess would empty every reference headline.
+        for confidence in [0.7, 0.6, 0.2] {
+            assert_eq!(
+                RelationResolution::of(&relation(confidence, RelationOrigin::Inferred)),
+                RelationResolution::NameOnly,
+                "tier {confidence} is name_only"
+            );
+            assert!(
+                !is_receiver_name_guess(&relation(confidence, RelationOrigin::Inferred)),
+                "but tier {confidence} is not the receiver fan-out"
+            );
+        }
+    }
+
+    #[test]
+    fn a_language_server_edge_is_never_a_receiver_name_guess() {
+        for origin in [RelationOrigin::Lsp, RelationOrigin::Manual] {
+            assert!(!is_receiver_name_guess(&relation(
+                RECEIVER_NAME_FANOUT_CONFIDENCE,
+                origin
+            )));
+        }
     }
 
     #[test]

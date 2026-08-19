@@ -202,8 +202,17 @@ pub fn build_refs_response(
         return Ok(RefsResponse { lines });
     }
 
-    lines.push(format!("referenced by {} entities:", refs.len()));
-    for entry in refs {
+    // FIR-1552. A receiver-method call the linker matched on the bare leaf name
+    // is a candidate, not a caller: nothing at the reference site says the
+    // receiver holds this type. Counting them beside real callers is what let
+    // `find_references(HTTPAdapter.send)` answer 33 for a method two lines call.
+    // The headline counts callers; the candidates get their own heading and
+    // their own count.
+    let (resolved, candidates): (Vec<ReferenceEntry>, Vec<ReferenceEntry>) = refs
+        .into_iter()
+        .partition(|entry| !entry.receiver_name_guess);
+
+    let render = |lines: &mut Vec<String>, entry: &ReferenceEntry| {
         let file_path = entry
             .file_path
             .as_deref()
@@ -220,6 +229,30 @@ pub fn build_refs_response(
             relation_kinds_label(&entry.relation_kinds),
             entry.resolution.as_str()
         ));
+    };
+
+    if resolved.is_empty() {
+        lines.push(format!(
+            "No resolved incoming {} relations.",
+            relation_kinds_label(&relation_kinds)
+        ));
+    } else {
+        lines.push(format!("referenced by {} entities:", resolved.len()));
+        for entry in &resolved {
+            render(&mut lines, entry);
+        }
+    }
+
+    if !candidates.is_empty() {
+        lines.push(format!(
+            "{} receiver-name candidate{} not counted above; each is a call through a \
+             receiver whose type nothing at the reference site settles:",
+            candidates.len(),
+            if candidates.len() == 1 { "" } else { "s" }
+        ));
+        for entry in &candidates {
+            render(&mut lines, entry);
+        }
     }
 
     Ok(RefsResponse { lines })
@@ -417,13 +450,24 @@ pub fn build_bulk_refs_response(
         // human-readable command could actually enumerate. Keep one grouping
         // authority for both paths so the count cannot drift again.
         let collected = collect_graph_references(graph, &entity_id, &relation_kinds)?;
-        let reference_count = collected.references.len();
         let matched_kinds = collected.matched_kinds;
+        // Same split the human-readable surface prints, for the same reason
+        // (FIR-1552): a bare-leaf receiver-method match is not evidence of use.
+        // Reporting the total here while `kin refs` reported the caller count
+        // would put two numbers for one target on two surfaces that share a
+        // collector precisely so they cannot drift.
+        let (resolved, receiver_name): (Vec<_>, Vec<_>) = collected
+            .references
+            .iter()
+            .partition(|entry| !entry.receiver_name_guess);
+        let reference_count = resolved.len();
+        let receiver_name_candidate_count = receiver_name.len();
 
         if !collected.missing_source_ids.is_empty() {
             incomplete_verdict_count += 1;
             let missing_source_count = collected.missing_source_ids.len();
-            let known_reference_count = reference_count + missing_source_count;
+            let known_reference_count =
+                reference_count + receiver_name_candidate_count + missing_source_count;
             let mut row = serde_json::json!({
                 "entity_id": entity_id.to_string(),
                 "has_references": null,
@@ -462,6 +506,7 @@ pub fn build_bulk_refs_response(
                 "entity_id": entity_id.to_string(),
                 "has_references": has_references,
                 "reference_count": reference_count,
+                "receiver_name_candidate_count": receiver_name_candidate_count,
             }));
         } else {
             results.push(serde_json::json!({
@@ -471,6 +516,7 @@ pub fn build_bulk_refs_response(
                 "file_path": entity.file_origin.as_ref().map(|p| p.0.clone()),
                 "has_references": has_references,
                 "reference_count": reference_count,
+                "receiver_name_candidate_count": receiver_name_candidate_count,
                 "matched_kinds": matched_kinds
                     .into_iter()
                     .map(relation_kind_label)
@@ -562,6 +608,12 @@ pub(crate) struct ReferenceEntry {
     /// is a same-name match with nothing at the reference site proving it, so
     /// dead-code reads this to decide whether the row is evidence of use.
     pub(crate) resolution: RelationResolution,
+    /// Whether EVERY edge behind this row is a receiver-method call matched on
+    /// the bare leaf name. `resolution` reports the strongest contributing edge
+    /// and cannot answer this: `name_only` also covers an exact-name match with
+    /// one candidate, which is an ordinary cross-file call. Only the receiver
+    /// fan-out is a candidate rather than a reference (FIR-1552).
+    pub(crate) receiver_name_guess: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -624,6 +676,7 @@ pub(crate) fn collect_graph_references(
     let allowed: std::collections::HashSet<_> = relation_kinds.iter().copied().collect();
     let mut grouped: HashMap<EntityId, Vec<RelationKind>> = HashMap::new();
     let mut resolutions: HashMap<EntityId, RelationResolution> = HashMap::new();
+    let mut receiver_name_guesses: HashMap<EntityId, bool> = HashMap::new();
     let mut matched_kinds = Vec::new();
 
     for rel in graph.get_all_relations_for_entity(entity_id)? {
@@ -648,6 +701,12 @@ pub(crate) fn collect_graph_references(
             .entry(src_entity_id)
             .and_modify(|current| *current = (*current).max(resolution))
             .or_insert(resolution);
+        // Every contributing edge has to be a guess for the row to be one.
+        let guess = kin_index::resolution::is_receiver_name_guess(&rel);
+        receiver_name_guesses
+            .entry(src_entity_id)
+            .and_modify(|current| *current &= guess)
+            .or_insert(guess);
     }
 
     let mut references = Vec::with_capacity(grouped.len());
@@ -668,6 +727,10 @@ pub(crate) fn collect_graph_references(
                 .get(&source_id)
                 .copied()
                 .unwrap_or(RelationResolution::NameOnly),
+            receiver_name_guess: receiver_name_guesses
+                .get(&source_id)
+                .copied()
+                .unwrap_or(false),
         });
     }
     missing_source_ids.sort();
@@ -730,6 +793,94 @@ mod tests {
         refs_not_found_guidance, BulkRefsRequest, BulkRefsResponse, RefsRequest,
     };
     use kin_model::RelationKind;
+
+    /// FIR-1552. The bulk row and the printed answer read one collector so their
+    /// numbers cannot drift, and a bare-leaf receiver-method match is not
+    /// evidence of use on either. Two real callers and three receiver-name
+    /// candidates give a row of `reference_count: 2` beside
+    /// `receiver_name_candidate_count: 3`, never a single `5`.
+    #[test]
+    fn bulk_refs_counts_resolved_callers_and_names_the_candidates_apart() {
+        use kin_db::InMemoryGraph;
+        use kin_model::relation::{Relation, RelationOrigin};
+        use kin_model::{
+            Entity, EntityId, EntityKind, EntityMetadata, EntityRole, EntityStore, FilePathId,
+            FingerprintAlgorithm, GraphNodeId, Hash256, LanguageId, SemanticFingerprint,
+            Visibility,
+        };
+
+        fn entity(name: &str, rel_path: &str) -> Entity {
+            Entity {
+                id: EntityId::new(),
+                kind: EntityKind::Function,
+                name: name.to_string(),
+                language: LanguageId::Rust,
+                fingerprint: SemanticFingerprint {
+                    algorithm: FingerprintAlgorithm::V1TreeSitter,
+                    ast_hash: Hash256::from_bytes([0; 32]),
+                    signature_hash: Hash256::from_bytes([0; 32]),
+                    behavior_hash: Hash256::from_bytes([0; 32]),
+                    equivalence_hash: kin_model::Hash256::from_bytes([0; 32]),
+                    stability_score: 1.0,
+                },
+                file_origin: Some(FilePathId::new(rel_path)),
+                span: None,
+                signature: name.to_string(),
+                visibility: Visibility::Public,
+                role: EntityRole::Source,
+                doc_summary: None,
+                metadata: EntityMetadata::default(),
+                lineage_parent: None,
+                created_in: None,
+                superseded_by: None,
+            }
+        }
+
+        let graph = InMemoryGraph::new();
+        let target = entity("send", "src/adapters.rs");
+        graph.upsert_entity(&target).unwrap();
+        // Two parser-certain callers and three receiver-method guesses, so the
+        // fixture cannot pass on numbers that happen to coincide.
+        for (index, name) in ["proven_a", "proven_b", "guess_a", "guess_b", "guess_c"]
+            .iter()
+            .enumerate()
+        {
+            let caller = entity(name, "src/callers.rs");
+            graph.upsert_entity(&caller).unwrap();
+            graph
+                .upsert_relation(&Relation {
+                    id: kin_model::ids::RelationId::new(),
+                    kind: RelationKind::Calls,
+                    src: GraphNodeId::Entity(caller.id),
+                    dst: GraphNodeId::Entity(target.id),
+                    confidence: if index < 2 {
+                        1.0
+                    } else {
+                        kin_index::resolution::RECEIVER_NAME_FANOUT_CONFIDENCE
+                    },
+                    origin: RelationOrigin::Parsed,
+                    created_in: None,
+                    import_source: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        }
+
+        let response = build_bulk_refs_response(
+            &graph,
+            &BulkRefsRequest {
+                entity_ids: vec![target.id.to_string()],
+                kind: "calls".to_string(),
+                compact: true,
+            },
+        )
+        .unwrap();
+        let row = &response.results[0];
+        assert_eq!(row["reference_count"], 2, "{row}");
+        assert_eq!(row["receiver_name_candidate_count"], 3, "{row}");
+        assert_eq!(row["has_references"], true, "{row}");
+        assert_eq!(response.with_references, 1);
+    }
 
     /// `kin refs` must answer only from graph-owned relation edges. A reference
     /// that exists in the working tree but is not linked into the graph must
