@@ -125,6 +125,15 @@ impl GraphRelationTotals {
 /// The same set `find_references` defaults to. Dead-code, coverage, and
 /// references must not each carry their own list: the four-entity contradiction
 /// FIR-2356 records is what two lists produce.
+/// The two artifact-level edge kinds an import statement can resolve to.
+///
+/// `Includes` is here because a C or C++ `#include` of a repo-local header
+/// resolves through the same import path and lands on the same artifact-level
+/// edge; counting only `Imports` would under-report those languages the same
+/// way `Imports` alone under-reported JavaScript.
+const ARTIFACT_IMPORT_RELATION_KINDS: [RelationKind; 2] =
+    [RelationKind::Imports, RelationKind::Includes];
+
 pub const REFERENCE_RELATION_KINDS: [RelationKind; 3] = [
     RelationKind::Calls,
     RelationKind::Imports,
@@ -180,15 +189,27 @@ pub struct LanguageReferenceCoverage {
     pub parsed_import_statements: Option<u64>,
     /// `Calls` edges the graph holds whose caller is of this language.
     pub resolved_call_edges: u64,
-    /// Entity-level `Imports` edges the graph holds whose importer is of this
-    /// language.
+    /// `Imports` and `Includes` edges the graph holds whose importer is of this
+    /// language, counted at BOTH levels.
     ///
     /// An import of a module this repository owns resolves to an
-    /// ARTIFACT-to-artifact edge, which no entity-rooted query reaches, so this
-    /// counter is normally driven by imports of code outside the repository.
-    /// That is why it does not on its own decide `resolution`: zero here is not
-    /// evidence of a broken graph the way zero call edges is.
+    /// artifact-to-artifact edge. Counting only the entity-rooted ones reported
+    /// `imports 0/220 (0%)` for a JavaScript repository whose relative
+    /// `require` specifiers had all resolved, because a CommonJS module is a
+    /// file and its import edge therefore joins two artifacts. Zero here still
+    /// does not on its own decide `resolution`: an import can only resolve to a
+    /// target the repository holds.
     pub resolved_import_edges: u64,
+    /// Of `parsed_import_statements`, how many name a module outside this
+    /// repository, so no resolver could have produced an in-repo target.
+    ///
+    /// `None` when no file of this language carries the count, which is every
+    /// language whose specifier syntax does not settle the question. Reported
+    /// beside the ratio so a low percentage is readable: an ECMAScript
+    /// repository whose dependencies outnumber its own modules has a low import
+    /// ratio by construction, not by defect.
+    #[serde(default)]
+    pub external_module_imports: Option<u64>,
     /// Reference edges (calls, imports, references) between two entities of
     /// this repository that live in DIFFERENT files. The count a
     /// whole-repository absence claim rests on.
@@ -450,9 +471,15 @@ fn language_summary(coverage: &LanguageReferenceCoverage) -> String {
             coverage.resolved_call_edges
         ),
     };
+    let external = match coverage.external_module_imports {
+        Some(external) if external > 0 => {
+            format!(", {external} name a module outside this repository")
+        }
+        _ => String::new(),
+    };
     let imports = match (coverage.parsed_import_statements, coverage.import_percent()) {
         (Some(parsed), Some(percent)) => format!(
-            "imports {}/{parsed} ({percent}%)",
+            "imports {}/{parsed} ({percent}%){external}",
             coverage.resolved_import_edges
         ),
         (Some(_), None) => format!(
@@ -485,6 +512,8 @@ struct LanguageTally {
     import_statement_files: usize,
     resolved_call_edges: u64,
     resolved_import_edges: u64,
+    external_module_imports: u64,
+    external_module_import_files: usize,
     cross_file: u64,
     intra_file: u64,
     external: u64,
@@ -556,6 +585,12 @@ where
             tally.parsed_import_statements += imports;
             tally.import_statement_files += 1;
         }
+        if let Some(external) =
+            read_count(entity, kin_parser::FILE_PARSED_EXTERNAL_MODULE_IMPORTS_KEY)
+        {
+            tally.external_module_imports += external;
+            tally.external_module_import_files += 1;
+        }
     }
 
     let allowed: HashSet<RelationKind> = REFERENCE_RELATION_KINDS.iter().copied().collect();
@@ -589,6 +624,42 @@ where
         }
     }
 
+    // An import of a module this repository owns joins two ARTIFACTS, not two
+    // entities, so nothing above can see it: the loop reads relations rooted at
+    // an entity, and then keeps only the ones whose endpoints are both
+    // entities. Every relative `require` and every resolved ESM specifier lands
+    // in that blind spot, which is how a JavaScript repository whose imports
+    // had all resolved still reported `imports 0/220 (0%)`. Ask the graph for
+    // them by artifact instead, attributed to the language of the file that
+    // wrote the import.
+    let mut counted_artifact_relations: HashSet<kin_model::RelationId> = HashSet::new();
+    for tally in tallies.values_mut() {
+        let mut files: Vec<&String> = tally.files.iter().collect();
+        files.sort();
+        for file in files {
+            let Ok(repo_path) = kin_model::RepoPath::from_bytes(file.as_bytes()) else {
+                continue;
+            };
+            let Some(artifact_id) = store.artifact_id_at_path(&repo_path) else {
+                continue;
+            };
+            let node = GraphNodeId::Artifact(artifact_id);
+            let neighborhood = store.traverse(&node, &ARTIFACT_IMPORT_RELATION_KINDS, 1)?;
+            for relation in neighborhood.relations {
+                // `traverse` walks both directions, so an edge INTO this file
+                // shows up here too and belongs to the importer's language, not
+                // this one.
+                if relation.src != node
+                    || !ARTIFACT_IMPORT_RELATION_KINDS.contains(&relation.kind)
+                    || !counted_artifact_relations.insert(relation.id)
+                {
+                    continue;
+                }
+                tally.resolved_import_edges += 1;
+            }
+        }
+    }
+
     let languages = tallies
         .into_iter()
         .map(|(language, tally)| {
@@ -609,6 +680,8 @@ where
                 parsed_import_statements,
                 resolved_call_edges: tally.resolved_call_edges,
                 resolved_import_edges: tally.resolved_import_edges,
+                external_module_imports: (tally.external_module_import_files > 0)
+                    .then_some(tally.external_module_imports),
                 cross_file_reference_edges: tally.cross_file,
                 intra_file_reference_edges: tally.intra_file,
                 external_reference_edges: tally.external,
@@ -724,6 +797,146 @@ mod tests {
         }
     }
 
+    /// Build a graph whose repository tree admits every named path, so
+    /// `artifact_id_at_path` answers and artifact-rooted traversal can run.
+    fn graph_with_artifacts(paths: &[&str]) -> (InMemoryGraph, Vec<kin_model::ArtifactId>) {
+        let mut artifacts = Vec::new();
+        let mut ids = Vec::new();
+        for (index, path) in paths.iter().enumerate() {
+            let artifact_id = kin_model::ArtifactId::new();
+            ids.push(artifact_id);
+            artifacts.push(kin_model::ResolvedArtifact::new(
+                artifact_id,
+                kin_model::RepoPath::from_utf8(*path).expect("repo-relative fixture path"),
+                kin_model::TreeEntry::blob(Hash256::from_bytes([index as u8; 32]), false),
+            ));
+        }
+        let mut snapshot = kin_db::GraphSnapshot::empty();
+        snapshot.resolved_tree =
+            kin_model::ResolvedTree::from_artifacts(artifacts).expect("distinct fixture paths");
+        let graph = InMemoryGraph::from_snapshot(snapshot).expect("snapshot loads");
+        (graph, ids)
+    }
+
+    fn js_entity(name: &str, file: &str, imports: u64, external: u64) -> Entity {
+        let mut entity = entity(name, file, Some(1), Some(imports));
+        entity.language = LanguageId::JavaScript;
+        entity.metadata.extra.insert(
+            kin_parser::FILE_PARSED_EXTERNAL_MODULE_IMPORTS_KEY.into(),
+            serde_json::Value::from(external),
+        );
+        entity
+    }
+
+    fn artifact_import(src: kin_model::ArtifactId, dst: kin_model::ArtifactId) -> Relation {
+        Relation {
+            id: RelationId::new(),
+            kind: RelationKind::Imports,
+            src: GraphNodeId::Artifact(src),
+            dst: GraphNodeId::Artifact(dst),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: Some("./express".to_string()),
+            evidence: vec![],
+        }
+    }
+
+    /// FIR-2440. A resolved `require('./lib/express')` joins two ARTIFACTS,
+    /// because a CommonJS module is a file. Counting only entity-rooted edges
+    /// reported `imports 0/220 (0%)` for a repository whose relative specifiers
+    /// had all resolved, and a reader took that for a broken graph.
+    #[test]
+    fn a_resolved_module_import_counts_even_though_it_joins_two_artifacts() {
+        let (graph, ids) = graph_with_artifacts(&["index.js", "lib/express.js"]);
+        graph
+            .upsert_entity(&js_entity("createApplication", "lib/express.js", 3, 3))
+            .unwrap();
+        graph
+            .upsert_entity(&js_entity("moduleExports", "index.js", 1, 0))
+            .unwrap();
+        graph
+            .upsert_relation(&artifact_import(ids[0], ids[1]))
+            .unwrap();
+
+        let coverage = collect_reference_edge_coverage(&graph).unwrap();
+        let js = coverage
+            .languages
+            .iter()
+            .find(|row| row.language == LanguageId::JavaScript.to_string())
+            .expect("javascript row");
+
+        assert_eq!(js.parsed_import_statements, Some(4));
+        assert_eq!(
+            js.resolved_import_edges, 1,
+            "the artifact-level import edge is the resolution, and must be counted"
+        );
+        assert_eq!(js.import_percent(), Some(25));
+        assert_eq!(js.external_module_imports, Some(3));
+    }
+
+    /// The importing file's language owns the edge. `traverse` walks both
+    /// directions from a node, so an edge INTO a file must not be counted a
+    /// second time under the imported file's language.
+    #[test]
+    fn an_artifact_import_edge_is_counted_once_under_the_importer() {
+        let (graph, ids) = graph_with_artifacts(&["app.js", "helper.py"]);
+        graph
+            .upsert_entity(&js_entity("run", "app.js", 1, 0))
+            .unwrap();
+        // `entity` builds a Python entity, which is the imported side here.
+        graph
+            .upsert_entity(&entity("helper", "helper.py", Some(0), Some(0)))
+            .unwrap();
+        graph
+            .upsert_relation(&artifact_import(ids[0], ids[1]))
+            .unwrap();
+
+        let coverage = collect_reference_edge_coverage(&graph).unwrap();
+        let js = coverage
+            .languages
+            .iter()
+            .find(|row| row.language == LanguageId::JavaScript.to_string())
+            .expect("javascript row");
+        let python = coverage
+            .languages
+            .iter()
+            .find(|row| row.language == LanguageId::Python.to_string())
+            .expect("python row");
+        assert_eq!(js.resolved_import_edges, 1);
+        assert_eq!(
+            python.resolved_import_edges, 0,
+            "the imported file did not write the import statement"
+        );
+    }
+
+    /// The rendered line names the external share, so a low ratio reads as a
+    /// repository with more dependencies than modules rather than as a defect.
+    #[test]
+    fn the_summary_line_discloses_imports_that_name_a_module_outside_the_repository() {
+        let (graph, ids) = graph_with_artifacts(&["index.js", "lib/express.js"]);
+        graph
+            .upsert_entity(&js_entity("createApplication", "lib/express.js", 3, 3))
+            .unwrap();
+        graph
+            .upsert_entity(&js_entity("moduleExports", "index.js", 1, 0))
+            .unwrap();
+        graph
+            .upsert_relation(&artifact_import(ids[0], ids[1]))
+            .unwrap();
+
+        let coverage = collect_reference_edge_coverage(&graph).unwrap();
+        let line = coverage
+            .summary_lines()
+            .into_iter()
+            .find(|line| line.contains("javascript:"))
+            .expect("javascript row is rendered");
+        assert!(
+            line.contains("imports 1/4 (25%), 3 name a module outside this repository"),
+            "{line}"
+        );
+    }
+
     /// The founding shape: every resolved call edge is intra-file, the files
     /// import across modules, and no cross-file edge exists, so absence must
     /// not be concluded.
@@ -821,6 +1034,7 @@ mod tests {
                 parsed_import_statements: Some(16),
                 resolved_call_edges: 16,
                 resolved_import_edges: 0,
+                external_module_imports: None,
                 cross_file_reference_edges: 0,
                 intra_file_reference_edges: 16,
                 external_reference_edges: 0,
@@ -933,6 +1147,7 @@ mod tests {
             parsed_import_statements: Some(2),
             resolved_call_edges: 4,
             resolved_import_edges: 2,
+            external_module_imports: None,
             cross_file_reference_edges: 2,
             intra_file_reference_edges: 2,
             external_reference_edges: 0,

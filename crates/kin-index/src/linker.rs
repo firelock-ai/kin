@@ -160,12 +160,40 @@ impl FileParseDataWithTests {
 }
 
 /// Extensions to try when resolving a bare module path.
+///
+/// The four ECMAScript module extensions sit with the other JavaScript ones
+/// because Node resolves `./x` to `x.mjs` or `x.cjs` exactly as it resolves it
+/// to `x.js`. Leaving them out made every `.mjs`/`.cjs` module in a repository
+/// unreachable through a relative specifier, which is the whole import surface
+/// of a modern ESM package.
 const MODULE_EXTENSIONS: &[&str] = &[
-    "ts", "tsx", "js", "jsx", "py", "rs", "go", "h", "hh", "hpp", "hxx",
+    "ts", "tsx", "js", "jsx", "mjs", "cjs", "mts", "cts", "py", "rs", "go", "h", "hh", "hpp", "hxx",
 ];
 
 /// Index filenames to try when resolving a directory module path.
-const INDEX_FILENAMES: &[&str] = &["index.ts", "index.tsx", "index.js", "index.jsx", "mod.rs"];
+const INDEX_FILENAMES: &[&str] = &[
+    "index.ts",
+    "index.tsx",
+    "index.js",
+    "index.jsx",
+    "index.mjs",
+    "index.cjs",
+    "mod.rs",
+];
+
+/// Source extensions a specifier's written JavaScript extension can stand for.
+///
+/// Node ESM requires the extension in the specifier, and a TypeScript package
+/// compiled for NodeNext writes `./util.js` in source whose file on disk is
+/// `util.ts`. The specifier names the emitted artifact; the repository holds the
+/// input. Substituting only within a pair keeps this a rewrite of one known
+/// emit convention rather than a search for a same-stemmed file.
+const EMITTED_EXTENSION_SOURCES: &[(&str, &[&str])] = &[
+    ("js", &["ts", "tsx"]),
+    ("jsx", &["tsx"]),
+    ("mjs", &["mts"]),
+    ("cjs", &["cts"]),
+];
 
 /// Resolve cross-file relations across all parsed files.
 ///
@@ -3368,6 +3396,12 @@ where
     S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
 {
     let resolved_path = resolve_module_path(importer_file, &import.module_path, known_files)?;
+    // `require('.')` from a file that IS its directory's index resolves back to
+    // the importer. A module does not import itself, and a self-loop would be
+    // counted as a resolved import by every surface that reads these edges.
+    if resolved_path == importer_file {
+        return None;
+    }
     let kind = if is_header_like_module_path(&import.module_path) {
         RelationKind::Includes
     } else {
@@ -3701,24 +3735,50 @@ where
         let importer = Path::new(importer_path);
         let importer_dir = importer.parent().unwrap_or(Path::new(""));
 
-        let resolved = normalize_path(&importer_dir.join(module_path));
+        // A specifier written with a trailing slash names the directory, which
+        // is Node's "resolve to the index file inside it" form. Joining it as
+        // written leaves an empty final component that no candidate matches.
+        let trimmed = module_path.trim_end_matches('/');
+        let joined = if trimmed.is_empty() {
+            importer_dir.to_path_buf()
+        } else {
+            importer_dir.join(trimmed)
+        };
+        let resolved = normalize_path(&joined);
         let resolved_str = resolved.to_string_lossy();
         // Try direct match (module path already has extension)
         if known_files.contains(resolved_str.as_ref()) {
             return Some(resolved_str.into_owned());
         }
 
-        // Try adding common extensions
-        for ext in MODULE_EXTENSIONS {
-            let candidate = format!("{}.{}", resolved_str, ext);
-            if known_files.contains(candidate.as_str()) {
-                return Some(candidate);
+        // The specifier may name the emitted JavaScript of a TypeScript source
+        // this repository holds instead.
+        if let Some(candidate) = resolve_emitted_extension(&resolved_str, known_files) {
+            return Some(candidate);
+        }
+
+        // Try adding common extensions. An empty resolved path is the
+        // repository root, which names a directory and never a file stem.
+        if !resolved_str.is_empty() {
+            for ext in MODULE_EXTENSIONS {
+                let candidate = format!("{}.{}", resolved_str, ext);
+                if known_files.contains(candidate.as_str()) {
+                    return Some(candidate);
+                }
             }
         }
 
-        // Try as directory with index file
+        // Try as directory with index file. `require('../..')` from a nested
+        // example directory names the repository root, and joining an index
+        // filename onto an empty prefix produced the absolute-looking
+        // `/index.js`, which matches no repo-relative path. That one missing
+        // branch was 96 of express's 157 relative specifiers.
         for index in INDEX_FILENAMES {
-            let candidate = format!("{}/{}", resolved_str, index);
+            let candidate = if resolved_str.is_empty() {
+                (*index).to_string()
+            } else {
+                format!("{}/{}", resolved_str, index)
+            };
             if known_files.contains(candidate.as_str()) {
                 return Some(candidate);
             }
@@ -3737,6 +3797,27 @@ where
             // Go module resolution: github.com/org/repo/v2/pkg/foo → pkg/foo/*.go
             .or_else(|| resolve_go_module_import(module_path, known_files))
     }
+}
+
+/// Resolve a specifier that names an emitted JavaScript file to the TypeScript
+/// source the repository actually holds.
+///
+/// Returns `None` when the specifier carries no JavaScript extension, so a
+/// caller can fall through to plain extension completion.
+fn resolve_emitted_extension<S>(resolved_path: &str, known_files: &HashSet<S>) -> Option<String>
+where
+    S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
+{
+    let (stem, written) = resolved_path.rsplit_once('.')?;
+    let sources = EMITTED_EXTENSION_SOURCES
+        .iter()
+        .find_map(|(emitted, sources)| (*emitted == written).then_some(*sources))?;
+    sources.iter().find_map(|source| {
+        let candidate = format!("{stem}.{source}");
+        known_files
+            .contains(candidate.as_str())
+            .then_some(candidate)
+    })
 }
 
 /// Source extensions a Python module name can materialize as.
@@ -7985,6 +8066,83 @@ void f();
         let known: HashSet<&str> = ["src/utils/index.ts"].into_iter().collect();
         let result = resolve_module_path("src/routes/api.ts", "../utils", &known);
         assert_eq!(result, Some("src/utils/index.ts".to_string()));
+    }
+
+    /// `require('../..')` from a nested directory names the repository root.
+    /// Joining an index filename onto the empty resolved prefix produced the
+    /// absolute-looking `/index.js`, which matches no repo-relative path.
+    #[test]
+    fn resolve_module_path_repository_root_resolves_to_its_index() {
+        let known: HashSet<&str> = ["index.js", "lib/express.js"].into_iter().collect();
+        assert_eq!(
+            resolve_module_path("examples/auth/index.js", "../..", &known),
+            Some("index.js".to_string())
+        );
+        assert_eq!(
+            resolve_module_path("examples/mvc/lib/boot.js", "../../..", &known),
+            Some("index.js".to_string())
+        );
+        assert_eq!(
+            resolve_module_path("examples/auth/index.js", "../../", &known),
+            Some("index.js".to_string()),
+            "the trailing-slash spelling names the same directory"
+        );
+    }
+
+    /// A repository root that holds no index file resolves to nothing rather
+    /// than to whatever else sits at the top level.
+    #[test]
+    fn resolve_module_path_repository_root_without_an_index_resolves_to_nothing() {
+        let known: HashSet<&str> = ["lib/express.js"].into_iter().collect();
+        assert_eq!(
+            resolve_module_path("examples/auth/index.js", "../..", &known),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_module_path_completes_ecmascript_module_extensions() {
+        let known: HashSet<&str> = ["src/deep/mod.mjs", "src/legacy.cjs", "src/pkg/index.mjs"]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            resolve_module_path("src/a.js", "./deep/mod", &known),
+            Some("src/deep/mod.mjs".to_string())
+        );
+        assert_eq!(
+            resolve_module_path("src/a.js", "./legacy", &known),
+            Some("src/legacy.cjs".to_string())
+        );
+        assert_eq!(
+            resolve_module_path("src/a.js", "./pkg", &known),
+            Some("src/pkg/index.mjs".to_string())
+        );
+    }
+
+    /// A NodeNext specifier names the emitted `.js`; the repository holds the
+    /// `.ts` it was emitted from.
+    #[test]
+    fn resolve_module_path_substitutes_the_typescript_source_for_emitted_javascript() {
+        let known: HashSet<&str> = ["src/util.ts", "src/view.tsx", "src/esm.mts"]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            resolve_module_path("src/a.mjs", "./util.js", &known),
+            Some("src/util.ts".to_string())
+        );
+        assert_eq!(
+            resolve_module_path("src/a.mjs", "./view.jsx", &known),
+            Some("src/view.tsx".to_string())
+        );
+        assert_eq!(
+            resolve_module_path("src/a.mjs", "./esm.mjs", &known),
+            Some("src/esm.mts".to_string())
+        );
+        assert_eq!(
+            resolve_module_path("src/a.mjs", "./missing.js", &known),
+            None,
+            "the substitution only ever names a file the repository holds"
+        );
     }
 
     #[test]
