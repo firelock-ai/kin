@@ -2968,11 +2968,14 @@ mod tests {
         );
     }
 
-    /// A pack fixture with both dependency shapes: a class whose only edges are
+    /// A pack fixture with every dependency shape: a class whose only edges are
     /// containment, so its dependency section can only be filled from the
     /// neighbours in its file, and a function that really does call two
-    /// entities. One store, so the two answers are told apart by what the
-    /// payload says rather than by which fixture produced it.
+    /// entities and is itself called by a third. One store, so the answers are
+    /// told apart by what the payload says rather than by which fixture
+    /// produced it. `renderer` calls `reader`, which makes `reader` a focal
+    /// with both directions on it: two things it needs, one thing that needs
+    /// it.
     struct PackProvenanceFixture {
         _dir: tempfile::TempDir,
         _env: EnvVarGuard,
@@ -2980,6 +2983,7 @@ mod tests {
         authority: RequestRepositoryAuthority,
         note_store: Entity,
         reader: Entity,
+        renderer: Entity,
     }
 
     const NOTES_SOURCE: &str = "export class NoteStore {\n  open(): void {}\n  close(): void {}\n  stats(): number { return 0; }\n}\n";
@@ -3072,6 +3076,13 @@ mod tests {
             EntityKind::Class,
             1,
         );
+        let renderer = file_entity(
+            "render.ts",
+            "export function renderNotes(): string {\n  return \"\";\n}\n",
+            "renderNotes",
+            EntityKind::Function,
+            0,
+        );
 
         // The class's only edges are containment, which is the shape that sends
         // the builder to its same-file fallback: edges exist, none of them is a
@@ -3101,6 +3112,9 @@ mod tests {
         }
         store.insert_test_calls_relation(&reader, &link_record);
         store.insert_test_calls_relation(&reader, &note_record);
+        // The arriving edge. `reader` does not depend on `renderNotes`; changing
+        // `reader` is what breaks it.
+        store.insert_test_calls_relation(&renderer, &reader);
 
         install_empty_store_exact_tree(&mut store, dir.path());
         let authority = test_repository_authority(dir.path());
@@ -3112,6 +3126,7 @@ mod tests {
             authority,
             note_store,
             reader,
+            renderer,
         }
     }
 
@@ -3217,6 +3232,88 @@ mod tests {
             );
             assert_eq!(value["dependency_selection"]["same_file_candidates"], 0);
         }
+    }
+
+    /// The greenfield stranger's pack called its focal's callers "dependencies"
+    /// and sorted the one real callee last of ten. Both directions ride the same
+    /// relation kinds, so the endpoint alone cannot say which question a row
+    /// answers, and one list named for half of what it carried made the wrong
+    /// answer the readable one.
+    #[test]
+    fn a_context_pack_serves_dependencies_and_dependents_as_separate_named_groups() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = pack_provenance_fixture();
+
+        for compact in [false, true] {
+            let value = context_pack_json(&fixture, &fixture.reader, compact);
+
+            let dependents = value["dependents"].as_array().unwrap_or_else(|| {
+                panic!("the pack must name the group holding what depends on the focal: {value}")
+            });
+            assert_eq!(
+                dependents.len(),
+                1,
+                "one entity calls the focal (compact={compact}): {value}"
+            );
+            assert_eq!(
+                dependents[0]["id"],
+                serde_json::json!(fixture.renderer.id.to_string()),
+                "the caller belongs in `dependents` (compact={compact}): {value}"
+            );
+            assert_eq!(
+                dependents[0]["relation"],
+                serde_json::json!("dependent_edge"),
+                "an arriving edge must say which way it points (compact={compact}): {value}"
+            );
+
+            let dependencies = value["dependencies"]
+                .as_array()
+                .unwrap_or_else(|| panic!("the pack must carry dependency rows: {value}"));
+            assert!(
+                dependencies
+                    .iter()
+                    .all(|row| row["id"] != serde_json::json!(fixture.renderer.id.to_string())),
+                "a caller must not be served as something the focal depends on \
+                 (compact={compact}): {value}"
+            );
+            assert_eq!(
+                value["dependency_selection"]["returned"],
+                serde_json::json!(2),
+                "`returned` counts the group it describes (compact={compact}): {value}"
+            );
+            assert_eq!(
+                value["dependency_selection"]["dependents_returned"],
+                serde_json::json!(1),
+                "the selection must count both groups (compact={compact}): {value}"
+            );
+        }
+    }
+
+    /// A focal with no callers still names the group, because "nothing depends
+    /// on this" and "this build does not report dependents" are different
+    /// answers and a caller deciding whether a change is safe acts on the first.
+    #[test]
+    fn a_context_pack_names_the_dependents_group_even_when_it_is_empty() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = pack_provenance_fixture();
+
+        let value = context_pack_json(&fixture, &fixture.note_store, false);
+        assert_eq!(
+            value["dependents"],
+            serde_json::json!([]),
+            "an empty group is still an answer: {value}"
+        );
+        assert_eq!(
+            value["dependency_selection"]["dependents_returned"],
+            serde_json::json!(0),
+            "{value}"
+        );
     }
 
     /// `compact: true` dropped the focal body while still paying for the read

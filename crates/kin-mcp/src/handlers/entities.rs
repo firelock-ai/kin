@@ -652,13 +652,16 @@ which measures the serialized response this call returns, as what the call costs
 `focal_entity.body` in the response IS the focal entity's exact source text, so this one \
 call already answers \"show me the code\": no follow-up read is needed, and it is the body \
 to edit and stage back, in compact mode too, which drops the dependency bodies and \
-projection levels but never the focal body. Every dependency row says why it is there: \
-`relation: \"dependency_edge\"` is an edge the graph asserts, and \
-`relation: \"same_file_neighbor\"` means the focal had no dependency edge at all, so the \
-row is a neighbour sharing the focal's file rather than anything the focal depends on. \
-That is the usual shape for a class whose only edges are containment. \
-`dependency_selection` names which of the two filled the list and, for the fallback, how \
-many same-file candidates there were and how many were dropped to fit. \
+projection levels but never the focal body. The two directions are separate groups, because they answer opposite questions: \
+`dependencies` is what the focal needs to run, and `dependents` is what breaks if you \
+change it. Every row also says why it is there: `relation: \"dependency_edge\"` is an \
+edge leaving the focal, `relation: \"dependent_edge\"` is an edge arriving at it, and \
+`relation: \"same_file_neighbor\"` means the focal had no dependency edge in either \
+direction, so the row is a neighbour sharing the focal's file rather than anything the \
+focal depends on. That last one is the usual shape for a class whose only edges are \
+containment, and those rows sort after the real edges. `dependency_selection` names \
+which of the two filled the list, how many rows each group returned, and, for the \
+fallback, how many same-file candidates there were and how many were dropped to fit. \
 If get_entity_source is available to you it is cheaper for a raw \
 body alone; if you need to follow an actual call chain step by step, use trace_data_flow.";
 
@@ -803,11 +806,25 @@ pub fn handle_get_context_pack<G: GraphStore>(
         }
     };
 
-    let dependencies: Vec<_> = pack
-        .dependency_signatures
-        .iter()
-        .map(|entry| project_dep(entry, Some(selection.relation_for(&entry.entity_id))))
-        .collect::<Result<Vec<_>>>()?;
+    // The dependency section carries both directions, so it is served as two
+    // groups named for what they are. Serving it as one list called
+    // `dependencies` reported a focal's callers as things the focal depends on,
+    // which is the opposite claim and the one an agent acts on when it decides
+    // what it may safely change. The builder has already ordered the section so
+    // real dependencies precede dependents and fallback neighbours, and that
+    // order survives the partition.
+    let mut dependencies: Vec<serde_json::Value> = Vec::new();
+    let mut dependents: Vec<serde_json::Value> = Vec::new();
+    for entry in &pack.dependency_signatures {
+        let relation = selection.relation_for(&entry.entity_id);
+        let row = project_dep(entry, Some(relation))?;
+        match relation {
+            DependencyRelation::DependentEdge => dependents.push(row),
+            DependencyRelation::DependencyEdge | DependencyRelation::SameFileNeighbor => {
+                dependencies.push(row)
+            }
+        }
+    }
     let transitive: Vec<_> = pack
         .transitive_deps
         .iter()
@@ -820,12 +837,18 @@ pub fn handle_get_context_pack<G: GraphStore>(
     // caller deciding whether to ask again needs it most when the answer is
     // small.
     let returned = dependencies.len();
+    let dependents_returned = dependents.len();
     let mut result = serde_json::json!({
         "focal_entity": focal_json,
         "dependencies": dependencies,
+        // Always present, empty included. "no dependents" and "this build does
+        // not report dependents" are different answers, and a group that
+        // appears only when populated cannot tell them apart.
+        "dependents": dependents,
         "dependency_selection": {
             "source": selection.source().as_str(),
             "returned": returned,
+            "dependents_returned": dependents_returned,
             "same_file_candidates": selection.same_file_candidates(),
             "same_file_dropped": selection.same_file_dropped(),
         },

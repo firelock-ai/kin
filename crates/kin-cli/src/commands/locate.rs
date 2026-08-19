@@ -1837,6 +1837,54 @@ fn record_vector_index_degradation(
     );
 }
 
+/// Disclose that this store is too small for a description query to rank well.
+///
+/// The threshold is the ranker's own fusion constant, not a number picked to fit
+/// the symptom. A ranked list contributes `1 / (k + rank + 1)` to a fused score,
+/// so across `n` entities the best and worst rows differ by a factor of
+/// `(k + n) / (k + 1)`. While `n` stays under `k` that whole span is under two:
+/// the corpus sits inside the flat part of the curve, rank position carries less
+/// than the constant does, and a description query, whose evidence is diffuse to
+/// begin with, has nothing left to separate candidates with. Tuning
+/// `KIN_LOCATE_RRF_K` therefore moves this disclosure with the behaviour it
+/// describes.
+///
+/// Exact names are unaffected and are what the remediation points at: a named
+/// hit sorts by its name tier ABOVE the fused score rather than through it, so
+/// it cannot be outbid by the flat band this entry is about.
+///
+/// This is a fact about the store, not a report that the query ran degraded.
+/// Every signal ran and nothing was cut, which is why
+/// [`kin_mcp::negative`] excludes this pair from the absence gate: a small graph
+/// makes an absence more trustworthy, not less, and gating on it would refuse to
+/// certify absences on exactly the stores where they are most reliable.
+///
+/// Ranking behaviour is deliberately unchanged here. Blending the signals
+/// differently at this scale is a measured project; saying so is not.
+fn record_small_corpus_degradation(entity_count: usize, sink: &mut Vec<RetrievalDegradation>) {
+    let threshold = locate_rrf_k() as usize;
+    if entity_count >= threshold {
+        return;
+    }
+    record_degradation(
+        sink,
+        RetrievalDegradation {
+            component: kin_mcp::negative::CORPUS_SCALE_COMPONENT.to_string(),
+            reason: kin_mcp::negative::SMALL_CORPUS_REASON.to_string(),
+            detail: format!(
+                "this graph holds {entity_count} entities, under the {threshold}-entity rank \
+                 fusion constant this ranker scores with, so a query phrased as a description \
+                 has too little signal to separate candidates and can rank the obvious target \
+                 low or miss it"
+            ),
+            remediation: "at this size ask by exact entity or file name, or by a literal \
+                 string you expect in the code; description queries earn their accuracy as the \
+                 graph grows"
+                .to_string(),
+        },
+    );
+}
+
 /// Record the active hardware capability tier as a structured degradation when
 /// it runs below the full pipeline. `LocateProfile` silently scales the graph
 /// multihop budget with the machine's effective cores/RAM (shallower depth, a
@@ -2495,6 +2543,9 @@ fn run_with_graph_capture_budgeted(
     // tier some retrieval signals are off, and that must never be silent — nor
     // must a tier that a failed host probe, rather than the host, chose.
     record_capability_tier_degradation(&detection, &mut degradations);
+    // Say when the graph is too small for a description query to rank well,
+    // rather than serving a weak answer that looks like a confident one.
+    record_small_corpus_degradation(graph.entity_count(), &mut degradations);
     // A caller that asked for tests outranks the keyword heuristic. Folding the
     // ask into `test_query` is what makes every stage that already respects the
     // heuristic respect the ask too, rather than adding a second, differently
@@ -17598,6 +17649,58 @@ mod tests {
         sink.iter()
             .find(|entry| entry.component == "capability_tier")
             .expect("a sub-Performance tier must record a capability_tier degradation")
+    }
+
+    /// The greenfield stranger stopped trusting description queries on a
+    /// five-module project and fell back to grep, which was the right call and
+    /// one the tool never made for them. Below the fusion constant the whole
+    /// corpus sits in the flat part of the curve, so the honest move is to say
+    /// so rather than serve a weak answer that looks like a confident one.
+    #[test]
+    fn a_graph_under_the_fusion_constant_discloses_that_descriptions_rank_weakly() {
+        let threshold = locate_rrf_k() as usize;
+        let small = threshold.saturating_sub(1);
+
+        let mut sink = Vec::new();
+        record_small_corpus_degradation(small, &mut sink);
+        let entry = sink
+            .iter()
+            .find(|entry| entry.component == kin_mcp::negative::CORPUS_SCALE_COMPONENT)
+            .unwrap_or_else(|| {
+                panic!(
+                    "a graph of {small} entities is under the {threshold}-entity fusion \
+                        constant and must disclose it, got {sink:?}"
+                )
+            });
+        assert_eq!(entry.reason, kin_mcp::negative::SMALL_CORPUS_REASON);
+        assert!(
+            entry.detail.contains(&format!("{small} entities")),
+            "the entry must name the count it is about: {}",
+            entry.detail
+        );
+        assert!(
+            entry.detail.contains(&threshold.to_string()),
+            "and the threshold it is measured against: {}",
+            entry.detail
+        );
+        assert!(
+            entry.remediation.contains("exact entity or file name"),
+            "the remediation must name the form that does work at this size: {}",
+            entry.remediation
+        );
+
+        // The control that makes the threshold mean something: a graph at the
+        // constant discloses nothing, so this cannot be an entry every store
+        // carries.
+        let mut large = Vec::new();
+        record_small_corpus_degradation(threshold, &mut large);
+        assert!(
+            large.is_empty(),
+            "a graph of {threshold} entities is not a small corpus, got {large:?}"
+        );
+        let mut much_larger = Vec::new();
+        record_small_corpus_degradation(threshold * 100, &mut much_larger);
+        assert!(much_larger.is_empty(), "{much_larger:?}");
     }
 
     /// The misread host in the surface a caller actually reads. A tier the host

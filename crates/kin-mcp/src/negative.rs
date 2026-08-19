@@ -851,8 +851,41 @@ fn trace_flow_gaps(payload: &Value) -> Vec<String> {
     gaps
 }
 
+/// The component and reason a retrieval payload files its corpus-scale
+/// disclosure under.
+///
+/// The names live here rather than at the surface that writes them because the
+/// exemption below is what makes them meaningful, and a name that moved without
+/// its exemption would silently start blocking absence claims. `kin-cli`'s
+/// locate path writes entries under this pair; nothing else may.
+pub const CORPUS_SCALE_COMPONENT: &str = "corpus_scale";
+/// See [`CORPUS_SCALE_COMPONENT`].
+pub const SMALL_CORPUS_REASON: &str = "small_corpus";
+
+/// Whether a `component:reason` label describes the STORE rather than the run.
+///
+/// A corpus-scale disclosure says a graph is too small for a description query
+/// to rank well. Every signal still ran, nothing was cut, and the pipeline
+/// answered at full capability: the corpus simply has little to say. Treating
+/// it as a run degradation would be wrong in the one direction that matters
+/// here, because a small graph makes an absence MORE trustworthy, not less,
+/// and there is less in it to have been missed. Folding it into the gate would
+/// have made every absence claim on a small store uncertifiable on the grounds
+/// that the store was small.
+///
+/// It stays in the payload's own `degradations[]`, where a caller reads it. This
+/// only keeps it out of the run-quality verdicts below.
+fn describes_the_store_not_the_run(label: &str) -> bool {
+    label.split_once(':').is_some_and(|(component, reason)| {
+        component == CORPUS_SCALE_COMPONENT && reason == SMALL_CORPUS_REASON
+    })
+}
+
 /// The degradations a retrieval payload reported about its OWN run, as stable
 /// `component:reason` labels.
+///
+/// Corpus-scale disclosures are excluded: they describe the store, not the run.
+/// See [`describes_the_store_not_the_run`].
 ///
 /// The envelope's [`Degraded`] flags describe the daemon; this array describes
 /// the query that just ran, and the two are not the same fact. A locate page
@@ -878,6 +911,7 @@ fn payload_degradation_labels(payload: &Value) -> Vec<String> {
             let reason = entry.get("reason").and_then(Value::as_str)?;
             Some(format!("{component}:{reason}"))
         })
+        .filter(|label| !describes_the_store_not_the_run(label))
         .collect()
 }
 
@@ -2172,6 +2206,84 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("no degraded signals"));
+    }
+
+    /// A small store is a fact about the corpus, not a report that the query
+    /// ran degraded, and an absence found in a small graph is MORE trustworthy
+    /// rather than less: there is less in it to have been missed. Folding the
+    /// disclosure into the run-quality gate would have refused to certify
+    /// absences on exactly the stores where they are most reliable.
+    #[test]
+    fn a_corpus_scale_disclosure_does_not_make_an_absence_inconclusive() {
+        let small = json!({
+            "query": "where do notes get written to disk",
+            "results": [],
+            "total_ranked": 0,
+            "degradations": [{
+                "component": CORPUS_SCALE_COMPONENT,
+                "reason": SMALL_CORPUS_REASON,
+                "detail": "this graph holds 41 entities, under the 60-entity rank fusion \
+                           constant this ranker scores with",
+                "remediation": "ask by exact entity or file name",
+            }],
+        });
+        let negative = negative_for(
+            "semantic_locate",
+            &small,
+            &semantic_authoritative_envelope(),
+        )
+        .expect("empty results yields a negative");
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(true),
+            "a small corpus is not a degraded run: {negative}"
+        );
+        assert_eq!(
+            negative["degraded_signals"],
+            json!([]),
+            "no signal degraded; every one of them ran: {negative}"
+        );
+        assert!(
+            !negative["trust_reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("retrieval_degraded"),
+            "the store's size is not a reason to distrust this run: {negative}"
+        );
+
+        // The control that keeps the exemption from swallowing real
+        // degradations: one genuine run degradation beside it still blocks.
+        let mut mixed = small.clone();
+        mixed["degradations"] = json!([
+            {
+                "component": CORPUS_SCALE_COMPONENT,
+                "reason": SMALL_CORPUS_REASON,
+                "detail": "small",
+                "remediation": "name it",
+            },
+            {
+                "component": "vector_sidecar",
+                "reason": "retired_entity_keys",
+                "detail": "40 ranked vector key(s) resolved to entities the graph no longer holds",
+                "remediation": "run 'kin embed'",
+            },
+        ]);
+        let negative = negative_for(
+            "semantic_locate",
+            &mixed,
+            &semantic_authoritative_envelope(),
+        )
+        .unwrap();
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(false),
+            "a real degradation must still block, exemption or not: {negative}"
+        );
+        assert_eq!(
+            negative["degraded_signals"],
+            json!(["vector_sidecar:retired_entity_keys"]),
+            "the exempt label is the only one dropped: {negative}"
+        );
     }
 
     #[test]
