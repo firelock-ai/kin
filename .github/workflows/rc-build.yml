@@ -913,6 +913,18 @@ jobs:
             setup-shell: powershell
 
     steps:
+      # Before the checkout, or it has nothing to act on. Windows otherwise
+      # checks out CRLF, and rc-build run 32275955235 is what that costs: every
+      # line of the workflow carried a trailing \r, the reconciler's exact match
+      # on "  build:" found nothing, and it reported "rc-build.yml has no build
+      # job to read a matrix from". That reads as a verdict about the workflow
+      # and was a fact about the probe. The parser below strips \r as well, so
+      # neither half of the fix depends on the other.
+      - name: Preserve tracked bytes on Windows
+        if: runner.os == 'Windows'
+        shell: bash
+        run: git config --global core.autocrlf false
+
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -924,12 +936,37 @@ jobs:
           ARTIFACT: ${{ matrix.artifact }}
           COVERED: ${{ matrix.covered }}
         run: |
-          set -euo pipefail
-          node <<'NODE'
+          set -uo pipefail
+          # `-e` is on by default in this shell and must be off across the
+          # reconciler, because a nonzero exit is one of its answers rather than
+          # an accident. Every path below exits explicitly.
+          set +e
+          verdict=kin-coverage-verdict.txt
+          rm -f "$verdict"
+          # Three outcomes that must never be confusable. RECONCILED and
+          # MISMATCH are verdicts about the build matrix. Anything else is
+          # UNREADABLE, which is a fact about this probe and says nothing about
+          # coverage. The verdict is a FILE rather than an exit code alone, so a
+          # reconciler that died before answering cannot be read as one that
+          # answered: run 32275955235 threw exit 1 for a CRLF parse failure,
+          # which is the same exit a real mismatch would have used.
+          VERDICT_FILE="$verdict" node <<'NODE'
           const fs = require("fs");
-          const lines = fs.readFileSync(".github/workflows/rc-build.yml", "utf8").split("\n");
+          const write = (line) => fs.writeFileSync(process.env.VERDICT_FILE, `${line}\n`);
+          const unreadable = (why) => { write(`UNREADABLE ${why}`); process.exit(30); };
+          const mismatch = (why) => { write(`MISMATCH ${why}`); process.exit(20); };
+          let lines;
+          try {
+            // Split on either line ending. A CRLF checkout otherwise leaves a
+            // trailing \r on every line and no exact match can land.
+            lines = fs.readFileSync(".github/workflows/rc-build.yml", "utf8").split(/\r?\n/);
+          } catch (error) {
+            unreadable(`this probe could not read .github/workflows/rc-build.yml: ${error.message}`);
+          }
           const start = lines.indexOf("  build:");
-          if (start === -1) throw new Error("rc-build.yml has no build job to read a matrix from");
+          if (start === -1) {
+            unreadable("this probe found no '  build:' line in rc-build.yml, so it read no matrix at all");
+          }
           let end = lines.length;
           for (let i = start + 1; i < lines.length; i += 1) {
             if (/^  [A-Za-z_][A-Za-z0-9_-]*:\s*$/.test(lines[i])) { end = i; break; }
@@ -939,23 +976,48 @@ jobs:
             .filter((line) => /^\s+artifact:\s/.test(line))
             .map((line) => line.trim().slice("artifact:".length).trim());
           // A parse that silently returned nothing would make every claim below
-          // read as "not built", which is the answer this job is here to stop
-          // anyone from faking. Refuse an empty or implausible read first.
+          // read as "not built", which is the answer this job exists to stop
+          // anyone from faking. That is a broken probe, not an uncovered
+          // platform, so it reports UNREADABLE rather than a verdict.
           if (built.length < 2 || !built.includes("kin-linux-x86_64")) {
-            throw new Error(`read ${built.length} artifact rows out of the build matrix (${built.join(", ") || "none"}); the parse, not the matrix, is what failed`);
+            unreadable(`this probe read ${built.length} artifact rows out of the build matrix (${built.join(", ") || "none"})`);
           }
           const artifact = process.env.ARTIFACT;
           const covered = process.env.COVERED === "true";
           const isBuilt = built.includes(artifact);
           if (covered && !isBuilt) {
-            throw new Error(`this row claims to probe ${artifact}, but the build matrix builds only ${built.join(", ")}`);
+            mismatch(`this row claims to probe ${artifact}, but the build matrix builds ${built.join(", ")}`);
           }
           if (!covered && isBuilt) {
-            throw new Error(`the build matrix now builds ${artifact}, so this row must set covered: true and probe it rather than reporting the platform unproven`);
+            mismatch(`the build matrix now builds ${artifact}, so this row must set covered: true and probe it rather than reporting the platform unproven`);
           }
-          console.log(`build matrix produces: ${built.join(", ")}`);
-          console.log(`${artifact}: covered=${covered}, built=${isBuilt}`);
+          write(`RECONCILED ${artifact} covered=${covered} built=${isBuilt}; the build matrix produces ${built.join(", ")}`);
           NODE
+          rc=$?
+          if [ ! -f "$verdict" ]; then
+            echo "::error::UNREADABLE: the coverage reconciler exited $rc without writing a verdict. That is a fact about this probe, not a coverage verdict: nothing here says whether $ARTIFACT is built or not."
+            exit 1
+          fi
+          line="$(cat "$verdict")"
+          rm -f "$verdict"
+          case "$line" in
+            RECONCILED*)
+              printf '%s\n' "$line"
+              exit 0
+              ;;
+            MISMATCH*)
+              echo "::error::COVERAGE MISMATCH: ${line#MISMATCH }"
+              exit 1
+              ;;
+            UNREADABLE*)
+              echo "::error::UNREADABLE: ${line#UNREADABLE } (reconciler exit $rc). That is a fact about this probe, not a coverage verdict: nothing here says whether $ARTIFACT is built or not."
+              exit 1
+              ;;
+            *)
+              echo "::error::UNREADABLE: the coverage reconciler wrote a verdict this step does not recognize: $line"
+              exit 1
+              ;;
+          esac
 
       - name: Record a platform this run builds no archive for
         if: ${{ !matrix.covered }}
