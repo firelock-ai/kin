@@ -4791,6 +4791,11 @@ mod tests {
             &[],
         )
         .expect("an empty search carries a negative");
+        // The Python half certifies, and FIR-2464 is what earns it: the host
+        // probe found a server for this language, so the observation reports
+        // `available` rather than leaving the question open. What stops a
+        // narrowed name filter certifying a false zero is FIR-2452's own gate on
+        // the name's side, not this one.
         assert_eq!(negative["safe_to_conclude_absent"], true);
         assert_eq!(negative["trust"], "authoritative");
     }
@@ -6013,10 +6018,21 @@ mod tests {
         );
         assert_eq!(coverage["entities_examined"], 0);
 
-        assert!(
-            response.get("negative").is_none(),
-            "a populated answer still synthesizes no negative, which is why the \
-             completeness signal is the one that has to carry this case"
+        // The completeness signal is no longer the only thing carrying this
+        // case: since FIR-2463 the qualifier rides a populated answer too, and
+        // the two say the same thing. What the qualifier must never do here is
+        // claim an absence off an answer holding a row.
+        assert_eq!(
+            response["negative"]["safe_to_conclude_absent"], false,
+            "{}",
+            response["negative"]
+        );
+        assert_eq!(response["negative"]["interpretation"], "qualified_answer");
+        assert_eq!(
+            response["negative"]["trust"], "authoritative",
+            "a complete cross-file answer is the whole set, and the verdict says so on both \
+             surfaces: {}",
+            response["negative"]
         );
     }
 
@@ -6063,10 +6079,14 @@ mod tests {
             response["total_upstream"], 1,
             "the answer itself is unchanged; what changes is what rides beside it"
         );
-        assert!(
-            response.get("negative").is_none(),
-            "non-empty, so the negative object never fires here"
+        // Since FIR-2463 the qualifier rides a populated answer too. What it
+        // must never do there is claim an absence.
+        assert_eq!(
+            response["negative"]["safe_to_conclude_absent"], false,
+            "a populated answer claims no absence: {}",
+            response["negative"]
         );
+        assert_eq!(response["negative"]["interpretation"], "qualified_answer");
 
         let completeness = &response["_kin"]["completeness"];
         assert_eq!(
@@ -6519,8 +6539,14 @@ mod tests {
             response["_kin"]["verdict"]
         );
         assert_eq!(
-            response["_kin"]["completeness"]["status"], "complete",
-            "the substrate observation is kept, not rewritten: {}",
+            response["_kin"]["completeness"]["status"], "partial",
+            "the one-word summary follows the verdict: {}",
+            response["_kin"]["completeness"]
+        );
+        assert_eq!(
+            response["_kin"]["completeness"]["classes"],
+            serde_json::json!({"calls": "present", "imports": "absent", "references": "absent"}),
+            "and the observation it was computed from is published unchanged beside it: {}",
             response["_kin"]["completeness"]
         );
         assert_eq!(
@@ -7140,9 +7166,16 @@ mod tests {
             response["relation_count"], 2,
             "the pre-truncation total still reports the two real edges"
         );
-        assert!(
-            response.get("negative").is_none(),
-            "a truncated edge array is not an absence and must not be qualified as one: {response}"
+        assert_eq!(
+            response["negative"]["safe_to_conclude_absent"], false,
+            "a walk that found two edges must not be reported as an absence when the caller \
+             capped the array: {}",
+            response["negative"]
+        );
+        assert_eq!(
+            response["negative"]["interpretation"], "qualified_answer",
+            "it is a qualified answer rather than an absence: {}",
+            response["negative"]
         );
     }
 

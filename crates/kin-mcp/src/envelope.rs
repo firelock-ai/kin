@@ -1775,6 +1775,17 @@ mod tests {
                 },
                 "references": vec![json!({"name": "extract_links"}); returned as usize],
                 "relation_kinds": ["calls", "imports", "references"],
+                // Complete on purpose. Since FIR-2463 a populated answer carries
+                // the response verdict too, and a fixture that reports no
+                // cross-repo authority is not the fully-resolved answer these
+                // cases are about: it would read as a floor for a reason the
+                // test never meant to exercise.
+                "cross_repo": {
+                    "status": "available",
+                    "authority_complete": true,
+                    "authority_revision": "sha256:complete",
+                    "authority_roots": { "local": "local-root" },
+                },
                 "edge_coverage": {
                     "scope": "language",
                     "language": "Python",
@@ -1824,16 +1835,16 @@ mod tests {
             "the limiting class is named rather than left to be inferred: {completeness}"
         );
 
-        // The payload is not empty, so the object that used to be the only trust
-        // signal is absent by design. That asymmetry is the defect this closes:
-        // without the completeness object this response carries nothing.
-        assert!(
-            !annotated_value(&annotated)
-                .as_object()
-                .unwrap()
-                .contains_key(crate::negative::NEGATIVE_KEY),
-            "a populated answer synthesizes no negative, which is why it needed this"
+        // The payload is not empty, and since FIR-2463 it still carries the
+        // response's verdict. What it must never carry is an absence claim, so
+        // the qualifier is present and says so.
+        let negative = &annotated_value(&annotated)[crate::negative::NEGATIVE_KEY];
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(false),
+            "a populated answer claims no absence: {negative}"
         );
+        assert_eq!(negative["interpretation"], json!("qualified_answer"));
     }
 
     /// The regression FIR-2357 item 4 bars, held in the opposite direction. A
