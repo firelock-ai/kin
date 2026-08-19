@@ -14,7 +14,7 @@ use tracing::debug;
 use sha2::{Digest, Sha256};
 
 use kin_model::{
-    ArtifactId, Entity, EntityId, EntityKind, EntityRole, GraphNodeId, LanguageId,
+    ArtifactId, Entity, EntityId, EntityKind, EntityRole, FilePathId, GraphNodeId, LanguageId,
     ParseCompleteness, Relation, RelationEvidence, RelationId, RelationKind, RelationOrigin,
     Visibility,
 };
@@ -703,12 +703,14 @@ fn resolve_one_file(
     let parse_completeness = completeness
         .and_then(|by_file| by_file.get(&file.file_path))
         .unwrap_or(&FULL_PARSE_COMPLETENESS);
+    let caller_file = FilePathId::new(&file.file_path);
     let make_relation = |rel: &ExtractedRelation, src, dst, confidence| {
         make_relation(
             rel,
             src,
             dst,
             confidence,
+            &caller_file,
             parse_completeness,
             call_extraction_complete,
         )
@@ -1756,6 +1758,16 @@ pub(crate) fn accumulate_relation(
     merge_relation_metadata(existing, &relation);
 
     if relation.kind != RelationKind::Calls {
+        // A non-call edge carries evidence only when the adapter recorded a
+        // site for it, and two sites for one edge are two lines to report, so
+        // they merge instead of the later one being dropped. None of the
+        // call-shape marker synthesis below applies: a non-call edge has no
+        // shape, so a spanless occurrence contributes nothing rather than an
+        // explicit unshaped marker.
+        if !relation.evidence.is_empty() {
+            existing.evidence.append(&mut relation.evidence);
+            canonicalize_call_evidence(&mut existing.evidence);
+        }
         return;
     }
 
@@ -3210,6 +3222,7 @@ fn make_relation(
     src: EntityId,
     dst: EntityId,
     confidence: f32,
+    caller_file: &FilePathId,
     parse_completeness: &ParseCompleteness,
     call_extraction_complete: bool,
 ) -> Relation {
@@ -3232,13 +3245,56 @@ fn make_relation(
         origin,
         created_in: None,
         import_source: None,
-        evidence: call_shape_evidence(
-            rel.kind,
-            rel.call_shape.as_ref(),
+        evidence: relation_evidence(
+            rel,
+            caller_file,
             parse_completeness,
             call_extraction_complete,
         ),
     }
+}
+
+/// The stored evidence for one resolved relation: its call shape, when the
+/// adapter records shapes, carrying the site the syntax was read at, when the
+/// adapter records sites.
+///
+/// The site is the whole point of `reference_lines`. An adapter reports it
+/// file-free, because a relation's syntax is always inside the file being
+/// parsed; pairing it with `caller_file` here is what makes the span belong to
+/// the caller rather than to whichever file a later stage happened to hold.
+/// That also means a parser-recorded site can never land under
+/// `span_outside_caller_file`.
+///
+/// A non-call edge previously carried no evidence record at all, so a site on
+/// one has nothing to attach to and gets a record of its own. A call edge's
+/// record already exists for the shape, and the site goes onto it rather than
+/// beside it, so an edge does not report one occurrence twice.
+pub(crate) fn relation_evidence(
+    rel: &ExtractedRelation,
+    caller_file: &FilePathId,
+    parse_completeness: &ParseCompleteness,
+    call_extraction_complete: bool,
+) -> Vec<RelationEvidence> {
+    let mut evidence = call_shape_evidence(
+        rel.kind,
+        rel.call_shape.as_ref(),
+        parse_completeness,
+        call_extraction_complete,
+    );
+    let Some(site) = rel.site.as_ref() else {
+        return evidence;
+    };
+    let span = site.to_source_span(caller_file);
+    if evidence.is_empty() {
+        return vec![RelationEvidence {
+            source_span: Some(span),
+            ..RelationEvidence::default()
+        }];
+    }
+    for record in &mut evidence {
+        record.source_span = Some(span.clone());
+    }
+    evidence
 }
 
 /// Convert a parser-side [`CallArgShape`] into stored relation evidence carrying
@@ -4851,12 +4907,14 @@ fn resolve_one_file_incremental(
     let parse_completeness = completeness
         .and_then(|by_file| by_file.get(&file.file_path))
         .unwrap_or(&FULL_PARSE_COMPLETENESS);
+    let caller_file = FilePathId::new(&file.file_path);
     let make_relation = |rel: &ExtractedRelation, src, dst, confidence| {
         make_relation(
             rel,
             src,
             dst,
             confidence,
+            &caller_file,
             parse_completeness,
             call_extraction_complete,
         )
@@ -6028,6 +6086,7 @@ mod tests {
             file_path: "src/a.ts".to_string(),
             entities: vec![e1.clone(), e2.clone()],
             relations: vec![ExtractedRelation {
+                site: None,
                 receiver: None,
                 call_shape: None,
                 kind: RelationKind::Calls,
@@ -6075,6 +6134,7 @@ mod tests {
             relations: shapes
                 .drain(..)
                 .map(|call_shape| ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape,
                     kind: RelationKind::Calls,
@@ -6153,6 +6213,7 @@ mod tests {
             relations: shapes
                 .into_iter()
                 .map(|call_shape| ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape,
                     kind: RelationKind::Calls,
@@ -6196,6 +6257,7 @@ mod tests {
             file_path: "src/a.py".to_string(),
             entities: vec![caller.clone(), target.clone()],
             relations: vec![ExtractedRelation {
+                site: None,
                 receiver: None,
                 call_shape: Some(CallArgShape {
                     positional: 2,
@@ -6255,6 +6317,7 @@ mod tests {
             entities: vec![caller.clone(), target.clone()],
             relations: vec![
                 ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: Some(CallArgShape {
                         positional: 2,
@@ -6342,6 +6405,7 @@ mod tests {
                 file_path: "src/good.py".to_string(),
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: Some(CallArgShape {
                         positional: 1,
@@ -6515,6 +6579,7 @@ mod tests {
                 file_path: "src/routes/api.ts".to_string(),
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::Calls,
@@ -6573,6 +6638,7 @@ mod tests {
             file_path: "src/routes/api.ts".to_string(),
             entities: vec![caller.clone()],
             relations: vec![ExtractedRelation {
+                site: None,
                 receiver: None,
                 call_shape: None,
                 kind: RelationKind::Calls,
@@ -6627,6 +6693,7 @@ mod tests {
             file_path: "src/app.ts".to_string(),
             entities: vec![caller.clone()],
             relations: vec![ExtractedRelation {
+                site: None,
                 receiver: None,
                 call_shape: None,
                 kind: RelationKind::Calls,
@@ -6660,6 +6727,7 @@ mod tests {
     #[test]
     fn parallel_resolution_is_byte_identical_to_serial() {
         let calls = |src: &str, dst: &str| ExtractedRelation {
+            site: None,
             receiver: None,
             call_shape: None,
             kind: RelationKind::Calls,
@@ -6891,6 +6959,7 @@ mod tests {
                 file_path: "src/app.ts".to_string(),
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::Calls,
@@ -6925,6 +6994,7 @@ mod tests {
                 file_path: "src/app.ts".to_string(),
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::Calls,
@@ -6986,6 +7056,7 @@ mod tests {
                 file_path: "src/app.ts".to_string(),
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::Calls,
@@ -7028,6 +7099,7 @@ mod tests {
                 file_path: "src/routes/api.ts".to_string(),
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::Calls,
@@ -7081,6 +7153,7 @@ mod tests {
                 file_path: "src/app.cpp".to_string(),
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::UsesMacro,
@@ -7134,6 +7207,7 @@ mod tests {
                 file_path: "src/app.cpp".to_string(),
                 entities: vec![caller],
                 relations: vec![ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::UsesMacro,
@@ -7252,6 +7326,7 @@ void f();
                 file_path: "src/parse.ts".to_string(),
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::Calls,
@@ -7298,6 +7373,7 @@ void f();
             entities: vec![e1.clone(), e2.clone()],
             relations: vec![
                 ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::Calls,
@@ -7306,6 +7382,7 @@ void f();
                     import_source: None,
                 },
                 ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::Calls,
@@ -7329,6 +7406,7 @@ void f();
             file_path: "src/a.ts".to_string(),
             entities: vec![e1],
             relations: vec![ExtractedRelation {
+                site: None,
                 receiver: None,
                 call_shape: None,
                 kind: RelationKind::Calls,
@@ -7356,6 +7434,7 @@ void f();
                 file_path: "src/wiring.rs".to_string(),
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::Calls,
@@ -7398,6 +7477,7 @@ void f();
                 file_path: "src/caller.rs".to_string(),
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::Calls,
@@ -7463,6 +7543,7 @@ void f();
             file_path: "src/wiring.rs".to_string(),
             entities: vec![caller.clone()],
             relations: vec![ExtractedRelation {
+                site: None,
                 receiver: None,
                 call_shape: None,
                 kind: RelationKind::Calls,
@@ -7505,6 +7586,7 @@ void f();
 
     fn bare_call(src_name: &str, dst_name: &str) -> ExtractedRelation {
         ExtractedRelation {
+            site: None,
             receiver: None,
             call_shape: None,
             kind: RelationKind::Calls,
@@ -7726,6 +7808,7 @@ void f();
                 file_path: "notekeeper/ingest.py".to_string(),
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
+                    site: None,
                     receiver: Some("store".to_string()),
                     call_shape: None,
                     kind: RelationKind::Calls,
@@ -7969,6 +8052,7 @@ void f();
                 entities: vec![a, b],
                 relations: vec![
                     ExtractedRelation {
+                        site: None,
                         receiver: None,
                         call_shape: None,
                         kind: RelationKind::Calls,
@@ -7977,6 +8061,7 @@ void f();
                         import_source: None,
                     },
                     ExtractedRelation {
+                        site: None,
                         receiver: None,
                         call_shape: None,
                         kind: RelationKind::Calls,
@@ -7985,6 +8070,7 @@ void f();
                         import_source: None,
                     },
                     ExtractedRelation {
+                        site: None,
                         receiver: None,
                         call_shape: None,
                         kind: RelationKind::Calls,
@@ -7993,6 +8079,7 @@ void f();
                         import_source: None,
                     },
                     ExtractedRelation {
+                        site: None,
                         receiver: None,
                         call_shape: None,
                         kind: RelationKind::Calls,
@@ -8061,6 +8148,7 @@ void f();
             file_path: "src/caller.rs".to_string(),
             entities: vec![caller.clone()],
             relations: vec![ExtractedRelation {
+                site: None,
                 receiver: None,
                 call_shape: None,
                 kind: RelationKind::Calls,
@@ -8277,6 +8365,7 @@ void f();
                 file_path: "src/api.ts".to_string(),
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::Calls,
@@ -8427,6 +8516,7 @@ void f();
                 file_path: "src/routes/api.ts".to_string(),
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::Calls,
@@ -8521,6 +8611,7 @@ void f();
                 file_path: "a.ts".to_string(),
                 entities: vec![e1.clone()],
                 relations: vec![ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::Calls,
@@ -8551,6 +8642,7 @@ void f();
             file_path: "src/app.rs".to_string(),
             entities: vec![caller.clone()],
             relations: vec![ExtractedRelation {
+                site: None,
                 receiver: None,
                 call_shape: None,
                 kind,
@@ -8700,6 +8792,7 @@ void f();
             file_path: "src/app.rs".to_string(),
             entities: vec![caller.clone()],
             relations: vec![ExtractedRelation {
+                site: None,
                 receiver: None,
                 call_shape: None,
                 kind: RelationKind::Calls,
@@ -8729,6 +8822,7 @@ void f();
             entities,
             relations: vec![
                 ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::Calls,
@@ -8737,6 +8831,7 @@ void f();
                     import_source: Some("kin_db".to_string()),
                 },
                 ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::Calls,
@@ -8745,6 +8840,7 @@ void f();
                     import_source: Some("kin_db".to_string()),
                 },
                 ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::Calls,
@@ -8793,6 +8889,7 @@ void f();
                 file_path: "src/routes/api.ts".to_string(),
                 entities: vec![handler.clone()],
                 relations: vec![ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::Calls,
@@ -8849,6 +8946,7 @@ void f();
 
     fn calls_relation(src: &str, dst: &str) -> ExtractedRelation {
         ExtractedRelation {
+            site: None,
             receiver: None,
             call_shape: None,
             kind: RelationKind::Calls,
@@ -9664,6 +9762,7 @@ void f();
 
     fn pinned_calls_relation(src: &str, dst: &str, import_source: &str) -> ExtractedRelation {
         ExtractedRelation {
+            site: None,
             receiver: None,
             call_shape: None,
             kind: RelationKind::Calls,
@@ -10441,6 +10540,7 @@ void f();
 
     fn py_receiver_call(src: &str, receiver: &str, method: &str) -> ExtractedRelation {
         ExtractedRelation {
+            site: None,
             receiver: Some(receiver.to_string()),
             call_shape: None,
             kind: RelationKind::Calls,
@@ -10665,6 +10765,7 @@ void f();
                 entities: vec![double_send.clone()],
                 // The double subclasses the mixin, not the adapter.
                 relations: vec![ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::Extends,

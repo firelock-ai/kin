@@ -5,12 +5,13 @@ use kin_model::{EntityKind, FilePathId, LanguageId, ParseState, Visibility};
 use tree_sitter::Tree;
 
 use crate::adapter::{
-    collect_error_ranges, compute_fingerprint, make_parser, span_from_node, LanguageAdapter,
+    collect_error_ranges, compute_fingerprint, make_parser, site_from_node, span_from_node,
+    LanguageAdapter,
 };
 use crate::error::Result;
 use crate::extract::{
     call_extraction_incomplete_marker, CallArgShape, ExtractedEntity, ExtractedRelation,
-    ExtractedTest, ExtractedTestKind, FileImport, ImportedName, ParseOutput,
+    ExtractedTest, ExtractedTestKind, FileImport, ImportedName, ParseOutput, RelationSite,
 };
 
 /// Every public name CPython's `builtins` module binds, sorted so
@@ -392,6 +393,7 @@ fn extract_py_node(
                 extract_value_refs_from_definition(node, source, &name, value_refs);
                 if let Some(cls) = class_ctx {
                     relations.push(ExtractedRelation {
+                        site: None,
                         receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::Contains,
@@ -443,6 +445,7 @@ fn extract_py_node(
                                     is_enum = true;
                                 }
                                 relations.push(ExtractedRelation {
+                                    site: None,
                                     receiver: None,
                                     call_shape: None,
                                     kind: kin_model::RelationKind::Extends,
@@ -498,7 +501,7 @@ fn extract_py_node(
         "decorated_definition" => {
             // Collect decorator names, then extract the inner definition
             // with decorators prepended to the signature.
-            let decorators = extract_decorator_names(node, source);
+            let decorators = extract_decorators(node, source);
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
                 if child.kind() == "function_definition" || child.kind() == "class_definition" {
@@ -511,16 +514,17 @@ fn extract_py_node(
                         if let Some(last) = entities.last_mut() {
                             let prefix = decorators
                                 .iter()
-                                .map(|d| format!("@{}", d))
+                                .map(|(name, _)| format!("@{}", name))
                                 .collect::<Vec<_>>()
                                 .join(" ");
                             last.signature = format!("{} {}", prefix, last.signature);
                         }
                         if let Some(last) = entities.last() {
                             let src_name = last.name.clone();
-                            for dec in &decorators {
+                            for (dec, site) in &decorators {
                                 if is_valid_callee_name(dec) {
                                     relations.push(ExtractedRelation {
+                                        site: Some(site.clone()),
                                         receiver: None,
                                         call_shape: None,
                                         kind: kin_model::RelationKind::Calls,
@@ -610,6 +614,11 @@ struct PythonValueRef {
     src_name: String,
     root: String,
     member: Option<String>,
+    /// Where the name was read. Carried per occurrence rather than per
+    /// (source, target) pair, because a function that reads a constant on three
+    /// lines has three reference sites and a row reporting one of them would
+    /// under-report while its completeness flag read true.
+    site: RelationSite,
 }
 
 /// Collect the references made by one `function_definition`, sourced from the
@@ -791,6 +800,7 @@ fn collect_python_value_refs(
                         src_name: context_name.to_string(),
                         root: name.to_string(),
                         member: None,
+                        site: site_from_node(node),
                     });
                 }
             }
@@ -811,6 +821,7 @@ fn collect_python_value_refs(
                                 src_name: context_name.to_string(),
                                 root: root.to_string(),
                                 member: Some(leaf.to_string()),
+                                site: site_from_node(node),
                             });
                         }
                     }
@@ -918,6 +929,7 @@ fn collect_python_type_refs(
                         src_name: context_name.to_string(),
                         root: name.to_string(),
                         member: None,
+                        site: site_from_node(node),
                     });
                 }
             }
@@ -938,6 +950,7 @@ fn collect_python_type_refs(
                                 src_name: context_name.to_string(),
                                 root: root.to_string(),
                                 member: Some(leaf.to_string()),
+                                site: site_from_node(node),
                             });
                         }
                     }
@@ -960,6 +973,7 @@ fn collect_python_type_refs(
                             src_name: context_name.to_string(),
                             root: text.to_string(),
                             member: None,
+                            site: site_from_node(&content),
                         });
                     }
                 }
@@ -1022,7 +1036,11 @@ fn emit_python_value_references(
         }
     }
 
-    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    // Keyed on the site as well as the pair: the same name read twice inside one
+    // function is two reference sites, and collapsing them here would leave the
+    // row reporting one line while claiming its sites were complete.
+    let mut seen: std::collections::HashSet<(String, String, usize)> =
+        std::collections::HashSet::new();
     for value_ref in value_refs {
         let root = value_ref.root.as_str();
         let dst = match &value_ref.member {
@@ -1039,10 +1057,15 @@ fn emit_python_value_references(
         if dst == value_ref.src_name {
             continue;
         }
-        if !seen.insert((value_ref.src_name.clone(), dst.clone())) {
+        if !seen.insert((
+            value_ref.src_name.clone(),
+            dst.clone(),
+            value_ref.site.start_byte,
+        )) {
             continue;
         }
         relations.push(ExtractedRelation {
+            site: Some(value_ref.site),
             call_shape: None,
             receiver: None,
             kind: kin_model::RelationKind::References,
@@ -1082,19 +1105,26 @@ fn looks_like_py_constant_name(name: &str) -> bool {
 
 /// Extract decorator names from a `decorated_definition` node.
 /// Returns a list of decorator names (e.g., ["staticmethod", "property"]).
-fn extract_decorator_names(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
-    let mut names = Vec::new();
+/// Each decorator's name paired with the site of the `@decorator` syntax that
+/// named it.
+///
+/// A decorator IS a call, and its `Calls` edge merges with any body call to the
+/// same target, so a decorator contributing no site would leave that merged edge
+/// reporting fewer lines than it has sites while its completeness flag still
+/// read true.
+fn extract_decorators(node: &tree_sitter::Node, source: &[u8]) -> Vec<(String, RelationSite)> {
+    let mut decorators = Vec::new();
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "decorator" {
             if let Some(name) = extract_decorator_payload_name(&child, source) {
                 if !name.is_empty() {
-                    names.push(name);
+                    decorators.push((name, site_from_node(&child)));
                 }
             }
         }
     }
-    names
+    decorators
 }
 
 /// Resolve a decorator's bare name from its tree-sitter payload.
@@ -1289,6 +1319,10 @@ fn extract_calls_from_context(
                 .and_then(|function| extract_named_callee(&function, source, class_ctx));
             if let Some(callee) = callee {
                 relations.push(ExtractedRelation {
+                    // The call expression itself, so a reference row can report the
+                    // line the call is written on rather than the line the caller's
+                    // definition starts on.
+                    site: Some(site_from_node(&child)),
                     receiver: callee.receiver,
                     call_shape: Some(extract_call_arg_shape(&child, source)),
                     kind: kin_model::RelationKind::Calls,
@@ -2081,17 +2115,44 @@ mod tests {
         );
     }
 
+    /// One name read twice is one edge with two sites.
+    ///
+    /// The parser emits a record per site, because a reference row reports every
+    /// line the name was read on and the site cannot be recovered downstream.
+    /// They still resolve to ONE graph edge, whose id is derived from
+    /// (src, dst, kind), so this is a per-site record rather than a duplicate
+    /// edge.
     #[test]
-    fn a_repeated_reference_emits_one_edge() {
-        let refs = value_refs(
-            "cli.py",
-            "def handler(args):\n    return 1\n\ndef wire():\n    a.set_defaults(func=handler)\n    b.set_defaults(func=handler)\n",
-        );
+    fn a_repeated_reference_emits_one_edge_with_a_site_each() {
+        let source = "def handler(args):\n    return 1\n\ndef wire():\n    a.set_defaults(func=handler)\n    b.set_defaults(func=handler)\n";
+        let refs = value_refs("cli.py", source);
         let hits = refs
             .iter()
             .filter(|(src, dst)| src == "wire" && dst == "handler")
             .count();
-        assert_eq!(hits, 1, "expected one deduped edge, got {refs:?}");
+        assert_eq!(hits, 2, "one record per reference site, got {refs:?}");
+
+        let adapter = PythonAdapter;
+        let bytes = source.as_bytes();
+        let tree = adapter.parse(bytes).unwrap();
+        let output = adapter
+            .extract(&tree, bytes, &FilePathId::new("cli.py"))
+            .unwrap();
+        let sites: std::collections::BTreeSet<usize> = output
+            .relations
+            .iter()
+            .filter(|r| {
+                r.kind == kin_model::RelationKind::References
+                    && r.src_name == "wire"
+                    && r.dst_name == "handler"
+            })
+            .filter_map(|r| r.site.as_ref().map(|site| site.start_byte))
+            .collect();
+        assert_eq!(
+            sites.len(),
+            2,
+            "the two reads must be two distinct positions, got {sites:?}"
+        );
     }
 
     #[test]

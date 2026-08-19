@@ -172,6 +172,7 @@ fn extract_kotlin_node(
                                             span: span_from_node(&member, file_id),
                                         });
                                         relations.push(ExtractedRelation {
+                                            site: None,
                                             receiver: None,
                                             call_shape: None,
                                             kind: kin_model::RelationKind::Contains,
@@ -285,6 +286,7 @@ fn extract_kotlin_node(
 
                 if let Some(cls) = class_ctx {
                     relations.push(ExtractedRelation {
+                        site: None,
                         receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::Contains,
@@ -310,6 +312,7 @@ fn extract_kotlin_node(
                     span: span_from_node(node, file_id),
                 });
                 relations.push(ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: kin_model::RelationKind::Contains,
@@ -353,6 +356,7 @@ fn extract_kotlin_node(
 
                 if let Some(cls) = class_ctx {
                     relations.push(ExtractedRelation {
+                        site: None,
                         receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::Contains,
@@ -578,6 +582,7 @@ fn extract_delegation_specifier(
             "constructor_invocation" => {
                 if let Some(parent_name) = extract_user_type_name(&child, source) {
                     relations.push(ExtractedRelation {
+                        site: None,
                         receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::Extends,
@@ -597,6 +602,7 @@ fn extract_delegation_specifier(
                         kin_model::RelationKind::Implements
                     };
                     relations.push(ExtractedRelation {
+                        site: None,
                         receiver: None,
                         call_shape: None,
                         kind: rel_kind,
@@ -634,6 +640,7 @@ fn extract_calls_from_body(
             if let Some(callee) = extract_callee_name(&child, source) {
                 if !callee.is_empty() {
                     relations.push(ExtractedRelation {
+                        site: None,
                         receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::Calls,

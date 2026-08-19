@@ -5,7 +5,8 @@ use kin_model::{EntityKind, FilePathId, LanguageId, ParseState, Visibility};
 use tree_sitter::Tree;
 
 use crate::adapter::{
-    collect_error_ranges, compute_fingerprint, make_parser, span_from_node, LanguageAdapter,
+    collect_error_ranges, compute_fingerprint, make_parser, site_from_node, span_from_node,
+    LanguageAdapter,
 };
 use crate::error::Result;
 use crate::extract::{
@@ -613,6 +614,7 @@ fn extract_js_assignment_target(
                     span: span_from_node(stmt, file_id),
                 });
                 relations.push(ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: kin_model::RelationKind::Contains,
@@ -788,6 +790,7 @@ pub(super) fn extract_js_object_methods(
             span: span_from_node(&function_node, file_id),
         });
         relations.push(ExtractedRelation {
+            site: None,
             receiver: None,
             call_shape: None,
             kind: kin_model::RelationKind::Contains,
@@ -836,6 +839,7 @@ fn extract_js_class_like(
                 continue;
             };
             relations.push(ExtractedRelation {
+                site: None,
                 receiver: None,
                 call_shape: None,
                 kind: kin_model::RelationKind::Extends,
@@ -891,6 +895,7 @@ fn extract_js_class_like(
             span: span_from_node(&member, file_id),
         });
         relations.push(ExtractedRelation {
+            site: None,
             receiver: None,
             call_shape: None,
             kind: kin_model::RelationKind::Contains,
@@ -1030,6 +1035,10 @@ pub(super) fn extract_calls_from_context(
                 };
                 if is_valid_callee_name(&callee_name) {
                     relations.push(ExtractedRelation {
+                        // The `call_expression` node, so a reference row can report
+                        // the line the call is written on rather than the line the
+                        // caller's definition starts on.
+                        site: Some(site_from_node(&child)),
                         receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::Calls,
