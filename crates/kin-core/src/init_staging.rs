@@ -46,6 +46,22 @@ pub const GIT_CAPTURE_PREFIX: &str = ".kin-git-capture-";
 /// published authority.
 const CAPTURE_LEASE_NAME: &str = "capture.lease";
 
+/// Name the lease is created and locked under before it is published.
+///
+/// A lease is proof only while it is held, so the name a reader tests must
+/// never exist unheld. Creating the file and locking it are two calls, and a
+/// reap landing between them takes the lock the claim is about to take, reads a
+/// live directory as abandoned, and deletes the capture out from under an init
+/// that carries on believing it owns one. Locking under this name and renaming
+/// it into place closes that window rather than narrowing it: the rename is
+/// atomic, the lock follows the inode through it, and `CAPTURE_LEASE_NAME`
+/// therefore never exists unheld.
+///
+/// The reap deliberately does not know this name. A directory carrying no
+/// published lease is retained and disclosed whatever else is inside it, which
+/// is what makes a claim in flight safe from a concurrent reap.
+const CAPTURE_LEASE_PENDING_NAME: &str = "capture.lease.pending";
+
 /// One init's isolated Git capture directory.
 ///
 /// Dropping this removes the directory. Holding it holds the lease that tells
@@ -73,22 +89,7 @@ impl GitCaptureStaging {
         register_staging_path(&path);
         let mut staging = Self { path, lease: None };
         create_private_directory(&staging.path)?;
-        let lease_path = staging.path.join(CAPTURE_LEASE_NAME);
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-
-            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        }
-        let lease = options
-            .open(&lease_path)
-            .map_err(|error| KinError::io(&lease_path, error))?;
-        lease
-            .try_lock_exclusive()
-            .map_err(|error| KinError::io(&lease_path, error))?;
-        staging.lease = Some(lease);
+        staging.lease = Some(hold_capture_lease(&staging.path)?);
         Ok(staging)
     }
 
@@ -103,6 +104,34 @@ impl Drop for GitCaptureStaging {
         unregister_staging_path(&self.path);
         remove_staging_tree(&self.path);
     }
+}
+
+/// Take this init's lease on one capture directory, held on return.
+///
+/// The lease is created and locked under [`CAPTURE_LEASE_PENDING_NAME`] and
+/// only then renamed to the name every reader tests, so no reader can ever
+/// observe [`CAPTURE_LEASE_NAME`] unheld. See that constant for why the order
+/// is the guarantee.
+fn hold_capture_lease(directory: &Path) -> Result<std::fs::File> {
+    let pending_path = directory.join(CAPTURE_LEASE_PENDING_NAME);
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let lease = options
+        .open(&pending_path)
+        .map_err(|error| KinError::io(&pending_path, error))?;
+    lease
+        .try_lock_exclusive()
+        .map_err(|error| KinError::io(&pending_path, error))?;
+    let lease_path = directory.join(CAPTURE_LEASE_NAME);
+    std::fs::rename(&pending_path, &lease_path)
+        .map_err(|error| KinError::io(&lease_path, error))?;
+    Ok(lease)
 }
 
 /// Create one directory readable only by its owner.
@@ -155,7 +184,8 @@ const STAGING_REMOVAL_ATTEMPTS: usize = 8;
 /// init, which is ordinary when sibling repositories under one parent are
 /// admitted at the same time. A directory carrying no readable lease is
 /// disclosed rather than removed, because an older Kin wrote it and this call
-/// cannot prove nothing is using it.
+/// cannot prove nothing is using it, and because a claim that has created its
+/// directory but not yet published its lease looks exactly the same from here.
 ///
 /// Answers how many were removed.
 pub(crate) fn reap_abandoned_git_captures(parent: &Path) -> Result<usize> {
@@ -427,6 +457,10 @@ mod tests {
         let path = staged.path().to_path_buf();
         assert!(path.is_dir());
         assert!(path.join(CAPTURE_LEASE_NAME).is_file());
+        assert!(
+            !path.join(CAPTURE_LEASE_PENDING_NAME).exists(),
+            "the lease is published by rename, so its pending name must be gone"
+        );
         drop(staged);
         assert!(!path.exists(), "{} survived its owner", path.display());
     }
@@ -582,6 +616,67 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
     }
+
+    /// A reap never removes a capture directory whose claim is still in flight.
+    ///
+    /// Two inits admitting sibling repositories under one parent share this
+    /// directory, which the module treats as ordinary, so one init's reap runs
+    /// while another init's claim is partway through. A claim becomes visible
+    /// to that reap the instant its directory exists, and stays reapable until
+    /// its lease is held, so the reaper hammers here for the whole of many
+    /// claims rather than sampling one.
+    #[test]
+    fn a_claim_in_flight_survives_a_concurrent_reap() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let parent = tempfile::tempdir().expect("tempdir");
+        let root = parent.path().to_path_buf();
+        let stop = Arc::new(AtomicBool::new(false));
+        let reaper = {
+            let root = root.clone();
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = reap_abandoned_git_captures(&root);
+                }
+            })
+        };
+
+        // The reaper is stopped before anything is asserted: a panic here would
+        // otherwise leave it spinning on a core for the rest of the run. Both
+        // ways a claim can lose are recorded, because an unpublished lease
+        // fails in two directions: the reap takes the lock the claim was about
+        // to take, or it removes the directory the claim already believes it
+        // owns.
+        let mut lost = None;
+        for attempt in 0..CONCURRENT_REAP_ATTEMPTS {
+            match GitCaptureStaging::claim(&root) {
+                Err(error) => {
+                    lost = Some(format!("attempt {attempt} could not claim at all: {error}"));
+                    break;
+                }
+                Ok(staged) => {
+                    let held =
+                        staged.path().is_dir() && staged.path().join(CAPTURE_LEASE_NAME).is_file();
+                    drop(staged);
+                    if !held {
+                        lost = Some(format!("attempt {attempt} lost the directory it claimed"));
+                        break;
+                    }
+                }
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        reaper.join().expect("reaper thread");
+
+        if let Some(detail) = lost {
+            panic!("a concurrent reap defeated a claim still in flight: {detail}");
+        }
+    }
+
+    /// How many claims the concurrent reap above races.
+    const CONCURRENT_REAP_ATTEMPTS: usize = 200;
 
     /// A path wearing the prefix that is not a directory is left alone.
     #[test]
