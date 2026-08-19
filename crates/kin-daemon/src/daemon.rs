@@ -56,6 +56,24 @@ fn should_enable_lsp_enrichment(config_enabled: bool, filesystem_reconcile_disab
     config_enabled && !filesystem_reconcile_disabled
 }
 
+/// Whether the daemon opens its enrichment channel at startup.
+///
+/// Taken ONCE, during startup, and that is the whole reason a language server
+/// installed while a daemon is already running may not reach it. With no server
+/// discovered here the channel is never created, so no enrichment message is
+/// ever sent for the life of the process and no adapter is ever consulted. That
+/// is the state the container behind the v0.5.42 stranger run was in: the Python
+/// adapter did not fail to start, it was never reached.
+///
+/// When discovery DID find a server the channel exists and each language's
+/// server is started lazily on first use, so a server installed afterwards is
+/// picked up with no restart. Both halves are true, and only the pessimistic one
+/// is safe for a surface to print, because a fresh install is exactly the host
+/// where discovery finds nothing.
+fn enrichment_channel_opens(enrichment_enabled: bool, servers_discovered: usize) -> bool {
+    enrichment_enabled && servers_discovered > 0
+}
+
 /// Acquire the process-lifetime repository authority before daemon state opens.
 pub fn acquire_daemon_authority(
     kin_root: &std::path::Path,
@@ -416,6 +434,32 @@ mod adapter_wiring_tests {
                 lsp_adapter_for(language, root).unwrap_or_else(|| panic!("{language} not wired"));
             assert_eq!(cmd, expected, "{language} server command");
         }
+    }
+
+    /// The startup gate behind the restart advice `kin doctor` prints.
+    ///
+    /// Asserted rather than reasoned about, because it is a user-facing claim:
+    /// a host that had no language server when its daemon started does not gain
+    /// enrichment when one is installed, and that is exactly the host doing the
+    /// installing. If this predicate ever stops keying on the discovered count,
+    /// the advice becomes wrong in the direction that leaves an operator
+    /// waiting for edges that will never arrive.
+    #[test]
+    fn no_server_at_startup_means_no_enrichment_channel_for_this_daemon() {
+        use super::enrichment_channel_opens;
+
+        assert!(
+            !enrichment_channel_opens(true, 0),
+            "with enrichment enabled and no server discovered the channel must stay closed"
+        );
+        assert!(
+            enrichment_channel_opens(true, 1),
+            "one discovered server is enough to open the channel"
+        );
+        assert!(
+            !enrichment_channel_opens(false, 3),
+            "disabled enrichment must not open a channel however many servers exist"
+        );
     }
 
     /// A language with no adapter stays unwired, so `Unsupported` remains a
@@ -1368,12 +1412,11 @@ pub async fn run_with_authority_on(
     }
 
     // Set up LSP enrichment channel before wrapping state in Arc.
-    let lsp_rx = if should_enable_lsp_enrichment(
-        config.lsp_enabled,
-        state.filesystem_reconcile_disabled(),
-    ) {
+    let enrichment_enabled =
+        should_enable_lsp_enrichment(config.lsp_enabled, state.filesystem_reconcile_disabled());
+    let lsp_rx = if enrichment_enabled {
         let discovered = kin_lsp::discovery::discover_servers();
-        if !discovered.is_empty() {
+        if enrichment_channel_opens(enrichment_enabled, discovered.len()) {
             info!(
                 count = discovered.len(),
                 languages = ?discovered.iter().map(|s| format!("{}", s.language)).collect::<Vec<_>>(),
@@ -1383,7 +1426,10 @@ pub async fn run_with_authority_on(
             state.lsp_enrichment_tx = Some(tx);
             Some(rx)
         } else {
-            info!("no LSP servers found — enrichment disabled");
+            info!(
+                "no LSP servers found — enrichment disabled for the life of this daemon; \
+                 install one and restart to enable it"
+            );
             None
         }
     } else {
