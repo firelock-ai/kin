@@ -1403,6 +1403,25 @@ fn proven_override_bases<G: GraphStore>(
         let Some(base) = store.get_entity(&base_id).map_err(McpError::graph)? else {
             continue;
         };
+        // A method overrides a METHOD. An override edge landing on a class or
+        // interface is the known-degraded shape, not a base to compose over:
+        // `EntityIndex::find_at` returns the first entity whose span contains
+        // the target line and a class span contains its methods, so a
+        // method-level target can resolve to the enclosing class. Composing
+        // over that would attribute every caller of `BaseAdapter` to
+        // `HTTPAdapter.send`, which is precisely the fabrication the
+        // proven-ness gate exists to prevent, and it would do it wearing a
+        // proven label.
+        //
+        // Refused rather than tolerated so this starts working correctly the
+        // moment the enrichment fix lands, instead of producing plausible wrong
+        // rows in the meantime and having to be untangled later.
+        if !matches!(
+            base.kind,
+            kin_model::EntityKind::Method | kin_model::EntityKind::Function
+        ) {
+            continue;
+        }
         bases.push((base_id, base.name.clone()));
     }
     Ok(bases)
@@ -3419,6 +3438,56 @@ mod override_composition_tests {
                 .iter()
                 .any(|row| row.entity_id.as_deref() == Some(&caller.to_string()[..])),
             "an override matched from a name_only base-class reference must compose nothing"
+        );
+    }
+
+    /// The known-degraded shape: the override edge lands on the enclosing CLASS
+    /// rather than the base method, which is what `EntityIndex::find_at`
+    /// currently produces when a method-level target resolves to the first
+    /// entity whose span contains the line. Composing over it would attribute
+    /// every caller of `BaseAdapter` to `HTTPAdapter.send`, wearing a proven
+    /// label.
+    ///
+    /// This is asserted now, while the graph still has that shape, so the
+    /// composition starts working correctly the moment the enrichment fix lands
+    /// rather than producing plausible wrong rows in the meantime.
+    #[test]
+    fn an_override_edge_landing_on_a_class_composes_nothing() {
+        let graph = InMemoryGraph::new();
+        let mut base_class = entity("BaseAdapter", "src/requests/adapters.py");
+        base_class.kind = EntityKind::Class;
+        let focal = entity("HTTPAdapter.send", "src/requests/adapters.py");
+        let caller = entity("Session.send", "src/requests/sessions.py");
+        for e in [&base_class, &focal, &caller] {
+            graph.upsert_entity(e).unwrap();
+        }
+        // Both legs are PROVEN. Only the shape is wrong, which is what makes
+        // this the case proven-ness alone cannot catch.
+        graph
+            .upsert_relation(&relation(
+                caller.id,
+                base_class.id,
+                RelationKind::Calls,
+                RelationOrigin::Lsp,
+                0.95,
+            ))
+            .unwrap();
+        graph
+            .upsert_relation(&relation(
+                focal.id,
+                base_class.id,
+                RelationKind::Overrides,
+                RelationOrigin::Lsp,
+                0.95,
+            ))
+            .unwrap();
+        let rows = rows_for(&graph, &focal.id);
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.entity_id.as_deref() == Some(&caller.id.to_string()[..])),
+            "an override edge pointing at a class is the degraded shape and must compose \
+             nothing: {rows:?}"
         );
     }
 
