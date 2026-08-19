@@ -22017,6 +22017,7 @@ mod tests {
                 payload: None,
                 body: Some("pub fn greet() {}".into()),
                 description: "restart-durability".into(),
+                destination: None,
             };
             registry.stage_transaction(&tx_id, vec![op]).unwrap();
             persist_mcp_transactions(&state, &registry);

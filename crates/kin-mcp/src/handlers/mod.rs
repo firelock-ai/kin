@@ -4324,6 +4324,7 @@ mod tests {
             payload: Some(McpMutationPayload::Entity(entity.clone())),
             body: None,
             description: "add test function".into(),
+            destination: None,
         };
 
         let mut stage_args = HashMap::new();
@@ -4469,6 +4470,7 @@ mod tests {
             payload: None::<McpMutationPayload>,
             body: Some("pub fn value() -> u8 { 2 }".into()),
             description: "payload-less body update".into(),
+            destination: None,
         };
         let mut stage_args = HashMap::new();
         stage_args.insert("transaction_id".into(), serde_json::json!(tx_id));
@@ -4534,6 +4536,7 @@ mod tests {
             payload: Some(McpMutationPayload::Entity(updated)),
             body: None,
             description: "entity payload update".into(),
+            destination: None,
         };
         let mut stage_args = HashMap::new();
         stage_args.insert("transaction_id".into(), serde_json::json!(tx_id));
@@ -4602,6 +4605,7 @@ mod tests {
             payload: Some(McpMutationPayload::Entity(updated)),
             body: Some("pub fn value() -> u8 { 2 }".into()),
             description: "entity payload plus source body".into(),
+            destination: None,
         };
         let mut stage_args = HashMap::new();
         stage_args.insert("transaction_id".into(), serde_json::json!(tx_id));
@@ -4675,6 +4679,7 @@ mod tests {
             payload: Some(McpMutationPayload::Entity(updated)),
             body: Some("pub fn value() -> u8 { 2 }".into()),
             description: "inline entity payload plus source body".into(),
+            destination: None,
         };
         let mut commit_args = HashMap::new();
         commit_args.insert("transaction_id".into(), serde_json::json!(tx_id));
@@ -4718,6 +4723,7 @@ mod tests {
             payload: None::<McpMutationPayload>,
             body: Some("pub fn value() -> u8 { 2 }".into()),
             description: "payload-less body update".into(),
+            destination: None,
         };
         let mut commit_args = HashMap::new();
         commit_args.insert("transaction_id".into(), serde_json::json!(tx_id));
@@ -4842,6 +4848,7 @@ mod tests {
                     .then_some(McpMutationPayload::Entity(updated)),
                 body: shape.body.map(str::to_string),
                 description: shape.label.into(),
+                destination: None,
             };
             let mut commit_args = HashMap::new();
             commit_args.insert("transaction_id".into(), serde_json::json!(tx_id));
@@ -4926,6 +4933,7 @@ mod tests {
                     payload: None::<McpMutationPayload>,
                     body: Some("pub fn value() -> u8 { 2 }".into()),
                     description: "body update".into(),
+                    destination: None,
                 }],
             )
             .unwrap();
@@ -4974,6 +4982,7 @@ mod tests {
             payload: None::<McpMutationPayload>,
             body: None,
             description: "add dummy".into(),
+            destination: None,
         };
         let mut stage_args = HashMap::new();
         stage_args.insert("transaction_id".into(), serde_json::json!("no-such-tx"));
@@ -5022,6 +5031,7 @@ mod tests {
             payload: None,
             body: Some("value = 1\n".into()),
             description: "admit new source src/tracked.py".into(),
+            destination: None,
         };
         let mut stage_args = HashMap::new();
         stage_args.insert("transaction_id".into(), serde_json::json!("no-such-tx"));
@@ -5036,6 +5046,101 @@ mod tests {
             err.to_string().contains("already tracked"),
             "actionable stage-time message expected, got: {err}"
         );
+    }
+
+    /// A retirement or a rename naming a path the graph does NOT track is
+    /// refused at stage time, and so is a rename onto a path it does.
+    ///
+    /// The mirror image of the create check, and it matters for the same
+    /// reason in the opposite direction: a retirement that answered "already
+    /// gone, nothing to do" would tell a caller its file left the graph while
+    /// the real one kept ranking, which is the FIR-2419 symptom arriving by a
+    /// second route.
+    #[tokio::test]
+    async fn handle_transaction_stage_rejects_file_level_operations_on_the_wrong_paths() {
+        use crate::session::McpMutationOperation;
+
+        let store = InMemoryGraph::default();
+        for path in ["src/tracked.py", "src/occupied.py"] {
+            let path = kin_model::RepoPath::from_utf8(path.to_string()).unwrap();
+            store
+                .apply_transaction_delta(&kin_model::TransactionDelta {
+                    tree_deltas: vec![kin_model::TreeDelta::Added {
+                        artifact_id: kin_model::ArtifactId::new(),
+                        new: kin_model::LocatedEntry::new(
+                            path,
+                            kin_model::TreeEntry::blob(Hash256::from_bytes([1; 32]), false),
+                        ),
+                    }],
+                    ..kin_model::TransactionDelta::default()
+                })
+                .unwrap();
+        }
+        let sessions = SessionRegistry::new();
+        let session_authority = SessionAuthorityMode::OfflineFallback;
+
+        let file_op = |verb: &str, target: &str, destination: Option<&str>| {
+            let op = McpMutationOperation {
+                verb: verb.into(),
+                target: target.into(),
+                payload: None,
+                body: None,
+                destination: destination.map(str::to_string),
+                description: format!("{verb} {target}"),
+            };
+            let mut args = HashMap::new();
+            args.insert("transaction_id".into(), serde_json::json!("no-such-tx"));
+            args.insert("operations".into(), serde_json::json!(vec![op]));
+            args
+        };
+
+        let err = sessions::handle_transaction_stage(
+            &file_op("delete", "src/never_tracked.py", None),
+            &store,
+            &sessions,
+            session_authority,
+        )
+        .await
+        .expect_err("a retirement of an untracked path must be rejected at stage time");
+        assert!(matches!(err, McpError::InvalidParams(_)));
+        assert!(
+            err.to_string()
+                .contains("is not tracked by repository authority"),
+            "actionable stage-time message expected, got: {err}"
+        );
+
+        let err = sessions::handle_transaction_stage(
+            &file_op("rename", "src/tracked.py", Some("src/occupied.py")),
+            &store,
+            &sessions,
+            session_authority,
+        )
+        .await
+        .expect_err("a rename onto a tracked path must be rejected at stage time");
+        assert!(
+            err.to_string()
+                .contains("is already tracked by repository authority"),
+            "actionable stage-time message expected, got: {err}"
+        );
+
+        // The control: the same two shapes on the right paths get past these
+        // checks and fail only on the bogus transaction id, which is what
+        // proves the refusals above came from the path checks rather than from
+        // staging refusing everything.
+        for args in [
+            file_op("delete", "src/tracked.py", None),
+            file_op("rename", "src/tracked.py", Some("src/moved.py")),
+        ] {
+            let result =
+                sessions::handle_transaction_stage(&args, &store, &sessions, session_authority)
+                    .await
+                    .expect("a well-formed file-level operation must reach transaction lookup");
+            let text = tool_result_text(&result);
+            assert!(
+                text.contains("Transaction not found"),
+                "expected the bogus transaction id to be what refuses, got: {text}"
+            );
+        }
     }
 
     use std::sync::{Mutex, OnceLock};

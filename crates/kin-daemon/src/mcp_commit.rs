@@ -103,8 +103,22 @@ fn authored_files_from_staged(
                 // collapses to `None`, and a resumed commit would then declare
                 // every file it published as carried when the original declared
                 // none of them.
-                if kin_mcp::session::is_new_source_file(operation) {
+                if kin_mcp::session::is_new_source_file(operation)
+                    || kin_mcp::session::is_retired_source_file(operation)
+                {
                     authored.insert(RepoPath::from_utf8(operation.target.trim().to_string()).ok()?);
+                    continue;
+                }
+                // A rename writes at both ends. Claiming only the destination
+                // would leave the origin looking like a file the workspace
+                // happened to be carrying, which is the distinction this set
+                // exists to keep.
+                if kin_mcp::session::is_renamed_source_file(operation) {
+                    authored.insert(RepoPath::from_utf8(operation.target.trim().to_string()).ok()?);
+                    authored.insert(
+                        RepoPath::from_utf8(operation.destination.as_deref()?.trim().to_string())
+                            .ok()?,
+                    );
                     continue;
                 }
                 kin_mcp::handlers::sessions::resolve_target_entity(graph, &operation.target).ok()?
@@ -927,6 +941,8 @@ fn plan_exact_transaction(
         .map_err(|error| format!("create prospective exact graph: {error}"))?;
     let mut edits: BTreeMap<String, (FilePathId, Vec<(Entity, Vec<u8>)>)> = BTreeMap::new();
     let mut creations: BTreeMap<String, (FilePathId, Vec<u8>)> = BTreeMap::new();
+    let mut retirements: BTreeMap<String, FilePathId> = BTreeMap::new();
+    let mut relocations: BTreeMap<String, (FilePathId, FilePathId)> = BTreeMap::new();
     let mut relation_operations = Vec::new();
     let mut edited_entities = HashSet::new();
 
@@ -942,6 +958,22 @@ fn plan_exact_transaction(
         // edit another and publish both or neither.
         if operation.payload.is_none() && kin_mcp::session::is_new_source_file(operation) {
             record_new_source_file(&mut creations, base, operation)?;
+            continue;
+        }
+        // A payload-less `delete` carrying a repository path retires source the
+        // graph already holds, and a payload-less `rename` carrying two paths
+        // relocates it. They are the mirror image of `create`: an entity
+        // payload names one entity, which can neither retire the artifact it
+        // sits on nor move it, so a file-level transition has to name the file.
+        // Recorded here and planned below, beside the creations and the edits,
+        // so one transaction can retire one file and write another and publish
+        // both or neither.
+        if operation.payload.is_none() && kin_mcp::session::is_retired_source_file(operation) {
+            record_retired_source_path(&mut retirements, base, operation)?;
+            continue;
+        }
+        if operation.payload.is_none() && kin_mcp::session::is_renamed_source_file(operation) {
+            record_renamed_source_path(&mut relocations, base, operation)?;
             continue;
         }
         // A payload-less `update` carrying a target and a body is the minimal
@@ -1087,6 +1119,8 @@ fn plan_exact_transaction(
         .values()
         .map(|(file_id, _)| file_id)
         .chain(creations.values().map(|(file_id, _)| file_id))
+        .chain(retirements.values())
+        .chain(relocations.values().flat_map(|(from, to)| [from, to]))
         .map(|file_id| {
             RepoPath::from_utf8(file_id.0.clone())
                 .map_err(|error| format!("invalid exact source path {file_id}: {error}"))
@@ -1096,6 +1130,16 @@ fn plan_exact_transaction(
     let mut layouts = Vec::new();
     let pipeline = kin_index::IndexPipeline::new();
 
+    refuse_overlapping_file_operations(&creations, &retirements, &relocations, &edits)?;
+    // Retirements and relocations run before the creations and the edits. A
+    // transaction that retires one path and creates another has to see the
+    // retirement first, or the create plans against a tree that still carries
+    // what this transaction is about to take out of it. Ordering them here also
+    // means a relocation's destination is occupied by the time a later create
+    // is planned against the same tree, so the collision is caught rather than
+    // published.
+    plan_retired_source_files(&prospective, retirements)?;
+    plan_renamed_source_files(&prospective, relocations, &mut layouts)?;
     plan_new_source_files(state, &prospective, &pipeline, creations, &mut layouts)?;
     for (_, (file_id, file_edits)) in edits {
         let path = RepoPath::from_utf8(file_id.0.clone())
@@ -1401,6 +1445,366 @@ fn record_new_source_file(
             "{target} is created more than once in one transaction; overlapping source authority \
              is ambiguous"
         ));
+    }
+    Ok(())
+}
+
+/// Refuse a transaction whose file-level operations act on the same path twice.
+///
+/// The three file-level shapes are planned in a fixed order (retire, relocate,
+/// create), and each one is checked against the base tree when it is recorded,
+/// so an overlap is invisible at record time and only surfaces as whichever
+/// error the second operation happens to hit against a tree the first one
+/// already moved. That error names an internal planning step rather than the
+/// pair of operations the caller wrote. Two operations on one path also have no
+/// unambiguous meaning: retiring and renaming the same file is a question about
+/// intent, not an ordering problem, and answering it by ordering would publish
+/// a guess.
+///
+/// An edit inside a file this transaction retires is the same class. The edit
+/// would be planned against a path the retirement has already taken out, and
+/// there is no reading of "change this function and delete the file it lives
+/// in" that both halves survive.
+fn refuse_overlapping_file_operations(
+    creations: &BTreeMap<String, (FilePathId, Vec<u8>)>,
+    retirements: &BTreeMap<String, FilePathId>,
+    relocations: &BTreeMap<String, (FilePathId, FilePathId)>,
+    edits: &BTreeMap<String, (FilePathId, Vec<(Entity, Vec<u8>)>)>,
+) -> Result<(), String> {
+    for path in retirements.keys() {
+        if relocations.contains_key(path) {
+            return Err(format!(
+                "{path} is both retired and renamed in one transaction; a file either leaves the \
+                 repository or moves within it, and which one was meant cannot be inferred"
+            ));
+        }
+        if creations.contains_key(path) {
+            return Err(format!(
+                "{path} is both retired and created in one transaction; retire it in one change \
+                 and admit the new file in the next, so each is reviewable on its own"
+            ));
+        }
+        if edits.contains_key(path) {
+            return Err(format!(
+                "{path} is retired and also carries an entity edit in one transaction; the edit \
+                 would be planned against a path this transaction has already taken out"
+            ));
+        }
+    }
+    let mut destinations = BTreeSet::new();
+    for (from, (_, to)) in relocations {
+        if !destinations.insert(to.0.clone()) {
+            return Err(format!(
+                "two files are renamed onto {} in one transaction; a destination holds one file",
+                to.0
+            ));
+        }
+        if creations.contains_key(&to.0) {
+            return Err(format!(
+                "{} is both a rename destination (from {from}) and a created path in one \
+                 transaction; a rename may not overwrite a file",
+                to.0
+            ));
+        }
+        if relocations.contains_key(&to.0) {
+            return Err(format!(
+                "{} is renamed away and is also the destination of {from} in one transaction; \
+                 chained renames are ambiguous, so stage them as separate transactions",
+                to.0
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Record one retirement: the file at `target` leaves the repository.
+///
+/// The path must be one repository authority already tracks. A retirement of a
+/// path nothing holds is refused rather than treated as satisfied, because the
+/// caller believes a file left the graph and would have no way to learn it
+/// never did; a silent success there is the same failure class as an admission
+/// that quietly overwrote somebody else's file.
+fn record_retired_source_path(
+    retirements: &mut BTreeMap<String, FilePathId>,
+    base: &NativeCommitBase,
+    operation: &kin_mcp::McpMutationOperation,
+) -> Result<(), String> {
+    let target = operation.target.trim();
+    let path = RepoPath::from_utf8(target.to_string())
+        .map_err(|error| format!("retired source path {target:?} is unusable: {error}"))?;
+    if base.tree.artifact_at_path(&path).is_none() {
+        return Err(format!(
+            "{target} is not tracked by repository authority, so there is nothing to retire; \
+             'delete' retires only a path the graph already holds. Name a path kin_graph_status \
+             or semantic_locate reports, or drop this operation"
+        ));
+    }
+    let file_id = FilePathId::new(target.to_string());
+    if retirements.insert(file_id.0.clone(), file_id).is_some() {
+        return Err(format!(
+            "{target} is retired more than once in one transaction; retiring a path that is \
+             already gone is ambiguous"
+        ));
+    }
+    Ok(())
+}
+
+/// Record one relocation: the file at `target` moves to `destination`.
+///
+/// Both ends are checked against the base tree here rather than only at the
+/// transition, so a caller learns which end was wrong. A destination that is
+/// already tracked is refused instead of overwritten, for the same reason
+/// `create` refuses a tracked path: a move that silently replaces another file
+/// destroys truth the caller never named.
+fn record_renamed_source_path(
+    relocations: &mut BTreeMap<String, (FilePathId, FilePathId)>,
+    base: &NativeCommitBase,
+    operation: &kin_mcp::McpMutationOperation,
+) -> Result<(), String> {
+    let target = operation.target.trim();
+    let destination = operation
+        .destination
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default();
+    let from = RepoPath::from_utf8(target.to_string())
+        .map_err(|error| format!("renamed source path {target:?} is unusable: {error}"))?;
+    let to = RepoPath::from_utf8(destination.to_string())
+        .map_err(|error| format!("rename destination {destination:?} is unusable: {error}"))?;
+    kin_core::validate_source_paths([&to]).map_err(|error| {
+        format!("rename destination {destination:?} is not an admissible repository path: {error}")
+    })?;
+    if base.tree.artifact_at_path(&from).is_none() {
+        return Err(format!(
+            "{target} is not tracked by repository authority, so there is nothing to rename; \
+             'rename' moves only a path the graph already holds"
+        ));
+    }
+    if base.tree.artifact_at_path(&to).is_some() {
+        return Err(format!(
+            "{destination} is already tracked by repository authority, so {target} cannot move \
+             onto it; a rename may not overwrite a file. Retire {destination} first, or pick a \
+             path that does not exist yet"
+        ));
+    }
+    let from_id = FilePathId::new(target.to_string());
+    let to_id = FilePathId::new(destination.to_string());
+    if relocations
+        .insert(from_id.0.clone(), (from_id, to_id))
+        .is_some()
+    {
+        return Err(format!(
+            "{target} is renamed more than once in one transaction; a file has one destination"
+        ));
+    }
+    Ok(())
+}
+
+/// Take every recorded retirement out of prospective graph truth: entities,
+/// their incident edges, the file layout, every non-entity enrichment facet,
+/// and the tree entry itself.
+///
+/// The enrichment goes before the tree entry and through the same function the
+/// watcher seam uses ([`crate::loop_runner::clear_incompatible_facets_in`]),
+/// which is what keeps the two definitions of "retire this file" from drifting
+/// apart. The order is not a preference: repository authority refuses a
+/// transition that leaves an entity on a path the staged tree no longer
+/// carries, and it is right to, because an artifact that stops existing while
+/// its entities keep ranking is exactly the stale top hit this exists to
+/// prevent. Removing the entities first is what makes the tree transition
+/// admissible.
+fn plan_retired_source_files(
+    prospective: &kin_db::InMemoryGraph,
+    retirements: BTreeMap<String, FilePathId>,
+) -> Result<(), String> {
+    if retirements.is_empty() {
+        return Ok(());
+    }
+    let mut artifacts = Vec::new();
+    for (_, file_id) in retirements {
+        let path = RepoPath::from_utf8(file_id.0.clone())
+            .map_err(|error| format!("invalid retired source path {file_id}: {error}"))?;
+        let artifact = prospective
+            .resolved_tree()
+            .artifact_at_path(&path)
+            .cloned()
+            .ok_or_else(|| {
+                format!("retired source artifact disappeared during planning: {file_id}")
+            })?;
+        crate::loop_runner::clear_incompatible_facets_in(
+            prospective,
+            &file_id,
+            crate::loop_runner::EnrichmentFacet::None,
+        )
+        .map_err(|error| format!("retire enrichment for {file_id}: {error}"))?;
+        artifacts.push(artifact);
+    }
+
+    // Edges that address the ARTIFACT rather than an entity inside it. Removing
+    // the entities took every edge incident to them, and this is what is left:
+    // an import that resolved to the file, a dependency drawn on the file. They
+    // are collected after the enrichment pass so an edge already gone is not
+    // removed twice, and carried in the same delta as the tree removal because
+    // repository authority requires artifact retirement and incident-edge
+    // retirement to be atomic. Without them the transition is refused outright
+    // with "unadmitted destination endpoint", which is the shape a two-file
+    // Python fixture reaches on its first import.
+    let mut seen = HashSet::new();
+    let mut relation_deltas = Vec::new();
+    for artifact in &artifacts {
+        let node = GraphNodeId::Artifact(artifact.artifact_id);
+        for relation in prospective
+            .get_all_relations_for_node(&node)
+            .map_err(|error| format!("load edges incident to {}: {error}", artifact.path))?
+        {
+            // An edge between two retired artifacts is reachable from both, and
+            // removing it twice in one delta is not the same statement as
+            // removing it once.
+            if seen.insert(relation.id) {
+                relation_deltas.push(RelationDelta::Removed { old: relation });
+            }
+        }
+    }
+
+    let tree_deltas = artifacts
+        .iter()
+        .map(|artifact| TreeDelta::Removed {
+            artifact_id: artifact.artifact_id,
+            old: artifact.located_entry(),
+        })
+        .collect::<Vec<_>>();
+    prospective
+        .apply_transaction_delta(&TransactionDelta {
+            relation_deltas,
+            tree_deltas,
+            ..TransactionDelta::default()
+        })
+        .map_err(|error| {
+            let paths = artifacts
+                .iter()
+                .map(|artifact| artifact.path.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("retire {paths} from the exact tree: {error}")
+        })?;
+    Ok(())
+}
+
+/// Move every recorded relocation in prospective graph truth, keeping the
+/// identity of everything it moves.
+///
+/// The artifact keeps its id, every entity keeps its id, span, lineage, and
+/// documentation, and every relation keeps both endpoints, because relations
+/// address entities rather than paths. Only the path changes, which is the
+/// whole difference between a rename and a retirement followed by an admission:
+/// the second mints new identity and orphans every incoming edge.
+///
+/// The entity relocation and the tree transition travel in ONE delta. Split
+/// across two, the first half would be exactly the state repository authority
+/// refuses (entities on a path the staged tree no longer carries), so a rename
+/// planned in two steps cannot reach the second. This is the "or relocation"
+/// half of what that refusal asks a caller to carry.
+///
+/// The layout and the non-entity facets carry the path in their key rather than
+/// in their body, so they are re-keyed rather than rebuilt: the bytes did not
+/// move, so every byte range in them is still correct.
+fn plan_renamed_source_files(
+    prospective: &kin_db::InMemoryGraph,
+    relocations: BTreeMap<String, (FilePathId, FilePathId)>,
+    layouts: &mut Vec<FileLayout>,
+) -> Result<(), String> {
+    for (_, (from_id, to_id)) in relocations {
+        let from = RepoPath::from_utf8(from_id.0.clone())
+            .map_err(|error| format!("invalid rename origin {from_id}: {error}"))?;
+        let to = RepoPath::from_utf8(to_id.0.clone())
+            .map_err(|error| format!("invalid rename destination {to_id}: {error}"))?;
+        let artifact = prospective
+            .resolved_tree()
+            .artifact_at_path(&from)
+            .cloned()
+            .ok_or_else(|| {
+                format!("renamed source artifact disappeared during planning: {from_id}")
+            })?;
+
+        let entity_deltas = prospective
+            .query_entities(&kin_model::EntityFilter {
+                file_path: Some(from_id.clone()),
+                ..Default::default()
+            })
+            .map_err(|error| format!("load entities on {from_id}: {error}"))?
+            .into_iter()
+            .map(|old| {
+                let mut new = old.clone();
+                new.file_origin = Some(to_id.clone());
+                EntityDelta::Modified { old, new }
+            })
+            .collect::<Vec<_>>();
+
+        prospective
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas,
+                tree_deltas: vec![TreeDelta::Updated {
+                    artifact_id: artifact.artifact_id,
+                    old: artifact.located_entry(),
+                    new: LocatedEntry::new(to.clone(), artifact.entry),
+                }],
+                ..TransactionDelta::default()
+            })
+            .map_err(|error| format!("relocate {from_id} to {to_id}: {error}"))?;
+
+        if let Some(layout) = prospective
+            .get_file_layout(&from_id)
+            .map_err(|error| format!("load layout for {from_id}: {error}"))?
+        {
+            let mut moved = layout;
+            moved.file_id = to_id.clone();
+            prospective
+                .delete_file_layout(&from_id)
+                .map_err(|error| format!("drop layout at {from_id}: {error}"))?;
+            prospective
+                .upsert_file_layout(&moved)
+                .map_err(|error| format!("install layout at {to_id}: {error}"))?;
+            layouts.push(moved);
+        }
+        if let Some(shallow) = prospective
+            .get_shallow_file(&from_id)
+            .map_err(|error| format!("load shallow record for {from_id}: {error}"))?
+        {
+            let mut moved = shallow;
+            moved.file_id = to_id.clone();
+            prospective
+                .delete_shallow_file(&from_id)
+                .map_err(|error| format!("drop shallow record at {from_id}: {error}"))?;
+            prospective
+                .upsert_shallow_file(&moved)
+                .map_err(|error| format!("install shallow record at {to_id}: {error}"))?;
+        }
+        if let Some(structured) = prospective
+            .get_structured_artifact(&from_id)
+            .map_err(|error| format!("load structured record for {from_id}: {error}"))?
+        {
+            let mut moved = structured;
+            moved.file_id = to_id.clone();
+            prospective
+                .delete_structured_artifact(&from_id)
+                .map_err(|error| format!("drop structured record at {from_id}: {error}"))?;
+            prospective
+                .upsert_structured_artifact(&moved)
+                .map_err(|error| format!("install structured record at {to_id}: {error}"))?;
+        }
+        if let Some(opaque) = prospective
+            .get_opaque_artifact(&from_id)
+            .map_err(|error| format!("load opaque record for {from_id}: {error}"))?
+        {
+            let mut moved = opaque;
+            moved.file_id = to_id.clone();
+            prospective
+                .delete_opaque_artifact(&from_id)
+                .map_err(|error| format!("drop opaque record at {from_id}: {error}"))?;
+            prospective
+                .upsert_opaque_artifact(&moved)
+                .map_err(|error| format!("install opaque record at {to_id}: {error}"))?;
+        }
     }
     Ok(())
 }
@@ -2274,6 +2678,7 @@ mod tests {
                     payload: Some(kin_mcp::McpMutationPayload::Entity(entity.clone())),
                     body: Some(body.to_string()),
                     description: "replace exact entity body".to_string(),
+                    destination: None,
                 }],
             )
             .unwrap();
@@ -2373,6 +2778,7 @@ mod tests {
             target: path.to_string(),
             payload: None,
             body: Some(body.to_string()),
+            destination: None,
             description: format!("admit new source {path}"),
         }
     }
@@ -2599,6 +3005,693 @@ mod tests {
             .expect("an ordinary repository-relative path must stage");
     }
 
+    /// One repository path, for the assertions that read the exact tree.
+    fn test_path(path: &str) -> RepoPath {
+        RepoPath::from_utf8(path.to_string()).expect("test repository path must be usable")
+    }
+
+    /// Build the delete-file operation an agent stages to retire source.
+    fn retired_source_file(path: &str) -> kin_mcp::McpMutationOperation {
+        kin_mcp::McpMutationOperation {
+            verb: "delete".to_string(),
+            target: path.to_string(),
+            payload: None,
+            body: None,
+            destination: None,
+            description: format!("retire {path}"),
+        }
+    }
+
+    /// Build the rename operation an agent stages to relocate source.
+    fn renamed_source_file(from: &str, to: &str) -> kin_mcp::McpMutationOperation {
+        kin_mcp::McpMutationOperation {
+            verb: "rename".to_string(),
+            target: from.to_string(),
+            payload: None,
+            body: None,
+            destination: Some(to.to_string()),
+            description: format!("move {from} to {to}"),
+        }
+    }
+
+    /// An agent holding only the MCP belt retires a file, and the graph stops
+    /// holding it.
+    ///
+    /// This is the defect FIR-2419 records, from the query side. A probe file
+    /// deleted 35 minutes earlier was still the top `semantic_locate` hit and
+    /// still the single file the graph counted, because retirement never
+    /// reached the retrieval index. It could not: the belt had no call that
+    /// retires anything. `create` admits a file and `update` edits an entity
+    /// inside one, and an entity payload carrying verb `delete` names one
+    /// entity, which cannot take the artifact it sits on out of the tree.
+    ///
+    /// Every surface a stale hit can come through is asserted, not just the
+    /// tree: the entity ids stop resolving, the file stops being an
+    /// entity-bearing path, the layout goes, and the working file goes with
+    /// them. `semantic_locate`, `find_references` and `get_context_pack` all
+    /// read those, so a retirement that left any of them standing would keep
+    /// steering an agent toward a file that no longer exists.
+    #[test]
+    fn retiring_a_tracked_file_over_mcp_takes_its_entities_and_its_tree_entry() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/retired.rs",
+            b"pub fn retired_value() -> u8 { 1 }\n",
+            "retired_value",
+        );
+        let (kept, _) = install_exact_source(
+            &state,
+            "src/kept.rs",
+            b"pub fn kept_value() -> u8 { 2 }\n",
+            "kept_value",
+        );
+        let file_id = FilePathId::new("src/retired.rs");
+        let before = load_native_commit_base(&state.layout).unwrap();
+        assert!(
+            before
+                .tree
+                .artifact_at_path(&test_path("src/retired.rs"))
+                .is_some(),
+            "the fixture never tracked the file, so nothing below proves a retirement"
+        );
+
+        let sessions = test_sessions();
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "file:src/retired.rs")
+            .unwrap();
+        let operations = vec![retired_source_file("src/retired.rs")];
+        kin_mcp::session::validate_staged_operations(&operations)
+            .expect("staging must accept the retirement form");
+        sessions
+            .stage_transaction(&transaction.transaction_id, operations)
+            .unwrap();
+
+        let result = commit_exact_transaction(
+            &state,
+            &sessions,
+            &HashMap::from([(
+                "transaction_id".to_string(),
+                serde_json::json!(transaction.transaction_id),
+            )]),
+            None,
+        );
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "retiring a tracked file over MCP failed: {}",
+            result_text(&result)
+        );
+
+        let after = load_native_commit_base(&state.layout).unwrap();
+        assert!(
+            after
+                .tree
+                .artifact_at_path(&test_path("src/retired.rs"))
+                .is_none(),
+            "a retired file is still tracked by repository authority"
+        );
+        assert!(
+            after.graph.get_entity(&entity.id).unwrap().is_none(),
+            "a retired file's entity id still resolves: {}",
+            entity.id
+        );
+        assert!(
+            after
+                .graph
+                .query_entities(&EntityFilter {
+                    file_path: Some(file_id.clone()),
+                    ..EntityFilter::default()
+                })
+                .unwrap()
+                .is_empty(),
+            "a retired path still owns entities"
+        );
+        assert!(
+            !after
+                .graph
+                .entity_bearing_file_paths()
+                .contains(&"src/retired.rs".to_string()),
+            "a retired path is still counted as an entity-bearing file"
+        );
+        // Enrichment lives on the live query graph rather than in the published
+        // change, and the live graph is what `semantic_locate`,
+        // `find_references` and `get_context_pack` read, so it is where a stale
+        // hit would actually come from. Asserted with the sibling beside it, so
+        // an assertion that could only ever pass would fail here too.
+        assert!(
+            state.graph.get_file_layout(&file_id).unwrap().is_none(),
+            "a retired file kept its layout on the live query graph"
+        );
+        assert!(
+            state
+                .graph
+                .get_file_layout(&FilePathId::new("src/kept.rs"))
+                .unwrap()
+                .is_some(),
+            "the control layout is absent, so the retired-layout assertion proves nothing"
+        );
+        assert!(
+            state
+                .graph
+                .query_entities(&EntityFilter {
+                    file_path: Some(file_id.clone()),
+                    ..EntityFilter::default()
+                })
+                .unwrap()
+                .is_empty(),
+            "a retired path still owns entities on the live query graph"
+        );
+        assert!(
+            state.graph.get_entity(&kept.id).unwrap().is_some(),
+            "the control entity is absent from the live graph, so the retirement proves nothing"
+        );
+        assert!(
+            !state.layout.working_dir().join("src/retired.rs").exists(),
+            "the commit projects the tree it published, so the working file must go with it"
+        );
+
+        // The two-sided arm: the sibling this transaction never named keeps its
+        // artifact and the exact entity id it had, so a retirement retired one
+        // path rather than emptying the graph.
+        assert!(
+            after
+                .tree
+                .artifact_at_path(&test_path("src/kept.rs"))
+                .is_some(),
+            "an unnamed sibling lost its artifact"
+        );
+        assert!(
+            after.graph.get_entity(&kept.id).unwrap().is_some(),
+            "an unnamed sibling lost its entity"
+        );
+
+        let reply: serde_json::Value = serde_json::from_str(result_text(&result)).unwrap();
+        assert!(
+            reply["change_id"].as_str().is_some_and(|id| !id.is_empty()),
+            "a retirement must publish a change an agent can review: {reply}"
+        );
+    }
+
+    /// A retired file leaves every row a retrieval surface reads.
+    ///
+    /// FIR-2419 is a query defect, not a bookkeeping one: the deleted file was
+    /// still the top `semantic_locate` hit and still the single file the graph
+    /// counted. Those surfaces do not read the tree. `semantic_locate` and
+    /// `get_context_pack` rank entities and read their layouts,
+    /// `find_references` reads relation rows, the file count reads
+    /// entity-bearing paths, and the embedding queue holds a retrieval key per
+    /// entity. A retirement that moved the tree and left any of those standing
+    /// would keep steering an agent toward a file that no longer exists, which
+    /// is exactly what 35 minutes of that container looked like.
+    ///
+    /// The cross-file edge is what makes this more than a restatement of the
+    /// previous test. `run` lives in a file this transaction never names, so
+    /// its edge to `helper` can only go if retiring a file takes the edges
+    /// incident to its entities with it.
+    #[test]
+    fn retiring_a_file_evicts_it_from_the_rows_every_retrieval_surface_reads() {
+        let (_dir, state) = test_state();
+        let sessions = test_sessions();
+
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "file:pkg/app.py")
+            .unwrap();
+        sessions
+            .stage_transaction(
+                &transaction.transaction_id,
+                vec![
+                    new_source_file("pkg/util.py", NEW_UTIL_PY),
+                    new_source_file("pkg/app.py", NEW_APP_PY),
+                ],
+            )
+            .unwrap();
+        let created = commit_exact_transaction(
+            &state,
+            &sessions,
+            &HashMap::from([(
+                "transaction_id".to_string(),
+                serde_json::json!(transaction.transaction_id),
+            )]),
+            None,
+        );
+        assert_ne!(created.is_error, Some(true), "{}", result_text(&created));
+
+        let entity_in = |file: &str, name: &str| {
+            state
+                .graph
+                .query_entities(&EntityFilter {
+                    file_path: Some(FilePathId::new(file)),
+                    ..EntityFilter::default()
+                })
+                .unwrap()
+                .into_iter()
+                .find(|entity| entity.name == name)
+                .unwrap_or_else(|| panic!("{name} must be a graph entity derived from {file}"))
+        };
+        let helper = entity_in("pkg/util.py", "helper");
+        let run = entity_in("pkg/app.py", "run");
+        let crossing = |graph: &kin_db::InMemoryGraph| {
+            graph
+                .get_all_relations_for_entity(&run.id)
+                .unwrap()
+                .into_iter()
+                .any(|relation| relation.dst == GraphNodeId::Entity(helper.id))
+        };
+        assert!(
+            crossing(state.graph.as_ref()),
+            "the fixture produced no cross-file edge, so nothing below proves one was evicted"
+        );
+        // The embedding queue only exists in a build that carries the vector
+        // feature, and `pending_embeddings` is a constant zero without it, so
+        // the fixture guard below would refuse a build that simply has no queue
+        // to evict from. Gated rather than softened: a zero that means "no
+        // queue" and a zero that means "the eviction did not happen" are
+        // different answers, and a guard that cannot tell them apart is not a
+        // guard.
+        #[cfg(feature = "vector")]
+        let queued_before = {
+            let queued = state.graph.pending_embeddings();
+            assert!(
+                queued > 0,
+                "the fixture queued no embeddings, so the queue assertion below proves nothing"
+            );
+            queued
+        };
+
+        let retire = sessions
+            .begin_transaction(TEST_SESSION, "file:pkg/util.py")
+            .unwrap();
+        sessions
+            .stage_transaction(
+                &retire.transaction_id,
+                vec![retired_source_file("pkg/util.py")],
+            )
+            .unwrap();
+        let result = commit_exact_transaction(
+            &state,
+            &sessions,
+            &HashMap::from([(
+                "transaction_id".to_string(),
+                serde_json::json!(retire.transaction_id),
+            )]),
+            None,
+        );
+        assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+
+        // What `semantic_locate` and `get_context_pack` rank.
+        assert!(
+            state.graph.get_entity(&helper.id).unwrap().is_none(),
+            "a retired file's entity still resolves, so it can still be ranked"
+        );
+        // What `find_references` reads, from the surviving side of the edge.
+        assert!(
+            !crossing(state.graph.as_ref()),
+            "an entity in an untouched file still holds an edge into the retired file"
+        );
+        // What the file count reads.
+        let bearing = state.graph.entity_bearing_file_paths();
+        assert!(
+            !bearing.contains(&"pkg/util.py".to_string()),
+            "a retired path is still counted as an entity-bearing file: {bearing:?}"
+        );
+        assert!(
+            bearing.contains(&"pkg/app.py".to_string()),
+            "the untouched file left the count too, so this proves nothing: {bearing:?}"
+        );
+        // What the vector index is fed from. kin-db drops the retrieval key for
+        // every removed entity in the same call that removes it, so a store
+        // that never built an index still shows the eviction here.
+        #[cfg(feature = "vector")]
+        assert!(
+            state.graph.pending_embeddings() < queued_before,
+            "the retired entities are still queued for embedding: {} of {queued_before}",
+            state.graph.pending_embeddings()
+        );
+        // The survivor keeps its own entity, so the eviction was scoped.
+        assert!(
+            state.graph.get_entity(&run.id).unwrap().is_some(),
+            "retiring one file took an entity out of another"
+        );
+    }
+
+    /// A `delete` naming a path the graph does not track is refused by name.
+    ///
+    /// Answering "already gone, nothing to do" would be the worse failure. A
+    /// caller that mistyped a path would be told its file left the graph while
+    /// the real one kept ranking, which is the FIR-2419 symptom arriving by a
+    /// second route.
+    #[test]
+    fn retiring_a_path_the_graph_does_not_track_is_refused_by_name() {
+        let (_dir, state) = test_state();
+        install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let sessions = test_sessions();
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "file:src/lib.rs")
+            .unwrap();
+        sessions
+            .stage_transaction(
+                &transaction.transaction_id,
+                vec![retired_source_file("src/never_existed.rs")],
+            )
+            .unwrap();
+
+        let result = commit_exact_transaction(
+            &state,
+            &sessions,
+            &HashMap::from([(
+                "transaction_id".to_string(),
+                serde_json::json!(transaction.transaction_id),
+            )]),
+            None,
+        );
+        assert_eq!(result.is_error, Some(true));
+        let text = result_text(&result);
+        assert!(
+            text.contains("src/never_existed.rs is not tracked by repository authority"),
+            "refusal must name the path it could not retire: {text}"
+        );
+
+        // The refusal is not merely a message: the file it did not name is
+        // untouched.
+        let after = load_native_commit_base(&state.layout).unwrap();
+        assert!(after
+            .tree
+            .artifact_at_path(&test_path("src/lib.rs"))
+            .is_some());
+    }
+
+    /// Two file-level operations on one path are refused by name, before
+    /// anything is planned.
+    ///
+    /// The three shapes are planned in a fixed order and each is checked
+    /// against the base tree when it is recorded, so an overlap is invisible
+    /// until the second operation meets a tree the first one already moved.
+    /// What comes back then names an internal planning step, not the pair the
+    /// caller wrote. Two operations on one path also have no unambiguous
+    /// meaning, so ordering them would publish a guess.
+    #[test]
+    fn overlapping_file_level_operations_on_one_path_are_refused_by_name() {
+        let (_dir, state) = test_state();
+        install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        install_exact_source(
+            &state,
+            "src/other.rs",
+            b"pub fn other() -> u8 { 2 }\n",
+            "other",
+        );
+        let sessions = test_sessions();
+
+        let commit_with = |operations: Vec<kin_mcp::McpMutationOperation>| {
+            let transaction = sessions
+                .begin_transaction(TEST_SESSION, "file:src/lib.rs")
+                .unwrap();
+            sessions
+                .stage_transaction(&transaction.transaction_id, operations)
+                .unwrap();
+            commit_exact_transaction(
+                &state,
+                &sessions,
+                &HashMap::from([(
+                    "transaction_id".to_string(),
+                    serde_json::json!(transaction.transaction_id),
+                )]),
+                None,
+            )
+        };
+
+        let both = commit_with(vec![
+            retired_source_file("src/lib.rs"),
+            renamed_source_file("src/lib.rs", "src/moved.rs"),
+        ]);
+        assert_eq!(both.is_error, Some(true));
+        assert!(
+            result_text(&both).contains("is both retired and renamed in one transaction"),
+            "{}",
+            result_text(&both)
+        );
+
+        let collide = commit_with(vec![
+            renamed_source_file("src/lib.rs", "src/dest.rs"),
+            renamed_source_file("src/other.rs", "src/dest.rs"),
+        ]);
+        assert_eq!(collide.is_error, Some(true));
+        assert!(
+            result_text(&collide).contains("two files are renamed onto src/dest.rs"),
+            "{}",
+            result_text(&collide)
+        );
+
+        // The control: the same two renames onto distinct destinations are not
+        // an overlap, so this refusal is about collisions rather than about
+        // refusing every multi-operation transaction.
+        let fine = commit_with(vec![
+            renamed_source_file("src/lib.rs", "src/one.rs"),
+            renamed_source_file("src/other.rs", "src/two.rs"),
+        ]);
+        assert_ne!(fine.is_error, Some(true), "{}", result_text(&fine));
+
+        // Neither end of the refused pairs moved.
+        let after = load_native_commit_base(&state.layout).unwrap();
+        assert!(after
+            .tree
+            .artifact_at_path(&test_path("src/one.rs"))
+            .is_some());
+        assert!(after
+            .tree
+            .artifact_at_path(&test_path("src/two.rs"))
+            .is_some());
+        assert!(after
+            .tree
+            .artifact_at_path(&test_path("src/dest.rs"))
+            .is_none());
+    }
+
+    /// A rename moves the file and everything keeps its identity.
+    ///
+    /// This is the half of FIR-2429 that a retirement cannot cover. A rename is
+    /// a removal at one path and an arrival at another, and doing it as that
+    /// pair mints new entity ids and orphans every incoming reference, so the
+    /// history of the code that moved is lost and every caller of it stops
+    /// resolving. Repository authority says as much from its own side: it
+    /// refuses a transition that leaves an entity on a path the staged tree no
+    /// longer carries unless the same delta carries its removal OR RELOCATION.
+    /// This is the relocation.
+    ///
+    /// The incoming edge is asserted because it is what `find_references` reads.
+    /// A move that kept the entity but dropped its callers would still report a
+    /// renamed function as referenced by nothing.
+    #[test]
+    fn renaming_a_tracked_file_over_mcp_keeps_entity_identity_and_incoming_edges() {
+        let (_dir, state) = test_state();
+        let sessions = test_sessions();
+
+        // Two files created in one transaction so the second really references
+        // the first; the planner seeds its cross-file linker for exactly this.
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "file:pkg/app.py")
+            .unwrap();
+        sessions
+            .stage_transaction(
+                &transaction.transaction_id,
+                vec![
+                    new_source_file("pkg/util.py", NEW_UTIL_PY),
+                    new_source_file("pkg/app.py", NEW_APP_PY),
+                ],
+            )
+            .unwrap();
+        let created = commit_exact_transaction(
+            &state,
+            &sessions,
+            &HashMap::from([(
+                "transaction_id".to_string(),
+                serde_json::json!(transaction.transaction_id),
+            )]),
+            None,
+        );
+        assert_ne!(created.is_error, Some(true), "{}", result_text(&created));
+
+        let before = load_native_commit_base(&state.layout).unwrap();
+        let helper = before
+            .graph
+            .query_entities(&EntityFilter {
+                file_path: Some(FilePathId::new("pkg/util.py")),
+                ..EntityFilter::default()
+            })
+            .unwrap()
+            .into_iter()
+            .find(|entity| entity.name == "helper")
+            .expect("the fixture must hold helper");
+        let referencing_before = before
+            .graph
+            .get_all_relations_for_entity(&helper.id)
+            .unwrap()
+            .len();
+        assert!(
+            referencing_before > 0,
+            "the fixture produced no edges on helper, so nothing below proves they survived"
+        );
+
+        let moved = sessions
+            .begin_transaction(TEST_SESSION, "file:pkg/util.py")
+            .unwrap();
+        let operations = vec![renamed_source_file("pkg/util.py", "pkg/core/util.py")];
+        kin_mcp::session::validate_staged_operations(&operations)
+            .expect("staging must accept the rename form");
+        sessions
+            .stage_transaction(&moved.transaction_id, operations)
+            .unwrap();
+        let result = commit_exact_transaction(
+            &state,
+            &sessions,
+            &HashMap::from([(
+                "transaction_id".to_string(),
+                serde_json::json!(moved.transaction_id),
+            )]),
+            None,
+        );
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "renaming a tracked file over MCP failed: {}",
+            result_text(&result)
+        );
+
+        let after = load_native_commit_base(&state.layout).unwrap();
+        assert!(
+            after
+                .tree
+                .artifact_at_path(&test_path("pkg/util.py"))
+                .is_none(),
+            "the origin path is still tracked after a rename"
+        );
+        let destination = after
+            .tree
+            .artifact_at_path(&test_path("pkg/core/util.py"))
+            .expect("the destination path must be tracked after a rename");
+        assert_eq!(
+            destination.artifact_id,
+            before
+                .tree
+                .artifact_at_path(&test_path("pkg/util.py"))
+                .unwrap()
+                .artifact_id,
+            "a rename must keep artifact identity; a new id is a delete plus a create"
+        );
+
+        let relocated = after
+            .graph
+            .get_entity(&helper.id)
+            .unwrap()
+            .expect("a rename must keep the entity id it moved");
+        assert_eq!(
+            relocated.file_origin,
+            Some(FilePathId::new("pkg/core/util.py")),
+            "the relocated entity still claims its old path"
+        );
+        assert_eq!(
+            after
+                .graph
+                .get_all_relations_for_entity(&helper.id)
+                .unwrap()
+                .len(),
+            referencing_before,
+            "a rename dropped edges incident to the entity it moved"
+        );
+        assert!(
+            state
+                .graph
+                .get_file_layout(&FilePathId::new("pkg/core/util.py"))
+                .unwrap()
+                .is_some(),
+            "the layout must move with the file on the live query graph"
+        );
+        assert!(
+            state
+                .graph
+                .get_file_layout(&FilePathId::new("pkg/util.py"))
+                .unwrap()
+                .is_none(),
+            "the layout must not stay behind at the old path"
+        );
+
+        // The bytes travelled unchanged, and the working copy is the projection
+        // of what committed rather than anything the agent wrote.
+        assert_eq!(
+            std::fs::read_to_string(state.layout.working_dir().join("pkg/core/util.py")).unwrap(),
+            NEW_UTIL_PY
+        );
+        assert!(
+            !state.layout.working_dir().join("pkg/util.py").exists(),
+            "the origin file must go with the rename"
+        );
+    }
+
+    /// A rename onto a path the graph already tracks is refused by name.
+    #[test]
+    fn renaming_onto_a_tracked_path_is_refused_by_name() {
+        let (_dir, state) = test_state();
+        install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        install_exact_source(
+            &state,
+            "src/other.rs",
+            b"pub fn other() -> u8 { 2 }\n",
+            "other",
+        );
+        let sessions = test_sessions();
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "file:src/lib.rs")
+            .unwrap();
+        sessions
+            .stage_transaction(
+                &transaction.transaction_id,
+                vec![renamed_source_file("src/lib.rs", "src/other.rs")],
+            )
+            .unwrap();
+
+        let result = commit_exact_transaction(
+            &state,
+            &sessions,
+            &HashMap::from([(
+                "transaction_id".to_string(),
+                serde_json::json!(transaction.transaction_id),
+            )]),
+            None,
+        );
+        assert_eq!(result.is_error, Some(true));
+        let text = result_text(&result);
+        assert!(
+            text.contains("src/other.rs is already tracked by repository authority"),
+            "refusal must name the destination it would have overwritten: {text}"
+        );
+
+        // Neither end moved.
+        let after = load_native_commit_base(&state.layout).unwrap();
+        assert!(after
+            .tree
+            .artifact_at_path(&test_path("src/lib.rs"))
+            .is_some());
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/other.rs")).unwrap(),
+            b"pub fn other() -> u8 { 2 }\n"
+        );
+    }
+
     #[test]
     fn payload_less_target_body_update_commits_like_an_entity_payload() {
         // Staging accepts verb `update` with a `target` (entity name or id) and a
@@ -2625,6 +3718,7 @@ mod tests {
             payload: None,
             body: Some("pub fn value() -> u8 { 2 }".to_string()),
             description: "payload-less body update".to_string(),
+            destination: None,
         };
         kin_mcp::session::validate_staged_operations(std::slice::from_ref(&operation))
             .expect("staging must accept the payload-less target body form");
@@ -3023,6 +4117,7 @@ mod tests {
                     payload: None,
                     body: Some(body.to_string()),
                     description: "attributed body update".to_string(),
+                    destination: None,
                 }],
             )
             .unwrap();
@@ -3626,6 +4721,7 @@ mod tests {
                     payload: None,
                     body: Some("pub fn value() -> u8 { 2 }".to_string()),
                     description: "attributed body update".to_string(),
+                    destination: None,
                 }],
             )
             .unwrap();
@@ -3704,6 +4800,7 @@ mod tests {
                     }),
                     body: None,
                     description: "link the call".to_string(),
+                    destination: None,
                 }],
             )
             .unwrap();
@@ -3912,6 +5009,7 @@ mod tests {
                     payload: None,
                     body: Some("pub fn no_such_entity() {}".to_string()),
                     description: String::new(),
+                    destination: None,
                 }],
             )
             .unwrap();
@@ -3981,6 +5079,7 @@ mod tests {
                         payload: None,
                         body: Some("pub fn value() -> u8 { 3 }".to_string()),
                         description: "correct work staged alongside the failure".to_string(),
+                        destination: None,
                     },
                     kin_mcp::McpMutationOperation {
                         verb: "update".to_string(),
@@ -3988,6 +5087,7 @@ mod tests {
                         payload: None,
                         body: Some("pub fn no_such_entity() {}".to_string()),
                         description: String::new(),
+                        destination: None,
                     },
                 ],
             )
@@ -4035,6 +5135,7 @@ mod tests {
                     payload: None,
                     body: Some("pub fn value() -> u8 { 2 }".to_string()),
                     description: "corrected retry".to_string(),
+                    destination: None,
                 }],
             )
             .unwrap();
@@ -4099,6 +5200,7 @@ mod tests {
                     payload: None,
                     body: Some("pub fn shared() -> u8 { 2 }".to_string()),
                     description: "bare name an agent would reach for first".to_string(),
+                    destination: None,
                 }],
             )
             .unwrap();
@@ -4138,6 +5240,7 @@ mod tests {
                     payload: None,
                     body: Some("pub fn shared() -> u8 { 2 }".to_string()),
                     description: "corrected id retry".to_string(),
+                    destination: None,
                 }],
             )
             .unwrap();
@@ -4204,6 +5307,7 @@ mod tests {
                             "    pub fn set(&mut self) -> u8 {\n        2\n    }".to_string(),
                         ),
                         description: "impl-nested method".to_string(),
+                        destination: None,
                     },
                     kin_mcp::McpMutationOperation {
                         verb: "update".to_string(),
@@ -4211,6 +5315,7 @@ mod tests {
                         payload: None,
                         body: Some("    pub fn nested() -> u8 {\n        2\n    }".to_string()),
                         description: "module-nested function".to_string(),
+                        destination: None,
                     },
                     kin_mcp::McpMutationOperation {
                         verb: "update".to_string(),
@@ -4218,6 +5323,7 @@ mod tests {
                         payload: None,
                         body: Some("pub fn plain() -> u8 {\n    2\n}".to_string()),
                         description: "top-level function".to_string(),
+                        destination: None,
                     },
                 ],
             )
@@ -4292,6 +5398,7 @@ mod tests {
                     // No leading indentation: the span slice, verbatim.
                     body: Some("pub fn set(&mut self) -> u8 {\n        2\n    }".to_string()),
                     description: "span-slice body".to_string(),
+                    destination: None,
                 }],
             )
             .unwrap();
@@ -4379,6 +5486,7 @@ mod tests {
                         payload: None,
                         body: Some(NEW_RESOLVE_BINARY.to_string()),
                         description: "add the search_dirs parameter".to_string(),
+                        destination: None,
                     },
                     kin_mcp::McpMutationOperation {
                         verb: "update".to_string(),
@@ -4386,6 +5494,7 @@ mod tests {
                         payload: None,
                         body: Some(NEW_PREPROCESSOR.to_string()),
                         description: "pass None".to_string(),
+                        destination: None,
                     },
                     kin_mcp::McpMutationOperation {
                         verb: "update".to_string(),
@@ -4393,6 +5502,7 @@ mod tests {
                         payload: None,
                         body: Some(NEW_COMMANDS.to_string()),
                         description: "pass None, targeted by bare name".to_string(),
+                        destination: None,
                     },
                 ],
             )
@@ -4437,6 +5547,7 @@ mod tests {
                         payload: None,
                         body: Some(NEW_RESOLVE_BINARY.to_string()),
                         description: "add the search_dirs parameter".to_string(),
+                        destination: None,
                     },
                     kin_mcp::McpMutationOperation {
                         verb: "update".to_string(),
@@ -4444,6 +5555,7 @@ mod tests {
                         payload: None,
                         body: Some(NEW_PREPROCESSOR.to_string()),
                         description: "pass None".to_string(),
+                        destination: None,
                     },
                     kin_mcp::McpMutationOperation {
                         verb: "update".to_string(),
@@ -4451,6 +5563,7 @@ mod tests {
                         payload: None,
                         body: Some(NEW_COMMANDS.to_string()),
                         description: "pass None".to_string(),
+                        destination: None,
                     },
                 ],
             )
@@ -4588,6 +5701,7 @@ mod tests {
                         payload: None,
                         body: Some("pub fn value() -> u8 { 2 }".to_string()),
                         description: "correct work staged alongside the failure".to_string(),
+                        destination: None,
                     },
                     kin_mcp::McpMutationOperation {
                         verb: "update".to_string(),
@@ -4595,6 +5709,7 @@ mod tests {
                         payload: None,
                         body: Some("pub fn no_such_entity() {}".to_string()),
                         description: String::new(),
+                        destination: None,
                     },
                 ],
             )
@@ -4630,6 +5745,7 @@ mod tests {
                         payload: None,
                         body: Some("pub fn value() -> u8 { 3 }".to_string()),
                         description: "after the abort".to_string(),
+                        destination: None,
                     }],
                 )
                 .is_err(),
@@ -4721,6 +5837,7 @@ mod tests {
                 payload: Some(kin_mcp::McpMutationPayload::Entity(payload)),
                 body: Some("pub fn value() -> u8 { 2 }".to_string()),
                 description: String::new(),
+                destination: None,
             }],
             commit_payload_hash: None,
         };
@@ -4856,6 +5973,7 @@ mod tests {
                     payload: Some(kin_mcp::McpMutationPayload::Entity(inserted)),
                     body: Some("pub fn inserted() {}".to_string()),
                     description: String::new(),
+                    destination: None,
                 }],
             )
             .unwrap();
@@ -4891,6 +6009,7 @@ mod tests {
                     payload: Some(kin_mcp::McpMutationPayload::Entity(entity)),
                     body: None,
                     description: String::new(),
+                    destination: None,
                 }],
             )
             .unwrap();
@@ -4950,6 +6069,7 @@ mod tests {
                         payload: Some(kin_mcp::McpMutationPayload::Entity(entity.clone())),
                         body: Some("pub fn value() -> u8 { 2 }".to_string()),
                         description: String::new(),
+                        destination: None,
                     },
                     kin_mcp::McpMutationOperation {
                         verb: "update".to_string(),
@@ -4957,6 +6077,7 @@ mod tests {
                         payload: Some(kin_mcp::McpMutationPayload::Entity(shadow.clone())),
                         body: Some("pub fn shadow() -> u8 { 3 }".to_string()),
                         description: String::new(),
+                        destination: None,
                     },
                 ],
             )
