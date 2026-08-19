@@ -59,6 +59,20 @@ export const ADDED_STEPS = [
 // steps; an anchor that stops matching is itself drift and fails below.
 export const DELTAS = [
   {
+    label: "archive-docs-version-windows",
+    from: `          node scripts/write-release-archive-docs.mjs "$env:ARTIFACT" "$env:TARGET" ($env:GITHUB_REF_NAME -replace '^v', '')
+`,
+    to: `          node scripts/write-release-archive-docs.mjs "$env:ARTIFACT" "$env:TARGET" $env:RC_VERSION
+`,
+  },
+  {
+    label: "archive-docs-version",
+    from: `          node scripts/write-release-archive-docs.mjs "$ARTIFACT" "$TARGET" "\${GITHUB_REF_NAME#v}"
+`,
+    to: `          node scripts/write-release-archive-docs.mjs "$ARTIFACT" "$TARGET" "$RC_VERSION"
+`,
+  },
+  {
     label: "apt",
     from: `        run: sudo apt-get update && sudo apt-get install -y musl-tools
 `,
