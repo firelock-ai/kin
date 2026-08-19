@@ -926,9 +926,23 @@ mod tests {
                 .clone()
         };
 
+        let shapes = |evidence: &[kin_model::RelationEvidence]| {
+            let mut shapes: Vec<String> = evidence
+                .iter()
+                .map(|record| format!("{:?}x{}", record.call_shape, record.occurrence_count))
+                .collect();
+            shapes.sort();
+            shapes
+        };
+
         let forward_evidence = evidence_for(forward);
         let reversed_evidence = evidence_for(reversed);
-        assert_eq!(forward_evidence, reversed_evidence);
+        // Evidence carries the call SITE now, and the two sources put their
+        // calls at different offsets, so byte equality across the reversal is
+        // not the invariant any more. What must hold is that the shapes reaching
+        // the callee, which is what the merge gate reads, do not depend on which
+        // call was written first.
+        assert_eq!(shapes(&forward_evidence), shapes(&reversed_evidence));
         assert_eq!(forward_evidence.len(), 2);
         assert!(forward_evidence.iter().any(|evidence| {
             evidence
@@ -936,6 +950,12 @@ mod tests {
                 .as_ref()
                 .is_some_and(|shape| shape.keywords == ["args"])
         }));
+        assert!(
+            forward_evidence
+                .iter()
+                .all(|record| record.source_span.is_some()),
+            "the same-file arm must carry each call's site: {forward_evidence:?}"
+        );
     }
 
     #[test]
