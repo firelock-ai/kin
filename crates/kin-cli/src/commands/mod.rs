@@ -40,6 +40,7 @@ pub mod history;
 pub mod impact;
 pub mod init;
 pub mod intent;
+pub mod language_servers;
 pub mod languages;
 pub mod locate;
 pub mod locate_cursor;

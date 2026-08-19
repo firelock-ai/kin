@@ -39,7 +39,23 @@ use serde::{Deserialize, Serialize};
 /// external language server. The daemon wires an adapter for exactly these
 /// languages, so every other language carries no such edge by construction, no
 /// matter what is installed on the host.
-pub const ENRICHABLE_LANGUAGES: &[LanguageId] = &[LanguageId::Rust, LanguageId::Python];
+///
+/// JavaScript and TypeScript are one entry each rather than one shared entry,
+/// because this list is read per language the repository actually holds and a
+/// JavaScript-only repository must not be told its enrichment rides on a
+/// TypeScript row. Both resolve to the same adapter and the same server binary.
+///
+/// "The daemon wires an adapter for exactly these" is an assertion, not a
+/// comment: `kin_daemon` holds one adapter map and a test there fails if the
+/// two sets ever disagree. They disagreed silently before, which is how a
+/// JavaScript repository read `unsupported` while the adapter it needed already
+/// existed in kin-lsp.
+pub const ENRICHABLE_LANGUAGES: &[LanguageId] = &[
+    LanguageId::Rust,
+    LanguageId::Python,
+    LanguageId::TypeScript,
+    LanguageId::JavaScript,
+];
 
 /// Whether cross-file reference evidence is available for one language.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -277,31 +277,16 @@ fn embedding_coverage_is_measured(_graph: &kin_db::InMemoryGraph) -> bool {
     true
 }
 
-/// Language servers this build can actually enrich with, and the binaries that
-/// provide them.
-///
-/// Two facts have to hold together for a reference edge to exist: the daemon
-/// wires an adapter for the language, and a server binary is installed. The
-/// binary names mirror `kin_lsp::discovery::KNOWN_SERVERS` for exactly the
-/// languages `kin_core::reference_coverage::ENRICHABLE_LANGUAGES` names;
-/// probing them here rather than through `discover_servers` keeps the daemon's
-/// status path off a subprocess, since discovery runs `--version` on every
-/// server it finds.
-pub(crate) const LANGUAGE_SERVER_BINARIES: &[(kin_model::LanguageId, &[&str])] = &[
-    (kin_model::LanguageId::Rust, &["rust-analyzer"]),
-    (
-        kin_model::LanguageId::Python,
-        &["pyright-langserver", "pylsp"],
-    ),
-];
-
 /// Languages whose enrichment server is installed on this host.
+///
+/// The table this probes lives in `crate::commands::language_servers`, beside
+/// the command that installs each one, because a name that drifts between the
+/// probe and the advice produces a doctor row that reports a gap and a fix that
+/// does not close it. Probing here rather than through
+/// `kin_lsp::discovery::discover_servers` keeps the status path off a
+/// subprocess, since discovery runs `--version` on every server it finds.
 pub(crate) fn installed_language_servers() -> HashSet<kin_model::LanguageId> {
-    LANGUAGE_SERVER_BINARIES
-        .iter()
-        .filter(|(_, binaries)| binaries.iter().any(|binary| which::which(binary).is_ok()))
-        .map(|(language, _)| *language)
-        .collect()
+    crate::commands::language_servers::installed_language_servers()
 }
 
 /// The whole-graph relation totals the completeness section reports beside its
