@@ -422,6 +422,11 @@ fn registered_tools() -> ToolsListResult {
                             "description": "Alias for include_body: false. Ignored when include_body is given explicitly.",
                             "default": false
                         },
+                        "include_type_edges": {
+                            "type": "boolean",
+                            "description": "Walk THROUGH a type-annotation edge to a type this repository defines (default false). A dataclass field typed with a repo class is a real flow into that class, so the hop is available; it is off by default because a shared type name otherwise joins every entity that annotates with it to every other one. An annotation target the repository does not define stays a leaf either way.",
+                            "default": false
+                        },
                         "max_response_chars": {
                             "type": "integer",
                             "description": "Serialized characters this response may occupy (default 30000, the same default every retrieval tool answers under). The tool enforces it itself, dropping bodies before edges and reporting the cut in degradations, so a result is never refused for size. `max_chars` is the same parameter under the name the other retrieval tools use.",
