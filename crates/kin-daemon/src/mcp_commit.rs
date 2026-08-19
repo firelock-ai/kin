@@ -1649,21 +1649,22 @@ fn plan_retired_source_files(
     // retirement to be atomic. Without them the transition is refused outright
     // with "unadmitted destination endpoint", which is the shape a two-file
     // Python fixture reaches on its first import.
-    let retired: HashSet<kin_model::ArtifactId> = artifacts
-        .iter()
-        .map(|artifact| artifact.artifact_id)
-        .collect();
-    let touches_retired = |node: GraphNodeId| match node {
-        GraphNodeId::Artifact(id) => retired.contains(&id),
-        _ => false,
-    };
-    let relation_deltas = prospective
-        .to_snapshot()
-        .relations
-        .into_values()
-        .filter(|relation| touches_retired(relation.src) || touches_retired(relation.dst))
-        .map(|old| RelationDelta::Removed { old })
-        .collect::<Vec<_>>();
+    let mut seen = HashSet::new();
+    let mut relation_deltas = Vec::new();
+    for artifact in &artifacts {
+        let node = GraphNodeId::Artifact(artifact.artifact_id);
+        for relation in prospective
+            .get_all_relations_for_node(&node)
+            .map_err(|error| format!("load edges incident to {}: {error}", artifact.path))?
+        {
+            // An edge between two retired artifacts is reachable from both, and
+            // removing it twice in one delta is not the same statement as
+            // removing it once.
+            if seen.insert(relation.id) {
+                relation_deltas.push(RelationDelta::Removed { old: relation });
+            }
+        }
+    }
 
     let tree_deltas = artifacts
         .iter()
