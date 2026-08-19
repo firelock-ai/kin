@@ -11726,6 +11726,26 @@ fn write_auto_daemon_config(enabled: bool) -> Result<()> {
 /// picked is printed with the evidence, including the modes it could not use
 /// and why. Recording it is what lets `kin doctor` later say that a configured
 /// projection is not working, which it cannot say about a mode nobody chose.
+/// The one honest recording decision setup can make, extracted so a test can
+/// hold it still: a recording claims the mode RUNS, setup engages nothing, and
+/// the shim is the only mode in force by mere installation. A mode an earlier
+/// `kin vfs on` recorded is kept even when it is a mount mode, because the
+/// chooser fed it in and it was recorded at a moment it actually engaged.
+pub(crate) fn projection_mode_to_record(
+    already: Option<crate::commands::projection::ProjectionMode>,
+    chosen: crate::commands::projection::ProjectionMode,
+    shim_available: bool,
+) -> Option<crate::commands::projection::ProjectionMode> {
+    use crate::commands::projection::ProjectionMode;
+    if already == Some(chosen) {
+        return Some(chosen);
+    }
+    if chosen == ProjectionMode::Shim {
+        return Some(ProjectionMode::Shim);
+    }
+    shim_available.then_some(ProjectionMode::Shim)
+}
+
 fn record_projection_choice() -> Result<()> {
     use crate::commands::projection;
 
@@ -11746,9 +11766,42 @@ fn record_projection_choice() -> Result<()> {
         println!("  {mark} {:<5} {}", probe.mode.as_str(), probe.evidence);
     }
     if modes.iter().any(|probe| probe.available) {
-        projection::record_mode(&kin_home, chosen)?;
-        println!("  Using {chosen}: {}", chosen.description());
-        println!("  Change it with `kin vfs on --mode <shim|nfs|fuse>`.");
+        // A recorded mode is a claim that this host RUNS it, and setup engages
+        // nothing: the shim is the one mode in force the moment it is
+        // installed, because it injects per process and needs no server and no
+        // mount. Recording a mount mode here is what made every fresh macOS
+        // and Windows install read `projection_mode=misconfigured` in `kin
+        // doctor` (the v0.5.41 release install proof failed on exactly that),
+        // since the chooser preferred nfs or projfs and nothing had mounted
+        // them. So setup records the shim when it is available and prints the
+        // preferred mount mode as the upgrade path; `kin vfs on` records that
+        // mode itself at the moment it actually engages. A mode an earlier
+        // `kin vfs on` already recorded is kept: the chooser fed it in, and
+        // overwriting a deliberate choice with the shim would un-configure a
+        // machine that was configured on purpose.
+        let already = projection::recorded_mode(&kin_home);
+        let shim_available = modes
+            .iter()
+            .any(|probe| probe.mode == projection::ProjectionMode::Shim && probe.available);
+        let to_record = projection_mode_to_record(already, chosen, shim_available);
+        match to_record {
+            Some(mode) => {
+                projection::record_mode(&kin_home, mode)?;
+                println!("  Using {mode}: {}", mode.description());
+                if mode == chosen {
+                    println!("  Change it with `kin vfs on --mode <shim|nfs|fuse>`.");
+                } else {
+                    println!(
+                        "  {chosen} is available: engage it with `kin vfs on --mode {chosen}`,                          which records it once it is actually running."
+                    );
+                }
+            }
+            None => {
+                println!(
+                    "  {chosen} is available but needs `kin vfs on --mode {chosen}` to engage;                      nothing is recorded until a projection is actually running."
+                );
+            }
+        }
     } else {
         // Nothing is recorded when nothing works. A recorded mode is a claim
         // that this host runs it, and `kin doctor` reads a recording that does
@@ -14204,6 +14257,70 @@ pub async fn uninstall(all: bool, dry_run: bool, force: bool, json: bool) -> Res
 
 #[cfg(test)]
 mod tests {
+    use super::projection_mode_to_record;
+
+    /// Setup must never record a mount mode it did not engage. The v0.5.41
+    /// release install proof failed on all three non-Linux legs because a
+    /// fresh install recorded nfs (macOS) or projfs (Windows) with nothing
+    /// mounted, and doctor read the recording as misconfigured.
+    #[test]
+    fn setup_records_the_shim_when_the_chooser_prefers_an_unengaged_mount() {
+        use crate::commands::projection::ProjectionMode;
+        assert_eq!(
+            projection_mode_to_record(None, ProjectionMode::Nfs, true),
+            Some(ProjectionMode::Shim)
+        );
+        assert_eq!(
+            projection_mode_to_record(None, ProjectionMode::ProjFs, true),
+            Some(ProjectionMode::Shim)
+        );
+        assert_eq!(
+            projection_mode_to_record(None, ProjectionMode::Fuse, true),
+            Some(ProjectionMode::Shim)
+        );
+    }
+
+    /// With no shim installed there is nothing setup can honestly claim runs,
+    /// so nothing is recorded and doctor stays clean on a projection-less host.
+    #[test]
+    fn setup_records_nothing_when_no_mode_is_in_force() {
+        use crate::commands::projection::ProjectionMode;
+        assert_eq!(
+            projection_mode_to_record(None, ProjectionMode::Nfs, false),
+            None
+        );
+        assert_eq!(
+            projection_mode_to_record(None, ProjectionMode::ProjFs, false),
+            None
+        );
+    }
+
+    /// The shim is in force by installation alone, so choosing it records it.
+    #[test]
+    fn setup_records_the_shim_when_the_shim_is_chosen() {
+        use crate::commands::projection::ProjectionMode;
+        assert_eq!(
+            projection_mode_to_record(None, ProjectionMode::Shim, true),
+            Some(ProjectionMode::Shim)
+        );
+    }
+
+    /// A mode an earlier `kin vfs on` engaged and recorded is preserved: the
+    /// chooser feeds the recording back in, and setup keeping it is what lets
+    /// a deliberately configured machine survive a setup re-run.
+    #[test]
+    fn setup_keeps_a_previously_engaged_recording() {
+        use crate::commands::projection::ProjectionMode;
+        assert_eq!(
+            projection_mode_to_record(Some(ProjectionMode::Nfs), ProjectionMode::Nfs, true),
+            Some(ProjectionMode::Nfs)
+        );
+        assert_eq!(
+            projection_mode_to_record(Some(ProjectionMode::ProjFs), ProjectionMode::ProjFs, false),
+            Some(ProjectionMode::ProjFs)
+        );
+    }
+
     use super::*;
     use crate::commands::setup_ledger::ArtifactKind;
     use kin_core::test_env::EnvVarGuard;
