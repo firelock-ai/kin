@@ -112,9 +112,13 @@ resolve_leg_unit() {
   artifacts="$(cargo test --no-run --message-format=json-render-diagnostics "$@")"
   executables="$(printf '%s\n' "$artifacts" | _leg_test_executables)"
   manifests="$(printf '%s\n' "$artifacts" | _leg_test_manifests)"
+  # These annotations go to stderr, not stdout. Callers read this function
+  # through a command substitution, which captures stdout, so an `::error` line
+  # written there would be swallowed into the caller's variable and never reach
+  # the log. GitHub reads workflow commands off either stream.
   count="$(printf '%s\n' "$executables" | _leg_count_lines)"
   if [ "$count" -ne 1 ]; then
-    echo "::error title=Ambiguous native Windows test binary::cargo test --no-run built $count test binaries for: $*"
+    echo "::error title=Ambiguous native Windows test binary::cargo test --no-run built $count test binaries for: $*" >&2
     echo "Each Windows authority leg must name exactly one compilation unit, because" >&2
     echo "the leg then drives that binary directly. Narrow the target selection." >&2
     printf '%s\n' "$executables" >&2
@@ -122,7 +126,7 @@ resolve_leg_unit() {
   fi
   count="$(printf '%s\n' "$manifests" | _leg_count_lines)"
   if [ "$count" -ne 1 ]; then
-    echo "::error title=Unresolvable native Windows package root::cargo test --no-run reported $count manifests for: $*"
+    echo "::error title=Unresolvable native Windows package root::cargo test --no-run reported $count manifests for: $*" >&2
     exit 1
   fi
 
@@ -134,16 +138,27 @@ resolve_leg_unit() {
 }
 
 # Run a resolved unit's binary the way cargo would have run it.
+#
+# The artifact directory goes on PATH through `cygpath -u` where that exists.
+# PATH is a COLON-separated list, and a `D:/a/kin/...` component in one is
+# ambiguous to the MSYS conversion that runs when bash spawns a native Windows
+# process: the drive letter can be read as its own entry. A single path argument
+# has no such ambiguity, which is why the executable and the package root are
+# passed through as they are and only the list is converted.
 _leg_exec() {
   local unit="$1"
   shift
-  local executable package_root
+  local executable package_root artifact_dir
   executable="${unit%%$'\t'*}"
   package_root="${unit#*$'\t'}"
+  artifact_dir="$(dirname "$executable")"
+  if command -v cygpath > /dev/null 2>&1; then
+    artifact_dir="$(cygpath -u "$artifact_dir")"
+  fi
   (
     cd "$package_root" || exit 1
     CARGO_MANIFEST_DIR="$package_root" \
-    PATH="$(dirname "$executable"):$PATH" \
+    PATH="$artifact_dir:$PATH" \
       "$executable" "$@"
   )
 }

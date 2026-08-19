@@ -225,6 +225,18 @@ main() {
   # shellcheck disable=SC2064
   [ -z "$cleanup" ] || trap "rm -f '$cleanup'" EXIT
 
+  # Printed on EVERY run, not only a failing one. The routing inputs are read
+  # from event payloads that differ per event type, and if one of them arrives
+  # empty the gate resolves the diff as unreadable and hard-fails, which is
+  # indistinguishable from the behaviour this step had before. That is the safe
+  # direction, and it is also invisible: the soft path would simply never fire
+  # and nobody would learn why. This line is what makes the wiring checkable
+  # from a green run.
+  echo "release-policy gate: event=${KIN_POLICY_EVENT:-unset}" \
+    "head_ref=${KIN_POLICY_HEAD_REF:-none}" \
+    "base_sha=${KIN_POLICY_BASE_SHA:-unset}" \
+    "head_sha=${KIN_POLICY_HEAD_SHA:-unset}"
+
   if run_validators "$commands"; then
     echo "release policy validators passed"
     return 0
