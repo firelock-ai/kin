@@ -1,0 +1,83 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+name: Windows Authority (nightly)
+
+# The Windows leg used to ride the `Check & Test` matrix on every pull request
+# and every merge-queue build. It is not a required status context on either
+# protection surface here, classic branch protection or the rulesets, so it
+# gated nothing while costing a full Windows build per event.
+#
+# Moving it to a schedule keeps the coverage and stops paying for it three
+# times per landing. What that trades away is stated plainly: a Windows-only
+# breakage is now found within a day rather than on the pull request that
+# introduced it. That is the right trade for a leg nothing was waiting on, and
+# it is only safe because the failure now reaches a person. See
+# `scheduled-failure-alarm.yml` beside this file: a failing run here opens and
+# escalates one issue, and a later green run closes it.
+#
+# Kept identical to the pull-request legs on purpose. This is the same job the
+# matrix ran, moved rather than reduced, so a nightly failure means the same
+# thing it meant before.
+
+on:
+  schedule:
+    # 07:37 UTC. Off the hour deliberately: GitHub delays scheduled runs
+    # queued on the hour, when everyone else's crons fire.
+    - cron: "37 7 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  windows:
+    name: Check & Test (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --all-targets
+
+      - name: Test
+        run: cargo test
+
+      # Runs from a required context on purpose. The nightly Windows workflow
+      # only carries the coverage this matrix gave up if it keeps running the
+      # same steps, and two files holding one step list drift the first time
+      # somebody edits either of them. The same step is present in the nightly,
+      # where it skips, which is what keeps the two lists identical.
+      - name: Check the nightly Windows job still runs these steps
+        if: runner.os == 'Linux'
+        run: ./scripts/check-windows-nightly-parity.sh

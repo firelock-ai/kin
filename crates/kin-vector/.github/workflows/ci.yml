@@ -32,8 +32,14 @@ jobs:
     name: Check & Test
     runs-on: ${{ matrix.os }}
     strategy:
+      # windows-latest left this matrix for `windows-nightly.yml`. It was not a
+      # required status context on either protection surface, classic branch
+      # protection or the rulesets, so it gated nothing here while running on
+      # the pull request, the merge-queue build, and the push to main. The
+      # coverage is unchanged and moved to a daily schedule with a failure
+      # alarm; only the three-times-per-landing cost is gone.
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v6
 
@@ -64,3 +70,12 @@ jobs:
 
       - name: Test
         run: cargo test
+
+      # Runs from a required context on purpose. The nightly Windows workflow
+      # only carries the coverage this matrix gave up if it keeps running the
+      # same steps, and two files holding one step list drift the first time
+      # somebody edits either of them. The same step is present in the nightly,
+      # where it skips, which is what keeps the two lists identical.
+      - name: Check the nightly Windows job still runs these steps
+        if: runner.os == 'Linux'
+        run: ./scripts/check-windows-nightly-parity.sh
