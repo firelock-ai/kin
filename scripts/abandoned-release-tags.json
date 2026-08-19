@@ -70,6 +70,13 @@
       "reason": "The Public Install Proof frozen at this tag fails on all five platforms at the installed capability validation: the tagged binary's locate coverage counts a graph-owned source path as bodied only when an opaque artifact carries a text preview for it, and no HEAD admission path writes such a record for a parsed source file (the daemon keeps one facet per path and clears opaque records on entity paths), so a fresh install's kin locate reports semantic coverage incomplete with a body gap on every store that holds one parsed source file, and the proof's complete-coverage assertion refuses it. The repair, which reads the entity body previews the graph already holds at HEAD, landed on main only after the tag, and both the proof workflow and the binary resolve from the tag, so no later change to main can reach the failing check. Both attempts of the cited run failed with the same signature on all five legs, the only GitHub Release object for this tag is the unpromoted prerelease the workflow publishes before proof, npm and Homebrew were verified untouched at 0.5.37, and the tag never became the finalized Latest release.",
       "superseded_by": "v0.5.39",
       "failed_release_run_id": "32107626360"
+    },
+    {
+      "tag": "v0.5.41",
+      "sha": "14efb5a7b1351cf5cde1a95a473781a9bec9fa96",
+      "reason": "The Public Install Proof frozen at this tag fails on its three non-Linux legs: the tagged binary's setup records the platform-preferred mount projection (nfs on macOS, projfs on Windows) without engaging it, so on every fresh install kin doctor reads the recorded mode against the running state and reports projection_mode=misconfigured, which is fatal under the proof's aggregate-health rule; the macOS legs' own capture reads nfs is recorded but is not what is running; mode=nfs mounted=no readable=no writable=no degraded=yes, and the Windows leg reads identically with projfs. The repair, which records only a projection that installation alone puts in force and prints the preferred mount mode as the engage-to-record upgrade path, landed on main only after the tag, and both the proof workflow and the binary resolve from the tag, so no later change to main can reach the failing check. Both attempts of the cited run failed with the same signature on windows-latest, macos-latest and macos-15-intel while the Linux legs passed, the only GitHub Release object for this tag is the unpromoted prerelease the workflow publishes before proof, npm and Homebrew were verified untouched at 0.5.40, and the tag never became the finalized Latest release.",
+      "superseded_by": "v0.5.42",
+      "failed_release_run_id": "32237324302"
     }
   ]
 }
