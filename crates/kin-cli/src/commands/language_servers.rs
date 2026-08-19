@@ -209,7 +209,9 @@ pub(crate) fn install_commands_for_names(names: &[&str]) -> Vec<String> {
 pub(crate) fn install_fix_line(missing_names: &[&str]) -> String {
     let commands = install_commands_for_names(missing_names);
     if commands.is_empty() {
-        return format!("install a language server for the named language, then {RESTART_AFTER_INSTALL}");
+        return format!(
+            "install a language server for the named language, then {RESTART_AFTER_INSTALL}"
+        );
     }
     format!(
         "run `kin doctor --fix --install-language-servers` to install {} for you, or run {} \
@@ -493,11 +495,8 @@ mod tests {
 
     #[test]
     fn install_commands_cover_every_distinct_missing_language() {
-        let commands = install_commands_for(&[
-            LanguageId::Python,
-            LanguageId::JavaScript,
-            LanguageId::Rust,
-        ]);
+        let commands =
+            install_commands_for(&[LanguageId::Python, LanguageId::JavaScript, LanguageId::Rust]);
         assert_eq!(commands.len(), 3, "{commands:?}");
         assert!(commands.contains(&"npm install -g pyright".to_string()));
     }

@@ -48,7 +48,10 @@ fn server_command_or_skip(language: LanguageId, test: &str) -> Option<(String, V
     };
     match which::which(&command) {
         Ok(path) => {
-            eprintln!("{test}: using {language} language server at {}", path.display());
+            eprintln!(
+                "{test}: using {language} language server at {}",
+                path.display()
+            );
             Some((command, args))
         }
         Err(_) => {
@@ -344,7 +347,11 @@ async fn javascript_resolves_a_require_chain_that_a_name_match_cannot() {
         },
     ];
     let refs = entity_refs(&fixtures);
-    let caller = refs.iter().find(|r| r.id == listen).expect("caller").clone();
+    let caller = refs
+        .iter()
+        .find(|r| r.id == listen)
+        .expect("caller")
+        .clone();
     let index = EntityIndex::new(refs);
 
     let server = start_server(&command, &args, root, LanguageId::JavaScript).await;

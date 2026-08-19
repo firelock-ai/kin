@@ -769,18 +769,21 @@ mod tests {
         assert_eq!(python["classes"]["calls"], json!("absent"));
     }
 
-    /// The build fact the scan cannot see. JavaScript has no language-server
-    /// adapter in this build, so its reference edges are unproducible rather
-    /// than merely unobserved, and the observation has to say so or the trust
-    /// gate reads an unproducible class as a scanned-and-empty one.
+    /// The build fact the scan cannot see. Ruby has no language-server adapter
+    /// in this build, so its reference edges are unproducible rather than merely
+    /// unobserved, and the observation has to say so or the trust gate reads an
+    /// unproducible class as a scanned-and-empty one.
+    ///
+    /// This case used to be written with JavaScript, which was true until
+    /// JavaScript and TypeScript were wired: kin-lsp already carried a working
+    /// adapter for both, so an express-shaped repository was told its reference
+    /// edges could never exist while the only thing missing was a server on the
+    /// host. `Unsupported` is deliberately not an actionable gap, so the
+    /// difference is what a reader is told to do about it.
     #[test]
     fn a_language_with_no_adapter_reports_reference_enrichment_unsupported() {
         let store = InMemoryGraph::new();
-        let target = entity(
-            "createApplication",
-            "lib/express.js",
-            LanguageId::JavaScript,
-        );
+        let target = entity("render_note", "app/notes.rb", LanguageId::Ruby);
         store.upsert_entity(&target).unwrap();
 
         let coverage =
@@ -799,6 +802,37 @@ mod tests {
             json!("unknown"),
             "a wired adapter's server is a host fact this scan does not probe"
         );
+    }
+
+    /// JavaScript is wired now, so an express-shaped repository must no longer
+    /// read `unsupported` here.
+    ///
+    /// Pinned as its own case rather than folded into the control above,
+    /// because this exact string on this exact shape of repository is what the
+    /// npm-0541 verdict recorded, and a regression would restore a state that
+    /// tells a reader there is nothing to be done.
+    #[test]
+    fn an_express_shaped_repository_no_longer_reports_reference_enrichment_unsupported() {
+        let store = InMemoryGraph::new();
+        for (name, path, language) in [
+            (
+                "createApplication",
+                "lib/express.js",
+                LanguageId::JavaScript,
+            ),
+            ("Router", "lib/router/index.ts", LanguageId::TypeScript),
+        ] {
+            let target = entity(name, path, language);
+            store.upsert_entity(&target).unwrap();
+            let coverage =
+                observe_cross_file_reference_coverage(&store, &target, &[RelationKind::References]);
+            assert_eq!(
+                coverage["reference_enrichment"],
+                json!("unknown"),
+                "{language} is wired, so its enrichment state is an unprobed host fact rather \
+                 than a build limit"
+            );
+        }
     }
 
     /// An intra-file edge is not a witness. Without this the FIR-2353 graph,
