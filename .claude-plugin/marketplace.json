@@ -1,6 +1,6 @@
 {
   "name": "kin",
-  "description": "Firelock's marketplace for Kin, the semantic system of record for software work. Ships the Kin plugin: the bundled MCP server plus skills for graph-backed retrieval and blast-radius review.",
+  "description": "Firelock's marketplace for Kin, the system of record for AI-written software. Ships the Kin plugin: the bundled MCP server plus skills for graph-backed retrieval and blast-radius review.",
   "owner": {
     "name": "Firelock",
     "url": "https://kinlab.ai"
@@ -9,7 +9,7 @@
     {
       "name": "kin",
       "source": "./plugins/kin-claude",
-      "description": "Semantic code retrieval over a graph of entities, relationships, changes, and provenance. Locate, search, context packs, data-flow tracing, and impact analysis without raw file search.",
+      "description": "Kin keeps a living map of the software itself so humans and agents can understand what every change touches. Locate, search, context packs, data-flow tracing, and impact analysis without raw file search.",
       "category": "development",
       "homepage": "https://kinlab.ai"
     }
