@@ -257,15 +257,12 @@ async fn enrich_after_init(kin_root: &Path) {
     // branches is at generation 2". Five branch tests failed exactly that way.
     // Conversion is a phase with an end, so its daemon has one too. A daemon the
     // caller already had is theirs and is left alone.
-    let borrowed_existing = kin_core::KinLayout::discover(kin_root)
-        .map(|layout| async move {
-            crate::daemon_client::resolve_daemon_url_if_running_async(&layout)
-                .await
-                .is_some()
-        })
-        .map(|fut| fut);
-    let borrowed_existing = match borrowed_existing {
-        Some(fut) => fut.await,
+    let borrowed_existing = match kin_core::KinLayout::discover(kin_root) {
+        Some(layout) => crate::daemon_client::resolve_daemon_url_if_running_async(&layout)
+            .await
+            .is_some(),
+        // No layout to ask about means nothing of ours is running, so anything
+        // started below is ours to stop.
         None => false,
     };
 
