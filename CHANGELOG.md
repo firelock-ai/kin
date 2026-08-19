@@ -33,6 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Pin kin-vfs-core 0.4.5 and the kin-vfs release checkout to the composed mount landing (#942)
 - Hold the Git capture lease before the name a reap tests exists (#943)
 - Give the MCP belt calls that retire and relocate source, and pin what a retirement takes with it (#939)
+- Report only what the capability tier actually gates (#945)
+- Report a commit whose daemon died in memory terms, and free the graph copies it held at its peak (#946)
+- Place watcher events by repository containment, not by path spelling (#948)
 
 
 ## [0.5.40] - 2026-08-18
