@@ -160,7 +160,7 @@ fn daemon_url_from_env() -> Result<String> {
 /// Query the daemon for federated impact analysis, returning the typed struct.
 ///
 /// Returns a [`SpineQuery`] so callers can distinguish a spine that is simply
-/// not configured (local-only — quiet) from one that is configured but
+/// not configured (local-only: quiet) from one that is configured but
 /// unavailable (surface it) and a healthy, possibly-empty answer.
 pub async fn fetch_spine_impact_typed(
     repo_id: &str,
@@ -1033,7 +1033,7 @@ pub struct ReferenceRow {
     /// Graph entity id of the referencing (caller) entity, when it is a
     /// graph-owned local entity. Lets an agent drill a reference straight to the
     /// caller's body (`get_entity_source`/`get_context_pack`) without re-resolving
-    /// the caller by name — the keystone of the no-filesystem reference→body
+    /// the caller by name. That is the keystone of the no-filesystem reference→body
     /// chain. `None` for federated spine xrefs (no local entity).
     pub entity_id: Option<String>,
     pub name: String,
@@ -1081,6 +1081,17 @@ pub struct ReferenceRow {
     /// the strongest contributing edge is the row's evidence. `name_only` means
     /// the reference is a guess and should be confirmed before being acted on.
     pub resolution: Option<RelationResolution>,
+    /// Whether EVERY edge behind this row is a receiver-method call the linker
+    /// matched on the bare leaf name.
+    ///
+    /// `resolution` cannot answer this. It reports the strongest contributing
+    /// edge, and `name_only` covers four tiers of very different strength: a
+    /// callee written `Error::msg` matching one entity in the repository lands
+    /// there beside the receiver fan-out that answered
+    /// `find_references(HTTPAdapter.send)` with 33 rows. Only the fan-out is a
+    /// candidate rather than a reference (FIR-1552), and only a row with no
+    /// other kind of edge behind it is one.
+    pub receiver_name_guess: bool,
 }
 
 /// Why a reference row carries no site lines.
@@ -1200,6 +1211,9 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
                 snippet,
                 relation_kinds: Vec::new(),
                 resolution: None,
+                // Every contributing edge has to be a guess for the row to be
+                // one, so this starts true and any other edge clears it.
+                receiver_name_guess: true,
             });
         if entry.file_path.is_none() {
             entry.file_path = file_path;
@@ -1226,6 +1240,7 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
             Some(current) => current.max(resolution),
             None => resolution,
         });
+        entry.receiver_name_guess &= kin_index::resolution::is_receiver_name_guess(&rel);
     }
 
     let mut rows = Vec::with_capacity(grouped.len());
@@ -1249,13 +1264,13 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
 }
 
 /// What one relation's evidence says about where its reference sites are.
-struct RelationSpanTally {
+pub struct RelationSpanTally {
     /// 1-based site lines inside the referencing entity's own file.
-    lines: Vec<u32>,
+    pub lines: Vec<u32>,
     /// Spans that named a different file and were therefore not reportable under
     /// this row. Counted rather than discarded so an empty `lines` can be
     /// explained.
-    outside_caller_file: usize,
+    pub outside_caller_file: usize,
 }
 
 /// 1-based reference-site lines a single relation records, restricted to the
@@ -1268,7 +1283,7 @@ struct RelationSpanTally {
 /// reports one `file_path` and a line from a different file would read as a line
 /// in that one. Both kinds of miss are counted, because an empty result that
 /// cannot say why is the defect this reports around.
-fn relation_reference_lines(
+pub fn relation_reference_lines(
     rel: &kin_model::relation::Relation,
     caller_file: Option<&kin_model::ids::FilePathId>,
 ) -> RelationSpanTally {
@@ -2248,7 +2263,7 @@ pub fn entity_body_gap_reason(entity: &Entity) -> String {
 
 /// Caps for the inline snippet surfaced on a retrieval hit (`kin locate --json`
 /// symbols, `semantic_locate` entity results): a signature plus the first
-/// several body lines — dense enough for an agent to act on without a follow-up
+/// several body lines, dense enough for an agent to act on without a follow-up
 /// read, but far tighter than the full-body excerpt
 /// ([`MCP_SOURCE_MAX_LINES`]/[`MCP_SOURCE_MAX_CHARS`]) `get_entity_source` and
 /// `get_context_pack` serve. One bound shared by every agent surface so the

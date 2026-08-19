@@ -3776,9 +3776,9 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-core"
-version = "0.4.2"
+version = "0.4.6"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "5032cf253334f030b958f36417f84978eafcdbf12708e777cf4e1f395ba49cd5"
+checksum = "7f82f2985f00428a2ec1c115cd74cade89785e70565e56407388755e4b104cdf"
 dependencies = [
  "lru",
  "parking_lot",

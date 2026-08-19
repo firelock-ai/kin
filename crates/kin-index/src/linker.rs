@@ -14,7 +14,7 @@ use tracing::debug;
 use sha2::{Digest, Sha256};
 
 use kin_model::{
-    ArtifactId, Entity, EntityId, EntityKind, EntityRole, GraphNodeId, LanguageId,
+    ArtifactId, Entity, EntityId, EntityKind, EntityRole, FilePathId, GraphNodeId, LanguageId,
     ParseCompleteness, Relation, RelationEvidence, RelationId, RelationKind, RelationOrigin,
     Visibility,
 };
@@ -24,6 +24,7 @@ use kin_parser::{
 };
 
 use crate::error::{IndexError, Result as IndexResult};
+use crate::resolution::RECEIVER_NAME_FANOUT_CONFIDENCE;
 
 /// Graph-assigned artifact identities keyed by repository-relative path.
 ///
@@ -702,12 +703,14 @@ fn resolve_one_file(
     let parse_completeness = completeness
         .and_then(|by_file| by_file.get(&file.file_path))
         .unwrap_or(&FULL_PARSE_COMPLETENESS);
+    let caller_file = FilePathId::new(&file.file_path);
     let make_relation = |rel: &ExtractedRelation, src, dst, confidence| {
         make_relation(
             rel,
             src,
             dst,
             confidence,
+            &caller_file,
             parse_completeness,
             call_extraction_complete,
         )
@@ -1160,10 +1163,17 @@ fn resolve_one_file(
                         }
                     },
                 );
-                let targets = caller_import_targets.get_or_insert_with(|| {
-                    resolve_caller_import_targets(&file.file_path, &file.imports, &ctx.known_files)
-                });
-                narrow_pairs_by_receiver_reach(candidates, targets, &owner_bound)
+                let settled = settle_receiver_method_owner(candidates, &owner_bound);
+                if settled.is_empty() {
+                    debug!(
+                        src = %rel.src_name,
+                        dst = %rel.dst_name,
+                        file = %file.file_path,
+                        named_owners = owner_bound.values().collect::<HashSet<_>>().len(),
+                        "linker: receiver-method call names no single owner this file reaches, leaving unlinked"
+                    );
+                }
+                settled
             } else if is_python_bare_identifier_call(rel, src_id, &ctx.entity_language_by_id) {
                 // This tier exists for calls made through a receiver. A bare
                 // Python identifier has none, so no method here is a dispatch
@@ -1193,7 +1203,7 @@ fn resolve_one_file(
                     accumulate_relation(
                         &mut resolved,
                         &mut relation_indices,
-                        make_relation(rel, src_id, dst_id, 0.3),
+                        make_relation(rel, src_id, dst_id, RECEIVER_NAME_FANOUT_CONFIDENCE),
                     );
                     linked = true;
                 }
@@ -1748,6 +1758,16 @@ pub(crate) fn accumulate_relation(
     merge_relation_metadata(existing, &relation);
 
     if relation.kind != RelationKind::Calls {
+        // A non-call edge carries evidence only when the adapter recorded a
+        // site for it, and two sites for one edge are two lines to report, so
+        // they merge instead of the later one being dropped. None of the
+        // call-shape marker synthesis below applies: a non-call edge has no
+        // shape, so a spanless occurrence contributes nothing rather than an
+        // explicit unshaped marker.
+        if !relation.evidence.is_empty() {
+            existing.evidence.append(&mut relation.evidence);
+            canonicalize_call_evidence(&mut existing.evidence);
+        }
         return;
     }
 
@@ -3018,7 +3038,7 @@ fn narrow_pairs_by_role<'a>(
 }
 
 /// The receiver-method candidates whose owning type the calling file binds by
-/// name.
+/// name, each mapped back to the local name that bound it.
 ///
 /// A method entity is keyed `Owner.method` or `Owner::method`, so a file's
 /// import bindings name candidate owners directly: for each local name an
@@ -3026,52 +3046,73 @@ fn narrow_pairs_by_role<'a>(
 /// select exactly the methods that name's type defines. `named_ids` is the
 /// caller's exact-name index, consulted once per import binding rather than
 /// once per candidate.
-fn owner_bound_targets(
+///
+/// The owner travels with each id because the number of DISTINCT owners is what
+/// decides whether the call has a destination at all: one owner is a
+/// destination the file named, several is a choice nothing at the call site
+/// makes.
+fn owner_bound_targets<'a>(
     leaf: &str,
-    file_imports: Option<&HashMap<&str, (&str, &str)>>,
-    mut named_ids: impl FnMut(&str, &mut HashSet<EntityId>),
-) -> HashSet<EntityId> {
-    let mut bound = HashSet::new();
+    file_imports: Option<&HashMap<&'a str, (&'a str, &'a str)>>,
+    mut named_ids: impl FnMut(&str, &mut Vec<EntityId>),
+) -> HashMap<EntityId, &'a str> {
+    let mut bound = HashMap::new();
     let Some(file_imports) = file_imports else {
         return bound;
     };
     for local_name in file_imports.keys() {
+        let mut ids = Vec::new();
         for key in receiver_method_keys(local_name, leaf) {
-            named_ids(&key, &mut bound);
+            named_ids(&key, &mut ids);
+        }
+        for id in ids {
+            bound.insert(id, *local_name);
         }
     }
     bound
 }
 
-/// Narrow a receiver-method fan-out to the candidates the calling file can
-/// reach.
+/// Settle a receiver-method call against the owners the calling file names.
 ///
-/// A call through an object dispatches on the receiver's static type, and a
-/// file that neither binds that type by name nor imports the module defining it
-/// cannot be holding one. Such a candidate is a same-named method of a type
-/// this file never sees, so it is not a dispatch target here however many other
-/// files do reach it.
+/// A call through an object dispatches on the receiver's static type, and the
+/// only types a file can be holding one of are the ones it names: a class it
+/// imports by name, or one it defines. A same-named method on a type this file
+/// never sees is not a dispatch target here however many other files reach it.
 ///
-/// Narrowing happens only when at least one candidate IS reached. A file whose
-/// imports account for none of them has no type evidence to narrow on, so it
-/// fans out exactly as before rather than losing every candidate to a rule that
-/// could not see any of them.
-fn narrow_pairs_by_receiver_reach<'a>(
+/// So exactly two shapes bind. Exactly one named owner carries the leaf, and
+/// its methods are the destination. Anything else binds nothing: no named owner
+/// carries it, so the call has no destination this file can reach; or several
+/// do, and choosing among them is a guess with nothing at the call site behind
+/// it. This is FIR-1552's rule, and it is the one kin#906 applied to bare
+/// Python builtins and kin#923 to bare Rust calls, applied to the shape that
+/// produced the most edges: `find_references(HTTPAdapter.send)` on psf/requests
+/// answered 33 where two lines call it, and every one of the 33 came through
+/// this tier.
+///
+/// The earlier rule fanned out to every candidate when the file's imports
+/// accounted for none of them, on the reasoning that a rule which cannot see
+/// any candidate should not drop them all. That is the fail-open that minted
+/// ten of those 33: a `sock.send(...)` in a test file that imports nothing
+/// defining `send` reached the HTTP adapter, the session, and every other
+/// `send` in the repository. A rule that cannot see the receiver's type does
+/// not thereby know the answer is all of them.
+fn settle_receiver_method_owner<'a>(
     candidates: Vec<(&'a str, EntityId)>,
-    import_target_files: &HashSet<String>,
-    owner_bound: &HashSet<EntityId>,
+    owner_bound: &HashMap<EntityId, &str>,
 ) -> Vec<(&'a str, EntityId)> {
-    let reached: Vec<(&str, EntityId)> = candidates
-        .iter()
-        .copied()
-        .filter(|(file_path, id)| {
-            import_target_files.contains(*file_path) || owner_bound.contains(id)
-        })
+    let reached: Vec<(&'a str, EntityId)> = candidates
+        .into_iter()
+        .filter(|(_, id)| owner_bound.contains_key(id))
         .collect();
-    if reached.is_empty() {
-        return candidates;
+    let owners: HashSet<&str> = reached
+        .iter()
+        .filter_map(|(_, id)| owner_bound.get(id).copied())
+        .collect();
+    if owners.len() == 1 {
+        reached
+    } else {
+        Vec::new()
     }
-    reached
 }
 
 /// Confidence for a call through a receiver the file's own imports bind to a
@@ -3181,6 +3222,7 @@ fn make_relation(
     src: EntityId,
     dst: EntityId,
     confidence: f32,
+    caller_file: &FilePathId,
     parse_completeness: &ParseCompleteness,
     call_extraction_complete: bool,
 ) -> Relation {
@@ -3203,13 +3245,56 @@ fn make_relation(
         origin,
         created_in: None,
         import_source: None,
-        evidence: call_shape_evidence(
-            rel.kind,
-            rel.call_shape.as_ref(),
+        evidence: relation_evidence(
+            rel,
+            caller_file,
             parse_completeness,
             call_extraction_complete,
         ),
     }
+}
+
+/// The stored evidence for one resolved relation: its call shape, when the
+/// adapter records shapes, carrying the site the syntax was read at, when the
+/// adapter records sites.
+///
+/// The site is the whole point of `reference_lines`. An adapter reports it
+/// file-free, because a relation's syntax is always inside the file being
+/// parsed; pairing it with `caller_file` here is what makes the span belong to
+/// the caller rather than to whichever file a later stage happened to hold.
+/// That also means a parser-recorded site can never land under
+/// `span_outside_caller_file`.
+///
+/// A non-call edge previously carried no evidence record at all, so a site on
+/// one has nothing to attach to and gets a record of its own. A call edge's
+/// record already exists for the shape, and the site goes onto it rather than
+/// beside it, so an edge does not report one occurrence twice.
+pub(crate) fn relation_evidence(
+    rel: &ExtractedRelation,
+    caller_file: &FilePathId,
+    parse_completeness: &ParseCompleteness,
+    call_extraction_complete: bool,
+) -> Vec<RelationEvidence> {
+    let mut evidence = call_shape_evidence(
+        rel.kind,
+        rel.call_shape.as_ref(),
+        parse_completeness,
+        call_extraction_complete,
+    );
+    let Some(site) = rel.site.as_ref() else {
+        return evidence;
+    };
+    let span = site.to_source_span(caller_file);
+    if evidence.is_empty() {
+        return vec![RelationEvidence {
+            source_span: Some(span),
+            ..RelationEvidence::default()
+        }];
+    }
+    for record in &mut evidence {
+        record.source_span = Some(span.clone());
+    }
+    evidence
 }
 
 /// Convert a parser-side [`CallArgShape`] into stored relation evidence carrying
@@ -4273,7 +4358,7 @@ pub struct IncrementalLinkerCheckpointV1 {
 }
 
 /// Bump whenever [`IncrementalLinkerCheckpointV1`] or linker semantics change.
-pub const INCREMENTAL_LINKER_CHECKPOINT_VERSION: u32 = 5;
+pub const INCREMENTAL_LINKER_CHECKPOINT_VERSION: u32 = 6;
 
 /// Build-time kin-index identity included in the composite hydration
 /// checkpoint version key.
@@ -4822,12 +4907,14 @@ fn resolve_one_file_incremental(
     let parse_completeness = completeness
         .and_then(|by_file| by_file.get(&file.file_path))
         .unwrap_or(&FULL_PARSE_COMPLETENESS);
+    let caller_file = FilePathId::new(&file.file_path);
     let make_relation = |rel: &ExtractedRelation, src, dst, confidence| {
         make_relation(
             rel,
             src,
             dst,
             confidence,
+            &caller_file,
             parse_completeness,
             call_extraction_complete,
         )
@@ -5275,14 +5362,17 @@ fn resolve_one_file_incremental(
                             }
                         },
                     );
-                    let targets = caller_import_targets.get_or_insert_with(|| {
-                        resolve_caller_import_targets(
-                            &file.file_path,
-                            &file.imports,
-                            &linker.known_files,
-                        )
-                    });
-                    narrow_pairs_by_receiver_reach(candidates, targets, &owner_bound)
+                    let settled = settle_receiver_method_owner(candidates, &owner_bound);
+                    if settled.is_empty() {
+                        debug!(
+                            src = %rel.src_name,
+                            dst = %rel.dst_name,
+                            file = %file.file_path,
+                            named_owners = owner_bound.values().collect::<HashSet<_>>().len(),
+                            "linker(incremental): receiver-method call names no single owner this file reaches, leaving unlinked"
+                        );
+                    }
+                    settled
                 } else if is_python_bare_identifier_call(rel, src_id, &linker.entity_language_by_id)
                 {
                     // A bare Python identifier carries no receiver, and this
@@ -5312,7 +5402,7 @@ fn resolve_one_file_incremental(
                         accumulate_relation(
                             &mut resolved,
                             &mut relation_indices,
-                            make_relation(rel, src_id, dst_id, 0.3),
+                            make_relation(rel, src_id, dst_id, RECEIVER_NAME_FANOUT_CONFIDENCE),
                         );
                     }
                     continue;
@@ -5996,6 +6086,7 @@ mod tests {
             file_path: "src/a.ts".to_string(),
             entities: vec![e1.clone(), e2.clone()],
             relations: vec![ExtractedRelation {
+                site: None,
                 receiver: None,
                 call_shape: None,
                 kind: RelationKind::Calls,
@@ -6043,6 +6134,7 @@ mod tests {
             relations: shapes
                 .drain(..)
                 .map(|call_shape| ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape,
                     kind: RelationKind::Calls,
@@ -6121,6 +6213,7 @@ mod tests {
             relations: shapes
                 .into_iter()
                 .map(|call_shape| ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape,
                     kind: RelationKind::Calls,
@@ -6164,6 +6257,7 @@ mod tests {
             file_path: "src/a.py".to_string(),
             entities: vec![caller.clone(), target.clone()],
             relations: vec![ExtractedRelation {
+                site: None,
                 receiver: None,
                 call_shape: Some(CallArgShape {
                     positional: 2,
@@ -6223,6 +6317,7 @@ mod tests {
             entities: vec![caller.clone(), target.clone()],
             relations: vec![
                 ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: Some(CallArgShape {
                         positional: 2,
@@ -6310,6 +6405,7 @@ mod tests {
                 file_path: "src/good.py".to_string(),
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: Some(CallArgShape {
                         positional: 1,
@@ -6483,6 +6579,7 @@ mod tests {
                 file_path: "src/routes/api.ts".to_string(),
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::Calls,
@@ -6541,6 +6638,7 @@ mod tests {
             file_path: "src/routes/api.ts".to_string(),
             entities: vec![caller.clone()],
             relations: vec![ExtractedRelation {
+                site: None,
                 receiver: None,
                 call_shape: None,
                 kind: RelationKind::Calls,
@@ -6595,6 +6693,7 @@ mod tests {
             file_path: "src/app.ts".to_string(),
             entities: vec![caller.clone()],
             relations: vec![ExtractedRelation {
+                site: None,
                 receiver: None,
                 call_shape: None,
                 kind: RelationKind::Calls,
@@ -6628,6 +6727,7 @@ mod tests {
     #[test]
     fn parallel_resolution_is_byte_identical_to_serial() {
         let calls = |src: &str, dst: &str| ExtractedRelation {
+            site: None,
             receiver: None,
             call_shape: None,
             kind: RelationKind::Calls,
@@ -6859,6 +6959,7 @@ mod tests {
                 file_path: "src/app.ts".to_string(),
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::Calls,
@@ -6893,6 +6994,7 @@ mod tests {
                 file_path: "src/app.ts".to_string(),
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::Calls,
@@ -6954,6 +7056,7 @@ mod tests {
                 file_path: "src/app.ts".to_string(),
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::Calls,
@@ -6996,6 +7099,7 @@ mod tests {
                 file_path: "src/routes/api.ts".to_string(),
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::Calls,
@@ -7049,6 +7153,7 @@ mod tests {
                 file_path: "src/app.cpp".to_string(),
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::UsesMacro,
@@ -7102,6 +7207,7 @@ mod tests {
                 file_path: "src/app.cpp".to_string(),
                 entities: vec![caller],
                 relations: vec![ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::UsesMacro,
@@ -7220,6 +7326,7 @@ void f();
                 file_path: "src/parse.ts".to_string(),
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::Calls,
@@ -7266,6 +7373,7 @@ void f();
             entities: vec![e1.clone(), e2.clone()],
             relations: vec![
                 ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::Calls,
@@ -7274,6 +7382,7 @@ void f();
                     import_source: None,
                 },
                 ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::Calls,
@@ -7297,6 +7406,7 @@ void f();
             file_path: "src/a.ts".to_string(),
             entities: vec![e1],
             relations: vec![ExtractedRelation {
+                site: None,
                 receiver: None,
                 call_shape: None,
                 kind: RelationKind::Calls,
@@ -7324,6 +7434,7 @@ void f();
                 file_path: "src/wiring.rs".to_string(),
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::Calls,
@@ -7366,6 +7477,7 @@ void f();
                 file_path: "src/caller.rs".to_string(),
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::Calls,
@@ -7431,6 +7543,7 @@ void f();
             file_path: "src/wiring.rs".to_string(),
             entities: vec![caller.clone()],
             relations: vec![ExtractedRelation {
+                site: None,
                 receiver: None,
                 call_shape: None,
                 kind: RelationKind::Calls,
@@ -7473,6 +7586,7 @@ void f();
 
     fn bare_call(src_name: &str, dst_name: &str) -> ExtractedRelation {
         ExtractedRelation {
+            site: None,
             receiver: None,
             call_shape: None,
             kind: RelationKind::Calls,
@@ -7694,6 +7808,7 @@ void f();
                 file_path: "notekeeper/ingest.py".to_string(),
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
+                    site: None,
                     receiver: Some("store".to_string()),
                     call_shape: None,
                     kind: RelationKind::Calls,
@@ -7937,6 +8052,7 @@ void f();
                 entities: vec![a, b],
                 relations: vec![
                     ExtractedRelation {
+                        site: None,
                         receiver: None,
                         call_shape: None,
                         kind: RelationKind::Calls,
@@ -7945,6 +8061,7 @@ void f();
                         import_source: None,
                     },
                     ExtractedRelation {
+                        site: None,
                         receiver: None,
                         call_shape: None,
                         kind: RelationKind::Calls,
@@ -7953,6 +8070,7 @@ void f();
                         import_source: None,
                     },
                     ExtractedRelation {
+                        site: None,
                         receiver: None,
                         call_shape: None,
                         kind: RelationKind::Calls,
@@ -7961,6 +8079,7 @@ void f();
                         import_source: None,
                     },
                     ExtractedRelation {
+                        site: None,
                         receiver: None,
                         call_shape: None,
                         kind: RelationKind::Calls,
@@ -8029,6 +8148,7 @@ void f();
             file_path: "src/caller.rs".to_string(),
             entities: vec![caller.clone()],
             relations: vec![ExtractedRelation {
+                site: None,
                 receiver: None,
                 call_shape: None,
                 kind: RelationKind::Calls,
@@ -8245,6 +8365,7 @@ void f();
                 file_path: "src/api.ts".to_string(),
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::Calls,
@@ -8395,6 +8516,7 @@ void f();
                 file_path: "src/routes/api.ts".to_string(),
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::Calls,
@@ -8489,6 +8611,7 @@ void f();
                 file_path: "a.ts".to_string(),
                 entities: vec![e1.clone()],
                 relations: vec![ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::Calls,
@@ -8519,6 +8642,7 @@ void f();
             file_path: "src/app.rs".to_string(),
             entities: vec![caller.clone()],
             relations: vec![ExtractedRelation {
+                site: None,
                 receiver: None,
                 call_shape: None,
                 kind,
@@ -8668,6 +8792,7 @@ void f();
             file_path: "src/app.rs".to_string(),
             entities: vec![caller.clone()],
             relations: vec![ExtractedRelation {
+                site: None,
                 receiver: None,
                 call_shape: None,
                 kind: RelationKind::Calls,
@@ -8697,6 +8822,7 @@ void f();
             entities,
             relations: vec![
                 ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::Calls,
@@ -8705,6 +8831,7 @@ void f();
                     import_source: Some("kin_db".to_string()),
                 },
                 ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::Calls,
@@ -8713,6 +8840,7 @@ void f();
                     import_source: Some("kin_db".to_string()),
                 },
                 ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::Calls,
@@ -8761,6 +8889,7 @@ void f();
                 file_path: "src/routes/api.ts".to_string(),
                 entities: vec![handler.clone()],
                 relations: vec![ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::Calls,
@@ -8817,6 +8946,7 @@ void f();
 
     fn calls_relation(src: &str, dst: &str) -> ExtractedRelation {
         ExtractedRelation {
+            site: None,
             receiver: None,
             call_shape: None,
             kind: RelationKind::Calls,
@@ -9632,6 +9762,7 @@ void f();
 
     fn pinned_calls_relation(src: &str, dst: &str, import_source: &str) -> ExtractedRelation {
         ExtractedRelation {
+            site: None,
             receiver: None,
             call_shape: None,
             kind: RelationKind::Calls,
@@ -10409,6 +10540,7 @@ void f();
 
     fn py_receiver_call(src: &str, receiver: &str, method: &str) -> ExtractedRelation {
         ExtractedRelation {
+            site: None,
             receiver: Some(receiver.to_string()),
             call_shape: None,
             kind: RelationKind::Calls,
@@ -10565,7 +10697,11 @@ void f();
                 file_path: "src/service.py".to_string(),
                 entities: vec![caller.clone()],
                 relations: vec![py_receiver_call("Service.persist", "store", "save")],
-                imports: vec![],
+                // The import the real shape carries: a file calling
+                // `store.save(...)` is a file that named `Store`. Without it the
+                // receiver has no owner this file reaches and FIR-1552 leaves
+                // the call unresolved before role can tie-break anything.
+                imports: vec![import_of(".store", "Store")],
             },
         ];
 
@@ -10618,13 +10754,18 @@ void f();
                 file_path: "src/requests/sessions.py".to_string(),
                 entities: vec![session_send.clone(), mixin_send.clone()],
                 relations: vec![py_receiver_call("Session.send", "adapter", "send")],
-                imports: vec![],
+                // `from .adapters import HTTPAdapter`, which the real
+                // `sessions.py` carries at its head. It is what makes the
+                // adapter an owner this file names, and under FIR-1552 that
+                // binding is the whole reason the call has a destination.
+                imports: vec![import_of(".adapters", "HTTPAdapter")],
             },
             FileParseData {
                 file_path: "tests/test_requests.py".to_string(),
                 entities: vec![double_send.clone()],
                 // The double subclasses the mixin, not the adapter.
                 relations: vec![ExtractedRelation {
+                    site: None,
                     receiver: None,
                     call_shape: None,
                     kind: RelationKind::Extends,
@@ -10646,12 +10787,16 @@ void f();
         assert_eq!(edges[0].dst, GraphNodeId::Entity(adapter_send.id));
     }
 
-    /// Rule 2's other half: where the ambiguity is real, the candidates are
-    /// still emitted so recall does not drop, but every one of them is marked
-    /// `name_only` so a reader can tell a guess from a fact. `req.copy()` in
-    /// psf/requests fans out to three same-named methods on unrelated types.
+    /// FIR-1552. Rule 2's other half used to emit every candidate and mark them
+    /// `name_only`, on the reasoning that a marked guess costs nothing. It cost
+    /// the headline: `find_references(HTTPAdapter.send)` on psf/requests
+    /// answered 33 where `git grep` finds two call sites, and all 33 rows were
+    /// `name_only`, so the per-row marker could not separate the two true ones
+    /// from the 31 invented ones. `req.copy()` in `sessions.py` is the same
+    /// shape: three same-named methods on unrelated types, and nothing in the
+    /// file names any of them.
     #[test]
-    fn a_genuinely_ambiguous_receiver_emits_candidates_all_marked_name_only() {
+    fn a_receiver_the_file_names_no_owner_for_binds_nothing() {
         let prepared_copy = py_method(
             "PreparedRequest.copy",
             "src/requests/models.py",
@@ -10701,16 +10846,49 @@ void f();
         ];
 
         let result = link_cross_file(&files);
-        let edges = calls_edges_from(&result, &caller);
-        assert_eq!(edges.len(), 3, "a real ambiguity keeps every candidate");
-        for edge in &edges {
-            assert_eq!(
-                RelationResolution::of(edge),
-                RelationResolution::NameOnly,
-                "an unprovable candidate is published as a guess, not a fact"
-            );
-            assert!(!RelationResolution::of(edge).is_proven());
-        }
+        assert!(
+            calls_edges_from(&result, &caller).is_empty(),
+            "a receiver whose type the file names no candidate owner for has no \
+             destination, and three guesses are not one answer: {result:#?}"
+        );
+    }
+
+    /// The other half of the same rule. Naming one owner is a destination;
+    /// naming two is a choice, and nothing at `req.copy()` makes it. This is the
+    /// case the fan-out cap used to admit, which is how one call site became
+    /// eight inbound edges.
+    #[test]
+    fn a_receiver_matching_two_named_owners_binds_neither() {
+        let store_save = py_method("Store.save", "pkg/store.py", EntityRole::Source);
+        let cache_save = py_method("Cache.save", "pkg/cache.py", EntityRole::Source);
+        let caller = py_function("run", "pkg/app.py", EntityRole::Source);
+
+        let files = vec![
+            FileParseData {
+                file_path: "pkg/store.py".to_string(),
+                entities: vec![store_save.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "pkg/cache.py".to_string(),
+                entities: vec![cache_save.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "pkg/app.py".to_string(),
+                entities: vec![caller.clone()],
+                relations: vec![py_receiver_call("run", "target", "save")],
+                imports: vec![import_of(".store", "Store"), import_of(".cache", "Cache")],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        assert!(
+            calls_edges_from(&result, &caller).is_empty(),
+            "two named owners carry `save`, so `target.save()` names neither: {result:#?}"
+        );
     }
 
     /// The founding false edge, kept as a permanent guard:
@@ -10785,7 +10963,7 @@ void f();
                 py_receiver_call("Service.persist", "store", "save"),
                 py_receiver_call("Service.persist", "cfg", "get"),
             ],
-            imports: vec![],
+            imports: vec![import_of(".store", "Store")],
         }];
 
         let result = link_cross_file_incremental(&files, &linker);

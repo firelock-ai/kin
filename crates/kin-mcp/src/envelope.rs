@@ -178,6 +178,12 @@ impl Degraded {
     }
 }
 
+/// What the daemon's entity count includes, in one sentence a reader can act on.
+pub const ENTITY_COUNT_SCOPE: &str =
+    "every entity node the daemon holds, including external reference targets this repository \
+     does not define; `kin graph status` prints the smaller count of definitions this \
+     repository owns and names the excluded targets on its own line";
+
 /// Graph freshness context — what graph state answered the query. `as_of` is a
 /// precise version marker only when the payload/daemon provides one; the rest
 /// are honest `/health`-derived signals (never fabricated).
@@ -189,6 +195,19 @@ pub struct GraphState {
     /// Daemon-reported entity count at answer time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entity_count: Option<u64>,
+    /// What `entity_count` counts, carried so an agent can reconcile it against
+    /// the smaller total the CLI prints without doing arithmetic.
+    ///
+    /// The two disagree on purpose and by a knowable amount: this one counts
+    /// every node the daemon holds, `kin graph status` counts only definitions
+    /// the repository owns, and the difference is the external reference
+    /// targets that surface names and excludes. A stranger on psf/requests read
+    /// 837 here against 777 there, worked the 60 out by subtraction, and had no
+    /// way to confirm the subtraction was the right operation. `kin status`
+    /// carries the reconciling sentence already; the surface agents actually
+    /// read carried nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entity_count_scope: Option<String>,
     /// Whether the daemon has a graph loaded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loaded: Option<bool>,
@@ -201,6 +220,7 @@ impl GraphState {
     fn is_empty(&self) -> bool {
         self.reconciliation_status.is_none()
             && self.entity_count.is_none()
+            && self.entity_count_scope.is_none()
             && self.loaded.is_none()
             && self.initialized.is_none()
     }
@@ -716,13 +736,28 @@ fn counted_for(tool: &str, payload: &Value) -> Option<Value> {
     // looked like, so the payload's own truncation flag outranks the class
     // verdict for this field.
     let truncated = payload.get("truncated").and_then(Value::as_bool) == Some(true);
+    // FIR-1552: same rule, other cause. An answer that held same-name candidates
+    // out of its headline reports a number some of those candidates may belong
+    // in, so the number is a floor and this object has to say so with the count
+    // beside it. Truncation is named first where both hold, because a walk that
+    // stopped early did not even see every candidate.
+    let withheld = payload
+        .get("counts")
+        .and_then(|counts| counts.get("receiver_name_candidates"))
+        .and_then(Value::as_u64)
+        .filter(|withheld| *withheld > 0);
     let mut counted = json!({
         "unit": unit,
         "reported": reported,
-        "exact": !truncated,
+        "exact": !truncated && withheld.is_none(),
     });
+    if let Some(withheld) = withheld {
+        counted["withheld_candidates"] = json!(withheld);
+    }
     if truncated {
         counted["floor_reason"] = json!("walk_truncated");
+    } else if withheld.is_some() {
+        counted["floor_reason"] = json!("receiver_name_candidates_withheld");
     }
     // The site numbers FIR-2398 added answer a narrower question than this
     // object does: whether every RETURNED row could be located at a line, not
@@ -972,6 +1007,7 @@ impl Envelope {
         }
         if let Some(value) = health.get("graph_entity_count").and_then(Value::as_u64) {
             self.graph_state.entity_count = Some(value);
+            self.graph_state.entity_count_scope = Some(ENTITY_COUNT_SCOPE.to_string());
         }
         if let Some(value) = health.get("graph_loaded").and_then(Value::as_bool) {
             self.graph_state.loaded = Some(value);

@@ -137,7 +137,7 @@ impl AdmittedFileEvent {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EnrichmentFacet {
+pub(crate) enum EnrichmentFacet {
     EntitySource,
     ShallowSyntax,
     StructuredArtifact,
@@ -146,8 +146,8 @@ enum EnrichmentFacet {
 }
 
 #[derive(Debug, Default)]
-struct FacetCleanup {
-    removed_entities: Vec<EntityId>,
+pub(crate) struct FacetCleanup {
+    pub(crate) removed_entities: Vec<EntityId>,
     changed: bool,
 }
 
@@ -216,59 +216,37 @@ enum TreePublication {
     DeferredToCaller,
 }
 
-fn canonicalize_host_parent_preserving_leaf(path: &Path) -> std::io::Result<PathBuf> {
-    let leaf = path.file_name().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "filesystem event has no repository entry name: {}",
-                path.display()
-            ),
-        )
-    })?;
-    let mut unresolved = vec![leaf.to_os_string()];
-    let mut ancestor = path.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "filesystem event has no parent directory: {}",
-                path.display()
-            ),
-        )
-    })?;
-
-    loop {
-        match ancestor.canonicalize() {
-            Ok(mut canonical) => {
-                for component in unresolved.iter().rev() {
-                    canonical.push(component);
-                }
-                return Ok(canonical);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let component = ancestor.file_name().ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!(
-                            "filesystem event has no existing ancestor to establish repository containment: {}",
-                            path.display()
-                        ),
-                    )
-                })?;
-                unresolved.push(component.to_os_string());
-                ancestor = ancestor.parent().ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!(
-                            "filesystem event has no existing ancestor to establish repository containment: {}",
-                            path.display()
-                        ),
-                    )
-                })?;
-            }
-            Err(error) => return Err(error),
-        }
+/// State what a watcher could not place inside this repository, or nothing when
+/// it has already been stated.
+///
+/// Once per rise rather than once per tick. The count is a running total, so a
+/// loop that re-read it every tick would re-record one unchanged fault forever
+/// and bury whatever failed next behind it. A rise is new evidence; a steady
+/// count is the same evidence.
+///
+/// The message names both spellings on purpose. The whole failure is that two
+/// correct names for one directory did not compare equal, and a report that
+/// gave only one of them would leave a reader unable to see why.
+fn events_outside_root_disclosure(
+    events: &kin_index::EventsOutsideRoot,
+    disclosed: u64,
+    working_dir: &Path,
+) -> Option<String> {
+    if events.count <= disclosed {
+        return None;
     }
+    let last_path = events
+        .last_path
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "an unrecorded path".to_string());
+    Some(format!(
+        "{} host event(s) named paths the watcher could not place inside the repository root \
+         {}; most recently {last_path}. Nothing those paths changed is admitted from the act of \
+         writing it",
+        events.count,
+        working_dir.display(),
+    ))
 }
 
 fn repo_path(path: &Path, working_dir: &Path) -> Result<Option<RepoPath>> {
@@ -279,7 +257,8 @@ fn repo_path(path: &Path, working_dir: &Path) -> Result<Option<RepoPath>> {
     // events that appear lexically beneath the repository but traverse a
     // directory symlink out of it.
     let canonical_root = working_dir.canonicalize().map_err(DaemonError::Io)?;
-    let canonical_path = canonicalize_host_parent_preserving_leaf(path).map_err(DaemonError::Io)?;
+    let canonical_path =
+        kin_index::canonicalize_host_parent_preserving_leaf(path).map_err(DaemonError::Io)?;
     let relative = canonical_path
         .strip_prefix(&canonical_root)
         .map_err(|error| {
@@ -1147,38 +1126,51 @@ fn clear_incompatible_facets(
     file_id: &FilePathId,
     keep: EnrichmentFacet,
 ) -> Result<FacetCleanup> {
+    clear_incompatible_facets_in(state.graph.as_ref(), file_id, keep)
+}
+
+/// The same cleanup against a graph named outright rather than reached through
+/// the daemon's live state.
+///
+/// The MCP transaction planner needs it against the PROSPECTIVE graph it is
+/// building, which is not the live one and must not be, because a transaction
+/// that fails to plan may not have touched anything a query can see. Naming the
+/// graph is what lets one definition of "retire this file's enrichment" serve
+/// both the watcher seam and the planner, so the two cannot drift into
+/// disagreeing about what a retirement takes with it.
+pub(crate) fn clear_incompatible_facets_in(
+    graph: &kin_db::InMemoryGraph,
+    file_id: &FilePathId,
+    keep: EnrichmentFacet,
+) -> Result<FacetCleanup> {
     let mut cleanup = FacetCleanup::default();
 
     if keep != EnrichmentFacet::EntitySource {
-        let entities = state.graph.query_entities(&EntityFilter {
+        let entities = graph.query_entities(&EntityFilter {
             file_path: Some(file_id.clone()),
             ..Default::default()
         })?;
         cleanup.removed_entities = entities.into_iter().map(|entity| entity.id).collect();
-        state
-            .graph
-            .remove_entities_batch(&cleanup.removed_entities)?;
+        graph.remove_entities_batch(&cleanup.removed_entities)?;
         cleanup.changed |= !cleanup.removed_entities.is_empty();
-        if state.graph.get_file_layout(file_id)?.is_some() {
-            state.graph.delete_file_layout(file_id)?;
+        if graph.get_file_layout(file_id)?.is_some() {
+            graph.delete_file_layout(file_id)?;
             cleanup.changed = true;
         }
     }
 
-    if keep != EnrichmentFacet::ShallowSyntax && state.graph.get_shallow_file(file_id)?.is_some() {
-        state.graph.delete_shallow_file(file_id)?;
+    if keep != EnrichmentFacet::ShallowSyntax && graph.get_shallow_file(file_id)?.is_some() {
+        graph.delete_shallow_file(file_id)?;
         cleanup.changed = true;
     }
     if keep != EnrichmentFacet::StructuredArtifact
-        && state.graph.get_structured_artifact(file_id)?.is_some()
+        && graph.get_structured_artifact(file_id)?.is_some()
     {
-        state.graph.delete_structured_artifact(file_id)?;
+        graph.delete_structured_artifact(file_id)?;
         cleanup.changed = true;
     }
-    if keep != EnrichmentFacet::OpaqueArtifact
-        && state.graph.get_opaque_artifact(file_id)?.is_some()
-    {
-        state.graph.delete_opaque_artifact(file_id)?;
+    if keep != EnrichmentFacet::OpaqueArtifact && graph.get_opaque_artifact(file_id)?.is_some() {
+        graph.delete_opaque_artifact(file_id)?;
         cleanup.changed = true;
     }
 
@@ -1825,6 +1817,10 @@ pub async fn run_loop(
 
     let watcher = FileWatcher::new(working_dir).map_err(DaemonError::from)?;
     let enrichment_pipeline = IndexPipeline::new();
+    // The watcher's running total of host events it could not place inside this
+    // repository, as this loop last disclosed it. Held so a standing count is
+    // reported once per rise rather than once per tick.
+    let mut disclosed_events_outside_root = 0_u64;
 
     info!(
         poll_ms = config.poll_interval_ms,
@@ -1948,6 +1944,25 @@ pub async fn run_loop(
             incoming_events.extend(due_retries.into_iter().map(FileEvent::Changed));
         }
         incoming_events.extend(watcher.drain());
+        // An event the watcher could not place inside this repository never
+        // reaches anything below, so this loop is the only place that can say it
+        // happened. Silence here is the whole defect: a repository reached
+        // through a symlink took nothing from ambient admission and every
+        // surface still reported a healthy daemon (FIR-2442). Reported through
+        // the skipped-event probe, which is what turns a working daemon that is
+        // seeing nothing into `attention` on `/health` and on `kin graph status`.
+        let events_outside_root = watcher.events_outside_root();
+        if let Some(disclosure) = events_outside_root_disclosure(
+            &events_outside_root,
+            disclosed_events_outside_root,
+            working_dir,
+        ) {
+            disclosed_events_outside_root = events_outside_root.count;
+            state
+                .background_work
+                .reconcile()
+                .record_event_skipped(disclosure, tick_started);
+        }
         // A graph-only repository member owns its own host subtree. Admission
         // already refuses to traverse one, so an event beneath it carries no
         // observation of this repository's source projection. Waking the tick
@@ -2783,6 +2798,80 @@ mod tests {
     fn open_test_state(repo: &tempfile::TempDir) -> Arc<DaemonState> {
         let init = kin_core::init(repo.path()).unwrap();
         Arc::new(DaemonState::open(init.layout).unwrap())
+    }
+
+    /// FIR-2442. A dropped host event is disclosed through the reconcile health
+    /// surface, naming the root it could not be placed in and the path itself.
+    #[test]
+    fn an_event_outside_the_bound_root_is_disclosed_with_both_paths() {
+        let events = kin_index::EventsOutsideRoot {
+            count: 2,
+            last_path: Some(PathBuf::from("/private/var/repo/main.rs")),
+        };
+
+        let disclosure = events_outside_root_disclosure(&events, 0, Path::new("/var/repo"))
+            .expect("a risen count is disclosed");
+
+        assert!(
+            disclosure.contains("/var/repo"),
+            "the disclosure names the bound root: {disclosure}"
+        );
+        assert!(
+            disclosure.contains("/private/var/repo/main.rs"),
+            "the disclosure names the dropped path: {disclosure}"
+        );
+        assert!(
+            disclosure.contains('2'),
+            "the disclosure carries the count: {disclosure}"
+        );
+    }
+
+    /// The same standing count is stated once. A running total re-read every
+    /// tick would otherwise re-record one unchanged fault forever.
+    #[test]
+    fn an_already_disclosed_outside_root_count_is_not_restated() {
+        let events = kin_index::EventsOutsideRoot {
+            count: 2,
+            last_path: Some(PathBuf::from("/private/var/repo/main.rs")),
+        };
+
+        assert_eq!(
+            events_outside_root_disclosure(&events, 2, Path::new("/var/repo")),
+            None,
+            "a count that has not risen is not new evidence"
+        );
+        assert!(
+            events_outside_root_disclosure(&events, 1, Path::new("/var/repo")).is_some(),
+            "a count that rose by one is"
+        );
+    }
+
+    /// FIR-2442. What the disclosure is for: the reconcile surface stops
+    /// reporting a healthy loop once a host event has been dropped unplaced.
+    #[test]
+    fn a_disclosed_outside_root_event_degrades_the_reconcile_surface() {
+        let probes = crate::background_work::ReconcileProbes::default();
+        let now = Instant::now();
+        assert!(
+            !probes.report(now).degraded(),
+            "a loop that has dropped nothing is not degraded"
+        );
+
+        let events = kin_index::EventsOutsideRoot {
+            count: 1,
+            last_path: Some(PathBuf::from("/private/var/repo/main.rs")),
+        };
+        let disclosure = events_outside_root_disclosure(&events, 0, Path::new("/var/repo"))
+            .expect("a risen count is disclosed");
+        probes.record_event_skipped(disclosure, now);
+
+        let report = probes.report(now);
+        assert!(report.degraded(), "a dropped host event is a degraded loop");
+        let reasons = report.degraded_reasons().join(" ");
+        assert!(
+            reasons.contains("/private/var/repo/main.rs"),
+            "the degraded reason names the dropped path: {reasons}"
+        );
     }
 
     #[cfg(unix)]

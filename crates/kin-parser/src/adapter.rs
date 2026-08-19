@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use tree_sitter::{Node, Parser, Tree};
 
 use crate::error::{ParseError, Result};
-use crate::extract::ParseOutput;
+use crate::extract::{ParseOutput, RelationSite};
 
 /// Hint for incremental tree-sitter parse. Maps directly to tree_sitter::InputEdit.
 #[derive(Debug, Clone)]
@@ -141,6 +141,22 @@ pub fn declaration_signature(node: &Node, source: &[u8]) -> String {
             child.kind(),
             "field_initializer_list" | "function_body" | "class_body" | "enum_class_body"
         ) {
+            end = end.min(child.start_byte());
+        }
+    }
+    // A comment between the declaration and its first statement is not part of
+    // the signature.
+    //
+    // Tree-sitter attaches such a comment to the declaration rather than to the
+    // body, so it sits inside `start..body.start_byte()` and was sliced in
+    // whole. `trace_data_flow` reported a Python signature with two lines of
+    // prose hanging off the end of `-> int:`, which is exactly the field a
+    // reader skims when scanning an eighteen-step chain. Clamping at the first
+    // comment keeps the declaration and drops the prose, in every language,
+    // because a comment can never be part of a signature in any of them.
+    let mut comments = node.walk();
+    for child in node.children(&mut comments) {
+        if child.kind() == "comment" && child.start_byte() >= start {
             end = end.min(child.start_byte());
         }
     }
@@ -293,6 +309,22 @@ pub fn span_from_node(node: &Node, file_id: &FilePathId) -> SourceSpan {
     let end = node.end_position();
     SourceSpan {
         file: file_id.clone(),
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: start.row as u32,
+        start_col: start.column as u32,
+        end_line: end.row as u32,
+        end_col: end.column as u32,
+    }
+}
+
+/// The file-free site of a node, for a relation whose evidence is the syntax at
+/// that node. Line and column are 0-based tree-sitter `Point` values, matching
+/// [`span_from_node`]; the presentation seam converts once, at the surface.
+pub fn site_from_node(node: &Node) -> RelationSite {
+    let start = node.start_position();
+    let end = node.end_position();
+    RelationSite {
         start_byte: node.start_byte(),
         end_byte: node.end_byte(),
         start_line: start.row as u32,

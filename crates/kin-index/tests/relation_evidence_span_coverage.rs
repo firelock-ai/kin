@@ -61,6 +61,13 @@ struct Fixture {
     /// Fewest `Calls` edges. Zero only where the language has no call syntax to
     /// extract.
     min_calls: usize,
+    /// Fewest `Calls` edges that must carry a `RelationEvidence::source_span`.
+    ///
+    /// Zero for an adapter that does not record call sites yet. A per-language
+    /// floor is what a bare total cannot give: a total alone stays satisfied
+    /// while Python drops to none and another language makes up the difference,
+    /// which is exactly the regression this file exists to catch.
+    min_calls_with_span: usize,
     files: &'static [(&'static str, &'static str)],
 }
 
@@ -69,6 +76,7 @@ const FIXTURES: &[Fixture] = &[
         language: "Rust",
         min_relations: 3,
         min_calls: 1,
+        min_calls_with_span: 0,
         files: &[
             (
                 "defs.rs",
@@ -96,6 +104,7 @@ const FIXTURES: &[Fixture] = &[
         language: "TypeScript",
         min_relations: 3,
         min_calls: 1,
+        min_calls_with_span: 1,
         files: &[
             (
                 "defs.ts",
@@ -119,6 +128,7 @@ const FIXTURES: &[Fixture] = &[
         language: "JavaScript",
         min_relations: 3,
         min_calls: 1,
+        min_calls_with_span: 1,
         files: &[
             (
                 "defs.js",
@@ -142,6 +152,7 @@ const FIXTURES: &[Fixture] = &[
         language: "Python",
         min_relations: 3,
         min_calls: 1,
+        min_calls_with_span: 1,
         files: &[
             (
                 "defs.py",
@@ -167,6 +178,7 @@ const FIXTURES: &[Fixture] = &[
         language: "Go",
         min_relations: 2,
         min_calls: 1,
+        min_calls_with_span: 0,
         files: &[
             (
                 "defs.go",
@@ -192,6 +204,7 @@ const FIXTURES: &[Fixture] = &[
         language: "Java",
         min_relations: 4,
         min_calls: 1,
+        min_calls_with_span: 0,
         files: &[
             (
                 "Defs.java",
@@ -216,6 +229,7 @@ const FIXTURES: &[Fixture] = &[
         language: "CSharp",
         min_relations: 5,
         min_calls: 1,
+        min_calls_with_span: 0,
         files: &[
             (
                 "Defs.cs",
@@ -240,6 +254,7 @@ const FIXTURES: &[Fixture] = &[
         language: "C",
         min_relations: 2,
         min_calls: 1,
+        min_calls_with_span: 0,
         files: &[
             (
                 "defs.c",
@@ -261,6 +276,7 @@ const FIXTURES: &[Fixture] = &[
         language: "Cpp",
         min_relations: 3,
         min_calls: 1,
+        min_calls_with_span: 0,
         files: &[
             (
                 "defs.cpp",
@@ -285,6 +301,7 @@ const FIXTURES: &[Fixture] = &[
         language: "Ruby",
         min_relations: 3,
         min_calls: 1,
+        min_calls_with_span: 0,
         files: &[
             (
                 "defs.rb",
@@ -312,6 +329,7 @@ const FIXTURES: &[Fixture] = &[
         language: "Php",
         min_relations: 3,
         min_calls: 1,
+        min_calls_with_span: 0,
         files: &[
             (
                 "defs.php",
@@ -336,6 +354,7 @@ const FIXTURES: &[Fixture] = &[
         language: "Kotlin",
         min_relations: 3,
         min_calls: 1,
+        min_calls_with_span: 0,
         files: &[
             (
                 "defs.kt",
@@ -359,6 +378,7 @@ const FIXTURES: &[Fixture] = &[
         language: "Swift",
         min_relations: 3,
         min_calls: 1,
+        min_calls_with_span: 0,
         files: &[
             (
                 "defs.swift",
@@ -387,6 +407,7 @@ const FIXTURES: &[Fixture] = &[
         language: "Hcl",
         min_relations: 0,
         min_calls: 0,
+        min_calls_with_span: 0,
         files: &[
             (
                 "defs.tf",
@@ -650,12 +671,25 @@ fn print_table(rows: &[(String, Counts)], title: &str) {
 /// The measured population, pinned so the number the rename gate cites stays
 /// live rather than becoming a claim in a document.
 ///
-/// It is zero today: no producer sets `RelationEvidence::source_span`. The
-/// parser -> linker seam (`kin_parser::ExtractedRelation`) has no span field to
-/// carry one, so the adapters cannot hand a site to the resolver even where
-/// tree-sitter knew it. When span emission lands, this test fails and the
-/// baseline moves to the new measured value.
-const MEASURED_RELATIONS_WITH_SPAN: usize = 0;
+/// It was zero until FIR-1825: no producer set `RelationEvidence::source_span`,
+/// because the parser -> linker seam (`kin_parser::ExtractedRelation`) had no
+/// span field to carry one, so the adapters could not hand a site to the
+/// resolver even where tree-sitter knew it. The Python and JavaScript adapters
+/// now record the call expression's own site, and TypeScript reuses
+/// JavaScript's call walker, so all three carry a span on every `Calls` edge in
+/// these fixtures. The remaining adapters do not record sites yet and their
+/// edges stay spanless.
+///
+/// This total is a whole-fleet check. The per-language floors above are what
+/// keeps a language from silently losing its sites.
+const MEASURED_RELATIONS_WITH_SPAN: usize = 9;
+
+/// Span-backed evidence RECORDS, which exceed span-backed relations whenever one
+/// caller reaches one callee at more than one site. Each fixture calls `compute`
+/// twice from `run`, so the three site-recording languages contribute four
+/// records across three edges apiece. That surplus is the point: it is what
+/// `find_references` turns into more than one entry in `reference_lines`.
+const MEASURED_EVIDENCE_RECORDS_WITH_SPAN: usize = 12;
 
 #[test]
 fn relation_evidence_span_population_per_language() {
@@ -691,6 +725,19 @@ fn relation_evidence_span_population_per_language() {
             counts.calls(),
             fixture.min_calls,
         );
+        let calls_with_span = counts
+            .by_kind
+            .get("Calls")
+            .map(|(_, spanned)| *spanned)
+            .unwrap_or(0);
+        assert!(
+            calls_with_span >= fixture.min_calls_with_span,
+            "`{language}` recorded a site on {calls_with_span} of its {} Calls edges, below its \
+             declared floor of {}; a reference row for this language would report callers with \
+             no call-site lines",
+            counts.calls(),
+            fixture.min_calls_with_span,
+        );
     }
 
     let mut total = Counts::default();
@@ -703,9 +750,18 @@ fn relation_evidence_span_population_per_language() {
          MEASURED_RELATIONS_WITH_SPAN to the new measured value and re-cite the rename gate \
          against it; if it fell, a producer stopped recording sites"
     );
+    assert!(
+        total.evidence_with_span >= total.relations_with_span,
+        "every span-backed relation must carry at least one span-backed evidence record, but \
+         {} records cover {} relations",
+        total.evidence_with_span,
+        total.relations_with_span,
+    );
     assert_eq!(
-        total.evidence_with_span, MEASURED_RELATIONS_WITH_SPAN,
-        "evidence-record span count and relation span count must move together"
+        total.evidence_with_span, MEASURED_EVIDENCE_RECORDS_WITH_SPAN,
+        "span-backed evidence-record population changed. Records exceed relations because one \
+         edge called twice carries one record per site, which is what lets a reference row \
+         report both lines"
     );
 }
 

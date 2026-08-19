@@ -16,7 +16,7 @@ Inspect the test coverage recorded for a single entity: which tests are linked t
 how many, and whether it is covered at all, alongside the repo-wide coverage figures for \
 context. Filter by runner (e.g. cargo, jest, pytest) when you only care about one test \
 system. Reach for it to answer \"is this function tested, and by what?\" before changing \
-or relying on it. Note this reports linked tests and recorded coverage from the graph — \
+or relying on it. Note this reports linked tests and recorded coverage from the graph; \
 it does not execute tests. For the whole-repo picture use kin_coverage_summary; for \
 contracts use kin_contract_check.";
 
@@ -68,7 +68,7 @@ Read `coverage_trust` BEFORE treating a low or zero number as a fact about the \
 repository: this tool counts RECORDED VERIFICATION RUNS, never the repository's test \
 files, so a graph with no runs reports zero coverage while the code may be thoroughly \
 tested. `safe_to_conclude_uncovered` is false in exactly that case, which is the normal \
-state of a freshly-initialised repo. `population` names what `total_entities` counts — \
+state of a freshly-initialised repo. `population` names what `total_entities` counts: \
 the current-generation entity map, which is NOT the set retrieval ranks over, so it is \
 the wrong denominator for a completeness claim about everything semantic_locate can \
 return.";

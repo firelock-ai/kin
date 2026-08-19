@@ -47,10 +47,36 @@ const MAX_BUNDLE_DEPTH = 6;
 // here even though that leg ships them opportunistically. Adding a component to
 // a release archive means adding it to the updater's platform component list
 // and to this set together.
+// Documentation members every archive carries, on every platform.
+//
+// The v0.5.40 archive was four executables and no words, and both strangers who
+// installed it scored the packaging below the binaries for exactly that reason.
+// A stranger's first two decisions, where the three executables go and what to
+// do with the shared library, are both unguided, and no `kin` command can
+// advise them before `kin` is on PATH. These three files are the answer that
+// travels with the bytes.
+//
+// They are members of the archive and nothing installs them: `kin update` skips
+// them by name (see RELEASE_ARCHIVE_DOC_FILES in the updater) and `scripts/
+// install.sh` moves a fixed list of binaries, so neither changes behaviour.
+const DOC_FILES = Object.freeze(["README.md", "INSTALL.md", "checksums-sha256.txt"]);
+
 const ROOT_FILES_BY_FAMILY = {
-  darwin: Object.freeze(["kin", "kin-daemon", "kin-vfs", "libkin_vfs_shim.dylib"]),
-  linux: Object.freeze(["kin", "kin-daemon", "kin-vfs", "libkin_vfs_shim.so"]),
-  windows: Object.freeze(["kin.exe", "kin-daemon.exe", "kin-vfs.exe", "kin_vfs_shim.dll"]),
+  darwin: Object.freeze([
+    "kin",
+    "kin-daemon",
+    "kin-vfs",
+    "libkin_vfs_shim.dylib",
+    ...DOC_FILES,
+  ]),
+  linux: Object.freeze(["kin", "kin-daemon", "kin-vfs", "libkin_vfs_shim.so", ...DOC_FILES]),
+  windows: Object.freeze([
+    "kin.exe",
+    "kin-daemon.exe",
+    "kin-vfs.exe",
+    "kin_vfs_shim.dll",
+    ...DOC_FILES,
+  ]),
 };
 
 // Whether a target triple is one whose archive may carry the notification
@@ -291,6 +317,7 @@ function classifyReleaseArchiveRoot(contentRoot, options) {
 }
 
 module.exports = {
+  DOC_FILES,
   MAX_ARCHIVE_MEMBERS,
   MAX_BUNDLE_DEPTH,
   MAX_BUNDLE_ENTRIES,

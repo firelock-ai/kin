@@ -581,6 +581,13 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
     ".github/workflows/publish-release-installers.yml": {
         "dispatch": None,
     },
+    # The release-candidate archive build. It is workflow_dispatch only, holds
+    # no credential, and publishes nothing, so it produces no pull-request check
+    # and can claim no required context. It is registered here because this
+    # census is what would otherwise let a new job's NAME appear unreviewed.
+    ".github/workflows/rc-build.yml": {
+        "build": "RC Build (${{ matrix.artifact }})",
+    },
     ".github/workflows/registry-index-migrate.yml": {
         "migrate": None,
     },
@@ -655,6 +662,10 @@ EXPECTED_DYNAMIC_JOB_CONTEXT_SHA256 = {
         ".github/workflows/install-proof.yml",
         "install-proof",
     ): "44b510d0d82f7b56b525b08f38a3f84916243c30e9c365b340718670f95af1ca",
+    (
+        ".github/workflows/rc-build.yml",
+        "build",
+    ): "8dc0699fb69599edbca87492f3f3a895aefa3bea8384c86d8fc11fef99f9d52a",
     (
         ".github/workflows/release.yml",
         "build",
@@ -12575,7 +12586,7 @@ jobs:
         "always()",
         "needs.publish.result == 'success'",
         "uses: ./.github/workflows/install-proof.yml",
-        "expected_vfs_commit: a1ba0a3a2556011c508aeb108ff9e2e21addd615",
+        "expected_vfs_commit: 2596a4477cfb0b389d9c52026cf9da8f7ff40138",
     ):
         require(install_proof_job, policy, "mandatory public install proof")
 

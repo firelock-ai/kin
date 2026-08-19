@@ -180,6 +180,43 @@ pub struct CallArgShape {
     pub has_var_keyword: bool,
 }
 
+/// Where in the caller's file the syntax that produced a relation sits.
+///
+/// Byte offsets and 0-based line/column, exactly as tree-sitter reports them,
+/// which is the same convention [`ExtractedEntity::span`] already carries. The
+/// file is deliberately absent: a relation's site is always inside the file
+/// being parsed, and the consumer that turns this into a
+/// [`kin_model::SourceSpan`] is the one holding that path, so there is no way
+/// for an adapter to attribute a site to the wrong file.
+///
+/// Adapters that do not record sites leave [`ExtractedRelation::site`] `None`,
+/// and the edge is stored exactly as it was before, without a span.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelationSite {
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub start_line: u32,
+    pub start_col: u32,
+    pub end_line: u32,
+    pub end_col: u32,
+}
+
+impl RelationSite {
+    /// Pair this site with the file it was read from, giving the graph-model
+    /// span the relation's evidence carries.
+    pub fn to_source_span(&self, file: &FilePathId) -> SourceSpan {
+        SourceSpan {
+            file: file.clone(),
+            start_byte: self.start_byte,
+            end_byte: self.end_byte,
+            start_line: self.start_line,
+            start_col: self.start_col,
+            end_line: self.end_line,
+            end_col: self.end_col,
+        }
+    }
+}
+
 /// Raw extracted relation between two named entities.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -211,11 +248,25 @@ pub struct ExtractedRelation {
     /// `requests.get`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receiver: Option<String>,
+    /// Where in the file this relation's syntax sits, when the adapter records
+    /// it. A `Calls` edge's site is its call expression; a `References` edge's
+    /// is the identifier that read the name.
+    ///
+    /// This is what lets `find_references` answer "who calls this, and WHERE"
+    /// instead of only "who calls this". Every producer of a relation's
+    /// evidence sits downstream of the parser, so a site the adapter drops here
+    /// cannot be recovered later: the seam carried no span field at all until
+    /// FIR-1825, which is why `RelationEvidence::source_span` was populated by
+    /// nothing in the fleet and every reference row came back with an empty
+    /// `reference_lines`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site: Option<RelationSite>,
 }
 
 /// Construct the reserved negative call-extraction coverage record.
 pub fn call_extraction_incomplete_marker() -> ExtractedRelation {
     ExtractedRelation {
+        site: None,
         receiver: None,
         kind: RelationKind::DependsOn,
         src_name: String::new(),

@@ -47,6 +47,11 @@ pub struct McpMutationOperation {
     /// closed because they cannot produce exact source truth.
     #[serde(default)]
     pub body: Option<String>,
+    /// Where a relocation puts the file `target` names, as a
+    /// repository-relative path. Present only on a rename, which is the one
+    /// operation that needs two paths; every other shape leaves it absent.
+    #[serde(default)]
+    pub destination: Option<String>,
     pub description: String,
 }
 
@@ -104,6 +109,59 @@ pub fn is_new_source_file(op: &McpMutationOperation) -> bool {
             .body
             .as_deref()
             .is_some_and(|body| !body.trim().is_empty())
+}
+
+/// A payload-less operation that expresses "the repository no longer holds the
+/// file at `target`": verb delete/remove, `target` naming a repository-relative
+/// path, and no body.
+///
+/// This is the retirement counterpart of [`is_new_source_file`], and it is the
+/// only shape that can retire a file. An entity payload carrying verb `delete`
+/// names one entity, which cannot retire the artifact the entity lives on, and
+/// leaves the file tracked with a hole in it. Naming the path instead retires
+/// the artifact, every entity derived from it, and every edge incident to
+/// those entities, in one delta, which is what repository authority requires
+/// of any transition that drops a path an entity sits on.
+///
+/// A body is refused rather than ignored. `create` and `update` both mean "the
+/// new text is `body`", so an operation that carries text and asks for a
+/// deletion is two intentions in one call, and guessing which one the caller
+/// meant is how a retirement silently becomes an edit.
+pub fn is_retired_source_file(op: &McpMutationOperation) -> bool {
+    op.payload.is_none()
+        && matches!(op.verb.trim().to_lowercase().as_str(), "delete" | "remove")
+        && !op.target.trim().is_empty()
+        && op.body.as_deref().is_none_or(|body| body.trim().is_empty())
+        && op
+            .destination
+            .as_deref()
+            .is_none_or(|to| to.trim().is_empty())
+}
+
+/// A payload-less operation that expresses "the file at `target` now lives at
+/// `destination`": verb rename/move, both paths repository-relative.
+///
+/// A rename is a removal at one path and an arrival at another, and staging it
+/// as that pair would lose the one fact that makes it a rename: that the
+/// entities on the old path are the entities on the new one. Repository
+/// authority already distinguishes the two, refusing a transition that leaves
+/// an entity on a path the staged tree no longer carries unless the same delta
+/// carries "its exact entity removal OR RELOCATION". This shape is how a caller
+/// says relocation, so entity identity, history, and every incoming edge
+/// survive the move.
+///
+/// The bytes are not resent. A rename that also rewrote the file would be a
+/// move and an edit at once, and the two have different failure modes: a move
+/// that cannot resolve its destination should refuse before anything is
+/// reparsed. Stage a rename and an `update` in the same transaction to do both.
+pub fn is_renamed_source_file(op: &McpMutationOperation) -> bool {
+    op.payload.is_none()
+        && matches!(op.verb.trim().to_lowercase().as_str(), "rename" | "move")
+        && !op.target.trim().is_empty()
+        && op
+            .destination
+            .as_deref()
+            .is_some_and(|to| !to.trim().is_empty())
 }
 
 /// An operation that carries new source text for a file.
@@ -333,12 +391,22 @@ pub struct CoordinationWritePreflight {
 
 /// The mutation verbs the transaction commit path understands, listed for
 /// actionable error messages.
-const KNOWN_MUTATION_VERBS: &str = "create/add/upsert/insert, update/modify, or delete/remove";
+const KNOWN_MUTATION_VERBS: &str =
+    "create/add/upsert/insert, update/modify, delete/remove, or rename/move";
 
 fn is_known_mutation_verb(verb: &str) -> bool {
     matches!(
         verb,
-        "create" | "add" | "upsert" | "insert" | "update" | "modify" | "delete" | "remove"
+        "create"
+            | "add"
+            | "upsert"
+            | "insert"
+            | "update"
+            | "modify"
+            | "delete"
+            | "remove"
+            | "rename"
+            | "move"
     )
 }
 
@@ -376,15 +444,39 @@ pub fn validate_staged_operations(
                 continue;
             }
             if is_new_source_file(op) {
-                validate_new_source_path(idx, op)?;
+                validate_source_operation_path(idx, op, op.target.trim(), "target")?;
+                continue;
+            }
+            if is_retired_source_file(op) {
+                validate_source_operation_path(idx, op, op.target.trim(), "target")?;
+                continue;
+            }
+            if is_renamed_source_file(op) {
+                let destination = op
+                    .destination
+                    .as_deref()
+                    .expect("a rename always carries a destination")
+                    .trim();
+                validate_source_operation_path(idx, op, op.target.trim(), "target")?;
+                validate_source_operation_path(idx, op, destination, "destination")?;
+                if op.target.trim() == destination {
+                    return Err(format!(
+                        "operation #{idx} ('{}'): `target` and `destination` are both {:?}; a \
+                         rename must move the file somewhere else",
+                        op.verb, destination
+                    ));
+                }
                 continue;
             }
             return Err(format!(
                 "operation #{idx} ('{}'): missing payload; provide an entity, relation, or blob \
                  payload, express an edit to an existing entity as verb 'update' with `target` \
-                 (entity name or id) and `body` (the entity's full new source text), or admit a \
+                 (entity name or id) and `body` (the entity's full new source text), admit a \
                  source file the graph has never seen as verb 'create' with `target` (its \
-                 repository-relative path) and `body` (the file's complete text)",
+                 repository-relative path) and `body` (the file's complete text), retire a \
+                 tracked file as verb 'delete' with `target` (its repository-relative path) and \
+                 no body, or relocate one as verb 'rename' with `target` and `destination` (both \
+                 repository-relative paths)",
                 op.verb
             ));
         };
@@ -406,7 +498,7 @@ pub fn validate_staged_operations(
     Ok(())
 }
 
-/// Validate the repository-relative path a new-source-file operation names.
+/// Validate one repository-relative path a path-shaped operation names.
 ///
 /// Runs the same path rule the projection applies
 /// ([`kin_core::validate_source_paths`]), so a path that stages clean is a path
@@ -419,19 +511,23 @@ pub fn validate_staged_operations(
 /// Intrinsic to the payload and free of graph access, like every other check in
 /// [`validate_staged_operations`], so it behaves identically in-process and
 /// through the daemon.
-fn validate_new_source_path(idx: usize, op: &McpMutationOperation) -> Result<(), String> {
-    let target = op.target.trim();
-    let path = kin_model::RepoPath::from_utf8(target.to_string()).map_err(|error| {
+fn validate_source_operation_path(
+    idx: usize,
+    op: &McpMutationOperation,
+    value: &str,
+    field: &str,
+) -> Result<(), String> {
+    let path = kin_model::RepoPath::from_utf8(value.to_string()).map_err(|error| {
         format!(
-            "operation #{idx} ('{}'): {target:?} is not a usable repository path: {error}",
+            "operation #{idx} ('{}'): `{field}` {value:?} is not a usable repository path: {error}",
             op.verb
         )
     })?;
     kin_core::validate_source_paths([&path]).map_err(|error| {
         format!(
-            "operation #{idx} ('{}'): {target:?} is not an admissible repository source path: \
-             {error}. Name a repository-relative path such as \"src/parser.py\", with no leading \
-             slash, no \"..\", and no Kin or Git control component",
+            "operation #{idx} ('{}'): `{field}` {value:?} is not an admissible repository source \
+             path: {error}. Name a repository-relative path such as \"src/parser.py\", with no \
+             leading slash, no \"..\", and no Kin or Git control component",
             op.verb
         )
     })
@@ -468,16 +564,37 @@ pub fn uncommittable_reason(op: &McpMutationOperation) -> Option<String> {
         ));
     }
     let Some(payload) = op.payload.as_ref() else {
-        if is_target_body_update(op) || is_new_source_file(op) {
+        if is_target_body_update(op)
+            || is_new_source_file(op)
+            || is_retired_source_file(op)
+            || is_renamed_source_file(op)
+        {
             return None;
         }
         return Some("missing payload".to_string());
     };
     match payload {
-        // Every known verb maps to an entity delta (add/modify/remove).
-        McpMutationPayload::Entity(_) => None,
+        // Every entity verb but relocation maps to an entity delta
+        // (add/modify/remove). A relocation is a statement about a file, and an
+        // entity payload cannot carry one: moving a single entity out of the
+        // file it was extracted from would leave the artifact tracked with a
+        // hole in it and the entity placed on a path no artifact holds. Refused
+        // here rather than at commit, where the payload branch has no arm for
+        // these verbs and would drop the operation without a word.
+        McpMutationPayload::Entity(_) => {
+            if matches!(verb.as_str(), "rename" | "move") {
+                Some(format!(
+                    "verb '{}' is not committable for entity payloads; a rename moves a file, so \
+                     stage it with no payload, `target` set to the file's current \
+                     repository-relative path, and `destination` set to its new one",
+                    op.verb
+                ))
+            } else {
+                None
+            }
+        }
         McpMutationPayload::Relation { .. } => {
-            if matches!(verb.as_str(), "update" | "modify") {
+            if matches!(verb.as_str(), "update" | "modify" | "rename" | "move") {
                 Some(format!(
                     "verb '{}' is not committable for relation payloads; relations support only \
                      create/add/upsert/insert or delete/remove",
@@ -509,19 +626,30 @@ pub const ACCEPTED_OPERATION_SHAPES: &str = "each element of `operations` is one
      \"description\": \"<why>\"}\n  \
      - a relation edit: {\"verb\": \"create\"|\"delete\", \"target\": \"\", \
      \"payload\": {\"Relation\": {\"from\": \"<uuid>\", \"to\": \"<uuid>\", \"kind\": \"<relation kind>\"}}, \
-     \"description\": \"<why>\"}\n\
-     Prefer the first shape: it needs only a target and the new source text.\n\
+     \"description\": \"<why>\"}\n  \
+     - a new source file: {\"verb\": \"create\", \"target\": \"<repository-relative path>\", \
+     \"body\": \"<the file's complete source text>\", \"description\": \"<why>\"}\n  \
+     - a retired source file: {\"verb\": \"delete\", \"target\": \"<repository-relative path>\", \
+     \"description\": \"<why>\"}\n  \
+     - a renamed source file: {\"verb\": \"rename\", \"target\": \"<current path>\", \
+     \"destination\": \"<new path>\", \"description\": \"<why>\"}\n\
+     Prefer the first shape for changing code that exists: it needs only a target and the new \
+     source text.\n\
      Every field of an operation, and nothing else is accepted:\n  \
-     - `verb` (string, REQUIRED): one of create/add/upsert/insert, update/modify, or \
-     delete/remove. Compared case-insensitively after trimming.\n  \
+     - `verb` (string, REQUIRED): one of create/add/upsert/insert, update/modify, \
+     delete/remove, or rename/move. Compared case-insensitively after trimming.\n  \
      - `target` (string, REQUIRED): the entity this operation acts on, as either its uuid or \
-     its exact name. Empty string for relation payloads, which identify themselves by their \
-     endpoints and kind.\n  \
+     its exact name. A repository-relative path instead for the three file-level shapes \
+     (create, delete, rename). Empty string for relation payloads, which identify themselves \
+     by their endpoints and kind.\n  \
      - `description` (string, REQUIRED): why this operation is being made.\n  \
+     - `destination` (string, optional): where a rename puts the file, as a \
+     repository-relative path. Required by rename/move and accepted by nothing else.\n  \
      - `body` (string, optional): the entity's complete new source text, never a fragment or a \
      diff. New source text is carried by this field and no other; a key like `content`, \
      `source`, or `new_body` is refused rather than accepted with the source dropped.\n  \
-     - `payload` (object, optional): omit it for a source edit. Otherwise exactly one of \
+     - `payload` (object, optional): omit it for a source edit and for every file-level shape. \
+     Otherwise exactly one of \
      {\"Entity\": {<entity object>}}, {\"Relation\": {\"from\": \"<uuid>\", \"to\": \"<uuid>\", \
      \"kind\": \"<relation kind>\"}}, or {\"Blob\": [<bytes>]}. Relation payloads accept only \
      create/add/upsert/insert or delete/remove, and blob payloads are not committable through \
@@ -533,7 +661,14 @@ pub const ACCEPTED_OPERATION_SHAPES: &str = "each element of `operations` is one
 /// anything other than `body` decodes cleanly with `body: None` and is planned
 /// as if no source had been sent. Checking the key set first is what turns that
 /// into a refusal the caller can act on.
-const OPERATION_FIELDS: [&str; 5] = ["verb", "target", "payload", "body", "description"];
+const OPERATION_FIELDS: [&str; 6] = [
+    "verb",
+    "target",
+    "payload",
+    "body",
+    "destination",
+    "description",
+];
 
 /// Decode an `operations` argument into staged operations.
 ///
@@ -2058,6 +2193,7 @@ mod tests {
             payload: None,
             body: None,
             description: "add dummy function".to_string(),
+            destination: None,
         };
         let tx_staged = registry
             .stage_transaction(&tx.transaction_id, vec![op])
@@ -2087,6 +2223,7 @@ mod tests {
                     payload: None,
                     body: Some("pub fn value() -> u8 { 2 }".to_string()),
                     description: "replace the body".to_string(),
+                    destination: None,
                 }],
             )
             .unwrap()
@@ -2211,7 +2348,7 @@ mod tests {
 
     // ── Stage-time validation (D.7 Track A) ──────────────────────────────────
 
-    fn entity_named(name: &str) -> kin_model::Entity {
+    pub(super) fn entity_named(name: &str) -> kin_model::Entity {
         use kin_model::entity::{
             EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, SemanticFingerprint,
             Visibility,
@@ -2249,6 +2386,7 @@ mod tests {
             target: "function".to_string(),
             payload,
             body: None,
+            destination: None,
             description: "d".to_string(),
         }
     }
@@ -2515,6 +2653,7 @@ mod target_body_update_tests {
             target: target.to_string(),
             payload: None,
             body: body.map(str::to_string),
+            destination: None,
             description: "test".to_string(),
         }
     }
@@ -2525,6 +2664,161 @@ mod target_body_update_tests {
         assert!(is_target_body_update(&op));
         assert!(uncommittable_reason(&op).is_none());
         assert!(validate_staged_operations(std::slice::from_ref(&op)).is_ok());
+    }
+
+    /// Build a file-level operation: a verb, a path, and optionally a
+    /// destination.
+    fn path_op(verb: &str, target: &str, destination: Option<&str>) -> McpMutationOperation {
+        McpMutationOperation {
+            verb: verb.to_string(),
+            target: target.to_string(),
+            payload: None,
+            body: None,
+            destination: destination.map(str::to_string),
+            description: "test".to_string(),
+        }
+    }
+
+    /// The two file-level shapes an agent can stage without a payload, and the
+    /// near misses that must not be mistaken for them.
+    ///
+    /// The near misses are the point. `delete` and `remove` were already known
+    /// verbs before they meant anything at the file level, so a payload-less
+    /// `delete` used to fail with "missing payload" and now succeeds; every
+    /// shape that still has to fail is listed here so the widening is bounded
+    /// to what was intended.
+    #[test]
+    fn file_level_shapes_are_recognized_and_their_near_misses_are_not() {
+        let retire = path_op("delete", "src/gone.rs", None);
+        assert!(is_retired_source_file(&retire));
+        assert!(!is_renamed_source_file(&retire));
+        assert!(!is_new_source_file(&retire));
+        assert!(uncommittable_reason(&retire).is_none());
+        validate_staged_operations(std::slice::from_ref(&retire))
+            .expect("a payload-less delete naming a path must stage");
+
+        let rename = path_op("rename", "src/old.rs", Some("src/new.rs"));
+        assert!(is_renamed_source_file(&rename));
+        assert!(!is_retired_source_file(&rename));
+        assert!(uncommittable_reason(&rename).is_none());
+        validate_staged_operations(std::slice::from_ref(&rename))
+            .expect("a payload-less rename naming both paths must stage");
+
+        // A retirement carrying text is two intentions in one call. Guessing
+        // which one was meant is how a delete silently becomes an edit.
+        let mut bodied = path_op("delete", "src/gone.rs", None);
+        bodied.body = Some("pub fn resurrect() {}\n".to_string());
+        assert!(!is_retired_source_file(&bodied));
+        assert!(validate_staged_operations(std::slice::from_ref(&bodied)).is_err());
+
+        // A rename is not a rename without somewhere to go.
+        let no_destination = path_op("rename", "src/old.rs", None);
+        assert!(!is_renamed_source_file(&no_destination));
+        assert!(validate_staged_operations(std::slice::from_ref(&no_destination)).is_err());
+
+        let empty_destination = path_op("rename", "src/old.rs", Some("   "));
+        assert!(!is_renamed_source_file(&empty_destination));
+        assert!(validate_staged_operations(std::slice::from_ref(&empty_destination)).is_err());
+
+        // A move to where it already is moves nothing, and would publish a
+        // change carrying no transition.
+        let in_place = path_op("rename", "src/same.rs", Some("src/same.rs"));
+        let error = validate_staged_operations(std::slice::from_ref(&in_place))
+            .expect_err("a rename onto its own path must not stage");
+        assert!(
+            error.contains("must move the file somewhere else"),
+            "{error}"
+        );
+
+        // A retirement with nothing to name.
+        let unnamed = path_op("delete", "  ", None);
+        assert!(!is_retired_source_file(&unnamed));
+        assert!(validate_staged_operations(std::slice::from_ref(&unnamed)).is_err());
+    }
+
+    /// Both ends of a file-level operation take the projection's path rule.
+    ///
+    /// Stage time, not commit time, and quoting the field so a caller with two
+    /// paths in one operation learns which of them is wrong.
+    #[test]
+    fn an_inadmissible_file_level_path_is_refused_at_stage_time_on_either_end() {
+        // Positive controls first, so a loop that refused everything would fail
+        // here rather than read as a working guard.
+        let ordinary_retirement = path_op("delete", "src/old.py", None);
+        validate_staged_operations(std::slice::from_ref(&ordinary_retirement))
+            .expect("an ordinary repository-relative path must stage as a retirement");
+        let ordinary = path_op("rename", "src/old.py", Some("src/new.py"));
+        validate_staged_operations(std::slice::from_ref(&ordinary))
+            .expect("two ordinary repository-relative paths must stage");
+
+        for path in [
+            "/etc/passwd",
+            "../outside.py",
+            ".kin/objects/sneak.py",
+            ".git/hooks/pre-commit",
+        ] {
+            let retire = path_op("delete", path, None);
+            let error = validate_staged_operations(std::slice::from_ref(&retire))
+                .expect_err("an inadmissible path must not stage as a retirement");
+            assert!(error.contains(path), "{error}");
+        }
+
+        for path in ["/etc/passwd", "../outside.py", ".git/config"] {
+            let bad_origin = path_op("rename", path, Some("src/new.py"));
+            let error = validate_staged_operations(std::slice::from_ref(&bad_origin))
+                .expect_err("an inadmissible origin must not stage");
+            assert!(error.contains("`target`"), "{error}");
+            assert!(error.contains(path), "{error}");
+
+            let bad_destination = path_op("rename", "src/old.py", Some(path));
+            let error = validate_staged_operations(std::slice::from_ref(&bad_destination))
+                .expect_err("an inadmissible destination must not stage");
+            assert!(error.contains("`destination`"), "{error}");
+            assert!(error.contains(path), "{error}");
+        }
+    }
+
+    /// A rename carrying a payload is refused rather than dropped.
+    ///
+    /// The in-process commit path builds its deltas from a `match` on the
+    /// payload and the verb, and it has no arm for rename/move. Without this
+    /// refusal such an operation stages clean, commits clean, and does nothing,
+    /// which is the silent-drop failure stage-time validation exists to be a
+    /// superset of.
+    #[test]
+    fn a_payload_cannot_carry_a_rename() {
+        let mut entity_rename = path_op("rename", "src/old.rs", Some("src/new.rs"));
+        entity_rename.payload = Some(McpMutationPayload::Entity(super::tests::entity_named(
+            "moved",
+        )));
+        let reason = uncommittable_reason(&entity_rename)
+            .expect("an entity payload must not be committable with a rename verb");
+        assert!(
+            reason.contains("is not committable for entity payloads"),
+            "{reason}"
+        );
+        assert!(validate_staged_operations(std::slice::from_ref(&entity_rename)).is_err());
+
+        let mut relation_rename = path_op("move", "", None);
+        relation_rename.payload = Some(McpMutationPayload::Relation {
+            from: kin_model::ids::EntityId::new(),
+            to: kin_model::ids::EntityId::new(),
+            kind: kin_model::relation::RelationKind::Calls,
+        });
+        let reason = uncommittable_reason(&relation_rename)
+            .expect("a relation payload must not be committable with a move verb");
+        assert!(
+            reason.contains("is not committable for relation payloads"),
+            "{reason}"
+        );
+
+        // Positive control: the same payloads stay committable under the verbs
+        // they were always committable under.
+        let mut entity_update = path_op("update", "src/old.rs", None);
+        entity_update.payload = Some(McpMutationPayload::Entity(super::tests::entity_named(
+            "moved",
+        )));
+        assert!(uncommittable_reason(&entity_update).is_none());
     }
 
     #[test]

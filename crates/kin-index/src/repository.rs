@@ -650,6 +650,73 @@ pub fn tracked_paths_retracted_by_ignore<'a>(
     covered
 }
 
+/// Resolve every symbolic link above a host path while leaving its final
+/// component exactly as it was named.
+///
+/// Repository containment is decided by comparing a host path against a
+/// repository root, and the two rarely arrive in the same form. A watcher
+/// backend, a shell, a config file, and `--repo` each name the same directory
+/// differently the moment a symbolic link stands anywhere above it, and a
+/// lexical comparison of two such names disagrees while both are correct.
+/// Resolving the parent puts them in one form.
+///
+/// The leaf is deliberately left alone. It may be a symbolic link whose own
+/// identity the repository tracks, it may dangle, and after a removal it may
+/// not exist at all, so dereferencing it would either answer about the wrong
+/// entry or fail on exactly the events that matter most. Resolving the parent
+/// also rejects a path that reads as being beneath the root but leaves it
+/// through a directory symlink, which a purely lexical test admits.
+pub fn canonicalize_host_parent_preserving_leaf(path: &Path) -> io::Result<PathBuf> {
+    let leaf = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("host path has no repository entry name: {}", path.display()),
+        )
+    })?;
+    let mut unresolved = vec![leaf.to_os_string()];
+    let mut ancestor = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("host path has no parent directory: {}", path.display()),
+        )
+    })?;
+
+    loop {
+        match ancestor.canonicalize() {
+            Ok(mut canonical) => {
+                for component in unresolved.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let component = ancestor.file_name().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!(
+                            "host path has no existing ancestor to establish repository \
+                             containment: {}",
+                            path.display()
+                        ),
+                    )
+                })?;
+                unresolved.push(component.to_os_string());
+                ancestor = ancestor.parent().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!(
+                            "host path has no existing ancestor to establish repository \
+                             containment: {}",
+                            path.display()
+                        ),
+                    )
+                })?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// Convert a host-relative path to Kin's byte-exact repository path.
 pub fn repo_path_from_host_relative(path: &Path) -> io::Result<RepoPath> {
     let mut bytes = Vec::new();

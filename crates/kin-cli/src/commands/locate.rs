@@ -1838,11 +1838,16 @@ fn record_vector_index_degradation(
 }
 
 /// Record the active hardware capability tier as a structured degradation when
-/// it runs below the full pipeline. `LocateProfile` silently scales retrieval
-/// quality with the machine's effective cores/RAM (shallower multihop, reranker
-/// / PRF / LTR off on smaller tiers); without this entry the same query returns
-/// different-quality results on different hardware with no in-band signal. On
-/// the `Performance` tier nothing is disabled and no entry is added.
+/// it runs below the full pipeline. `LocateProfile` silently scales the graph
+/// multihop budget with the machine's effective cores/RAM (shallower depth, a
+/// smaller frontier, a shorter timeout); without this entry the same query
+/// returns different-quality results on different hardware with no in-band
+/// signal. On the `Performance` tier nothing is narrowed and no entry is added.
+///
+/// The entry describes the multihop budget and stops there, because that is the
+/// entire reach of the tier. It is not an arm selector: the fused pipeline
+/// answers on every tier, and a `text_fallback` row means the query found no
+/// better evidence, never that the hardware withdrew a stage.
 ///
 /// A tier chosen after a failed host probe is reported as its own thing. The
 /// ordinary entry's remediation tells the reader to run on a bigger host, which
@@ -1886,27 +1891,35 @@ fn record_capability_tier_degradation(
                 describe_disabled_signals(profile),
             ),
             remediation:
-                "set KIN_LOCATE_PROFILE=performance to force the full pipeline, or run on a host \
-                 with >=8 cores and >=16GB RAM"
+                "set KIN_LOCATE_PROFILE=performance to widen the multihop budget on this host, \
+                 or run on a host with >=8 cores and >=16GB RAM"
                     .to_string(),
         },
     );
 }
 
-/// The signals a tier turns off and the depths it narrows, as a clause both
-/// capability entries append to their own opening.
+/// What a tier narrows, as a clause both capability entries append to their own
+/// opening.
+///
+/// It reports the graph multihop budget and says outright that the rest of the
+/// pipeline is untouched, because the entry's job is to let a reader size the
+/// downgrade rather than guess at it. The clause used to say three named
+/// signals were "disabled"; see [`LocateProfile::disabled_signals`] for why
+/// that was false. "Narrowed" is also the accurate verb: these are bounds the
+/// tier lowers, not features it removes.
 fn describe_disabled_signals(profile: LocateProfile) -> String {
-    let disabled = profile.disabled_signals();
-    if disabled.is_empty() {
+    if profile.disabled_signals().is_empty() {
         return ": full pipeline".to_string();
     }
     format!(
-        ": {} disabled; multihop depth {}/{}, frontier {}/{}",
-        disabled.join(", "),
+        ": graph multihop budget narrowed (depth {}/{}, frontier {}/{}, timeout {}ms/{}ms); \
+         retrieval is otherwise unchanged, since the tier gates no other stage",
         profile.multihop_max_depth(),
         LocateProfile::Performance.multihop_max_depth(),
         profile.multihop_frontier_limit(),
         LocateProfile::Performance.multihop_frontier_limit(),
+        profile.multihop_timeout_ms(),
+        LocateProfile::Performance.multihop_timeout_ms(),
     )
 }
 
@@ -17630,8 +17643,17 @@ mod tests {
         );
         let entry = capability_entry(&small);
         assert_eq!(entry.reason, "minimal");
-        assert!(entry.detail.contains("reranker"));
+        assert!(entry.detail.contains("multihop"));
         assert!(entry.remediation.contains(">=8 cores"));
+        // The entry may only name what the tier gates. It used to assert
+        // "reranker" here, which was the false claim itself under test.
+        for phantom in ["reranker", "prf", "ltr"] {
+            assert!(
+                !entry.detail.contains(phantom),
+                "the capability entry must not claim {phantom}, which no tier gates: {}",
+                entry.detail
+            );
+        }
     }
 
     /// The full pipeline on a host that was actually read stays silent, which

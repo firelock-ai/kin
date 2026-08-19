@@ -388,12 +388,11 @@
     },
     {
       "file": "crates/kin-daemon/src/loop_runner.rs",
-      "reason": "Host event ingestion boundary. The excused bodies are the file watcher's admission path: reading a host file or symlink target and its mode so the change can be admitted into the graph as exact tree state, and comparing a host entry against what the graph already holds so an unchanged file is not re-admitted. Reading the working tree is the entire job of an ingestion boundary, and the result is written into graph truth rather than returned as an answer. The remaining three are repository binding, which precedes any graph consult: recognizing a bare git layout, canonicalizing a host parent while preserving the leaf, and resolving a path relative to the bound root. The cfg-gated executable-bit helper is the pair that carries a count of two. Function-scoped so the rest of the runner stays scanned.",
+      "reason": "Host event ingestion boundary. The excused bodies are the file watcher's admission path: reading a host file or symlink target and its mode so the change can be admitted into the graph as exact tree state, and comparing a host entry against what the graph already holds so an unchanged file is not re-admitted. Reading the working tree is the entire job of an ingestion boundary, and the result is written into graph truth rather than returned as an answer. The remaining two are repository binding, which precedes any graph consult: recognizing a bare git layout, and resolving a path relative to the bound root. The helper that canonicalized a host parent while preserving its leaf moved to kin-index, which is a declared ingestion boundary, so the watcher and this runner decide repository containment by one rule instead of two. The cfg-gated executable-bit helper is the pair that carries a count of two. Function-scoped so the rest of the runner stays scanned.",
       "owner": "kin-daemon",
       "expiration": "2026-12-31",
       "allow_fn": [
         "is_bare_repository",
-        "canonicalize_host_parent_preserving_leaf",
         "repo_path",
         {
           "fn": "regular_file_is_executable",

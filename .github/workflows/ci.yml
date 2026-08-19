@@ -333,6 +333,16 @@ jobs:
             "init::tests" \
             --locked --target x86_64-pc-windows-msvc \
             -p kin-core --lib
+          # The capture lease is the only thing that stops one init's reap from
+          # deleting a sibling init's capture directory, and every clause of it
+          # is a Windows sharing rule rather than Kin's code: that a locked file
+          # can be renamed at all, that the lock follows it, and that a second
+          # opener is then refused. None of that is observable from a Unix run,
+          # and until this leg existed no Windows run touched the module.
+          run_required_filter "kin-core Git capture lease" \
+            "init_staging::tests" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-core --lib
           run_required_filter "managed-install spawn fence" \
             "managed_spawn_fence" \
             --locked --target x86_64-pc-windows-msvc \
@@ -954,6 +964,7 @@ jobs:
           node --test \
             scripts/check-glibc-floor.test.mjs \
             scripts/check-kin-vfs-compat.test.mjs \
+            scripts/check-rc-build-drift.test.mjs \
             scripts/check-release-version.test.mjs \
             scripts/extract-release-notes.test.mjs \
             scripts/prepare-release.test.mjs \
@@ -961,6 +972,15 @@ jobs:
           node --check scripts/check-release-version.mjs
           node --check scripts/prepare-release.mjs
           node --check scripts/release-intent.mjs
+
+      # rc-build.yml builds release-candidate archives from a copy of
+      # release.yml's build job, so the archive stranger and the preflight Linux
+      # leg can run before a tag exists. A copy nothing checks keeps reporting
+      # success while the original moves, and release.yml is the one workflow
+      # whose mistakes a later commit cannot repair.
+      - name: Check the RC build mirrors the release build
+        if: runner.os == 'Linux'
+        run: node scripts/check-rc-build-drift.mjs
 
       # release.yml refuses a release whose Kin lock resolves a different
       # kin-vfs-core than the pinned kin-vfs checkout builds, and that

@@ -177,8 +177,12 @@ impl IndexPipeline {
         }
 
         let parse_completeness = ParseCompleteness::from_parse_state(&parse_state);
-        let (relations, unresolved_relations) =
-            resolve_relations(&extracted_relations, &entities, &parse_completeness);
+        let (relations, unresolved_relations) = resolve_relations(
+            &extracted_relations,
+            &entities,
+            file_id,
+            &parse_completeness,
+        );
         let file_layout = build_layout(file_id, &entities, source.len(), &[], parse_completeness);
 
         debug!(
@@ -315,8 +319,12 @@ impl IndexPipeline {
 
         // Resolve extracted relations to model relations using entity name mapping
         let parse_completeness = ParseCompleteness::from_parse_state(&parse_state);
-        let (relations, unresolved_relations) =
-            resolve_relations(&extracted_relations, &entities, &parse_completeness);
+        let (relations, unresolved_relations) = resolve_relations(
+            &extracted_relations,
+            &entities,
+            file_id,
+            &parse_completeness,
+        );
         let file_layout = build_layout(file_id, &entities, source.len(), &[], parse_completeness);
 
         debug!(
@@ -760,6 +768,7 @@ pub fn classify_file_role(path: &str) -> EntityRole {
 fn resolve_relations(
     extracted: &[kin_parser::ExtractedRelation],
     entities: &[Entity],
+    file_id: &FilePathId,
     parse_completeness: &ParseCompleteness,
 ) -> (Vec<Relation>, Vec<UnresolvedRelation>) {
     let mut resolved = Vec::new();
@@ -795,9 +804,9 @@ fn resolve_relations(
                         origin: RelationOrigin::Parsed,
                         created_in: None,
                         import_source: rel.import_source.clone(),
-                        evidence: crate::linker::call_shape_evidence(
-                            rel.kind,
-                            rel.call_shape.as_ref(),
+                        evidence: crate::linker::relation_evidence(
+                            rel,
+                            file_id,
                             parse_completeness,
                             call_extraction_complete,
                         ),
@@ -917,9 +926,23 @@ mod tests {
                 .clone()
         };
 
+        let shapes = |evidence: &[kin_model::RelationEvidence]| {
+            let mut shapes: Vec<String> = evidence
+                .iter()
+                .map(|record| format!("{:?}x{}", record.call_shape, record.occurrence_count))
+                .collect();
+            shapes.sort();
+            shapes
+        };
+
         let forward_evidence = evidence_for(forward);
         let reversed_evidence = evidence_for(reversed);
-        assert_eq!(forward_evidence, reversed_evidence);
+        // Evidence carries the call SITE now, and the two sources put their
+        // calls at different offsets, so byte equality across the reversal is
+        // not the invariant any more. What must hold is that the shapes reaching
+        // the callee, which is what the merge gate reads, do not depend on which
+        // call was written first.
+        assert_eq!(shapes(&forward_evidence), shapes(&reversed_evidence));
         assert_eq!(forward_evidence.len(), 2);
         assert!(forward_evidence.iter().any(|evidence| {
             evidence
@@ -927,6 +950,12 @@ mod tests {
                 .as_ref()
                 .is_some_and(|shape| shape.keywords == ["args"])
         }));
+        assert!(
+            forward_evidence
+                .iter()
+                .all(|record| record.source_span.is_some()),
+            "the same-file arm must carry each call's site: {forward_evidence:?}"
+        );
     }
 
     #[test]

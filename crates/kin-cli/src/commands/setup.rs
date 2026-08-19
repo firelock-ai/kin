@@ -1232,7 +1232,7 @@ fn copy_shim(src: &Path, dest: &Path) -> Result<ShimCopy> {
     Ok(ShimCopy::Copied)
 }
 
-fn find_shim() -> Option<PathBuf> {
+pub(crate) fn find_shim() -> Option<PathBuf> {
     let name = shim_filename();
 
     if let Ok(kin_home) = kin_dir() {

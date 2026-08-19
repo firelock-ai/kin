@@ -1120,8 +1120,11 @@ fn spine_reference_rows(
             // the source relation was Calls/Imports/References.
             relation_kinds: Vec::new(),
             // The resolving edge lives in the other repository's graph, so how
-            // it was resolved is not knowable here. Absent, not guessed.
+            // it was resolved is not knowable here. Absent, not guessed. For
+            // the same reason it is not a receiver-name guess: nothing in this
+            // payload could show that it was.
             resolution: None,
+            receiver_name_guess: false,
         });
     }
 
@@ -1211,7 +1214,7 @@ fn answer_witnessed_classes<G: GraphStore>(
 /// complete is the `negative` object's question for an empty answer and
 /// `edge_coverage`'s for the classes the query read; this field does not restate
 /// either, and on an empty answer it describes an empty set.
-fn reference_counts(rows: &[ReferenceRow]) -> serde_json::Value {
+fn reference_counts(rows: &[ReferenceRow], receiver_name_candidates: usize) -> serde_json::Value {
     let known_reference_sites: usize = rows.iter().map(|row| row.reference_lines.len()).sum();
     let reference_sites_complete = rows.iter().all(|row| !row.reference_lines.is_empty());
     let files = rows
@@ -1226,7 +1229,51 @@ fn reference_counts(rows: &[ReferenceRow]) -> serde_json::Value {
         "reference_sites": reference_sites_complete.then_some(known_reference_sites),
         "known_reference_sites": known_reference_sites,
         "reference_sites_complete": reference_sites_complete,
+        // Rows held out of every number above, carried in `candidates`. Stated
+        // here so a reader who looks only at `counts` still learns the answer
+        // withheld something (FIR-1552).
+        "receiver_name_candidates": receiver_name_candidates,
     })
+}
+
+/// Component and reason a withheld-candidate disclosure is filed under, matched
+/// to the pair `trace_data_flow` already files its `name_only` hops under so one
+/// vocabulary covers both surfaces.
+const CALL_RESOLUTION_COMPONENT: &str = "call_resolution";
+const RECEIVER_NAME_CANDIDATES_REASON: &str = "receiver_name_candidates";
+
+/// Declare the candidates this answer held out of its headline.
+///
+/// Withholding them is what makes the count honest, and saying nothing about it
+/// would make the count look whole instead. A reported degradation is the one
+/// disclosure the absence gate already consumes: `negative` reads the payload's
+/// own `degradations` and refuses to certify an absence beside one, so an answer
+/// that resolved nothing and withheld twenty candidates cannot come back as
+/// `safe_to_conclude_absent: true`.
+fn disclose_withheld_candidates(result: &mut serde_json::Value) {
+    let withheld = result["candidates"].as_array().map_or(0, Vec::len);
+    if withheld == 0 {
+        return;
+    }
+    let resolved = result["total_upstream"].as_u64().unwrap_or(0);
+    let disclosure = serde_json::json!({
+        "component": CALL_RESOLUTION_COMPONENT,
+        "reason": RECEIVER_NAME_CANDIDATES_REASON,
+        "detail": format!(
+            "{withheld} same-name candidate(s) were held out of the {resolved} counted here, \
+             because a bare-name match does not prove its destination"
+        ),
+        "remediation":
+            "read `candidates` for the rows withheld, and confirm each at its reference site \
+             before treating it as a caller",
+    });
+    match result
+        .get_mut("degradations")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        Some(existing) => existing.push(disclosure),
+        None => result["degradations"] = serde_json::Value::Array(vec![disclosure]),
+    }
 }
 
 /// Project one reference row.
@@ -1458,6 +1505,7 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
         default_reference_kinds()
     };
 
+    let addressed_by_name = get_optional_string_param(args, "entity_id").is_none();
     let target = if let Some(entity_id_str) = get_optional_string_param(args, "entity_id") {
         let entity_id = parse_entity_id(&entity_id_str)?;
         store.get_entity(&entity_id).map_err(McpError::graph)?
@@ -1549,17 +1597,36 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
             .then_with(|| left.entity_id.cmp(&right.entity_id))
     });
 
+    // Read off the rows before they are projected, where the caller's entity id
+    // is still addressable. Every row witnesses its own edge classes, candidate
+    // or not: a `name_only` edge is still an edge of that class, and reading
+    // only the resolved rows here would report a class absent on a graph
+    // holding it.
+    let witnessed = answer_witnessed_classes(store, &target, &rows);
+
+    // FIR-1552. A `name_only` row was matched on a bare name with nothing at the
+    // reference site proving the destination. Counting one beside a proven
+    // caller is how `find_references(HTTPAdapter.send)` on psf/requests answered
+    // `total_upstream: 33` for a method `git grep` finds two call sites for,
+    // with all 33 rows carrying `resolution: "name_only"` so the per-row marker
+    // could not separate the two true rows from the 31 invented ones. The
+    // headline counts what resolved; candidates travel in their own array under
+    // their own count and are never added to it.
+    let (rows, candidate_rows): (Vec<ReferenceRow>, Vec<ReferenceRow>) =
+        rows.into_iter().partition(|row| !row.receiver_name_guess);
+
     // What this answer counted, computed before the rows are projected. One row
     // is one referencing entity, so `referencing_entities` is the row count and
     // `files` is what the pre-FIR-2398 `total_upstream` was reporting.
-    let counts = reference_counts(&rows);
-    // Read off the rows before they are projected, where the caller's entity id
-    // is still addressable.
-    let witnessed = answer_witnessed_classes(store, &target, &rows);
+    let counts = reference_counts(&rows, candidate_rows.len());
 
     // `entity_id` remains the local drill-through keystone. Federated rows use
     // repo-qualified paths and carry no local entity id.
     let references = rows
+        .into_iter()
+        .map(|row| reference_row_json(row, include_snippets))
+        .collect::<Vec<_>>();
+    let candidates = candidate_rows
         .into_iter()
         .map(|row| reference_row_json(row, include_snippets))
         .collect::<Vec<_>>();
@@ -1605,9 +1672,48 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
         "total_upstream": references.len(),
         "counts": counts,
         "references": references,
+        // Same row shape as `references`, held apart because these are not
+        // references: each is a same-name match whose destination nothing at the
+        // reference site proves. Read them to widen a search by hand; never add
+        // them to `total_upstream`.
+        "candidates": candidates,
         "cross_repo": cross_repo,
     });
     result[crate::edge_coverage::EDGE_COVERAGE_KEY] = edge_coverage;
+    disclose_withheld_candidates(&mut result);
+
+    // Say that a bare name was resolved, and to how many candidates.
+    //
+    // A repository holding both `Database.resolve` and `LinkGraph.resolve`
+    // answered `find_references(query: "resolve")` with one of them and its
+    // reference list, and nothing in the response said the other existed. The
+    // answer was right, and a rename driven by it on a colliding name is a
+    // rename driven by an unannounced guess. `trace_data_flow` already reports
+    // this as `focal_resolution`; the shape is copied deliberately so the two
+    // tools answer the same question with the same key.
+    let same_name_candidates = same_name_entity_count(store, &target.name)?;
+    result["focal_resolution"] = serde_json::json!({
+        "addressed_by": if addressed_by_name { "name" } else { "entity_id" },
+        "same_name_candidates": same_name_candidates,
+    });
+    if addressed_by_name && same_name_candidates > 1 {
+        let entry = serde_json::json!({
+            "component": "focal_resolution",
+            "reason": "ambiguous_name",
+            "detail": format!(
+                "{same_name_candidates} entities are named '{}', and this answer describes the \
+                 one reported as focal_entity. Address it by entity_id to pin the choice.",
+                target.name
+            ),
+        });
+        match result
+            .get_mut("degradations")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            Some(existing) => existing.push(entry),
+            None => result["degradations"] = serde_json::Value::Array(vec![entry]),
+        }
+    }
 
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
@@ -4881,6 +4987,56 @@ mod tests {
         assert_eq!(verbose_refs[0]["signature"], "fn caller()");
     }
 
+    /// A bare name that matches several entities is resolved to one of them and
+    /// says so.
+    ///
+    /// A repository holding both `Database.resolve` and `LinkGraph.resolve`
+    /// answered `find_references(query: "resolve")` with one of them and its
+    /// reference list, and nothing in the response mentioned that the other
+    /// existed. The answer was correct; a rename driven by it on a colliding
+    /// name is a rename driven by an unannounced guess.
+    #[tokio::test]
+    async fn find_references_reports_an_ambiguous_name_resolution() {
+        let store = InMemoryGraph::new();
+        let one = make_entity("resolve", "src/database.rs");
+        let two = make_entity("resolve", "src/link_graph.rs");
+        store.upsert_entity(&one).unwrap();
+        store.upsert_entity(&two).unwrap();
+
+        let mut args = HashMap::new();
+        args.insert("query".to_string(), serde_json::json!("resolve"));
+        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+
+        assert_eq!(body["focal_resolution"]["addressed_by"], "name");
+        assert_eq!(
+            body["focal_resolution"]["same_name_candidates"], 2,
+            "two entities carry this name and the response must say so: {body}"
+        );
+        let degradations = body["degradations"]
+            .as_array()
+            .unwrap_or_else(|| panic!("an ambiguous resolution must degrade: {body}"));
+        assert!(
+            degradations
+                .iter()
+                .any(|entry| entry["reason"] == "ambiguous_name"),
+            "the ambiguity must be named, not left to focal_entity: {body}"
+        );
+
+        // Addressing the same entity by id is not ambiguous and must not
+        // degrade: the caller already pinned the choice.
+        let mut pinned = HashMap::new();
+        pinned.insert(
+            "entity_id".to_string(),
+            serde_json::json!(one.id.to_string()),
+        );
+        let exact = parsed_response(&handle_find_references(&pinned, &store, None).await.unwrap());
+        assert_eq!(exact["focal_resolution"]["addressed_by"], "entity_id");
+        assert!(
+            exact.get("degradations").is_none(),
+            "pinning by id resolves nothing and must not degrade: {exact}"
+        );
+    }
+
     /// One row per REFERENCING ENTITY, and `total_upstream` counting those
     /// entities rather than the files they sit in.
     ///
@@ -4954,12 +5110,14 @@ mod tests {
     /// whether any site could be located at all.
     ///
     /// FIR-2357 item 3: an empty `reference_lines` on a row that DID come back
-    /// is the quiet-partial failure in miniature. No production ingest path
-    /// populates `RelationEvidence::source_span` today (measured and asserted at
-    /// zero by `kin-index`'s `relation_evidence_span_coverage`), so this is what
-    /// every real answer looks like, and saying so is the difference between a
-    /// caller that knows the sites are unavailable and one that reads `[]` as
-    /// "no sites".
+    /// is the quiet-partial failure in miniature. This was once what EVERY real
+    /// answer looked like, because no ingest path populated
+    /// `RelationEvidence::source_span`. The Python and JavaScript adapters now
+    /// record their call sites (FIR-1825, measured per language by `kin-index`'s
+    /// `relation_evidence_span_coverage`), so this is now the shape of a row
+    /// from a language whose adapter does not, and saying so is still the
+    /// difference between a caller that knows the sites are unavailable and one
+    /// that reads `[]` as "no sites".
     #[tokio::test]
     async fn find_references_says_why_a_row_carries_no_site_lines() {
         let store = InMemoryGraph::new();
@@ -5297,6 +5455,217 @@ mod tests {
         assert!(
             !trust_reason.contains("mismatch"),
             "and never the one that did not: {trust_reason}"
+        );
+    }
+
+    /// A relation at a chosen confidence, so a fixture can hold real callers and
+    /// receiver-name guesses side by side. The tiers used below are the
+    /// receiver-method fan-out, the exact-name match at `0.7` (also `name_only`,
+    /// and still a caller), and parser-certain at `1.0`.
+    fn make_relation_at(
+        src: EntityId,
+        dst: EntityId,
+        kind: RelationKind,
+        confidence: f32,
+    ) -> Relation {
+        Relation {
+            confidence,
+            ..make_relation(src, dst, kind)
+        }
+    }
+
+    /// FIR-1552. `find_references(HTTPAdapter.send)` on psf/requests answered
+    /// `total_upstream: 33` where `git grep` finds two call sites, and all 33
+    /// rows carried `resolution: "name_only"`, so the per-row marker could not
+    /// tell the two true rows from the 31 the receiver fan-out invented. The
+    /// headline counts callers. Candidates travel in their own array under their
+    /// own count, and adding the two numbers together is the only way to get the
+    /// old one back.
+    ///
+    /// `resolution` is not the discriminator here and cannot be: an ordinary
+    /// cross-file call whose callee name matches exactly one entity is
+    /// `name_only` too, and demoting those would empty the headline on every
+    /// repository. The candidate class is the receiver fan-out alone.
+    ///
+    /// The fixture is deliberately lopsided, three guesses against two proven
+    /// callers, so no assertion here can pass on a fixture where every number
+    /// happens to coincide.
+    #[tokio::test]
+    async fn a_receiver_name_row_is_a_candidate_and_never_a_counted_reference() {
+        let store = InMemoryGraph::new();
+        let target = make_entity("send", "src/adapters.rs");
+        store.upsert_entity(&target).unwrap();
+
+        let proven = ["Session.send", "handle_401"];
+        // 0.7 is the exact-name tier: `name_only` by the ladder, and an ordinary
+        // caller all the same. It has to land in the headline, or this fix takes
+        // real callers out of every count with the invented ones.
+        let exact_name_caller = "Session.request";
+        let guessed = ["test_lowlevel", "text_response_server", "test_pickling"];
+        for name in proven
+            .iter()
+            .chain(guessed.iter())
+            .chain([&exact_name_caller])
+        {
+            let caller = make_entity(name, "src/callers.rs");
+            store.upsert_entity(&caller).unwrap();
+            let confidence = if guessed.contains(name) {
+                kin_index::resolution::RECEIVER_NAME_FANOUT_CONFIDENCE
+            } else if *name == exact_name_caller {
+                0.7
+            } else {
+                1.0
+            };
+            store
+                .upsert_relation(&make_relation_at(
+                    caller.id,
+                    target.id,
+                    RelationKind::Calls,
+                    confidence,
+                ))
+                .unwrap();
+        }
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+
+        assert_eq!(
+            body["total_upstream"], 3,
+            "the headline counts callers, the exact-name one included: {body:#}"
+        );
+        assert_eq!(
+            body["counts"]["referencing_entities"], 3,
+            "the counts object must agree with the headline: {body:#}"
+        );
+        assert_eq!(
+            body["counts"]["receiver_name_candidates"], 3,
+            "and must state how many rows it held back: {body:#}"
+        );
+
+        let named = |rows: &serde_json::Value| -> Vec<String> {
+            rows.as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let references = named(&body["references"]);
+        let candidates = named(&body["candidates"]);
+        assert_eq!(references.len(), 3, "{body:#}");
+        assert_eq!(candidates.len(), 3, "{body:#}");
+        for name in proven {
+            assert!(references.contains(&name.to_string()), "{body:#}");
+        }
+        // The positive control. This row's `resolution` reads `name_only`, and
+        // it is still a caller.
+        assert!(
+            references.contains(&exact_name_caller.to_string()),
+            "an exact-name caller must survive the split: {body:#}"
+        );
+        assert!(
+            body["references"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["name"] == exact_name_caller && row["resolution"] == "name_only"),
+            "and it must survive it while still reading name_only, which is what \
+             makes this control able to fail: {body:#}"
+        );
+        for name in guessed {
+            assert!(
+                candidates.contains(&name.to_string()),
+                "a guess belongs in `candidates`, never in `references`: {body:#}"
+            );
+            assert!(!references.contains(&name.to_string()), "{body:#}");
+        }
+        for row in body["candidates"].as_array().unwrap() {
+            assert_eq!(row["resolution"], "name_only", "{body:#}");
+        }
+        // Nothing was dropped: every caller the graph holds is in one array or
+        // the other, so this is a split rather than a filter.
+        assert_eq!(references.len() + candidates.len(), 6, "{body:#}");
+    }
+
+    /// Holding candidates back is what makes the count honest, and saying
+    /// nothing about it would make the count look whole instead. An answer that
+    /// resolved nothing and withheld three candidates is the case that matters:
+    /// its `references` array is empty, and an absence gate reading only that
+    /// would certify a method as unused while three rows sat beside it.
+    #[tokio::test]
+    async fn withheld_candidates_are_disclosed_and_cannot_certify_an_absence() {
+        let store = InMemoryGraph::new();
+        let target = make_entity("send", "src/adapters.rs");
+        store.upsert_entity(&target).unwrap();
+        for name in ["test_one", "test_two", "test_three"] {
+            let caller = make_entity(name, "tests/test_requests.rs");
+            store.upsert_entity(&caller).unwrap();
+            store
+                .upsert_relation(&make_relation_at(
+                    caller.id,
+                    target.id,
+                    RelationKind::Calls,
+                    kin_index::resolution::RECEIVER_NAME_FANOUT_CONFIDENCE,
+                ))
+                .unwrap();
+        }
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let response = parsed_response(&crate::finalize_with_envelope(
+            handle_find_references(&args, &store, None).await.unwrap(),
+            structurally_ready_envelope(),
+            "find_references",
+        ));
+
+        assert_eq!(response["total_upstream"], 0, "{response:#}");
+        assert!(response["references"].as_array().unwrap().is_empty());
+        assert_eq!(response["candidates"].as_array().unwrap().len(), 3);
+
+        let disclosed = response["degradations"]
+            .as_array()
+            .unwrap_or_else(|| panic!("withholding rows must be declared: {response:#}"))
+            .iter()
+            .any(|entry| {
+                entry["component"] == "call_resolution"
+                    && entry["reason"] == "receiver_name_candidates"
+            });
+        assert!(disclosed, "{response:#}");
+
+        // The discriminating assertion. `safe_to_conclude_absent` is already
+        // false in this fixture for an unrelated reason (no `KIN_REPO_ID`, so
+        // cross-repo authority cannot bind), which would make an assertion on it
+        // alone a check that cannot fail. What proves the gate consumed THIS
+        // disclosure is the label reaching the signal list it reads.
+        let signals = response["negative"]["degraded_signals"]
+            .as_array()
+            .unwrap_or_else(|| panic!("a negative carries its signals: {response:#}"));
+        assert!(
+            signals
+                .iter()
+                .any(|signal| signal == "call_resolution:receiver_name_candidates"),
+            "the absence gate must see the rows this answer withheld: {response:#}"
+        );
+        assert_eq!(
+            response["negative"]["safe_to_conclude_absent"], false,
+            "an empty headline beside three withheld candidates is not an absence: {response:#}"
+        );
+
+        let counted = &response["_kin"]["completeness"]["counted"];
+        assert_eq!(counted["reported"], 0, "{counted}");
+        assert_eq!(counted["exact"], false, "{counted}");
+        assert_eq!(counted["withheld_candidates"], 3, "{counted}");
+        assert_eq!(
+            counted["floor_reason"], "receiver_name_candidates_withheld",
+            "{counted}"
+        );
+        assert_eq!(
+            response["_kin"]["completeness"]["bound"], "at_least",
+            "a count that withheld rows is a floor: {response:#}"
         );
     }
 
@@ -7334,6 +7703,7 @@ mod tests {
             max_chars: RESPONSE_MAX_MAX_CHARS,
             compact: false,
             explicit_max_chars: true,
+            envelope_reserve: 0,
         }
     }
 
