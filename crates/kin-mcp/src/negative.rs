@@ -373,7 +373,7 @@ pub(crate) fn load_bearing_classes(requested: &[String]) -> Vec<String> {
 /// `absent` for every class and a language's zero to `absent` for that language;
 /// [`crate::edge_coverage`] can then be retired, since it is called from exactly
 /// three payload builders.
-fn absence_coverage_gap(tool: &str, payload: &Value) -> Option<String> {
+pub(crate) fn absence_coverage_gap(tool: &str, payload: &Value) -> Option<String> {
     let requested = absence_cross_file_classes(tool, payload);
     let language_scoped = absence_is_language_scoped(tool);
     if requested.is_empty() && !language_scoped {
@@ -492,6 +492,18 @@ fn absence_coverage_gap(tool: &str, payload: &Value) -> Option<String> {
     }
 
     (!gaps.is_empty()).then(|| gaps.join("; "))
+}
+
+/// Whether `tool` declares anything [`absence_coverage_gap`] can gate, so a
+/// `None` from that gate means "every dependency it declared was observed
+/// present" rather than "it declared none".
+///
+/// The distinction is what stops [`crate::verdict`] certifying a response on no
+/// evidence. A tool that reads neither cross-file edges nor a language's
+/// extracted graph has nothing for this gate to say, and silence is not
+/// agreement.
+pub(crate) fn declares_absence_dependency(tool: &str, payload: &Value) -> bool {
+    !absence_cross_file_classes(tool, payload).is_empty() || absence_is_language_scoped(tool)
 }
 
 /// One class's observed state, defaulting to `unknown` for a class the
@@ -900,7 +912,7 @@ fn describes_the_store_not_the_run(label: &str) -> bool {
 /// is not one.
 ///
 /// [`Degraded`]: crate::envelope::Degraded
-fn payload_degradation_labels(payload: &Value) -> Vec<String> {
+pub(crate) fn payload_degradation_labels(payload: &Value) -> Vec<String> {
     let Some(entries) = payload.get("degradations").and_then(Value::as_array) else {
         return Vec::new();
     };
@@ -1262,7 +1274,12 @@ fn cross_repo_bulk_gap(payload: &Value) -> Option<String> {
 ///
 /// The returned object is additive: callers attach it under [`NEGATIVE_KEY`]
 /// beside the existing payload keys, never replacing them.
-pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<Value> {
+pub fn negative_for(
+    tool: &str,
+    payload: &Value,
+    envelope: &Envelope,
+    response_gaps: &[String],
+) -> Option<Value> {
     let spec = spec_for(tool)?;
     let count = if tool == "semantic_locate" {
         locate_result_count(payload)?
@@ -1291,6 +1308,15 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
     // if it were.
     if let Some(gap) = absence_coverage_gap(tool, payload) {
         push_gap(&mut trustworthy, &mut trust_reason, gap);
+    }
+
+    // Gaps the response carries that this function cannot observe from the
+    // payload's collections alone, contributed by [`crate::verdict`] so the one
+    // verdict and the advice a reader acts on are built from the same list.
+    // Threading them in here rather than patching the finished object is what
+    // keeps `trust`, `trust_reason` and `advice` one consistent sentence.
+    for gap in response_gaps {
+        push_gap(&mut trustworthy, &mut trust_reason, gap.clone());
     }
 
     // Receiver-method calls (`x.method()`) are resolved by bare name in
@@ -1671,6 +1697,18 @@ pub fn resolution_miss_for(tool: &str, message: &str, envelope: &Envelope) -> Op
 mod tests {
     use super::*;
     use crate::envelope::{Degraded, Envelope, SemanticCoverage};
+
+    /// The absence object for a response carrying no gaps beyond the ones this
+    /// module computes for itself.
+    ///
+    /// Shadows [`super::negative_for`] so the cases below keep asserting on the
+    /// gates that live here. The response-scoped gaps the real signature takes
+    /// are contributed by [`crate::verdict`] and are exercised where they are
+    /// computed; passing an empty list here is what makes a failure in this
+    /// module a failure of this module.
+    fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<Value> {
+        super::negative_for(tool, payload, envelope, &[])
+    }
 
     /// A daemon envelope whose SEMANTIC substrate is complete — full embedding
     /// coverage, no degraded signals: the only state in which a *semantic* tool's

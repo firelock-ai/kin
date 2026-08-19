@@ -578,7 +578,7 @@ impl Completeness {
             .cloned();
 
         Some(Completeness {
-            note: completeness_note(status, bound, substrate, &limits),
+            note: completeness_note(status, bound, substrate, &decided_by, &limits),
             status: status.to_string(),
             bound: bound.to_string(),
             substrate: substrate.as_str().to_string(),
@@ -785,10 +785,17 @@ fn counted_for(tool: &str, payload: &Value) -> Option<Value> {
 
 /// One line an agent can act on. Says what the answer is worth and, when it is
 /// worth less than it looks, what limited it.
+///
+/// The deciding classes are NAMED rather than described as "every class this
+/// answer depended on". That phrasing was accurate about `decided_by` and read
+/// as a claim about `classes`, which sat directly below it in the same object
+/// with two of three entries marked `absent`. A reader cannot be expected to
+/// know which subset a sentence means when the superset is printed beside it.
 fn completeness_note(
     status: &str,
     bound: &str,
     substrate: CoverageSubstrate,
+    decided_by: &[String],
     limits: &[String],
 ) -> String {
     let named = if limits.is_empty() {
@@ -796,16 +803,22 @@ fn completeness_note(
     } else {
         format!(" Limited by: {}.", limits.join(", "))
     };
+    let deciding = if decided_by.is_empty() {
+        format!("no {} class", substrate.noun())
+    } else {
+        format!(
+            "the {} {} class(es)",
+            decided_by.join(", "),
+            substrate.noun()
+        )
+    };
     match (status, bound) {
-        ("complete", "exact") => format!(
-            "Every {} class this answer depended on was observed present, so the counts here are \
-             the whole set.",
-            substrate.noun()
-        ),
+        ("complete", "exact") => {
+            format!("This answer rested on {deciding}, and each was observed present, so the counts here are the whole set.")
+        }
         ("complete", _) => format!(
-            "Every {} class this answer depended on was observed present, but the counts are a \
-             lower bound.{named}",
-            substrate.noun()
+            "This answer rested on {deciding}, and each was observed present, but the counts are \
+             a lower bound.{named}"
         ),
         ("partial", _) => format!(
             "One of the {} classes this answer depended on was observed absent, so what came back \
@@ -856,6 +869,15 @@ pub struct Envelope {
     /// partial one, which is the case an agent cannot see.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completeness: Option<Completeness>,
+    /// The response's one verdict (FIR-2463): the single field a reader acts on,
+    /// computed from every block that would otherwise publish a verdict-shaped
+    /// claim of its own, with the most pessimistic input winning.
+    ///
+    /// `negative` and `completeness` beside it are inputs to this and are
+    /// projections of it, never independent answers. Present on every retrieval
+    /// response at least one input spoke about, absent on everything else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<Value>,
     /// What the response budget did to this payload: the budget applied and what
     /// the response measured before it. Present only on the retrieval tools the
     /// budget governs, and written by [`finalize_bounded`] AFTER this struct is
@@ -881,6 +903,7 @@ impl Envelope {
                 ..Degraded::default()
             },
             completeness: None,
+            verdict: None,
             response: None,
         }
     }
@@ -898,6 +921,7 @@ impl Envelope {
             graph_state: GraphState::default(),
             degraded: Degraded::default(),
             completeness: None,
+            verdict: None,
             response: None,
         }
     }
@@ -962,6 +986,7 @@ impl Envelope {
                 ..Degraded::default()
             },
             completeness: None,
+            verdict: None,
             response: None,
         }
     }
@@ -987,6 +1012,7 @@ impl Envelope {
                 ..Degraded::default()
             },
             completeness: None,
+            verdict: None,
             response: None,
         }
     }
@@ -1268,12 +1294,30 @@ pub fn finalize_bounded(
         envelope.completeness = Completeness::for_tool(tool_name, payload, &envelope);
     }
     let negative = match &payload {
-        Some(payload) => crate::negative::negative_for(tool_name, payload, &envelope),
+        Some(payload) => crate::negative::negative_for(
+            tool_name,
+            payload,
+            &envelope,
+            &crate::verdict::Verdict::pre_negative_gaps(payload),
+        ),
         None if result.is_error == Some(true) => first_message_text(&result).and_then(|message| {
             crate::negative::resolution_miss_for(tool_name, message, &envelope)
         }),
         None => None,
     };
+    // The one verdict is computed last, because every block it reads has to
+    // exist first, and then projected back over the blocks that would otherwise
+    // answer the same question differently. Projection only ever downgrades: the
+    // completeness signal is itself an input, so a certified verdict is one it
+    // already agreed with.
+    if let Some(payload) = &payload {
+        if let Some(verdict) =
+            crate::verdict::Verdict::compute(tool_name, payload, &envelope, negative.as_ref())
+        {
+            verdict.project_onto_completeness(&mut envelope.completeness);
+            envelope.verdict = Some(verdict.to_value());
+        }
+    }
     annotate_inner(result, &envelope, negative.as_ref(), tool_name, budget)
 }
 
@@ -1316,6 +1360,15 @@ fn annotate_block(
     };
     let mut annotated = annotated;
     apply_response_budget(&mut annotated, tool_name, budget);
+    // The invariant that keeps the collapse from being undone one block at a
+    // time. It reads what a client will read, after the budget has had its say,
+    // so a block added later cannot reintroduce a second verdict without this
+    // firing in every debug build and every test.
+    debug_assert!(
+        crate::verdict::disagreements(&annotated).is_empty(),
+        "response for {tool_name} contradicts its own verdict: {:?}",
+        crate::verdict::disagreements(&annotated)
+    );
     let rendered =
         serde_json::to_string_pretty(&annotated).unwrap_or_else(|_| annotated.to_string());
     ContentBlock::Text { text: rendered }
@@ -1355,6 +1408,10 @@ fn apply_response_budget(annotated: &mut Value, tool_name: &str, budget: &Respon
         {
             Completeness::mark_response_bounded(completeness);
         }
+        // The verdict and the absence object are downgraded with it. A budget
+        // that removed rows on purpose is the one cut that cannot leave a
+        // response certifying what it no longer carries.
+        crate::verdict::mark_response_bounded(annotated);
     }
 }
 
