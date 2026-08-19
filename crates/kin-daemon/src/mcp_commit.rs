@@ -1130,6 +1130,7 @@ fn plan_exact_transaction(
     let mut layouts = Vec::new();
     let pipeline = kin_index::IndexPipeline::new();
 
+    refuse_overlapping_file_operations(&creations, &retirements, &relocations, &edits)?;
     // Retirements and relocations run before the creations and the edits. A
     // transaction that retires one path and creates another has to see the
     // retirement first, or the create plans against a tree that still carries
@@ -1444,6 +1445,74 @@ fn record_new_source_file(
             "{target} is created more than once in one transaction; overlapping source authority \
              is ambiguous"
         ));
+    }
+    Ok(())
+}
+
+/// Refuse a transaction whose file-level operations act on the same path twice.
+///
+/// The three file-level shapes are planned in a fixed order (retire, relocate,
+/// create), and each one is checked against the base tree when it is recorded,
+/// so an overlap is invisible at record time and only surfaces as whichever
+/// error the second operation happens to hit against a tree the first one
+/// already moved. That error names an internal planning step rather than the
+/// pair of operations the caller wrote. Two operations on one path also have no
+/// unambiguous meaning: retiring and renaming the same file is a question about
+/// intent, not an ordering problem, and answering it by ordering would publish
+/// a guess.
+///
+/// An edit inside a file this transaction retires is the same class. The edit
+/// would be planned against a path the retirement has already taken out, and
+/// there is no reading of "change this function and delete the file it lives
+/// in" that both halves survive.
+fn refuse_overlapping_file_operations(
+    creations: &BTreeMap<String, (FilePathId, Vec<u8>)>,
+    retirements: &BTreeMap<String, FilePathId>,
+    relocations: &BTreeMap<String, (FilePathId, FilePathId)>,
+    edits: &BTreeMap<String, (FilePathId, Vec<(Entity, Vec<u8>)>)>,
+) -> Result<(), String> {
+    for path in retirements.keys() {
+        if relocations.contains_key(path) {
+            return Err(format!(
+                "{path} is both retired and renamed in one transaction; a file either leaves the \
+                 repository or moves within it, and which one was meant cannot be inferred"
+            ));
+        }
+        if creations.contains_key(path) {
+            return Err(format!(
+                "{path} is both retired and created in one transaction; retire it in one change \
+                 and admit the new file in the next, so each is reviewable on its own"
+            ));
+        }
+        if edits.contains_key(path) {
+            return Err(format!(
+                "{path} is retired and also carries an entity edit in one transaction; the edit \
+                 would be planned against a path this transaction has already taken out"
+            ));
+        }
+    }
+    let mut destinations = BTreeSet::new();
+    for (from, (_, to)) in relocations {
+        if !destinations.insert(to.0.clone()) {
+            return Err(format!(
+                "two files are renamed onto {} in one transaction; a destination holds one file",
+                to.0
+            ));
+        }
+        if creations.contains_key(&to.0) {
+            return Err(format!(
+                "{} is both a rename destination (from {from}) and a created path in one \
+                 transaction; a rename may not overwrite a file",
+                to.0
+            ));
+        }
+        if relocations.contains_key(&to.0) {
+            return Err(format!(
+                "{} is renamed away and is also the destination of {from} in one transaction; \
+                 chained renames are ambiguous, so stage them as separate transactions",
+                to.0
+            ));
+        }
     }
     Ok(())
 }
@@ -3302,6 +3371,97 @@ mod tests {
             .tree
             .artifact_at_path(&test_path("src/lib.rs"))
             .is_some());
+    }
+
+    /// Two file-level operations on one path are refused by name, before
+    /// anything is planned.
+    ///
+    /// The three shapes are planned in a fixed order and each is checked
+    /// against the base tree when it is recorded, so an overlap is invisible
+    /// until the second operation meets a tree the first one already moved.
+    /// What comes back then names an internal planning step, not the pair the
+    /// caller wrote. Two operations on one path also have no unambiguous
+    /// meaning, so ordering them would publish a guess.
+    #[test]
+    fn overlapping_file_level_operations_on_one_path_are_refused_by_name() {
+        let (_dir, state) = test_state();
+        install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        install_exact_source(
+            &state,
+            "src/other.rs",
+            b"pub fn other() -> u8 { 2 }\n",
+            "other",
+        );
+        let sessions = test_sessions();
+
+        let commit_with = |operations: Vec<kin_mcp::McpMutationOperation>| {
+            let transaction = sessions
+                .begin_transaction(TEST_SESSION, "file:src/lib.rs")
+                .unwrap();
+            sessions
+                .stage_transaction(&transaction.transaction_id, operations)
+                .unwrap();
+            commit_exact_transaction(
+                &state,
+                &sessions,
+                &HashMap::from([(
+                    "transaction_id".to_string(),
+                    serde_json::json!(transaction.transaction_id),
+                )]),
+                None,
+            )
+        };
+
+        let both = commit_with(vec![
+            retired_source_file("src/lib.rs"),
+            renamed_source_file("src/lib.rs", "src/moved.rs"),
+        ]);
+        assert_eq!(both.is_error, Some(true));
+        assert!(
+            result_text(&both).contains("is both retired and renamed in one transaction"),
+            "{}",
+            result_text(&both)
+        );
+
+        let collide = commit_with(vec![
+            renamed_source_file("src/lib.rs", "src/dest.rs"),
+            renamed_source_file("src/other.rs", "src/dest.rs"),
+        ]);
+        assert_eq!(collide.is_error, Some(true));
+        assert!(
+            result_text(&collide).contains("two files are renamed onto src/dest.rs"),
+            "{}",
+            result_text(&collide)
+        );
+
+        // The control: the same two renames onto distinct destinations are not
+        // an overlap, so this refusal is about collisions rather than about
+        // refusing every multi-operation transaction.
+        let fine = commit_with(vec![
+            renamed_source_file("src/lib.rs", "src/one.rs"),
+            renamed_source_file("src/other.rs", "src/two.rs"),
+        ]);
+        assert_ne!(fine.is_error, Some(true), "{}", result_text(&fine));
+
+        // Neither end of the refused pairs moved.
+        let after = load_native_commit_base(&state.layout).unwrap();
+        assert!(after
+            .tree
+            .artifact_at_path(&test_path("src/one.rs"))
+            .is_some());
+        assert!(after
+            .tree
+            .artifact_at_path(&test_path("src/two.rs"))
+            .is_some());
+        assert!(after
+            .tree
+            .artifact_at_path(&test_path("src/dest.rs"))
+            .is_none());
     }
 
     /// A rename moves the file and everything keeps its identity.
