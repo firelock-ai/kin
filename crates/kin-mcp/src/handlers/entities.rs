@@ -5026,12 +5026,14 @@ mod tests {
     /// whether any site could be located at all.
     ///
     /// FIR-2357 item 3: an empty `reference_lines` on a row that DID come back
-    /// is the quiet-partial failure in miniature. No production ingest path
-    /// populates `RelationEvidence::source_span` today (measured and asserted at
-    /// zero by `kin-index`'s `relation_evidence_span_coverage`), so this is what
-    /// every real answer looks like, and saying so is the difference between a
-    /// caller that knows the sites are unavailable and one that reads `[]` as
-    /// "no sites".
+    /// is the quiet-partial failure in miniature. This was once what EVERY real
+    /// answer looked like, because no ingest path populated
+    /// `RelationEvidence::source_span`. The Python and JavaScript adapters now
+    /// record their call sites (FIR-1825, measured per language by `kin-index`'s
+    /// `relation_evidence_span_coverage`), so this is now the shape of a row
+    /// from a language whose adapter does not, and saying so is still the
+    /// difference between a caller that knows the sites are unavailable and one
+    /// that reads `[]` as "no sites".
     #[tokio::test]
     async fn find_references_says_why_a_row_carries_no_site_lines() {
         let store = InMemoryGraph::new();

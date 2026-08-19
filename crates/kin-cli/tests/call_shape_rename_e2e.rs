@@ -919,6 +919,24 @@ fn e2e_shadow_gate_var_keyword_caller_rename_would_block() {
     );
 }
 
+/// The call shapes an evidence set carries, as an order-independent multiset.
+///
+/// Evidence became position-bearing when the adapters started recording call
+/// sites (FIR-1825), so two source files that differ only in the ORDER of their
+/// calls no longer produce byte-identical evidence: the calls genuinely sit at
+/// different offsets, and a reference row reports those offsets as its site
+/// lines. What must still not depend on source order is the thing the merge
+/// gate reads, which is the set of shapes reaching the callee and how many
+/// occurrences each has. That is what this compares.
+fn shape_multiset(evidence: &[kin_model::RelationEvidence]) -> Vec<String> {
+    let mut shapes: Vec<String> = evidence
+        .iter()
+        .map(|record| format!("{:?}x{}", record.call_shape, record.occurrence_count))
+        .collect();
+    shapes.sort();
+    shapes
+}
+
 #[test]
 fn e2e_same_caller_keyword_shape_blocks_independent_of_source_order() {
     let old = "def target(ext, args)";
@@ -931,10 +949,18 @@ fn e2e_same_caller_keyword_shape_blocks_independent_of_source_order() {
     assert_eq!(forward_verdict, ShadowGateVerdict::WouldBlock);
     assert_eq!(reverse_verdict, ShadowGateVerdict::WouldBlock);
     assert_eq!(
-        forward_evidence, reverse_evidence,
-        "logical call evidence must be byte-stable across source-order reversal"
+        shape_multiset(&forward_evidence),
+        shape_multiset(&reverse_evidence),
+        "the shapes reaching the callee must not depend on source order"
     );
     assert_eq!(forward_evidence.len(), 2, "both distinct shapes survive");
+    assert!(
+        forward_evidence
+            .iter()
+            .all(|record| record.source_span.is_some()),
+        "Python records its call sites, so each occurrence names one: \
+         {forward_evidence:?}"
+    );
     assert!(forward_evidence.iter().any(|evidence| {
         evidence
             .call_shape
@@ -960,8 +986,9 @@ fn e2e_same_caller_var_keyword_shape_blocks_independent_of_source_order() {
     assert_eq!(forward_verdict, ShadowGateVerdict::WouldBlock);
     assert_eq!(reverse_verdict, ShadowGateVerdict::WouldBlock);
     assert_eq!(
-        forward_evidence, reverse_evidence,
-        "`**kwargs` evidence must not depend on which call appears first"
+        shape_multiset(&forward_evidence),
+        shape_multiset(&reverse_evidence),
+        "`**kwargs` shapes must not depend on which call appears first"
     );
     assert_eq!(forward_evidence.len(), 2, "both distinct shapes survive");
     assert!(forward_evidence.iter().any(|evidence| {
@@ -984,13 +1011,18 @@ fn e2e_same_caller_all_positional_shapes_remain_neutral_and_deterministic() {
     assert_eq!(forward_verdict, ShadowGateVerdict::NeedsAttention);
     assert_eq!(reverse_verdict, ShadowGateVerdict::NeedsAttention);
     assert_eq!(
-        forward_evidence, reverse_evidence,
-        "all-positional evidence must sort and deduplicate deterministically"
+        shape_multiset(&forward_evidence),
+        shape_multiset(&reverse_evidence),
+        "all-positional shapes must sort deterministically and ignore source order"
     );
+    // One record per call site, because each site is a distinct position now
+    // that the adapter records one. Two calls of the same shape used to collapse
+    // into a single record with `occurrence_count: 2`; collapsing them now would
+    // cost a reference row one of its two site lines.
     assert_eq!(
         forward_evidence.len(),
-        3,
-        "four calls collapse to three distinct shapes"
+        4,
+        "four calls are four sites: {forward_evidence:?}"
     );
     assert_eq!(
         forward_evidence
@@ -999,6 +1031,16 @@ fn e2e_same_caller_all_positional_shapes_remain_neutral_and_deterministic() {
             .sum::<u32>(),
         4,
         "occurrence counts retain every call site"
+    );
+    assert_eq!(
+        forward_evidence
+            .iter()
+            .filter_map(|record| record.source_span.as_ref())
+            .map(|span| span.start_byte)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        4,
+        "four sites must be four distinct positions: {forward_evidence:?}"
     );
     assert!(forward_evidence.iter().all(|evidence| {
         evidence.parser_rule.as_deref() == Some(CALL_SHAPE_EVIDENCE_AGGREGATION_V1)
@@ -1015,13 +1057,17 @@ fn e2e_same_caller_all_positional_shapes_remain_neutral_and_deterministic() {
             .as_ref()
             .is_some_and(|shape| shape.has_var_positional)
     }));
-    assert!(forward_evidence.iter().any(|evidence| {
-        evidence.occurrence_count == 2
-            && evidence
+    assert_eq!(
+        forward_evidence
+            .iter()
+            .filter(|evidence| evidence
                 .call_shape
                 .as_ref()
-                .is_some_and(|shape| shape.positional == 2 && !shape.has_var_positional)
-    }));
+                .is_some_and(|shape| shape.positional == 2 && !shape.has_var_positional))
+            .count(),
+        2,
+        "the repeated two-positional call keeps both of its sites"
+    );
 }
 
 #[test]
