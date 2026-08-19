@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Name the context pack's two directions and disclose small-corpus ranking (#960)
 - Cut CI wall clock: build Windows legs once, shard the macOS gate, route release-policy failures (#964)
 - Cut the release build's dead cache and its 40-minute Intel leg, and probe a candidate's first install (#961)
+- chore(ci): pin kin-actions v0.1.33 (#968)
+- Collapse a retrieval response's three verdict blocks into one (#966)
 
 
 ## [0.5.42] - 2026-08-19
