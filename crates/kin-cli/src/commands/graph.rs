@@ -337,6 +337,24 @@ fn graph_relation_totals(
     }
 }
 
+/// The one line that answers "how much of this repository can I query".
+///
+/// Pure so both arms are testable without a store. A repository with nothing
+/// admitted has no fraction to state and says so rather than printing a ratio
+/// over zero, which is the shape this line exists to stop producing.
+fn repository_coverage_line(files_with_entities: usize, admitted: usize) -> String {
+    if admitted == 0 {
+        return "Repository coverage: no files admitted yet, so there is no coverage fraction to \
+                report"
+            .to_string();
+    }
+    format!(
+        "Repository coverage: {files_with_entities} of {admitted} admitted files produced \
+         entities ({:.0}%)",
+        (files_with_entities as f64 / admitted as f64) * 100.0
+    )
+}
+
 fn build_graph_status_response(
     authority: &super::repository_authority::RequestRepositoryAuthority,
     graph: &kin_db::InMemoryGraph,
@@ -482,22 +500,16 @@ fn build_graph_status_response(
         .repository_artifact_coverage
         .enrichable_artifact_count;
     let supported = health.supported_entity_source_file_count;
-    if admitted > 0 {
+    lines.push(repository_coverage_line(unique_files.len(), admitted));
+    // Why the other counters differ, as arithmetic rather than an inference left
+    // to the reader. `Supported inputs` is an upper bound on coverage and was
+    // read as a contradiction of it.
+    if admitted > 0 && supported >= unique_files.len() {
         lines.push(format!(
-            "Repository coverage: {} of {admitted} admitted files produced entities ({:.0}%)",
-            unique_files.len(),
-            (unique_files.len() as f64 / admitted as f64) * 100.0
+            "  of the {admitted} admitted, {supported} carry a full language adapter; {} of \
+             those produced no entity",
+            supported - unique_files.len()
         ));
-        // Why the other counters differ, as arithmetic rather than an inference
-        // left to the reader. `Supported inputs` is an upper bound on coverage
-        // and was read as a contradiction of it.
-        if supported >= unique_files.len() {
-            lines.push(format!(
-                "  of the {admitted} admitted, {supported} carry a full language adapter; \
-                 {} of those produced no entity",
-                supported - unique_files.len()
-            ));
-        }
     }
     lines.push(format!(
         "Entity-to-entity rels/entity: {:.2}",
@@ -2399,6 +2411,73 @@ mod tests {
                 .any(|line| line.contains("no relations in graph")),
             "{:?}",
             response.lines
+        );
+    }
+
+    /// One line states how much of the repository can be queried, and the
+    /// counters that are not that answer say what they count instead.
+    ///
+    /// Four counters on this screen bore on repository coverage and none was
+    /// labelled the answer. A stranger reading `Files: 66` beside `Supported
+    /// inputs: 141` beside `213 admitted regular files` concluded, correctly,
+    /// that the output could not say what fraction of the repository it covered.
+    #[test]
+    fn graph_status_states_repository_coverage_once_and_labels_it() {
+        let (_temp, binding, graph) = graph_validation_fixture();
+        let entity = test_entity("run_task");
+        graph.upsert_entity(&entity).unwrap();
+
+        let response = build_graph_status_response(
+            &pinned(&binding),
+            &graph,
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
+
+        let coverage: Vec<&String> = response
+            .lines
+            .iter()
+            .filter(|line| line.starts_with("Repository coverage:"))
+            .collect();
+        assert_eq!(
+            coverage.len(),
+            1,
+            "exactly one line answers the coverage question: {:?}",
+            response.lines
+        );
+        assert!(
+            coverage[0].starts_with("Repository coverage:"),
+            "the answer must be labelled: {}",
+            coverage[0]
+        );
+
+        // The counter that read as a contradiction of it now says it measures
+        // something else.
+        let supported = response
+            .lines
+            .iter()
+            .find(|line| line.starts_with("Supported inputs:"))
+            .unwrap_or_else(|| panic!("supported inputs line: {:?}", response.lines));
+        assert!(
+            supported.contains("upper bound on coverage"),
+            "the upper bound must not read as a second coverage answer: {supported}"
+        );
+    }
+
+    /// Both arms of the coverage line, stated without a store.
+    #[test]
+    fn repository_coverage_names_the_fraction_or_says_there_is_none() {
+        assert_eq!(
+            repository_coverage_line(66, 213),
+            "Repository coverage: 66 of 213 admitted files produced entities (31%)"
+        );
+        // The express numbers the stranger read. A fresh store has no fraction
+        // to state, and printing a ratio over zero is the shape being removed.
+        assert_eq!(
+            repository_coverage_line(0, 0),
+            "Repository coverage: no files admitted yet, so there is no coverage fraction to \
+             report"
         );
     }
 

@@ -3327,11 +3327,10 @@ pub fn daemon_startup_patience(recorded: Option<Duration>, override_secs: Option
                 .saturating_mul(u64::from(DAEMON_STARTUP_PATIENCE_MULTIPLE))
         })
         .unwrap_or(0);
-    Duration::from_secs(
-        scaled
-            .max(DAEMON_STARTUP_PATIENCE_DEFAULT_SECS)
-            .min(DAEMON_STARTUP_PATIENCE_MAX_SECS),
-    )
+    Duration::from_secs(scaled.clamp(
+        DAEMON_STARTUP_PATIENCE_DEFAULT_SECS,
+        DAEMON_STARTUP_PATIENCE_MAX_SECS,
+    ))
 }
 
 /// Read the operator's patience override, ignoring a value that is not a number.
