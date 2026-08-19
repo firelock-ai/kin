@@ -1282,6 +1282,22 @@ pub struct DaemonState {
     /// Channel for LSP enrichment messages (incremental or sweep).
     /// None if LSP enrichment is disabled (no servers found).
     pub lsp_enrichment_tx: Option<tokio::sync::mpsc::Sender<LspEnrichmentMessage>>,
+    /// How far the running cold sweep has got, and how many have finished.
+    ///
+    /// A sweep is asynchronous and takes minutes on a real repository, and until
+    /// this existed nothing could tell a converged graph from one still being
+    /// enriched: `POST /lsp/sweep` answered `sweep_queued` and never spoke
+    /// again. A caller that must not query a half-enriched graph, which is every
+    /// conversion, had no signal to wait on. These are the signal.
+    pub lsp_sweep_files_done: AtomicU64,
+    pub lsp_sweep_files_total: AtomicU64,
+    /// Incremented when a sweep finishes, so a waiter can tell "the sweep I
+    /// asked for has completed" from "a sweep is not running yet". A bare
+    /// running/idle flag cannot: a waiter that polls before the worker picks the
+    /// message up reads idle and concludes it is done.
+    pub lsp_sweeps_completed: AtomicU64,
+    /// Set while a sweep is in flight.
+    pub lsp_sweep_running: AtomicBool,
     /// Repo ID resolved once at construction. Cached to avoid re-reading
     /// `.kin/manifest.json` on every snapshot save — under high host
     /// concurrency those reads contend and surface as opaque "Core error"
@@ -2355,6 +2371,10 @@ impl DaemonState {
             idle_timeout_ms: AtomicU64::new(0),
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
+            lsp_sweep_files_done: AtomicU64::new(0),
+            lsp_sweep_files_total: AtomicU64::new(0),
+            lsp_sweeps_completed: AtomicU64::new(0),
+            lsp_sweep_running: AtomicBool::new(false),
             cached_repo_id,
             cached_workspace_id: Some(workspace_id),
             is_shutdown: AtomicBool::new(false),
@@ -2578,6 +2598,10 @@ impl DaemonState {
             idle_timeout_ms: AtomicU64::new(0),
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
+            lsp_sweep_files_done: AtomicU64::new(0),
+            lsp_sweep_files_total: AtomicU64::new(0),
+            lsp_sweeps_completed: AtomicU64::new(0),
+            lsp_sweep_running: AtomicBool::new(false),
             cached_repo_id: repo_id.to_string(),
             cached_workspace_id: None,
             is_shutdown: AtomicBool::new(false),

@@ -468,8 +468,8 @@ fn javascript_no_longer_reports_the_unsupported_state_it_shipped_with() {
 /// `get_adapter` is declared `-> BaseAdapter` (sessions.py:870) and
 /// `Response.connection` is declared `HTTPAdapter` (models.py:750).
 #[tokio::test(flavor = "multi_thread")]
-async fn diagnostic_what_pyright_answers_for_the_requests_dispatch_shapes() {
-    const TEST: &str = "diagnostic_what_pyright_answers_for_the_requests_dispatch_shapes";
+async fn pyright_resolves_the_one_hop_to_the_base_and_the_two_hop_to_the_override() {
+    const TEST: &str = "pyright_resolves_the_one_hop_to_the_base_and_the_two_hop_to_the_override";
     let Some((command, args)) = server_command_or_skip(LanguageId::Python, TEST) else {
         return;
     };
@@ -540,18 +540,22 @@ async fn diagnostic_what_pyright_answers_for_the_requests_dispatch_shapes() {
     )
     .await;
 
-    for (label, file, line, col) in [
+    // `adapters.py` line 1 is `BaseAdapter.send`; line 6 is `HTTPAdapter.send`.
+    // The two cases must answer DIFFERENTLY, and that difference is the finding.
+    for (label, file, line, col, want_line) in [
         (
-            "Session.send (one-hop, get_adapter -> BaseAdapter)",
+            "Session.send (one-hop through get_adapter -> BaseAdapter)",
             "sessions.py",
             10u32,
             8u32,
+            1u64,
         ),
         (
-            "HTTPDigestAuth.handle_401 (two-hop, r.connection)",
+            "HTTPDigestAuth.handle_401 (two-hop through r.connection: HTTPAdapter)",
             "auth.py",
             4,
             8,
+            6u64,
         ),
     ] {
         let uri = kin_lsp::protocol::path_to_uri(&root.join(file));
@@ -578,26 +582,23 @@ async fn diagnostic_what_pyright_answers_for_the_requests_dispatch_shapes() {
                 serde_json::json!({"item": item}),
             )
             .await;
-        match out {
-            Ok(value) => match value.as_array() {
-                Some(calls) if !calls.is_empty() => {
-                    for call in calls {
-                        let to = &call["to"];
-                        let file = to["uri"]
-                            .as_str()
-                            .unwrap_or("")
-                            .rsplit('/')
-                            .next()
-                            .unwrap_or("");
-                        eprintln!(
-                            "{label}: TARGET {} in {} at line {}",
-                            to["name"], file, to["selectionRange"]["start"]["line"]
-                        );
-                    }
-                }
-                _ => eprintln!("{label}: pyright answered NO outgoing calls"),
-            },
-            Err(e) => eprintln!("{label}: outgoingCalls errored: {e}"),
-        }
+        let calls = match out {
+            Ok(value) => value.as_array().cloned().unwrap_or_default(),
+            Err(error) => panic!("{label}: outgoingCalls errored: {error}"),
+        };
+        let sends: Vec<u64> = calls
+            .iter()
+            .map(|call| &call["to"])
+            .filter(|to| to["name"] == "send")
+            .filter(|to| to["uri"].as_str().unwrap_or("").ends_with("/adapters.py"))
+            .filter_map(|to| to["selectionRange"]["start"]["line"].as_u64())
+            .collect();
+        assert!(
+            sends.contains(&want_line),
+            "{label}: pyright must resolve the `.send` call to adapters.py line {want_line}; it \
+             answered {sends:?}. Line 1 is BaseAdapter.send and line 6 is HTTPAdapter.send, and \
+             which one comes back decides whether the reference surface must compose over an \
+             Overrides edge or can count the caller directly."
+        );
     }
 }

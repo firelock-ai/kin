@@ -112,7 +112,7 @@ struct UncommittedPathPayload {
     state: &'static str,
 }
 
-pub async fn run(path: Option<String>, json: bool) -> Result<()> {
+pub async fn run(path: Option<String>, json: bool, no_enrich: bool) -> Result<()> {
     let _span = tracing::info_span!("kin.init").entered();
     let dir = path
         .map(PathBuf::from)
@@ -158,12 +158,130 @@ pub async fn run(path: Option<String>, json: bool) -> Result<()> {
         );
     }
 
+    // Conversion is not finished when the graph exists. Cross-file reference,
+    // override and type-use edges are not derivable from a single-file parse:
+    // they need a resolved program from a language server, and until this ran
+    // here nothing ever asked for one. The sweep had exactly one caller,
+    // `POST /lsp/sweep`, which nothing in the product called, so every converted
+    // repository answered cross-file questions by matching bare names.
+    //
+    // Runs before the result is printed so what a reader is told about their
+    // repository is true of the repository they now have.
+    if !no_enrich {
+        enrich_after_init(result.layout.working_dir()).await;
+    }
+
     if json {
         print_json_result(&result, boundary, enrichment)?;
     } else {
         print_human_result(&result, boundary, &enrichment)?;
     }
     Ok(())
+}
+
+/// How long the conversion phase will wait for the sweep before handing the
+/// repository over anyway.
+///
+/// Bounded because a language server can hang and a conversion that never
+/// returns is worse than one that finishes thin: the sweep is resumable, so
+/// what this budget cuts short the next daemon start continues. Generous
+/// because the alternative failure is worse, an enrichment abandoned at 80% on
+/// a large repository every single time.
+const ENRICH_BUDGET: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// Run the language-server sweep as a phase of conversion, with progress.
+///
+/// Every failure here is reported and swallowed. A repository whose graph is
+/// built is a usable repository, and refusing the whole `kin init` because a
+/// language server was missing, slow, or broken would turn an enrichment
+/// shortfall into a conversion failure. The shortfall is visible afterwards:
+/// `kin doctor` reports the enrichment gap and names the command that closes it.
+async fn enrich_after_init(working_dir: &Path) {
+    let url = match crate::daemon_client::ensure_daemon_running(working_dir).await {
+        Ok(url) => url,
+        Err(error) => {
+            eprintln!(
+                "note: cross-file reference enrichment was skipped because no daemon could be \
+                 started ({error}); run `kin doctor` to see what is missing"
+            );
+            return;
+        }
+    };
+    let client = match crate::daemon_client::DaemonClient::from_base_url(url) {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!("note: cross-file reference enrichment was skipped: {error:#}");
+            return;
+        }
+    };
+
+    let queued = match client.queue_lsp_sweep().await {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("note: cross-file reference enrichment could not be started: {error:#}");
+            return;
+        }
+    };
+    // A daemon with no language server never sweeps. Saying so, with the
+    // command that fixes it, beats waiting fifteen minutes for an event that
+    // cannot happen.
+    if queued.get("enrichment_available").and_then(|v| v.as_bool()) == Some(false) {
+        eprintln!(
+            "note: no language server is installed, so cross-file reference and override edges \
+             were not produced. Run `kin doctor --fix --install-language-servers` to install one, \
+             then `kin daemon stop`; the next command re-enriches this repository."
+        );
+        return;
+    }
+    let baseline = queued
+        .get("sweeps_completed")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    println!("Enriching cross-file references (language server)...");
+    let deadline = std::time::Instant::now() + ENRICH_BUDGET;
+    let mut last_reported = 0u64;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let status = match client.lsp_sweep_status().await {
+            Ok(status) => status,
+            Err(error) => {
+                eprintln!("note: enrichment progress could not be read: {error:#}");
+                return;
+            }
+        };
+        let done = status
+            .get("files_done")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let total = status
+            .get("files_total")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        // Progress is printed per file rather than at the end, because a
+        // conversion that prints nothing for minutes reads as hung and gets
+        // interrupted, which is how the work a user asked for gets thrown away.
+        if done > last_reported {
+            last_reported = done;
+            println!("  enriched {done}/{total} files");
+        }
+        let completed = status
+            .get("sweeps_completed")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if completed > baseline {
+            println!("  cross-file enrichment complete ({done}/{total} files)");
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            eprintln!(
+                "note: cross-file enrichment did not finish within {}s and was left running; it \
+                 resumes from where it stopped on the next daemon start",
+                ENRICH_BUDGET.as_secs()
+            );
+            return;
+        }
+    }
 }
 
 fn ensure_directory(dir: &Path) -> Result<()> {
@@ -1255,7 +1373,10 @@ mod tests {
         let _kin_home_var = kin_core::test_env::EnvVarGuard::set("KIN_HOME", &kin_home);
         let _registry = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path);
 
-        run(Some(repo.to_str().unwrap().to_string()), false)
+        // Enrichment off: this case is about the conversion transaction, and
+        // starting a daemon to query a language server would make it depend on
+        // what the host has installed.
+        run(Some(repo.to_str().unwrap().to_string()), false, true)
             .await
             .expect("kin init must succeed under a scratch registry");
 

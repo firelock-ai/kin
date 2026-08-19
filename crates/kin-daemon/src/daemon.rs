@@ -2662,7 +2662,13 @@ pub async fn run_with_authority_on(
                     } // end Incremental
 
                     LspEnrichmentMessage::Sweep => {
-                        info!("LSP cold sweep started — enriching all entities");
+                        info!("LSP cold sweep started, enriching all entities");
+                        lsp_state
+                            .lsp_sweep_running
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                        lsp_state
+                            .lsp_sweep_files_done
+                            .store(0, std::sync::atomic::Ordering::SeqCst);
 
                         // Get all entities from the graph.
                         use kin_model::EntityStore;
@@ -2683,6 +2689,9 @@ pub async fn run_with_authority_on(
                         }
 
                         let total_files = by_file.len();
+                        lsp_state
+                            .lsp_sweep_files_total
+                            .store(total_files as u64, std::sync::atomic::Ordering::SeqCst);
                         let mut files_processed = 0usize;
                         let mut total_relations = 0usize;
 
@@ -2874,6 +2883,9 @@ pub async fn run_with_authority_on(
                                 .await;
 
                             files_processed += 1;
+                            lsp_state
+                                .lsp_sweep_files_done
+                                .store(files_processed as u64, std::sync::atomic::Ordering::SeqCst);
                             total_relations += file_relations;
                             // Credited per file rather than once at the end. A
                             // cold sweep walks the whole graph, and a pass that
@@ -2910,6 +2922,19 @@ pub async fn run_with_authority_on(
                         if total_relations > 0 {
                             lsp_state.mark_dirty();
                         }
+                        // Marked complete even when the loop broke early on
+                        // shutdown or a supervisor halt. A waiter blocked on a
+                        // counter that only advances on a clean finish would
+                        // wait out its whole budget on a sweep that already
+                        // stopped, and report a timeout for a pass that ended
+                        // seconds in. What was enriched is durable either way,
+                        // and the next sweep resumes from it.
+                        lsp_state
+                            .lsp_sweep_running
+                            .store(false, std::sync::atomic::Ordering::SeqCst);
+                        lsp_state
+                            .lsp_sweeps_completed
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         info!(
                             files = files_processed,
                             total_files,
