@@ -611,7 +611,7 @@ mod tests {
                     "match_evidence": {
                         "ranker": "fused-v1",
                         "signals": ["vector", "lexical", "graph"],
-                        "matched_variants": ["a", "b", "c"],
+                        "matched_variant_indexes": [0, 1, 2],
                     },
                     "provenance": { "file": format!("src/f{index}.rs") },
                 })

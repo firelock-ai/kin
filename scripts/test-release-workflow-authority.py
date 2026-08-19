@@ -3865,6 +3865,44 @@ def assert_assertion_reachability_gate_wired(workflow: str) -> None:
         )
 
 
+def assert_kin_vfs_mount_features_built(release: str) -> None:
+    """Keep the shipped kin-vfs able to serve a mounted projection.
+
+    Kin has four projections and only one of them, the injected shim, needs no
+    feature flag. The published `kin-vfs` is built by this workflow from a
+    pinned checkout, and with no `--features` it carries neither `nfs-start` nor
+    `mount`, so every mount reports itself unavailable on every machine that
+    installs Kin. That is invisible from the release side: the archive shape
+    check greps for a file named `kin-vfs` and finds one either way, and nothing
+    else reads what the binary can do.
+
+    macOS builds `nfs` because it carries an NFS client in the base system, and
+    Linux builds `fuse` because it carries libfuse far more widely than a
+    configured NFS client. Both are asserted, because losing either one silently
+    removes a platform's mount without removing anything a reader would notice.
+    """
+
+    release_lines = {line.strip() for line in release.splitlines()}
+    if (
+        'cargo build --locked --release --target "$VFS_TARGET" -p kin-vfs-cli --features nfs'
+        not in release_lines
+    ):
+        raise AssertionError(
+            "release.yml must build the macOS kin-vfs CLI with --features nfs; "
+            "without it the shipped driver carries no nfs-start and every NFS "
+            "mount reports itself unavailable on every install"
+        )
+    if (
+        'cargo zigbuild --locked --release --target "${VFS_TARGET}.${floor}" -p kin-vfs-cli --features fuse'
+        not in release_lines
+    ):
+        raise AssertionError(
+            "release.yml must build the Linux kin-vfs CLI with --features fuse; "
+            "without it the shipped driver carries no mount subcommand and every "
+            "FUSE mount reports itself unavailable on every install"
+        )
+
+
 def assert_glibc_floor_guard_wired(ci: str, release: str) -> None:
     """Keep the floor that decides which Linux distributions can start Kin.
 
@@ -10921,6 +10959,27 @@ def main() -> None:
             )
     assert_kin_vfs_compat_gate_wired(ci_workflow)
     assert_glibc_floor_guard_wired(ci_workflow, release)
+    assert_kin_vfs_mount_features_built(release)
+    expect_assertion(
+        "macOS kin-vfs built without the nfs feature",
+        "--features nfs",
+        lambda: assert_kin_vfs_mount_features_built(
+            release.replace(
+                '-p kin-vfs-cli --features nfs',
+                '-p kin-vfs-cli',
+            )
+        ),
+    )
+    expect_assertion(
+        "Linux kin-vfs built without the fuse feature",
+        "--features fuse",
+        lambda: assert_kin_vfs_mount_features_built(
+            release.replace(
+                '-p kin-vfs-cli --features fuse',
+                '-p kin-vfs-cli',
+            )
+        ),
+    )
     expect_assertion(
         "release.yml stops reading the glibc floor off the packaged binaries",
         "release.yml must run",

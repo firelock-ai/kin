@@ -1141,6 +1141,20 @@ fn resolve_one_file(
                 // Python identifier has none, so no method here is a dispatch
                 // target for it.
                 drop_method_candidates(candidates, &ctx.entity_kind_by_id)
+            } else if is_rust_bare_identifier_call(rel, src_id, &ctx.entity_language_by_id)
+                && !rust_bare_call_may_reach_owned(
+                    rel.dst_name.as_str(),
+                    file,
+                    ctx.import_map.get(file.file_path.as_str()),
+                )
+            {
+                debug!(
+                    src = %rel.src_name,
+                    dst = %rel.dst_name,
+                    file = %file.file_path,
+                    "linker: bare Rust call cannot reach an owner-qualified entity this file does not import, leaving unlinked"
+                );
+                Vec::new()
             } else {
                 candidates
             };
@@ -2861,6 +2875,49 @@ fn is_unbound_python_builtin_call(
         && !defined_in_file
         && !file_imports.is_some_and(|imports| imports.contains_key(rel.dst_name.as_str()))
         && imports_are_name_complete(&file.imports)
+}
+
+/// Whether this relation is a Rust call written as a plain `name(..)`.
+///
+/// The Rust adapter records a dispatch through an object with its receiver as
+/// written, and folds `self.m()` / `Self::m()` into the `Owner::m` key the
+/// method entity is stored under. So a Rust call arriving with neither a
+/// receiver nor a path is the one shape that genuinely has no receiver.
+fn is_rust_bare_identifier_call(
+    rel: &ExtractedRelation,
+    src_id: EntityId,
+    languages: &HashMap<EntityId, LanguageId>,
+) -> bool {
+    rel.kind == RelationKind::Calls
+        && rel.receiver.is_none()
+        && !rel.dst_name.contains('.')
+        && !rel.dst_name.contains("::")
+        && languages.get(&src_id) == Some(&LanguageId::Rust)
+}
+
+/// Whether a bare Rust call may reach the owner-qualified entities the
+/// bare-name index holds.
+///
+/// Every entry in that index is stored under an owner (`Type::method`,
+/// `Enum::Variant`), and Rust reaches none of those from a plain `name(..)`.
+/// An inherent or trait method needs a receiver or a `Type::` path, and a
+/// variant or associated item needs the `use` that binds its short name here.
+/// That is how `Ok(self.width())` acquired a `Calls` edge to a repository
+/// `ParseResult::Ok` in a module the caller never names: `Ok` is
+/// `core::result::Result::Ok`, and the one entity in the graph spelling the
+/// same leaf captured the call, carrying a `trace_data_flow` subtree with it.
+///
+/// A `use` of that exact name is the binding Rust does allow, and it wins. A
+/// glob import binds names this parse cannot see, so a file carrying one has no
+/// answer to "does this file bind that name" and the gate stands down rather
+/// than guessing, exactly as the Python builtin gate does for `import *`.
+fn rust_bare_call_may_reach_owned(
+    dst_name: &str,
+    file: &FileParseData,
+    file_imports: Option<&HashMap<&str, (&str, &str)>>,
+) -> bool {
+    !imports_are_name_complete(&file.imports)
+        || file_imports.is_some_and(|imports| imports.contains_key(dst_name))
 }
 
 /// Drop the method candidates a bare Python call can never dispatch to.
@@ -5150,6 +5207,20 @@ fn resolve_one_file_incremental(
                     // A bare Python identifier carries no receiver, and this
                     // tier resolves calls that have one.
                     drop_method_candidates(candidates, &linker.entity_kind_by_id)
+                } else if is_rust_bare_identifier_call(rel, src_id, &linker.entity_language_by_id)
+                    && !rust_bare_call_may_reach_owned(
+                        rel.dst_name.as_str(),
+                        file,
+                        import_map.get(file.file_path.as_str()),
+                    )
+                {
+                    debug!(
+                        src = %rel.src_name,
+                        dst = %rel.dst_name,
+                        file = %file.file_path,
+                        "linker: bare Rust call cannot reach an owner-qualified entity this file does not import, leaving unlinked"
+                    );
+                    Vec::new()
                 } else {
                     candidates
                 };
@@ -6253,10 +6324,19 @@ mod tests {
             }
             vec![
                 FileParseData {
+                    // Load-bearing: a bare Rust call reaches the bare-name tier
+                    // only from a file whose import list cannot answer whether it
+                    // binds that name. With no imports at all the list is
+                    // name-complete, and the bare `make` is refused before it can
+                    // merge with the qualified one, which is the FIR-1581 gate
+                    // doing its job rather than this test's subject.
                     file_path: "src/caller.rs".to_string(),
                     entities: vec![caller.clone()],
                     relations,
-                    imports: vec![],
+                    imports: vec![FileImport {
+                        module_path: "crate::model".to_string(),
+                        specifiers: vec![],
+                    }],
                 },
                 FileParseData {
                     file_path: "src/model.rs".to_string(),

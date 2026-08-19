@@ -399,6 +399,7 @@ pub fn is_trace_function(entity: &Entity) -> bool {
 
 pub use kin_ranking::entity_ranking::{
     trace_callee_score, trace_entity_is_external, trace_fanout_score, trace_relation_rank,
+    trace_step_terminal, TraceTerminal,
 };
 
 /// Serialized characters one trace response may occupy before the tool cuts its

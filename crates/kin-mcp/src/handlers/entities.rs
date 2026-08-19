@@ -36,7 +36,13 @@ On an empty result the response carries an additive `negative` object: its \
 (daemon-owned graph, initialized and loaded, holding entities, no degraded signals) \
 or merely \"not indexed yet\" — check it before treating \"none found\" as ground \
 truth. This filter reads the entity index rather than the vector index, so its \
-absence is gated on the graph being complete, not on embedding coverage.";
+absence is gated on the graph being complete, not on embedding coverage. An empty \
+answer also carries `edge_coverage`, naming the languages the filter's own scope \
+spans and how many entities it holds with the name pattern removed, and the absence \
+is NOT certified when that scope is empty or when its language is one this build \
+wires no language-server adapter for: nothing then resolves the program behind the \
+declarations, so a miss cannot separate a symbol the repository lacks from one the \
+extractor never admitted as an entity of that kind.";
 
 pub fn handle_semantic_search<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
@@ -48,13 +54,13 @@ pub fn handle_semantic_search<G: GraphStore>(
     let entities = store.query_entities(&filter).map_err(McpError::graph)?;
     let total_matches = entities.len();
 
-    let json = if compact {
+    let mut payload = if compact {
         let limited: Vec<_> = entities
             .into_iter()
             .take(limit)
             .map(CompactSearchResult::from)
             .collect();
-        serde_json::to_string_pretty(&CompactSearchResponse {
+        serde_json::to_value(CompactSearchResponse {
             query,
             limit,
             total_matches,
@@ -68,7 +74,7 @@ pub fn handle_semantic_search<G: GraphStore>(
             .take(limit)
             .map(SemanticSearchResult::from)
             .collect();
-        serde_json::to_string_pretty(&SemanticSearchResponse {
+        serde_json::to_value(SemanticSearchResponse {
             query,
             limit,
             total_matches,
@@ -78,6 +84,32 @@ pub fn handle_semantic_search<G: GraphStore>(
         .map_err(McpError::Json)?
     };
 
+    // FIR-2430. An empty search is a claim about the region this filter selected,
+    // and until this observation existed the claim was certified from daemon
+    // health alone: `semantic_search(query: "utils", kind: "module")` on
+    // expressjs/express reported `safe_to_conclude_absent: true` while
+    // `lib/utils.js` sat in the tree holding nine entities, minutes after
+    // `find_references` had refused to certify an absence on the same repository
+    // because JavaScript has no reference enrichment in this build.
+    //
+    // The scope query is the same filter with the name pattern removed, so the
+    // count is the coverage of the kind/language/role the caller asked about
+    // rather than of the name they asked for. Paid only on the empty path, which
+    // is the only answer whose trust depends on it.
+    if total_matches == 0 {
+        let scope = kin_model::graph::EntityFilter {
+            name_pattern: None,
+            ..filter.clone()
+        };
+        let scoped = store.query_entities(&scope).map_err(McpError::graph)?;
+        payload[crate::edge_coverage::EDGE_COVERAGE_KEY] =
+            crate::edge_coverage::observe_absence_scope(
+                &crate::edge_coverage::languages_of(&scoped),
+                Some(scoped.len()),
+            );
+    }
+
+    let json = serde_json::to_string_pretty(&payload).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
 }
 
@@ -87,7 +119,10 @@ when you are looking for \"where is the code that does X\" and you only have a \
 description of the behavior, not an exact symbol name. Unlike semantic_search (which \
 matches declarations by name/kind/language and ignores the query for ranking), \
 semantic_locate ranks by query relevance and returns act-on-able hits: entity_id, file, \
-line span, kind, score, and a bounded inline snippet. Set granularity to \"entity\" \
+line span, kind, score, and a bounded inline source excerpt. Each hit carries that text \
+ONCE: read it from `body` on the fused pipeline (the default) and from `snippet` on the \
+cosine pipeline, and read `routing` if you need to know which answered. Set \
+granularity to \"entity\" \
 (default) for ranked declarations or \"file\" to roll results up to the most relevant \
 files. Two pipelines can answer. The default on every profile is the full fused \
 retrieval pipeline `kin locate` serves: vector similarity, lexical search, and \
@@ -101,13 +136,19 @@ produced it, the score source, whether the query matched the entity name, and th
 ranking signals that applied — derived from graph-owned retrieval data, never a \
 working-tree read. Pass an optional `queries` array of additional query variants to fan \
 out: `query` plus each variant are retrieved independently and their rankings RRF-fused \
-into one deduped result, with each hit's `match_evidence.matched_variants` naming the \
-variants that surfaced it (diverse variants — identifiers, behavior, subsystem — recover \
+into one deduped result. The fan-out is echoed once under `queries` and each hit's \
+`matched_variant_indexes` gives the positions in that list of the variants \
+that surfaced it (diverse variants, meaning identifiers, behavior and subsystem, recover \
 more than any single phrasing); multi-query fusion always uses the fused pipeline. Both \
-pipelines report semantic_coverage — the fraction of the graph \
-that has embeddings indexed; the fused arm additionally reports a `degradations` array \
+pipelines report semantic_coverage as one counter object (indexed, total, pending, \
+complete), the same shape `_kin.semantic_coverage` carries; the fused arm additionally reports a `degradations` array \
 naming any retrieval capability that could not fully run (empty vector index, reranker \
-model not cached, …), so a thin result set is attributable instead of silent. Requires \
+model not cached, …), so a thin result set is attributable instead of silent. Ranking \
+demotes test-role entities, and at several stages excludes them, unless the query text \
+itself reads as being about tests; pass `include_tests: true` to rank them alongside \
+source. When the default withholds test paths the response says how many under \
+`semantic_coverage.graph_bodies.withheld_test_paths` and records a `graph_role_filter` \
+degradation, and `complete` is never true over a population that filter narrowed. Requires \
 the Kin daemon: retrieval runs against the daemon's live graph, so this tool returns an \
 error in offline/no-daemon mode. On an empty result the additive `negative` object's \
 `safe_to_conclude_absent` flag distinguishes an authoritative \"no match\" from \"not \
@@ -1093,6 +1134,66 @@ fn reference_filter_covers_unknown_subtypes(relation_kinds: &[RelationKind]) -> 
         && defaults.iter().all(|kind| relation_kinds.contains(kind))
 }
 
+/// The reference classes this answer itself proves the graph holds across files.
+///
+/// A returned row IS a resolved edge, so a row whose caller sits in a different
+/// file from the focal and carries the focal's language is exactly the witness
+/// the language scan in [`crate::edge_coverage`] goes looking for. Handing it
+/// over spares that scan on the healthy path, which matters now that an
+/// observation is taken on every answer rather than only on empty ones.
+///
+/// The language check is not optional. The scan is scoped to the focal's
+/// language because extraction gaps are per-language, so a caller written in
+/// another language proves nothing about whether THIS language's edges resolve,
+/// and a witness taken from one would let a well-linked language lend coverage
+/// to a language whose edges were never produced.
+///
+/// A row this cannot confirm contributes nothing and the scan runs, so the
+/// failure direction is a scan that was not needed rather than a class reported
+/// present on evidence that did not support it.
+fn answer_witnessed_classes<G: GraphStore>(
+    store: &G,
+    focal: &kin_model::entity::Entity,
+    rows: &[ReferenceRow],
+) -> Vec<RelationKind> {
+    let focal_file = focal.file_origin.as_ref().map(|path| path.0.clone());
+    let mut witnessed: Vec<RelationKind> = Vec::new();
+    for row in rows {
+        if row
+            .relation_kinds
+            .iter()
+            .all(|kind| witnessed.contains(kind))
+        {
+            continue;
+        }
+        let Some(file_path) = row.file_path.as_ref() else {
+            continue;
+        };
+        if focal_file.as_ref() == Some(file_path) {
+            continue;
+        }
+        let Some(entity_id) = row
+            .entity_id
+            .as_deref()
+            .and_then(|id| parse_entity_id(id).ok())
+        else {
+            continue;
+        };
+        let Ok(Some(caller)) = store.get_entity(&entity_id) else {
+            continue;
+        };
+        if caller.language != focal.language {
+            continue;
+        }
+        for kind in &row.relation_kinds {
+            if !witnessed.contains(kind) {
+                witnessed.push(*kind);
+            }
+        }
+    }
+    witnessed
+}
+
 /// What a reference answer counted, stated rather than left to be inferred.
 ///
 /// `total_upstream` is a bare number, and a reader who does not know its unit
@@ -1452,6 +1553,9 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     // is one referencing entity, so `referencing_entities` is the row count and
     // `files` is what the pre-FIR-2398 `total_upstream` was reporting.
     let counts = reference_counts(&rows);
+    // Read off the rows before they are projected, where the caller's entity id
+    // is still addressable.
+    let witnessed = answer_witnessed_classes(store, &target, &rows);
 
     // `entity_id` remains the local drill-through keystone. Federated rows use
     // repo-qualified paths and carry no local entity id.
@@ -1461,17 +1565,24 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
         .collect::<Vec<_>>();
 
     // What the graph can structurally answer over the edge classes this query
-    // reads. An empty reference list is only evidence about the code when the
-    // graph demonstrably holds cross-file edges of those classes for the focal's
+    // reads. A reference list is only evidence about the code when the graph
+    // demonstrably holds cross-file edges of those classes for the focal's
     // language, and nothing else in this payload reports that.
     //
-    // Observed only for an empty answer, which is the only answer whose trust
-    // depends on it: an answer that returned rows has proved the edges exist by
-    // returning them, and paying a language scan on the populated path would be
-    // a cost with nothing to buy.
-    let edge_coverage = references.is_empty().then(|| {
-        crate::edge_coverage::observe_cross_file_reference_coverage(store, &target, &relation_kinds)
-    });
+    // Observed on EVERY answer, empty or not (FIR-2357 item 1). The reasoning
+    // that limited it to empty answers is the defect: an answer that returned
+    // rows proved the classes those rows came through, and proved nothing about
+    // the class a caller it missed would have come through. `normalize_title`
+    // came back with one intra-file caller for a symbol five call sites reached,
+    // and an unqualified `1` is the answer an agent cannot tell from a complete
+    // one. The witnesses the rows already carry keep the healthy path from
+    // paying a language scan for a fact it is holding.
+    let edge_coverage = crate::edge_coverage::observe_cross_file_reference_coverage_witnessed(
+        store,
+        &target,
+        &relation_kinds,
+        &witnessed,
+    );
 
     let mut result = serde_json::json!({
         "focal_entity": {
@@ -1496,9 +1607,7 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
         "references": references,
         "cross_repo": cross_repo,
     });
-    if let Some(edge_coverage) = edge_coverage {
-        result[crate::edge_coverage::EDGE_COVERAGE_KEY] = edge_coverage;
-    }
+    result[crate::edge_coverage::EDGE_COVERAGE_KEY] = edge_coverage;
 
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
@@ -2375,8 +2484,10 @@ List dead or unreachable code straight from the semantic graph. With no filters 
 returns entities that have no incoming relations at all — nothing calls, imports, or \
 references them — across the whole repo, up to `limit`. Pass `files` to narrow the \
 scan to specific file paths and return only the dead functions, methods, and classes \
-declared there, ignoring within-file references so genuinely-unused declarations stand \
-out. Reach for it when you want to find removable code, audit a module for orphaned \
+declared there. `files` narrows WHICH entities are classified, never the evidence they \
+are classified on: a declaration its own file calls is live in both modes, so the \
+answer means the same thing whether or not you passed `files`. \
+Reach for it when you want to find removable code, audit a module for orphaned \
 definitions, or check whether a particular file still has live entry points. Because \
 reachability is read directly off the graph's relation edges, you get the answer in one \
 call without manually cross-referencing every symbol. When you'd rather start from a \
@@ -2384,6 +2495,10 @@ search concept than scan files — \"which of the entities matching X are dead?\
 find_dead_code_seeded combines the search and the dead-classification in one step. \
 A runtime entry point (a `main`) is never listed: it is called by the runtime rather than \
 by any edge, so no inbound edge was ever owed. \
+Only a PROVEN inbound edge counts as life. An edge the linker chose by matching a bare \
+name across the repository is a candidate, not evidence, so it does not keep an entity \
+off this list; that makes the list longer rather than shorter, which is why you must \
+read coverage before acting on it. \
 The response carries an additive `negative` object whose `safe_to_conclude_absent` flag \
 says whether \"nothing dead found\" is authoritative or limited by index freshness — \
 check it before concluding everything is reachable. Absence is only as good as the \
@@ -2396,14 +2511,13 @@ pub fn handle_dead_code<G: GraphStore>(
 ) -> Result<ToolCallResult> {
     let limit = get_optional_u64(args, "limit", 50) as usize;
     let files = get_optional_string_array(args, "files").unwrap_or_default();
+    // One reference-kind list for both scopes. Passing `files` chooses which
+    // entities are classified; it must not change what "dead" means, or the two
+    // modes answer different questions under one tool name.
+    let incoming_kinds = default_reference_kinds();
 
     if !files.is_empty() {
         let mut dead = Vec::new();
-        let incoming_kinds = [
-            RelationKind::Calls,
-            RelationKind::Imports,
-            RelationKind::References,
-        ];
 
         for file in files {
             let mut entities = store
@@ -2438,15 +2552,22 @@ pub fn handle_dead_code<G: GraphStore>(
             });
 
             for entity in entities {
-                let is_live = store
-                    .has_incoming_relation_kinds(&entity.id, &incoming_kinds, true)
-                    .map_err(McpError::graph)?;
-                if !is_live {
-                    dead.push(entity);
-                    if dead.len() >= limit {
-                        let json = serde_json::to_string_pretty(&dead).map_err(McpError::Json)?;
-                        return Ok(ToolCallResult::text(json));
-                    }
+                // Same rule as the whole-repo scope below, read off the same
+                // edges `find_references` reads. This branch used to exclude
+                // within-file callers, which answers "unused OUTSIDE this file"
+                // — a different question that the undifferentiated row shape
+                // cannot report. On a graph holding no cross-file edge it named
+                // every entity in the file, callers and all.
+                if kin_core::entry_points::is_conventional_entry_point(&entity) {
+                    continue;
+                }
+                if has_incoming_reference_edge(store, &entity.id, &incoming_kinds)? {
+                    continue;
+                }
+                dead.push(entity);
+                if dead.len() >= limit {
+                    let json = serde_json::to_string_pretty(&dead).map_err(McpError::Json)?;
+                    return Ok(ToolCallResult::text(json));
                 }
             }
         }
@@ -2462,7 +2583,6 @@ pub fn handle_dead_code<G: GraphStore>(
     // only the candidates that have none, read through the same reference kinds
     // `find_references` defaults to. An entry point is referenced by the runtime
     // rather than by an edge, so it is not a candidate either.
-    let incoming_kinds = default_reference_kinds();
     let mut dead = Vec::new();
     for entity in store.find_dead_code().map_err(McpError::graph)? {
         if dead.len() >= limit {
@@ -2487,6 +2607,14 @@ pub fn handle_dead_code<G: GraphStore>(
 ///
 /// A self-recursive function references nothing but itself, so its own edge
 /// never makes it reachable.
+///
+/// Only a proven edge counts. A `name_only` edge was chosen by matching a bare
+/// name across the whole repository, so it is a candidate for where a call went
+/// rather than evidence that this destination is used, and counting one as life
+/// is exactly what made `Session.request` appear to call
+/// `RequestsCookieJar.update`. Discarding it lengthens the delete list rather
+/// than shortening it, so every surface that prints the list states its own
+/// reference-edge coverage beside it.
 fn has_incoming_reference_edge<G: GraphStore>(
     store: &G,
     entity_id: &kin_model::EntityId,
@@ -2502,6 +2630,7 @@ fn has_incoming_reference_edge<G: GraphStore>(
         if relation.dst != kin_model::GraphNodeId::Entity(*entity_id)
             || !kinds.contains(&relation.kind)
             || source == *entity_id
+            || !RelationResolution::of(&relation).is_proven()
         {
             continue;
         }
@@ -2514,14 +2643,22 @@ pub const FIND_DEAD_CODE_SEEDED_DESC: &str = "\
 Find dead code starting from a search concept, in a single call. Give it a query (a \
 concept or partial name) and it searches the graph for the top-N matching entities, \
 counts each one's incoming references, and returns them ranked dead-first — each row \
-annotated with reference_count and a boolean `dead` flag, plus name, kind, file, and \
-signature. Reach for it when you suspect a feature/area is unused and want to confirm \
+annotated with reference_count, proven_reference_count and a boolean `dead` flag, plus \
+name, kind, file, and signature. `dead` is decided on the PROVEN count, the same rule \
+dead_code applies, so a row can carry references and still be dead: the difference \
+between the two counts is the edges the linker chose by matching a bare name across \
+the repository, which prove nothing about this destination. Reach for it when you suspect a feature/area is unused and want to confirm \
 which of its declarations are actually orphaned, without first knowing their IDs. Its \
 value is that it fuses three steps — semantic_search, then a reference count per match, \
 then the dead filter — into one response, so you don't loop find_references over every \
 candidate and exhaust your round-trips on a large repo. Use dead_code instead when you \
 want a whole-repo or file-scoped sweep rather than a concept-seeded one, and \
-bulk_check_references when you already hold the exact set of entity IDs to classify.";
+bulk_check_references when you already hold the exact set of entity IDs to classify. \
+When the seed matches nothing the response carries an additive `negative` object beside \
+an `edge_coverage` naming the languages the graph holds, and that absence is not \
+certified on a language this build wires no language-server adapter for, because a seed \
+that matched no declaration cannot then separate a symbol the repository lacks from one \
+the extractor never admitted.";
 
 /// Seeded find-dead-code primitive: `semantic_search(query)` + per-candidate
 /// reference counting + dead-filter, returned as one structured response, so
@@ -2571,6 +2708,7 @@ pub fn handle_find_dead_code_seeded<G: GraphStore>(
             continue;
         }
         let mut reference_count = 0usize;
+        let mut proven_reference_count = 0usize;
         for rel in store
             .get_all_relations_for_entity(&entity.id)
             .map_err(McpError::graph)?
@@ -2588,8 +2726,15 @@ pub fn handle_find_dead_code_seeded<G: GraphStore>(
                 continue;
             }
             reference_count += 1;
+            if RelationResolution::of(&rel).is_proven() {
+                proven_reference_count += 1;
+            }
         }
-        let dead = reference_count == 0;
+        // Decided on proven edges, the same rule `dead_code` and the CLI scan
+        // apply. A raw count here would make one entity dead on one surface and
+        // live on another, and the row carries both counts so a reader can see
+        // which edges were discarded rather than infer it.
+        let dead = proven_reference_count == 0;
         candidates.push(serde_json::json!({
             "id": entity.id.to_string(),
             "name": entity.name,
@@ -2597,29 +2742,50 @@ pub fn handle_find_dead_code_seeded<G: GraphStore>(
             "file": entity.file_origin.as_ref().map(|p| p.to_string()),
             "signature": (!entity.signature.is_empty()).then_some(entity.signature),
             "reference_count": reference_count,
+            "proven_reference_count": proven_reference_count,
             "dead": dead,
         }));
     }
 
+    // Dead first, and `dead` keys on the proven count, so the proven count is
+    // what orders the page.
     candidates.sort_by(|a, b| {
+        let a_proven = a["proven_reference_count"].as_u64().unwrap_or(0);
+        let b_proven = b["proven_reference_count"].as_u64().unwrap_or(0);
         let a_count = a["reference_count"].as_u64().unwrap_or(0);
         let b_count = b["reference_count"].as_u64().unwrap_or(0);
         let a_name = a["name"].as_str().unwrap_or("");
         let b_name = b["name"].as_str().unwrap_or("");
         let a_id = a["id"].as_str().unwrap_or("");
         let b_id = b["id"].as_str().unwrap_or("");
-        a_count
-            .cmp(&b_count)
+        a_proven
+            .cmp(&b_proven)
+            .then_with(|| a_count.cmp(&b_count))
             .then_with(|| a_name.cmp(b_name))
             .then_with(|| a_id.cmp(b_id))
     });
 
     let total_searched = candidates.len();
-    let result = serde_json::json!({
+    let mut result = serde_json::json!({
         "query": trimmed,
         "total_searched": total_searched,
         "candidates": candidates,
     });
+
+    // The seed match is the same name filter over the same entity index
+    // `semantic_search` reads, so an empty seed carries the same observation and
+    // answers to the same gate (FIR-2430). The scope is the whole graph because
+    // the seed filter constrains nothing but the name.
+    if total_searched == 0 {
+        let scoped = store
+            .query_entities(&kin_model::graph::EntityFilter::default())
+            .map_err(McpError::graph)?;
+        result[crate::edge_coverage::EDGE_COVERAGE_KEY] =
+            crate::edge_coverage::observe_absence_scope(
+                &crate::edge_coverage::languages_of(&scoped),
+                Some(scoped.len()),
+            );
+    }
 
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
@@ -2657,7 +2823,17 @@ absence. A focal that resolves to no entity at all carries the same object, nami
 resolution miss rather than reporting an empty chain. \
 Each step carries `resolution` for the edge that reached it: `type_resolved`, \
 `import_scoped`, or `name_only`. A chain is only as trustworthy as its weakest hop, so a \
-`name_only` step means the flow it claims may not exist at all.";
+`name_only` step means the flow it claims may not exist at all. \
+The walk ends at two boundaries rather than crossing them, and says which on the step that \
+stopped it. A symbol this repository does not define is a leaf carrying \
+`terminal: \"external_reference\"`: there is no next hop, and walking one turns a shared \
+stdlib name into a hub that joins unrelated code into the chain. An edge that merely states \
+a type is a leaf carrying `terminal: \"type_annotation\"`, because two entities that annotate \
+with the same class share no data; pass include_type_edges=true to walk through those when \
+the type is one this repository defines, which is a real flow for a field or a return. \
+`terminal_external_steps` and `terminal_annotation_steps` count them, kept apart because only \
+the second is recoverable by a parameter. Neither sets `truncated`: a boundary means the chain \
+ends there, not that you received less of one that exists.";
 
 /// One node of a trace walk, carrying the file and directory its fan-out is
 /// scored against.
@@ -2770,6 +2946,7 @@ fn trace_step_value(
     parent_step: usize,
     depth: usize,
     entity: &kin_model::entity::Entity,
+    terminal: Option<TraceTerminal>,
 ) -> serde_json::Value {
     let mut value = serde_json::json!({
         "step": step,
@@ -2783,6 +2960,11 @@ fn trace_step_value(
         "depth": depth,
         "fanout_truncated": false,
         "fanout_dropped": 0,
+        // Why the walk stopped here, or null for an ordinary step. Written on
+        // every step rather than only on a terminal one: this array's keys are
+        // uniform by contract, and a sometimes-absent key is the shape that
+        // broke a consumer's parser twice.
+        "terminal": terminal.map(TraceTerminal::as_str),
     });
     let record = trace_entity_value(entity);
     if let (Some(target), Some(source)) = (value.as_object_mut(), record.as_object()) {
@@ -2903,6 +3085,10 @@ pub fn handle_trace_data_flow<G: GraphStore>(
     let depth = get_optional_u64(args, "depth", DEFAULT_DEPTH).clamp(1, MAX_DEPTH) as usize;
     let limit_per_step = get_optional_u64(args, "limit_per_step", DEFAULT_LIMIT_PER_STEP)
         .clamp(1, MAX_LIMIT_PER_STEP) as usize;
+    let include_type_edges = args
+        .get("include_type_edges")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     let direction = match get_optional_string_param(args, "direction") {
         Some(value) => match value.trim().to_lowercase().as_str() {
             "calls" | "callee" | "callees" | "out" | "outgoing" => "calls",
@@ -2934,13 +3120,24 @@ pub fn handle_trace_data_flow<G: GraphStore>(
     };
     let same_name_candidates = same_name_entity_count(store, &focal_entity.name)?;
 
+    // The kinds a data-flow claim actually rests on, and the ones the coverage
+    // observation below is measured against.
     let reference_kinds = [
         RelationKind::Calls,
         RelationKind::Imports,
         RelationKind::References,
     ];
-    let allowed: std::collections::HashSet<RelationKind> =
-        reference_kinds.iter().copied().collect();
+    // `UsesType` is walkable only in the sense that it can REACH a step:
+    // admitted so an annotation target is a named leaf rather than a symbol the
+    // walk silently never mentions, and so `include_type_edges` has an edge to
+    // open. It is deliberately not in `reference_kinds`, because a graph
+    // holding no annotation edges says nothing about whether this walk's
+    // answer was whole.
+    let allowed: std::collections::HashSet<RelationKind> = reference_kinds
+        .iter()
+        .copied()
+        .chain(std::iter::once(RelationKind::UsesType))
+        .collect();
 
     let want_callees = matches!(direction, "calls" | "both");
     let want_callers = matches!(direction, "callers" | "both");
@@ -3099,6 +3296,15 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                         // rather than admitting one symbol under two identities.
                         let promoted_depth =
                             chain[existing - 1]["depth"].as_u64().unwrap_or(0) as usize;
+                        // A promoted record is located by construction, so the
+                        // external boundary no longer applies to it; the edge
+                        // that reached it is unchanged, so the annotation one
+                        // still does.
+                        let promoted_terminal = trace_step_terminal(
+                            &candidate.entity,
+                            candidate.relation_kind,
+                            include_type_edges,
+                        );
                         let promoted = trace_step_value(
                             existing,
                             chain[existing - 1]["role"].as_str().unwrap_or("callee"),
@@ -3111,11 +3317,12 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                             chain[existing - 1]["parent_step"].as_u64().unwrap_or(0) as usize,
                             promoted_depth,
                             &candidate.entity,
+                            promoted_terminal,
                         );
                         chain[existing - 1] = promoted;
                         visited.insert(candidate.entity.id);
                         external_identities_merged += 1;
-                        if promoted_depth < depth {
+                        if promoted_terminal.is_none() && promoted_depth < depth {
                             next_frontier.push(TraceFrontierNode::at(
                                 existing,
                                 promoted_depth,
@@ -3133,6 +3340,13 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                 name_index
                     .entry(candidate.entity.name.clone())
                     .or_insert(step_index);
+                // Decided before the step is pushed, because it decides both
+                // what the step says and whether the node is expanded at all.
+                let terminal = trace_step_terminal(
+                    &candidate.entity,
+                    candidate.relation_kind,
+                    include_type_edges,
+                );
                 chain.push(trace_step_value(
                     step_index,
                     candidate.role,
@@ -3141,8 +3355,9 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                     node.step,
                     next_depth,
                     &candidate.entity,
+                    terminal,
                 ));
-                if next_depth < depth {
+                if terminal.is_none() && next_depth < depth {
                     next_frontier.push(TraceFrontierNode::at(
                         step_index,
                         next_depth,
@@ -3163,17 +3378,22 @@ pub fn handle_trace_data_flow<G: GraphStore>(
     }
 
     let total_steps = chain.len();
-    // The walk expands exactly the reference kinds above, so an empty chain is
-    // only evidence about the focal when the graph holds cross-file edges of
-    // those kinds for its language. A walk that returned steps needs no such
-    // evidence and pays no scan for it.
-    let edge_coverage = chain.is_empty().then(|| {
-        crate::edge_coverage::observe_cross_file_reference_coverage(
-            store,
-            &focal_entity,
-            &reference_kinds,
-        )
-    });
+    // The walk expands exactly the reference kinds above, so a chain is only
+    // evidence about the focal when the graph holds cross-file edges of those
+    // kinds for its language. Observed on every walk rather than only on an
+    // empty one (FIR-2357 item 1): a walk that returned three steps over a graph
+    // holding no cross-file calls has stayed inside one file, and reporting that
+    // as an unqualified chain is the same quiet partial the reference tool had.
+    //
+    // No witness is passed here, unlike `find_references`. A chain step records
+    // the entity reached, not which class of edge reached it, and a witness
+    // asserted for the wrong class is the one thing this observation must never
+    // accept.
+    let edge_coverage = crate::edge_coverage::observe_cross_file_reference_coverage(
+        store,
+        &focal_entity,
+        &reference_kinds,
+    );
     let mut result = serde_json::json!({
         "focal_id": focal_entity.id.to_string(),
         "focal_name": focal_entity.name.clone(),
@@ -3187,6 +3407,11 @@ pub fn handle_trace_data_flow<G: GraphStore>(
         // with no repository authority to project source through. Stating it
         // keeps `include_body` from reading as honoured here.
         "bodies_included": false,
+        // Echoed because it is the parameter a caller reading a
+        // `type_annotation` terminal has to change, and a caller cannot
+        // otherwise tell a walk that had no type edges from one that refused
+        // them.
+        "include_type_edges": include_type_edges,
         "chain": chain,
         "total_steps": total_steps,
         "truncated": truncated,
@@ -3195,9 +3420,7 @@ pub fn handle_trace_data_flow<G: GraphStore>(
             "same_name_candidates": same_name_candidates,
         },
     });
-    if let Some(edge_coverage) = edge_coverage {
-        result[crate::edge_coverage::EDGE_COVERAGE_KEY] = edge_coverage;
-    }
+    result[crate::edge_coverage::EDGE_COVERAGE_KEY] = edge_coverage;
     if !clipped_steps.is_empty() {
         result["clipped_steps"] = serde_json::Value::Array(clipped_steps);
     }
@@ -3211,6 +3434,32 @@ pub fn handle_trace_data_flow<G: GraphStore>(
     );
     result["max_response_chars"] = serde_json::Value::from(max_response_chars);
     bound_trace_payload(&mut result, max_response_chars);
+    // Counted from the chain rather than during the walk, so the numbers
+    // describe the steps this payload carries after `bound_trace_payload` has
+    // dropped whatever it drops. Kept apart rather than summed because only the
+    // annotation half is recoverable: `include_type_edges` opens those leaves
+    // and opens none of the external ones. Neither sets `truncated`, since a
+    // boundary means the chain ends there rather than that the caller received
+    // less of one that exists.
+    let terminal_count = |class: TraceTerminal| {
+        result["chain"]
+            .as_array()
+            .map(|chain| {
+                chain
+                    .iter()
+                    .filter(|step| step["terminal"].as_str() == Some(class.as_str()))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    let terminal_external_steps = terminal_count(TraceTerminal::ExternalReference);
+    let terminal_annotation_steps = terminal_count(TraceTerminal::TypeAnnotation);
+    if terminal_external_steps > 0 {
+        result["terminal_external_steps"] = serde_json::Value::from(terminal_external_steps);
+    }
+    if terminal_annotation_steps > 0 {
+        result["terminal_annotation_steps"] = serde_json::Value::from(terminal_annotation_steps);
+    }
 
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
@@ -3259,7 +3508,9 @@ a directional ordered chain with bodies inlined, use trace_data_flow. \
 When no neighbors come back, the additive `negative` object's `safe_to_conclude_absent` \
 flag says whether that absence is authoritative or merely \"not indexed yet\", and its \
 `subject` scopes the absence to the side that was walked, so an empty 'in' result is never \
-read as \"no dependencies\". A focal that is not in the graph is reported as that gap \
+read as \"no dependencies\". A walk that expanded no edge also carries `edge_coverage` \
+naming the focal's language, and the absence is not certified when this build wires no \
+language-server adapter for it. A focal that is not in the graph is reported as that gap \
 rather than as an isolated entity. Every edge also carries `resolution` \
 (`type_resolved`, `import_scoped`, `name_only`) saying how strongly its destination was \
 proven; a `name_only` edge was matched by bare name and is a candidate, not structure you \
@@ -3394,7 +3645,7 @@ pub fn handle_graph_neighborhood<G: GraphStore>(
     // Cap relations to match the entity limit to avoid unbounded output.
     relations.truncate(limit * 3);
 
-    let result = serde_json::json!({
+    let mut result = serde_json::json!({
         "focal_id": entity_id.to_string(),
         "direction": direction,
         "depth": depth,
@@ -3404,6 +3655,22 @@ pub fn handle_graph_neighborhood<G: GraphStore>(
         "entities": entities,
         "relations": relations,
     });
+
+    // A walk that expanded no edge is claiming the focal has no neighbors on the
+    // side that was walked, and for an incoming walk that is the same claim
+    // `find_references` makes. It answers to the same gate (FIR-2430), scoped to
+    // the focal's own language. A focal that did not resolve names no language,
+    // and the observation says so rather than guessing one, so the
+    // focal-not-in-graph gap stays the limiting factor a reader is handed.
+    if total_relations == 0 {
+        let focal_languages = store
+            .get_entity(&entity_id)
+            .map_err(McpError::graph)?
+            .map(|entity| vec![entity.language])
+            .unwrap_or_default();
+        result[crate::edge_coverage::EDGE_COVERAGE_KEY] =
+            crate::edge_coverage::observe_absence_scope(&focal_languages, None);
+    }
 
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
@@ -3504,6 +3771,18 @@ pub struct GraphStatusReport {
     /// repository generation and not stable across daemon restarts.
     pub authority_epoch: u64,
     pub entity_count: usize,
+    /// Entities durable repository authority carried when the daemon last
+    /// levelled this graph with authority (FIR-2421).
+    ///
+    /// Beside `entity_count` because that is where it is misread. The live
+    /// count above is what the daemon can answer from right now, and a daemon
+    /// admits host content into that graph continuously without recording any
+    /// of it, so a populated `entity_count` says nothing about whether the work
+    /// survives this process. The difference between the two is what a daemon
+    /// exit would lose; `_kin.durability` states it as a sentence. Absent, not
+    /// zero, when the daemon has never levelled with durable authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_entity_count: Option<u64>,
     pub relation_count: usize,
     pub embedding_source: GraphStatusEmbeddingSource,
     pub embeddings_indexed: usize,
@@ -3544,6 +3823,8 @@ struct GraphStatusReportWire {
     sampling: GraphStatusSampling,
     authority_epoch: u64,
     entity_count: usize,
+    #[serde(default)]
+    durable_entity_count: Option<u64>,
     relation_count: usize,
     embedding_source: GraphStatusEmbeddingSource,
     embeddings_indexed: usize,
@@ -3573,6 +3854,7 @@ impl<'de> Deserialize<'de> for GraphStatusReport {
             sampling: wire.sampling,
             authority_epoch: wire.authority_epoch,
             entity_count: wire.entity_count,
+            durable_entity_count: wire.durable_entity_count,
             relation_count: wire.relation_count,
             embedding_source: wire.embedding_source,
             embeddings_indexed: wire.embeddings_indexed,
@@ -3742,6 +4024,10 @@ pub struct GraphStatusObservation {
     /// Vectors resident in the selected graph's index, sampled under the same
     /// fence as the counters above. `None` when there is no index to measure.
     pub embedding_index_keys: Option<usize>,
+    /// Entities durable repository authority carried when the daemon last
+    /// levelled this graph with authority (FIR-2421). `None` when it never has,
+    /// which is not zero.
+    pub durable_entity_count: Option<u64>,
 }
 
 pub fn handle_daemon_graph_status_observation(
@@ -3756,6 +4042,7 @@ pub fn handle_daemon_graph_status_observation(
         sampling: GraphStatusSampling::PointInTimeSelectedGraph,
         authority_epoch: observation.authority_epoch,
         entity_count: observation.entity_count,
+        durable_entity_count: observation.durable_entity_count,
         relation_count: observation.relation_count,
         embedding_source: GraphStatusEmbeddingSource::SelectedGraph,
         embeddings_indexed: observation.embeddings_indexed,
@@ -4153,6 +4440,233 @@ mod tests {
         assert_eq!(env["total_requested"], 50);
         assert_eq!(env["returned"], 0);
         assert_eq!(env["results"][0]["reason"], "not_found");
+    }
+
+    fn search_args(query: &str, kind: Option<&str>) -> HashMap<String, serde_json::Value> {
+        let mut args = HashMap::new();
+        args.insert("query".to_string(), serde_json::json!(query));
+        if let Some(kind) = kind {
+            args.insert("kind".to_string(), serde_json::json!(kind));
+        }
+        args
+    }
+
+    /// A daemon envelope reporting the graph initialized, loaded and populated:
+    /// the state in which a structural absence is otherwise certifiable, so the
+    /// verdicts below turn on the scope observation and nothing else.
+    fn ready_daemon_envelope(entity_count: u64) -> crate::envelope::Envelope {
+        crate::envelope::Envelope::daemon().with_health(&serde_json::json!({
+            "graph_loaded": true,
+            "initialized": true,
+            "graph_entity_count": entity_count,
+            "graph_generation": 1,
+        }))
+    }
+
+    fn module_entity(language: LanguageId, name: &str, file: &str) -> Entity {
+        let mut entity = make_entity_in(language, name, file);
+        entity.kind = EntityKind::Module;
+        entity
+    }
+
+    /// FIR-2430, end to end through the handler that built the bad answer.
+    ///
+    /// The store is shaped like expressjs/express as the stranger run found it:
+    /// JavaScript, with a `Module` entity for one file and none for
+    /// `lib/utils.js`, which still holds entities of other kinds. That is the
+    /// state in which `semantic_search(query: "utils", kind: "module")` returned
+    /// zero and stamped it `safe_to_conclude_absent: true`, `trust:
+    /// "authoritative"`, minutes after `find_references` refused to certify an
+    /// absence on the same repository because this build wires no
+    /// language-server adapter for JavaScript.
+    #[test]
+    fn a_javascript_search_absence_is_inconclusive_while_a_python_one_still_certifies() {
+        let store = InMemoryGraph::new();
+        store
+            .upsert_entity(&module_entity(
+                LanguageId::JavaScript,
+                "express",
+                "lib/express.js",
+            ))
+            .unwrap();
+        store
+            .upsert_entity(&make_entity_in(
+                LanguageId::JavaScript,
+                "createETagGenerator",
+                "lib/utils.js",
+            ))
+            .unwrap();
+
+        // Positive control on the same call: a module that IS in the graph comes
+        // back populated and carries no scope observation, because an answer
+        // that returned a row proved the region can answer.
+        let found = parsed_response(
+            &handle_semantic_search(&search_args("express", Some("module")), &store).unwrap(),
+        );
+        assert_eq!(found["total_matches"], 1);
+        assert!(
+            found.get(crate::edge_coverage::EDGE_COVERAGE_KEY).is_none(),
+            "a populated answer needs no scope observation: {found}"
+        );
+
+        // The reported call, verbatim. The region is populated (one module), so
+        // what stops the certification is that nothing resolves the program
+        // behind these declarations, which is exactly what the stranger's own
+        // find_references had just said about the same repository.
+        let empty = parsed_response(
+            &handle_semantic_search(&search_args("utils", Some("module")), &store).unwrap(),
+        );
+        assert_eq!(empty["total_matches"], 0);
+        let coverage = &empty[crate::edge_coverage::EDGE_COVERAGE_KEY];
+        assert_eq!(coverage["language"], "JavaScript");
+        assert_eq!(coverage["reference_enrichment"], "unsupported");
+        assert_eq!(
+            coverage["scope_entities"], 1,
+            "the kind-filtered absence states the coverage of that kind: {coverage}"
+        );
+        let negative =
+            crate::negative::negative_for("semantic_search", &empty, &ready_daemon_envelope(2))
+                .expect("an empty search carries a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], false);
+        assert_eq!(negative["trust"], "inconclusive");
+        assert!(
+            negative["trust_reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("entity_index_unresolved"),
+            "{negative}"
+        );
+
+        // The other direction on the same code path. Python is a language this
+        // build wires an adapter for, so a name nothing carries is still a
+        // certifiable absence and the fix has not degraded into marking
+        // everything uncertain.
+        let python = InMemoryGraph::new();
+        python
+            .upsert_entity(&module_entity(LanguageId::Python, "utils", "app/utils.py"))
+            .unwrap();
+        python
+            .upsert_entity(&make_entity_in(
+                LanguageId::Python,
+                "render_page",
+                "app/views.py",
+            ))
+            .unwrap();
+        let found = parsed_response(
+            &handle_semantic_search(&search_args("utils", Some("module")), &python).unwrap(),
+        );
+        assert_eq!(
+            found["total_matches"], 1,
+            "control: the module the Python graph holds is findable, so the absence below \
+             is a real absence rather than a broken filter"
+        );
+
+        let absent = parsed_response(
+            &handle_semantic_search(&search_args("zzz_not_a_symbol", None), &python).unwrap(),
+        );
+        assert_eq!(absent["total_matches"], 0);
+        let coverage = &absent[crate::edge_coverage::EDGE_COVERAGE_KEY];
+        assert_eq!(coverage["language"], "Python");
+        assert_eq!(coverage["reference_enrichment"], "unknown");
+        assert_eq!(coverage["scope_entities"], 2);
+        let negative =
+            crate::negative::negative_for("semantic_search", &absent, &ready_daemon_envelope(2))
+                .expect("an empty search carries a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], true);
+        assert_eq!(negative["trust"], "authoritative");
+    }
+
+    /// A filter that selected a region the extractor never populated says
+    /// nothing about the repository, whatever language it is over.
+    #[test]
+    fn a_search_filtered_into_an_unpopulated_region_certifies_nothing() {
+        let store = InMemoryGraph::new();
+        store
+            .upsert_entity(&make_entity_in(
+                LanguageId::Python,
+                "render_page",
+                "app/views.py",
+            ))
+            .unwrap();
+
+        let empty = parsed_response(
+            &handle_semantic_search(&search_args("utils", Some("module")), &store).unwrap(),
+        );
+        assert_eq!(
+            empty[crate::edge_coverage::EDGE_COVERAGE_KEY]["scope_entities"],
+            0,
+            "this graph holds no module entity at all: {empty}"
+        );
+        let negative =
+            crate::negative::negative_for("semantic_search", &empty, &ready_daemon_envelope(1))
+                .expect("an empty search carries a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], false);
+        assert!(
+            negative["trust_reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("absence_scope_empty"),
+            "{negative}"
+        );
+    }
+
+    /// The neighborhood publishes the same observation, and a focal that did not
+    /// resolve names no language rather than borrowing one, so the
+    /// focal-not-in-graph gap stays the limiting factor a reader is handed.
+    #[test]
+    fn an_empty_neighborhood_publishes_the_scope_it_walked() {
+        let store = InMemoryGraph::new();
+        let focal = make_entity_in(
+            LanguageId::JavaScript,
+            "createETagGenerator",
+            "lib/utils.js",
+        );
+        let focal_id = focal.id;
+        store.upsert_entity(&focal).unwrap();
+
+        let mut args = HashMap::new();
+        args.insert(
+            "entity_id".to_string(),
+            serde_json::json!(focal_id.to_string()),
+        );
+        args.insert("direction".to_string(), serde_json::json!("in"));
+        let walked = parsed_response(&handle_graph_neighborhood(&args, &store).unwrap());
+        assert_eq!(walked["relation_count"], 0);
+        let coverage = &walked[crate::edge_coverage::EDGE_COVERAGE_KEY];
+        assert_eq!(coverage["language"], "JavaScript");
+        assert_eq!(coverage["reference_enrichment"], "unsupported");
+        assert!(
+            coverage.get("scope_entities").is_none(),
+            "a walk counts no region, so it publishes no count: {coverage}"
+        );
+        let negative =
+            crate::negative::negative_for("graph_neighborhood", &walked, &ready_daemon_envelope(1))
+                .expect("an empty walk carries a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], false);
+
+        let mut missing = HashMap::new();
+        missing.insert(
+            "entity_id".to_string(),
+            serde_json::json!(EntityId::new().to_string()),
+        );
+        let unresolved = parsed_response(&handle_graph_neighborhood(&missing, &store).unwrap());
+        assert_eq!(
+            unresolved[crate::edge_coverage::EDGE_COVERAGE_KEY]["language"],
+            "no resolved language"
+        );
+        let negative = crate::negative::negative_for(
+            "graph_neighborhood",
+            &unresolved,
+            &ready_daemon_envelope(1),
+        )
+        .expect("an unresolved focal carries a negative");
+        assert!(
+            negative["trust_reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("focal_not_in_graph"),
+            "the focal miss stays the limiting factor: {negative}"
+        );
     }
 
     #[test]
@@ -4838,11 +5352,18 @@ mod tests {
         );
     }
 
-    /// An answer that returned rows proved the edges exist by returning them, so
-    /// it pays no language scan and carries no observation. Stating it as a test
-    /// keeps the populated path from silently acquiring one.
+    /// A populated answer over a graph that demonstrably links calls across
+    /// files reports itself complete, and its count is exact.
+    ///
+    /// This test asserted the opposite until FIR-2357: that a populated answer
+    /// carried no observation at all, on the reasoning that rows prove the edges
+    /// exist by existing. They prove the classes those rows came through and
+    /// nothing about the class a caller the answer MISSED would have come
+    /// through, which is how a 20%-complete answer shipped with no signal. The
+    /// observation is now taken on every answer, and this is the direction that
+    /// stops it from degrading into marking everything uncertain.
     #[tokio::test]
-    async fn a_populated_reference_answer_carries_no_edge_observation() {
+    async fn a_populated_cross_file_answer_reports_itself_complete() {
         let store = InMemoryGraph::new();
         let caller = make_entity("caller", "src/a.rs");
         let target = make_entity("target", "src/b.rs");
@@ -4862,16 +5383,143 @@ mod tests {
             "find_references",
         ));
         assert_eq!(response["total_upstream"], 1);
+
+        let completeness = &response["_kin"]["completeness"];
+        assert_eq!(completeness["status"], "complete", "{completeness}");
+        assert_eq!(completeness["bound"], "exact", "{completeness}");
+        assert_eq!(completeness["counted"]["reported"], 1);
+
+        // The row itself was the witness, so the language scan never ran. That
+        // is what keeps an observation on every answer from costing a
+        // language-wide relation walk per call on a healthy graph.
+        let coverage = &response[crate::edge_coverage::EDGE_COVERAGE_KEY];
+        assert_eq!(coverage["scan"], "skipped_answer_witnessed", "{coverage}");
+        assert_eq!(
+            coverage["witnessed_by_answer"],
+            serde_json::json!(["calls"])
+        );
+        assert_eq!(coverage["entities_examined"], 0);
+
         assert!(
-            response
-                .get(crate::edge_coverage::EDGE_COVERAGE_KEY)
-                .is_none(),
-            "a populated answer needs no coverage observation: {response}"
+            response.get("negative").is_none(),
+            "a populated answer still synthesizes no negative, which is why the \
+             completeness signal is the one that has to carry this case"
+        );
+    }
+
+    /// The FIR-2357 headline end to end. A graph holding one intra-file call
+    /// edge answers for a symbol a sibling file also calls, and returns exactly
+    /// one caller. Ground truth is more, and every freshness signal reads
+    /// healthy, so nothing in the response used to suggest the answer was a
+    /// fifth of the truth.
+    ///
+    /// This is the shape the isolated stranger hit on `normalize_title`: one
+    /// reference back, `total_upstream: 1`, no negative because the answer was
+    /// not empty, and an agent that reasonably concluded the function was local.
+    #[tokio::test]
+    async fn a_partial_reference_answer_says_its_count_is_a_floor() {
+        let store = InMemoryGraph::new();
+        let target = make_entity("normalize_title", "nk/parsing.rs");
+        let same_file_caller = make_entity("extract_links", "nk/parsing.rs");
+        // The sibling file that really calls the target. The extractor linked
+        // nothing across files, so no edge represents it and the answer cannot
+        // find it. That gap is the fact the response has to report.
+        let cross_file_caller = make_entity("render_note", "nk/render.rs");
+        store.upsert_entity(&target).unwrap();
+        store.upsert_entity(&same_file_caller).unwrap();
+        store.upsert_entity(&cross_file_caller).unwrap();
+        store
+            .upsert_relation(&make_relation(
+                same_file_caller.id,
+                target.id,
+                RelationKind::Calls,
+            ))
+            .unwrap();
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let response = parsed_response(&crate::finalize_with_envelope(
+            handle_find_references(&args, &store, None).await.unwrap(),
+            structurally_ready_envelope(),
+            "find_references",
+        ));
+
+        assert_eq!(
+            response["total_upstream"], 1,
+            "the answer itself is unchanged; what changes is what rides beside it"
         );
         assert!(
             response.get("negative").is_none(),
-            "and carries no negative to consume one"
+            "non-empty, so the negative object never fires here"
         );
+
+        let completeness = &response["_kin"]["completeness"];
+        assert_eq!(
+            completeness["status"], "partial",
+            "a graph with no cross-file call edge could not have found the sibling \
+             caller: {completeness}"
+        );
+        assert_eq!(
+            completeness["bound"], "at_least",
+            "so the 1 is a floor rather than a fact: {completeness}"
+        );
+        assert_eq!(completeness["classes"]["calls"], "absent");
+        assert_eq!(completeness["decided_by"], serde_json::json!(["calls"]));
+        assert!(
+            completeness["limits"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("edge_coverage:calls_absent")),
+            "{completeness}"
+        );
+        // The row's own caller sits in the target's file, so it witnesses
+        // nothing cross-file and the scan runs.
+        let coverage = &response[crate::edge_coverage::EDGE_COVERAGE_KEY];
+        assert_eq!(coverage["scan"], "ran", "{coverage}");
+        assert_eq!(coverage["witnessed_by_answer"], serde_json::json!([]));
+    }
+
+    /// The count side (FIR-2357 item 2). When the graph carries a parse-side
+    /// call-site count, a short answer says how short: parsed call sites against
+    /// the reference edges that resolved, so "1 of 5" is readable off the
+    /// response instead of an unqualified "1".
+    #[tokio::test]
+    async fn a_partial_reference_answer_reports_parsed_against_resolved() {
+        let store = InMemoryGraph::new();
+        let mut target = make_entity("normalize_title", "nk/parsing.rs");
+        let mut caller = make_entity("extract_links", "nk/parsing.rs");
+        // What extraction recorded for the file: five call sites read from the
+        // source, against the one edge that resolved.
+        for entity in [&mut target, &mut caller] {
+            entity.metadata.extra.insert(
+                kin_parser::FILE_PARSED_CALL_SITES_KEY.to_string(),
+                serde_json::json!(5),
+            );
+        }
+        store.upsert_entity(&target).unwrap();
+        store.upsert_entity(&caller).unwrap();
+        store
+            .upsert_relation(&make_relation(caller.id, target.id, RelationKind::Calls))
+            .unwrap();
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let response = parsed_response(&crate::finalize_with_envelope(
+            handle_find_references(&args, &store, None).await.unwrap(),
+            structurally_ready_envelope(),
+            "find_references",
+        ));
+
+        let resolution = &response["_kin"]["completeness"]["reference_resolution"];
+        assert_eq!(resolution["parsed_call_sites"], 5, "{resolution}");
+        assert_eq!(resolution["resolved_call_edges"], 1, "{resolution}");
+        assert_eq!(resolution["call_percent"], 20, "{resolution}");
+        assert_eq!(resolution["resolution"], "partial", "{resolution}");
+        assert_eq!(response["_kin"]["completeness"]["bound"], "at_least");
     }
 
     /// The other half of the same claim, on the daemon authority path so nothing
@@ -5678,6 +6326,246 @@ mod tests {
         parsed_response(&handle_trace_data_flow(&arguments, store).unwrap())
     }
 
+    /// The reported shape on this arm: a focal that names `typing.Any` in a
+    /// signature, and an `Any` the graph holds with no file and 44 further
+    /// referrers. `direction: "both"` is where it bit, because the inbound half
+    /// of an annotation edge is every other thing that mentions the type.
+    fn annotation_hub_store(other_referrers: usize) -> (InMemoryGraph, EntityId) {
+        let store = InMemoryGraph::new();
+        let focal = make_entity("cert_verify", "src/requests/adapters.py");
+        let focal_id = focal.id;
+        store.upsert_entity(&focal).unwrap();
+
+        let mut hub = make_entity("Any", "unused");
+        hub.kind = EntityKind::Module;
+        hub.file_origin = None;
+        let hub_id = hub.id;
+        store.upsert_entity(&hub).unwrap();
+        store
+            .upsert_relation(&make_relation(focal_id, hub_id, RelationKind::References))
+            .unwrap();
+
+        for index in 0..other_referrers {
+            let other = make_entity(
+                &format!("unrelated_{index}"),
+                &format!("src/requests/u_{index}.py"),
+            );
+            let other_id = other.id;
+            store.upsert_entity(&other).unwrap();
+            store
+                .upsert_relation(&make_relation(other_id, hub_id, RelationKind::References))
+                .unwrap();
+        }
+        (store, focal_id)
+    }
+
+    fn traced_step_names(payload: &serde_json::Value) -> Vec<String> {
+        payload["chain"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| step["entity_name"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// Both arms of one tool have to answer the same way, so the offline arm
+    /// gets the same fixture at the same reported parameters.
+    #[test]
+    fn trace_data_flow_offline_stops_at_an_external_annotation_hub() {
+        let (store, focal_id) = annotation_hub_store(44);
+        let payload = traced_payload(
+            &store,
+            &[
+                ("focal", serde_json::json!(focal_id.to_string())),
+                ("direction", serde_json::json!("both")),
+                ("depth", serde_json::json!(2)),
+                ("limit_per_step", serde_json::json!(8)),
+            ],
+        );
+
+        let names = traced_step_names(&payload);
+        assert_eq!(
+            names,
+            vec!["Any".to_string()],
+            "the chain must end at the file-less hub; it reached {names:?}"
+        );
+        assert_eq!(
+            payload["chain"][0]["terminal"],
+            serde_json::json!("external_reference")
+        );
+        assert_eq!(payload["terminal_external_steps"], serde_json::json!(1));
+        assert_eq!(payload["truncated"], serde_json::json!(false));
+        assert_eq!(payload["clipped_steps"], serde_json::Value::Null);
+    }
+
+    /// `include_type_edges` opens a type edge to a type this repository
+    /// defines, and opens nothing else. Both halves are asserted, because a
+    /// parameter that reopened the external hub would put the defect back
+    /// behind an argument.
+    #[test]
+    fn trace_data_flow_offline_type_edges_open_a_repo_type_and_never_an_external_one() {
+        let store = InMemoryGraph::new();
+        let focal = make_entity("ParsedNote", "src/notes.py");
+        let repo_type = make_entity("WikiLink", "src/links.py");
+        let beyond = make_entity("normalize_target", "src/links.py");
+        let mut stdlib = make_entity("Any", "unused");
+        stdlib.kind = EntityKind::Module;
+        stdlib.file_origin = None;
+        let unrelated = make_entity("unrelated", "src/other.py");
+        for entity in [&focal, &repo_type, &beyond, &stdlib, &unrelated] {
+            store.upsert_entity(entity).unwrap();
+        }
+        store
+            .upsert_relation(&make_relation(
+                focal.id,
+                repo_type.id,
+                RelationKind::UsesType,
+            ))
+            .unwrap();
+        store
+            .upsert_relation(&make_relation(repo_type.id, beyond.id, RelationKind::Calls))
+            .unwrap();
+        store
+            .upsert_relation(&make_relation(focal.id, stdlib.id, RelationKind::UsesType))
+            .unwrap();
+        store
+            .upsert_relation(&make_relation(
+                unrelated.id,
+                stdlib.id,
+                RelationKind::UsesType,
+            ))
+            .unwrap();
+
+        let args = |include: bool| {
+            [
+                ("focal", serde_json::json!(focal.id.to_string())),
+                ("direction", serde_json::json!("both")),
+                ("depth", serde_json::json!(3)),
+                ("include_type_edges", serde_json::json!(include)),
+            ]
+        };
+
+        let closed = traced_payload(&store, &args(false));
+        let mut closed_names = traced_step_names(&closed);
+        closed_names.sort();
+        assert_eq!(
+            closed_names,
+            vec!["Any".to_string(), "WikiLink".to_string()]
+        );
+        assert_eq!(closed["terminal_annotation_steps"], serde_json::json!(1));
+        assert_eq!(closed["terminal_external_steps"], serde_json::json!(1));
+        assert_eq!(closed["include_type_edges"], serde_json::json!(false));
+
+        let open = traced_payload(&store, &args(true));
+        let mut open_names = traced_step_names(&open);
+        open_names.sort();
+        assert_eq!(
+            open_names,
+            vec![
+                "Any".to_string(),
+                "WikiLink".to_string(),
+                "normalize_target".to_string(),
+            ],
+            "the repo type opens and the stdlib one does not"
+        );
+        assert_eq!(open["terminal_annotation_steps"], serde_json::Value::Null);
+        assert_eq!(
+            open["terminal_external_steps"],
+            serde_json::json!(1),
+            "no parameter makes a symbol this repository does not define walkable"
+        );
+        assert!(
+            !open_names.iter().any(|name| name == "unrelated"),
+            "the other annotator of the stdlib type is not in this flow: {open_names:?}"
+        );
+    }
+
+    /// The recoverable half is disclosed on the envelope; the unrecoverable one
+    /// is not, because no parameter would produce more of it.
+    #[test]
+    fn a_withheld_type_hop_is_named_in_completeness_limits_and_an_external_leaf_is_not() {
+        let (store, focal_id) = annotation_hub_store(2);
+        let mut args = HashMap::new();
+        args.insert("focal".to_string(), serde_json::json!(focal_id.to_string()));
+        args.insert("direction".to_string(), serde_json::json!("both"));
+        let external_only = parsed_response(&crate::finalize_with_envelope(
+            handle_trace_data_flow(&args, &store).unwrap(),
+            populated_ready_envelope(),
+            "trace_data_flow",
+        ));
+        let limits = external_only["_kin"]["completeness"]["limits"].to_string();
+        assert!(
+            !limits.contains("type_annotation_edges_not_walked"),
+            "an external leaf is not a shortfall a parameter can repair: {limits}"
+        );
+
+        let annotated = InMemoryGraph::new();
+        // The witness is what makes this fixture's `calls` class present, and
+        // therefore its completeness `complete` and its bound `exact`. Without
+        // it both runs below read `partial`/`at_least` for reasons that have
+        // nothing to do with type edges, and the comparison could not detect a
+        // label that decided either.
+        seed_cross_file_call_witness(&annotated);
+        let focal = make_entity("ParsedNote", "src/notes.py");
+        let repo_type = make_entity("WikiLink", "src/links.py");
+        annotated.upsert_entity(&focal).unwrap();
+        annotated.upsert_entity(&repo_type).unwrap();
+        annotated
+            .upsert_relation(&make_relation(
+                focal.id,
+                repo_type.id,
+                RelationKind::UsesType,
+            ))
+            .unwrap();
+        let annotated_trace = |include_type_edges: bool| {
+            let mut args = HashMap::new();
+            args.insert("focal".to_string(), serde_json::json!(focal.id.to_string()));
+            args.insert(
+                "include_type_edges".to_string(),
+                serde_json::json!(include_type_edges),
+            );
+            parsed_response(&crate::finalize_with_envelope(
+                handle_trace_data_flow(&args, &annotated).unwrap(),
+                populated_ready_envelope(),
+                "trace_data_flow",
+            ))
+        };
+
+        let withheld = annotated_trace(false);
+        assert_eq!(
+            withheld["_kin"]["completeness"]["status"],
+            serde_json::json!("complete"),
+            "the fixture must start complete or the comparison below cannot detect a flip"
+        );
+        let limits = withheld["_kin"]["completeness"]["limits"].to_string();
+        assert!(
+            limits.contains("type_annotation_edges_not_walked"),
+            "a withheld type hop is disclosed: {limits}"
+        );
+
+        // Compared against the same walk with the hop taken, rather than
+        // asserted against a literal. `bound` and `status` describe the edge
+        // coverage of the graph under test, which this fixture is too small to
+        // make `complete`, so a literal would be asserting the fixture rather
+        // than the claim. The claim is that the label is disclosure: it must
+        // move neither field.
+        let opened = annotated_trace(true);
+        assert!(
+            !opened["_kin"]["completeness"]["limits"]
+                .to_string()
+                .contains("type_annotation_edges_not_walked"),
+            "the label describes a hop that was withheld, and this one was not"
+        );
+        assert_eq!(
+            withheld["_kin"]["completeness"]["bound"], opened["_kin"]["completeness"]["bound"],
+            "disclosure only: declining a type hop must not make an honest chain read as a floor"
+        );
+        assert_eq!(
+            withheld["_kin"]["completeness"]["status"], opened["_kin"]["completeness"]["status"],
+            "disclosure only: a limit label must not decide the completeness status"
+        );
+    }
+
     /// The measured fan-out inversion on this arm: a node whose callees include
     /// two in its own file, a distant method, a test double, and a file-less
     /// import placeholder.
@@ -6195,6 +7083,7 @@ mod tests {
             embeddings_pending: embeddings.pending,
             embeddings_total: embeddings.total,
             embedding_index_keys: None,
+            durable_entity_count: None,
         };
         let result =
             handle_daemon_graph_status_observation(GraphStatusScope::TemporalSession, observation)
@@ -6235,6 +7124,7 @@ mod tests {
                 embeddings_pending: 0,
                 embeddings_total: 2,
                 embedding_index_keys: None,
+                durable_entity_count: None,
             },
         )
         .expect_err("the direct daemon boundary must reject impossible coverage");
@@ -6265,6 +7155,7 @@ mod tests {
                 embeddings_pending: 0,
                 embeddings_total: 49,
                 embedding_index_keys: Some(89),
+                durable_entity_count: None,
             },
         )
         .expect("a stale-but-covered graph is a reportable observation");
@@ -6285,6 +7176,7 @@ mod tests {
                 embeddings_pending: 0,
                 embeddings_total: 49,
                 embedding_index_keys: Some(49),
+                durable_entity_count: None,
             },
         )
         .unwrap();
@@ -6303,6 +7195,7 @@ mod tests {
                 embeddings_pending: 12,
                 embeddings_total: 12,
                 embedding_index_keys: None,
+                durable_entity_count: None,
             },
         )
         .unwrap();
@@ -6329,6 +7222,7 @@ mod tests {
                 embeddings_pending: 0,
                 embeddings_total: 10,
                 embedding_index_keys: Some(9),
+                durable_entity_count: None,
             },
         )
         .expect_err("an index below its own covered keys is not a reportable observation");

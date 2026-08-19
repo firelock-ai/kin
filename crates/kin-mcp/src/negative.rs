@@ -176,6 +176,18 @@ fn spec_for(tool: &str) -> Option<RetrievalSpec> {
     Some(spec)
 }
 
+/// Which substrate's completeness gates this tool, or `None` for a tool that is
+/// not negative-capable retrieval.
+///
+/// The one reader outside this module is [`crate::envelope::Completeness`],
+/// which needs the same per-tool substrate answer to say what "complete" means
+/// for an answer. Serving it from [`spec_for`] keeps one registry: a retrieval
+/// tool declares what it reads once and both the absence verdict and the
+/// completeness signal follow from that declaration.
+pub(crate) fn negative_class_for(tool: &str) -> Option<NegativeClass> {
+    spec_for(tool).map(|spec| spec.class)
+}
+
 /// The cross-file edge classes each tool's ABSENCE claim depends on: the
 /// per-tool dependency map, in code, so authority can only be granted for a
 /// substrate the tool actually reads.
@@ -202,7 +214,7 @@ fn spec_for(tool: &str) -> Option<RetrievalSpec> {
 /// A tool absent from the map contributes no classes, so a new retrieval tool
 /// starts with no edge-derived authority to inherit and has to declare what it
 /// reads to earn one.
-fn absence_cross_file_classes(tool: &str, payload: &Value) -> Vec<String> {
+pub(crate) fn absence_cross_file_classes(tool: &str, payload: &Value) -> Vec<String> {
     match tool {
         "find_references" | "bulk_check_references" => payload
             .get("relation_kinds")
@@ -219,6 +231,44 @@ fn absence_cross_file_classes(tool: &str, payload: &Value) -> Vec<String> {
         "trace_data_flow" | "impact_analysis" => reference_classes(),
         _ => Vec::new(),
     }
+}
+
+/// Whether `tool`'s ABSENCE claim is a statement about one language's extracted
+/// graph, and so cannot outrun what this build can resolve for that language.
+///
+/// Separate from [`absence_cross_file_classes`] because the two facts are
+/// independent: a tool can traverse no edge at all and still be claiming
+/// something about a language's graph. `semantic_search` is exactly that shape,
+/// and it is why FIR-2430 happened. It filters declarations by name, kind,
+/// language and role, declares no edge class, and therefore cleared the whole
+/// gate `find_references` had just refused to clear on the same repository in
+/// the same session: `semantic_search(query: "utils", kind: "module")` on
+/// expressjs/express certified `safe_to_conclude_absent: true` while
+/// `lib/utils.js` sat in the tree holding nine entities.
+///
+/// | tool | language-scoped | why |
+/// |---|---|---|
+/// | `semantic_search` | yes | "no declaration carries this name/kind" is a claim about what the extractor admitted as an entity for that language |
+/// | `find_dead_code_seeded` | yes | its seed match is the same name/kind filter over the same entity index |
+/// | `graph_neighborhood` | yes | an empty neighborhood for a focal that IS in the graph claims nothing reaches it, which is a claim about that language's edges |
+/// | `find_references`, `bulk_check_references`, `trace_data_flow`, `impact_analysis` | yes | already gated this way by FIR-2404; the flag records the fact rather than changing it |
+/// | `semantic_locate` | no | its payload is built by the daemon's own locate route and publishes no observation, so declaring a dependency here would make every empty ranking inconclusive on evidence nothing collected; its absence stays gated on complete embedding coverage, and its unnamed-ranking arm is never certifiable at all |
+/// | `dead_code` | no | its empty result is the INVERSE claim ("nothing unreachable"), and a language this build cannot resolve produces MORE candidates rather than fewer |
+/// | `entity_history` | no | reads change history, which no language server contributes to |
+///
+/// A tool absent from this list is not language-scoped, so a new retrieval tool
+/// starts with no authority to inherit and has to declare what it reads.
+fn absence_is_language_scoped(tool: &str) -> bool {
+    matches!(
+        tool,
+        "find_references"
+            | "bulk_check_references"
+            | "trace_data_flow"
+            | "impact_analysis"
+            | "semantic_search"
+            | "find_dead_code_seeded"
+            | "graph_neighborhood"
+    )
 }
 
 /// The default reference edge classes, matching `default_reference_kinds` on the
@@ -260,7 +310,7 @@ fn reference_classes() -> Vec<String> {
 /// A query that asked for no load-bearing class falls back to the classes it did
 /// ask for, so an `imports`-only or `references`-only query is still gated on
 /// what it actually read rather than on nothing.
-fn load_bearing_classes(requested: &[String]) -> Vec<String> {
+pub(crate) fn load_bearing_classes(requested: &[String]) -> Vec<String> {
     let load_bearing: Vec<String> = requested
         .iter()
         .filter(|class| class.as_str() == "calls")
@@ -273,14 +323,25 @@ fn load_bearing_classes(requested: &[String]) -> Vec<String> {
     }
 }
 
-/// Why the graph cannot certify this absence over the edge classes the query
-/// reads, or `None` when every class the focal could plausibly be reached
-/// through is demonstrably present.
+/// Why the graph cannot certify this absence, or `None` when every substrate the
+/// claim actually rests on is demonstrably present.
 ///
-/// Two gates, and an answer has to clear both. Every load-bearing requested class
-/// must be observed present ([`load_bearing_classes`] says which, and why the set
-/// is narrower than it looks), and the language must be one this build can
-/// produce reference edges for at all.
+/// This is the one gate. Every negative-capable tool passes through it and is
+/// checked against what it DECLARES it reads: [`absence_cross_file_classes`] for
+/// the edges an absence is read off, and [`absence_is_language_scoped`] for
+/// whether the claim is about a language's extracted graph at all. A tool that
+/// declares either and publishes no observation is inconclusive by construction,
+/// so authority can never be inherited by a tool that has not earned it. Before
+/// FIR-2430 the whole gate was skipped for any tool declaring no edge class,
+/// which is how `semantic_search` reached `structural_authoritative` from daemon
+/// health alone, minutes after `find_references` refused the same absence on the
+/// same repository.
+///
+/// Three gates, and an answer has to clear all of them. Every load-bearing
+/// requested class must be observed present ([`load_bearing_classes`] says which,
+/// and why the set is narrower than it looks); a filter must have selected a
+/// region the index actually populated; and the language must be one this build
+/// can resolve at all.
 ///
 /// The second gate is what FIR-2404 added. A witness proves the extractor links
 /// SOME class across files for the language; it never proved the language's
@@ -299,7 +360,7 @@ fn load_bearing_classes(requested: &[String]) -> Vec<String> {
 /// before it can certify anything.
 ///
 /// The extraction side grew a richer statement of the same fact under FIR-2354:
-/// `kin_core::cross_file_coverage::CrossFileCoverage`, whole-graph counts plus a
+/// `kin_core::reference_coverage::ReferenceEdgeCoverage`, whole-graph counts plus a
 /// per-language entry carrying `reference_enrichment`, which knows something a
 /// witness scan cannot observe from the graph alone. Half of that now reaches
 /// this gate: [`crate::edge_coverage`] publishes `reference_enrichment`, and the
@@ -312,9 +373,10 @@ fn load_bearing_classes(requested: &[String]) -> Vec<String> {
 /// `absent` for every class and a language's zero to `absent` for that language;
 /// [`crate::edge_coverage`] can then be retired, since it is called from exactly
 /// three payload builders.
-fn edge_coverage_gap(tool: &str, payload: &Value) -> Option<String> {
+fn absence_coverage_gap(tool: &str, payload: &Value) -> Option<String> {
     let requested = absence_cross_file_classes(tool, payload);
-    if requested.is_empty() {
+    let language_scoped = absence_is_language_scoped(tool);
+    if requested.is_empty() && !language_scoped {
         return None;
     }
     let named = requested.join(", ");
@@ -323,11 +385,18 @@ fn edge_coverage_gap(tool: &str, payload: &Value) -> Option<String> {
         .get(crate::edge_coverage::EDGE_COVERAGE_KEY)
         .and_then(Value::as_object)
     else {
-        return Some(format!(
-            "edge_coverage_unreported: this answer did not report whether the graph holds \
-             cross-file {named} edges, so an empty result cannot be distinguished from a graph \
-             that could not have found a reference in the first place"
-        ));
+        return Some(if requested.is_empty() {
+            "absence_coverage_unreported: this answer did not report which languages the absence \
+             claim spans or whether this build can resolve their programs, so an empty result \
+             cannot be distinguished from a scope the extractor never populated"
+                .to_string()
+        } else {
+            format!(
+                "edge_coverage_unreported: this answer did not report whether the graph holds \
+                 cross-file {named} edges, so an empty result cannot be distinguished from a graph \
+                 that could not have found a reference in the first place"
+            )
+        });
     };
     let language = coverage
         .get("language")
@@ -336,56 +405,90 @@ fn edge_coverage_gap(tool: &str, payload: &Value) -> Option<String> {
         .unwrap_or("an unreported language");
     let states = coverage.get("classes").and_then(Value::as_object);
 
-    let required = load_bearing_classes(&requested);
-    let absent = classes_in_state(&required, states, "absent");
-    let unknown = classes_in_state(&required, states, "unknown");
-    let present = classes_in_state(&requested, states, "present");
-
     let mut gaps: Vec<String> = Vec::new();
-    if !absent.is_empty() {
-        let missing = absent.join(", ");
-        // Naming what IS present matters as much as naming what is missing. The
-        // reader's next question after "no imports edges" is "then what did the
-        // 258 entities this scan examined prove", and leaving that unanswered is
-        // how a present sibling class came to look like coverage for the absent
-        // one in the first place.
-        let observed = if present.is_empty() {
-            String::new()
-        } else {
-            format!(
-                " (cross-file {} edges are present and do not stand in for {missing}: an entity \
-                 other files reach only through {missing} is invisible to a graph holding none)",
-                present.join(", ")
-            )
-        };
+
+    if !requested.is_empty() {
+        let required = load_bearing_classes(&requested);
+        let absent = classes_in_state(&required, states, "absent");
+        let unknown = classes_in_state(&required, states, "unknown");
+        let present = classes_in_state(&requested, states, "present");
+
+        if !absent.is_empty() {
+            let missing = absent.join(", ");
+            // Naming what IS present matters as much as naming what is missing. The
+            // reader's next question after "no imports edges" is "then what did the
+            // 258 entities this scan examined prove", and leaving that unanswered is
+            // how a present sibling class came to look like coverage for the absent
+            // one in the first place.
+            let observed = if present.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " (cross-file {} edges are present and do not stand in for {missing}: an \
+                     entity other files reach only through {missing} is invisible to a graph \
+                     holding none)",
+                    present.join(", ")
+                )
+            };
+            gaps.push(format!(
+                "cross_file_edges_absent: the graph holds no cross-file {missing} edges for \
+                 {language}{observed}, so a use that reaches the target through {missing} could \
+                 not have been found and an empty result says nothing about whether the target is \
+                 used; the gap is in extraction/enrichment for that language, not in the code"
+            ));
+        } else if !unknown.is_empty()
+            || coverage.get("budget_exhausted").and_then(Value::as_bool) == Some(true)
+        {
+            gaps.push(format!(
+                "edge_coverage_unknown: whether the graph holds cross-file {named} edges for \
+                 {language} could not be established, so an empty result may mean the query had \
+                 no edges to answer from rather than that the target is unused"
+            ));
+        }
+    }
+
+    // A filter that selected a region the graph does not populate answers every
+    // query in that region identically, so its empty result is a fact about the
+    // index. This is the gate the `kind` filter needed: certifying "no module
+    // named utils" is a statement about the modules the extractor admitted, and
+    // it cannot be read as one about the repository until the region holds
+    // something. Reported only when the answer measured it, because an
+    // unmeasured region is unknown rather than empty.
+    if coverage.get("scope_entities").and_then(Value::as_u64) == Some(0) {
         gaps.push(format!(
-            "cross_file_edges_absent: the graph holds no cross-file {missing} edges for \
-             {language}{observed}, so a use that reaches the target through {missing} could not \
-             have been found and an empty result says nothing about whether the target is used; \
-             the gap is in extraction/enrichment for that language, not in the code"
-        ));
-    } else if !unknown.is_empty()
-        || coverage.get("budget_exhausted").and_then(Value::as_bool) == Some(true)
-    {
-        gaps.push(format!(
-            "edge_coverage_unknown: whether the graph holds cross-file {named} edges for \
-             {language} could not be established, so an empty result may mean the query had no \
-             edges to answer from rather than that the target is unused"
+            "absence_scope_empty: the graph holds no entity at all under the filter this query \
+             applied for {language}, so an empty result describes the region the index populated \
+             rather than the code"
         ));
     }
 
-    // Independent of what the scan measured. A class that cannot be produced at
-    // all is not a class that happened to come back empty, and no amount of
-    // scanning or re-indexing will ever move it, so an absence over a language
-    // this build cannot enrich is never certifiable however healthy its calls and
-    // imports look.
+    // Independent of what any scan measured. A language this build cannot
+    // resolve is not one that happened to come back empty, and no amount of
+    // scanning or re-indexing will ever move it.
+    //
+    // The wording splits on what the tool actually claimed, because a correct
+    // verdict beside an unrelated reason is the failure this module exists to
+    // prevent. For a tool reading reference edges the limit is that those edges
+    // cannot exist; for a tool reading the entity index the limit is that
+    // nothing resolved the program behind the declarations it filtered, so a
+    // name-and-kind miss cannot separate a declaration the repository lacks from
+    // one the extractor never admitted as an entity of that kind.
     if coverage.get("reference_enrichment").and_then(Value::as_str) == Some("unsupported") {
-        gaps.push(format!(
-            "reference_enrichment_unsupported: this build wires no language-server adapter for \
-             {language}, so cross-file reference and override edges cannot exist for it at all, \
-             and an empty result cannot separate a symbol nothing uses from one this graph could \
-             never have linked"
-        ));
+        gaps.push(if requested.is_empty() {
+            format!(
+                "entity_index_unresolved: this build wires no language-server adapter for \
+                 {language}, so nothing resolves the program behind its parsed declarations, and \
+                 an empty name/kind filter cannot separate a declaration the repository does not \
+                 have from one the extractor did not admit as an entity of that kind"
+            )
+        } else {
+            format!(
+                "reference_enrichment_unsupported: this build wires no language-server adapter \
+                 for {language}, so cross-file reference and override edges cannot exist for it \
+                 at all, and an empty result cannot separate a symbol nothing uses from one this \
+                 graph could never have linked"
+            )
+        });
     }
 
     (!gaps.is_empty()).then(|| gaps.join("; "))
@@ -427,16 +530,21 @@ fn classes_in_state<'a>(
 /// `edge_coverage:references_absent` beside it is saying something exact: the
 /// graph links calls and imports across files, it holds no reference edges, and
 /// the claim rests on the first fact rather than the second.
-fn edge_coverage_degradation_labels(tool: &str, payload: &Value) -> Vec<String> {
+pub(crate) fn edge_coverage_degradation_labels(tool: &str, payload: &Value) -> Vec<String> {
     let requested = absence_cross_file_classes(tool, payload);
-    if requested.is_empty() {
+    let language_scoped = absence_is_language_scoped(tool);
+    if requested.is_empty() && !language_scoped {
         return Vec::new();
     }
     let Some(coverage) = payload
         .get(crate::edge_coverage::EDGE_COVERAGE_KEY)
         .and_then(Value::as_object)
     else {
-        return vec!["edge_coverage:unreported".to_string()];
+        return vec![if requested.is_empty() {
+            "absence_coverage:unreported".to_string()
+        } else {
+            "edge_coverage:unreported".to_string()
+        }];
     };
     let states = coverage.get("classes").and_then(Value::as_object);
     let mut labels: Vec<String> = requested
@@ -446,6 +554,9 @@ fn edge_coverage_degradation_labels(tool: &str, payload: &Value) -> Vec<String> 
             state => Some(format!("edge_coverage:{class}_{state}")),
         })
         .collect();
+    if coverage.get("scope_entities").and_then(Value::as_u64) == Some(0) {
+        labels.push("absence_coverage:scope_empty".to_string());
+    }
     if coverage.get("reference_enrichment").and_then(Value::as_str) == Some("unsupported") {
         labels.push("edge_coverage:reference_enrichment_unsupported".to_string());
     }
@@ -796,6 +907,85 @@ fn degraded_signals(tool: &str, payload: &Value, envelope: &Envelope) -> Vec<Str
     labels
 }
 
+/// Which substrate's completeness this verdict actually rests on.
+///
+/// Published beside the verdict because the pairing FIR-2430 objected to was a
+/// true statement of the wrong fact: the express negative certified an absence
+/// in the same sentence that read "semantic coverage unknown", and both halves
+/// were accurate. Embedding coverage was never what backed that claim. A
+/// negative that names its basis and recites THAT can no longer put an unknown
+/// coverage beside a certification the coverage did not back.
+fn coverage_basis(class: NegativeClass) -> &'static str {
+    match class {
+        NegativeClass::Semantic => "embeddings",
+        NegativeClass::Structural => "graph_structure",
+    }
+}
+
+/// The coverage the verdict rests on, as the clause [`build_advice`] recites.
+///
+/// The embedding wording is unchanged for the tools embedding coverage actually
+/// gates. A structural claim recites the observation its own gate read, and when
+/// no observation is in hand it recites the graph state the structural gate
+/// checked, which is exactly as much as that verdict knows.
+fn coverage_clause(class: NegativeClass, payload: &Value, envelope: &Envelope) -> String {
+    match class {
+        NegativeClass::Semantic => match &envelope.semantic_coverage {
+            Some(coverage) if coverage.total > 0 => {
+                let percent = (coverage.indexed as f64 / coverage.total as f64) * 100.0;
+                format!("semantic coverage {percent:.1}%")
+            }
+            Some(_) => "semantic coverage complete".to_string(),
+            None => "semantic coverage unknown".to_string(),
+        },
+        NegativeClass::Structural => structural_coverage_clause(payload, envelope),
+    }
+}
+
+/// What a structural absence observed about the graph it is claiming over.
+fn structural_coverage_clause(payload: &Value, envelope: &Envelope) -> String {
+    if let Some(coverage) = payload
+        .get(crate::edge_coverage::EDGE_COVERAGE_KEY)
+        .and_then(Value::as_object)
+    {
+        let language = coverage
+            .get("language")
+            .and_then(Value::as_str)
+            .filter(|language| !language.trim().is_empty())
+            .unwrap_or("an unreported language");
+        let classes = coverage
+            .get("classes")
+            .and_then(Value::as_object)
+            .map(|states| {
+                states
+                    .iter()
+                    .map(|(class, state)| {
+                        format!("{class} {}", state.as_str().unwrap_or("unknown"))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .filter(|rendered| !rendered.is_empty())
+            .unwrap_or_else(|| "this answer reads no edge class".to_string());
+        let enrichment = match coverage.get("reference_enrichment").and_then(Value::as_str) {
+            Some("unsupported") => "no language-server adapter for it in this build",
+            Some("available") => "a language server available for it",
+            Some("no_language_server") => {
+                "an adapter wired for it but no language server installed"
+            }
+            _ => "its language-server availability unprobed",
+        };
+        return format!("graph coverage for {language} ({classes}; {enrichment})");
+    }
+    match (
+        envelope.graph_state.initialized,
+        envelope.graph_state.loaded,
+    ) {
+        (Some(true), Some(true)) => "a graph reported initialized and loaded".to_string(),
+        _ => "an unconfirmed graph state".to_string(),
+    }
+}
+
 /// A human sentence spelling out "absent as-of X, coverage Y%, degraded Z" and
 /// the actionable consequence, so the negative is legible without cross-reading
 /// the envelope. `subject` and `consequence` are passed rather than read off a
@@ -807,20 +997,13 @@ fn degraded_signals(tool: &str, payload: &Value, envelope: &Envelope) -> Vec<Str
 fn build_advice(
     subject: &str,
     consequence: &str,
+    coverage: &str,
     envelope: &Envelope,
     degraded: &[String],
 ) -> String {
     let as_of = match &envelope.graph_as_of {
         Some(value) => format!("graph as-of {value}"),
         None => "an unversioned graph snapshot".to_string(),
-    };
-    let coverage = match &envelope.semantic_coverage {
-        Some(coverage) if coverage.total > 0 => {
-            let percent = (coverage.indexed as f64 / coverage.total as f64) * 100.0;
-            format!("semantic coverage {percent:.1}%")
-        }
-        Some(_) => "semantic coverage complete".to_string(),
-        None => "semantic coverage unknown".to_string(),
     };
     let degraded = if degraded.is_empty() {
         "no degraded signals".to_string()
@@ -1065,13 +1248,14 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
     let (mut trustworthy, trust_reason) = envelope.negative_trust(spec.class);
     let mut trust_reason = trust_reason.to_string();
 
-    // The edge-class gate leads every other gap because it is the one that can
+    // The coverage gate leads every other gap because it is the one that can
     // make the query structurally unable to answer. A graph holding no
-    // cross-file edges of the class a reference query reads returns an empty
-    // array for every symbol in it, healthy or not, so no later gap is the
+    // cross-file edges of the class a reference query reads, or no resolved
+    // program behind the declarations a name filter reads, returns an empty
+    // answer for every symbol in it, healthy or not, so no later gap is the
     // limiting factor when this one applies and none of them may be reported as
     // if it were.
-    if let Some(gap) = edge_coverage_gap(tool, payload) {
+    if let Some(gap) = absence_coverage_gap(tool, payload) {
         push_gap(&mut trustworthy, &mut trust_reason, gap);
     }
 
@@ -1265,6 +1449,7 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
     };
 
     let degraded_signals = degraded_signals(tool, payload, envelope);
+    let coverage_clause = coverage_clause(spec.class, payload, envelope);
 
     let mut negative = Map::new();
     negative.insert("kind".to_string(), json!(kind));
@@ -1286,11 +1471,19 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
         envelope.graph_as_of.clone().unwrap_or(Value::Null),
     );
     negative.insert("semantic_coverage".to_string(), coverage_value(envelope));
+    // Which coverage the verdict rests on. `semantic_coverage` above stays what
+    // it always was, the envelope's embedding reading, and this says whether it
+    // is the reading that decided anything here.
+    negative.insert(
+        "coverage_basis".to_string(),
+        json!(coverage_basis(spec.class)),
+    );
     negative.insert(
         "advice".to_string(),
         json!(build_advice(
             subject,
             &consequence,
+            &coverage_clause,
             envelope,
             &degraded_signals
         )),
@@ -1423,10 +1616,15 @@ pub fn resolution_miss_for(tool: &str, message: &str, envelope: &Envelope) -> Op
     );
     negative.insert("semantic_coverage".to_string(), coverage_value(envelope));
     negative.insert(
+        "coverage_basis".to_string(),
+        json!(coverage_basis(NegativeClass::Structural)),
+    );
+    negative.insert(
         "advice".to_string(),
         json!(build_advice(
             subject,
             &consequence,
+            &coverage_clause(NegativeClass::Structural, &Value::Null, envelope),
             envelope,
             &degraded_signals
         )),
@@ -1491,6 +1689,55 @@ mod tests {
             "reference_enrichment": "unknown",
             "budget_exhausted": false,
             "entities_examined": 2,
+        })
+    }
+
+    /// The scope observation a tool that traverses no edge publishes for an
+    /// absence, over a language this build CAN resolve.
+    ///
+    /// The shape is the one [`crate::edge_coverage::observe_absence_scope`]
+    /// emits: no edge classes, because this claim is not about edges, and the
+    /// one fact the verdict rests on. Without it in the payload an absence has
+    /// no evidence that the query could have found anything, which is the
+    /// FIR-2430 failure, so every fixture asserting an authoritative absence for
+    /// one of these tools carries it.
+    fn resolvable_language_scope(scope_entities: Option<usize>) -> Value {
+        let mut observation = json!({
+            "scope": "absence_scope",
+            "language": "Python",
+            "requested_classes": [],
+            "classes": {},
+            "cross_file_classes": [],
+            "reference_enrichment": "unknown",
+            "budget_exhausted": false,
+            "entities_examined": 0,
+            "scan": "skipped_no_edge_dependency",
+        });
+        if let Some(count) = scope_entities {
+            observation["scope_entities"] = json!(count);
+        }
+        observation
+    }
+
+    /// The same observation over a language this build wires no adapter for:
+    /// the express shape, where `imports` and `references` cannot exist at all.
+    fn unresolvable_language_scope(scope_entities: Option<usize>) -> Value {
+        let mut observation = resolvable_language_scope(scope_entities);
+        observation["language"] = json!("JavaScript");
+        observation["reference_enrichment"] = json!("unsupported");
+        observation
+    }
+
+    /// An empty `semantic_search` page over `scope`, the payload shape the
+    /// handler builds for a filter that matched no declaration.
+    fn empty_search_page(scope: Value) -> Value {
+        json!({
+            "query": "utils",
+            "limit": 20,
+            "total_matches": 0,
+            "truncated": false,
+            "results": [],
+            "edge_coverage": scope,
         })
     }
 
@@ -1652,8 +1899,10 @@ mod tests {
         // made every empty search report `coverage_unknown` and advise
         // "re-check after embedding is complete" — including on a store whose
         // embeddings were complete. It answers to the graph gate instead, which
-        // is the substrate it actually reads.
-        let payload = json!({ "results": [] });
+        // is the substrate it actually reads. Since FIR-2430 that substrate has
+        // to be OBSERVED rather than assumed, so the page carries the scope its
+        // filter selected; embedding coverage is still not what decides.
+        let payload = empty_search_page(resolvable_language_scope(Some(12)));
         let negative = negative_for("semantic_search", &payload, &structural_ready_envelope())
             .expect("empty results yields a negative");
         assert_eq!(negative["safe_to_conclude_absent"], json!(true));
@@ -1662,11 +1911,211 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("structural_authoritative"));
+        assert_eq!(negative["semantic_coverage"], Value::Null);
+        assert_eq!(negative["coverage_basis"], json!("graph_structure"));
         // Negative control on the same tool: an unloaded graph must still be
         // inconclusive, so the gate is one that can fail.
         let unloaded = Envelope::daemon().with_health(&json!({ "graph_loaded": false }));
         let negative = negative_for("semantic_search", &payload, &unloaded).unwrap();
         assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+    }
+
+    #[test]
+    fn a_javascript_search_absence_is_not_certified_without_reference_enrichment() {
+        // FIR-2430, the reported payload. `semantic_search(query: "utils",
+        // kind: "module")` on expressjs/express came back
+        // `safe_to_conclude_absent: true`, `trust: "authoritative"` while
+        // `lib/utils.js` sat in the tree holding nine entities. Minutes earlier
+        // `find_references` had refused to certify an absence on the same
+        // repository in the same session, because this build wires no
+        // language-server adapter for JavaScript. The gate reached one tool and
+        // not its sibling.
+        let payload = empty_search_page(unresolvable_language_scope(Some(29)));
+        let negative = negative_for("semantic_search", &payload, &structural_ready_envelope())
+            .expect("empty results yields a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert_eq!(negative["trust"], json!("inconclusive"));
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            reason.starts_with("entity_index_unresolved"),
+            "the limiting factor leads the reason: {reason}"
+        );
+        assert!(
+            reason.contains("JavaScript"),
+            "the reason names the language it is about: {reason}"
+        );
+        // The reason has to be about what this tool actually read. A name/kind
+        // filter traverses no reference edge, so borrowing the sibling's
+        // sentence would hand back a correct verdict beside an explanation of a
+        // mechanism this query never used.
+        assert!(
+            !reason.contains("cross-file reference and override edges"),
+            "semantic_search reads no edge, so its reason must not claim one: {reason}"
+        );
+        let advice = negative["advice"].as_str().unwrap();
+        assert!(advice.contains("Absence is NOT authoritative"), "{advice}");
+        assert!(
+            advice.contains("Limiting factor: entity_index_unresolved"),
+            "{advice}"
+        );
+        assert!(
+            negative["degraded_signals"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("edge_coverage:reference_enrichment_unsupported")),
+            "the shortfall the verdict rests on is disclosed: {negative}"
+        );
+    }
+
+    #[test]
+    fn a_resolvable_language_still_certifies_a_genuinely_absent_declaration() {
+        // The other direction, and the regression bar FIR-2404 set: the fix must
+        // not degrade into marking everything inconclusive. Python is a language
+        // this build wires an adapter for, so an empty name filter over a
+        // populated region is still a certifiable absence.
+        let payload = empty_search_page(resolvable_language_scope(Some(29)));
+        let negative = negative_for("semantic_search", &payload, &structural_ready_envelope())
+            .expect("empty results yields a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(true));
+        assert_eq!(negative["trust"], json!("authoritative"));
+        assert!(negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .contains("structural_authoritative"));
+    }
+
+    #[test]
+    fn a_kind_filter_that_selected_an_empty_region_certifies_nothing() {
+        // The second half of the FIR-2430 contract: a kind-filtered absence is a
+        // statement about the kind the index holds. Certifying "no schema named
+        // X" against a graph the extractor admitted no schema entity into at all
+        // answers for the index and not for the repository, and the language
+        // being one this build resolves does not change that.
+        let payload = empty_search_page(resolvable_language_scope(Some(0)));
+        let negative = negative_for("semantic_search", &payload, &structural_ready_envelope())
+            .expect("empty results yields a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(reason.starts_with("absence_scope_empty"), "{reason}");
+        assert!(negative["degraded_signals"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("absence_coverage:scope_empty")));
+        // Positive control on the same payload shape: one entity in the region
+        // and the same absence certifies, so the gate reads the count.
+        let populated = empty_search_page(resolvable_language_scope(Some(1)));
+        let negative = negative_for("semantic_search", &populated, &structural_ready_envelope())
+            .expect("empty results yields a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(true));
+    }
+
+    #[test]
+    fn an_authoritative_absence_never_recites_a_coverage_it_did_not_rest_on() {
+        // FIR-2430 contract item 3. The express envelope certified an absence in
+        // the same sentence that read "semantic coverage unknown". Both halves
+        // were true and the pairing was still wrong, because embedding coverage
+        // was never what backed a structural claim. A negative names the basis
+        // its verdict rests on and recites THAT, so an unknown coverage can no
+        // longer sit beside a certification it did not back.
+        let payload = empty_search_page(resolvable_language_scope(Some(29)));
+        let negative = negative_for("semantic_search", &payload, &structural_ready_envelope())
+            .expect("empty results yields a negative");
+        assert_eq!(negative["trust"], json!("authoritative"));
+        assert_eq!(negative["semantic_coverage"], Value::Null);
+        assert_eq!(negative["coverage_basis"], json!("graph_structure"));
+        let advice = negative["advice"].as_str().unwrap();
+        assert!(
+            !advice.contains("semantic coverage"),
+            "a structural verdict must not recite embedding coverage: {advice}"
+        );
+        assert!(
+            advice.contains("graph coverage for Python"),
+            "it recites the observation its own gate read: {advice}"
+        );
+
+        // The embedding-backed tools keep reciting embedding coverage, because
+        // for them it IS the basis.
+        let ranked = json!({ "query": "auth", "results": [], "total_ranked": 0 });
+        let negative = negative_for(
+            "semantic_locate",
+            &ranked,
+            &semantic_authoritative_envelope(),
+        )
+        .expect("empty results yields a negative");
+        assert_eq!(negative["coverage_basis"], json!("embeddings"));
+        assert!(negative["advice"]
+            .as_str()
+            .unwrap()
+            .contains("semantic coverage 100.0%"));
+    }
+
+    #[test]
+    fn the_neighborhood_and_the_seeded_scan_answer_to_the_same_gate() {
+        // The two siblings the same audit found. An empty neighborhood claims
+        // nothing reaches the focal, which for an incoming walk is the claim
+        // `find_references` makes; an empty seed match is the same name filter
+        // over the same entity index `semantic_search` reads. Both were
+        // certifying from daemon health alone.
+        let mut neighborhood = neighborhood_payload("in", 0);
+        neighborhood["edge_coverage"] = unresolvable_language_scope(None);
+        let negative = negative_for(
+            "graph_neighborhood",
+            &neighborhood,
+            &structural_ready_envelope(),
+        )
+        .expect("an indexed focal with no neighbors carries a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert!(negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("entity_index_unresolved"));
+
+        let seeded = json!({
+            "query": "utils",
+            "total_searched": 0,
+            "candidates": [],
+            "edge_coverage": unresolvable_language_scope(Some(29)),
+        });
+        let negative = negative_for(
+            "find_dead_code_seeded",
+            &seeded,
+            &structural_ready_envelope(),
+        )
+        .expect("an empty seed match carries a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert!(negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("entity_index_unresolved"));
+
+        // Positive control for both: a resolvable language certifies, so
+        // neither gate is one that always fires.
+        let mut neighborhood = neighborhood_payload("in", 0);
+        neighborhood["edge_coverage"] = resolvable_language_scope(None);
+        assert_eq!(
+            negative_for(
+                "graph_neighborhood",
+                &neighborhood,
+                &structural_ready_envelope()
+            )
+            .unwrap()["safe_to_conclude_absent"],
+            json!(true)
+        );
+        let seeded = json!({
+            "query": "utils",
+            "total_searched": 0,
+            "candidates": [],
+            "edge_coverage": resolvable_language_scope(Some(29)),
+        });
+        assert_eq!(
+            negative_for(
+                "find_dead_code_seeded",
+                &seeded,
+                &structural_ready_envelope()
+            )
+            .unwrap()["safe_to_conclude_absent"],
+            json!(true)
+        );
     }
 
     #[test]
@@ -1757,7 +2206,7 @@ mod tests {
             "initialized": true,
             "graph_entity_count": 0,
         }));
-        let payload = json!({ "results": [] });
+        let payload = empty_search_page(resolvable_language_scope(Some(12)));
         let negative = negative_for("semantic_search", &payload, &empty_graph)
             .expect("empty results yields a negative");
         assert_eq!(negative["safe_to_conclude_absent"], json!(false));
@@ -2071,20 +2520,74 @@ mod tests {
         );
     }
 
-    /// Tools that read no edges must not be gated by an edge observation they
-    /// have no way to publish. `semantic_locate` ranks embeddings and
-    /// `semantic_search` filters declarations, so their absences answer to their
-    /// own substrates and stay reachable.
+    /// The one gate reads two independent declarations, and a tool that
+    /// traverses no edge is still gated when its absence is a claim about a
+    /// language's extracted graph (FIR-2430). Before this, declaring no edge
+    /// class skipped the gate entirely, which is how `semantic_search` reached
+    /// `structural_authoritative` from daemon health alone.
     #[test]
-    fn tools_that_traverse_no_edges_are_not_gated_by_edge_coverage() {
-        assert!(edge_coverage_gap("semantic_locate", &json!({ "results": [] })).is_none());
-        assert!(edge_coverage_gap("semantic_search", &json!({ "results": [] })).is_none());
-        assert!(edge_coverage_gap("graph_neighborhood", &json!({ "relations": [] })).is_none());
-        assert!(edge_coverage_gap("entity_history", &json!([])).is_none());
-        assert!(edge_coverage_gap("dead_code", &json!([])).is_none());
+    fn a_tool_that_traverses_no_edges_is_still_gated_on_its_language_scope() {
+        // Language-scoped and publishing nothing: inconclusive by construction,
+        // and the reason names the missing observation rather than an edge class
+        // the tool never reads.
+        for tool in [
+            "semantic_search",
+            "find_dead_code_seeded",
+            "graph_neighborhood",
+        ] {
+            let gap = absence_coverage_gap(tool, &json!({ "results": [] }))
+                .unwrap_or_else(|| panic!("{tool} is language-scoped and must be gated"));
+            assert!(
+                gap.starts_with("absence_coverage_unreported"),
+                "{tool} names the missing scope observation: {gap}"
+            );
+            assert!(
+                !gap.contains("cross-file"),
+                "{tool} reads no edge class, so the reason must not name one: {gap}"
+            );
+        }
+        // Not language-scoped: `semantic_locate` publishes no observation from
+        // the daemon's own locate route and answers to embedding coverage;
+        // `dead_code`'s empty result is the inverse claim; `entity_history`
+        // reads change history. None of them may be gated on evidence nothing
+        // collected.
+        assert!(absence_coverage_gap("semantic_locate", &json!({ "results": [] })).is_none());
+        assert!(absence_coverage_gap("entity_history", &json!([])).is_none());
+        assert!(absence_coverage_gap("dead_code", &json!([])).is_none());
         // And an unknown tool inherits nothing: it declares no dependency, so it
         // is neither gated nor granted authority by this map.
-        assert!(edge_coverage_gap("some_future_tool", &json!({})).is_none());
+        assert!(absence_coverage_gap("some_future_tool", &json!({})).is_none());
+    }
+
+    /// The language-scope map is the contract, asserted directly rather than
+    /// only through the tools that consume it today.
+    #[test]
+    fn the_language_scope_map_names_every_absence_that_claims_over_a_language() {
+        for tool in [
+            "find_references",
+            "bulk_check_references",
+            "trace_data_flow",
+            "impact_analysis",
+            "semantic_search",
+            "find_dead_code_seeded",
+            "graph_neighborhood",
+        ] {
+            assert!(
+                absence_is_language_scoped(tool),
+                "{tool}'s absence is a claim about one language's extracted graph"
+            );
+        }
+        for tool in [
+            "semantic_locate",
+            "dead_code",
+            "entity_history",
+            "some_future_tool",
+        ] {
+            assert!(
+                !absence_is_language_scoped(tool),
+                "{tool} must not be gated on a language scope it never claims over"
+            );
+        }
     }
 
     /// The map is the contract, so it is asserted directly rather than only
@@ -2487,7 +2990,7 @@ mod tests {
             entities.push(json!({ "id": focal, "name": format!("neighbor{index}") }));
             relations.push(json!({ "src": focal, "dst": focal, "direction": "outgoing" }));
         }
-        json!({
+        let mut payload = json!({
             "focal_id": focal,
             "direction": direction,
             "depth": 2,
@@ -2495,7 +2998,15 @@ mod tests {
             "relation_count": relations.len(),
             "entities": entities,
             "relations": relations,
-        })
+        });
+        // The handler observes the focal's language on every walk that expanded
+        // no edge, so the fixture does too. Scoped without a count: a walk
+        // measures no region, and a count it did not take must not be published
+        // as a zero.
+        if relations.is_empty() {
+            payload["edge_coverage"] = resolvable_language_scope(None);
+        }
+        payload
     }
 
     /// The neighborhood always returns the focal itself, so keying its absence

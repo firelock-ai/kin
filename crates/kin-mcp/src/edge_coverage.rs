@@ -53,7 +53,7 @@
 
 use serde_json::{json, Map, Value};
 
-use kin_core::cross_file_coverage::{ReferenceEnrichment, ENRICHABLE_LANGUAGES};
+use kin_core::reference_coverage::{ReferenceEnrichment, ENRICHABLE_LANGUAGES};
 use kin_model::entity::Entity;
 use kin_model::graph::{EntityFilter, EntityStore};
 use kin_model::ids::{EntityId, FilePathId, LanguageId};
@@ -63,6 +63,12 @@ use kin_model::relation::RelationKind;
 /// observation. Read by [`crate::negative`]; additive to every payload it is
 /// attached to.
 pub const EDGE_COVERAGE_KEY: &str = "edge_coverage";
+
+/// Key inside the observation carrying the parsed-versus-resolved reading for
+/// the focal's language, when one could be measured. Read by
+/// [`crate::envelope::Completeness`] so a partial answer can say "1 of 5"
+/// instead of an unqualified "1".
+pub const REFERENCE_RESOLUTION_KEY: &str = "reference_resolution";
 
 /// How many entities may have their relations read while looking for a witness.
 ///
@@ -126,7 +132,42 @@ pub fn observe_cross_file_reference_coverage<S: EntityStore>(
     focal: &Entity,
     kinds: &[RelationKind],
 ) -> Value {
-    observe_cross_file_reference_coverage_for_languages(store, &[focal.language], kinds)
+    observe_cross_file_reference_coverage_witnessed(store, focal, kinds, &[])
+}
+
+/// [`observe_cross_file_reference_coverage`], told which classes the ANSWER
+/// itself already proved.
+///
+/// The observation is now attached to populated answers too (FIR-2357 item 1),
+/// because an answer that returned one row proved one edge exists and proved
+/// nothing about the class a missing caller would have come through. That is
+/// the founding case exactly: a single intra-file caller came back for a symbol
+/// five call sites reached, and the classes carrying the other four were absent.
+///
+/// Paying a full language scan on every populated answer would be a real cost
+/// for a fact the answer often already carries, so a caller that holds a
+/// cross-file row of class K passes K here and the scan is spared. A witness
+/// only ever raises a class from `unknown` to `present`; it never overturns a
+/// completed scan that observed one absent, so a witness the caller scoped
+/// wrongly can slow this down but cannot make it certify anything.
+///
+/// The caller's contract: pass a class only for an edge whose two endpoints sit
+/// in different files and whose source entity carries the focal's language,
+/// which is the same thing the scan below looks for.
+pub fn observe_cross_file_reference_coverage_witnessed<S: EntityStore>(
+    store: &S,
+    focal: &Entity,
+    kinds: &[RelationKind],
+    witnessed: &[RelationKind],
+) -> Value {
+    let mut observation = observe_cross_file_reference_coverage_for_languages_witnessed(
+        store,
+        &[focal.language],
+        kinds,
+        witnessed,
+    );
+    attach_reference_resolution(store, focal.language, &mut observation);
+    observation
 }
 
 /// Observe cross-file coverage across every language a batch of focals spans.
@@ -141,11 +182,35 @@ pub fn observe_cross_file_reference_coverage_for_languages<S: EntityStore>(
     languages: &[kin_model::ids::LanguageId],
     kinds: &[RelationKind],
 ) -> Value {
+    observe_cross_file_reference_coverage_for_languages_witnessed(store, languages, kinds, &[])
+}
+
+/// [`observe_cross_file_reference_coverage_for_languages`] with the answer's own
+/// witnesses, as documented on
+/// [`observe_cross_file_reference_coverage_witnessed`].
+pub fn observe_cross_file_reference_coverage_for_languages_witnessed<S: EntityStore>(
+    store: &S,
+    languages: &[kin_model::ids::LanguageId],
+    kinds: &[RelationKind],
+    witnessed: &[RelationKind],
+) -> Value {
     let requested = requested_classes(kinds);
+    let witnessed: Vec<RelationKind> = requested
+        .iter()
+        .copied()
+        .filter(|kind| witnessed.contains(kind))
+        .collect();
     let mut merged: Vec<(RelationKind, ClassState)> = requested
         .iter()
         .copied()
-        .map(|kind| (kind, ClassState::Unknown))
+        .map(|kind| {
+            let state = if witnessed.contains(&kind) {
+                ClassState::Present
+            } else {
+                ClassState::Unknown
+            };
+            (kind, state)
+        })
         .collect();
     let mut examined_total = 0usize;
     let mut any_budget_exhausted = false;
@@ -157,16 +222,34 @@ pub fn observe_cross_file_reference_coverage_for_languages<S: EntityStore>(
         observed_languages.push(*language);
     }
 
-    for (index, language) in observed_languages.iter().enumerate() {
-        let (states, examined, budget_exhausted) = observe_language(store, *language, &requested);
-        examined_total += examined;
-        any_budget_exhausted |= budget_exhausted;
-        for (slot, (_, state)) in merged.iter_mut().zip(states.iter()) {
-            slot.1 = if index == 0 {
-                *state
-            } else {
-                weakest(slot.1, *state)
-            };
+    // The scan exists to decide the classes the verdict rests on. When the
+    // answer already carried a witness for every one of them, running it buys a
+    // disclosure about classes nothing decides and costs a language-wide relation
+    // walk on the populated path, where there was no scan at all before.
+    let scan_needed = !deciding_classes_all_present(&merged);
+    if scan_needed {
+        for (index, language) in observed_languages.iter().enumerate() {
+            let (states, examined, budget_exhausted) =
+                observe_language(store, *language, &requested);
+            examined_total += examined;
+            any_budget_exhausted |= budget_exhausted;
+            for (slot, (_, state)) in merged.iter_mut().zip(states.iter()) {
+                slot.1 = if index == 0 {
+                    *state
+                } else {
+                    weakest(slot.1, *state)
+                };
+            }
+        }
+        // A witness raises `unknown` to `present` and stops there. A scan that
+        // ran to completion and observed a class absent is a stronger statement
+        // than one row's provenance, so a caller that scoped its witness wrongly
+        // can cost this a scan it did not need but can never buy an absence a
+        // certification would rest on.
+        for (kind, state) in merged.iter_mut() {
+            if *state == ClassState::Unknown && witnessed.contains(kind) {
+                *state = ClassState::Present;
+            }
         }
     }
 
@@ -205,7 +288,185 @@ pub fn observe_cross_file_reference_coverage_for_languages<S: EntityStore>(
         "reference_enrichment": reference_enrichment(&observed_languages),
         "budget_exhausted": any_budget_exhausted,
         "entities_examined": examined_total,
+        // How each verdict was reached, because "present" from a witness the
+        // answer carried and "present" from a completed scan are the same word
+        // for two different amounts of evidence.
+        "witnessed_by_answer": witnessed
+            .iter()
+            .map(|kind| class_name(*kind))
+            .collect::<Vec<_>>(),
+        "scan": if scan_needed {
+            "ran"
+        } else {
+            "skipped_answer_witnessed"
+        },
     })
+}
+
+/// Observe the language scope an absence claim covers, for a tool that
+/// traverses no edge to make it.
+///
+/// `semantic_search`, `find_dead_code_seeded` and `graph_neighborhood` answer
+/// from the entity index and the walk, not from a cross-file reference class, so
+/// the witness scan above measures nothing their verdict rests on. What their
+/// verdict does rest on is which languages the claim spans and whether this
+/// build can resolve their programs, which is the one fact
+/// [`reference_enrichment`] already answers. Publishing it under the same key
+/// the reference tools publish means one gate reads one observation rather than
+/// two shapes drifting apart.
+///
+/// `classes` is deliberately empty rather than absent: this observation asserts
+/// nothing about cross-file edges, and a class map full of `unknown` would read
+/// as a scan that failed instead of one that was never the question.
+///
+/// `scope_entities` is the count of entities the query's own filter selects with
+/// its name pattern removed, so a kind-filtered absence can state the coverage
+/// of that kind. `None` leaves it out entirely, because a region nothing counted
+/// is unknown rather than empty. A resolved count of zero says the filter
+/// selected a region the index never populated, which is a fact about the index.
+pub fn observe_absence_scope(languages: &[LanguageId], scope_entities: Option<usize>) -> Value {
+    let mut observed: Vec<LanguageId> = Vec::new();
+    for language in languages {
+        if !observed.contains(language) {
+            observed.push(*language);
+        }
+    }
+    let language = if observed.is_empty() {
+        "no resolved language".to_string()
+    } else {
+        observed
+            .iter()
+            .map(|language| format!("{language:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut observation = json!({
+        "scope": "absence_scope",
+        "language": language,
+        "requested_classes": Vec::<&str>::new(),
+        "classes": Map::new(),
+        "cross_file_classes": Vec::<&str>::new(),
+        "reference_enrichment": reference_enrichment(&observed),
+        "budget_exhausted": false,
+        "entities_examined": 0,
+        "scan": "skipped_no_edge_dependency",
+    });
+    if let Some(count) = scope_entities {
+        observation["scope_entities"] = json!(count);
+    }
+    observation
+}
+
+/// The distinct languages a resolved entity set spans, in first-seen order.
+pub fn languages_of(entities: &[Entity]) -> Vec<LanguageId> {
+    let mut languages: Vec<LanguageId> = Vec::new();
+    for entity in entities {
+        if !languages.contains(&entity.language) {
+            languages.push(entity.language);
+        }
+    }
+    languages
+}
+
+/// Whether every class the absence verdict rests on is already `present`.
+///
+/// Narrowed by [`crate::negative::load_bearing_classes`] rather than by a rule
+/// of its own: Kin mints no entity-level `Imports` edge, so a rule that waited
+/// for every requested class would never skip a scan and would report every
+/// answer on every healthy graph as short of coverage.
+fn deciding_classes_all_present(merged: &[(RelationKind, ClassState)]) -> bool {
+    let requested: Vec<String> = merged
+        .iter()
+        .map(|(kind, _)| class_name(*kind).to_string())
+        .collect();
+    let deciding = crate::negative::load_bearing_classes(&requested);
+    if deciding.is_empty() {
+        return false;
+    }
+    deciding.iter().all(|class| {
+        merged
+            .iter()
+            .any(|(kind, state)| class_name(*kind) == class && *state == ClassState::Present)
+    })
+}
+
+/// Attach the parsed-versus-resolved reading for `language` when the observation
+/// says a deciding class was not available (FIR-2357 item 2).
+///
+/// This is the count side of the completeness contract. `kin graph status`
+/// already reports it per language through
+/// [`kin_core::reference_coverage`], and that shipped measurement is reused here
+/// rather than re-derived, because two counters for one fact is precisely how a
+/// coverage figure and a coverage verdict come to disagree inside one response.
+///
+/// Scoped to the focal's language, which makes exactly the fields this reads
+/// exact: `parsed_call_sites` and `parsed_import_statements` are tallied off
+/// entities of that language, and `resolved_call_edges` / `resolved_import_edges`
+/// off their outgoing relations. The cross-file, intra-file and external split is
+/// NOT read here, because classifying a target requires the target's own entity
+/// and a language-scoped list does not carry targets in other languages, which
+/// would report a cross-language edge as external.
+///
+/// Attached only when a deciding class is short, so a healthy answer pays
+/// nothing for a ratio it does not need, and a shortfall gets the number that
+/// says how big it is.
+fn attach_reference_resolution<S: EntityStore>(
+    store: &S,
+    language: LanguageId,
+    observation: &mut Value,
+) {
+    let already_covered = observation
+        .get("classes")
+        .and_then(Value::as_object)
+        .map(|classes| {
+            let requested: Vec<String> = classes.keys().cloned().collect();
+            let deciding = crate::negative::load_bearing_classes(&requested);
+            !deciding.is_empty()
+                && deciding.iter().all(|class| {
+                    classes.get(class).and_then(Value::as_str) == Some(ClassState::Present.as_str())
+                })
+        })
+        .unwrap_or(false);
+    if already_covered {
+        return;
+    }
+
+    let Ok(entities) = store.query_entities(&EntityFilter {
+        languages: Some(vec![language]),
+        ..EntityFilter::default()
+    }) else {
+        return;
+    };
+    let Ok(coverage) =
+        kin_core::reference_coverage::collect_reference_edge_coverage_from(store, &entities)
+    else {
+        return;
+    };
+    let Some(measured) = coverage
+        .languages
+        .into_iter()
+        .find(|entry| entry.language == language.to_string())
+    else {
+        return;
+    };
+
+    // No `language` key here on purpose. The observation names the language one
+    // level up, and `kin_core` spells it lowercase where this object spells it
+    // capitalised, so carrying both would put two spellings of one fact inside
+    // one response for a reader to reconcile.
+    observation[REFERENCE_RESOLUTION_KEY] = json!({
+        "files": measured.files,
+        "files_measured": measured.files_measured,
+        // `null` when no file of this language carries a parse-side count. An
+        // unmeasured parse side is not a zero, and publishing it as one would
+        // turn "nothing counted the source" into "the source had no calls".
+        "parsed_call_sites": measured.parsed_call_sites,
+        "resolved_call_edges": measured.resolved_call_edges,
+        "call_percent": measured.call_percent(),
+        "parsed_import_statements": measured.parsed_import_statements,
+        "resolved_import_edges": measured.resolved_import_edges,
+        "resolution": measured.resolution.label(),
+    });
 }
 
 /// Whether this build can produce cross-file reference and override edges for
@@ -223,7 +484,9 @@ pub fn observe_cross_file_reference_coverage_for_languages<S: EntityStore>(
 /// Only the unsupported half is published as a verdict. Whether an installed
 /// server actually backs a wired adapter is a HOST fact this observation does not
 /// probe (the CLI's status path does, through `which`), so a wired language
-/// reports `unknown` rather than claiming an availability nothing here checked.
+/// reports [`ReferenceEnrichment::Unknown`] rather than claiming an availability
+/// nothing here checked. That variant carries the wire string, so this gate and
+/// the status surfaces cannot drift on what an unprobed language looks like.
 /// The weakest language governs, matching how the class states above merge: one
 /// unsupported language in a batch makes the batch's reference evidence
 /// unproducible.
@@ -234,7 +497,7 @@ fn reference_enrichment(languages: &[LanguageId]) -> Value {
     {
         json!(ReferenceEnrichment::Unsupported)
     } else {
-        json!("unknown")
+        json!(ReferenceEnrichment::Unknown)
     }
 }
 

@@ -182,7 +182,7 @@ pub struct SemanticCoverage {
 /// which is precisely the state that produces `all_fallback: true` on a fully
 /// embedded store.
 ///
-/// Deliberately NOT a new coverage type alongside `kin_core::cross_file_coverage`
+/// Deliberately NOT a new coverage type alongside `kin_core::reference_coverage`
 /// and `kin_mcp::edge_coverage`. Those answer questions about relation topology:
 /// whether edges leave their file, and whether the graph holds the edge class an
 /// absence claim depends on. Body presence is a different axis, and it belongs on
@@ -201,6 +201,23 @@ pub struct GraphBodyCoverage {
     /// daemon logging. Capped at [`GRAPH_BODY_GAP_SAMPLE`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sample: Vec<String>,
+    /// Source paths the role filter removed from `source_paths` before any of
+    /// the counters above were taken.
+    ///
+    /// Without this the coverage report is scoped by the same filter it is
+    /// supposed to disclose, so it can never disclose it: a twelve-file
+    /// repository with six test files reported `source_paths: 6` and
+    /// `complete: true`, which is a true statement about a population the
+    /// caller was never told had been narrowed. Zero is serialized away, so a
+    /// repository whose tests were all admitted carries the payload it always
+    /// did.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub withheld_test_paths: usize,
+}
+
+/// Serde predicate for a count that means "nothing to disclose".
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 /// Gap paths named in [`GraphBodyCoverage::sample`]. Enough to recognize a
@@ -213,6 +230,7 @@ impl GraphBodyCoverage {
     /// authority, and the subset it resolved a body for.
     fn observe<'a>(
         source_paths: impl IntoIterator<Item = &'a String>,
+        withheld_test_paths: usize,
         has_body: impl Fn(&str) -> bool,
     ) -> Self {
         let mut total = 0usize;
@@ -237,12 +255,18 @@ impl GraphBodyCoverage {
             with_body,
             gap_paths,
             sample: gaps,
+            withheld_test_paths,
         }
     }
 
     /// Whether ranking ran against an incomplete body set.
     fn has_gap(&self) -> bool {
         self.gap_paths > 0
+    }
+
+    /// Whether the role filter narrowed the population the counters describe.
+    fn withholds_tests(&self) -> bool {
+        self.withheld_test_paths > 0
     }
 }
 
@@ -1468,22 +1492,83 @@ fn embedding_strict_mode() -> bool {
         && !locate_env_bool("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK", false)
 }
 
+/// What the cross-encoder loader is asked to load: the snapshot directory this
+/// process resolved, or the bare repo id when it resolved none.
+///
+/// Named rather than inlined because it is the whole of the handoff. The
+/// loader takes one `&str` and decides from it alone whether to read a
+/// directory or to go to the Hub, so passing the repo id where a resolved
+/// directory exists is the entire defect restored, and a decision that lives
+/// in a `match` argument cannot be asserted on without a model on disk.
+///
+/// A path that is not UTF-8 falls back to the repo id for the same reason a
+/// missing snapshot does: it cannot be spelled as the `&str` the loader takes.
+#[cfg(feature = "embeddings")]
+fn cross_encoder_load_target(model_id: &str, snapshot: Option<&std::path::Path>) -> String {
+    snapshot
+        .and_then(std::path::Path::to_str)
+        .unwrap_or(model_id)
+        .to_string()
+}
+
+/// Whether a graph has a vector index attached at all.
+///
+/// `embedding_status` cannot answer this. Its `indexed` count is derived by
+/// testing every retrievable key against the index and it answers zero for all
+/// of them when there is no index to test against, so an index that was never
+/// built and an index that is attached and empty produce identical counters.
+/// `vector_index_stats()` is the call that separates them, and reading it is a
+/// lock and an `Option` map rather than a walk of graph truth.
+#[cfg(feature = "vector")]
+fn vector_index_attached(graph: &kin_db::InMemoryGraph) -> bool {
+    graph.vector_index_stats().is_some()
+}
+
+/// Without vector support there is no index to attach. The `supported: false`
+/// arm of the coverage report is what callers read in this build; this exists
+/// so the two arms share one call shape.
+#[cfg(not(feature = "vector"))]
+fn vector_index_attached(_graph: &kin_db::InMemoryGraph) -> bool {
+    false
+}
+
+/// The embedding status backing this query's semantic signal, paired with
+/// whether the graph it came from has a vector index attached.
+///
+/// The pairing is the point. Both facts are read from the SAME graph in one
+/// place, so a caller cannot take the counters from the scoped-session vector
+/// source and the attachment from the primary graph and report a state neither
+/// of them is in.
+struct EffectiveEmbedding {
+    status: kin_db::EmbeddingStatus,
+    index_attached: bool,
+}
+
 /// Pick the embedding status that actually backs the semantic signal for this
 /// query — the primary graph when it carries embeddings (or has no entities at
 /// all), otherwise the HEAD vector source used for scoped-session search.
 /// Mirrors the graph-selection logic in `extract_embedding_signals`.
-fn effective_embedding_status(
+fn effective_embedding(
     graph: &kin_db::InMemoryGraph,
     vector_source: Option<&kin_db::InMemoryGraph>,
-) -> kin_db::EmbeddingStatus {
+) -> EffectiveEmbedding {
     let primary_status = graph.embedding_status();
     if primary_status.total == 0 || primary_status.indexed > 0 {
-        return primary_status;
+        return EffectiveEmbedding {
+            status: primary_status,
+            index_attached: vector_index_attached(graph),
+        };
     }
     if let Some(source) = vector_source.filter(|source| !std::ptr::eq(*source, graph)) {
-        return source.embedding_status();
+        return EffectiveEmbedding {
+            status: source.embedding_status(),
+            index_attached: vector_index_attached(source),
+        };
     }
-    primary_status
+    EffectiveEmbedding {
+        status: primary_status,
+        index_attached: vector_index_attached(graph),
+    }
 }
 
 /// Evaluate embedding coverage for a locate query.
@@ -1494,30 +1579,43 @@ fn effective_embedding_status(
 /// ran. Strict (benchmark) behavior, gated behind
 /// `KIN_REQUIRE_COMPLETE_EMBEDDINGS=1`: bails on incomplete coverage exactly as
 /// before, so benchmarks refuse to score a half-embedded repo.
+///
+/// The strict gate keeps reading the counters alone, deliberately. It is a
+/// benchmark-integrity check on how much of a store got embedded, and a
+/// benchmark that reaches it is running against a populated store where an
+/// absent index already shows up as `indexed < total`. What changes is the
+/// REPORT the gate does not consume.
 fn evaluate_embedding_coverage(
     graph: &kin_db::InMemoryGraph,
     vector_source: Option<&kin_db::InMemoryGraph>,
-) -> Result<SemanticCoverage> {
-    let status = effective_embedding_status(graph, vector_source);
+) -> Result<(SemanticCoverage, bool)> {
+    let effective = effective_embedding(graph, vector_source);
 
     #[cfg(feature = "vector")]
-    if !embedding_status_complete(&status) && embedding_strict_mode() {
+    if !embedding_status_complete(&effective.status) && embedding_strict_mode() {
         anyhow::bail!(
             "semantic locate requires complete embeddings; graph has {}. Run `kin embed` until `kin status --json` reports embeddingsIndexed == embeddingsTotal and embeddingsPending == 0. (Set KIN_REQUIRE_COMPLETE_EMBEDDINGS=0 to allow graceful degradation.)",
-            embedding_status_summary(&status)
+            embedding_status_summary(&effective.status)
         );
     }
 
-    Ok(coverage_from_status(&status))
+    Ok((
+        coverage_from_status(&effective.status, effective.index_attached),
+        effective.index_attached,
+    ))
 }
 
 /// Build the non-gating [`SemanticCoverage`] report from an embedding status.
 /// This is the default (non-strict) coverage `evaluate_embedding_coverage`
 /// returns, factored out so post-retrieval surfaces can re-report coverage
 /// without re-running the strict benchmark gate.
-fn coverage_from_status(status: &kin_db::EmbeddingStatus) -> SemanticCoverage {
+fn coverage_from_status(
+    status: &kin_db::EmbeddingStatus,
+    index_attached: bool,
+) -> SemanticCoverage {
     #[cfg(not(feature = "vector"))]
     {
+        let _ = index_attached;
         return SemanticCoverage {
             supported: false,
             indexed: status.indexed,
@@ -1534,9 +1632,20 @@ fn coverage_from_status(status: &kin_db::EmbeddingStatus) -> SemanticCoverage {
 
     #[cfg(feature = "vector")]
     {
-        let complete = embedding_status_complete(status);
+        // An absent index is never complete coverage, whatever the counters
+        // say. `embedding_status_complete` answers true for `total == 0`, and
+        // `total` is zero on a graph with nothing retrievable, so a store with
+        // no index at all could report complete semantic coverage and let a
+        // caller treat an empty result as a definitive absence. There is no
+        // index behind that answer to be definitive about.
+        let complete = index_attached && embedding_status_complete(status);
         let note = if complete {
             None
+        } else if !index_attached {
+            Some(format!(
+            "no vector index is attached, so nothing is embedded and semantic ranking did not run ({} entities eligible). Lexical + graph results returned; run `kin embed` to build the index.",
+            status.total
+        ))
         } else {
             Some(format!(
             "semantic signal partial: {} embedded. Lexical + graph results returned; run `kin embed` for full semantic ranking.",
@@ -1566,6 +1675,24 @@ impl SemanticCoverage {
     /// overwritten, since both causes can hold at once and the caller needs to
     /// know which remediation applies.
     pub fn with_graph_bodies(mut self, bodies: GraphBodyCoverage) -> Self {
+        if bodies.withholds_tests() {
+            // Completeness is a claim about the population the caller asked
+            // about, and this one was narrowed before the counters were taken.
+            // Saying `complete: true` over it is the defect: the caller cannot
+            // tell a repository whose every path was covered from one where
+            // half the paths were removed from the question.
+            self.complete = false;
+            let withheld_note = format!(
+                "role filter: {} test-role source path(s) were withheld from ranking and from \
+                 the counters beside this note, so completeness is claimed over source paths \
+                 only; pass include_tests to rank them.",
+                bodies.withheld_test_paths
+            );
+            self.note = Some(match self.note.take() {
+                Some(existing) => format!("{existing} {withheld_note}"),
+                None => withheld_note,
+            });
+        }
         if bodies.has_gap() {
             self.complete = false;
             let gap_note = format!(
@@ -1591,7 +1718,8 @@ pub fn local_semantic_coverage(
     graph: &kin_db::InMemoryGraph,
     vector_source: Option<&kin_db::InMemoryGraph>,
 ) -> SemanticCoverage {
-    coverage_from_status(&effective_embedding_status(graph, vector_source))
+    let effective = effective_embedding(graph, vector_source);
+    coverage_from_status(&effective.status, effective.index_attached)
 }
 
 /// Push a degradation once per (component, reason); repeated hits within one
@@ -1607,12 +1735,21 @@ pub fn record_degradation(sink: &mut Vec<RetrievalDegradation>, event: Retrieval
 }
 
 /// Record the vector-index state for this query as a structured degradation
-/// when it is empty or partial. The `SemanticCoverage` object already carries
-/// the numbers; this adds the machine-readable component/reason/remediation
-/// entry so an empty vector index can never read as a clean lexical answer.
+/// when it is absent, empty or partial. The `SemanticCoverage` object already
+/// carries the numbers; this adds the machine-readable
+/// component/reason/remediation entry so a vector index that is missing or
+/// unfinished can never read as a clean lexical answer.
+///
+/// `absent` is its own reason and not a shade of `empty`, because they have
+/// different remediations and only one of them is reachable by waiting. An
+/// index that is attached and empty is being filled; an index that was never
+/// built is not, and on a freshly converted repository that is the state every
+/// first query runs in. Telling them apart needs `index_attached`: the
+/// `indexed` counter reads zero for both, so a reason picked from the counters
+/// alone can neither name the absent case nor fail to name it.
 fn record_vector_index_degradation(
     coverage: &SemanticCoverage,
-    vector_source: Option<&kin_db::InMemoryGraph>,
+    index_attached: bool,
     sink: &mut Vec<RetrievalDegradation>,
 ) {
     if coverage.complete {
@@ -1631,24 +1768,62 @@ fn record_vector_index_degradation(
         );
         return;
     }
-    let vector_arm_present = coverage.indexed > 0
-        || vector_source.is_some_and(|source| source.embedding_status().indexed > 0);
-    let (reason, detail) = if vector_arm_present {
+    let (reason, detail, remediation) = if !index_attached {
+        let detail = format!(
+            "no vector index has been built for this graph, so none of its {} entities \
+             are embedded and only lexical and graph signals ranked this query",
+            coverage.total
+        );
+        // The opt-out is read from this process's own environment, which is the
+        // daemon's environment on the serving path, where the daemon reads the same
+        // variable at its own start to decide the pass. Saying which of the two
+        // states holds is the whole difference between "this fills in on its
+        // own" and "this stays as it is until someone asks".
+        if kin_daemon_spawn::auto_embed_enabled_from(
+            std::env::var(kin_daemon_spawn::DAEMON_AUTO_EMBED_ENV)
+                .ok()
+                .as_deref(),
+        ) {
+            (
+                "absent",
+                detail,
+                "wait for the background embedding pass to build the index, or run 'kin embed' \
+                 to build it now"
+                    .to_string(),
+            )
+        } else {
+            (
+                "absent_opt_out",
+                format!(
+                    "{detail}; {} opts out of the background embedding pass, so nothing will \
+                     build the index on its own",
+                    kin_daemon_spawn::DAEMON_AUTO_EMBED_ENV
+                ),
+                format!(
+                    "run 'kin embed' to build the index, or clear {} and restart the daemon to \
+                     let the background pass run",
+                    kin_daemon_spawn::DAEMON_AUTO_EMBED_ENV
+                ),
+            )
+        }
+    } else if coverage.indexed > 0 {
         (
             "partial",
             format!(
                 "semantic signal partial: {}/{} entities embedded ({} pending)",
                 coverage.indexed, coverage.total, coverage.pending
             ),
+            "run 'kin embed' until kin status reports full embedding coverage".to_string(),
         )
     } else {
         (
             "empty",
             format!(
-                "vector index empty: 0/{} entities embedded — semantic ranking disabled, \
-                 lexical + graph signals only",
+                "vector index empty: 0/{} entities embedded, so semantic ranking is off \
+                 and only lexical and graph signals ranked this query",
                 coverage.total
             ),
+            "run 'kin embed' until kin status reports full embedding coverage".to_string(),
         )
     };
     record_degradation(
@@ -1657,8 +1832,7 @@ fn record_vector_index_degradation(
             component: "vector_index".to_string(),
             reason: reason.to_string(),
             detail,
-            remediation: "run 'kin embed' until kin status reports full embedding coverage"
-                .to_string(),
+            remediation,
         },
     );
 }
@@ -1792,6 +1966,7 @@ fn graph_source_path_set(graph: &kin_db::InMemoryGraph) -> HashSet<String> {
 fn merge_graph_entity_bodies(
     graph: &kin_db::InMemoryGraph,
     source_paths: &HashSet<String>,
+    scope: LocateScope,
     previews: &mut HashMap<String, String>,
 ) {
     let Ok(entities) = graph.query_entities(&EntityFilter::default()) else {
@@ -1802,7 +1977,10 @@ fn merge_graph_entity_bodies(
         let Some(path) = entity.file_origin.as_ref().map(|origin| origin.0.as_str()) else {
             continue;
         };
-        if previews.contains_key(path) || !source_paths.contains(path) || is_test_path(path) {
+        if previews.contains_key(path)
+            || !source_paths.contains(path)
+            || (!scope.include_tests && is_test_path(path))
+        {
             continue;
         }
         let Some(body) = entity
@@ -1837,6 +2015,44 @@ pub struct LocatePaging {
     pub page_size: Option<usize>,
 }
 
+/// Which entity roles a locate is allowed to return.
+///
+/// Test-role entities are demoted, and in several stages excluded outright,
+/// unless the query itself reads as being about tests. That default is right
+/// for the query it was built for ("where does this feature live"), and wrong
+/// for the caller who knows exactly what it is asking for: on a repository
+/// whose test files hold half the entities, `semantic_locate` could not return
+/// one at all, while `kin search` and `kin refs` returned the same entity first
+/// try on the same daemon. A keyword heuristic over the query text
+/// ([`is_test_query`]) is the only thing that lifted the demotion, and a caller
+/// has no way to say "I mean it" to a heuristic.
+///
+/// The default is tests EXCLUDED, so every existing caller keeps the ranking it
+/// has today.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LocateScope {
+    /// Rank test-role entities alongside source, and keep test paths in the
+    /// body set the term loops read.
+    pub include_tests: bool,
+}
+
+impl LocateScope {
+    /// The documented default: tests are withheld from ranking.
+    pub const SOURCE_ONLY: Self = Self {
+        include_tests: false,
+    };
+
+    /// Tests are ranked alongside source, because the caller said so.
+    pub const WITH_TESTS: Self = Self {
+        include_tests: true,
+    };
+
+    /// From a request flag.
+    pub fn with_tests(include_tests: bool) -> Self {
+        Self { include_tests }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     text: &str,
@@ -1848,6 +2064,7 @@ pub async fn run(
     reference: Option<String>,
     snippets: bool,
     paging: LocatePaging,
+    scope: LocateScope,
 ) -> Result<()> {
     let _span = tracing::info_span!(
         "kin.locate",
@@ -1869,6 +2086,7 @@ pub async fn run(
         // entity ranking whether or not it asked for bodies.
         json,
         paging,
+        scope,
     )
     .await?;
     // Persist the paging cursor so `kin locate --next` can fetch the next page
@@ -1896,6 +2114,7 @@ pub async fn capture(
     snippets: bool,
     entity_surface: bool,
     paging: LocatePaging,
+    scope: LocateScope,
 ) -> Result<LocateResult> {
     let layout = crate::commands::require_repository_layout()?;
     if locate_env_bool("KIN_LOCATE_FORCE_LOCAL", false) {
@@ -1915,6 +2134,7 @@ pub async fn capture(
         snippets,
         entity_surface,
         paging,
+        scope,
     )
     .await?;
     record_locate_telemetry(&layout, text, max_files, &result);
@@ -2002,6 +2222,7 @@ async fn try_locate_via_daemon(
     snippets: bool,
     entity_surface: bool,
     paging: LocatePaging,
+    scope: LocateScope,
 ) -> Result<LocateResult> {
     let daemon_url = std::env::var("KIN_DAEMON_URL")
         .ok()
@@ -2023,6 +2244,7 @@ async fn try_locate_via_daemon(
         entity_surface,
         cursor: paging.cursor,
         page_size: paging.page_size,
+        include_tests: scope.include_tests,
     };
     client
         .locate(&request)
@@ -2107,6 +2329,7 @@ pub fn run_with_graph_capture_with_priority_files(
         SnippetOptions::default(),
         None,
         kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+        LocateScope::SOURCE_ONLY,
     )
 }
 
@@ -2123,6 +2346,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     snippet_opts: SnippetOptions,
     repository_authority: Option<&kin_mcp::handlers::RequestRepositoryAuthority>,
     source_scope: kin_mcp::handlers::common::EntitySourceScope,
+    scope: LocateScope,
 ) -> Result<LocateResult> {
     run_with_graph_capture_budgeted(
         graph,
@@ -2136,6 +2360,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         snippet_opts,
         repository_authority,
         source_scope,
+        scope,
         LocateBudget::from_env(),
     )
 }
@@ -2156,6 +2381,35 @@ fn run_with_graph_capture_in_workspace_budgeted(
     max_files_explicit: bool,
     budget: LocateBudget,
 ) -> Result<LocateResult> {
+    run_with_graph_capture_in_workspace_budgeted_scoped(
+        graph,
+        workspace_root,
+        text,
+        explain,
+        max_files,
+        max_files_explicit,
+        LocateScope::SOURCE_ONLY,
+        budget,
+    )
+}
+
+/// The shape above, with the role scope taken by argument.
+///
+/// Separate so the default stays stated once and every existing assertion keeps
+/// running under it, while a test about the scope can vary the one input it is
+/// about.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn run_with_graph_capture_in_workspace_budgeted_scoped(
+    graph: &kin_db::InMemoryGraph,
+    workspace_root: Option<&std::path::Path>,
+    text: &str,
+    explain: bool,
+    max_files: usize,
+    max_files_explicit: bool,
+    scope: LocateScope,
+    budget: LocateBudget,
+) -> Result<LocateResult> {
     run_with_graph_capture_budgeted(
         graph,
         workspace_root,
@@ -2168,6 +2422,7 @@ fn run_with_graph_capture_in_workspace_budgeted(
         SnippetOptions::default(),
         None,
         kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+        scope,
         budget,
     )
 }
@@ -2191,6 +2446,7 @@ fn run_with_graph_capture_budgeted(
     snippet_opts: SnippetOptions,
     repository_authority: Option<&kin_mcp::handlers::RequestRepositoryAuthority>,
     source_scope: kin_mcp::handlers::common::EntitySourceScope,
+    scope: LocateScope,
     mut budget: LocateBudget,
 ) -> Result<LocateResult> {
     let _span = tracing::info_span!(
@@ -2206,7 +2462,8 @@ fn run_with_graph_capture_budgeted(
     let cleaned_text = clean_issue_text(text);
     let semantic_text = strip_pr_template_boilerplate(&cleaned_text);
     let text = semantic_text.as_str();
-    let semantic_coverage = evaluate_embedding_coverage(graph, vector_source)?;
+    let (semantic_coverage, vector_index_attached) =
+        evaluate_embedding_coverage(graph, vector_source)?;
 
     // Quality profile: supplies the DEFAULT for each retrieval lever below;
     // explicit env vars always win. Resolved once per query so one run cannot
@@ -2214,7 +2471,7 @@ fn run_with_graph_capture_budgeted(
     let quality = crate::retrieval_profile::RetrievalProfile::from_env();
     // No-silent-degradation ledger for this query (attached to the result).
     let mut degradations: Vec<RetrievalDegradation> = Vec::new();
-    record_vector_index_degradation(&semantic_coverage, vector_source, &mut degradations);
+    record_vector_index_degradation(&semantic_coverage, vector_index_attached, &mut degradations);
     // Per-stage prune attribution, recorded only under --explain.
     let mut prune_ledger: Vec<PruneEvent> = Vec::new();
 
@@ -2225,7 +2482,11 @@ fn run_with_graph_capture_budgeted(
     // tier some retrieval signals are off, and that must never be silent — nor
     // must a tier that a failed host probe, rather than the host, chose.
     record_capability_tier_degradation(&detection, &mut degradations);
-    let test_query = is_test_query(text);
+    // A caller that asked for tests outranks the keyword heuristic. Folding the
+    // ask into `test_query` is what makes every stage that already respects the
+    // heuristic respect the ask too, rather than adding a second, differently
+    // spelled exemption to each of them.
+    let test_query = scope.include_tests || is_test_query(text);
     let text_lower = text.to_ascii_lowercase();
     let source_text_priority_query = test_query
         || query_mentions_cli_flags(text)
@@ -2366,7 +2627,7 @@ fn run_with_graph_capture_budgeted(
         )
     } else {
         let phase_start = std::time::Instant::now();
-        let result = resolve_entities_to_files(&all_entity_seeds, graph, explain, "text")?;
+        let result = resolve_entities_to_files(&all_entity_seeds, graph, explain, "text", scope)?;
         if phase_start.elapsed().as_secs_f64()
             > budget
                 .phase_budgets
@@ -2411,7 +2672,7 @@ fn run_with_graph_capture_budgeted(
             _embed_signal_scores,
             embed_symbols,
             embed_candidate_stages,
-        ) = resolve_entities_to_files(&embedding_entity_seeds, graph, explain, "vector")?;
+        ) = resolve_entities_to_files(&embedding_entity_seeds, graph, explain, "vector", scope)?;
         if phase_start.elapsed().as_secs_f64()
             > budget
                 .phase_budgets
@@ -2467,7 +2728,7 @@ fn run_with_graph_capture_budgeted(
         HashMap::new()
     } else {
         let phase_start = std::time::Instant::now();
-        let signals = extract_source_text_signals(text, graph)?;
+        let signals = extract_source_text_signals_scoped(text, graph, scope)?;
         if phase_start.elapsed().as_secs_f64()
             > budget
                 .phase_budgets
@@ -2496,6 +2757,24 @@ fn run_with_graph_capture_budgeted(
     // the remediation.
     let semantic_coverage = match graph_body_coverage {
         Some(bodies) => {
+            if bodies.withholds_tests() {
+                record_degradation(
+                    &mut degradations,
+                    RetrievalDegradation {
+                        component: "graph_role_filter".to_string(),
+                        reason: "tests_withheld".to_string(),
+                        detail: format!(
+                            "{} test-role source path(s) were kept out of ranking and out of \
+                             the graph_bodies counters; an entity defined only in one of them \
+                             could not be returned by this query",
+                            bodies.withheld_test_paths
+                        ),
+                        remediation: "pass include_tests to rank test-role entities alongside \
+                                      source, or name the entity in the query"
+                            .to_string(),
+                    },
+                );
+            }
             if bodies.has_gap() {
                 record_degradation(
                     &mut degradations,
@@ -2827,6 +3106,7 @@ fn run_with_graph_capture_budgeted(
             &all_entity_seeds,
             &embedding_entity_seeds,
             graph,
+            scope,
         )?
     } else {
         match track {
@@ -3027,7 +3307,7 @@ fn run_with_graph_capture_budgeted(
         };
         // Re-attach entity identity (dropped at the FileHit/entity→file seam) to
         // resolved files for observability. Read-only; never feeds ranking.
-        let resolve_identity = entity_resolve_identity(&all_entity_seeds, graph)?;
+        let resolve_identity = entity_resolve_identity(&all_entity_seeds, graph, scope)?;
         Some(LocateDebugInfo {
             scoring_track: Some(format!("{track:?}")),
             retrieval_profile: Some(quality.name().to_string()),
@@ -3792,7 +4072,15 @@ fn run_with_graph_capture_budgeted(
     {
         let ce_model_id = std::env::var("KIN_LOCATE_CROSS_ENCODER_MODEL")
             .unwrap_or_else(|_| "BAAI/bge-reranker-base".to_string());
-        let ce_model_cached = crate::retrieval_profile::cross_encoder_model_cached(&ce_model_id);
+        // Resolved beside the model id, not inside the arming branch below,
+        // because the cache probe needs it: a snapshot is addressed by the
+        // commit its revision ref names, so probing without the revision asks a
+        // different question than the one the loader will ask.
+        let ce_revision = std::env::var("KIN_LOCATE_CROSS_ENCODER_REVISION")
+            .unwrap_or_else(|_| "main".to_string());
+        let ce_snapshot =
+            crate::retrieval_profile::cross_encoder_model_snapshot(&ce_model_id, &ce_revision);
+        let ce_model_cached = ce_snapshot.is_some();
         if quality.cross_encoder_default(true)
             && !ce_model_cached
             && std::env::var("KIN_LOCATE_CROSS_ENCODER_ENABLED").is_err()
@@ -3825,8 +4113,13 @@ fn run_with_graph_capture_budgeted(
                 // effective in that mode.
                 if cross_encoder_has_graph_candidates(graph) {
                     let model_id = ce_model_id.clone();
-                    let revision = std::env::var("KIN_LOCATE_CROSS_ENCODER_REVISION")
-                        .unwrap_or_else(|_| "main".to_string());
+                    let revision = ce_revision.clone();
+                    // Load from the directory the cache probe resolved rather
+                    // than from the repo id, so the loader reads the snapshot
+                    // this process just verified instead of rediscovering a
+                    // root of its own. `CrossEncoder::new` takes a local
+                    // directory whenever its model id names one.
+                    let load_target = cross_encoder_load_target(&model_id, ce_snapshot.as_deref());
 
                     // 1.7 latency gate: time model acquisition + rerank so an
                     // over-budget rerank can fall back to the pre-rerank order (see
@@ -3835,7 +4128,7 @@ fn run_with_graph_capture_budgeted(
                     // here; after that the model is resident (see model_residency)
                     // and this window is the rerank itself.
                     let rerank_started = std::time::Instant::now();
-                    match crate::model_residency::cross_encoder(&model_id, &revision) {
+                    match crate::model_residency::cross_encoder(&load_target, &revision) {
                         Ok(encoder) => {
                             let mut docs = Vec::new();
                             let mut candidates = Vec::new();
@@ -4393,6 +4686,7 @@ pub fn run_with_graph_capture_at_ref(
     max_files: usize,
     max_files_explicit: bool,
     snippet_opts: SnippetOptions,
+    scope: LocateScope,
 ) -> Result<LocateResult> {
     let authority =
         crate::commands::repository_authority::ActiveRepositoryAuthority::open(binding)?;
@@ -4410,6 +4704,7 @@ pub fn run_with_graph_capture_at_ref(
         max_files,
         max_files_explicit,
         snippet_opts,
+        scope,
         LocateBudget::from_env(),
     )
 }
@@ -4425,6 +4720,7 @@ fn run_with_repository_authority_capture_at_ref<B>(
     max_files: usize,
     max_files_explicit: bool,
     snippet_opts: SnippetOptions,
+    scope: LocateScope,
     budget: LocateBudget,
 ) -> Result<LocateResult>
 where
@@ -4454,6 +4750,7 @@ where
         snippet_opts,
         repository_authority,
         kin_mcp::handlers::common::EntitySourceScope::At(*head),
+        scope,
         budget,
     )
 }
@@ -9673,9 +9970,24 @@ struct SourceTextSignals {
     graph_bodies: Option<GraphBodyCoverage>,
 }
 
+/// Source-text signals under the default scope: tests withheld.
+///
+/// The two-argument form every assertion about term hits already uses. Production
+/// takes its scope from the request, so this shape has no caller outside the test
+/// module and is gated accordingly; a test that is about the scope calls
+/// [`extract_source_text_signals_scoped`] directly.
+#[cfg(test)]
 fn extract_source_text_signals(
     text: &str,
     graph: &kin_db::InMemoryGraph,
+) -> Result<SourceTextSignals> {
+    extract_source_text_signals_scoped(text, graph, LocateScope::SOURCE_ONLY)
+}
+
+fn extract_source_text_signals_scoped(
+    text: &str,
+    graph: &kin_db::InMemoryGraph,
+    scope: LocateScope,
 ) -> Result<SourceTextSignals> {
     let _span =
         tracing::info_span!("locate.extract_source_text_signals", text_len = text.len()).entered();
@@ -9703,7 +10015,7 @@ fn extract_source_text_signals(
         .into_iter()
         .filter_map(|artifact| {
             let path = artifact.file_id.0;
-            if !source_paths.contains(&path) || is_test_path(&path) {
+            if !source_paths.contains(&path) || (!scope.include_tests && is_test_path(&path)) {
                 return None;
             }
             let preview = artifact.text_preview?;
@@ -9715,7 +10027,7 @@ fn extract_source_text_signals(
         .filter(|(_, preview)| preview.len() > 1024)
         .map(|(path, _)| path.clone())
         .collect();
-    merge_graph_entity_bodies(graph, &source_paths, &mut source_previews);
+    merge_graph_entity_bodies(graph, &source_paths, scope, &mut source_previews);
     let preview_source_texts: HashMap<String, String> = source_previews
         .iter()
         .map(|(path, preview)| (path.clone(), preview.to_ascii_lowercase()))
@@ -9727,18 +10039,25 @@ fn extract_source_text_signals(
         .collect();
 
     // Measure body coverage here, against exactly the two sets the term loops
-    // below consult. Scope is `source_paths` minus test paths, because
-    // `source_previews` excludes test paths by construction and counting them as
-    // gaps would report a hole the ranking path never had.
+    // below consult, and report separately how many paths were kept out of that
+    // scope. Counting withheld test paths as body GAPS would report a hole the
+    // ranking path never had; counting them nowhere at all is what let a
+    // twelve-file repository answer `source_paths: 6, complete: true` without a
+    // word about the other six. They are two different facts and the payload now
+    // carries both.
     //
     // Every miss the loops take also emits a `kin.locate.graph_gap` warning, one
     // per path per term, which is why a session logs far more warnings than it
     // has body-less paths. This is the same fact stated once, as a number, on
     // the payload.
-    let graph_bodies = GraphBodyCoverage::observe(
-        source_paths.iter().filter(|path| !is_test_path(path)),
-        |path| preview_source_texts.contains_key(path),
-    );
+    let observed_paths: Vec<&String> = source_paths
+        .iter()
+        .filter(|path| scope.include_tests || !is_test_path(path))
+        .collect();
+    let withheld_test_paths = source_paths.len() - observed_paths.len();
+    let graph_bodies = GraphBodyCoverage::observe(observed_paths, withheld_test_paths, |path| {
+        preview_source_texts.contains_key(path)
+    });
     let mut path_term_support: HashMap<String, HashSet<String>> = HashMap::new();
 
     let mut terms = extract_search_terms(text);
@@ -9825,7 +10144,7 @@ fn extract_source_text_signals(
             let Some(path) = file_path_from_retrieval_key(graph, &retrieval_key) else {
                 continue;
             };
-            if !source_paths.contains(&path) || is_test_path(&path) {
+            if !source_paths.contains(&path) || (!scope.include_tests && is_test_path(&path)) {
                 continue;
             }
             if symbolic
@@ -11080,6 +11399,7 @@ fn resolve_entities_to_files(
     graph: &kin_db::InMemoryGraph,
     explain: bool,
     origin: &str,
+    scope: LocateScope,
 ) -> Result<ResolveEntitiesOutput> {
     let _span = tracing::info_span!(
         "locate.resolve_entities_to_files",
@@ -11284,7 +11604,7 @@ fn resolve_entities_to_files(
 
         if let Some(ref fo) = entity.file_origin {
             let path = &fo.0;
-            if entity_is_test && !discovery.exact_name {
+            if entity_is_test && !discovery.exact_name && !scope.include_tests {
                 // Skip direct attribution for test entities the query does not
                 // literally name, but still follow their graph relations below —
                 // tests call the source that needs fixing. An exactly-named
@@ -11727,6 +12047,7 @@ fn resolve_entities_to_files(
 fn entity_resolve_identity(
     seeds: &HashMap<kin_model::EntityId, EntityDiscovery>,
     graph: &kin_db::InMemoryGraph,
+    scope: LocateScope,
 ) -> Result<HashMap<String, kin_model::EntityId>> {
     let mut ordered: Vec<(&kin_model::EntityId, &EntityDiscovery)> = seeds.iter().collect();
     ordered.sort_by(|a, b| a.0.cmp(b.0));
@@ -11738,7 +12059,10 @@ fn entity_resolve_identity(
         let Some(file_origin) = entity.file_origin.as_ref() else {
             continue;
         };
-        if is_test_by_role(&file_origin.0, Some(&entity)) && !discovery.exact_name {
+        if is_test_by_role(&file_origin.0, Some(&entity))
+            && !discovery.exact_name
+            && !scope.include_tests
+        {
             continue;
         }
         let keep = match best.get(file_origin.0.as_str()) {
@@ -11769,6 +12093,7 @@ fn entity_resolve_identity(
 fn entity_seed_keyed(
     seeds: &HashMap<kin_model::EntityId, EntityDiscovery>,
     graph: &kin_db::InMemoryGraph,
+    scope: LocateScope,
 ) -> Result<Vec<(String, String, f32)>> {
     let mut out: Vec<(String, String, f32)> = Vec::new();
     for (entity_id, discovery) in seeds {
@@ -11778,7 +12103,9 @@ fn entity_seed_keyed(
         let Some(file_origin) = entity.file_origin.as_ref() else {
             continue;
         };
-        if (is_test_by_role(&file_origin.0, Some(&entity)) && !discovery.exact_name)
+        if (is_test_by_role(&file_origin.0, Some(&entity))
+            && !discovery.exact_name
+            && !scope.include_tests)
             || is_vendored_path(&file_origin.0)
         {
             continue;
@@ -11892,9 +12219,10 @@ fn entity_granular_fused_files(
     text_seeds: &HashMap<kin_model::EntityId, EntityDiscovery>,
     embedding_seeds: &HashMap<kin_model::EntityId, EntityDiscovery>,
     graph: &kin_db::InMemoryGraph,
+    scope: LocateScope,
 ) -> Result<Vec<(String, f32)>> {
-    let resolve_keyed = entity_seed_keyed(text_seeds, graph)?;
-    let embedding_keyed = entity_seed_keyed(embedding_seeds, graph)?;
+    let resolve_keyed = entity_seed_keyed(text_seeds, graph, scope)?;
+    let embedding_keyed = entity_seed_keyed(embedding_seeds, graph, scope)?;
     let path_keyed = |list: &[(String, f32)]| -> Vec<(String, String, f32)> {
         list.iter()
             .map(|(path, score)| (path.clone(), path.clone(), *score))
@@ -17548,6 +17876,7 @@ mod tests {
             SnippetOptions::enabled(None),
             None,
             kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+            LocateScope::SOURCE_ONLY,
             LocateBudget::unbounded(),
         )
         .unwrap()
@@ -20299,6 +20628,203 @@ mod tests {
         assert!(
             format!("{err}").contains("semantic locate requires complete embeddings"),
             "unexpected error: {err:#}"
+        );
+    }
+
+    /// The reranker is asked for the directory this process resolved, not for
+    /// the repo id it started from.
+    ///
+    /// `CrossEncoder::new` decides from its one string argument whether to read
+    /// a local directory or to fetch from the Hub, so which string reaches it
+    /// IS the fix. Passing the repo id where a snapshot resolved is the defect
+    /// restored in full: the loader would go back to `Cache::default()`, miss a
+    /// relocated cache, and download inside the query.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn the_reranker_is_asked_for_the_resolved_snapshot_when_there_is_one() {
+        let snapshot = std::path::Path::new("/models/hub/models--org--name/snapshots/abc123");
+
+        assert_eq!(
+            cross_encoder_load_target("org/name", Some(snapshot)),
+            snapshot.to_str().unwrap(),
+            "a resolved snapshot must be what the loader is handed"
+        );
+        assert_eq!(
+            cross_encoder_load_target("org/name", None),
+            "org/name",
+            "with nothing resolved the bare repo id still reaches hf-hub, so an \
+             explicit prefetch on a cold machine keeps working"
+        );
+    }
+
+    /// Identical counters, two different states, and only one of them fills in
+    /// on its own.
+    ///
+    /// `embedding_status` derives `indexed` by testing every retrievable key
+    /// against the vector index and answers zero for all of them when there is
+    /// no index to test against, so an index nothing has filled yet and an
+    /// index nobody built produce the same numbers. A reason picked from those
+    /// numbers cannot name the second case, which is the state every freshly
+    /// converted repository serves its first queries in.
+    ///
+    /// The `complete` half is the sharper edge. It was true whenever `total`
+    /// was zero, so a store with no vector index behind it could report
+    /// complete semantic coverage, and the envelope's semantic negative gate
+    /// reads exactly that flag to decide whether an empty result may be
+    /// reported as a definitive absence.
+    #[cfg(feature = "vector")]
+    #[test]
+    #[serial_test::serial]
+    fn coverage_separates_an_index_nobody_built_from_one_nothing_has_filled() {
+        let _opt_out =
+            kin_core::test_env::EnvVarGuard::unset(kin_daemon_spawn::DAEMON_AUTO_EMBED_ENV);
+
+        let nothing_retrievable = kin_db::EmbeddingStatus {
+            pending: 0,
+            indexed: 0,
+            total: 0,
+        };
+        assert!(
+            coverage_from_status(&nothing_retrievable, true).complete,
+            "an attached index with nothing to embed is genuinely complete"
+        );
+        assert!(
+            !coverage_from_status(&nothing_retrievable, false).complete,
+            "with no index behind it there is nothing for a negative to be definitive about"
+        );
+
+        let unfilled = kin_db::EmbeddingStatus {
+            pending: 12,
+            indexed: 0,
+            total: 12,
+        };
+        let partial = kin_db::EmbeddingStatus {
+            pending: 7,
+            indexed: 5,
+            total: 12,
+        };
+        let mut sink = Vec::new();
+        record_vector_index_degradation(&coverage_from_status(&unfilled, false), false, &mut sink);
+        record_vector_index_degradation(&coverage_from_status(&unfilled, true), true, &mut sink);
+        record_vector_index_degradation(&coverage_from_status(&partial, true), true, &mut sink);
+
+        let reasons = sink
+            .iter()
+            .map(|entry| entry.reason.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reasons,
+            vec!["absent", "empty", "partial"],
+            "the same 0/12 counters must read as absent or empty depending on the index"
+        );
+        assert!(
+            sink[0].remediation.contains("kin embed"),
+            "an unbuilt index must name the command that builds it: {}",
+            sink[0].remediation
+        );
+    }
+
+    /// An operator who turned the background pass off is in a different state
+    /// from one waiting for it, and the remediation is the difference.
+    #[cfg(feature = "vector")]
+    #[test]
+    #[serial_test::serial]
+    fn an_absent_index_nothing_will_build_is_reported_as_its_own_reason() {
+        let unfilled = kin_db::EmbeddingStatus {
+            pending: 12,
+            indexed: 0,
+            total: 12,
+        };
+
+        let mut waiting = Vec::new();
+        {
+            let _on =
+                kin_core::test_env::EnvVarGuard::unset(kin_daemon_spawn::DAEMON_AUTO_EMBED_ENV);
+            record_vector_index_degradation(
+                &coverage_from_status(&unfilled, false),
+                false,
+                &mut waiting,
+            );
+        }
+        assert_eq!(waiting[0].reason, "absent");
+        assert!(
+            waiting[0].remediation.contains("background embedding pass"),
+            "a pass that is coming is worth waiting for: {}",
+            waiting[0].remediation
+        );
+
+        let mut opted_out = Vec::new();
+        {
+            let _off =
+                kin_core::test_env::EnvVarGuard::set(kin_daemon_spawn::DAEMON_AUTO_EMBED_ENV, "0");
+            record_vector_index_degradation(
+                &coverage_from_status(&unfilled, false),
+                false,
+                &mut opted_out,
+            );
+        }
+        assert_eq!(opted_out[0].reason, "absent_opt_out");
+        assert!(
+            opted_out[0]
+                .detail
+                .contains(kin_daemon_spawn::DAEMON_AUTO_EMBED_ENV),
+            "the lever that decided this must be named: {}",
+            opted_out[0].detail
+        );
+    }
+
+    /// The pipeline itself reports the unbuilt index, not only the helper that
+    /// formats the entry.
+    ///
+    /// A graph with entities and no vector index is what `kin init` leaves
+    /// behind, and the whole defect was that a query against it came back
+    /// looking clean. This drives the real locate path over that fixture and
+    /// reads the ledger it attaches.
+    #[cfg(feature = "vector")]
+    #[test]
+    #[serial_test::serial]
+    fn locate_reports_an_unbuilt_vector_index_on_a_fresh_store() {
+        let graph = kin_db::InMemoryGraph::new();
+        let entity = test_entity("handler", "src/lib.py", 1, 5);
+        graph.upsert_entity(&entity).unwrap();
+        admit_test_source(&graph, "src/lib.py", "def handler():\n    pass\n");
+        assert!(
+            graph.vector_index_stats().is_none(),
+            "fixture control: this store must carry no vector index"
+        );
+
+        let _strict = kin_core::test_env::EnvVarGuard::unset("KIN_REQUIRE_COMPLETE_EMBEDDINGS")
+            .without(kin_daemon_spawn::DAEMON_AUTO_EMBED_ENV);
+
+        let result = run_with_graph_capture_in_workspace_budgeted(
+            &graph,
+            None,
+            "handler failure",
+            true,
+            10,
+            true,
+            LocateBudget::unbounded(),
+        )
+        .expect("locate must still serve lexical and graph signals");
+
+        let coverage = result
+            .semantic_coverage
+            .expect("locate must report semantic coverage");
+        assert!(
+            !coverage.complete,
+            "a store with no vector index must not report complete semantic coverage"
+        );
+
+        let entry = result
+            .degradations
+            .iter()
+            .find(|degradation| degradation.component == "vector_index")
+            .expect("an unbuilt vector index must reach the degradation ledger");
+        assert_eq!(entry.reason, "absent");
+        assert!(
+            entry.detail.contains("no vector index"),
+            "the detail must say which state this is: {}",
+            entry.detail
         );
     }
 
@@ -24745,6 +25271,209 @@ mod tests {
         );
     }
 
+    // ── role scope and its disclosure (FIR-2424) ───────────────────────────
+
+    /// Build a graph whose entities are split evenly between a source file and
+    /// a test file, both carrying graph-owned bodies. This is the twelve-file
+    /// shape the ticket reports, at the smallest size that still has both
+    /// populations.
+    fn graph_with_source_and_test_bodies() -> kin_db::InMemoryGraph {
+        let graph = kin_db::InMemoryGraph::new();
+        let mut source = test_entity("resolve_manifest", "src/manifest.py", 10, 40);
+        source.metadata.extra.insert(
+            "embedding_body_preview".to_string(),
+            serde_json::Value::String("resolve manifest authority for a repository".to_string()),
+        );
+        graph.upsert_entity(&source).unwrap();
+
+        let mut covered = test_entity(
+            "test_resolve_manifest_authority",
+            "tests/test_manifest.py",
+            5,
+            25,
+        );
+        covered.role = EntityRole::Test;
+        covered.metadata.extra.insert(
+            "embedding_body_preview".to_string(),
+            serde_json::Value::String(
+                "assert resolve manifest authority for a repository".to_string(),
+            ),
+        );
+        graph.upsert_entity(&covered).unwrap();
+        graph.flush_text_index().unwrap();
+        graph
+    }
+
+    /// The ticket's coverage half. The counters were scoped by the very filter
+    /// they were supposed to disclose, so a repository whose test files hold
+    /// half the entities answered `source_paths: 6, complete: true` and said
+    /// nothing about the other six. Completeness may not be claimed over a
+    /// population the filter narrowed.
+    #[test]
+    fn the_default_scope_discloses_the_test_paths_it_withheld() {
+        let graph = graph_with_source_and_test_bodies();
+        let signals = extract_source_text_signals_scoped(
+            "resolve manifest",
+            &graph,
+            LocateScope::SOURCE_ONLY,
+        )
+        .unwrap();
+        let bodies = signals
+            .graph_bodies
+            .expect("a graph with source paths reports coverage over them");
+
+        assert_eq!(
+            bodies.withheld_test_paths, 1,
+            "the one test path kept out of ranking must be counted: {bodies:?}"
+        );
+        assert_eq!(
+            bodies.source_paths, 1,
+            "the counters still describe only what ranking saw: {bodies:?}"
+        );
+
+        let coverage = fully_embedded_coverage().with_graph_bodies(bodies);
+        assert!(
+            !coverage.complete,
+            "complete must not be claimed over a population the role filter narrowed"
+        );
+        let note = coverage
+            .note
+            .as_deref()
+            .expect("a cleared flag owes a reason");
+        assert!(
+            note.contains("role filter") && note.contains("include_tests"),
+            "the note must name the cause and the parameter that lifts it: {note}"
+        );
+    }
+
+    /// The control the disclosure needs: when the caller asks for tests, there
+    /// is nothing withheld, the counters cover both populations, and
+    /// completeness is decided by the embedding counters alone again.
+    #[test]
+    fn asking_for_tests_widens_the_population_the_counters_describe() {
+        let graph = graph_with_source_and_test_bodies();
+        let signals =
+            extract_source_text_signals_scoped("resolve manifest", &graph, LocateScope::WITH_TESTS)
+                .unwrap();
+        let bodies = signals
+            .graph_bodies
+            .expect("a graph with source paths reports coverage over them");
+
+        assert_eq!(
+            bodies.withheld_test_paths, 0,
+            "nothing is withheld once the caller asked for it: {bodies:?}"
+        );
+        assert_eq!(
+            bodies.source_paths, 2,
+            "both populations are now in scope: {bodies:?}"
+        );
+        assert!(
+            fully_embedded_coverage().with_graph_bodies(bodies).complete,
+            "with nothing withheld and no body gap, completeness stands"
+        );
+    }
+
+    /// The ticket's returnability half, at the stage that closed the last door.
+    /// A test-role entity the query does not literally name is skipped for
+    /// direct file attribution, so nothing downstream can rank it. An explicit
+    /// ask has to open that door; the exact-name escape was the only key and a
+    /// caller cannot hand a key to a heuristic.
+    #[test]
+    fn a_caller_that_asks_for_tests_gets_direct_attribution_for_a_test_entity() {
+        let graph = kin_db::InMemoryGraph::new();
+        let mut test_fn = test_entity(
+            "verifies_manifest_authority",
+            "tests/test_manifest.py",
+            5,
+            25,
+        );
+        test_fn.role = EntityRole::Test;
+        graph.upsert_entity(&test_fn).unwrap();
+
+        let seeds = HashMap::from([(
+            test_fn.id,
+            EntityDiscovery {
+                score: 22.5,
+                signals: vec!["search"],
+                cosine: None,
+                exact_name: false,
+            },
+        )]);
+
+        let (_, _, _, withheld, _) =
+            resolve_entities_to_files(&seeds, &graph, false, "text", LocateScope::SOURCE_ONLY)
+                .unwrap();
+        assert!(
+            !withheld.contains_key("tests/test_manifest.py"),
+            "the default still withholds a test entity the query does not name"
+        );
+
+        let (_, _, _, admitted, _) =
+            resolve_entities_to_files(&seeds, &graph, false, "text", LocateScope::WITH_TESTS)
+                .unwrap();
+        let symbols = admitted
+            .get("tests/test_manifest.py")
+            .expect("an asked-for test entity must reach direct attribution");
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "verifies_manifest_authority"),
+            "the test entity must appear as a symbol of its own file: {symbols:?}"
+        );
+    }
+
+    fn ranked_paths(graph: &kin_db::InMemoryGraph, query: &str, scope: LocateScope) -> Vec<String> {
+        run_with_graph_capture_in_workspace_budgeted_scoped(
+            graph,
+            None,
+            query,
+            false,
+            5,
+            true,
+            scope,
+            LocateBudget::unbounded(),
+        )
+        .unwrap()
+        .files
+        .into_iter()
+        .map(|file| file.path)
+        .collect()
+    }
+
+    /// The whole pipeline, both directions at once. The ticket's claim is that
+    /// `semantic_locate` structurally cannot return a test-role entity, and the
+    /// first assertion here is that claim reproduced: a query whose terms are
+    /// the test's own body returns the source file and nothing else. The second
+    /// is the fix. The third is the direction that decides whether the fix is
+    /// safe, because widening what MAY be returned must not reorder a query
+    /// that was never about tests.
+    #[test]
+    fn asking_for_tests_returns_the_test_file_and_still_ranks_source_first() {
+        let graph = graph_with_source_and_test_bodies();
+
+        for query in ["resolve_manifest", "assert manifest authority repository"] {
+            let default_scope = ranked_paths(&graph, query, LocateScope::SOURCE_ONLY);
+            assert!(
+                !default_scope
+                    .iter()
+                    .any(|path| path == "tests/test_manifest.py"),
+                "the default withholds the test file for {query:?}: {default_scope:?}"
+            );
+
+            let asked = ranked_paths(&graph, query, LocateScope::WITH_TESTS);
+            assert!(
+                asked.iter().any(|path| path == "tests/test_manifest.py"),
+                "a caller that asked for tests must be able to receive one for {query:?}: \
+                 {asked:?}"
+            );
+            assert_eq!(
+                asked.first().map(String::as_str),
+                Some("src/manifest.py"),
+                "source must still rank first for {query:?}: {asked:?}"
+            );
+        }
+    }
+
     /// The uq04/uq05/uq07 gauntlet shape: a `#[test]` fn inside an inline
     /// `mod tests` block carries `EntityRole::Test` inside a Source-role file,
     /// and a bare-name query for it returned NOTHING (rank null) because the
@@ -24774,7 +25503,8 @@ mod tests {
         );
 
         let (_, _, _, file_symbols, _) =
-            resolve_entities_to_files(&seeds, &graph, false, "text").unwrap();
+            resolve_entities_to_files(&seeds, &graph, false, "text", LocateScope::SOURCE_ONLY)
+                .unwrap();
         let syms = file_symbols
             .get("crates/kin-db/src/storage/snapshot.rs")
             .expect("direct attribution must mint the file's symbol list");
@@ -24809,7 +25539,8 @@ mod tests {
             },
         )]);
         let (_, _, _, file_symbols, _) =
-            resolve_entities_to_files(&seeds, &graph, false, "text").unwrap();
+            resolve_entities_to_files(&seeds, &graph, false, "text", LocateScope::SOURCE_ONLY)
+                .unwrap();
         assert!(
             !file_symbols.contains_key("crates/kin-db/src/storage/snapshot.rs"),
             "a test entity the query does not name still skips direct attribution"
@@ -24861,7 +25592,8 @@ mod tests {
         );
 
         let (_, _, _, file_symbols, _) =
-            resolve_entities_to_files(&seeds, &graph, false, "text").unwrap();
+            resolve_entities_to_files(&seeds, &graph, false, "text", LocateScope::SOURCE_ONLY)
+                .unwrap();
         assert!(
             file_symbols
                 .get("crates/kin-db/src/storage/delta.rs")
@@ -24906,7 +25638,7 @@ mod tests {
             },
         );
 
-        let keyed = entity_seed_keyed(&seeds, &graph).unwrap();
+        let keyed = entity_seed_keyed(&seeds, &graph, LocateScope::SOURCE_ONLY).unwrap();
         let keys: Vec<&str> = keyed.iter().map(|(k, _, _)| k.as_str()).collect();
         assert!(
             keys.contains(&format!("entity:{}", named.id).as_str()),
@@ -25009,9 +25741,11 @@ mod tests {
         )]);
 
         let (_, _, signal_scores_without_explain, _, _) =
-            resolve_entities_to_files(&seeds, &graph, false, "text").unwrap();
+            resolve_entities_to_files(&seeds, &graph, false, "text", LocateScope::SOURCE_ONLY)
+                .unwrap();
         let (_, _, signal_scores_with_explain, _, _) =
-            resolve_entities_to_files(&seeds, &graph, true, "text").unwrap();
+            resolve_entities_to_files(&seeds, &graph, true, "text", LocateScope::SOURCE_ONLY)
+                .unwrap();
 
         assert_eq!(
             signal_scores_without_explain, signal_scores_with_explain,
@@ -25092,7 +25826,8 @@ mod tests {
         )]);
 
         let (resolved, _, _, _, _) =
-            resolve_entities_to_files(&seeds, &graph, false, "text").unwrap();
+            resolve_entities_to_files(&seeds, &graph, false, "text", LocateScope::SOURCE_ONLY)
+                .unwrap();
 
         assert!(
             resolved
@@ -25203,7 +25938,7 @@ mod tests {
             let _frontier =
                 kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_RESOLVE_ARTIFACT_FRONTIER", "1")
                     .with("KIN_LOCATE_GRAPH_ONLY_PROJECTION_FLOOR", "0.25");
-            resolve_entities_to_files(&seeds, &graph, true, "text")
+            resolve_entities_to_files(&seeds, &graph, true, "text", LocateScope::SOURCE_ONLY)
         };
         let (resolved, _, _, _, candidate_stages) = result.unwrap();
 
@@ -26835,6 +27570,7 @@ mod tests {
             10,
             true,
             SnippetOptions::default(),
+            LocateScope::SOURCE_ONLY,
             LocateBudget::unbounded(),
         )
         .unwrap();
@@ -26859,6 +27595,7 @@ mod tests {
             10,
             true,
             SnippetOptions::default(),
+            LocateScope::SOURCE_ONLY,
             LocateBudget::unbounded(),
         )
         .unwrap();
@@ -27026,19 +27763,21 @@ mod tests {
             },
         );
 
-        let first = resolve_entities_to_files(&seeds, &graph, false, "test")
-            .unwrap()
-            .0
-            .iter()
-            .map(|(p, _)| p.clone())
-            .collect::<Vec<_>>();
-        for _ in 0..8 {
-            let again = resolve_entities_to_files(&seeds, &graph, false, "test")
+        let first =
+            resolve_entities_to_files(&seeds, &graph, false, "test", LocateScope::SOURCE_ONLY)
                 .unwrap()
                 .0
                 .iter()
                 .map(|(p, _)| p.clone())
                 .collect::<Vec<_>>();
+        for _ in 0..8 {
+            let again =
+                resolve_entities_to_files(&seeds, &graph, false, "test", LocateScope::SOURCE_ONLY)
+                    .unwrap()
+                    .0
+                    .iter()
+                    .map(|(p, _)| p.clone())
+                    .collect::<Vec<_>>();
             assert_eq!(
                 again, first,
                 "resolve projection order must be deterministic"
@@ -27115,7 +27854,7 @@ mod tests {
             (b.id, disc(6.0)),
             (t.id, disc(100.0)),
         ]);
-        let keyed = entity_seed_keyed(&seeds, &graph).unwrap();
+        let keyed = entity_seed_keyed(&seeds, &graph, LocateScope::SOURCE_ONLY).unwrap();
         // Test entity excluded; the other three survive as distinct items.
         assert_eq!(keyed.len(), 3, "test entity must be excluded");
         let shared_items: Vec<&(String, String, f32)> = keyed
@@ -27148,9 +27887,14 @@ mod tests {
             HashMap::from([(a1.id, disc(10.0)), (a2.id, disc(4.0)), (b.id, disc(8.0))]);
         let embedding_seeds: HashMap<kin_model::EntityId, EntityDiscovery> = HashMap::new();
         let ranked_lists: Vec<Vec<(String, f32)>> = vec![Vec::new(); 10];
-        let fused =
-            entity_granular_fused_files(&ranked_lists, &text_seeds, &embedding_seeds, &graph)
-                .unwrap();
+        let fused = entity_granular_fused_files(
+            &ranked_lists,
+            &text_seeds,
+            &embedding_seeds,
+            &graph,
+            LocateScope::SOURCE_ONLY,
+        )
+        .unwrap();
         // Both files present; the two src/a.rs entities collapse to ONE file.
         assert_eq!(
             fused.len(),
@@ -27174,7 +27918,14 @@ mod tests {
             ("src/y.rs".to_string(), 0.5),
             ("vendor/dep/z.rs".to_string(), 9.0),
         ];
-        let fused = entity_granular_fused_files(&ranked_lists, &empty, &empty, &graph).unwrap();
+        let fused = entity_granular_fused_files(
+            &ranked_lists,
+            &empty,
+            &empty,
+            &graph,
+            LocateScope::SOURCE_ONLY,
+        )
+        .unwrap();
         let paths: Vec<&str> = fused.iter().map(|(p, _)| p.as_str()).collect();
         assert!(paths.contains(&"src/x.rs"));
         assert!(paths.contains(&"src/y.rs"));
@@ -27338,7 +28089,8 @@ mod tests {
         .iter()
         .map(|path| (*path).to_string())
         .collect();
-        let bodies = GraphBodyCoverage::observe(paths.iter(), |path| path.ends_with("api.py"));
+        let bodies =
+            GraphBodyCoverage::observe(paths.iter(), 0, |path: &str| path.ends_with("api.py"));
 
         assert_eq!(bodies.source_paths, 4);
         assert_eq!(bodies.with_body, 1);
@@ -27361,7 +28113,7 @@ mod tests {
         let paths: Vec<String> = (0..40)
             .map(|index| format!("src/mod{index:02}.py"))
             .collect();
-        let bodies = GraphBodyCoverage::observe(paths.iter(), |_| false);
+        let bodies = GraphBodyCoverage::observe(paths.iter(), 0, |_| false);
 
         assert_eq!(bodies.gap_paths, 40, "the count must be the whole truth");
         assert_eq!(
@@ -27386,6 +28138,7 @@ mod tests {
                 "src/requests/utils.py".to_string(),
             ]
             .iter(),
+            0,
             |_| false,
         ));
 
@@ -27421,6 +28174,7 @@ mod tests {
     fn full_body_coverage_and_an_unobserved_one_both_leave_complete_alone() {
         let observed = fully_embedded_coverage().with_graph_bodies(GraphBodyCoverage::observe(
             ["src/requests/api.py".to_string()].iter(),
+            0,
             |_| true,
         ));
         assert!(observed.complete, "no gap, so nothing to clear");
@@ -27450,6 +28204,7 @@ mod tests {
         };
         let coverage = partial.with_graph_bodies(GraphBodyCoverage::observe(
             ["src/requests/sessions.py".to_string()].iter(),
+            0,
             |_| false,
         ));
 

@@ -97,6 +97,16 @@ fn authored_files_from_staged(
             // A relation operation writes no file, so it claims none.
             Some(_) => continue,
             None => {
+                // A creation names its file directly and has no entity to
+                // resolve, which is also why it must be answered here: falling
+                // through to entity resolution fails, the whole authored set
+                // collapses to `None`, and a resumed commit would then declare
+                // every file it published as carried when the original declared
+                // none of them.
+                if kin_mcp::session::is_new_source_file(operation) {
+                    authored.insert(RepoPath::from_utf8(operation.target.trim().to_string()).ok()?);
+                    continue;
+                }
                 kin_mcp::handlers::sessions::resolve_target_entity(graph, &operation.target).ok()?
             }
         };
@@ -916,11 +926,24 @@ fn plan_exact_transaction(
     let prospective = kin_db::InMemoryGraph::from_snapshot(base.graph.to_snapshot())
         .map_err(|error| format!("create prospective exact graph: {error}"))?;
     let mut edits: BTreeMap<String, (FilePathId, Vec<(Entity, Vec<u8>)>)> = BTreeMap::new();
+    let mut creations: BTreeMap<String, (FilePathId, Vec<u8>)> = BTreeMap::new();
     let mut relation_operations = Vec::new();
     let mut edited_entities = HashSet::new();
 
     for operation in &transaction.staged_operations {
         let verb = operation.verb.trim().to_ascii_lowercase();
+        // A payload-less `create` carrying a repository path and a body admits
+        // source the graph has never seen. It is the only shape that can: an
+        // edit resolves its target against an existing entity and splices into
+        // an existing span, so a file with neither is unreachable through it,
+        // and the structured branch would require the caller to invent entity
+        // identity the extractor is about to derive. Recorded here and planned
+        // below, beside the edits, so one transaction can create a file and
+        // edit another and publish both or neither.
+        if operation.payload.is_none() && kin_mcp::session::is_new_source_file(operation) {
+            record_new_source_file(&mut creations, base, operation)?;
+            continue;
+        }
         // A payload-less `update` carrying a target and a body is the minimal
         // agent write surface: an agent knows a name and the new source text but
         // not Kin's entity structs. Staging accepts it, so the planner must too,
@@ -1062,7 +1085,9 @@ fn plan_exact_transaction(
     // tree deltas.
     let authored_files = edits
         .values()
-        .map(|(file_id, _)| {
+        .map(|(file_id, _)| file_id)
+        .chain(creations.values().map(|(file_id, _)| file_id))
+        .map(|file_id| {
             RepoPath::from_utf8(file_id.0.clone())
                 .map_err(|error| format!("invalid exact source path {file_id}: {error}"))
         })
@@ -1070,6 +1095,8 @@ fn plan_exact_transaction(
 
     let mut layouts = Vec::new();
     let pipeline = kin_index::IndexPipeline::new();
+
+    plan_new_source_files(state, &prospective, &pipeline, creations, &mut layouts)?;
     for (_, (file_id, file_edits)) in edits {
         let path = RepoPath::from_utf8(file_id.0.clone())
             .map_err(|error| format!("invalid exact source path {file_id}: {error}"))?;
@@ -1161,7 +1188,11 @@ fn plan_exact_transaction(
             )
         }) {
             return Err(format!(
-                "body edit for {file_id} would create or remove source entities ({delta:?}); insertion/deletion is not yet supported"
+                "body edit for {file_id} would create or remove source entities ({delta:?}); an \
+                 edit may only change the body of the entity it names. To add a whole new file, \
+                 stage verb 'create' with `target` set to its repository path and `body` set to \
+                 its complete text; adding or removing an entity inside an existing file is not \
+                 yet supported"
             ));
         }
         prospective
@@ -1329,6 +1360,129 @@ fn record_source_edit(
         .or_insert_with(|| (file_id, Vec::new()))
         .1
         .push((existing, body.to_vec()));
+    Ok(())
+}
+
+/// Record one "admit this new source file" operation against repository
+/// authority, refusing every shape the planner could not honor later.
+///
+/// The path is validated with the same rule the projection applies, so a
+/// creation the planner accepts is a creation the commit can materialize, and
+/// a path already tracked is refused by name rather than silently turned into
+/// an edit of somebody else's file.
+fn record_new_source_file(
+    creations: &mut BTreeMap<String, (FilePathId, Vec<u8>)>,
+    base: &NativeCommitBase,
+    operation: &kin_mcp::McpMutationOperation,
+) -> Result<(), String> {
+    let target = operation.target.trim();
+    let path = RepoPath::from_utf8(target.to_string())
+        .map_err(|error| format!("new source path {target:?} is unusable: {error}"))?;
+    kin_core::validate_source_paths([&path]).map_err(|error| {
+        format!("new source path {target:?} is not an admissible repository path: {error}")
+    })?;
+    if base.tree.artifact_at_path(&path).is_some() {
+        return Err(format!(
+            "{target} is already tracked by repository authority, so it cannot be created; \
+             'create' admits only source the graph has never seen. Edit it with verb 'update' \
+             naming an entity inside it, or create a path that does not exist yet"
+        ));
+    }
+    let body = operation
+        .body
+        .as_ref()
+        .expect("a new source file operation always carries a body");
+    let file_id = FilePathId::new(target.to_string());
+    if creations
+        .insert(file_id.0.clone(), (file_id, body.as_bytes().to_vec()))
+        .is_some()
+    {
+        return Err(format!(
+            "{target} is created more than once in one transaction; overlapping source authority \
+             is ambiguous"
+        ));
+    }
+    Ok(())
+}
+
+/// Turn recorded creations into prospective graph truth: exact blob, tree
+/// identity, derived entities, derived relations, and a file layout.
+///
+/// Every step here is the one the ingest path runs. The bytes come from the
+/// call rather than from the filesystem, and after they are written to the blob
+/// store the file is admitted to the tree, classified and parsed by
+/// [`kin_index::IndexPipeline`], and reconciled by [`kin_reconcile::Reconciler`]
+/// exactly as an admitted file is. Nothing in this function reads the working
+/// copy; the working file appears afterwards because the commit projects the
+/// tree it published, which is the graph-owns-truth direction rather than the
+/// filesystem-tells-the-graph one.
+///
+/// One reconciler spans the whole batch, and it is seeded from the prospective
+/// graph, because cross-file resolution is skipped outright on an unseeded
+/// linker. That is what lets two files created in one transaction reference
+/// each other: the first file's unresolved references wait on the names it
+/// imported, and installing the second file's entities binds them. The seeding
+/// pass is one walk of the entity universe and runs only when a transaction
+/// actually creates a file, so a transaction that only edits bodies keeps
+/// exactly the planning it had before.
+///
+/// A file whose content does not classify as entity source is still admitted.
+/// Parser support decides how much semantics a file gets, never whether the
+/// repository holds it, which is the rule the ambient admission seam already
+/// follows.
+fn plan_new_source_files(
+    state: &DaemonState,
+    prospective: &kin_db::InMemoryGraph,
+    pipeline: &kin_index::IndexPipeline,
+    creations: BTreeMap<String, (FilePathId, Vec<u8>)>,
+    layouts: &mut Vec<FileLayout>,
+) -> Result<(), String> {
+    if creations.is_empty() {
+        return Ok(());
+    }
+    let mut reconciler = kin_reconcile::Reconciler::new(PathBuf::new());
+    reconciler.seed_cross_file_linker_from_graph(prospective);
+
+    for (_, (file_id, body)) in creations {
+        let path = RepoPath::from_utf8(file_id.0.clone())
+            .map_err(|error| format!("invalid new source path {file_id}: {error}"))?;
+        let digest = state
+            .blobs
+            .write(&body)
+            .map_err(|error| format!("store new source {file_id}: {error}"))?;
+        let hash = Hash256::from_bytes(digest.0);
+        prospective
+            .apply_transaction_delta(&TransactionDelta {
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id: kin_model::ArtifactId::new(),
+                    new: LocatedEntry::new(path, TreeEntry::blob(hash, false)),
+                }],
+                ..TransactionDelta::default()
+            })
+            .map_err(|error| format!("admit new source {file_id} to the exact tree: {error}"))?;
+
+        let indexed = pipeline
+            .index_any_content(&file_id, &body, digest)
+            .map_err(|error| format!("parse new source {file_id}: {error}"))?;
+        let kin_index::IndexedAny::EntitySource(indexed) = indexed else {
+            continue;
+        };
+        let reconcile = reconciler
+            .reconcile_indexed_content(&indexed, state.blobs.as_ref(), prospective)
+            .map_err(|error| format!("derive semantics for new source {file_id}: {error}"))?;
+        prospective
+            .apply_transaction_delta(&reconcile.delta)
+            .map_err(|error| format!("apply derived semantics for {file_id}: {error}"))?;
+        let layout = reconciler
+            .projection()
+            .get_layout(&file_id)
+            .cloned()
+            .ok_or_else(|| format!("parsing produced no file layout for new source {file_id}"))?;
+        prospective
+            .upsert_file_layout(&layout)
+            .map_err(|error| format!("install prospective layout for {file_id}: {error}"))?;
+        layouts.push(layout);
+    }
     Ok(())
 }
 
@@ -1622,6 +1776,13 @@ fn finalize_committed_transaction(
     timed_finalize_step("install_authority_graph", || {
         install_authority_graph(state.graph.as_ref(), &authority.graph, &committed)
     })?;
+    // The live graph now carries what authority carries, so this is the moment
+    // the two are level and the only honest place to record the durable side's
+    // count (FIR-2421). Taken from the authority graph rather than the live one:
+    // an ambient admission may already have added entities to the live graph
+    // that this commit did not publish, and reading the live count here would
+    // record those as durable.
+    state.record_durable_entity_count(authority.graph.entity_count() as u64);
     let layouts = timed_finalize_step("rebuild_changed_layouts", || {
         if planned_layouts.is_empty() && committed.file_count > 0 {
             rebuild_changed_layouts(state, &authority, &committed.change)
@@ -2203,6 +2364,239 @@ mod tests {
         {
             kin_mcp::ContentBlock::Text { text } => text,
         }
+    }
+
+    /// Build the create-file operation an agent stages for new source.
+    fn new_source_file(path: &str, body: &str) -> kin_mcp::McpMutationOperation {
+        kin_mcp::McpMutationOperation {
+            verb: "create".to_string(),
+            target: path.to_string(),
+            payload: None,
+            body: Some(body.to_string()),
+            description: format!("admit new source {path}"),
+        }
+    }
+
+    const NEW_UTIL_PY: &str = "def helper(value):\n    return value + 1\n";
+    const NEW_APP_PY: &str =
+        "from pkg.util import helper\n\n\ndef run(value):\n    return helper(value)\n";
+
+    /// An agent holding only the MCP belt creates new source and the graph holds
+    /// it, including the references that cross between two files created in the
+    /// same transaction.
+    ///
+    /// This is the defect FIR-2417 records, driven the way it was found. Before
+    /// this operation existed there was no call on the belt that could introduce
+    /// a file: an edit resolves its target against an existing entity, so a path
+    /// with no entity was unreachable through it, and nothing ambient admits
+    /// untracked content (the watch loop leaves it for an explicit admission
+    /// seam, and the only seams are `kin commit` and `kin admit`, both of which
+    /// need a shell). So an agent wrote files and the graph stayed empty.
+    ///
+    /// Cross-file resolution is asserted rather than assumed because it is what
+    /// separates two files that are merely present from two files Kin
+    /// understands together, and because the planner has to seed its linker for
+    /// it to happen at all.
+    #[test]
+    fn new_source_files_created_over_mcp_enter_the_graph_and_reference_each_other() {
+        let (_dir, state) = test_state();
+        let sessions = test_sessions();
+
+        let before = load_native_commit_base(&state.layout).unwrap();
+        let entities_before = before
+            .graph
+            .query_entities(&EntityFilter::default())
+            .unwrap()
+            .len();
+        let files_before = before.tree.artifacts().count();
+
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "file:pkg/app.py")
+            .unwrap();
+        let operations = vec![
+            new_source_file("pkg/util.py", NEW_UTIL_PY),
+            new_source_file("pkg/app.py", NEW_APP_PY),
+        ];
+        kin_mcp::session::validate_staged_operations(&operations)
+            .expect("staging must accept the new source file form");
+        sessions
+            .stage_transaction(&transaction.transaction_id, operations)
+            .unwrap();
+
+        let result = commit_exact_transaction(
+            &state,
+            &sessions,
+            &HashMap::from([(
+                "transaction_id".to_string(),
+                serde_json::json!(transaction.transaction_id),
+            )]),
+            None,
+        );
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "creating new source over MCP failed: {}",
+            result_text(&result)
+        );
+
+        // The working files are a projection of what committed, written by the
+        // commit rather than by the agent. Byte-exact, so a body that arrived
+        // mangled cannot pass.
+        assert_eq!(
+            std::fs::read_to_string(state.layout.working_dir().join("pkg/util.py")).unwrap(),
+            NEW_UTIL_PY
+        );
+        assert_eq!(
+            std::fs::read_to_string(state.layout.working_dir().join("pkg/app.py")).unwrap(),
+            NEW_APP_PY
+        );
+
+        let after = load_native_commit_base(&state.layout).unwrap();
+        assert_eq!(
+            after.tree.artifacts().count(),
+            files_before + 2,
+            "both created files must be tracked by repository authority"
+        );
+
+        let find = |name: &str, file: &str| {
+            after
+                .graph
+                .query_entities(&EntityFilter {
+                    name_pattern: Some(name.to_string()),
+                    file_path: Some(FilePathId::new(file)),
+                    ..EntityFilter::default()
+                })
+                .unwrap()
+                .into_iter()
+                .find(|entity| entity.name == name)
+                .unwrap_or_else(|| panic!("{name} must be a graph entity derived from {file}"))
+        };
+        let helper = find("helper", "pkg/util.py");
+        let run = find("run", "pkg/app.py");
+        assert!(
+            after
+                .graph
+                .query_entities(&EntityFilter::default())
+                .unwrap()
+                .len()
+                > entities_before,
+            "the graph must hold more entities after admitting two source files"
+        );
+
+        // The reference that crosses files. `find_references` reads exactly
+        // these relation rows, so asserting them here is asserting what the
+        // belt sees.
+        let crossing = after
+            .graph
+            .get_all_relations_for_entity(&run.id)
+            .unwrap()
+            .into_iter()
+            .any(|relation| relation.dst == GraphNodeId::Entity(helper.id));
+        assert!(
+            crossing,
+            "pkg/app.py's run must reference pkg/util.py's helper across the two created files"
+        );
+
+        // What the agent actually reads back. `modified_files` is the field the
+        // tool documents, and a created file has to appear in it exactly as an
+        // edited one does or the caller cannot tell the commit landed.
+        let reply: serde_json::Value = serde_json::from_str(result_text(&result)).unwrap();
+        let modified = reply["modified_files"]
+            .as_array()
+            .expect("a successful commit reply names modified_files")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>();
+        assert!(
+            modified.contains(&"pkg/util.py") && modified.contains(&"pkg/app.py"),
+            "the commit reply must name both created files, got {modified:?}"
+        );
+        assert!(
+            reply["change_id"].as_str().is_some_and(|id| !id.is_empty()),
+            "the commit must publish a change an agent can review: {reply}"
+        );
+    }
+
+    /// A `create` naming a path the graph already tracks is refused by name.
+    ///
+    /// The refusal exists because the alternative is worse than a failure: an
+    /// agent that meant to add a file and typed a path already in use would
+    /// silently replace somebody else's file with its own, and a whole-file
+    /// replacement is exactly what an edit is designed not to be. It also keeps
+    /// `create` honest about what it means, so the caller is pointed at the verb
+    /// that does what it wanted.
+    #[test]
+    fn creating_a_path_the_graph_already_tracks_is_refused_by_name() {
+        let (_dir, state) = test_state();
+        install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let sessions = test_sessions();
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "file:src/lib.rs")
+            .unwrap();
+        sessions
+            .stage_transaction(
+                &transaction.transaction_id,
+                vec![new_source_file("src/lib.rs", "pub fn replaced() {}\n")],
+            )
+            .unwrap();
+
+        let result = commit_exact_transaction(
+            &state,
+            &sessions,
+            &HashMap::from([(
+                "transaction_id".to_string(),
+                serde_json::json!(transaction.transaction_id),
+            )]),
+            None,
+        );
+        assert_eq!(result.is_error, Some(true));
+        let text = result_text(&result);
+        assert!(
+            text.contains("src/lib.rs is already tracked by repository authority"),
+            "refusal must name the tracked path: {text}"
+        );
+
+        // The refusal is not merely a message: the file it named is untouched.
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/lib.rs")).unwrap(),
+            b"pub fn value() -> u8 { 1 }\n"
+        );
+    }
+
+    /// A path that could not be materialized is refused where it was typed.
+    ///
+    /// Stage time, not commit time, so a caller learns which operation is wrong
+    /// while the transaction still holds only what it typed. Checking it here as
+    /// well as in the planner is what keeps stage-time rejection a superset of
+    /// commit-time rejection, which is the contract the stage tool advertises.
+    #[test]
+    fn an_inadmissible_new_source_path_is_refused_at_stage_time() {
+        for path in [
+            "/etc/passwd",
+            "../outside.py",
+            ".kin/objects/sneak.py",
+            ".git/hooks/pre-commit",
+        ] {
+            let operation = new_source_file(path, "print('x')\n");
+            let error =
+                kin_mcp::session::validate_staged_operations(std::slice::from_ref(&operation))
+                    .expect_err(&format!("{path} must not stage"));
+            assert!(
+                error.contains(path),
+                "the refusal must quote the path it rejected: {error}"
+            );
+        }
+
+        // Positive control: the check refuses these paths because they are
+        // inadmissible, not because it refuses every path.
+        let ordinary = new_source_file("pkg/util.py", "print('x')\n");
+        kin_mcp::session::validate_staged_operations(std::slice::from_ref(&ordinary))
+            .expect("an ordinary repository-relative path must stage");
     }
 
     #[test]

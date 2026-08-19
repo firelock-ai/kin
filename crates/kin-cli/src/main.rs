@@ -342,6 +342,13 @@ enum Command {
         /// (`KIN_LOCATE_ENTITY_CAP` otherwise).
         #[arg(long)]
         page_size: Option<usize>,
+        /// Rank test-role entities alongside source. Off by default: locate
+        /// demotes tests unless the query text itself reads as being about
+        /// them, which is right for "where does this feature live" and wrong
+        /// when you already know you are asking for a test. The response says
+        /// how many test paths a default run withheld.
+        #[arg(long = "include-tests", default_value_t = false)]
+        include_tests: bool,
     },
     /// Debug locate results: show per-signal breakdown, rank gold files,
     /// and diagnose why targets were missed.
@@ -523,6 +530,12 @@ enum Command {
         /// bodies, and then steps, to fit (default 80000).
         #[arg(long = "max-response-chars", value_name = "C")]
         max_response_chars: Option<usize>,
+        /// Walk through a type-annotation edge to a type this repository
+        /// defines. Off by default, because a shared type name otherwise joins
+        /// every entity that annotates with it to every other one. A target
+        /// this repository does not define stays a leaf either way.
+        #[arg(long = "include-type-edges", default_value_t = false)]
+        include_type_edges: bool,
     },
     /// Show this repository's recorded cross-repo dependencies
     Deps {
@@ -1156,9 +1169,18 @@ enum Command {
         /// Run non-interactively using defaults or provided flags
         #[arg(long, global = true)]
         no_interactive: bool,
+        /// Skip the MCP round trip that proves each configured AI client can
+        /// actually call Kin (for a scripted install with no repository yet)
+        #[arg(long, global = true)]
+        skip_mcp_check: bool,
         /// Skip the wizard and only run the first-run health check
         #[arg(long, default_value_t = false)]
         check: bool,
+    },
+    /// Engage, disengage, or report the filesystem projection for this repository
+    Vfs {
+        #[command(subcommand)]
+        action: VfsAction,
     },
     /// Send a user-facing notification through Kin's own identity
     Notify {
@@ -2102,6 +2124,29 @@ enum SetupAction {
     },
 }
 
+/// `kin vfs`: one command for the projection that shows graph truth as files.
+///
+/// The graph is the authority either way. These verbs decide which of the three
+/// views of it this repository gets, and prove the one they engaged rather than
+/// announcing it.
+#[derive(Subcommand)]
+enum VfsAction {
+    /// Engage the projection for this repository
+    On {
+        /// Force a projection mode: shim, nfs, or fuse
+        #[arg(long, value_parser = ["shim", "nfs", "fuse"])]
+        mode: Option<String>,
+    },
+    /// Disengage the projection for this repository
+    Off,
+    /// Report which projection is in force, probed live
+    Status {
+        /// Emit the probe results as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+}
+
 #[derive(Subcommand)]
 enum RegistryAction {
     /// Verify local registry authority without reading its contents
@@ -2642,6 +2687,7 @@ fn main() -> Result<()> {
                     next,
                     cursor,
                     page_size,
+                    include_tests,
                 } => {
                     // Inline snippets default ON for the structured/agent `--json`
                     // surface (so an agent gets code on the first locate);
@@ -2698,6 +2744,7 @@ fn main() -> Result<()> {
                             // lean on bodies unless --snippets is explicit.
                             true,
                             paging,
+                            commands::locate::LocateScope::with_tests(include_tests),
                         )
                         .await?;
 
@@ -2819,6 +2866,7 @@ fn main() -> Result<()> {
                             reference,
                             want_snippets,
                             paging,
+                            commands::locate::LocateScope::with_tests(include_tests),
                         )
                         .await
                     }
@@ -2980,6 +3028,7 @@ fn main() -> Result<()> {
                     limit_per_step,
                     no_bodies,
                     max_response_chars,
+                    include_type_edges,
                 } => {
                     commands::trace_data_flow::run_seeded(
                         focal,
@@ -2988,6 +3037,7 @@ fn main() -> Result<()> {
                         limit_per_step,
                         no_bodies.then_some(false),
                         max_response_chars,
+                        include_type_edges.then_some(true),
                     )
                     .await
                 }
@@ -3555,6 +3605,11 @@ fn main() -> Result<()> {
                         commands::setup::doctor(fix, json).await
                     }
                 }
+                Command::Vfs { action } => match action {
+                    VfsAction::On { mode } => commands::projection::on(mode).await,
+                    VfsAction::Off => commands::projection::off().await,
+                    VfsAction::Status { json } => commands::projection::status(json).await,
+                },
                 Command::Notify {
                     action,
                     title,
@@ -3603,6 +3658,7 @@ fn main() -> Result<()> {
                     shell,
                     auto_daemon,
                     no_interactive,
+                    skip_mcp_check,
                     check,
                 } => match action {
                     Some(SetupAction::Status { json }) => commands::setup::status(json).await,
@@ -3626,6 +3682,7 @@ fn main() -> Result<()> {
                             auto_daemon,
                             no_interactive,
                             intent,
+                            skip_mcp_check,
                         })
                         .await
                     }

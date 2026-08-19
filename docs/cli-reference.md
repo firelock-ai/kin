@@ -35,7 +35,7 @@ These apply to every command.
 - [Sessions and agents](#sessions-and-agents): `agent`, `exec`, `shell`, `open`, `with`, `mcp`, `assistant`, `intent`, `traffic`, `work`, `note`, `todo`, `feature`
 - [Remotes and publishing](#remotes-and-publishing): `auth`, `remote`, `push`, `pull`, `publish`, `release`, `hosted-release`, `pipeline`, `secret`
 - [Graph, store, and daemon operations](#graph-store-and-daemon-operations): `graph`, `embed`, `cache`, `backup`, `resources`, `support`, `daemon`, `registry`, `telemetry`, `notify`, `bench`
-- [Install and health](#install-and-health): `capabilities`, `setup`, `doctor`, `update`, `completions`
+- [Install and health](#install-and-health): `capabilities`, `setup`, `doctor`, `vfs`, `update`, `completions`
 
 ## Start here
 
@@ -2581,6 +2581,7 @@ kin setup [<subcommand>] [options]
 | `--shell <shell>` |  | Shell to configure: zsh, bash, or powershell |
 | `--auto-daemon` |  | Auto-start kin-daemon when entering workspaces |
 | `--no-interactive` |  | Run non-interactively using defaults or provided flags |
+| `--skip-mcp-check` |  | Skip the MCP round trip that proves each configured AI client can actually call Kin (for a scripted install with no repository yet) |
 | `--check` |  | Skip the wizard and only run the first-run health check |
 
 Run `kin setup` with no subcommand for the default behavior above, or one of:
@@ -2651,6 +2652,38 @@ kin doctor [options]
 | `--json` |  | Emit the machine-readable health report as JSON |
 | `--drift` |  | Compare an explicit projection observation with graph truth |
 | `--heal` |  | Rematerialize the derived projection from graph truth, DISCARDING uncommitted changes to tracked files that diverge from it |
+
+Two rows cover filesystem projection and they answer different questions.
+`VFS projection` says whether projection is installed on this machine.
+`Projection in force` says whether the file you just edited went through the
+graph, reading `mode/mounted/readable/writable/degraded` from a probe that runs
+rather than from a configuration file. A machine can pass the first and fail the
+second: a container where the loader strips the injected shim has an intact
+install and every process reading raw disk.
+
+### `kin vfs`
+
+Engage, disengage, or report the filesystem projection for this repository.
+
+The graph is the authority. A projection is how that truth reaches your tools as
+ordinary files, and Kin has four: the injected shim, an NFS mount, a FUSE mount,
+and Windows ProjFS. Kin prefers a mount where one is available, because the
+kernel serves it and no process can have it stripped. macOS and Linux fall back
+to the shim; Windows has no shim and leads with ProjFS, which ships on every
+SKU. See [Filesystem projection](projection.md) for the full order and the
+per-platform table of what each mode needs.
+
+```
+kin vfs on [--mode <shim|nfs|fuse|projfs>]
+kin vfs off
+kin vfs status [--json]
+```
+
+| Subcommand | Description |
+| --- | --- |
+| `on` | Engage the projection for this repository. `--mode` forces one; without it Kin uses the recorded mode, or picks by the fallback order. A mode that cannot run here falls back with a message naming what is missing and the exact line that installs or enables it, and never reports a mount that is not running. |
+| `off` | Disengage the projection. An NFS mount admits whatever is staged through it before unmounting, so turning the projection off strands nothing. The shim is injected per process, so it cannot be withdrawn from a running shell; the command says so and names `KIN_VFS_DISABLE=1`. ProjFS is a Windows feature rather than a process Kin starts, so there is nothing to stop. |
+| `status` | Print each mode's live probe result and what is in force, as `mode/mounted/readable/writable/degraded`. |
 
 ### `kin update`
 

@@ -559,8 +559,9 @@ pub(crate) struct ReferenceEntry {
     start_line: Option<u32>,
     pub(crate) relation_kinds: Vec<RelationKind>,
     /// Strongest resolution among the edges behind this row. A `name_only` row
-    /// is a same-name match with nothing at the reference site proving it.
-    resolution: RelationResolution,
+    /// is a same-name match with nothing at the reference site proving it, so
+    /// dead-code reads this to decide whether the row is evidence of use.
+    pub(crate) resolution: RelationResolution,
 }
 
 #[derive(Debug, Clone)]

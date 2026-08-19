@@ -143,7 +143,7 @@ fn extract_rust_node(
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
                 });
-                extract_calls_from_context(node, source, &name, relations);
+                extract_calls_from_context(node, source, &name, None, relations);
             }
         }
         "struct_item" => {
@@ -329,7 +329,13 @@ fn extract_rust_node(
                                 fingerprint: compute_fingerprint(&member, source),
                                 span: span_from_node(&member, file_id),
                             });
-                            extract_calls_from_context(&member, source, &qualified, relations);
+                            extract_calls_from_context(
+                                &member,
+                                source,
+                                &qualified,
+                                (!type_name.is_empty()).then_some(type_name.as_str()),
+                                relations,
+                            );
                             // A method declared in `impl Trait for Type` satisfies
                             // the trait's contract, so a caller holding the trait
                             // reaches it without any edge naming the method. Only
@@ -542,6 +548,7 @@ fn extract_calls_from_context(
     node: &tree_sitter::Node,
     source: &[u8],
     context_name: &str,
+    owner: Option<&str>,
     relations: &mut Vec<ExtractedRelation>,
 ) {
     let mut cursor = node.walk();
@@ -549,19 +556,10 @@ fn extract_calls_from_context(
         if child.kind() == "call_expression" {
             // The callee is the `function` field
             if let Some(function) = child.child_by_field_name("function") {
-                let callee_name = match function.kind() {
-                    "field_expression" => {
-                        // obj.method() — extract just the method name (field)
-                        function
-                            .child_by_field_name("field")
-                            .map(|f| f.utf8_text(source).unwrap_or("").to_string())
-                            .unwrap_or_default()
-                    }
-                    _ => function.utf8_text(source).unwrap_or("").to_string(),
-                };
+                let (callee_name, receiver) = rust_callee_and_receiver(&function, source, owner);
                 if is_valid_callee_name(&callee_name) {
                     relations.push(ExtractedRelation {
-                        receiver: None,
+                        receiver,
                         call_shape: None,
                         kind: kin_model::RelationKind::Calls,
                         src_name: context_name.to_string(),
@@ -581,12 +579,18 @@ fn extract_calls_from_context(
             let mut macro_cursor = child.walk();
             for macro_child in child.children(&mut macro_cursor) {
                 if macro_child.kind() == "token_tree" {
-                    extract_calls_from_token_tree(&macro_child, source, context_name, relations);
+                    extract_calls_from_token_tree(
+                        &macro_child,
+                        source,
+                        context_name,
+                        owner,
+                        relations,
+                    );
                 }
             }
         }
         // Recurse into child nodes
-        extract_calls_from_context(&child, source, context_name, relations);
+        extract_calls_from_context(&child, source, context_name, owner, relations);
     }
 }
 
@@ -609,6 +613,7 @@ fn extract_calls_from_token_tree(
     node: &tree_sitter::Node,
     source: &[u8],
     context_name: &str,
+    owner: Option<&str>,
     relations: &mut Vec<ExtractedRelation>,
 ) {
     let mut cursor = node.walk();
@@ -616,7 +621,7 @@ fn extract_calls_from_token_tree(
 
     for (index, token) in tokens.iter().enumerate() {
         if token.kind() == "token_tree" {
-            extract_calls_from_token_tree(token, source, context_name, relations);
+            extract_calls_from_token_tree(token, source, context_name, owner, relations);
             continue;
         }
         if token.kind() != "identifier" {
@@ -630,7 +635,19 @@ fn extract_calls_from_token_tree(
             continue;
         }
         // `x.method(..)`: bare method name, matching the field_expression arm.
+        // The token before the dot is the receiver, so a macro-body dispatch
+        // carries the same receiver evidence a `call_expression` one does. With
+        // no such token there is nothing to attribute the call to, and recording
+        // it receiverless would present a dispatch as a bare call.
         let is_method_call = index > 0 && tokens[index - 1].kind() == ".";
+        let receiver = if is_method_call {
+            let Some(receiver_token) = index.checked_sub(2).and_then(|at| tokens.get(at)) else {
+                continue;
+            };
+            Some(receiver_token.utf8_text(source).unwrap_or("").to_string())
+        } else {
+            None
+        };
         let mut callee_name = token.utf8_text(source).unwrap_or("").to_string();
         if !is_method_call {
             // Reconstruct a leading `a::b::` path so qualified callees keep
@@ -648,9 +665,10 @@ fn extract_calls_from_token_tree(
                 );
             }
         }
+        let (callee_name, receiver) = fold_settled_rust_receiver(callee_name, receiver, owner);
         if is_valid_callee_name(&callee_name) {
             relations.push(ExtractedRelation {
-                receiver: None,
+                receiver,
                 call_shape: None,
                 kind: kin_model::RelationKind::Calls,
                 src_name: context_name.to_string(),
@@ -658,6 +676,69 @@ fn extract_calls_from_token_tree(
                 import_source: None,
             });
         }
+    }
+}
+
+/// The callee name and receiver one Rust call site records.
+///
+/// A method reached through an object keeps its bare leaf and carries the
+/// receiver as written, which is what lets the linker tell a dispatch from a
+/// free-function call: without it, `builder.multi_line(..)` and a module-level
+/// `multi_line(..)` are the same relation, and every same-named method in the
+/// repository is an equally good answer.
+///
+/// A receiver the syntax settles is folded into the callee instead. Inside
+/// `impl Type`, `self.m()` and `Self::m()` can only reach `Type`'s own `m`, and
+/// `Type::m` is the exact key the method entity is stored under, so the call
+/// resolves to that definition rather than fanning out by name. `self.field.m()`
+/// is deliberately not folded: it dispatches on the field's type, which the
+/// syntax does not settle.
+fn rust_callee_and_receiver(
+    function: &tree_sitter::Node,
+    source: &[u8],
+    owner: Option<&str>,
+) -> (String, Option<String>) {
+    if function.kind() == "field_expression" {
+        let method = function
+            .child_by_field_name("field")
+            .map(|field| field.utf8_text(source).unwrap_or("").to_string())
+            .unwrap_or_default();
+        let receiver = function
+            .child_by_field_name("value")
+            .map(|value| value.utf8_text(source).unwrap_or("").to_string());
+        return fold_settled_rust_receiver(method, receiver, owner);
+    }
+    let name = function.utf8_text(source).unwrap_or("").to_string();
+    (fold_self_path(name, owner), None)
+}
+
+/// Fold a `self.m()` receiver into `Owner::m`, or keep the receiver as written.
+///
+/// Shared by the `call_expression` and macro-token-tree extraction paths so a
+/// call inside `assert!(..)` records the same shape as the identical call
+/// outside it.
+fn fold_settled_rust_receiver(
+    method: String,
+    receiver: Option<String>,
+    owner: Option<&str>,
+) -> (String, Option<String>) {
+    match (owner, receiver.as_deref()) {
+        (Some(owner), Some("self")) if !method.is_empty() => (format!("{owner}::{method}"), None),
+        _ => (method, receiver.filter(|value| !value.is_empty())),
+    }
+}
+
+/// Rewrite a `Self::m` path callee as `Owner::m`.
+///
+/// `Self` names the impl's own type, so the call reaches that type's method and
+/// nothing else. Left alone outside an impl, and for every other path.
+fn fold_self_path(name: String, owner: Option<&str>) -> String {
+    let Some(owner) = owner else {
+        return name;
+    };
+    match name.strip_prefix("Self::") {
+        Some(rest) if !rest.is_empty() => format!("{owner}::{rest}"),
+        _ => name,
     }
 }
 
@@ -686,6 +767,25 @@ fn extract_rust_use(node: &tree_sitter::Node, source: &[u8]) -> Option<FileImpor
             "scoped_use_list" => {
                 // use foo::{bar, baz};
                 return extract_scoped_use_list_import(&child, source);
+            }
+            "use_wildcard" => {
+                // `use foo::*;` binds every public name in `foo`, and none of
+                // them is written here. Recording the module with no specifier
+                // is what tells a consumer this file's import list cannot answer
+                // "does this file bind that name", the same shape the Python
+                // adapter records `from foo import *` as. Dropping the import
+                // entirely would leave the file looking name-complete.
+                let module_path = child
+                    .children(&mut child.walk())
+                    .find(|node| {
+                        matches!(node.kind(), "scoped_identifier" | "identifier" | "crate")
+                    })
+                    .map(|node| node.utf8_text(source).unwrap_or("").to_string())
+                    .unwrap_or_default();
+                return Some(FileImport {
+                    module_path,
+                    specifiers: Vec::new(),
+                });
             }
             "identifier" => {
                 // use foo;

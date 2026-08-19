@@ -158,7 +158,9 @@ pub async fn run_health_checks() -> HealthReport {
         check_kin_daemon_binary(),
         check_supervisor_startup_protocol(),
         check_daemon_running().await,
+        check_daemon_idle_window(),
         check_vfs_projection(),
+        check_projection_mode(),
         check_repo_init(),
         check_session_runtime(),
         check_shell_path(),
@@ -173,7 +175,6 @@ pub async fn run_health_checks() -> HealthReport {
     checks.push(check_background_work().await);
     checks.push(check_embedding_model().await);
     checks.push(check_retrieval_profile());
-    checks.push(check_cross_file_enrichment());
     checks.push(check_update_policy());
     checks.push(check_binary_assessment_load());
 
@@ -609,22 +610,61 @@ fn daemon_not_running_check_for(repo: &str, endpoint_record: &Path) -> HealthChe
     }
 }
 
+/// Report the idle window the next CLI-spawned daemon for this repository will
+/// take, and what decided it.
+///
+/// Always advisory: every window here is a correct one. The check exists
+/// because the window used to be a compiled 60 seconds for every store, which
+/// was shorter than a converted repository's own cold start, so each command
+/// paid a fresh open and nothing on any surface said why. A number an operator
+/// cannot see is a number nobody can question.
+fn check_daemon_idle_window() -> HealthCheck {
+    let cwd = env::current_dir().unwrap_or_default();
+    let Some(layout) = kin_core::KinLayout::discover(&cwd) else {
+        return HealthCheck::new(
+            "daemon_idle_window",
+            "Daemon idle window",
+            HealthStatus::Unsupported,
+            "not in a Kin repository, so there is no per-store window to report",
+        );
+    };
+    if let Ok(user_value) = env::var("KIN_DAEMON_IDLE_TIMEOUT_SECS") {
+        return HealthCheck::new(
+            "daemon_idle_window",
+            "Daemon idle window",
+            HealthStatus::Healthy,
+            format!(
+                "{}s, from KIN_DAEMON_IDLE_TIMEOUT_SECS in this environment, which overrides \
+                 the measured rule",
+                user_value.trim()
+            ),
+        );
+    }
+    let window = kin_daemon_spawn::cli_idle_window_for_store(layout.root());
+    HealthCheck::new(
+        "daemon_idle_window",
+        "Daemon idle window",
+        HealthStatus::Healthy,
+        window.describe(),
+    )
+}
+
 fn check_vfs_projection() -> HealthCheck {
     if cfg!(target_os = "windows") {
         return HealthCheck::new(
             "vfs_projection",
             "VFS projection",
             HealthStatus::Unsupported,
-            "Windows uses ProjFS, which is not shell-auto-injected",
+            "Windows projects through ProjFS rather than an injected shim; see the \
+             Projection in force row",
         )
         .with_platform_note(
-            "Windows projection uses ProjFS (planned), enabled via the optional \
-             feature and started by an explicit daemon init — it is not injected \
-             by the shell hook like the macOS/Linux shim.",
+            "This row is about the shim, which Windows has no equivalent of: there is no \
+             library the shell hook can inject. Windows projection is the Windows Projected \
+             File System, and whether it is enabled and running here is reported by the \
+             Projection in force row rather than guessed at by this one.",
         )
-        .with_manual_fix(
-            "Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS -NoRestart",
-        );
+        .with_manual_fix(crate::commands::projection::PROJFS_ENABLE_COMMAND);
     }
 
     let kin_home = match kin_dir() {
@@ -640,11 +680,55 @@ fn check_vfs_projection() -> HealthCheck {
     };
     let lib_path = kin_home.join("lib").join(shim_filename());
     let driver = resolve_vfs_driver(&vfs_driver_candidates(
+        pinned_vfs_driver().as_deref(),
         &kin_home,
         env::current_exe().ok().as_deref(),
     ));
 
-    vfs_projection_check_for(&lib_path, &driver)
+    vfs_projection_check_for_recorded(
+        &lib_path,
+        &driver,
+        crate::commands::projection::recorded_mode(&kin_home),
+    )
+}
+
+/// The install check, plus the one thing it cannot know on its own: whether
+/// anyone asked for a projection here.
+///
+/// [`vfs_projection_check_for`] answers "is projection installed", and its
+/// sanctioned outcome on a host that ships without it is a green n/a reading
+/// "nothing is missing". That sentence is true only while nobody has chosen a
+/// projection mode. Once a mode is recorded, the same machine state is a
+/// configured projection that is not installed, and reporting it as nothing
+/// missing is the same class of confident negative FIR-2394 removed from the
+/// row above it.
+fn vfs_projection_check_for_recorded(
+    lib_path: &Path,
+    driver: &VfsDriverState,
+    recorded: Option<crate::commands::projection::ProjectionMode>,
+) -> HealthCheck {
+    let check = vfs_projection_check_for(lib_path, driver);
+    let Some(mode) = recorded else {
+        return check;
+    };
+    if !matches!(check.status, HealthStatus::Unsupported) {
+        return check;
+    }
+    HealthCheck::new(
+        "vfs_projection",
+        "VFS projection",
+        HealthStatus::Missing,
+        format!(
+            "projection mode {mode} is recorded in ~/.kin/config/setup.toml, but no kin-vfs \
+             driver was found beside the kin binary, in ~/.kin/bin, or on PATH, and no shim is \
+             installed at {}",
+            lib_path.display()
+        ),
+    )
+    .with_manual_fix(
+        "reinstall kin to restore projection: curl -fsSL https://get.kinlab.dev/install | sh, or \
+         run `kin vfs status` to see what this host can actually run",
+    )
 }
 
 /// Name of the projection driver binary the installer places beside `kin`.
@@ -656,6 +740,20 @@ fn vfs_binary_filename() -> &'static str {
     }
 }
 
+/// The environment variable that pins the projection driver.
+///
+/// It answers a step the docs otherwise have to ask for: a contributor who has
+/// just built `kin-vfs` with a mount feature should be able to point Kin at
+/// that binary without reordering PATH ahead of the installed one.
+pub(crate) const VFS_DRIVER_ENV: &str = "KIN_VFS_BIN";
+
+/// The pinned driver, when one is named. An empty value is not a pin.
+pub(crate) fn pinned_vfs_driver() -> Option<PathBuf> {
+    env::var_os(VFS_DRIVER_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
 /// Every place the projection driver can be, in resolution order.
 ///
 /// The installer ships `kin-vfs` beside the `kin` binary it installs, and that
@@ -663,7 +761,19 @@ fn vfs_binary_filename() -> &'static str {
 /// puts both somewhere else, so looking in `~/.kin/bin` alone read a driver
 /// sitting next to the running binary as absent, and the check then phrased
 /// that guess as a confident "neither is present here".
-fn vfs_driver_candidates(kin_home: &Path, exe: Option<&Path>) -> Vec<PathBuf> {
+pub(crate) fn vfs_driver_candidates(
+    pinned: Option<&Path>,
+    kin_home: &Path,
+    exe: Option<&Path>,
+) -> Vec<PathBuf> {
+    // A pinned driver is the only candidate. Falling back past it would defeat
+    // the point of pinning: an operator who names a driver and gets a different
+    // one has been told nothing, and a pin that silently resolves elsewhere is
+    // how "I tested my build" becomes "I tested the one already installed".
+    if let Some(pinned) = pinned {
+        return vec![pinned.to_path_buf()];
+    }
+
     fn push_unique(into: &mut Vec<PathBuf>, path: PathBuf) {
         if !into.contains(&path) {
             into.push(path);
@@ -690,7 +800,7 @@ fn vfs_driver_candidates(kin_home: &Path, exe: Option<&Path>) -> Vec<PathBuf> {
 /// real defect, and reporting it as absence tells a user nothing is missing on
 /// a machine where projection is installed and dead.
 #[derive(Debug, PartialEq, Eq)]
-enum VfsDriverState {
+pub(crate) enum VfsDriverState {
     /// No `kin-vfs` beside the running binary, in `~/.kin/bin`, or on PATH.
     Absent,
     /// A driver that runs: probing it reached the driver's own code.
@@ -759,7 +869,7 @@ fn loader_failure_message(stderr: &[u8], status: &std::process::ExitStatus) -> S
 /// A driver that runs wins over one that does not, so a stale copy in one
 /// location cannot hide a working install in another. A candidate that exists
 /// and refuses to run is reported only when nothing else runs.
-fn resolve_vfs_driver(candidates: &[PathBuf]) -> VfsDriverState {
+pub(crate) fn resolve_vfs_driver(candidates: &[PathBuf]) -> VfsDriverState {
     let mut refused: Option<VfsDriverState> = None;
     for candidate in candidates {
         if !candidate.is_file() {
@@ -961,6 +1071,158 @@ fn vfs_projection_check_for(lib_path: &Path, driver: &VfsDriverState) -> HealthC
         .fixable()
         .with_manual_fix(SHIM_REINSTALL_HINT),
     }
+}
+
+/// Report which projection is in force and whether it is actually working.
+///
+/// The row above answers whether projection is installed. This one answers the
+/// question a user standing in a repository is actually asking: is the file I
+/// just edited going through the graph. They are different questions, and a
+/// machine can pass the first and fail the second, which is exactly what a
+/// container does when the loader strips the injected shim: the library is on
+/// disk, the install is intact, and every process is reading raw disk.
+fn check_projection_mode() -> HealthCheck {
+    let kin_home = match kin_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            return HealthCheck::new(
+                "projection_mode",
+                "Projection in force",
+                HealthStatus::Missing,
+                format!("could not resolve ~/.kin: {e}"),
+            );
+        }
+    };
+    let cwd = env::current_dir().unwrap_or_default();
+    let repo_root = kin_core::KinLayout::discover(&cwd)
+        .map(|layout| layout.root().to_path_buf())
+        .unwrap_or(cwd);
+    let report = crate::commands::projection::report_for(
+        &kin_home,
+        env::current_exe().ok().as_deref(),
+        &repo_root,
+        None,
+    );
+    projection_mode_check_for(&report, env::consts::OS)
+}
+
+/// Build the projection row from an already-probed report. Split out so all
+/// three fixtures (everything present, no shim, a mount that is not mounted)
+/// are testable without a real `$HOME` or a real mount.
+/// `os` is an argument rather than read from `env::consts::OS` for the reason
+/// [`crate::commands::setup::resolve_home_dir`] gives for the same choice: read
+/// ambiently, the Windows branch below could only ever be exercised on the one
+/// platform this fleet has no host for, and a test written on macOS would take
+/// the macOS branch and prove nothing about Windows while looking like it did.
+fn projection_mode_check_for(
+    report: &crate::commands::projection::ProjectionReport,
+    os: &str,
+) -> HealthCheck {
+    use crate::commands::projection::ProjectionMode;
+
+    let live = &report.live;
+    let row = live.row();
+    let evidence = live.evidence.join("; ");
+    let detail = format!("{row}; {evidence}");
+    let any_available = report.modes.iter().any(|probe| probe.available);
+
+    // Nothing chosen and nothing installed is the installer's sanctioned
+    // outcome, not a defect: the CLI and daemon answer from the graph without
+    // any projection at all. It stops being sanctioned the moment someone
+    // records a mode, and it was never sanctioned on a machine that HAS a
+    // driver or a shim. Both extra conditions matter: with only "no mode is
+    // available" as the test, a container whose loader refuses the driver
+    // produces no available modes and would have read as this same green n/a,
+    // which is the exact overclaim this row exists to remove.
+    let nothing_installed = report.driver.path.is_none() && !report.shim.installed;
+    // And the absence is only sanctioned where the platform's floor is something
+    // Kin ships and can decline to ship. Windows' floor is ProjFS, an operating
+    // system feature present on every SKU that only needs enabling, so a Windows
+    // machine with no projection is always a machine someone can fix and must
+    // never be told that nothing is missing.
+    let floor_is_kin_shipped = crate::commands::projection::floor_mode(os) == ProjectionMode::Shim;
+    if report.recorded.is_none() && !any_available && nothing_installed && floor_is_kin_shipped {
+        return HealthCheck::new(
+            "projection_mode",
+            "Projection in force",
+            HealthStatus::Unsupported,
+            format!(
+                "no projection is available on this host and none is configured; the CLI and \
+                 daemon are fully functional without one; {evidence}"
+            ),
+        )
+        .with_platform_note(
+            "Run `kin vfs status` for what each of shim, NFS and FUSE would need here.",
+        );
+    }
+
+    if !live.degraded {
+        return HealthCheck::new(
+            "projection_mode",
+            "Projection in force",
+            HealthStatus::Healthy,
+            detail,
+        );
+    }
+
+    // A recorded mode that is not the one running, or one that is running and
+    // failing its own probe, is a configured projection that does not work. It
+    // has to fail: this is the row that must never read "nothing is missing"
+    // for a mode somebody chose.
+    let configured_and_broken = report.recorded.is_some_and(|recorded| {
+        recorded != live.mode || live.readable != crate::commands::projection::Tri::Yes
+    });
+    if configured_and_broken {
+        let remedy = report
+            .modes
+            .iter()
+            .find(|probe| Some(probe.mode) == report.recorded)
+            .and_then(|probe| probe.remedy.clone())
+            .unwrap_or_else(|| "run `kin vfs status` for what this host can run".to_string());
+        return HealthCheck::new(
+            "projection_mode",
+            "Projection in force",
+            HealthStatus::Misconfigured,
+            format!(
+                "{} is recorded but is not what is running; {detail}",
+                report
+                    .recorded
+                    .map(|mode| mode.to_string())
+                    .unwrap_or_default()
+            ),
+        )
+        .with_manual_fix(remedy);
+    }
+
+    // An installed projection that is simply not engaged in this process is
+    // ordinary: the shell hook injects the shim into new shells, and `kin` run
+    // from an editor terminal or a script without the hook is not under it.
+    // Advisory rather than failing, and named so the user can see it, because a
+    // silent green here is what lets someone edit raw disk believing otherwise.
+    // Advisory means "installed and working, just not injected into this
+    // process", which is what running `kin` from a shell without the hook looks
+    // like. A shim mode that failed its own probe is not that, so a refused
+    // driver or a corrupt library cannot borrow the softer status.
+    let shim_usable = report
+        .modes
+        .iter()
+        .any(|probe| probe.mode == ProjectionMode::Shim && probe.available);
+    let advisory = live.mode == ProjectionMode::Shim
+        && shim_usable
+        && live.readable == crate::commands::projection::Tri::Yes;
+    let status = if advisory {
+        HealthStatus::Stale
+    } else {
+        HealthStatus::Misconfigured
+    };
+    HealthCheck::new("projection_mode", "Projection in force", status, detail).with_manual_fix(
+        if advisory {
+            "start a new shell, or run `exec $SHELL -l`, so the hook injects the shim"
+        } else {
+            "run `kin vfs on` to engage a projection, or `kin vfs status` to see why none is \
+             available here"
+        },
+    )
 }
 
 fn check_repo_init() -> HealthCheck {
@@ -2126,6 +2388,13 @@ async fn check_reference_edge_coverage() -> HealthCheck {
     const ID: &str = "reference_edge_coverage";
     const LABEL: &str = "Reference edge coverage";
 
+    // Probed first, because it needs no daemon. Every branch below that cannot
+    // read the graph still reports this half, so a repository whose daemon is
+    // down does not silently lose the language-server signal that used to have
+    // its own row.
+    let missing_servers =
+        missing_language_servers(&crate::commands::graph::installed_language_servers());
+
     let cwd = env::current_dir().unwrap_or_default();
     let Some(layout) = kin_core::KinLayout::discover(&cwd) else {
         return HealthCheck::new(
@@ -2137,14 +2406,13 @@ async fn check_reference_edge_coverage() -> HealthCheck {
     };
     let Some(daemon_url) = crate::daemon_client::resolve_daemon_url_if_running_async(&layout).await
     else {
-        return HealthCheck::new(
-            ID,
-            LABEL,
+        return coverage_unreadable(
             HealthStatus::Unsupported,
-            "n/a — no daemon running for this repository, so relation-graph completeness cannot \
-             be read; a daemon starts on first use",
-        )
-        .with_manual_fix("run any `kin` command in the repo to auto-start the daemon");
+            "no daemon running for this repository, so relation-graph completeness cannot be \
+             read; a daemon starts on first use",
+            "run any `kin` command in the repo to auto-start the daemon",
+            &missing_servers,
+        );
     };
     let client = match crate::daemon_client::DaemonClient::from_base_url_for_layout(
         daemon_url.clone(),
@@ -2152,11 +2420,11 @@ async fn check_reference_edge_coverage() -> HealthCheck {
     ) {
         Ok(client) => client,
         Err(error) => {
-            return HealthCheck::new(
-                ID,
-                LABEL,
+            return coverage_unreadable(
                 HealthStatus::Stale,
                 format!("daemon reachable ({daemon_url}), but its URL is invalid: {error}"),
+                "check the daemon URL recorded for this repository",
+                &missing_servers,
             );
         }
     };
@@ -2166,29 +2434,61 @@ async fn check_reference_edge_coverage() -> HealthCheck {
     {
         Ok(response) => response,
         Err(error) => {
-            return HealthCheck::new(
-                ID,
-                LABEL,
+            return coverage_unreadable(
                 HealthStatus::Stale,
                 format!(
                     "daemon reachable ({daemon_url}), but relation-graph completeness is \
                      unavailable: {error}"
                 ),
-            )
-            .with_manual_fix("run `kin graph status` and resolve the reported daemon error");
+                "run `kin graph status` and resolve the reported daemon error",
+                &missing_servers,
+            );
         }
     };
     let Some(coverage) = response.reference_edge_coverage else {
-        return HealthCheck::new(
-            ID,
-            LABEL,
+        return coverage_unreadable(
             HealthStatus::Stale,
             "the daemon serving this repository does not report relation-graph completeness; it \
              predates the measurement",
-        )
-        .with_manual_fix("restart the daemon with `kin daemon restart` to pick up this build");
+            "restart the daemon with `kin daemon restart` to pick up this build",
+            &missing_servers,
+        );
     };
     reference_edge_coverage_health(&coverage)
+}
+
+/// The row for every state where the graph itself could not be read.
+///
+/// It still reports the host probe, because that needed no daemon. Reporting
+/// only "completeness unavailable" would drop a fact this process holds, and
+/// this row is the only one that carries it now.
+fn coverage_unreadable(
+    status: HealthStatus,
+    detail: impl Into<String>,
+    manual_fix: &str,
+    missing_servers: &[String],
+) -> HealthCheck {
+    const ID: &str = "reference_edge_coverage";
+    const LABEL: &str = "Reference edge coverage";
+
+    let detail = detail.into();
+    if missing_servers.is_empty() {
+        return HealthCheck::new(ID, LABEL, status, format!("n/a — {detail}"))
+            .with_manual_fix(manual_fix);
+    }
+    // A missing server is a measured host fact even when the graph is not
+    // readable, so it decides the status rather than deferring to the unread
+    // half. Stale, not Missing: the graph still answers from the edges it holds.
+    HealthCheck::new(
+        ID,
+        LABEL,
+        HealthStatus::Stale,
+        format!(
+            "{}; graph completeness not read: {detail}",
+            language_server_gap_detail(missing_servers)
+        ),
+    )
+    .with_manual_fix(LANGUAGE_SERVER_FIX)
 }
 
 /// Turn the measurement into a verdict, split from its fetch so the rule is
@@ -2226,7 +2526,20 @@ pub(crate) fn reference_edge_coverage_health(
         .collect::<Vec<_>>()
         .join("; ");
 
-    let gaps = coverage.unsupportable_absence_reasons();
+    // The language-server state arrives measured, per language this repository
+    // actually holds, rather than probed against every wired language. This row
+    // used to have a sibling that probed the host, and that sibling warned about
+    // rust-analyzer on a Python-only repository, which is exactly the row a
+    // reader learns to skip.
+    let missing_servers = coverage.languages_missing_a_language_server();
+    let mut gaps = coverage.unsupportable_absence_reasons();
+    if !missing_servers.is_empty() {
+        gaps.push(format!(
+            "cross-file reference and override edges unavailable for {}: no language server \
+             found. Import and call edges are still resolved from source",
+            missing_servers.join(", ")
+        ));
+    }
     if gaps.is_empty() {
         return HealthCheck::new(ID, LABEL, HealthStatus::Healthy, summary);
     }
@@ -2435,71 +2748,46 @@ async fn check_semantic_query_readiness() -> HealthCheck {
     semantic_query_health_from_runtime(&daemon_url, &response.embed_runtime)
 }
 
-/// Report whether cross-file reference edges can be produced on this host.
+/// Which wired languages have no language server on this host.
 ///
 /// Reference and override edges are not derivable from a single-file parse:
 /// they need a resolved program, which Kin gets from an external language
 /// server. On a host with none installed the graph simply never gains that edge
-/// class, and until this row existed the only trace was a relation count a
-/// reader had to already know the expected value of. The row names the language
-/// and the missing binary so the gap is a fact on the page rather than an
-/// inference from a ratio.
+/// class, and the only trace used to be a relation count a reader had to
+/// already know the expected value of.
 ///
-/// It reports `Stale` rather than `Missing`: the graph still answers, with
-/// import and call edges resolved from source, so this degrades an install
-/// without breaking it.
-fn check_cross_file_enrichment() -> HealthCheck {
-    cross_file_enrichment_check(&crate::commands::graph::installed_language_servers())
+/// This probes the host and needs no daemon, so it is what the completeness row
+/// falls back to when the graph itself cannot be read. When the graph IS
+/// readable the same fact arrives measured, per language the repository
+/// actually holds, and [`reference_edge_coverage_health`] reads it from there
+/// instead: warning about rust-analyzer on a Python-only repository is a row a
+/// reader learns to skip.
+fn missing_language_servers(
+    installed: &std::collections::HashSet<kin_model::LanguageId>,
+) -> Vec<String> {
+    crate::commands::graph::LANGUAGE_SERVER_BINARIES
+        .iter()
+        .filter(|(language, _)| !installed.contains(language))
+        .map(|(language, binaries)| format!("{language} ({})", binaries.join(" or ")))
+        .collect()
 }
 
-/// The verdict half of [`check_cross_file_enrichment`], over an explicit set of
-/// installed servers so both outcomes can be exercised on any host.
-fn cross_file_enrichment_check(
-    installed: &std::collections::HashSet<kin_model::LanguageId>,
-) -> HealthCheck {
-    let mut available: Vec<String> = Vec::new();
-    let mut missing: Vec<String> = Vec::new();
-    for (language, binaries) in crate::commands::graph::LANGUAGE_SERVER_BINARIES {
-        if installed.contains(language) {
-            available.push(language.to_string());
-        } else {
-            missing.push(format!("{language} ({})", binaries.join(" or ")));
-        }
-    }
-
-    if missing.is_empty() {
-        return HealthCheck::new(
-            "cross_file_enrichment",
-            "Cross-file reference edges",
-            HealthStatus::Healthy,
-            format!("language server found for {}", available.join(", ")),
-        );
-    }
-
-    let detail = format!(
-        "cross-file reference and override edges unavailable: no language server found for {}",
-        missing.join(", ")
-    );
-    HealthCheck::new(
-        "cross_file_enrichment",
-        "Cross-file reference edges",
-        HealthStatus::Stale,
-        // Say what still works. A row that reports only the loss reads as "the
-        // graph knows nothing across files", and import-bound calls are
-        // resolved from source with no language server involved at all.
-        format!(
-            "{detail}; import and call edges are still resolved from source. Languages outside \
-             {} gain no reference edges in this build either",
-            crate::commands::graph::LANGUAGE_SERVER_BINARIES
-                .iter()
-                .map(|(language, _)| language.to_string())
-                .collect::<Vec<_>>()
-                .join("/")
-        ),
-    )
-    .with_manual_fix(
-        "install a language server for the named language (for example `npm i -g pyright` or \
-         `rustup component add rust-analyzer`), then restart the daemon",
+/// The sentence that names what a missing server costs, and what still works.
+///
+/// A row that reports only the loss reads as "the graph knows nothing across
+/// files", and import-bound calls are resolved from source with no language
+/// server involved at all.
+fn language_server_gap_detail(missing: &[String]) -> String {
+    format!(
+        "cross-file reference and override edges unavailable: no language server found for {}; \
+         import and call edges are still resolved from source. Languages outside {} gain no \
+         reference edges in this build either",
+        missing.join(", "),
+        crate::commands::graph::LANGUAGE_SERVER_BINARIES
+            .iter()
+            .map(|(language, _)| language.to_string())
+            .collect::<Vec<_>>()
+            .join("/")
     )
 }
 
@@ -2619,6 +2907,10 @@ fn embedding_model_check_from(
     ))
 }
 
+const LANGUAGE_SERVER_FIX: &str =
+    "install a language server for the named language (for example `npm i -g pyright` or \
+     `rustup component add rust-analyzer`), then restart the daemon";
+
 /// Report the active retrieval quality profile and the effective lever set,
 /// so an operator can see at a glance whether they are getting full
 /// retrieval capability — and why not, when a lever is off.
@@ -2626,7 +2918,9 @@ fn check_retrieval_profile() -> HealthCheck {
     let profile = crate::retrieval_profile::RetrievalProfile::from_env();
     let ce_model = env::var("KIN_LOCATE_CROSS_ENCODER_MODEL")
         .unwrap_or_else(|_| "BAAI/bge-reranker-base".to_string());
-    let ce_cached = crate::retrieval_profile::cross_encoder_model_cached(&ce_model);
+    let ce_revision =
+        env::var("KIN_LOCATE_CROSS_ENCODER_REVISION").unwrap_or_else(|_| "main".to_string());
+    let ce_cached = crate::retrieval_profile::cross_encoder_model_cached(&ce_model, &ce_revision);
     // Report the daemon-serving default (the state queries actually run
     // under), not this one-shot CLI process's own gate. The accessor answers
     // exactly that question, so this check cannot drift from the profile's
@@ -2724,9 +3018,17 @@ mod tests {
 
     /// A host with no language server must be told which language lost which
     /// edge class, and told it in words rather than as a low relation count.
+    /// The graph is unreadable here, which is exactly the state that used to
+    /// carry its own row; folding the two rows must not lose the probe.
     #[test]
     fn doctor_names_the_language_whose_missing_server_costs_cross_file_edges() {
-        let check = cross_file_enrichment_check(&std::collections::HashSet::new());
+        let missing = missing_language_servers(&std::collections::HashSet::new());
+        let check = coverage_unreadable(
+            HealthStatus::Unsupported,
+            "no daemon running for this repository",
+            "start the daemon",
+            &missing,
+        );
 
         assert!(matches!(check.status, HealthStatus::Stale));
         assert!(
@@ -2747,6 +3049,11 @@ mod tests {
             "the row must not read as a total loss: {}",
             check.detail
         );
+        assert!(
+            check.detail.contains("no daemon running"),
+            "the unread half is reported beside the probed one, in one row: {}",
+            check.detail
+        );
         assert!(check.manual_fix.is_some());
     }
 
@@ -2759,9 +3066,16 @@ mod tests {
                 .iter()
                 .map(|(language, _)| *language)
                 .collect();
-        let check = cross_file_enrichment_check(&installed);
+        let missing = missing_language_servers(&installed);
+        assert!(missing.is_empty(), "{missing:?}");
 
-        assert!(matches!(check.status, HealthStatus::Healthy));
+        let check = coverage_unreadable(
+            HealthStatus::Unsupported,
+            "no daemon running for this repository",
+            "start the daemon",
+            &missing,
+        );
+        assert!(matches!(check.status, HealthStatus::Unsupported));
         assert!(!check.detail.contains("unavailable"), "{}", check.detail);
     }
 
@@ -2770,11 +3084,71 @@ mod tests {
     /// turn `kin doctor` red on every host that never installed one.
     #[test]
     fn a_missing_language_server_needs_attention_without_blocking_readiness() {
-        let check = cross_file_enrichment_check(&std::collections::HashSet::new());
+        let missing = missing_language_servers(&std::collections::HashSet::new());
+        let check = coverage_unreadable(
+            HealthStatus::Unsupported,
+            "no daemon running for this repository",
+            "start the daemon",
+            &missing,
+        );
         assert!(!blocks_readiness(&check));
         let report = assemble_health_report("test".to_string(), vec![check]);
         assert!(report.healthy);
         assert_eq!(report.summary().attention, 1);
+    }
+
+    /// FIR-2370. Two rows about one graph teach an operator to skip both, so the
+    /// measured completeness and the language-server state are ONE row. This
+    /// pins that: when the graph is readable, the single row carries both facts,
+    /// and the language-server half is read per language the repository
+    /// actually holds rather than probed against every wired language.
+    #[test]
+    fn one_doctor_row_carries_both_completeness_facts() {
+        use kin_core::reference_coverage::{
+            LanguageReferenceCoverage, ReferenceEdgeCoverage, ReferenceEnrichment,
+            ReferenceResolution,
+        };
+
+        let coverage = ReferenceEdgeCoverage {
+            languages: vec![LanguageReferenceCoverage {
+                language: "python".to_string(),
+                files: 12,
+                files_measured: 12,
+                entities: 46,
+                parsed_call_sites: Some(78),
+                parsed_import_statements: Some(16),
+                resolved_call_edges: 16,
+                resolved_import_edges: 0,
+                cross_file_reference_edges: 0,
+                intra_file_reference_edges: 16,
+                external_reference_edges: 0,
+                resolution: ReferenceResolution::PartiallyResolved,
+                reference_enrichment: ReferenceEnrichment::NoLanguageServer,
+            }],
+            totals: None,
+        };
+
+        let check = reference_edge_coverage_health(&coverage);
+        assert_eq!(check.id, "reference_edge_coverage");
+        assert!(
+            check.detail.contains("no cross-file reference edge"),
+            "the measured gap: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("no language server found"),
+            "and the host gap, in the same row: {}",
+            check.detail
+        );
+
+        // A language the repository holds no source in produces no row at all,
+        // so no gap is reported for it. The old second row probed every wired
+        // language and warned about rust-analyzer on a Python-only repository.
+        assert!(
+            !check.detail.contains("rust"),
+            "a language this repository holds nothing in is not a gap: {}",
+            check.detail
+        );
     }
 
     fn write_file(path: &Path, bytes: &[u8]) {
@@ -2971,6 +3345,363 @@ mod tests {
         assert!(matches!(classify_shim(&path), ShimState::Valid(_)));
     }
 
+    // ---- Projection in force -------------------------------------------
+
+    use crate::commands::projection::{
+        DriverProbe, LiveProjection, ModeProbe, ProjectionMode, ProjectionReport, ShimPresence, Tri,
+    };
+
+    /// The row as a macOS host reads it. Every fixture below is about a
+    /// macOS/Linux machine, and naming the platform once keeps them from
+    /// silently changing meaning on whichever host runs the suite.
+    fn projection_mode_check_for_macos(
+        report: &crate::commands::projection::ProjectionReport,
+    ) -> HealthCheck {
+        projection_mode_check_for(report, "macos")
+    }
+
+    fn mode_probe(mode: ProjectionMode, available: bool) -> ModeProbe {
+        ModeProbe {
+            mode,
+            available,
+            evidence: format!("{mode} fixture probe"),
+            remedy: (!available).then(|| format!("fixture remedy for {mode}")),
+        }
+    }
+
+    fn report(
+        recorded: Option<ProjectionMode>,
+        available: &[ProjectionMode],
+        live: LiveProjection,
+    ) -> ProjectionReport {
+        ProjectionReport {
+            recorded,
+            modes: [
+                ProjectionMode::Nfs,
+                ProjectionMode::Fuse,
+                ProjectionMode::Shim,
+            ]
+            .into_iter()
+            .map(|mode| mode_probe(mode, available.contains(&mode)))
+            .collect(),
+            driver: DriverProbe {
+                path: None,
+                refusal: None,
+                subcommands: None,
+            },
+            shim: ShimPresence {
+                path: PathBuf::from("/home/u/.kin/lib/libkin_vfs_shim.so"),
+                installed: available.contains(&ProjectionMode::Shim),
+                engaged: false,
+            },
+            live,
+        }
+    }
+
+    fn live(
+        intent: ProjectionMode,
+        mode: ProjectionMode,
+        mounted: Tri,
+        readable: Tri,
+        degraded: bool,
+    ) -> LiveProjection {
+        LiveProjection {
+            intent,
+            mode,
+            at: PathBuf::from("/w/repo"),
+            mounted,
+            readable,
+            writable: Tri::NotApplicable,
+            degraded,
+            evidence: vec!["fixture evidence".to_string()],
+        }
+    }
+
+    /// The three fixtures the row exists to tell apart: everything present, no
+    /// shim anywhere, and a configured mount that is not mounted. Each has to
+    /// produce a different status and a different detail, or the row is
+    /// decorative.
+    #[test]
+    fn the_projection_row_changes_across_the_three_fixtures() {
+        let working = projection_mode_check_for_macos(&report(
+            Some(ProjectionMode::Shim),
+            &[ProjectionMode::Shim],
+            live(
+                ProjectionMode::Shim,
+                ProjectionMode::Shim,
+                Tri::NotApplicable,
+                Tri::Yes,
+                false,
+            ),
+        ));
+        assert!(
+            matches!(working.status, HealthStatus::Healthy),
+            "a working projection is healthy, got {:?}",
+            working.status
+        );
+
+        let nothing = projection_mode_check_for_macos(&report(
+            None,
+            &[],
+            live(
+                ProjectionMode::Shim,
+                ProjectionMode::Shim,
+                Tri::NotApplicable,
+                Tri::No,
+                true,
+            ),
+        ));
+        assert!(
+            matches!(nothing.status, HealthStatus::Unsupported),
+            "an install that ships without projection and configures none stays skipped, got {:?}",
+            nothing.status
+        );
+        assert!(!is_failing(&nothing.status));
+
+        let unmounted = projection_mode_check_for_macos(&report(
+            Some(ProjectionMode::Nfs),
+            &[ProjectionMode::Shim],
+            live(
+                ProjectionMode::Nfs,
+                ProjectionMode::Shim,
+                Tri::No,
+                Tri::No,
+                true,
+            ),
+        ));
+        assert!(
+            matches!(unmounted.status, HealthStatus::Misconfigured),
+            "a configured mount that is not running must fail, got {:?}",
+            unmounted.status
+        );
+        assert!(is_failing(&unmounted.status));
+        assert!(
+            unmounted.detail.contains("nfs is recorded"),
+            "the row must name the mode that was configured: {}",
+            unmounted.detail
+        );
+        assert_eq!(
+            unmounted.manual_fix.as_deref(),
+            Some("fixture remedy for nfs"),
+            "the configured mode's own remedy must reach the row"
+        );
+
+        let details = [&working.detail, &nothing.detail, &unmounted.detail];
+        for (i, a) in details.iter().enumerate() {
+            for b in details.iter().skip(i + 1) {
+                assert_ne!(a, b, "each fixture must read differently");
+            }
+        }
+    }
+
+    /// A shim installed and not injected is the container case. It must be
+    /// visible and must not be healthy, and it must not fail readiness either:
+    /// running `kin` from an editor terminal without the shell hook is ordinary
+    /// and would otherwise fail every install that works.
+    #[test]
+    fn an_installed_but_unengaged_shim_is_visible_without_failing_readiness() {
+        let check = projection_mode_check_for_macos(&report(
+            None,
+            &[ProjectionMode::Shim],
+            live(
+                ProjectionMode::Shim,
+                ProjectionMode::Shim,
+                Tri::NotApplicable,
+                Tri::Yes,
+                true,
+            ),
+        ));
+        assert!(
+            matches!(check.status, HealthStatus::Stale),
+            "an unengaged shim is advisory, got {:?}",
+            check.status
+        );
+        assert!(!matches!(check.status, HealthStatus::Healthy));
+        assert!(!is_failing(&check.status));
+        assert!(check
+            .manual_fix
+            .as_deref()
+            .is_some_and(|fix| fix.contains("new shell")));
+    }
+
+    /// The container case, at the row level. A driver the loader refuses
+    /// leaves no mode available, which is the same shape as a machine that
+    /// shipped without projection, and the two must not produce the same row:
+    /// one is fine and the other is every process on the box reading raw disk.
+    #[test]
+    fn a_refused_driver_is_not_a_sanctioned_absence() {
+        let mut refused = report(
+            None,
+            &[],
+            live(
+                ProjectionMode::Shim,
+                ProjectionMode::Shim,
+                Tri::NotApplicable,
+                Tri::Yes,
+                true,
+            ),
+        );
+        refused.driver = DriverProbe {
+            path: Some(PathBuf::from("/opt/kin/kin-vfs")),
+            refusal: Some("GLIBC_2.39 not found".to_string()),
+            subcommands: None,
+        };
+        refused.shim.installed = true;
+
+        let check = projection_mode_check_for_macos(&refused);
+        assert!(
+            is_failing(&check.status),
+            "a projection installed and dead must fail, got {:?}",
+            check.status
+        );
+
+        // Falsification: the same shape with genuinely nothing installed stays
+        // the sanctioned green n/a, so the failure above is about the refusal
+        // and not about there being no available mode.
+        let bare = report(
+            None,
+            &[],
+            live(
+                ProjectionMode::Shim,
+                ProjectionMode::Shim,
+                Tri::NotApplicable,
+                Tri::Yes,
+                true,
+            ),
+        );
+        assert!(
+            matches!(
+                projection_mode_check_for_macos(&bare).status,
+                HealthStatus::Unsupported
+            ),
+            "an install that ships without projection stays skipped"
+        );
+    }
+
+    /// Windows has no sanctioned absence. ProjFS ships on every SKU and only
+    /// needs enabling, so a Windows machine with no projection running is
+    /// always one someone can fix, and the row that tells a macOS user nothing
+    /// is missing would be a lie there.
+    #[test]
+    fn windows_never_reports_that_nothing_is_missing() {
+        // The floor decides it, and the floor is the platform's, not a constant.
+        assert_eq!(
+            crate::commands::projection::floor_mode("windows"),
+            ProjectionMode::ProjFs
+        );
+        assert_eq!(
+            crate::commands::projection::floor_mode("macos"),
+            ProjectionMode::Shim
+        );
+
+        // ProjFS off, with the exact remedy a user pastes.
+        let off = crate::commands::projection::projfs_mode_probe(
+            &crate::commands::projection::ProjFsState::FeatureOff,
+        );
+        assert!(!off.available);
+        assert!(off.remedy.as_deref().is_some_and(|remedy| remedy
+            .contains("Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS")));
+
+        // One machine shape, nothing available and nothing recorded, judged as
+        // each platform. macOS keeps the sanctioned skip because the installer
+        // is allowed to ship without projection there. Windows must not have
+        // it, and asserting both from one host is the whole reason the platform
+        // is an argument rather than something this function reads.
+        let bare = report(
+            None,
+            &[],
+            live(
+                ProjectionMode::Shim,
+                ProjectionMode::Shim,
+                Tri::NotApplicable,
+                Tri::Yes,
+                true,
+            ),
+        );
+
+        for os in ["macos", "linux"] {
+            let check = projection_mode_check_for(&bare, os);
+            assert!(
+                matches!(check.status, HealthStatus::Unsupported),
+                "{os} keeps the sanctioned skip, got {:?}",
+                check.status
+            );
+            assert!(!is_failing(&check.status));
+        }
+
+        let windows = projection_mode_check_for(&bare, "windows");
+        assert!(
+            !matches!(windows.status, HealthStatus::Unsupported),
+            "Windows has no sanctioned skip, got {:?}",
+            windows.status
+        );
+        assert!(
+            !windows.detail.contains("none is configured")
+                && windows
+                    .platform_note
+                    .as_deref()
+                    .is_none_or(|note| !note.contains("would need")),
+            "Windows must not be told that nothing is missing: {windows:?}"
+        );
+    }
+
+    /// The green n/a on the install row is true only while nobody chose a
+    /// projection. Once a mode is recorded the same machine state is a
+    /// configured projection that is not installed, and "nothing is missing" is
+    /// the confident negative this row keeps producing when nothing checks.
+    #[test]
+    fn a_recorded_mode_turns_the_sanctioned_absence_into_a_defect() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_shim = dir.path().join("no-shim");
+
+        let unconfigured =
+            vfs_projection_check_for_recorded(&missing_shim, &VfsDriverState::Absent, None);
+        assert!(
+            matches!(unconfigured.status, HealthStatus::Unsupported),
+            "with nothing configured the absence stays sanctioned, got {:?}",
+            unconfigured.status
+        );
+        assert!(
+            unconfigured
+                .platform_note
+                .as_deref()
+                .is_some_and(|note| note.contains("nothing is missing")),
+            "the sanctioned row is the one that says nothing is missing"
+        );
+
+        let configured = vfs_projection_check_for_recorded(
+            &missing_shim,
+            &VfsDriverState::Absent,
+            Some(ProjectionMode::Nfs),
+        );
+        assert!(
+            is_failing(&configured.status),
+            "a recorded mode with nothing installed must fail, got {:?}",
+            configured.status
+        );
+        assert!(
+            configured.detail.contains("nfs is recorded"),
+            "the row must name what was configured: {}",
+            configured.detail
+        );
+        assert!(
+            !configured.detail.contains("nothing is missing") && configured.platform_note.is_none(),
+            "the sanctioned wording must not survive a recorded mode: {configured:?}"
+        );
+
+        // A recorded mode does not rewrite a row that already had something to
+        // say: a broken driver stays a broken driver, with the loader's words.
+        let broken = vfs_projection_check_for_recorded(
+            &missing_shim,
+            &VfsDriverState::Unloadable {
+                path: PathBuf::from("/opt/kin/kin-vfs"),
+                message: "GLIBC_2.39 not found".to_string(),
+            },
+            Some(ProjectionMode::Shim),
+        );
+        assert!(broken.detail.contains("GLIBC_2.39"), "{}", broken.detail);
+    }
+
     #[test]
     fn macho_magic_matches_the_shipped_dylib_header() {
         // The v0.2.x macOS shim begins CF FA ED FE (MH_MAGIC_64 little-endian).
@@ -3082,7 +3813,7 @@ mod tests {
         let exe = install.join("kin");
         write_file(&exe, b"kin");
 
-        let candidates = vfs_driver_candidates(&dir.path().join("kin-home"), Some(&exe));
+        let candidates = vfs_driver_candidates(None, &dir.path().join("kin-home"), Some(&exe));
         assert!(
             candidates.contains(&install.join(vfs_binary_filename())),
             "a driver beside the running binary must be probed: {candidates:?}"
@@ -3095,6 +3826,38 @@ mod tests {
                     .join(vfs_binary_filename())
             ),
             "the managed location must still be probed: {candidates:?}"
+        );
+    }
+
+    /// A pinned driver replaces the search rather than joining it. A pin that
+    /// resolved to some other driver when the named one is missing would report
+    /// on a binary the operator did not name, which is the failure a pin exists
+    /// to prevent.
+    #[test]
+    fn a_pinned_driver_is_the_only_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("opt/kin/kin");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        write_file(&exe, b"kin");
+        let pinned = dir.path().join("built/kin-vfs");
+
+        let candidates =
+            vfs_driver_candidates(Some(&pinned), &dir.path().join("kin-home"), Some(&exe));
+        assert_eq!(candidates, vec![pinned.clone()]);
+
+        // Falsification: without the pin the same call searches every location.
+        let searched = vfs_driver_candidates(None, &dir.path().join("kin-home"), Some(&exe));
+        assert!(
+            searched.len() > 1 && !searched.contains(&pinned),
+            "an unpinned search must look in the ordinary places: {searched:?}"
+        );
+
+        // A pin naming a file that is not there is an absent driver, not a
+        // fallback to whatever else the host happens to carry.
+        assert_eq!(
+            resolve_vfs_driver(&candidates),
+            VfsDriverState::Absent,
+            "a pin to a missing file reports absence"
         );
     }
 
@@ -3530,7 +4293,8 @@ mod tests {
     #[test]
     fn reference_edge_coverage_needs_attention_when_absence_is_unanswerable() {
         use kin_core::reference_coverage::{
-            LanguageReferenceCoverage, ReferenceEdgeCoverage, ReferenceResolution,
+            LanguageReferenceCoverage, ReferenceEdgeCoverage, ReferenceEnrichment,
+            ReferenceResolution,
         };
 
         fn python(cross_file: u64, resolved_calls: u64) -> ReferenceEdgeCoverage {
@@ -3548,7 +4312,9 @@ mod tests {
                     intra_file_reference_edges: 16,
                     external_reference_edges: 0,
                     resolution: ReferenceResolution::PartiallyResolved,
+                    reference_enrichment: ReferenceEnrichment::Available,
                 }],
+                totals: None,
             }
         }
 
@@ -3655,6 +4421,7 @@ mod tests {
         assert!(json.contains("\"kin_binary\""));
         assert!(json.contains("\"kin_daemon_binary\""));
         assert!(json.contains("\"daemon_running\""));
+        assert!(json.contains("\"daemon_idle_window\""));
         assert!(json.contains("\"vfs_projection\""));
         assert!(json.contains("\"shell_path\""));
         assert!(json.contains("\"registry_authority\""));
@@ -3983,6 +4750,48 @@ mod tests {
             summary.passed + summary.attention + summary.skipped,
             report.checks.len(),
             "every check lands in exactly one bucket"
+        );
+    }
+
+    /// FIR-2426. The idle window is a per-store number now, so a surface has to
+    /// say what it is. It is always advisory: every window the rule produces is
+    /// a correct one, and a check that could fail readiness over a legitimate
+    /// preference would make `kin doctor` cry wolf on a healthy install.
+    #[test]
+    fn the_idle_window_check_reports_the_window_and_never_fails_readiness() {
+        let check = check_daemon_idle_window();
+        assert_eq!(check.id, "daemon_idle_window");
+        assert!(
+            matches!(
+                check.status,
+                HealthStatus::Healthy | HealthStatus::Unsupported
+            ),
+            "the idle window is a report, not a verdict: {:?}",
+            check.status
+        );
+        assert!(
+            !blocks_readiness(&check),
+            "a legitimate window must never block readiness"
+        );
+        assert!(
+            !check.detail.trim().is_empty(),
+            "the check owes a reason, not just a status"
+        );
+    }
+
+    /// Whatever the window is, the reason names what decided it, because a
+    /// number with no cause behind it cannot be questioned.
+    #[test]
+    fn the_idle_window_detail_names_what_decided_it() {
+        let detail = check_daemon_idle_window().detail;
+        assert!(
+            detail.contains("not in a Kin repository")
+                || detail.contains("no local daemon")
+                || detail.contains("the floor")
+                || detail.contains("the ceiling")
+                || detail.contains("times the last open")
+                || detail.contains("KIN_DAEMON_IDLE_TIMEOUT_SECS"),
+            "the detail must name a cause: {detail}"
         );
     }
 

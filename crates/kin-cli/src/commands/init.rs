@@ -146,6 +146,18 @@ pub async fn run(path: Option<String>, json: bool) -> Result<()> {
 
     let enrichment =
         SemanticEnrichmentStatus::from_durable_summary(&result.authority.semantic_enrichment);
+
+    if let Err(error) =
+        kin_migrate::update_registry(result.layout.working_dir(), enrichment.entity_count)
+    {
+        eprintln!(
+            "warning: {} was not added to the local repository registry, so cross-repo \
+             commands (`kin deps`, `kin xref`) will not see it from sibling repositories: \
+             {error:#}",
+            result.layout.root().display()
+        );
+    }
+
     if json {
         print_json_result(&result, boundary, enrichment)?;
     } else {
@@ -1218,6 +1230,44 @@ mod tests {
         assert!(
             overridden_notice.contains("fetches the model from huggingface.co"),
             "the fetch is still named without a size: {overridden_notice}"
+        );
+    }
+
+    /// The registration defect, made visible under a scratch registry with
+    /// nothing in it. On a developer machine a leftover registry.toml from an
+    /// old migration hides that nothing calls `update_registry`; this test
+    /// starts from empty, so it cannot be fooled the same way.
+    #[tokio::test]
+    async fn init_registers_the_repository_under_a_scratch_registry() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.email", "kin-test@example.invalid"]);
+        git(&repo, &["config", "user.name", "Kin Test"]);
+        std::fs::write(repo.join("seed"), b"seed").unwrap();
+        git(&repo, &["add", "seed"]);
+        git(&repo, &["commit", "-qm", "seed"]);
+
+        let kin_home = scratch.path().join("kin-home");
+        let registry_path = kin_home.join("registry.toml");
+        let _home = kin_core::test_env::EnvVarGuard::set("HOME", &kin_home);
+        let _kin_home_var = kin_core::test_env::EnvVarGuard::set("KIN_HOME", &kin_home);
+        let _registry = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path);
+
+        run(Some(repo.to_str().unwrap().to_string()), false)
+            .await
+            .expect("kin init must succeed under a scratch registry");
+
+        let registry = kin_core::registry::KinRegistry::load_from(&registry_path)
+            .expect("registry must be readable after init");
+        let canonical = repo.canonicalize().unwrap();
+        assert!(
+            registry.repos.iter().any(|entry| entry.path == canonical),
+            "kin init must register the repository it just admitted, so a second \
+             repository's registration can later find it as a cross-repo sibling; \
+             registry entries: {:?}",
+            registry.repos
         );
     }
 }

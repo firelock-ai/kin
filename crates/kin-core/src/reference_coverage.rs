@@ -16,11 +16,109 @@
 //! `kin_parser::FILE_PARSED_IMPORT_STATEMENTS_KEY`); the resolved side is
 //! counted off the same relation table `find_references` reads. Nothing here
 //! reads a working-tree file.
+//!
+//! This module is the ONE graph-completeness vocabulary. A second one used to
+//! sit beside it in `cross_file_coverage`, measuring the overlapping fact from
+//! its own walk and wiring its own `kin graph status` section and `kin doctor`
+//! row. The two agreed on every number they shared and still left a reader two
+//! sections about one graph, with no way to tell which denominator answered the
+//! question they arrived with. Its unique halves live here now: the whole-graph
+//! relation totals in [`GraphRelationTotals`] and the language-server state in
+//! [`ReferenceEnrichment`]. Anything that needs a third completeness signal
+//! belongs in this type, not beside it.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use kin_model::{Entity, EntityId, EntityStore, GraphNodeId, LanguageId, RelationKind};
 use serde::{Deserialize, Serialize};
+
+/// Languages this build can enrich with language-server evidence.
+///
+/// Reference, override, and type-use edges are not derivable from a
+/// single-file parse: they need a resolved program, which Kin gets from an
+/// external language server. The daemon wires an adapter for exactly these
+/// languages, so every other language carries no such edge by construction, no
+/// matter what is installed on the host.
+pub const ENRICHABLE_LANGUAGES: &[LanguageId] = &[LanguageId::Rust, LanguageId::Python];
+
+/// Whether cross-file reference evidence is available for one language.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReferenceEnrichment {
+    /// Nothing told this report which language servers the host has, so the
+    /// state is unread rather than absent. The default, because a measurement
+    /// taken without that input must not report a gap it never looked for.
+    #[default]
+    Unknown,
+    /// An adapter is wired and its language server was found.
+    Available,
+    /// An adapter is wired but no language server for it is installed, so
+    /// reference and override edges cannot be produced on this host.
+    NoLanguageServer,
+    /// This build wires no adapter for the language, so reference and override
+    /// edges are unavailable regardless of what is installed.
+    Unsupported,
+}
+
+impl ReferenceEnrichment {
+    /// Whether this state should be surfaced as needing attention.
+    ///
+    /// A missing language server is a host gap an operator can close.
+    /// `Unsupported` is a property of the build, and a row a reader can do
+    /// nothing about is noise rather than a finding. `Unknown` is not a gap
+    /// either: nothing looked, so nothing was found missing.
+    pub fn is_actionable_gap(&self) -> bool {
+        matches!(self, ReferenceEnrichment::NoLanguageServer)
+    }
+}
+
+/// Whether the language server for `language` can enrich this host's graph.
+pub fn reference_enrichment_for(
+    language: LanguageId,
+    servers_found: &HashSet<LanguageId>,
+) -> ReferenceEnrichment {
+    if !ENRICHABLE_LANGUAGES.contains(&language) {
+        return ReferenceEnrichment::Unsupported;
+    }
+    if servers_found.contains(&language) {
+        ReferenceEnrichment::Available
+    } else {
+        ReferenceEnrichment::NoLanguageServer
+    }
+}
+
+/// Whole-graph relation totals, across EVERY entity-to-entity relation kind.
+///
+/// Deliberately a wider scope than the per-language rows below, which count
+/// only the three reference kinds five shipped surfaces answer from. Both are
+/// true about one graph and they are different numbers, so they are named apart
+/// and the summary says which is which; a reader handed two bare totals cannot
+/// tell which denominator applies to the question they actually asked.
+///
+/// Supplied by the caller that already walked the relation table rather than
+/// re-walked here, so one response counts each edge once.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphRelationTotals {
+    /// Entity-to-entity relations counted, both endpoints resolved to entities.
+    pub entity_relations: usize,
+    /// How many of those cross a file boundary.
+    pub cross_file_entity_relations: usize,
+    /// Artifact-to-artifact import and include edges, which no entity-rooted
+    /// query reaches.
+    pub artifact_import_relations: usize,
+}
+
+impl GraphRelationTotals {
+    /// Whether the graph holds entity relations but no edge between two files.
+    ///
+    /// This is the state a relations-per-entity ratio used to hide. It is
+    /// deliberately keyed on a hard zero: a graph with even one cross-file edge
+    /// is answering the question, and how well it answers is a recall question
+    /// this counter cannot settle.
+    pub fn holds_no_cross_file_edges(&self) -> bool {
+        self.entity_relations > 0 && self.cross_file_entity_relations == 0
+    }
+}
 
 /// Reference kinds every consulting surface treats as a reference.
 ///
@@ -37,9 +135,11 @@ pub const REFERENCE_RELATION_KINDS: [RelationKind; 3] = [
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReferenceResolution {
-    /// No file of this language carries a parse-side count, so the ratio is
-    /// unknown. A store ingested before the count was recorded reads this way.
-    /// Unmeasured is not zero and it is not complete.
+    /// Nothing gave this language a call-site denominator, so the ratio is
+    /// unknown. Either no file carries a parse-side count (a store ingested
+    /// before the count was recorded reads this way), or every file that
+    /// carries one recorded zero. Unmeasured is not zero and it is not
+    /// complete.
     Unmeasured,
     /// The parser read call sites and the graph holds no call edge at all. The
     /// strongest available evidence that resolution is broken for this language
@@ -101,6 +201,13 @@ pub struct LanguageReferenceCoverage {
     /// resolving them inside the repository.
     pub external_reference_edges: u64,
     pub resolution: ReferenceResolution,
+    /// Whether a language server can supply this language's reference and
+    /// override edges on this host. The collector cannot know that from graph
+    /// truth, so it leaves `Unknown` and
+    /// [`ReferenceEdgeCoverage::with_language_servers`] fills it in on the
+    /// surfaces that probed.
+    #[serde(default)]
+    pub reference_enrichment: ReferenceEnrichment,
 }
 
 impl LanguageReferenceCoverage {
@@ -169,9 +276,42 @@ fn percent(parsed: Option<u64>, resolved: u64) -> Option<u32> {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReferenceEdgeCoverage {
     pub languages: Vec<LanguageReferenceCoverage>,
+    /// Whole-graph relation totals, when the caller measured them. `None` means
+    /// nobody counted, which is not the same as a graph holding no edges, so no
+    /// surface may render a zero for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totals: Option<GraphRelationTotals>,
 }
 
 impl ReferenceEdgeCoverage {
+    /// Attach the whole-graph totals the caller already counted.
+    pub fn with_totals(mut self, totals: GraphRelationTotals) -> Self {
+        self.totals = Some(totals);
+        self
+    }
+
+    /// Fill in each language's enrichment state from the servers a caller found.
+    ///
+    /// Kept off the collector because probing the host is not reading the graph,
+    /// and this module measures graph truth alone.
+    pub fn with_language_servers(mut self, servers_found: &HashSet<LanguageId>) -> Self {
+        for language in &mut self.languages {
+            // The rows carry a language's display name, and kin-model has no
+            // parse back from one. Matching against the enrichable set's own
+            // names keeps the mapping in a single place: a name outside that set
+            // is Unsupported by definition, which is the answer either way.
+            let enrichable = ENRICHABLE_LANGUAGES
+                .iter()
+                .copied()
+                .find(|candidate| candidate.to_string() == language.language);
+            language.reference_enrichment = match enrichable {
+                Some(id) => reference_enrichment_for(id, servers_found),
+                None => ReferenceEnrichment::Unsupported,
+            };
+        }
+        self
+    }
+
     /// Languages whose edges cannot support an absence claim, worst first.
     pub fn unsupportable_absence_reasons(&self) -> Vec<String> {
         self.languages
@@ -187,23 +327,97 @@ impl ReferenceEdgeCoverage {
             .all(LanguageReferenceCoverage::absence_is_supportable)
     }
 
+    /// Whether the graph holds entity relations but no edge between two files.
+    ///
+    /// False when nobody counted the totals: an unmeasured graph has not been
+    /// shown to hold no cross-file edge.
+    pub fn holds_no_cross_file_edges(&self) -> bool {
+        self.totals
+            .is_some_and(|totals| totals.holds_no_cross_file_edges())
+    }
+
+    /// Languages whose missing language server an operator could install.
+    pub fn languages_missing_a_language_server(&self) -> Vec<&str> {
+        self.languages
+            .iter()
+            .filter(|language| language.reference_enrichment.is_actionable_gap())
+            .map(|language| language.language.as_str())
+            .collect()
+    }
+
+    /// Whether any surface should present this as needing attention.
+    pub fn needs_attention(&self) -> bool {
+        self.holds_no_cross_file_edges()
+            || !self.languages_missing_a_language_server().is_empty()
+            || !self.absence_is_supportable()
+    }
+
     /// Terminal rendering, one line per language plus the caveat a reader needs
     /// to keep a sub-100% ratio from reading as a defect.
+    ///
+    /// This is the whole completeness section for a status surface. It used to
+    /// be two, printed from two types, and neither said which of its two
+    /// denominators the other was using.
     pub fn summary_lines(&self) -> Vec<String> {
-        if self.languages.is_empty() {
-            return vec![
-                "Reference edge coverage: no language entities in the graph yet".to_string(),
-            ];
+        let mut lines = Vec::new();
+        if let Some(totals) = self.totals {
+            lines.push(format!(
+                "Cross-file entity relations: {} of {} across all relation kinds ({} artifact \
+                 import/include edges)",
+                totals.cross_file_entity_relations,
+                totals.entity_relations,
+                totals.artifact_import_relations
+            ));
+            if totals.holds_no_cross_file_edges() {
+                lines.push(
+                    "  no relation in this graph crosses a file boundary, so `find_references` \
+                     and `trace_data_flow` cannot leave the file they start in"
+                        .to_string(),
+                );
+            }
         }
 
-        let mut lines = vec!["Reference edge coverage (parsed -> resolved):".to_string()];
+        if self.languages.is_empty() {
+            lines
+                .push("Reference edge coverage: no language entities in the graph yet".to_string());
+            return lines;
+        }
+
+        lines.push("Reference edge coverage (resolved edges / parsed sites):".to_string());
         for language in &self.languages {
             lines.push(format!("  {}", language_summary(language)));
         }
+
+        let missing = self.languages_missing_a_language_server();
+        if !missing.is_empty() {
+            lines.push(format!(
+                "  cross-file reference and override edges unavailable for {}: no language server \
+                 found",
+                missing.join(", ")
+            ));
+        }
+        let unsupported: Vec<&str> = self
+            .languages
+            .iter()
+            .filter(|language| {
+                language.reference_enrichment == ReferenceEnrichment::Unsupported
+                    && language.entities > 0
+            })
+            .map(|language| language.language.as_str())
+            .collect();
+        if !unsupported.is_empty() {
+            lines.push(format!(
+                "  cross-file reference and override edges unsupported for {}: this build wires \
+                 no language-server adapter",
+                unsupported.join(", ")
+            ));
+        }
+
         lines.push(
             "  Counts entity-level reference edges only, which is what find_references, \
              trace_data_flow, impact and dead-code answer from; a local import statement also \
-             resolves to an artifact-level edge those queries never reach."
+             resolves to an artifact-level edge those queries never reach. The all-kinds total \
+             above is the wider count and is not this denominator."
                 .to_string(),
         );
         lines.push(
@@ -222,7 +436,15 @@ fn language_summary(coverage: &LanguageReferenceCoverage) -> String {
             "calls {}/{parsed} ({percent}%)",
             coverage.resolved_call_edges
         ),
-        (Some(parsed), None) => format!("calls {}/{parsed}", coverage.resolved_call_edges),
+        // `call_percent` declines exactly when there is no denominator, so this
+        // arm is the zero-parse-side case. Printing it as a fraction produced
+        // `calls 238/0` beside `imports 0/40 (0%)`, which reads as two fields
+        // in opposite orders rather than as the one thing it is: a count with
+        // nothing to compare it against.
+        (Some(_), None) => format!(
+            "calls {} resolved, parse side counted no call sites",
+            coverage.resolved_call_edges
+        ),
         (None, _) => format!(
             "calls {} resolved, parse side unmeasured",
             coverage.resolved_call_edges
@@ -233,7 +455,10 @@ fn language_summary(coverage: &LanguageReferenceCoverage) -> String {
             "imports {}/{parsed} ({percent}%)",
             coverage.resolved_import_edges
         ),
-        (Some(parsed), None) => format!("imports {}/{parsed}", coverage.resolved_import_edges),
+        (Some(_), None) => format!(
+            "imports {} resolved, parse side counted no import statements",
+            coverage.resolved_import_edges
+        ),
         (None, _) => format!(
             "imports {} resolved, parse side unmeasured",
             coverage.resolved_import_edges
@@ -388,11 +613,15 @@ where
                 intra_file_reference_edges: tally.intra_file,
                 external_reference_edges: tally.external,
                 resolution,
+                reference_enrichment: ReferenceEnrichment::Unknown,
             }
         })
         .collect();
 
-    Ok(ReferenceEdgeCoverage { languages })
+    Ok(ReferenceEdgeCoverage {
+        languages,
+        totals: None,
+    })
 }
 
 /// Classify off call sites alone.
@@ -410,7 +639,12 @@ fn classify(
         return ReferenceResolution::Unmeasured;
     }
     match parsed_call_sites {
-        None | Some(0) => ReferenceResolution::FullyResolved,
+        // No denominator, so no ratio and no verdict. A parse side that
+        // recorded nothing is not evidence that everything it would have
+        // recorded reached the graph, and reading it as one is what let a
+        // language holding 238 call edges against a zero parse count print
+        // `[resolved]` under a no-issues banner.
+        None | Some(0) => ReferenceResolution::Unmeasured,
         Some(_) if resolved_call_edges == 0 => ReferenceResolution::NoneResolved,
         Some(parsed) if resolved_call_edges < parsed => ReferenceResolution::PartiallyResolved,
         Some(_) => ReferenceResolution::FullyResolved,
@@ -569,6 +803,144 @@ mod tests {
     /// A store ingested before the parse side was recorded reads unmeasured,
     /// which is neither zero nor complete, and a multi-file unmeasured language
     /// with no cross-file edge still cannot support absence.
+    /// FIR-2370. Two completeness types each wired their own `kin graph status`
+    /// section and their own `kin doctor` row, agreeing on every number they
+    /// shared. A reader got two sections about one graph and no way to tell
+    /// which denominator answered the question they arrived with. One type now
+    /// carries both scopes, and the section names them apart rather than
+    /// printing two totals a reader must reconcile.
+    #[test]
+    fn one_section_carries_both_scopes_and_names_which_is_which() {
+        let coverage = ReferenceEdgeCoverage {
+            languages: vec![LanguageReferenceCoverage {
+                language: "python".to_string(),
+                files: 12,
+                files_measured: 12,
+                entities: 46,
+                parsed_call_sites: Some(78),
+                parsed_import_statements: Some(16),
+                resolved_call_edges: 16,
+                resolved_import_edges: 0,
+                cross_file_reference_edges: 0,
+                intra_file_reference_edges: 16,
+                external_reference_edges: 0,
+                resolution: ReferenceResolution::PartiallyResolved,
+                reference_enrichment: ReferenceEnrichment::NoLanguageServer,
+            }],
+            totals: Some(GraphRelationTotals {
+                entity_relations: 17,
+                cross_file_entity_relations: 0,
+                artifact_import_relations: 3,
+            }),
+        };
+
+        let rendered = coverage.summary_lines().join("\n");
+
+        assert!(
+            rendered.contains("Cross-file entity relations: 0 of 17 across all relation kinds"),
+            "the all-kinds scope, labelled as such: {rendered}"
+        );
+        assert!(
+            rendered.contains("no relation in this graph crosses a file boundary"),
+            "the shortfall is stated, not left to a ratio: {rendered}"
+        );
+        assert!(
+            rendered.contains("python: 12 files, calls 16/78"),
+            "the reference-kind scope, per language: {rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "The all-kinds total above is the wider count and is not this \
+                               denominator"
+            ),
+            "and the two are told apart: {rendered}"
+        );
+        assert!(
+            rendered.contains("unavailable for python: no language server found"),
+            "the language-server state travels with the same object: {rendered}"
+        );
+        assert_eq!(
+            rendered.matches("Reference edge coverage").count(),
+            1,
+            "one section, not two: {rendered}"
+        );
+        assert!(coverage.needs_attention());
+    }
+
+    /// A measurement nobody handed totals to reports no cross-file verdict at
+    /// all. Unmeasured is not zero, and a surface that rendered a zero here
+    /// would claim a graph holds no cross-file edge on the strength of nobody
+    /// having counted.
+    #[test]
+    fn unmeasured_totals_produce_no_cross_file_claim() {
+        let coverage = ReferenceEdgeCoverage::default();
+        let rendered = coverage.summary_lines().join("\n");
+
+        assert!(!coverage.holds_no_cross_file_edges());
+        assert!(
+            !rendered.contains("Cross-file entity relations"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("no language entities in the graph yet"),
+            "{rendered}"
+        );
+    }
+
+    /// The language-server state is filled from a probe the caller ran, not
+    /// guessed here. A language this build wires no adapter for is Unsupported
+    /// whatever is installed, which is why gopls on PATH buys Go nothing.
+    #[test]
+    fn language_server_state_is_attached_rather_than_assumed() {
+        let unfilled = ReferenceEdgeCoverage {
+            languages: vec![
+                language_row("python", ReferenceEnrichment::Unknown),
+                language_row("go", ReferenceEnrichment::Unknown),
+            ],
+            totals: None,
+        };
+        assert!(
+            unfilled.languages_missing_a_language_server().is_empty(),
+            "nothing looked, so nothing was found missing"
+        );
+
+        let filled = unfilled
+            .clone()
+            .with_language_servers(&[LanguageId::Go].into_iter().collect());
+        assert_eq!(
+            filled.languages_missing_a_language_server(),
+            vec!["python"],
+            "a wired language with no server is the actionable gap"
+        );
+        assert_eq!(
+            filled.languages[1].reference_enrichment,
+            ReferenceEnrichment::Unsupported,
+            "gopls on PATH gives Go nothing: no adapter consumes it"
+        );
+
+        let complete = unfilled
+            .with_language_servers(&[LanguageId::Python, LanguageId::Rust].into_iter().collect());
+        assert!(complete.languages_missing_a_language_server().is_empty());
+    }
+
+    fn language_row(name: &str, enrichment: ReferenceEnrichment) -> LanguageReferenceCoverage {
+        LanguageReferenceCoverage {
+            language: name.to_string(),
+            files: 2,
+            files_measured: 2,
+            entities: 4,
+            parsed_call_sites: Some(4),
+            parsed_import_statements: Some(2),
+            resolved_call_edges: 4,
+            resolved_import_edges: 2,
+            cross_file_reference_edges: 2,
+            intra_file_reference_edges: 2,
+            external_reference_edges: 0,
+            resolution: ReferenceResolution::FullyResolved,
+            reference_enrichment: enrichment,
+        }
+    }
+
     #[test]
     fn a_store_without_parse_counts_reads_unmeasured() {
         let graph = InMemoryGraph::new();
@@ -583,6 +955,89 @@ mod tests {
         assert_eq!(python.parsed_call_sites, None);
         assert_eq!(python.files_measured, 0);
         assert!(!coverage.absence_is_supportable());
+    }
+
+    /// The header names the order the rows actually print.
+    ///
+    /// The shipped header read `(parsed -> resolved)` while `language_summary`
+    /// printed resolved first, so a reader handed `calls 238/0, imports 0/40
+    /// (0%)` saw two fields in what looked like opposite orders and had no way
+    /// to tell which number was which. Pinning the header against a row whose
+    /// two numbers differ is what stops the label and the rows drifting apart
+    /// again.
+    #[test]
+    fn the_header_names_the_order_the_rows_print() {
+        let mut row = language_row("python", ReferenceEnrichment::Available);
+        row.parsed_call_sites = Some(10);
+        row.resolved_call_edges = 3;
+        row.parsed_import_statements = Some(8);
+        row.resolved_import_edges = 2;
+        let coverage = ReferenceEdgeCoverage {
+            languages: vec![row],
+            totals: None,
+        };
+        let rendered = coverage.summary_lines().join("\n");
+
+        assert!(
+            rendered.contains("calls 3/10 (30%)"),
+            "a row prints resolved over parsed: {rendered}"
+        );
+        assert!(
+            rendered.contains("imports 2/8 (25%)"),
+            "and both halves print the same way round: {rendered}"
+        );
+
+        let header = rendered
+            .lines()
+            .find(|line| line.starts_with("Reference edge coverage"))
+            .expect("the section header");
+        let resolved_at = header
+            .find("resolved")
+            .expect("the header names the resolved side");
+        let parsed_at = header
+            .find("parsed")
+            .expect("the header names the parsed side");
+        assert!(
+            resolved_at < parsed_at,
+            "the header must name the numerator first, as every row prints it: {header}"
+        );
+    }
+
+    /// A parse side that counted nothing is not a ratio and not a verdict.
+    ///
+    /// A stranger's run printed `calls 238/0` and labelled the row `[resolved]`
+    /// under a no-issues banner: call edges in the graph against a parse side
+    /// reporting zero call sites, divided by nothing and then read as complete
+    /// resolution. Zero parsed sites is the absence of a denominator, so the
+    /// row says so in words and classifies as unmeasured.
+    #[test]
+    fn a_zero_parse_side_is_neither_a_ratio_nor_a_resolved_verdict() {
+        let graph = InMemoryGraph::new();
+        let caller = entity("main", "pkg/a.py", Some(0), Some(0));
+        let callee = entity("helper", "pkg/b.py", Some(0), Some(0));
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&callee).unwrap();
+        graph.upsert_relation(&calls(caller.id, callee.id)).unwrap();
+
+        let coverage = collect_reference_edge_coverage(&graph).unwrap();
+        let python = &coverage.languages[0];
+        assert_eq!(python.parsed_call_sites, Some(0));
+        assert_eq!(python.resolved_call_edges, 1);
+        assert_eq!(
+            python.resolution,
+            ReferenceResolution::Unmeasured,
+            "a zero denominator is not evidence that every parsed site resolved"
+        );
+
+        let rendered = coverage.summary_lines().join("\n");
+        assert!(
+            rendered.contains("calls 1 resolved, parse side counted no call sites"),
+            "the count is stated rather than divided by nothing: {rendered}"
+        );
+        assert!(
+            !rendered.contains("calls 1/0"),
+            "and no fraction over a zero denominator survives: {rendered}"
+        );
     }
 
     /// One file cannot have a cross-file edge, so a single-file language is not

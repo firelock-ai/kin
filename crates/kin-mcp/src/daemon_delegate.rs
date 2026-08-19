@@ -516,7 +516,8 @@ fn mcp_spawn_plan(
         working_dir,
         idle_timeout_secs: mcp_spawn_idle_timeout(
             std::env::var_os("KIN_DAEMON_IDLE_TIMEOUT_SECS").is_some(),
-        ),
+        )
+        .map(str::to_string),
         supervisor_url,
     }
 }

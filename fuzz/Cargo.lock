@@ -645,9 +645,9 @@ dependencies = [
 
 [[package]]
 name = "kin-model"
-version = "0.7.8"
+version = "0.7.9"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "75c237b19289638e728e70048011c5d5731d9ef45878f078e7663f2b0e9475e1"
+checksum = "859744dbb2855216be40ea258c0ff608888f00f19435d1bdf3714314176d93d3"
 dependencies = [
  "chrono",
  "gix-hash",
@@ -666,7 +666,7 @@ dependencies = [
 
 [[package]]
 name = "kin-parser"
-version = "0.5.39"
+version = "0.5.40"
 dependencies = [
  "kin-model",
  "serde",
@@ -702,9 +702,9 @@ dependencies = [
 
 [[package]]
 name = "kin-vector"
-version = "0.1.11"
+version = "0.1.12"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "c1904ba13d244810b195168b04ada8884094f8d5374c54f36e9b9375ac6e625a"
+checksum = "455de2428eef80e8496e1963a24a8469ca3c15702dc4bfb46bd5182e1f3bdda3"
 dependencies = [
  "fs2",
  "hashbrown 0.15.5",

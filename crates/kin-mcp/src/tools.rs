@@ -55,13 +55,45 @@ fn destructive_idempotent(title: &str) -> ToolAnnotations {
 
 /// Honest JSON Schema for one transaction operation.
 ///
-/// The product daemon accepts two materially different shapes. A source-body
-/// edit is intentionally payload-less; structured entity/relation mutations
-/// require `payload`. Keeping these as disjoint `oneOf` branches prevents MCP
-/// clients from being told that the preferred source-edit form is invalid.
+/// The product daemon accepts three materially different shapes. A source-body
+/// edit and a new source file are both intentionally payload-less; structured
+/// entity/relation mutations require `payload`. Keeping these as disjoint
+/// `oneOf` branches prevents MCP clients from being told that the preferred
+/// source-edit form is invalid.
+///
+/// The branches cannot both match one operation: the two payload-less branches
+/// carry disjoint verb enums, and the structured branch requires `payload`,
+/// which neither of the others accepts.
 fn transaction_operation_schema() -> serde_json::Value {
     serde_json::json!({
         "oneOf": [
+            {
+                "title": "New source file",
+                "type": "object",
+                "properties": {
+                    "verb": {
+                        "type": "string",
+                        "enum": ["create", "add", "insert"],
+                        "description": "Admit a source file the graph has never seen. This is the only operation that introduces a new file."
+                    },
+                    "target": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Repository-relative path of the new file, such as \"src/parser.py\". No leading slash, no \"..\", and no Kin or Git control component. A path the graph already tracks is refused; edit that one with verb 'update' instead."
+                    },
+                    "body": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "The file's complete UTF-8 source text. Kin parses it with the same extractor the ingest path uses, so every entity in it enters the graph, and writes the file into the working directory when the transaction commits. You do not need to write the file yourself first."
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Human-readable explanation of this change."
+                    }
+                },
+                "required": ["verb", "target", "body", "description"],
+                "additionalProperties": false
+            },
             {
                 "title": "Entity source body edit",
                 "type": "object",
@@ -220,7 +252,7 @@ fn registered_tools() -> ToolsListResult {
                         "queries": {
                             "type": "array",
                             "items": { "type": "string" },
-                            "description": "Optional additional query variants for multi-query fan-out. When present, `query` plus each variant are retrieved independently and their rankings RRF-fused into one deduped result, with each hit's `match_evidence.matched_variants` naming the variants that surfaced it. Diverse variants (identifiers, behavior, subsystem) recover more relevant hits than any single phrasing. Requires the fused pipeline (automatic when set)."
+                            "description": "Optional additional query variants for multi-query fan-out. When present, `query` plus each variant are retrieved independently and their rankings RRF-fused into one deduped result. The response echoes the fan-out once under `queries`, and each hit's `matched_variant_indexes` gives the positions in that list of the variants that surfaced it. Diverse variants (identifiers, behavior, subsystem) recover more relevant hits than any single phrasing. Requires the fused pipeline (automatic when set)."
                         },
                         "limit": { "type": "integer", "description": "Max ranked entities per page (page size). Default 20.", "default": 20 },
                         "page_size": { "type": "integer", "description": "Entities per page; overrides `limit` for paging when set." },
@@ -233,13 +265,23 @@ fn registered_tools() -> ToolsListResult {
                         },
                         "include_snippet": {
                             "type": "boolean",
-                            "description": "Attach a bounded inline source snippet to each entity hit, projected from graph-owned content. Read it from the hit's `snippet` field (the fused pipeline also carries the same text as `body` for locate-schema parity). Entity granularity only: a file hit has no single entity body. A hit with no graph-owned body carries no snippet rather than a placeholder.",
+                            "description": "Attach a bounded inline source excerpt to each entity hit, projected from graph-owned content. Read it from `body` on the fused pipeline (routing `fused-v1`, the default) and from `snippet` on the cosine pipeline (routing `cosine-v0`); `routing` on the response says which answered. Each hit carries the text once. Entity granularity only: a file hit has no single entity body. A hit with no graph-owned body carries no excerpt rather than a placeholder.",
                             "default": true
+                        },
+                        "snippet_alias": {
+                            "type": "boolean",
+                            "description": "Repeat each fused hit's `body` under a second `snippet` key, for a consumer that reads that name. Off by default: the repeat doubles the most expensive field on every hit and, under the response budget, evicts real hits to make room for copies. Prefer reading `body` on the fused pipeline. No effect on the cosine pipeline, whose text is already `snippet`.",
+                            "default": false
                         },
                         "pipeline": {
                             "type": "string",
                             "enum": ["fused", "cosine"],
                             "description": "Force a retrieval pipeline for this call: 'fused' (full multi-signal locate ranking) or 'cosine' (legacy single-vector). The default is 'fused' on every profile, the same ranking kin locate serves; 'cosine' is the per-call escape hatch for A/B comparison."
+                        },
+                        "include_tests": {
+                            "type": "boolean",
+                            "description": "Rank test-role entities alongside source. Off by default: locate demotes test-role entities, and at several stages excludes them, unless the query text itself reads as being about tests. That default is right for `where does this feature live` and wrong when you already know you are asking for a test, and a keyword heuristic over your query was the only thing that lifted it. When the default withholds test paths, the response says how many under `semantic_coverage.graph_bodies.withheld_test_paths` and records a `graph_role_filter` degradation, so `complete` is never claimed over a population the filter removed.",
+                            "default": false
                         },
                         "explain": {
                             "type": "boolean",
@@ -378,6 +420,11 @@ fn registered_tools() -> ToolsListResult {
                         "compact": {
                             "type": "boolean",
                             "description": "Alias for include_body: false. Ignored when include_body is given explicitly.",
+                            "default": false
+                        },
+                        "include_type_edges": {
+                            "type": "boolean",
+                            "description": "Walk THROUGH a type-annotation edge to a type this repository defines (default false). A dataclass field typed with a repo class is a real flow into that class, so the hop is available; it is off by default because a shared type name otherwise joins every entity that annotates with it to every other one. An annotation target the repository does not define stays a leaf either way.",
                             "default": false
                         },
                         "max_response_chars": {
@@ -1586,7 +1633,23 @@ mod tests {
             let variants = tool["inputSchema"]["properties"]["operations"]["items"]["oneOf"]
                 .as_array()
                 .expect("transaction operations must be disjoint oneOf variants");
-            assert_eq!(variants.len(), 2, "{tool_name}");
+            assert_eq!(variants.len(), 3, "{tool_name}");
+
+            let new_source_file = variants
+                .iter()
+                .find(|variant| variant["title"] == "New source file")
+                .expect("payload-less new-source-file branch");
+            assert_eq!(
+                required_set(new_source_file),
+                ["body", "description", "target", "verb"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+            );
+            assert!(
+                new_source_file["properties"].get("payload").is_none(),
+                "payload-less new-source-file branch must reject payload"
+            );
 
             let body_edit = variants
                 .iter()

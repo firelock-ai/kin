@@ -70,6 +70,42 @@ pub fn is_target_body_update(op: &McpMutationOperation) -> bool {
             .is_some_and(|body| !body.trim().is_empty())
 }
 
+/// A payload-less operation that expresses "the complete source of the new
+/// repository file at `target` is `body`": verb create/add/insert, `target`
+/// naming a repository-relative path, and a non-empty `body`.
+///
+/// This is the admission surface for source the graph has never seen.
+/// [`is_target_body_update`] covers the case where an entity already exists to
+/// edit, and it cannot reach a new file: it resolves `target` against
+/// repository authority and splices into an existing span, so a path with no
+/// entity and no span has nothing for it to resolve. An agent that has just
+/// authored a module holds neither an entity id nor a span, so `target` names
+/// the path and the daemon derives every entity in the file from `body`
+/// through the same extractor the ingest path runs.
+///
+/// The body travels in the call rather than the daemon reading the path off
+/// disk. Graph truth is then written from bytes the caller supplied, and the
+/// working file is a projection of what was committed, which is the direction
+/// the graph-first thesis requires. It also keeps admission off the filesystem
+/// entirely: no walk, no scan, and no race against the caller's own writes.
+///
+/// `upsert` is deliberately not one of the verbs. It would have to mean
+/// "create if absent, edit if present", and a create that silently becomes an
+/// edit of somebody else's file is the failure this shape exists to make
+/// impossible. A path that is already tracked is refused by name.
+pub fn is_new_source_file(op: &McpMutationOperation) -> bool {
+    op.payload.is_none()
+        && matches!(
+            op.verb.trim().to_lowercase().as_str(),
+            "create" | "add" | "insert"
+        )
+        && !op.target.trim().is_empty()
+        && op
+            .body
+            .as_deref()
+            .is_some_and(|body| !body.trim().is_empty())
+}
+
 /// An operation that carries new source text for a file.
 ///
 /// Source text can only become truth by being spliced into exact repository
@@ -339,10 +375,16 @@ pub fn validate_staged_operations(
             if is_target_body_update(op) {
                 continue;
             }
+            if is_new_source_file(op) {
+                validate_new_source_path(idx, op)?;
+                continue;
+            }
             return Err(format!(
                 "operation #{idx} ('{}'): missing payload; provide an entity, relation, or blob \
-                 payload, or express an entity source edit as verb 'update' with `target` (entity \
-                 name or id) and `body` (the entity's full new source text)",
+                 payload, express an edit to an existing entity as verb 'update' with `target` \
+                 (entity name or id) and `body` (the entity's full new source text), or admit a \
+                 source file the graph has never seen as verb 'create' with `target` (its \
+                 repository-relative path) and `body` (the file's complete text)",
                 op.verb
             ));
         };
@@ -364,6 +406,37 @@ pub fn validate_staged_operations(
     Ok(())
 }
 
+/// Validate the repository-relative path a new-source-file operation names.
+///
+/// Runs the same path rule the projection applies
+/// ([`kin_core::validate_source_paths`]), so a path that stages clean is a path
+/// the commit can materialize. Doing it here rather than only in the daemon is
+/// what keeps stage-time rejection a superset of commit-time rejection: an
+/// absolute path, a `..` escape, or a name reserved for Kin or Git control
+/// metadata is refused at the call that introduced it, with the path quoted,
+/// instead of at a commit that has already accepted several other operations.
+///
+/// Intrinsic to the payload and free of graph access, like every other check in
+/// [`validate_staged_operations`], so it behaves identically in-process and
+/// through the daemon.
+fn validate_new_source_path(idx: usize, op: &McpMutationOperation) -> Result<(), String> {
+    let target = op.target.trim();
+    let path = kin_model::RepoPath::from_utf8(target.to_string()).map_err(|error| {
+        format!(
+            "operation #{idx} ('{}'): {target:?} is not a usable repository path: {error}",
+            op.verb
+        )
+    })?;
+    kin_core::validate_source_paths([&path]).map_err(|error| {
+        format!(
+            "operation #{idx} ('{}'): {target:?} is not an admissible repository source path: \
+             {error}. Name a repository-relative path such as \"src/parser.py\", with no leading \
+             slash, no \"..\", and no Kin or Git control component",
+            op.verb
+        )
+    })
+}
+
 /// Why a single staged operation cannot be turned into a committed delta, or
 /// `None` when it is committable.
 ///
@@ -376,10 +449,11 @@ pub fn validate_staged_operations(
 /// No graph access is required, so it is safe to run in any runtime; existence
 /// checks (does the relation/entity actually exist) stay graph-side.
 ///
-/// Runtime-independent by design, so a payload-less source update is `None`
-/// here: the daemon commits it. The in-process commit path layers its own
-/// offline-only refusal for that shape on top of this check; see
-/// `handlers::sessions::handle_transaction_commit`.
+/// Runtime-independent by design, so a payload-less source update and a
+/// payload-less new source file are both `None` here: the daemon commits them.
+/// The in-process commit path layers its own offline-only refusal on top of
+/// this check, and [`carries_source_body`] already covers both shapes because
+/// each is a body; see `handlers::sessions::handle_transaction_commit`.
 pub fn uncommittable_reason(op: &McpMutationOperation) -> Option<String> {
     let verb = op.verb.trim().to_lowercase();
     if verb.is_empty() {
@@ -394,7 +468,7 @@ pub fn uncommittable_reason(op: &McpMutationOperation) -> Option<String> {
         ));
     }
     let Some(payload) = op.payload.as_ref() else {
-        if is_target_body_update(op) {
+        if is_target_body_update(op) || is_new_source_file(op) {
             return None;
         }
         return Some("missing payload".to_string());
@@ -2275,10 +2349,17 @@ mod tests {
     #[test]
     fn validate_staged_operations_rejects_missing_payload() {
         // The commit path silently skips payload-less ops; stage time must not.
-        // (A payload-less UPDATE with target and body is the one valid form.)
+        // A payload-less op is valid in exactly two shapes: an entity source
+        // edit (verb "update", target plus body) and a new-source-file create
+        // (verb "create", target plus body); `op()` here supplies neither
+        // (target "function", body None), so it must still be rejected.
         let err = validate_staged_operations(&[op("create", None)]).unwrap_err();
         assert!(err.contains("missing payload"), "{err}");
-        assert!(err.contains("entity source edit"), "{err}");
+        assert!(
+            err.contains("express an edit to an existing entity"),
+            "{err}"
+        );
+        assert!(err.contains("admit a source file"), "{err}");
     }
 
     #[test]
@@ -2448,8 +2529,15 @@ mod target_body_update_tests {
 
     #[test]
     fn target_body_update_requires_verb_target_and_body() {
-        let wrong_verb = target_op("create", "resolve_binary", Some("x"));
+        // "create" used to be a wrong verb for this shape; it now names the
+        // new-source-file operation (`is_new_source_file`), so a payload-less
+        // "create" with a target and body is a valid create, not a rejected
+        // update. "upsert" stays wrong on purpose: it is deliberately not one
+        // of the create verbs (see `is_new_source_file`), so it still matches
+        // neither payload-less shape and must still fail closed.
+        let wrong_verb = target_op("upsert", "resolve_binary", Some("x"));
         assert!(!is_target_body_update(&wrong_verb));
+        assert!(!is_new_source_file(&wrong_verb));
         assert!(validate_staged_operations(std::slice::from_ref(&wrong_verb)).is_err());
 
         let no_target = target_op("update", "", Some("x"));
