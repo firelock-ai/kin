@@ -289,7 +289,11 @@ pub(crate) fn reset_vector_index_and_requeue_after_contention_for_test(
 ///
 /// The returned triple is exactly what `LspServer::start` takes: the command,
 /// its arguments, and the initialization options for this workspace.
-fn lsp_adapter_for(
+/// Public because it is this build's whole answer to "which server do you start
+/// for this language", and two surfaces outside the enrichment loop need that
+/// answer to agree with it: the provisioning advice that tells an operator what
+/// to install, and the proof that starts a real server against a fixture.
+pub fn lsp_adapter_for(
     language: kin_model::LanguageId,
     workspace_root: &std::path::Path,
 ) -> Option<(String, Vec<String>, Option<serde_json::Value>)> {
