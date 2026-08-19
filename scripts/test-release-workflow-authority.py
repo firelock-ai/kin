@@ -715,30 +715,37 @@ REQUIRED_CHECK_JOB_PRODUCERS = {
 # Durable workflow IDs are GitHub's repository-scoped identity, while `path`
 # makes that identity reviewable in source. These values are also exercised
 # against the current REST response shape by the positive fixture below.
+#
+# The third element is the event the producer publishes under INSIDE the merge
+# queue, which is not uniform: ci.yml and sast.yml carry a `merge_group:`
+# trigger, while secret-scan.yml carries only `push: branches: ["**"]` and so
+# publishes `gitleaks (full history)` from a push to the queue ref. That
+# asymmetry is why the mint admits a tier by the ref the queue built rather
+# than by the event name.
 REQUIRED_RELEASE_CHECK_PROVENANCE = {
     "Check & Test (ubuntu-latest)": (
         245_803_170,
         ".github/workflows/ci.yml",
-        "push",
+        "merge_group",
     ),
     "Check & Test (macos-latest)": (
         245_803_170,
         ".github/workflows/ci.yml",
-        "push",
+        "merge_group",
     ),
-    "Falsify guards": (245_803_170, ".github/workflows/ci.yml", "push"),
+    "Falsify guards": (245_803_170, ".github/workflows/ci.yml", "merge_group"),
     "Feature permutation tests (ubuntu-latest)": (
         245_803_170,
         ".github/workflows/ci.yml",
-        "push",
+        "merge_group",
     ),
     "Feature permutation tests (macos-latest)": (
         245_803_170,
         ".github/workflows/ci.yml",
-        "push",
+        "merge_group",
     ),
-    "DCO Sign-off": (245_803_170, ".github/workflows/ci.yml", "push"),
-    "cargo-deny": (251_549_972, ".github/workflows/sast.yml", "push"),
+    "DCO Sign-off": (245_803_170, ".github/workflows/ci.yml", "merge_group"),
+    "cargo-deny": (251_549_972, ".github/workflows/sast.yml", "merge_group"),
     "gitleaks (full history)": (
         293_452_372,
         ".github/workflows/secret-scan.yml",
@@ -747,12 +754,24 @@ REQUIRED_RELEASE_CHECK_PROVENANCE = {
     "Windows installer + vector release build": (
         245_803_170,
         ".github/workflows/ci.yml",
-        "push",
+        "merge_group",
     ),
+}
+# Ruleset 19746451 "Require status checks on main" gates the merge queue and is
+# live GitHub configuration no test here can read. The mint carries a reviewed
+# mirror of it; this is the part of that mirror the mint does not itself veto
+# on, which it still requires an admitted build to have published.
+RULESET_ONLY_RELEASE_CHECKS = {
+    "PR text hygiene": (328_945_626, ".github/workflows/pr-text-hygiene.yml"),
 }
 GITHUB_ACTIONS_APP_ID = 15_368
 RELEASE_TAG_WORKFLOW_ID = 318_521_292
 RELEASE_GATE_FIXTURE_SHA = "1" * 40
+# The landing commit's first parent, and the base sha the queue ref embeds.
+# The mint requires these to be the same value, which is the assertion that
+# binds "the tree the queue proved" to "the commit being released".
+RELEASE_GATE_PARENT_SHA = "2" * 40
+RELEASE_GATE_QUEUE_REF = f"gh-readonly-queue/main/pr-958-{RELEASE_GATE_PARENT_SHA}"
 RELEASE_GATE_CURRENT_RUN_ID = 9000
 EXTERNAL_REQUIRED_CONTEXT_SPOOF = textwrap.dedent(
     """\
@@ -5146,16 +5165,24 @@ def execute_release_check_gate(
         None,
     ]
     | None = None,
+    parent_sha: str = RELEASE_GATE_PARENT_SHA,
 ) -> subprocess.CompletedProcess[str]:
-    """Execute the real gate against a current-API-shaped provenance fixture."""
+    """Execute the real gate against a current-API-shaped provenance fixture.
+
+    The default fixture is a merge-queue landing as the API actually reports
+    one: every required context published once, by the queue's build of the
+    exact sha that landed. That is the mint's authority, so the falsifications
+    below mutate the evidence a release is really minted from rather than a
+    second copy of it. Fixtures that need the landing push add it explicitly.
+    """
 
     workflow_specs = {
         ".github/workflows/ci.yml": {
             "id": 1001,
             "workflow_id": 245_803_170,
             "path": ".github/workflows/ci.yml",
-            "event": "push",
-            "head_branch": "main",
+            "event": "merge_group",
+            "head_branch": RELEASE_GATE_QUEUE_REF,
             "head_sha": RELEASE_GATE_FIXTURE_SHA,
             "status": "completed",
             "conclusion": "success",
@@ -5165,23 +5192,37 @@ def execute_release_check_gate(
             "id": 1002,
             "workflow_id": 251_549_972,
             "path": ".github/workflows/sast.yml",
-            "event": "push",
-            "head_branch": "main",
+            "event": "merge_group",
+            "head_branch": RELEASE_GATE_QUEUE_REF,
             "head_sha": RELEASE_GATE_FIXTURE_SHA,
             "status": "completed",
             "conclusion": "success",
             "check_suite_id": 102,
         },
+        # secret-scan.yml carries no merge_group trigger. Inside the queue it
+        # publishes from the push that creates the queue ref, which is why the
+        # admitted tier is the ref and never the event name.
         ".github/workflows/secret-scan.yml": {
             "id": 1003,
             "workflow_id": 293_452_372,
             "path": ".github/workflows/secret-scan.yml",
             "event": "push",
-            "head_branch": "main",
+            "head_branch": RELEASE_GATE_QUEUE_REF,
             "head_sha": RELEASE_GATE_FIXTURE_SHA,
             "status": "completed",
             "conclusion": "success",
             "check_suite_id": 103,
+        },
+        ".github/workflows/pr-text-hygiene.yml": {
+            "id": 1004,
+            "workflow_id": 328_945_626,
+            "path": ".github/workflows/pr-text-hygiene.yml",
+            "event": "merge_group",
+            "head_branch": RELEASE_GATE_QUEUE_REF,
+            "head_sha": RELEASE_GATE_FIXTURE_SHA,
+            "status": "completed",
+            "conclusion": "success",
+            "check_suite_id": 107,
         },
     }
     workflow_runs = list(workflow_specs.values())
@@ -5198,8 +5239,14 @@ def execute_release_check_gate(
     }
     workflow_runs.append(current_run.copy())
     check_runs = []
-    for index, name in enumerate(REQUIRED_RELEASE_CHECKS, start=1):
-        _, workflow_path, _ = REQUIRED_RELEASE_CHECK_PROVENANCE[name]
+    fixture_contexts = list(REQUIRED_RELEASE_CHECKS) + sorted(
+        RULESET_ONLY_RELEASE_CHECKS
+    )
+    for index, name in enumerate(fixture_contexts, start=1):
+        if name in RULESET_ONLY_RELEASE_CHECKS:
+            workflow_path = RULESET_ONLY_RELEASE_CHECKS[name][1]
+        else:
+            _, workflow_path, _ = REQUIRED_RELEASE_CHECK_PROVENANCE[name]
         check_runs.append(
             {
                 "name": name,
@@ -5247,7 +5294,11 @@ def execute_release_check_gate(
                 "CURRENT_RUN_ID": str(RELEASE_GATE_CURRENT_RUN_ID),
                 "CURRENT_RUN_EVENT": str(current_run["event"]),
                 "REQUIRED_CHECKS": "\n".join(REQUIRED_RELEASE_CHECKS),
+                "RULESET_REQUIRED_CHECKS": "\n".join(
+                    list(REQUIRED_RELEASE_CHECKS) + sorted(RULESET_ONLY_RELEASE_CHECKS)
+                ),
                 "SHA": RELEASE_GATE_FIXTURE_SHA,
+                "RELEASE_PARENT_SHA": parent_sha,
                 "TRIGGER_SHA": RELEASE_GATE_FIXTURE_SHA,
                 "GITHUB_ACTIONS_APP_ID": str(GITHUB_ACTIONS_APP_ID),
                 "GITHUB_ACTIONS_APP_SLUG": "github-actions",
@@ -6584,6 +6635,53 @@ def assert_selector_arguments(
         )
 
 
+RELEASE_PR_HEAD_REF = "automation/release-next"
+
+
+def assert_release_pr_ci_scope_cannot_widen(ci: str) -> None:
+    """A release-PR CI carve-out must be unable to reach the queue or main.
+
+    The release pull request is the one whose whole content is the version
+    bump, and the merge queue is what proves it. A carve-out scoped loosely
+    enough to match `merge_group` would merge that pull request with no full
+    pass anywhere. One that matched `push` would leave a skipped required
+    context on the release sha, which the mint reads as not green and refuses
+    permanently. Neither failure announces itself as a scoping mistake: the
+    first is invisible until something ships broken, and the second looks like
+    a broken mint rather than a broken condition.
+
+    `github.head_ref` is what makes the scoping structural rather than
+    conventional: it is set only on pull-request events and is empty under
+    both `push` and `merge_group`, so a condition written against it cannot
+    match either however the rest of the expression is edited. This assertion
+    passes vacuously today, because ci.yml carries no such carve-out yet, and
+    starts constraining the moment one lands.
+    """
+
+    for job, block in workflow_job_blocks(ci).items():
+        active = "\n".join(active_lines(block))
+        if RELEASE_PR_HEAD_REF not in active:
+            continue
+        if "github.head_ref" not in active:
+            raise AssertionError(
+                f"ci.yml job {job} scopes the release pull request by something "
+                "other than github.head_ref, which is the only selector that is "
+                "empty under push and merge_group"
+            )
+        if "github.event_name == 'pull_request'" not in active:
+            raise AssertionError(
+                f"ci.yml job {job} carves out the release pull request without "
+                "pinning the pull_request event, so the carve-out's reach "
+                "depends on expression evaluation rather than on the event"
+            )
+        for reaching in ("github.ref ", "github.ref=", "github.ref==", "github.base_ref"):
+            if reaching in active:
+                raise AssertionError(
+                    f"ci.yml job {job} scopes the release pull request with a "
+                    f"context that is populated off pull requests: {reaching.strip()}"
+                )
+
+
 def assert_mint_trigger_survives_advisory_flakes(release_tag: str) -> None:
     """The event-driven mint must evaluate on any completed main-push CI run.
 
@@ -6629,12 +6727,25 @@ def assert_mint_trigger_survives_advisory_flakes(release_tag: str) -> None:
     for clause in (
         "github.event.workflow_run.event == 'push'",
         "github.event.workflow_run.head_branch == 'main'",
+        # The queue's own CI run is the occasion that removes the wait: it
+        # concludes when the landing does, roughly half an hour before the
+        # landing push's run concludes, and the mint now keys off exactly the
+        # sha that build proved. Losing this clause does not break a release,
+        # which is what makes it worth pinning: it silently restores the
+        # half-hour of pure waiting the rekey exists to delete.
+        "github.event.workflow_run.event == 'merge_group'",
+        "startsWith(github.event.workflow_run.head_branch, 'gh-readonly-queue/main/')",
     ):
         if clause not in active:
             raise AssertionError(
-                "the release mint's workflow_run trigger must still pin the "
-                f"reviewed default-branch push it evaluates: {clause}"
+                "the release mint's workflow_run trigger must pin both reviewed "
+                f"occasions it evaluates: {clause}"
             )
+    if "gh-readonly-queue/'" in active or "'gh-readonly-queue/')" in active:
+        raise AssertionError(
+            "the release mint's queue trigger must pin the merge-queue ref for "
+            "main, not any merge-queue ref in the repository"
+        )
 
     # A widened trigger must not widen what the mint may release. The event's
     # own head sha is the only stale-capable input into the candidate: a rerun
@@ -7902,8 +8013,26 @@ def main() -> None:
         "head_branch: .head_branch",
         'release_branch = "main"',
         "expected_provenance = {",
-        "if identity == expected_identity:",
+        "tier = evidence_tier(workflow)",
+        ") != expected_producer:",
+        "if tier == authority_tier:",
         "ambiguous required check",
+        # The rekey onto the merge-group-proven sha. Each of these is one half
+        # of a proof that cannot be dropped on its own: the queue anchor names
+        # the ref, the parent read from checked-out history is what the ref's
+        # embedded base has to equal, and the tier decision is what keeps a
+        # duplicated context from reading as ambiguous authority.
+        'RELEASE_PARENT_SHA="$(git rev-parse "${SHA}^")"',
+        "queue_anchor_workflow = (245803170",
+        'authority_tier = "merge_group" if queue_ref is not None else "push"',
+        "ambiguous merge-group evidence",
+        "merge-group evidence is not on a merge-queue ref",
+        "merge-group evidence sha mismatch",
+        "merge-group evidence proved a different tree",
+        "corroborating required check not green",
+        "RULESET_REQUIRED_CHECKS:",
+        "ruleset-required context has no admitted build at",
+        "mint requires a context the reviewed main ruleset does not",
         'allowed_conclusions = (\n                  {"success", "skipped"}',
         "release_tag_suite_ids",
         "did not settle within 30 minutes",
@@ -7989,6 +8118,11 @@ def main() -> None:
         "github.event.workflow_run.event == 'push'",
         "github.event.workflow_run.head_branch == 'main'",
         "github.event.workflow_run.conclusion == 'success'",
+        # The train reconciles off the queue's CI completion as well, for the
+        # same reason the mint does: it is the occasion that arrives when the
+        # landing does rather than half an hour later.
+        "github.event.workflow_run.event == 'merge_group'",
+        "startsWith(github.event.workflow_run.head_branch, 'gh-readonly-queue/main/')",
         "environment: release-tag",
         "actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1",
         "repositories: kin",
@@ -10820,12 +10954,19 @@ def main() -> None:
     ):
         require(windows_job, policy, "Windows exact lockfile provenance regression")
 
-    # The Windows installer leg is off the pull-request path, so the only place
-    # it can still prove anything is a push to main. The only reason that is
-    # safe is that release-tag.yml refuses to mint a tag unless this exact
-    # check is present and green on the release sha. Pin both halves together:
-    # dropping either one silently turns a required release gate into a job that
-    # never runs on the commit being released.
+    # The Windows installer leg is off the pull-request path, so the only
+    # places it can prove anything are the queue's build and the landing push.
+    # The only reason that is safe is that release-tag.yml refuses to mint a
+    # tag unless this exact check is present and green on the release sha. Pin
+    # every half together: dropping one silently turns a required release gate
+    # into a job that never runs on the commit being released.
+    #
+    # The merge-queue half is load-bearing now rather than optional. The mint
+    # keys off the merge-group-proven sha, and this leg is the one required
+    # context the queue used to skip, so a build that skips it is a build the
+    # mint must refuse. Restoring a merge_group exclusion here would make the
+    # queue's proof incomplete for exactly the platform that has been killing
+    # tags, and the mint would refuse every release until someone noticed.
     installer_start = ci_workflow.index("  windows-installer:")
     installer_end = ci_workflow.index("\n  changes:", installer_start)
     installer_job = ci_workflow[installer_start:installer_end]
@@ -10835,10 +10976,21 @@ def main() -> None:
         "needs.changes.outputs.docs_only != 'true'",
     ):
         require(installer_job, policy, "main-only Windows installer admission")
+    if "github.event_name != 'merge_group'" in installer_job:
+        raise AssertionError(
+            "the Windows installer leg must run inside the merge queue: the "
+            "release mint keys off the queue-proven sha and refuses a build "
+            "that skipped this required context"
+        )
     require(
         ci_workflow,
         "  push:\n    branches: [main]",
         "Windows installer proof still reaching every main commit",
+    )
+    require(
+        ci_workflow,
+        "  merge_group:",
+        "Windows installer proof reaching the queue build the mint keys off",
     )
 
     # Main's classifier must keep reporting false so the release-critical
@@ -11911,18 +12063,23 @@ def main() -> None:
         add_duplicate_success,
     )
 
-    def add_merge_queue_producer(
+    def add_landing_push_producer(
         check_runs: list[dict[str, object]],
         workflow_runs: list[dict[str, object]],
         _current_run: dict[str, object],
     ) -> None:
-        """A landing through the merge queue publishes the same contexts twice."""
+        """The landing push republishes every context the queue already proved.
 
-        queue_branch = "gh-readonly-queue/main/pr-1-" + "0" * 40
+        Both builds carry the same sha because the queue's speculative commit
+        IS the squash that lands. Crediting both would make every context
+        ambiguous, so the queue build is the authority and this one is
+        corroboration: judged when it has concluded, never waited for.
+        """
+
         for path, suite in (
-            (".github/workflows/ci.yml", 201),
-            (".github/workflows/sast.yml", 202),
-            (".github/workflows/secret-scan.yml", 203),
+            (".github/workflows/ci.yml", 301),
+            (".github/workflows/sast.yml", 302),
+            (".github/workflows/secret-scan.yml", 303),
         ):
             source = workflow_fixture(
                 workflow_runs,
@@ -11935,88 +12092,341 @@ def main() -> None:
             source.update(
                 {
                     "id": suite * 10,
-                    "event": (
-                        "push" if path.endswith("secret-scan.yml") else "merge_group"
-                    ),
-                    "head_branch": queue_branch,
+                    "event": "push",
+                    "head_branch": "main",
                     "check_suite_id": suite,
                 }
             )
             workflow_runs.append(source)
         for name in REQUIRED_RELEASE_CHECKS:
             _, workflow_path, _ = REQUIRED_RELEASE_CHECK_PROVENANCE[name]
-            queue_copy = required_check_fixture(check_runs, name).copy()
-            queue_copy.update(
+            push_copy = required_check_fixture(check_runs, name).copy()
+            push_copy.update(
                 {
                     "id": 20_000 + len(check_runs),
                     "check_suite_id": {
-                        ".github/workflows/ci.yml": 201,
-                        ".github/workflows/sast.yml": 202,
-                        ".github/workflows/secret-scan.yml": 203,
+                        ".github/workflows/ci.yml": 301,
+                        ".github/workflows/sast.yml": 302,
+                        ".github/workflows/secret-scan.yml": 303,
                     }[workflow_path],
-                    # The queue build deliberately skips the legs that only the
-                    # landing push runs for real.
-                    "conclusion": "skipped",
                 }
             )
-            check_runs.append(queue_copy)
+            check_runs.append(push_copy)
 
     merge_queue_fixture = execute_release_check_gate(
         release_gate,
         {},
-        mutate_fixture=add_merge_queue_producer,
+        mutate_fixture=add_landing_push_producer,
     )
     if merge_queue_fixture.returncode != 0:
         raise AssertionError(
             "a merge-queue landing's duplicate contexts blocked the release: "
             f"{merge_queue_fixture.stdout}{merge_queue_fixture.stderr}"
         )
+    if "corroborated by the other admitted build" not in (
+        merge_queue_fixture.stdout + merge_queue_fixture.stderr
+    ):
+        raise AssertionError(
+            "the landing push's verdict on an already-proven tree was neither "
+            "judged nor reported: "
+            f"{merge_queue_fixture.stdout}{merge_queue_fixture.stderr}"
+        )
 
-    def only_merge_queue_producer(
+    def red_landing_push_corroboration(
         check_runs: list[dict[str, object]],
         workflow_runs: list[dict[str, object]],
         current_run: dict[str, object],
     ) -> None:
-        """Before the landing push runs, only queue evidence exists."""
+        """The other build of this exact tree failed the same required context."""
 
-        add_merge_queue_producer(check_runs, workflow_runs, current_run)
-        release_suites = {
-            run["check_suite_id"]
-            for run in workflow_runs
-            if run.get("head_branch") == "main"
-            and run.get("path")
-            in (
-                ".github/workflows/ci.yml",
-                ".github/workflows/sast.yml",
-                ".github/workflows/secret-scan.yml",
-            )
-        }
+        add_landing_push_producer(check_runs, workflow_runs, current_run)
+        for run in check_runs:
+            if run["name"] == "cargo-deny" and run["check_suite_id"] == 302:
+                run["conclusion"] = "failure"
+
+    assert_release_gate_fixture_rejected(
+        release_gate,
+        "the landing push failed a context the queue passed",
+        "corroborating required check not green: cargo-deny (conclusion=failure",
+        red_landing_push_corroboration,
+    )
+
+    def unfinished_landing_push_corroboration(
+        check_runs: list[dict[str, object]],
+        workflow_runs: list[dict[str, object]],
+        current_run: dict[str, object],
+    ) -> None:
+        """The usual case: the landing push is still running when the mint fires."""
+
+        add_landing_push_producer(check_runs, workflow_runs, current_run)
+        workflow_fixture(workflow_runs, 301).update(
+            {"status": "in_progress", "conclusion": None}
+        )
+        for run in check_runs:
+            if run["check_suite_id"] == 301:
+                run.update({"status": "in_progress", "conclusion": None})
+
+    assert_release_gate_admits(
+        release_gate,
+        "the landing push is still running when the queue's proof is complete",
+        (
+            "not waiting for the other admitted build of a required context: "
+            "Check & Test (ubuntu-latest) (status=in_progress",
+        ),
+        unfinished_landing_push_corroboration,
+    )
+
+    def skipped_queue_leg(
+        check_runs: list[dict[str, object]],
+        _workflow_runs: list[dict[str, object]],
+        _current_run: dict[str, object],
+    ) -> None:
+        """The queue build skipped a leg the mint now keys off.
+
+        This is the pre-rekey shape of the merge_group build, and it is the
+        defect the rekey would reintroduce if the Windows leg were admitted as
+        proof while the queue kept skipping it.
+        """
+
+        required_check_fixture(
+            check_runs,
+            "Windows installer + vector release build",
+        )["conclusion"] = "skipped"
+
+    assert_release_gate_fixture_rejected(
+        release_gate,
+        "the queue's skipped Windows leg is admitted as release evidence",
+        (
+            "required check not green: Windows installer + vector release build "
+            "(conclusion=skipped)"
+        ),
+        skipped_queue_leg,
+    )
+
+    def absent_queue_leg(
+        check_runs: list[dict[str, object]],
+        _workflow_runs: list[dict[str, object]],
+        _current_run: dict[str, object],
+    ) -> None:
+        """The queue build published no such context at all."""
+
         check_runs[:] = [
-            run for run in check_runs if run["check_suite_id"] not in release_suites
+            run
+            for run in check_runs
+            if run["name"] != "Windows installer + vector release build"
+        ]
+
+    absent_leg_fixture = execute_release_check_gate(
+        release_gate,
+        {},
+        mutate_fixture=absent_queue_leg,
+    )
+    if absent_leg_fixture.returncode != 2:
+        raise AssertionError(
+            "a required context the admitted build never published no longer "
+            "holds the mint for retry: "
+            f"rc={absent_leg_fixture.returncode} "
+            f"{absent_leg_fixture.stdout}{absent_leg_fixture.stderr}"
+        )
+    if "missing required check: Windows installer + vector release build" not in (
+        absent_leg_fixture.stdout + absent_leg_fixture.stderr
+    ):
+        raise AssertionError(
+            "absent queue evidence was held without naming the missing "
+            f"producer: {absent_leg_fixture.stdout}{absent_leg_fixture.stderr}"
+        )
+
+    def queue_ref_names_another_base(
+        _check_runs: list[dict[str, object]],
+        workflow_runs: list[dict[str, object]],
+        _current_run: dict[str, object],
+    ) -> None:
+        """The queue built a tree whose parent is not this release's parent."""
+
+        workflow_fixture(workflow_runs, 101)["head_branch"] = (
+            "gh-readonly-queue/main/pr-958-" + "9" * 40
+        )
+
+    assert_release_gate_fixture_rejected(
+        release_gate,
+        "the queue build credited to this release was built on another base",
+        "merge-group evidence proved a different tree",
+        queue_ref_names_another_base,
+    )
+
+    # The other half of that equality, mutated on the git side. The parent is
+    # read from the protected history this job checked out rather than from the
+    # endpoint being judged, so this proves the assertion consults it at all
+    # instead of comparing the API's answer with itself.
+    wrong_parent_fixture = execute_release_check_gate(
+        release_gate,
+        {},
+        parent_sha="9" * 40,
+    )
+    if wrong_parent_fixture.returncode == 0:
+        raise AssertionError(
+            "a queue build was credited to a release whose first parent is not "
+            "the base that build was made on"
+        )
+    if "merge-group evidence proved a different tree" not in (
+        wrong_parent_fixture.stdout + wrong_parent_fixture.stderr
+    ):
+        raise AssertionError(
+            "the sha-identity refusal fired for the wrong reason: "
+            f"{wrong_parent_fixture.stdout}{wrong_parent_fixture.stderr}"
+        )
+
+    def queue_build_proved_another_sha(
+        _check_runs: list[dict[str, object]],
+        workflow_runs: list[dict[str, object]],
+        _current_run: dict[str, object],
+    ) -> None:
+        workflow_fixture(workflow_runs, 101)["head_sha"] = "7" * 40
+
+    assert_release_gate_fixture_rejected(
+        release_gate,
+        "the queue build credited to this release proved another sha",
+        "merge-group evidence sha mismatch",
+        queue_build_proved_another_sha,
+    )
+
+    def queue_ref_is_an_ordinary_branch(
+        _check_runs: list[dict[str, object]],
+        workflow_runs: list[dict[str, object]],
+        _current_run: dict[str, object],
+    ) -> None:
+        """A branch that merely looks like queue evidence cannot nominate itself."""
+
+        workflow_fixture(workflow_runs, 101)["head_branch"] = "attacker/queue-lookalike"
+
+    assert_release_gate_fixture_rejected(
+        release_gate,
+        "an ordinary branch claims to be the queue build",
+        "merge-group evidence is not on a merge-queue ref",
+        queue_ref_is_an_ordinary_branch,
+    )
+
+    def two_uncancelled_queue_builds(
+        _check_runs: list[dict[str, object]],
+        workflow_runs: list[dict[str, object]],
+        _current_run: dict[str, object],
+    ) -> None:
+        rebuild = workflow_fixture(workflow_runs, 101).copy()
+        rebuild.update({"id": 1_101, "check_suite_id": 401})
+        workflow_runs.append(rebuild)
+
+    assert_release_gate_fixture_rejected(
+        release_gate,
+        "two uncancelled queue builds of one sha are collapsed by recency",
+        "ambiguous merge-group evidence",
+        two_uncancelled_queue_builds,
+    )
+
+    def superseded_queue_build(
+        check_runs: list[dict[str, object]],
+        workflow_runs: list[dict[str, object]],
+        _current_run: dict[str, object],
+    ) -> None:
+        """A speculative group the queue cancelled and rebatched gated nothing."""
+
+        cancelled = workflow_fixture(workflow_runs, 101).copy()
+        cancelled.update(
+            {"id": 1_102, "check_suite_id": 402, "conclusion": "cancelled"}
+        )
+        workflow_runs.append(cancelled)
+        check_runs.append(
+            {
+                "name": "Check & Test (ubuntu-latest)",
+                "status": "completed",
+                "conclusion": "cancelled",
+                "id": 40_201,
+                "app_id": GITHUB_ACTIONS_APP_ID,
+                "app_slug": "github-actions",
+                "check_suite_id": 402,
+                "head_sha": RELEASE_GATE_FIXTURE_SHA,
+            }
+        )
+
+    superseded_fixture = execute_release_check_gate(
+        release_gate,
+        {},
+        mutate_fixture=superseded_queue_build,
+    )
+    if superseded_fixture.returncode != 0:
+        raise AssertionError(
+            "a cancelled superseded queue group was read as a competing "
+            f"authority: {superseded_fixture.stdout}{superseded_fixture.stderr}"
+        )
+
+    def no_queue_build_at_all(
+        check_runs: list[dict[str, object]],
+        workflow_runs: list[dict[str, object]],
+        current_run: dict[str, object],
+    ) -> None:
+        """A commit that reached main without a queue build is still releasable.
+
+        The landing push is the fallback authority, which is exactly the
+        evidence the mint used before it was rekeyed. Removing that path would
+        make one queue outage an unreleasable repository.
+        """
+
+        add_landing_push_producer(check_runs, workflow_runs, current_run)
+        queue_suites = {101, 102, 103, 107}
+        check_runs[:] = [
+            run for run in check_runs if run["check_suite_id"] not in queue_suites
         ]
         workflow_runs[:] = [
             run
             for run in workflow_runs
-            if run.get("check_suite_id") not in release_suites
+            if run.get("check_suite_id") not in queue_suites
         ]
 
-    queue_only_fixture = execute_release_check_gate(
+    assert_release_gate_admits(
         release_gate,
-        {},
-        mutate_fixture=only_merge_queue_producer,
+        "a landing with no queue build at all",
+        (
+            "admitting on landing-push evidence: no merge-group build exists at",
+        ),
+        no_queue_build_at_all,
     )
-    if queue_only_fixture.returncode == 0:
-        raise AssertionError(
-            "the merge queue's skipped build was admitted as release evidence"
-        )
-    for name in REQUIRED_RELEASE_CHECKS:
-        expected = f"missing required check: {name}"
-        if expected not in queue_only_fixture.stdout + queue_only_fixture.stderr:
-            raise AssertionError(
-                "queue-only evidence was refused without naming the missing "
-                f"producer: {name}: {queue_only_fixture.stdout}"
-                f"{queue_only_fixture.stderr}"
-            )
+
+    def ruleset_context_nothing_publishes(
+        check_runs: list[dict[str, object]],
+        _workflow_runs: list[dict[str, object]],
+        _current_run: dict[str, object],
+    ) -> None:
+        """Ruleset 19746451 still gates a context no producer publishes.
+
+        Nothing in this repository can read that ruleset, and the queue's own
+        symptom is a wait with every visible check green, so the mint reading
+        its reviewed mirror against the sha is the only place this becomes a
+        stated failure.
+        """
+
+        check_runs[:] = [
+            run for run in check_runs if run["name"] != "PR text hygiene"
+        ]
+
+    assert_release_gate_fixture_rejected(
+        release_gate,
+        "a ruleset-gated context that no admitted build published",
+        "ruleset-required context has no admitted build at this sha: PR text hygiene",
+        ruleset_context_nothing_publishes,
+    )
+
+    def ruleset_context_is_red(
+        check_runs: list[dict[str, object]],
+        _workflow_runs: list[dict[str, object]],
+        _current_run: dict[str, object],
+    ) -> None:
+        required_check_fixture(check_runs, "PR text hygiene")["conclusion"] = "failure"
+
+    assert_release_gate_fixture_rejected(
+        release_gate,
+        "a ruleset-gated context that the admitted build failed",
+        "ruleset-required context not green: PR text hygiene (conclusion=failure)",
+        ruleset_context_is_red,
+    )
 
     def non_required_check(
         name: str,
@@ -12037,32 +12447,33 @@ def main() -> None:
             "head_sha": RELEASE_GATE_FIXTURE_SHA,
         }
 
-    def add_red_queue_job_after_landing(
+    def add_red_advisory_in_the_queue_build(
         check_runs: list[dict[str, object]],
-        workflow_runs: list[dict[str, object]],
-        current_run: dict[str, object],
+        _workflow_runs: list[dict[str, object]],
+        _current_run: dict[str, object],
     ) -> None:
-        """The queue's own build reds on the landing sha, after the merge.
+        """An advisory job reds inside the build the mint now keys off.
 
-        A solo queue entry's speculative sha IS the landing sha, so a
-        merge_group job no ruleset required keeps running past the merge and
-        concludes on the exact commit being released.
+        Before the rekey this was discounted, because a merge_group job the
+        queue never waited for concluded after the merge having gated nothing.
+        The queue's build is now this release's evidence, so a red in it is
+        the same class of fact as a red in the landing push: admitted over,
+        and announced. The disclosure got wider here rather than darker, which
+        is the property the rekey had to preserve.
         """
 
-        add_merge_queue_producer(check_runs, workflow_runs, current_run)
         check_runs.append(
-            non_required_check("Windows authority tests", 201, 30_001)
+            non_required_check("Windows authority tests", 101, 30_001)
         )
 
     assert_release_gate_admits(
         release_gate,
-        "a merge_group job the queue never waited for concluded red",
+        "an advisory job reds inside the admitted queue build",
         (
-            "discounting a red check that is not this release's evidence: "
-            "Windows authority tests",
-            "the landing push build on the release branch is the evidence",
+            "admitting over a red check no required context covers: "
+            "Windows authority tests (conclusion=failure",
         ),
-        add_red_queue_job_after_landing,
+        add_red_advisory_in_the_queue_build,
     )
 
     def add_red_queue_only_job(
@@ -12070,7 +12481,7 @@ def main() -> None:
         workflow_runs: list[dict[str, object]],
         _current_run: dict[str, object],
     ) -> None:
-        """A red job from a workflow that never builds the release branch."""
+        """A red job from another queue entry's build of this same sha."""
 
         workflow_runs.append(
             {
@@ -12089,11 +12500,11 @@ def main() -> None:
 
     assert_release_gate_admits(
         release_gate,
-        "a red job that only ever runs inside the queue",
+        "a red job from a build neither tier admits",
         (
             "discounting a red check that is not this release's evidence: "
             "Queue-only smoke",
-            "it has no build on the release branch at this sha",
+            "it has no admitted build at this sha",
         ),
         add_red_queue_only_job,
     )
@@ -12297,17 +12708,19 @@ def main() -> None:
         workflow_runs: list[dict[str, object]],
         _current_run: dict[str, object],
     ) -> None:
-        check = required_check_fixture(
-            check_runs,
-            "Check & Test (macos-latest)",
-        )
+        # Deliberately not a ci.yml context. ci.yml's run is the queue anchor,
+        # and moving its head sha is refused earlier and more specifically by
+        # the sha-identity assertion, which `queue_build_proved_another_sha`
+        # covers. This case is the per-context provenance path, which every
+        # non-anchor producer still has to be judged against.
+        check = required_check_fixture(check_runs, "cargo-deny")
         workflow = workflow_fixture(workflow_runs, check["check_suite_id"])
         workflow["head_sha"] = "3" * 40
 
     assert_release_gate_fixture_rejected(
         release_gate,
         "required workflow run is attached to the wrong head sha",
-        "required check workflow provenance mismatch: Check & Test (macos-latest)",
+        "required check workflow provenance mismatch: cargo-deny",
         change_required_workflow_head,
     )
 
@@ -12353,6 +12766,39 @@ def main() -> None:
         RELEASE_RECOVERY.read_text(encoding="utf-8")
     )
     assert_mint_trigger_survives_advisory_flakes(release_tag)
+    assert_release_pr_ci_scope_cannot_widen(ci_workflow)
+    # This guard has to be able to fail before it is worth carrying, and it
+    # currently constrains nothing in the tree, so falsify it against the two
+    # shapes a loose carve-out actually takes.
+    release_pr_job_start = ci_workflow.index("  npm-launchers:")
+    release_pr_job_end = ci_workflow.index("\n  windows-authority-tests:")
+    release_pr_job = ci_workflow[release_pr_job_start:release_pr_job_end]
+    for label, condition, expected in (
+        (
+            "a release-PR carve-out written against github.ref",
+            "    if: >-\n      ${{ github.ref != 'refs/heads/automation/release-next' }}\n",
+            "other than github.head_ref",
+        ),
+        (
+            "a release-PR carve-out that never pins the pull_request event",
+            "    if: >-\n      ${{ github.head_ref != 'automation/release-next' }}\n",
+            "without pinning the pull_request event",
+        ),
+    ):
+        mutated_ci = (
+            ci_workflow[:release_pr_job_start]
+            + release_pr_job.replace(
+                "    name: npm launcher tests\n",
+                "    name: npm launcher tests\n" + condition,
+                1,
+            )
+            + ci_workflow[release_pr_job_end:]
+        )
+        expect_assertion(
+            label,
+            expected,
+            lambda source=mutated_ci: assert_release_pr_ci_scope_cannot_widen(source),
+        )
 
     with tempfile.TemporaryDirectory() as directory:
         fixture_directory = Path(directory)
