@@ -40,6 +40,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bind a receiver-method call only to an owner its file names (#950)
 - Record call sites in relation evidence and paint them in kin refs (#951)
 - Bring the README, the agent-distribution manifests, and the MCP tool copy back to canon (#947)
+- Make ten first-run and retrieval surfaces report what is actually true (#941)
+- Pin kin-vfs-core 0.4.6 so the release ships the ProjFS write path (#949)
 
 
 ## [0.5.40] - 2026-08-18
