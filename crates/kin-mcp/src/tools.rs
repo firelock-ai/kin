@@ -278,6 +278,11 @@ fn registered_tools() -> ToolsListResult {
                             "enum": ["fused", "cosine"],
                             "description": "Force a retrieval pipeline for this call: 'fused' (full multi-signal locate ranking) or 'cosine' (legacy single-vector). The default is 'fused' on every profile, the same ranking kin locate serves; 'cosine' is the per-call escape hatch for A/B comparison."
                         },
+                        "include_tests": {
+                            "type": "boolean",
+                            "description": "Rank test-role entities alongside source. Off by default: locate demotes test-role entities, and at several stages excludes them, unless the query text itself reads as being about tests. That default is right for `where does this feature live` and wrong when you already know you are asking for a test, and a keyword heuristic over your query was the only thing that lifted it. When the default withholds test paths, the response says how many under `semantic_coverage.graph_bodies.withheld_test_paths` and records a `graph_role_filter` degradation, so `complete` is never claimed over a population the filter removed.",
+                            "default": false
+                        },
                         "explain": {
                             "type": "boolean",
                             "description": "Include the fused pipeline's debug object (per-stage scores and the prune ledger). Fused pipeline only.",
@@ -415,6 +420,11 @@ fn registered_tools() -> ToolsListResult {
                         "compact": {
                             "type": "boolean",
                             "description": "Alias for include_body: false. Ignored when include_body is given explicitly.",
+                            "default": false
+                        },
+                        "include_type_edges": {
+                            "type": "boolean",
+                            "description": "Walk THROUGH a type-annotation edge to a type this repository defines (default false). A dataclass field typed with a repo class is a real flow into that class, so the hop is available; it is off by default because a shared type name otherwise joins every entity that annotates with it to every other one. An annotation target the repository does not define stays a leaf either way.",
                             "default": false
                         },
                         "max_response_chars": {

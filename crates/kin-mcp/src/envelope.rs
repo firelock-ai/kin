@@ -487,6 +487,21 @@ impl Completeness {
             CoverageSubstrate::Graph => graph_class_states(envelope),
         };
 
+        // A walk that refused a type-annotation hop withheld something the
+        // caller could have asked for, so it is named here. It is disclosure
+        // only: `limits` does not decide `status`, and it must not, because a
+        // data-flow chain that declines to hop through a type name is more
+        // correct rather than less complete. An `external_reference` terminal
+        // gets no label at all, since no parameter would produce more of a
+        // symbol this repository does not define.
+        if payload
+            .get("terminal_annotation_steps")
+            .and_then(Value::as_u64)
+            .is_some_and(|steps| steps > 0)
+        {
+            limits.push("type_annotation_edges_not_walked".to_string());
+        }
+
         // Runtime facts are disclosed and never decide. The question this object
         // answers is whether the substrate was whole, and `_kin.runtime` plus
         // `_kin.degraded` already answer the separate question of who served it.

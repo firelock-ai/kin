@@ -5497,6 +5497,9 @@ async fn locate(
     let (variants, auto_fanout) =
         with_auto_sharp_variant(build_locate_variants(&req.text, &req.queries));
     let multi_query = variants.len() >= 2;
+    // The caller's role ask, resolved once so every arm below runs the same
+    // scope. Absent on an older client, which is the documented default.
+    let scope = kin_cli::commands::locate::LocateScope::with_tests(req.include_tests);
 
     let mut result = if let Some(reference) = req.reference.as_deref() {
         // Explicit --ref always takes precedence over session scope. Ref
@@ -5523,6 +5526,7 @@ async fn locate(
                 req.max_files,
                 req.max_files_explicit,
                 snippet_opts,
+                scope,
             )
         } else {
             kin_cli::commands::locate::run_with_graph_capture_at_ref(
@@ -5536,6 +5540,7 @@ async fn locate(
                 req.max_files,
                 req.max_files_explicit,
                 snippet_opts,
+                scope,
             )
             .map_err(|error| error.to_string())
         }
@@ -5553,6 +5558,7 @@ async fn locate(
                 req.max_files,
                 req.max_files_explicit,
                 snippet_opts,
+                scope,
             )
             .await
         } else {
@@ -5565,6 +5571,7 @@ async fn locate(
                 req.max_files,
                 req.max_files_explicit,
                 snippet_opts,
+                scope,
             )
             .await
         }
@@ -5622,6 +5629,7 @@ async fn run_fused_locate_for_state(
     max_files: usize,
     max_files_explicit: bool,
     snippet_opts: kin_cli::commands::locate::SnippetOptions,
+    scope: kin_cli::commands::locate::LocateScope,
 ) -> Result<kin_cli::commands::locate::LocateResult, String> {
     // Bound to this daemon's shared per-publication load, and resolved only if
     // the page actually projects a body: a locate that returns no snippets
@@ -5679,6 +5687,7 @@ async fn run_fused_locate_for_state(
         snippet_opts,
         Some(&repository_authority),
         source_scope,
+        scope,
     )
     .map_err(|error| error.to_string())
 }
@@ -5768,6 +5777,7 @@ async fn run_multiquery_fused_locate(
     max_files: usize,
     max_files_explicit: bool,
     snippet_opts: kin_cli::commands::locate::SnippetOptions,
+    scope: kin_cli::commands::locate::LocateScope,
 ) -> Result<kin_cli::commands::locate::LocateResult, String> {
     let mut per_variant = Vec::with_capacity(variants.len());
     for (index, variant) in variants.iter().enumerate() {
@@ -5781,6 +5791,7 @@ async fn run_multiquery_fused_locate(
                 max_files,
                 max_files_explicit,
                 snippet_opts,
+                scope,
             )
             .await?,
         );
@@ -5834,6 +5845,7 @@ fn run_multiquery_locate_at_ref(
     max_files: usize,
     max_files_explicit: bool,
     snippet_opts: kin_cli::commands::locate::SnippetOptions,
+    scope: kin_cli::commands::locate::LocateScope,
 ) -> Result<kin_cli::commands::locate::LocateResult, String> {
     let mut per_variant = Vec::with_capacity(variants.len());
     for (index, variant) in variants.iter().enumerate() {
@@ -5849,6 +5861,7 @@ fn run_multiquery_locate_at_ref(
                 max_files,
                 max_files_explicit,
                 snippet_opts,
+                scope,
             )
             .map_err(|error| error.to_string())?,
         );
@@ -7988,6 +8001,15 @@ async fn build_fused_semantic_locate_result(
         .and_then(serde_json::Value::as_str)
         .map(|value| value.eq_ignore_ascii_case("file"))
         .unwrap_or(false);
+    // Rank test-role entities alongside source when the caller says so. Absent
+    // means the documented default, which is the ranking this tool has always
+    // served; the response says how many test paths that default withheld.
+    let scope = kin_cli::commands::locate::LocateScope::with_tests(
+        arguments
+            .get("include_tests")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    );
     let include_snippet = arguments
         .get("include_snippet")
         .and_then(serde_json::Value::as_bool)
@@ -8109,6 +8131,7 @@ async fn build_fused_semantic_locate_result(
             limit,
             true,
             snippet_opts,
+            scope,
         )
         .await
     } else {
@@ -8121,6 +8144,7 @@ async fn build_fused_semantic_locate_result(
             limit,
             true,
             snippet_opts,
+            scope,
         )
         .await
     };
@@ -8505,6 +8529,10 @@ async fn mcp_tools_call_inner(
                 kin_cli::commands::trace_data_flow::focal_not_found_error(&focal).to_string(),
             )));
         }
+        let include_type_edges = request
+            .arguments
+            .get("include_type_edges")
+            .and_then(serde_json::Value::as_bool);
         let req = kin_cli::commands::trace_data_flow::TraceDataFlowRequest {
             focal,
             depth,
@@ -8512,6 +8540,7 @@ async fn mcp_tools_call_inner(
             limit_per_step,
             include_body,
             max_response_chars,
+            include_type_edges,
         };
         let repository_authority = match require_mcp_command_repository_authority(&state) {
             Ok(authority) => authority,
@@ -29235,6 +29264,7 @@ mod tests {
                             entity_surface: false,
                             cursor: None,
                             page_size: None,
+                            include_tests: false,
                         })
                         .unwrap(),
                     ))
@@ -30215,6 +30245,7 @@ mod tests {
                                 entity_surface,
                                 cursor,
                                 page_size: Some(1),
+                                include_tests: false,
                             })
                             .unwrap(),
                         ))
@@ -30391,6 +30422,7 @@ mod tests {
                             entity_surface: true,
                             cursor: None,
                             page_size: None,
+                            include_tests: false,
                         })
                         .unwrap(),
                     ))

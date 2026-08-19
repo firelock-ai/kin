@@ -160,6 +160,7 @@ pub async fn run(task_file: PathBuf, json: bool, debug: bool) -> Result<()> {
         // benchmark number.
         false,
         crate::commands::locate::LocatePaging::default(),
+        crate::commands::locate::LocateScope::SOURCE_ONLY,
     )
     .await?;
 
