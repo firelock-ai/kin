@@ -1298,6 +1298,18 @@ pub struct DaemonState {
     pub lsp_sweeps_completed: AtomicU64,
     /// Set while a sweep is in flight.
     pub lsp_sweep_running: AtomicBool,
+    /// Files a sweep has finished enriching, so a later pass can skip them.
+    ///
+    /// An explicit marker rather than an inference from the graph. Two attempts
+    /// to infer it from relation origin failed, both silently and both on the
+    /// files that matter: asking whether a file's entities carry an Lsp-origin
+    /// relation counts edges pointing INTO them, and narrowing to edges they are
+    /// the SOURCE of still skipped `sessions.py`, `auth.py` and `adapters.py`,
+    /// because enrichment writes source-side edges from more than one direction.
+    /// A marker the sweep writes when it finishes a file cannot be confused by
+    /// any of that: it records what the sweep DID, which is the only thing a
+    /// skip is entitled to act on.
+    pub lsp_enriched_files: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Repo ID resolved once at construction. Cached to avoid re-reading
     /// `.kin/manifest.json` on every snapshot save — under high host
     /// concurrency those reads contend and surface as opaque "Core error"
@@ -2375,6 +2387,7 @@ impl DaemonState {
             lsp_sweep_files_total: AtomicU64::new(0),
             lsp_sweeps_completed: AtomicU64::new(0),
             lsp_sweep_running: AtomicBool::new(false),
+            lsp_enriched_files: std::sync::Mutex::new(std::collections::HashSet::new()),
             cached_repo_id,
             cached_workspace_id: Some(workspace_id),
             is_shutdown: AtomicBool::new(false),
@@ -2602,6 +2615,7 @@ impl DaemonState {
             lsp_sweep_files_total: AtomicU64::new(0),
             lsp_sweeps_completed: AtomicU64::new(0),
             lsp_sweep_running: AtomicBool::new(false),
+            lsp_enriched_files: std::sync::Mutex::new(std::collections::HashSet::new()),
             cached_repo_id: repo_id.to_string(),
             cached_workspace_id: None,
             is_shutdown: AtomicBool::new(false),
