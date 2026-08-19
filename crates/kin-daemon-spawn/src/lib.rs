@@ -6524,5 +6524,4 @@ mod tests {
             "a measured store raises the wait to a multiple of its own open"
         );
     }
-
 }
