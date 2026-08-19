@@ -1411,6 +1411,19 @@ pub async fn run_with_authority_on(
         return Err(error.into());
     }
 
+    // Publish which language servers this host has, so every answer this daemon
+    // serves reports the same fact the enrichment path acts on. Without it the
+    // absence-trust gate cannot tell a language whose program a server resolved
+    // from one nothing resolved, and it certified an absence over the latter.
+    //
+    // A cheap PATH lookup rather than `discover_servers`, which runs `--version`
+    // on every server it finds, and published unconditionally: a daemon with
+    // enrichment switched off produces no reference edge either, so its answers
+    // must not claim otherwise.
+    kin_mcp::edge_coverage::publish_installed_language_servers(
+        kin_core::reference_coverage::installed_language_servers(),
+    );
+
     // Set up LSP enrichment channel before wrapping state in Arc.
     let enrichment_enabled =
         should_enable_lsp_enrichment(config.lsp_enabled, state.filesystem_reconcile_disabled());

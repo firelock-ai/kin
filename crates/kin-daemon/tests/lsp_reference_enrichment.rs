@@ -55,6 +55,19 @@ fn server_command_or_skip(language: LanguageId, test: &str) -> Option<(String, V
             Some((command, args))
         }
         Err(_) => {
+            // In CI the skip is not allowed to be quiet. `scripts/ci-install-language-servers.sh`
+            // sets this variable only after proving both binaries are executable, so if it is
+            // set and the binary is still missing, the proof is being skipped in the one
+            // environment built to run it. A skip that nextest swallows (it captures a passing
+            // test's stderr) would read as a 0.02s pass, which is what a real run never looks
+            // like and what nobody would notice.
+            if std::env::var_os("KIN_CI_LANGUAGE_SERVERS_INSTALLED").is_some() {
+                panic!(
+                    "{test}: KIN_CI_LANGUAGE_SERVERS_INSTALLED is set, so this runner was \
+                     provisioned, yet `{command}` is not on PATH. The enrichment proof would \
+                     have skipped silently."
+                );
+            }
             eprintln!(
                 "SKIP {test}: no `{command}` on PATH, so the {language} enrichment path cannot be \
                  exercised on this host. Install it with `{}` and re-run.",

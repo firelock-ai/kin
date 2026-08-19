@@ -55,7 +55,9 @@ use std::collections::HashSet;
 
 use serde_json::{json, Map, Value};
 
-use kin_core::reference_coverage::{reference_enrichment_for, ReferenceEnrichment};
+use kin_core::reference_coverage::{
+    reference_enrichment_for, ReferenceEnrichment, ENRICHABLE_LANGUAGES,
+};
 use kin_model::entity::Entity;
 use kin_model::graph::{EntityFilter, EntityStore};
 use kin_model::ids::{EntityId, FilePathId, LanguageId};
@@ -504,10 +506,26 @@ fn attach_reference_resolution<S: EntityStore>(
 /// in a batch makes the batch's reference evidence unproducible, and one missing
 /// server makes it unproduced.
 fn reference_enrichment(languages: &[LanguageId]) -> Value {
-    json!(weakest_reference_enrichment(
-        languages,
-        &installed_language_servers()
-    ))
+    let Some(servers) = published_language_servers() else {
+        // Nobody published the host state, so nothing is established about any
+        // language's server. Still report the build limit, which is knowable
+        // from this process alone and is what makes an unwired language's
+        // absence uncertifiable.
+        return json!(build_only_reference_enrichment(languages));
+    };
+    json!(weakest_reference_enrichment(languages, &servers))
+}
+
+/// What is knowable without the host: whether this build wires an adapter.
+fn build_only_reference_enrichment(languages: &[LanguageId]) -> ReferenceEnrichment {
+    if languages
+        .iter()
+        .any(|language| !ENRICHABLE_LANGUAGES.contains(language))
+    {
+        ReferenceEnrichment::Unsupported
+    } else {
+        ReferenceEnrichment::Unknown
+    }
 }
 
 /// [`reference_enrichment`] with the host state given rather than probed.
@@ -534,22 +552,46 @@ fn weakest_reference_enrichment(
         .unwrap_or(ReferenceEnrichment::Unknown)
 }
 
-/// Which languages have an enrichment server on this host, read once.
+/// Which languages have an enrichment server on this host, as PUBLISHED by the
+/// process that knows, or `None` when nobody published it.
 ///
-/// Cached because an observation is built per answer and a `PATH` lookup per
-/// answer is a cost no surface needs to pay repeatedly. A server installed while
-/// the process runs is therefore not seen until restart, which is the same thing
-/// the daemon's own startup discovery does and what `kin doctor` already tells
-/// an operator to expect.
-fn installed_language_servers() -> HashSet<LanguageId> {
+/// Deliberately not a `PATH` probe taken here. Reading the host from inside a
+/// query function makes every answer, and every test of one, depend on the
+/// machine it runs on: the same assertion passes on a laptop carrying pyright
+/// and fails on a runner without it, and a local gate goes green for a reason
+/// that has nothing to do with the change under test. That is not hypothetical.
+/// It is how `daemon_mcp_bulk_reachability_uses_exact_federated_authority`
+/// passed here and failed in CI on the first attempt at this.
+///
+/// The daemon publishes it once at startup, which is the same moment it decides
+/// whether to open its enrichment channel at all, so the value a query reads is
+/// the same fact the enrichment path acted on. Unpublished reads as unknown, and
+/// unknown establishes nothing, which is the conservative reading this module
+/// takes everywhere else.
+fn published_language_servers() -> Option<HashSet<LanguageId>> {
     #[cfg(test)]
     if let Some(servers) = test_support::server_override() {
-        return servers;
+        return Some(servers);
     }
-    static INSTALLED: std::sync::OnceLock<HashSet<LanguageId>> = std::sync::OnceLock::new();
-    INSTALLED
-        .get_or_init(kin_core::reference_coverage::installed_language_servers)
-        .clone()
+    PUBLISHED_SERVERS
+        .read()
+        .ok()
+        .and_then(|servers| servers.clone())
+}
+
+static PUBLISHED_SERVERS: std::sync::RwLock<Option<HashSet<LanguageId>>> =
+    std::sync::RwLock::new(None);
+
+/// Publish which languages have an enrichment server on this host.
+///
+/// Called by the daemon at startup, beside the discovery that decides whether
+/// enrichment runs. Until it is called, every observation reports its languages'
+/// enrichment as unknown and the absence-trust gate stays silent about it, which
+/// is the behaviour a process that never looked should have.
+pub fn publish_installed_language_servers(servers: HashSet<LanguageId>) {
+    if let Ok(mut slot) = PUBLISHED_SERVERS.write() {
+        *slot = Some(servers);
+    }
 }
 
 /// Lets a test state which language servers its host has.

@@ -63,6 +63,11 @@ for attempt in 1 2 3; do
       exit 0
     fi
     echo "$BIN" >>"${GITHUB_PATH:-/dev/null}"
+    # Only set after both binaries are proven executable above. The proof reads
+    # it and turns a skip into a hard failure, so the tests cannot quietly stop
+    # running on a runner that was provisioned for them: nextest captures a
+    # passing test's stderr, so a skip reads as a fast pass and nobody notices.
+    echo "KIN_CI_LANGUAGE_SERVERS_INSTALLED=1" >>"${GITHUB_ENV:-/dev/null}"
     echo "language servers installed at $BIN"
     "$BIN/typescript-language-server" --version
     exit 0
