@@ -173,7 +173,9 @@ impl Verdict {
                     .to_string(),
             );
         }
-        if withheld_candidate_count(payload) > 0 && !discloses_withheld_candidates(payload) {
+        if withheld_candidate_count(payload).is_some_and(|withheld| withheld > 0)
+            && !discloses_withheld_candidates(payload)
+        {
             gaps.push(
                 "withheld_candidates: same-name candidates were held out of the counts here, \
                  so the headline is a floor and the withheld rows may belong in it"
@@ -353,8 +355,14 @@ fn edge_coverage_reading(tool: &str, payload: &Value) -> Reading {
 /// keeps.
 fn withheld_candidates_reading(payload: &Value) -> Reading {
     match withheld_candidate_count(payload) {
-        0 => Reading::Certified,
-        withheld => Reading::Inconclusive(format!(
+        // A payload carrying no candidate accounting at all has nothing to say
+        // here, which is not the same as saying nothing was withheld. Answering
+        // `certified` for a concept the payload does not carry is how a mutation
+        // response, whose every other input is silent, came to ship a certified
+        // verdict about nothing.
+        None => Reading::Silent,
+        Some(0) => Reading::Certified,
+        Some(withheld) => Reading::Inconclusive(format!(
             "withheld_candidates: {withheld} same-name candidate(s) are carried in `candidates` \
              and are not in the counts here, so the headline is a floor and each withheld row \
              may belong in it"
@@ -364,6 +372,9 @@ fn withheld_candidates_reading(payload: &Value) -> Reading {
 
 /// This query's own reported degradations.
 fn degradations_reading(payload: &Value) -> Reading {
+    if payload.get("degradations").is_none() {
+        return Reading::Silent;
+    }
     let labels = crate::negative::payload_degradation_labels(payload);
     if labels.is_empty() {
         Reading::Certified
@@ -401,7 +412,7 @@ fn completeness_reading(envelope: &Envelope) -> Reading {
 
 /// How many same-name candidates the payload held out of its counts, read from
 /// the one number the withheld plumbing already publishes.
-fn withheld_candidate_count(payload: &Value) -> u64 {
+fn withheld_candidate_count(payload: &Value) -> Option<u64> {
     payload
         .get("counts")
         .and_then(|counts| counts.get("receiver_name_candidates"))
@@ -412,7 +423,6 @@ fn withheld_candidate_count(payload: &Value) -> u64 {
                 .and_then(Value::as_array)
                 .map(|rows| rows.len() as u64)
         })
-        .unwrap_or(0)
 }
 
 /// Whether the payload already names its withheld candidates as a degradation,
@@ -776,6 +786,49 @@ mod tests {
             disagreements(&response).is_empty(),
             "{:?}",
             disagreements(&response)
+        );
+    }
+
+    /// A response no retrieval input spoke about must carry no verdict at all.
+    ///
+    /// Certification on no evidence is the failure this module would otherwise
+    /// introduce. A mutation payload has no absence gate, no edge coverage and
+    /// no completeness signal, so an input that answers `certified` for a
+    /// concept the payload does not carry would put a certified verdict on every
+    /// commit response. Both remaining inputs stay silent instead.
+    #[test]
+    fn a_non_retrieval_payload_carries_no_verdict() {
+        let payload = json!({"committed": true, "change_id": "abc"});
+        let envelope = Envelope::daemon();
+        assert!(
+            Verdict::compute("kin_transaction_commit", &payload, &envelope, None).is_none(),
+            "a payload no input spoke about must not be certified"
+        );
+    }
+
+    /// The other direction: a retrieval payload that genuinely withheld nothing
+    /// and reported no degradation still certifies, so the silence above is not
+    /// a blanket refusal.
+    #[test]
+    fn a_clean_retrieval_payload_still_certifies() {
+        let payload = json!({
+            "references": [{"name": "caller"}],
+            "relation_kinds": ["calls"],
+            "counts": {"receiver_name_candidates": 0},
+            "degradations": [],
+            "edge_coverage": {
+                "language": "Rust",
+                "classes": {"calls": "present"},
+                "reference_enrichment": "supported",
+            },
+        });
+        let verdict = Verdict::compute("find_references", &payload, &Envelope::daemon(), None)
+            .expect("a retrieval payload carries a verdict");
+        assert_eq!(
+            verdict.to_value()["state"],
+            json!(CERTIFIED),
+            "{}",
+            verdict.to_value()
         );
     }
 
