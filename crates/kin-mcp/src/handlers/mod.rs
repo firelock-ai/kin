@@ -6111,6 +6111,66 @@ mod tests {
         assert_eq!(rows[0]["span"]["start_line"], 41);
     }
 
+    /// The measurement FIR-2408 asked for, taken on the real handler output
+    /// rather than a hand-built payload.
+    ///
+    /// `impact_analysis` on one method of a 37-file repository returned 416,567
+    /// characters and could not be called from Claude Code at all. kin#902 added
+    /// an `impact_analysis` entry to the response budget, but it named
+    /// `impacted_entities`, a key this response has never carried, so every rung
+    /// of the ladder walked an absent array and cut nothing. The buckets an
+    /// `ImpactReport` actually serializes are the four in `IMPACT_ENTITY_BUCKETS`.
+    ///
+    /// This drives the handler, then applies the same `ResponseBudget` the MCP
+    /// path applies, and measures the bytes a caller would receive.
+    #[tokio::test]
+    async fn impact_analysis_over_the_budget_fits_a_client_ceiling() {
+        let callee = impact_probe_entity("hot_callee_2408", None);
+        let mut store = EmptyStore::default();
+        store.insert_test_entity(callee.clone());
+        for index in 0..120 {
+            let caller = impact_probe_entity(&format!("caller_2408_{index}"), Some(index));
+            store.insert_test_entity(caller.clone());
+            store.insert_test_calls_relation(&caller, &callee);
+        }
+
+        let args = HashMap::from([
+            (
+                "entity_ids".to_string(),
+                serde_json::json!([callee.id.to_string()]),
+            ),
+            ("include_traffic".to_string(), serde_json::json!(false)),
+        ]);
+        let sessions = SessionRegistry::new();
+        let mut value = tool_result_json(
+            review::handle_impact_analysis(&args, &store, &sessions)
+                .await
+                .unwrap(),
+        );
+
+        let before = crate::budget::measure(&value);
+        let budget = crate::budget::ResponseBudget::default();
+        crate::budget::enforce(&mut value, "impact_analysis", &budget)
+            .expect("impact_analysis is governed by the budget");
+        let after = crate::budget::measure(&value);
+        eprintln!("FIR-2408 impact_analysis: {before} chars before, {after} after");
+        assert!(
+            after <= budget.max_chars,
+            "impact_analysis measured {after} characters against a {} budget (was {before})",
+            budget.max_chars
+        );
+        // Compact mode is the default and is what sheds the bulk: 78.5% of the
+        // reported payload was four 32-element hash arrays and two previews per
+        // row, none of which answers "what breaks if I change this".
+        if let Some(row) = value["affected_callers"].as_array().and_then(|r| r.first()) {
+            assert!(
+                row.get("fingerprint").is_none(),
+                "fingerprint survived: {row}"
+            );
+            assert!(row.get("metadata").is_none(), "metadata survived: {row}");
+        }
+    }
+
     /// FIR-2217. Files mode reported a diff-mode complaint on a resolution
     /// failure.
     ///

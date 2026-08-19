@@ -184,7 +184,7 @@ jobs:
           repository: firelock-ai/kin-vfs
           path: kin-vfs
           # Release inputs must never move under an unchanged Kin tag.
-          ref: 3df11fcbbb541e4b0ee98d6da50ccae1063abe66
+          ref: 2596a4477cfb0b389d9c52026cf9da8f7ff40138
           persist-credentials: false
 
       - name: Verify canonical release input bytes
@@ -512,6 +512,11 @@ jobs:
           if [ -d "target/${TARGET}/release/KinNotifier.app" ]; then
             cp -R "target/${TARGET}/release/KinNotifier.app" "$ARTIFACT/"
           fi
+          # Words, not just executables. Both arms of the isolated stranger run
+          # installed this archive successfully and both scored the packaging
+          # below the binaries, because nothing in it says where the three
+          # executables go or that the shared library belongs somewhere else.
+          node scripts/write-release-archive-docs.mjs "$ARTIFACT" "$TARGET" "$RC_VERSION"
           tar czf "${ARTIFACT}.tar.gz" "$ARTIFACT"
           # Take the listing once into a file. Piping it into `grep -q` lets grep
           # exit on its first match, and under `pipefail` the SIGPIPE that raises
@@ -520,7 +525,7 @@ jobs:
           ARCHIVE_LISTING="$RUNNER_TEMP/${ARTIFACT}.listing.txt"
           tar tzf "${ARTIFACT}.tar.gz" > "$ARCHIVE_LISTING"
           # All supported Unix surfaces are mandatory release contents.
-          for required in kin kin-daemon kin-vfs "$SHIM_NAME"; do
+          for required in kin kin-daemon kin-vfs "$SHIM_NAME" README.md INSTALL.md checksums-sha256.txt; do
             if ! grep -q "/${required}$" "$ARCHIVE_LISTING"; then
               echo "::error::$required missing from ${ARTIFACT}.tar.gz"
               exit 1
@@ -568,12 +573,25 @@ jobs:
           Copy-Item "target/$env:TARGET/release/kin-daemon.exe" "$env:ARTIFACT/" -ErrorAction Stop
           Copy-Item "kin-vfs/target/$env:TARGET/release/kin-vfs.exe" "$env:ARTIFACT/" -ErrorAction SilentlyContinue
           Copy-Item "kin-vfs/target/$env:TARGET/release/$env:SHIM_NAME" "$env:ARTIFACT/" -ErrorAction SilentlyContinue
+          # See the Unix leg: the archive carries its own README, INSTALL and
+          # checksum manifest so a stranger is not guessing at layout.
+          node scripts/write-release-archive-docs.mjs "$env:ARTIFACT" "$env:TARGET" $env:RC_VERSION
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "failed to write the release archive documentation"
+            exit 1
+          }
           Compress-Archive -Path "$env:ARTIFACT/*" -DestinationPath "$env:ARTIFACT.zip"
           # Assert the produced zip actually contains kin-daemon.exe.
           $entries = [System.IO.Compression.ZipFile]::OpenRead("$PWD/$env:ARTIFACT.zip").Entries.Name
           if ($entries -notcontains "kin-daemon.exe") {
             Write-Error "kin-daemon.exe missing from $env:ARTIFACT.zip, refusing to publish a daemon-less archive"
             exit 1
+          }
+          foreach ($doc in @("README.md", "INSTALL.md", "checksums-sha256.txt")) {
+            if ($entries -notcontains $doc) {
+              Write-Error "$doc missing from $env:ARTIFACT.zip"
+              exit 1
+            }
           }
           # The POSIX installer builds one archive name for every platform it
           # detects, "kin-<os>-<arch>.tar.gz", and it detects windows from the
@@ -640,7 +658,7 @@ jobs:
           ARTIFACT: ${{ matrix.artifact }}
           TARGET: ${{ matrix.target }}
           VFS_TARGET: ${{ matrix.vfs_target || matrix.target }}
-          EXPECTED_VFS_COMMIT: 3df11fcbbb541e4b0ee98d6da50ccae1063abe66
+          EXPECTED_VFS_COMMIT: 2596a4477cfb0b389d9c52026cf9da8f7ff40138
         run: |
           set -euo pipefail
           node <<'NODE'

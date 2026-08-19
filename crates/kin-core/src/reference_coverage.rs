@@ -173,6 +173,18 @@ impl ReferenceResolution {
     }
 }
 
+/// How much of a language's call parse side carries a graph-owned count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallSiteMeasurement {
+    /// No file recorded a call-site count. Absent, not zero.
+    None,
+    /// Some files recorded one and some did not, so the sum is drawn from a
+    /// different set of files than the resolved edges are.
+    Partial,
+    /// Every file of this language recorded one, so the pair is a ratio.
+    Complete,
+}
+
 /// Reference-edge completeness for one language present in the graph.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LanguageReferenceCoverage {
@@ -185,6 +197,18 @@ pub struct LanguageReferenceCoverage {
     /// Call sites the parser read across measured files, before resolution.
     /// `None` when no file of this language carries the count.
     pub parsed_call_sites: Option<u64>,
+    /// Files of this language that recorded a CALL-site count specifically.
+    ///
+    /// Distinct from `files_measured`, which is satisfied by an import count
+    /// alone, and the distinction is the whole defect. Python removes the
+    /// call-site count from any file whose call extraction was incomplete and
+    /// keeps it on any file that had no calls at all, so on a real repository
+    /// the only files reporting a call count are the ones with no calls. Summed
+    /// blind that is a measured zero, and `calls 238/0` is what every Python
+    /// user read: 238 call edges against a denominator drawn from the files
+    /// that could not contribute one.
+    #[serde(default)]
+    pub call_sites_measured_files: usize,
     /// Import statements the parser read across measured files.
     pub parsed_import_statements: Option<u64>,
     /// `Calls` edges the graph holds whose caller is of this language.
@@ -237,7 +261,25 @@ impl LanguageReferenceCoverage {
     /// A call site can fan out to several same-named targets, so the raw ratio
     /// can exceed 1; the cap keeps the figure readable as coverage.
     pub fn call_percent(&self) -> Option<u32> {
+        if self.call_site_measurement() != CallSiteMeasurement::Complete {
+            return None;
+        }
         percent(self.parsed_call_sites, self.resolved_call_edges)
+    }
+
+    /// How much of this language's call parse side was actually measured.
+    ///
+    /// A count summed over some files cannot be a denominator for edges counted
+    /// over all of them. Naming the three states keeps the renderer, the
+    /// percentage and any future consumer reading the same rule instead of each
+    /// re-deriving it from two integers.
+    pub fn call_site_measurement(&self) -> CallSiteMeasurement {
+        match self.parsed_call_sites {
+            None => CallSiteMeasurement::None,
+            Some(_) if self.call_sites_measured_files == 0 => CallSiteMeasurement::None,
+            Some(_) if self.call_sites_measured_files < self.files => CallSiteMeasurement::Partial,
+            Some(_) => CallSiteMeasurement::Complete,
+        }
     }
 
     pub fn import_percent(&self) -> Option<u32> {
@@ -457,6 +499,18 @@ fn language_summary(coverage: &LanguageReferenceCoverage) -> String {
             "calls {}/{parsed} ({percent}%)",
             coverage.resolved_call_edges
         ),
+        // Some files recorded a call count and some did not. Printing the sum
+        // against edges counted over every file states a ratio between two
+        // different populations, which is how a working Python graph reported
+        // itself as `calls 238/0`. Say which files the parse side came from.
+        (Some(parsed), None)
+            if coverage.call_site_measurement() == CallSiteMeasurement::Partial =>
+        {
+            format!(
+                "calls {} resolved, parse side measured on {} of {} files ({parsed} sites there)",
+                coverage.resolved_call_edges, coverage.call_sites_measured_files, coverage.files
+            )
+        }
         // `call_percent` declines exactly when there is no denominator, so this
         // arm is the zero-parse-side case. Printing it as a fraction produced
         // `calls 238/0` beside `imports 0/40 (0%)`, which reads as two fields
@@ -677,6 +731,7 @@ where
                 files_measured: tally.measured_files.len(),
                 entities: tally.entities,
                 parsed_call_sites,
+                call_sites_measured_files: tally.call_site_files,
                 parsed_import_statements,
                 resolved_call_edges: tally.resolved_call_edges,
                 resolved_import_edges: tally.resolved_import_edges,
@@ -937,6 +992,104 @@ mod tests {
         );
     }
 
+    /// The Python shape, reproduced from the parser's own behaviour: a file
+    /// whose call extraction was incomplete removes its call count, and a file
+    /// with no calls at all keeps one that reads zero. So the only files
+    /// contributing a denominator are the ones that had nothing to count, and
+    /// summing them blind published a measured zero against every resolved edge
+    /// in the language.
+    #[test]
+    fn a_parse_side_measured_on_only_some_files_is_never_a_denominator() {
+        let graph = InMemoryGraph::new();
+        // Call-bearing file: extraction was incomplete, so no call count.
+        let caller = entity("resolve", "requests/sessions.py", None, Some(4));
+        let callee = entity("send", "requests/adapters.py", None, Some(3));
+        // Callless file: nothing to count, so it records a truthful zero.
+        let constant = entity(
+            "DEFAULT_PORTS",
+            "requests/status_codes.py",
+            Some(0),
+            Some(1),
+        );
+        for e in [&caller, &callee, &constant] {
+            graph.upsert_entity(e).unwrap();
+        }
+        graph.upsert_relation(&calls(caller.id, callee.id)).unwrap();
+
+        let coverage = collect_reference_edge_coverage(&graph).unwrap();
+        let python = coverage
+            .languages
+            .iter()
+            .find(|l| l.language == "python")
+            .expect("python row");
+
+        assert_eq!(python.files, 3);
+        assert_eq!(python.call_sites_measured_files, 1);
+        assert_eq!(python.resolved_call_edges, 1);
+        assert_eq!(python.call_site_measurement(), CallSiteMeasurement::Partial);
+        assert_eq!(
+            python.call_percent(),
+            None,
+            "a sum over 1 of 3 files is not a percentage of the edges counted over all 3"
+        );
+
+        let rendered = coverage.summary_lines().join("\n");
+        assert!(
+            rendered.contains("parse side measured on 1 of 3 files"),
+            "the line must say where its denominator came from: {rendered}"
+        );
+        assert!(
+            !rendered.contains("calls 1/0"),
+            "the shape every Python user read must not reappear: {rendered}"
+        );
+    }
+
+    /// The same rule where the partial sum is not zero, which is the case a
+    /// zero denominator cannot stand in for.
+    ///
+    /// A sum of 5 call sites read from one of three files, against call edges
+    /// counted over all three, would divide cleanly and print a percentage
+    /// comparing two different populations. That number is worse than the
+    /// missing one, because it looks answerable.
+    #[test]
+    fn a_nonzero_partial_sum_still_publishes_no_percentage() {
+        let graph = InMemoryGraph::new();
+        let caller = entity("resolve", "requests/sessions.py", None, Some(4));
+        let callee = entity("send", "requests/adapters.py", None, Some(3));
+        let counted = entity("helper", "requests/utils.py", Some(5), Some(1));
+        for e in [&caller, &callee, &counted] {
+            graph.upsert_entity(e).unwrap();
+        }
+        graph.upsert_relation(&calls(caller.id, callee.id)).unwrap();
+
+        let coverage = collect_reference_edge_coverage(&graph).unwrap();
+        let python = coverage
+            .languages
+            .iter()
+            .find(|l| l.language == "python")
+            .expect("python row");
+
+        assert_eq!(python.parsed_call_sites, Some(5));
+        assert_eq!(python.call_sites_measured_files, 1);
+        assert_eq!(python.files, 3);
+        assert_eq!(python.call_site_measurement(), CallSiteMeasurement::Partial);
+        assert_eq!(
+            python.call_percent(),
+            None,
+            "1 resolved edge over 5 sites read from one of three files is not 20% of anything"
+        );
+
+        let rendered = coverage.summary_lines().join("\n");
+        assert!(
+            rendered.contains("parse side measured on 1 of 3 files (5 sites there)"),
+            "the partial denominator and its scope must both be named: {rendered}"
+        );
+        assert!(
+            !rendered.contains("calls 1/5"),
+            "a ratio between two populations must not be printed: {rendered}"
+        );
+    }
+
     /// The founding shape: every resolved call edge is intra-file, the files
     /// import across modules, and no cross-file edge exists, so absence must
     /// not be concluded.
@@ -1031,6 +1184,7 @@ mod tests {
                 files_measured: 12,
                 entities: 46,
                 parsed_call_sites: Some(78),
+                call_sites_measured_files: 12,
                 parsed_import_statements: Some(16),
                 resolved_call_edges: 16,
                 resolved_import_edges: 0,
@@ -1144,6 +1298,7 @@ mod tests {
             files_measured: 2,
             entities: 4,
             parsed_call_sites: Some(4),
+            call_sites_measured_files: 2,
             parsed_import_statements: Some(2),
             resolved_call_edges: 4,
             resolved_import_edges: 2,
