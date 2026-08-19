@@ -163,10 +163,11 @@ _leg_exec() {
   )
 }
 
-list_tests() {
-  local unit
-  unit="$(resolve_leg_unit "$@")"
-  _leg_exec "$unit" --list | tr -d '\r'
+# The listing a leg's guards read. It is the same text `cargo test -- --list`
+# produced, because that is what cargo shells out to. `tr -d` strips the CRs a
+# native Windows binary writes, so the awk matches below see plain lines.
+_leg_listing() {
+  _leg_exec "$1" --list | tr -d '\r'
 }
 
 assert_nonempty_listing() {
@@ -189,7 +190,7 @@ run_nonempty_target() {
   local unit
   local listing
   unit="$(resolve_leg_unit "$@")"
-  listing="$(_leg_exec "$unit" --list | tr -d '\r')"
+  listing="$(_leg_listing "$unit")"
   assert_nonempty_listing "$label" "$listing"
   _leg_exec "$unit" --test-threads=1
 }
@@ -202,7 +203,7 @@ run_required_filter() {
   local listing
   local matches
   unit="$(resolve_leg_unit "$@")"
-  listing="$(_leg_exec "$unit" --list | tr -d '\r')"
+  listing="$(_leg_listing "$unit")"
   matches="$(printf '%s\n' "$listing" \
     | awk -v needle="$filter" \
       'index($0, needle) > 0 && /: test$/ { count += 1 } END { print count + 0 }')"
@@ -223,7 +224,7 @@ run_required_exact() {
   local listing
   local matches
   unit="$(resolve_leg_unit "$@")"
-  listing="$(_leg_exec "$unit" --list | tr -d '\r')"
+  listing="$(_leg_listing "$unit")"
   matches="$(printf '%s\n' "$listing" \
     | awk -v expected="$test_name: test" \
       '$0 == expected { count += 1 } END { print count + 0 }')"
@@ -243,7 +244,7 @@ run_required_target() {
   local listing
   local matches
   unit="$(resolve_leg_unit "$@")"
-  listing="$(_leg_exec "$unit" --list | tr -d '\r')"
+  listing="$(_leg_listing "$unit")"
   assert_nonempty_listing "$label" "$listing"
   matches="$(printf '%s\n' "$listing" \
     | awk -v expected="$required_test: test" \
@@ -264,7 +265,7 @@ compile_required_target() {
   local listing
   local matches
   unit="$(resolve_leg_unit "$@")"
-  listing="$(_leg_exec "$unit" --list | tr -d '\r')"
+  listing="$(_leg_listing "$unit")"
   assert_nonempty_listing "$label" "$listing"
   matches="$(printf '%s\n' "$listing" \
     | awk -v expected="$required_test: test" \
