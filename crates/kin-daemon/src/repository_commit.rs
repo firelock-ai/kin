@@ -766,17 +766,28 @@ fn plan_native_commit_inner(
         None => None,
     };
 
-    let authority_workspace_graph =
-        lease
-            .workspace_graph_snapshot(&workspace_id)?
-            .ok_or_else(|| {
-                invalid(format!(
-                    "repository authority has no graph snapshot for workspace {workspace_id}"
-                ))
-            })?;
-    let desired_workspace_graph =
-        crate::mcp_commit::timed_commit_phase("plan_snapshot_clone", || graph.to_snapshot());
-    let workspace_semantic_delta =
+    // Both sides of the semantic diff are whole copies of the graph and neither
+    // is read again once the delta exists, so both are scoped to the diff and
+    // freed before the phase that follows.
+    //
+    // `InMemoryGraph::to_snapshot` deep-clones every sub-store, the change DAG
+    // included, so on a converted repository it is a copy of the store rather
+    // than a copy of the workspace. Left at function scope it stayed resident
+    // through `plan_compute_deltas`, which is where a one-file commit on a
+    // 1.0 GB psf/requests store reaches its resident-set peak, and through the
+    // whole authority publication after it. It has nothing to contribute to
+    // either.
+    let workspace_semantic_delta = {
+        let authority_workspace_graph =
+            lease
+                .workspace_graph_snapshot(&workspace_id)?
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "repository authority has no graph snapshot for workspace {workspace_id}"
+                    ))
+                })?;
+        let desired_workspace_graph =
+            crate::mcp_commit::timed_commit_phase("plan_snapshot_clone", || graph.to_snapshot());
         crate::mcp_commit::timed_commit_phase("plan_diff_semantics", || {
             kin_core::diff_workspace_semantics(
                 &authority_workspace_graph.entities,
@@ -784,7 +795,8 @@ fn plan_native_commit_inner(
                 &desired_workspace_graph.entities,
                 &desired_workspace_graph.relations,
             )
-        })?;
+        })?
+    };
     let deltas = crate::mcp_commit::timed_commit_phase("plan_compute_deltas", || {
         compute_deltas_vs_repository_authority(graph, lease.snapshot(), parent.as_ref())
     })?;

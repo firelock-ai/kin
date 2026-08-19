@@ -2935,7 +2935,12 @@ const MIB: u64 = 1024 * 1024;
 /// The two rows are why a curve would be wrong: a store less than half the size
 /// of the other peaked within 12% of it, because a commit prepares the whole
 /// repository successor in memory and the fixed part of that dominates. Both
-/// were measured in the same 5 CPU / 12 GiB container on `kin 0.5.40`.
+/// were measured in the same 5 CPU / 12 GiB container on `kin 0.5.40`, before
+/// the workspace-graph scoping in `plan_native_commit_inner` cut what a commit
+/// holds at its peak. A build that peaks lower than a row makes this check
+/// conservative rather than wrong, which is the safe direction for a warning:
+/// it can advise headroom nobody needs, and it cannot stay quiet about a
+/// ceiling somebody does.
 const MEASURED_COMMIT_PEAKS: &[MeasuredCommitPeak] = &[
     MeasuredCommitPeak {
         repository: "expressjs/express",
