@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.41] - 2026-08-19
+
+### Changed
+
+- Stop semantic_locate spending its response on copies of its own answer (#920)
+- Register a repository with kin init so cross-repo commands can see it (#919)
+- Carry a completeness signal on every retrieval answer, not just empty ones (#921)
+- Report an unbuilt vector index, and hand the reranker the cache it probed (#922)
+- Paint the refs rows the product composes, and pin the fixture Git scope an admission proof reads (#925)
+- Move the kin registry pins to kin-db 0.7.35, kin-model 0.7.9, and kin-vector 0.1.12 (#926)
+- Resolve a Rust method call by its receiver and refuse a bare prelude call (#923)
+- Prove each configured MCP client with a real tool call before setup claims it works (#928)
+- Choose, probe and report the filesystem projection across shim, NFS and FUSE (#930)
+- Make every dead-code surface answer one question and say what it did not check (#924)
+- Give the MCP belt a call that admits new source into the graph (#931)
+- Add Windows ProjFS as a fourth projection, and ship the mount features (#932)
+- Say whether an MCP answer's graph is recorded or live-only (#933)
+- Give a CommonJS export assigned from a call result an entity (#934)
+- Route every absence through one gate, so a name filter cannot certify what a reference query refused (#935)
+- Size the daemon idle window against a store's measured boot, and let locate return test-role entities on request (#936)
+- End a trace walk at an external reference target and at a type-annotation edge (#937)
+- Resolve JavaScript module specifiers and count the edges they produce (#938)
+- chore(ci): pin kin-actions v0.1.31 (#944)
+- Pin kin-vfs-core 0.4.5 and the kin-vfs release checkout to the composed mount landing (#942)
+- Hold the Git capture lease before the name a reap tests exists (#943)
+- Give the MCP belt calls that retire and relocate source, and pin what a retirement takes with it (#939)
+- Report only what the capability tier actually gates (#945)
+- Report a commit whose daemon died in memory terms, and free the graph copies it held at its peak (#946)
+- Place watcher events by repository containment, not by path spelling (#948)
+- Build release-candidate archives without a tag (#940)
+- Bind a receiver-method call only to an owner its file names (#950)
+- Record call sites in relation evidence and paint them in kin refs (#951)
+- Bring the README, the agent-distribution manifests, and the MCP tool copy back to canon (#947)
+- Make ten first-run and retrieval surfaces report what is actually true (#941)
+- Pin kin-vfs-core 0.4.6 so the release ships the ProjFS write path (#949)
+
+
 ## [0.5.40] - 2026-08-18
 
 ### Changed
