@@ -22,6 +22,16 @@ pub const FILE_PARSED_CALL_SITES_KEY: &str = "file_parsed_call_sites";
 /// Import statements the parser read in this entity's file, before resolution.
 pub const FILE_PARSED_IMPORT_STATEMENTS_KEY: &str = "file_parsed_import_statements";
 
+/// Of those import statements, how many name a module this repository cannot
+/// own, so no resolver could have produced an in-repo target for them.
+///
+/// Recorded only for the languages where the specifier alone settles it. In
+/// ECMAScript a specifier that does not begin with `.`, `/` or `#` is a bare
+/// package specifier, which names a dependency rather than a path. Everywhere
+/// else the same syntax can name an in-repo module, so the key is absent and a
+/// reader treats it as unmeasured rather than as zero.
+pub const FILE_PARSED_EXTERNAL_MODULE_IMPORTS_KEY: &str = "file_parsed_external_module_imports";
+
 /// Reserved parser-to-linker control record: at least one source-level call in
 /// this file could not be represented with a statically proven named target.
 /// This includes wholly unrepresentable callees and receiver calls whose leaf
@@ -311,6 +321,10 @@ pub fn attach_file_reference_parse_counts(
         .filter(|relation| relation.kind == RelationKind::Calls)
         .count();
     let import_statements = imports.len();
+    let external_module_imports = imports
+        .iter()
+        .filter(|import| is_bare_package_specifier(&import.module_path))
+        .count();
 
     for entity in entities {
         if call_extraction_complete {
@@ -325,7 +339,40 @@ pub fn attach_file_reference_parse_counts(
             FILE_PARSED_IMPORT_STATEMENTS_KEY.into(),
             serde_json::Value::from(import_statements),
         );
+        if specifier_syntax_settles_externality(entity.language) {
+            entity.metadata.extra.insert(
+                FILE_PARSED_EXTERNAL_MODULE_IMPORTS_KEY.into(),
+                serde_json::Value::from(external_module_imports),
+            );
+        } else {
+            entity
+                .metadata
+                .extra
+                .remove(FILE_PARSED_EXTERNAL_MODULE_IMPORTS_KEY);
+        }
     }
+}
+
+/// Whether a module specifier's own syntax says the module is outside the
+/// repository, with no resolver run.
+///
+/// True only for the ECMAScript family. A Python `import os` and a Go
+/// `import "fmt"` look exactly like an in-repo module of the same name, so
+/// counting them would report a gap the specifier does not establish.
+fn specifier_syntax_settles_externality(language: LanguageId) -> bool {
+    matches!(language, LanguageId::JavaScript | LanguageId::TypeScript)
+}
+
+/// Whether an ECMAScript specifier names a package rather than a path.
+///
+/// `#`-prefixed subpath imports resolve through the importing package's own
+/// manifest, so they name something the repository owns and are not bare.
+fn is_bare_package_specifier(module_path: &str) -> bool {
+    let specifier = module_path.trim();
+    !specifier.is_empty()
+        && !specifier.starts_with('.')
+        && !specifier.starts_with('/')
+        && !specifier.starts_with('#')
 }
 
 fn build_file_import_context(imports: &[FileImport]) -> Option<String> {
@@ -631,5 +678,72 @@ mod tests {
         assert!(import_context.contains("create Hydration Renderer"));
         assert!(surface_context.contains("runtime-dom"));
         assert!(surface_context.contains("runtime dom"));
+    }
+
+    fn import(module_path: &str) -> FileImport {
+        FileImport {
+            module_path: module_path.to_string(),
+            specifiers: Vec::new(),
+        }
+    }
+
+    /// FIR-2440. Most of an ECMAScript repository's imports name packages it
+    /// does not hold, so a resolved-over-parsed ratio reads as a defect unless
+    /// the report says how many could never have resolved. The specifier alone
+    /// settles it there: anything not starting with `.`, `/` or `#` is a bare
+    /// package specifier.
+    #[test]
+    fn a_javascript_file_records_how_many_imports_name_a_package() {
+        let mut entity = test_entity("lib/express.js");
+        entity.language = LanguageId::JavaScript;
+        let mut entities = vec![entity];
+        let imports = [
+            import("./application"),
+            import("./router"),
+            import("merge-descriptors"),
+            import("body-parser"),
+            import("@scope/thing"),
+            import("#internal/shim"),
+        ];
+        attach_file_reference_parse_counts(&mut entities, &[], &imports);
+
+        let extra = &entities[0].metadata.extra;
+        assert_eq!(
+            extra
+                .get(FILE_PARSED_IMPORT_STATEMENTS_KEY)
+                .and_then(|v| v.as_u64()),
+            Some(6)
+        );
+        assert_eq!(
+            extra
+                .get(FILE_PARSED_EXTERNAL_MODULE_IMPORTS_KEY)
+                .and_then(|v| v.as_u64()),
+            Some(3),
+            "the two relative specifiers and the `#` subpath import name modules \
+             this repository owns"
+        );
+    }
+
+    /// A Python `import os` and a Go `import "fmt"` look exactly like an
+    /// in-repo module of the same name, so the count is absent rather than
+    /// zero: nothing looked, so nothing was found missing.
+    #[test]
+    fn a_language_whose_specifier_syntax_settles_nothing_records_no_external_count() {
+        let mut entity = test_entity("app/parsing.py");
+        entity.language = LanguageId::Python;
+        let mut entities = vec![entity];
+        attach_file_reference_parse_counts(&mut entities, &[], &[import("os"), import("helpers")]);
+
+        let extra = &entities[0].metadata.extra;
+        assert_eq!(
+            extra
+                .get(FILE_PARSED_IMPORT_STATEMENTS_KEY)
+                .and_then(|v| v.as_u64()),
+            Some(2)
+        );
+        assert!(
+            !extra.contains_key(FILE_PARSED_EXTERNAL_MODULE_IMPORTS_KEY),
+            "an absent count is unmeasured, and must not be read as zero"
+        );
     }
 }
