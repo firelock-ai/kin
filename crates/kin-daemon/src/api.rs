@@ -13060,6 +13060,7 @@ mod tests {
             "semantic_locate",
             &empty,
             &kin_mcp::Envelope::daemon(),
+            &[],
         )
         .expect("an empty cosine page must carry a negative");
         assert_eq!(negative["kind"], json!("no_ranked_match"));
@@ -13471,9 +13472,13 @@ mod tests {
             "an empty fused page omits `entities` entirely: {body}"
         );
         assert_eq!(body["files"], json!([]));
-        let negative =
-            kin_mcp::negative::negative_for("semantic_locate", &body, &kin_mcp::Envelope::daemon())
-                .expect("an empty fused page must carry a negative");
+        let negative = kin_mcp::negative::negative_for(
+            "semantic_locate",
+            &body,
+            &kin_mcp::Envelope::daemon(),
+            &[],
+        )
+        .expect("an empty fused page must carry a negative");
         assert_eq!(negative["kind"], json!("no_ranked_match"));
         assert_eq!(negative["result_count"], json!(0));
     }
@@ -13491,9 +13496,13 @@ mod tests {
         };
         let body = fused_locate_body(result, "zzqqxx_nonexistent_symbol_9f3a");
         assert_eq!(body["all_fallback"], json!(true));
-        let negative =
-            kin_mcp::negative::negative_for("semantic_locate", &body, &kin_mcp::Envelope::daemon())
-                .expect("a ranking that names nothing must be qualified");
+        let negative = kin_mcp::negative::negative_for(
+            "semantic_locate",
+            &body,
+            &kin_mcp::Envelope::daemon(),
+            &[],
+        )
+        .expect("a ranking that names nothing must be qualified");
         assert_eq!(negative["kind"], json!("no_named_match"));
         assert_eq!(negative["interpretation"], json!("unnamed_ranking"));
         assert_eq!(negative["result_count"], json!(1));
@@ -13513,7 +13522,8 @@ mod tests {
         assert!(kin_mcp::negative::negative_for(
             "semantic_locate",
             &body,
-            &kin_mcp::Envelope::daemon()
+            &kin_mcp::Envelope::daemon(),
+            &[],
         )
         .is_none());
     }
