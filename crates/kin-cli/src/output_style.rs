@@ -94,17 +94,25 @@ fn paint_refs(line: &str) -> String {
         return format!("referenced by {ACCENT_BOLD}{}{RESET} entities:", &caps[1]);
     }
 
-    // A row's location omits `:line` when the entity carries no span, and the
-    // resolution marker trails the relation bracket. Anchoring on either shape
-    // loses the color silently, because an unmatched line prints as plain text.
-    let entry = compiled(&ENTRY, r"^  (.+) @ (\S+) \[([^\]]*)\](?: \(([^)]*)\))?$");
+    // A row's location omits `:line` when the entity carries no span, the
+    // resolution marker trails the relation bracket, and the reference sites
+    // trail that. Anchoring on any one shape loses the color silently, because
+    // an unmatched line prints as plain text.
+    let entry = compiled(
+        &ENTRY,
+        r"^  (.+) @ (\S+) \[([^\]]*)\](?: \(([^)]*)\))?(?: (sites .*))?$",
+    );
     if let Some(caps) = entry.captures(line) {
         let resolution = caps
             .get(4)
             .map(|marker| format!(" {DIM}({}){RESET}", marker.as_str()))
             .unwrap_or_default();
+        let sites = caps
+            .get(5)
+            .map(|marker| format!(" {ACCENT_DIM}{}{RESET}", marker.as_str()))
+            .unwrap_or_default();
         return format!(
-            "  {BRIGHT}{}{RESET} @ {ACCENT}{}{RESET} {FAINT}[{}]{RESET}{resolution}",
+            "  {BRIGHT}{}{RESET} @ {ACCENT}{}{RESET} {FAINT}[{}]{RESET}{resolution}{sites}",
             &caps[1], &caps[2], &caps[3]
         );
     }
@@ -320,12 +328,34 @@ mod tests {
         // Two confidences, so the rows carry two different resolution markers
         // and a painter that assumed one value would be caught. The weaker one
         // is the receiver-method fan-out tier, which is what puts its row under
-        // the candidate heading.
-        for (caller, confidence) in [
-            (&spanned, 1.0f32),
+        // the candidate heading. One caller's edge also carries site spans and
+        // the other's does not, so the answer holds both shapes the trailing
+        // site clause can take: a list of lines, and a named absence.
+        let site_span = |row: u32| SourceSpan {
+            file: FilePathId::new("spanned.rs"),
+            start_byte: 0,
+            end_byte: 1,
+            start_line: row,
+            start_col: 0,
+            end_line: row,
+            end_col: 1,
+        };
+        let sited_evidence = vec![
+            kin_model::relation::RelationEvidence {
+                source_span: Some(site_span(6)),
+                ..Default::default()
+            },
+            kin_model::relation::RelationEvidence {
+                source_span: Some(site_span(8)),
+                ..Default::default()
+            },
+        ];
+        for (caller, confidence, evidence) in [
+            (&spanned, 1.0f32, sited_evidence),
             (
                 &spanless,
                 kin_index::resolution::RECEIVER_NAME_FANOUT_CONFIDENCE,
+                Vec::new(),
             ),
         ] {
             graph
@@ -338,7 +368,7 @@ mod tests {
                     origin: RelationOrigin::Parsed,
                     created_in: None,
                     import_source: None,
-                    evidence: Vec::new(),
+                    evidence,
                 })
                 .unwrap();
         }
@@ -409,6 +439,11 @@ mod tests {
             painted.contains(&format!("{DIM}(type_resolved){RESET}")),
             "the resolution marker must be painted: {painted:?}"
         );
+        assert!(
+            painted.contains(&format!("{ACCENT_DIM}sites 7,9{RESET}")),
+            "the reference sites must be painted, not left as plain text after a \
+             painted row: {painted:?}"
+        );
 
         let spanless = rows
             .iter()
@@ -424,6 +459,11 @@ mod tests {
         assert!(
             painted.contains(&format!("{DIM}(name_only){RESET}")),
             "the resolution marker must be painted: {painted:?}"
+        );
+        assert!(
+            painted.contains(&format!("{ACCENT_DIM}sites none (no_evidence_span){RESET}")),
+            "a named site absence must be painted the same way a site list is: \
+             {painted:?}"
         );
     }
 
