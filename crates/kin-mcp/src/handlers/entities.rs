@@ -143,7 +143,12 @@ more than any single phrasing); multi-query fusion always uses the fused pipelin
 pipelines report semantic_coverage as one counter object (indexed, total, pending, \
 complete), the same shape `_kin.semantic_coverage` carries; the fused arm additionally reports a `degradations` array \
 naming any retrieval capability that could not fully run (empty vector index, reranker \
-model not cached, …), so a thin result set is attributable instead of silent. Requires \
+model not cached, …), so a thin result set is attributable instead of silent. Ranking \
+demotes test-role entities, and at several stages excludes them, unless the query text \
+itself reads as being about tests; pass `include_tests: true` to rank them alongside \
+source. When the default withholds test paths the response says how many under \
+`semantic_coverage.graph_bodies.withheld_test_paths` and records a `graph_role_filter` \
+degradation, and `complete` is never true over a population that filter narrowed. Requires \
 the Kin daemon: retrieval runs against the daemon's live graph, so this tool returns an \
 error in offline/no-daemon mode. On an empty result the additive `negative` object's \
 `safe_to_conclude_absent` flag distinguishes an authoritative \"no match\" from \"not \

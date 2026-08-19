@@ -437,6 +437,15 @@ pub struct LocateRequest {
     /// (`KIN_LOCATE_ENTITY_CAP` otherwise). Only affects entity paging.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page_size: Option<usize>,
+    /// Rank test-role entities alongside source for this query.
+    ///
+    /// Defaults to false, which is the ranking every caller has today: test-role
+    /// entities are demoted, and at several stages excluded, unless the query
+    /// text itself reads as being about tests. That heuristic is the only thing
+    /// that lifted the demotion, and a caller who knows exactly what it is
+    /// asking for had no way to say so.
+    #[serde(default)]
+    pub include_tests: bool,
 }
 
 /// Resolve the bearer token the daemon expects on non-public routes.
@@ -4161,12 +4170,33 @@ fn daemon_ready_timeout_secs() -> u64 {
         .unwrap_or(300)
 }
 
-fn default_idle_timeout_secs() -> &'static str {
+/// The idle window a spawn takes when nothing about a particular store applies:
+/// the supervisor, and any unit-test build that must not keep a daemon alive.
+fn default_idle_timeout_secs() -> String {
     if cfg!(test) {
-        "1"
+        "1".to_string()
     } else {
-        "60"
+        kin_daemon_spawn::CLI_IDLE_FLOOR_SECS.to_string()
     }
+}
+
+/// The idle window a CLI spawn gives a repo daemon, sized against what opening
+/// THAT store last cost.
+///
+/// A fixed window cannot be right for every store: the same 60 seconds that is
+/// generous for a small repository is shorter than a converted repository's own
+/// cold start, so the daemon expires between two commands and the next command
+/// pays the whole open again. Sizing the window against the measured cost makes
+/// the window at least as long as the thing it would otherwise force a caller
+/// to repeat. The store's record is written by the daemon that paid the cost;
+/// see [`kin_daemon_spawn::cli_idle_window`] for the floor and the ceiling.
+fn store_idle_timeout_secs(kin_root: &Path) -> String {
+    if cfg!(test) {
+        return "1".to_string();
+    }
+    kin_daemon_spawn::cli_idle_window_for_store(kin_root)
+        .secs
+        .to_string()
 }
 
 /// Idle timeout (seconds) for MCP-initiated daemon autostarts: 30 minutes.
@@ -4182,18 +4212,23 @@ const MCP_IDLE_TIMEOUT_SECS: &str = kin_daemon_spawn::MCP_IDLE_TIMEOUT_SECS;
 /// Returns `None` when the user has already set `KIN_DAEMON_IDLE_TIMEOUT_SECS`
 /// (their value propagates naturally to the child process). Returns
 /// `Some(value)` when we should inject it: the caller's override if given,
-/// otherwise the compiled default (60 s / 1 s in tests).
+/// otherwise the window this store's own recorded open cost asks for (1 s in
+/// unit-test builds, which must never leave a daemon behind).
 ///
-/// Factored out of the spawn path so the env-assembly logic is unit-testable
-/// without actually starting a daemon process.
+/// `store_window` is passed in rather than read here so the assembly logic is
+/// unit-testable without a store on disk.
 fn resolve_idle_timeout_env(
     user_env_is_set: bool,
-    caller_override: Option<&'static str>,
-) -> Option<&'static str> {
+    caller_override: Option<&str>,
+    store_window: &str,
+) -> Option<String> {
     if user_env_is_set {
         return None;
     }
-    Some(caller_override.unwrap_or_else(default_idle_timeout_secs))
+    Some(match caller_override {
+        Some(value) => value.to_string(),
+        None => store_window.to_string(),
+    })
 }
 
 /// The idle window a caller must carry to a daemon it did not start, in
@@ -7091,10 +7126,15 @@ pub async fn ensure_daemon_running_with_idle_timeout(
     info!(binary = %daemon_bin.display(), repo = %working_dir.display(), "starting daemon (OS-assigned port)");
 
     let user_timeout_set = std::env::var_os("KIN_DAEMON_IDLE_TIMEOUT_SECS").is_some();
+    let store_window = store_idle_timeout_secs(kin_root);
     let plan = kin_daemon_spawn::DaemonSpawnPlan {
         daemon_bin,
         working_dir: working_dir.to_path_buf(),
-        idle_timeout_secs: resolve_idle_timeout_env(user_timeout_set, idle_timeout_override),
+        idle_timeout_secs: resolve_idle_timeout_env(
+            user_timeout_set,
+            idle_timeout_override,
+            &store_window,
+        ),
         supervisor_url: Some(supervisor_url.clone()),
     };
     let mut cmd = plan.command();
@@ -11160,34 +11200,66 @@ mod tests {
     // ── idle-timeout env-assembly ──────────────────────────────────────────
 
     #[test]
-    fn resolve_idle_timeout_uses_default_when_nothing_set() {
-        // No user env, no caller override → compiled default.
-        // In test builds default_idle_timeout_secs() returns "1"; we key on
-        // whatever that function returns so the assertion survives cfg changes.
+    fn resolve_idle_timeout_uses_the_store_window_when_nothing_set() {
+        // No user env, no caller override → the window this store's own
+        // recorded open cost asked for, verbatim.
         assert_eq!(
-            resolve_idle_timeout_env(false, None),
-            Some(default_idle_timeout_secs())
+            resolve_idle_timeout_env(false, None, "600"),
+            Some("600".to_string())
         );
     }
 
     #[test]
     fn resolve_idle_timeout_mcp_override_propagates() {
-        // MCP-path caller passes Some(MCP_IDLE_TIMEOUT_SECS) → "1800" reaches daemon.
+        // MCP-path caller passes Some(MCP_IDLE_TIMEOUT_SECS) → "1800" reaches
+        // the daemon, whatever the store window would have been.
         assert_eq!(
-            resolve_idle_timeout_env(false, Some(MCP_IDLE_TIMEOUT_SECS)),
-            Some("1800")
+            resolve_idle_timeout_env(false, Some(MCP_IDLE_TIMEOUT_SECS), "600"),
+            Some("1800".to_string())
         );
     }
 
     #[test]
     fn resolve_idle_timeout_user_env_always_wins() {
         // When user has set KIN_DAEMON_IDLE_TIMEOUT_SECS we must not inject anything,
-        // regardless of the caller override.
-        assert_eq!(resolve_idle_timeout_env(true, None), None);
+        // regardless of the caller override or the store window.
+        assert_eq!(resolve_idle_timeout_env(true, None, "600"), None);
         assert_eq!(
-            resolve_idle_timeout_env(true, Some(MCP_IDLE_TIMEOUT_SECS)),
+            resolve_idle_timeout_env(true, Some(MCP_IDLE_TIMEOUT_SECS), "600"),
             None
         );
+    }
+
+    /// FIR-2426. A CLI spawn used one compiled 60-second window for every
+    /// store, and a converted repository's own cold start measured 48 to 71
+    /// seconds, so the daemon expired between two commands and the next command
+    /// paid the whole open again. The window a spawn takes now comes from what
+    /// opening THAT store last cost.
+    #[test]
+    fn a_slow_store_gets_a_window_longer_than_its_own_cold_start() {
+        let window = kin_daemon_spawn::cli_idle_window(Some(60_000));
+        assert!(
+            window.secs >= 600,
+            "a store whose open costs 60s must get at least ten minutes, got {}s",
+            window.secs
+        );
+        assert!(
+            resolve_idle_timeout_env(false, None, &window.secs.to_string())
+                .is_some_and(|value| value == "600"),
+            "the spawn plan must carry the store's window, not the floor"
+        );
+    }
+
+    /// Control for the rule: a store with no recorded cost keeps exactly the
+    /// window every CLI spawn used before, so the change cannot be passing by
+    /// making every window longer.
+    #[test]
+    fn a_store_with_no_recorded_cost_keeps_the_old_window() {
+        assert_eq!(
+            kin_daemon_spawn::cli_idle_window(None).secs,
+            kin_daemon_spawn::CLI_IDLE_FLOOR_SECS
+        );
+        assert_eq!(kin_daemon_spawn::CLI_IDLE_FLOOR_SECS, 60);
     }
 
     #[test]
