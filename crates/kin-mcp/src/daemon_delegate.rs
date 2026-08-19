@@ -535,6 +535,24 @@ fn mcp_spawn_plan(
 /// needs a corrected call.
 pub const DAEMON_EXITED_RESTART_REQUIRED: &str = "repo daemon exited; restart required";
 
+/// Marker inside a revival error meaning the replacement daemon is alive and
+/// still loading, rather than dead.
+///
+/// The two need different remediations and got the same one. A daemon mid-boot
+/// answers nothing yet, which reads exactly like a daemon that failed to start,
+/// and the caller was told to restart `kin mcp start`. Restarting the MCP
+/// server while its child is mid-boot is the one action that makes this worse:
+/// the work already done is discarded and the next call starts the same wait
+/// again. Waiting was always the fix, and on a store whose daemon takes a
+/// minute to open its graph, waiting is the ONLY fix.
+pub const DAEMON_STILL_STARTING: &str = "daemon is still starting";
+
+/// Whether a revival error describes a daemon that is booting rather than one
+/// that is gone.
+pub fn is_still_starting_error(message: &str) -> bool {
+    message.contains(DAEMON_STILL_STARTING)
+}
+
 /// Does this delegate error mean the repo daemon is gone rather than that the
 /// call itself was rejected?
 ///
@@ -1209,7 +1227,18 @@ async fn await_revived_daemon(
     // fallback: a revival that cannot learn the real port has no daemon to
     // talk to, and addressing a default port would reach whatever else is
     // listening there.
-    let port_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    // A deadline is patience, not a health check: `startup_disposition` inside
+    // `await_reported_port` detects a dead child immediately and independently
+    // of this number. Fifteen seconds was hardcoded here while the CLI's own
+    // wait on the same daemon resolved to 300 and said in its doc comment why.
+    // The observed cost of the store this fired on was 48.9 s to 71.1 s, so the
+    // MCP path gave up four times too early on every single boot and then told
+    // the caller to restart.
+    let patience = kin_daemon_spawn::daemon_startup_patience(
+        kin_daemon_spawn::recorded_daemon_boot_cost(kin_dir),
+        kin_daemon_spawn::daemon_startup_patience_override(),
+    );
+    let port_deadline = tokio::time::Instant::now() + patience;
     let port = kin_daemon_spawn::await_reported_port(kin_dir, child, port_deadline)
         .await
         .map_err(|e| format!("MCP revival: {e}"))?;
@@ -1221,7 +1250,7 @@ async fn await_revived_daemon(
         .timeout(Duration::from_secs(3))
         .build()
         .map_err(|e| format!("MCP revival: build probe client: {e}"))?;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline = tokio::time::Instant::now() + patience;
     loop {
         if let Ok(resp) = probe.get(format!("{new_base}/health")).send().await {
             if resp.status().is_success() {
@@ -1497,6 +1526,12 @@ where
         ));
     }
     match reviver.revive().await {
+        Err(revive_err) if is_still_starting_error(&revive_err) => Err(format!(
+            "{operation}: daemon at {daemon_url} is not responding ({first_err}); a replacement \
+             was started and is still loading this repository's graph ({revive_err}). It was \
+             left running. Retry this tool in a moment; do not restart `kin mcp start`, which \
+             discards the startup already in progress."
+        )),
         Err(revive_err) => Err(format!(
             "{DAEMON_EXITED_RESTART_REQUIRED}: {operation}: daemon at {daemon_url} \
              is not responding ({first_err}); revival failed: {revive_err}. \

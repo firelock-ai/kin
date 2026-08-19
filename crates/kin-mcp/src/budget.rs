@@ -87,6 +87,16 @@ pub struct ResponseBudget {
     pub compact: bool,
     /// True when the caller named a budget rather than taking the default.
     pub explicit_max_chars: bool,
+    /// Characters [`ResponseBudget::less_envelope_reserve`] took off a default
+    /// budget, or 0 when nothing was reserved.
+    ///
+    /// A cut discloses the ceiling it actually enforced, and on the default that
+    /// ceiling is not the published one. Carrying the difference lets the
+    /// disclosure name both and the reserve between them, so one response stops
+    /// reporting two budgets and explaining neither. Both strangers on the
+    /// v0.5.40 candidate spent attention deciding which of 30000 and 28000 was
+    /// real; the arithmetic joining them was in this file the whole time.
+    pub envelope_reserve: usize,
 }
 
 impl Default for ResponseBudget {
@@ -95,6 +105,7 @@ impl Default for ResponseBudget {
             max_chars: RESPONSE_DEFAULT_MAX_CHARS,
             compact: true,
             explicit_max_chars: false,
+            envelope_reserve: 0,
         }
     }
 }
@@ -128,6 +139,7 @@ impl ResponseBudget {
                 .and_then(Value::as_bool)
                 .unwrap_or(!explain),
             explicit_max_chars: requested.is_some(),
+            envelope_reserve: 0,
         }
     }
 
@@ -145,11 +157,13 @@ impl ResponseBudget {
         if self.explicit_max_chars {
             return self;
         }
+        let reduced = self
+            .max_chars
+            .saturating_sub(RESPONSE_ENVELOPE_RESERVE_CHARS)
+            .max(RESPONSE_MIN_MAX_CHARS);
         Self {
-            max_chars: self
-                .max_chars
-                .saturating_sub(RESPONSE_ENVELOPE_RESERVE_CHARS)
-                .max(RESPONSE_MIN_MAX_CHARS),
+            max_chars: reduced,
+            envelope_reserve: self.max_chars.saturating_sub(reduced),
             ..self
         }
     }
@@ -199,6 +213,16 @@ struct ResponseShape {
     /// Per-hit keys holding a nested repeat of hits another collection already
     /// reports in full.
     duplicate_keys: &'static [&'static str],
+    /// Per-hit keys holding bulk identity or retrieval-internal state that no
+    /// reader of this tool's answer consumes.
+    ///
+    /// Separate from `explain_keys` because it is not an explanation of a hit:
+    /// it is machinery that rides along on a serialized entity. `impact_analysis`
+    /// returned 416,567 characters for one method on a 37-file repository, and
+    /// 78.5% of it was four 32-element hash arrays per row plus embedding and
+    /// import previews. None of it answers "what breaks if I change this", and
+    /// a caller who wants an entity in full has `get_entity_source`.
+    bulk_keys: &'static [&'static str],
     /// The parameter a caller narrows to avoid a trim.
     narrow_param: &'static str,
 }
@@ -226,6 +250,7 @@ fn shape_for(tool: &str) -> Option<ResponseShape> {
             // Every symbol in `files[].symbols[]` is a hit `entities[]` already
             // reports with more fields, so the roll-up is the redundant copy.
             duplicate_keys: &["symbols"],
+            bulk_keys: &[],
             narrow_param: "limit",
         },
         "semantic_search" => ResponseShape {
@@ -234,6 +259,7 @@ fn shape_for(tool: &str) -> Option<ResponseShape> {
             explain_keys: &[],
             top_explain_keys: &[],
             duplicate_keys: &[],
+            bulk_keys: &[],
             narrow_param: "limit",
         },
         "trace_data_flow" => ResponseShape {
@@ -242,6 +268,7 @@ fn shape_for(tool: &str) -> Option<ResponseShape> {
             explain_keys: &[],
             top_explain_keys: &[],
             duplicate_keys: &[],
+            bulk_keys: &[],
             narrow_param: "depth",
         },
         "get_context_pack" | "trace_computation" => ResponseShape {
@@ -250,6 +277,7 @@ fn shape_for(tool: &str) -> Option<ResponseShape> {
             explain_keys: &["projection"],
             top_explain_keys: &[],
             duplicate_keys: &[],
+            bulk_keys: &[],
             narrow_param: "depth",
         },
         "find_references" => ResponseShape {
@@ -258,6 +286,7 @@ fn shape_for(tool: &str) -> Option<ResponseShape> {
             explain_keys: &[],
             top_explain_keys: &[],
             duplicate_keys: &[],
+            bulk_keys: &[],
             narrow_param: "relation_kinds",
         },
         "graph_neighborhood" => ResponseShape {
@@ -266,14 +295,28 @@ fn shape_for(tool: &str) -> Option<ResponseShape> {
             explain_keys: &[],
             top_explain_keys: &[],
             duplicate_keys: &[],
+            bulk_keys: &[],
             narrow_param: "depth",
         },
+        // The four buckets an `ImpactReport` serializes as arrays of raw
+        // entities, most important first. `impacted_entities` was never a key
+        // this response carries, so naming it here left every rung of the ladder
+        // walking an array that does not exist: nothing was stripped and nothing
+        // was trimmed on a 416,567-character answer. `entity_impacts` is
+        // deliberately absent, because its per-entity counts ARE the answer and
+        // they are small.
         "impact_analysis" => ResponseShape {
-            collections: &["impacted_entities", "affected_tests"],
+            collections: &[
+                "affected_callers",
+                "affected_dependents",
+                "affected_contract_consumers",
+                "affected_tests",
+            ],
             body_keys: &["body"],
             explain_keys: &[],
             top_explain_keys: &[],
             duplicate_keys: &[],
+            bulk_keys: &["fingerprint", "metadata"],
             narrow_param: "depth",
         },
         "find_dead_code_seeded" => ResponseShape {
@@ -282,6 +325,7 @@ fn shape_for(tool: &str) -> Option<ResponseShape> {
             explain_keys: &[],
             top_explain_keys: &[],
             duplicate_keys: &[],
+            bulk_keys: &[],
             narrow_param: "limit",
         },
         "bulk_check_references" => ResponseShape {
@@ -290,6 +334,7 @@ fn shape_for(tool: &str) -> Option<ResponseShape> {
             explain_keys: &[],
             top_explain_keys: &[],
             duplicate_keys: &[],
+            bulk_keys: &[],
             narrow_param: "entity_ids",
         },
         _ => return None,
@@ -338,6 +383,7 @@ pub fn enforce(
     // shape rather than something the budget took away under pressure.
     if budget.compact {
         strip_keys(payload, &shape, shape.explain_keys, shape.top_explain_keys);
+        strip_keys(payload, &shape, shape.bulk_keys, &[]);
     }
 
     if measure(payload) <= budget.max_chars {
@@ -364,8 +410,19 @@ pub fn enforce(
                 "ranking explanation and per-signal breakdowns dropped from {stripped} entries"
             ));
         }
+        // Bulk identity is shed here too. A caller that turned compaction off
+        // asked to see the ranking, not to be served a response its client
+        // refuses because every row carries four hash arrays.
+        let stripped = strip_keys(payload, &shape, shape.bulk_keys, &[]);
+        if stripped > 0 {
+            accounting.bounded = true;
+            cuts.push(format!(
+                "identity fingerprints and retrieval metadata dropped from {stripped} entries, \
+                 each of which still carries its name, location, and span"
+            ));
+        }
         if measure(payload) <= target {
-            disclose(payload, budget.max_chars, &cuts, &remediations);
+            disclose(payload, budget, &cuts, &remediations);
             return Some(accounting);
         }
     }
@@ -381,7 +438,7 @@ pub fn enforce(
             ));
         }
         if measure(payload) <= target {
-            disclose(payload, budget.max_chars, &cuts, &remediations);
+            disclose(payload, budget, &cuts, &remediations);
             return Some(accounting);
         }
     }
@@ -397,7 +454,7 @@ pub fn enforce(
             remediations.push("read one body with get_entity_source".to_string());
         }
         if measure(payload) <= target {
-            disclose(payload, budget.max_chars, &cuts, &remediations);
+            disclose(payload, budget, &cuts, &remediations);
             return Some(accounting);
         }
     }
@@ -441,7 +498,7 @@ pub fn enforce(
         }
     }
 
-    disclose(payload, budget.max_chars, &cuts, &remediations);
+    disclose(payload, budget, &cuts, &remediations);
     Some(accounting)
 }
 
@@ -565,10 +622,35 @@ fn trim_collection(payload: &mut Value, key: &str, target: usize, min_keep: usiz
 /// Appended rather than assigned: the pipeline may already have disclosed
 /// something about this same answer, and overwriting that would trade one silent
 /// degradation for another.
-fn disclose(payload: &mut Value, max_chars: usize, cuts: &[String], remediations: &[String]) {
+/// Record one bounded response as a degradation, naming the ceiling that was
+/// actually enforced.
+///
+/// On a caller-named budget that ceiling is the number the caller passed and
+/// there is nothing more to say. On the default it is the published default
+/// less the envelope reserve, and a disclosure that names only the enforced
+/// number leaves the response reporting two budgets with no arithmetic between
+/// them. So the default case names all three: what was enforced, what was
+/// reserved, and the published number both come from.
+fn disclose(
+    payload: &mut Value,
+    budget: &ResponseBudget,
+    cuts: &[String],
+    remediations: &[String],
+) {
     if cuts.is_empty() {
         return;
     }
+    let max_chars = budget.max_chars;
+    let ceiling = if budget.envelope_reserve == 0 {
+        format!("{max_chars}-character budget")
+    } else {
+        format!(
+            "{max_chars}-character budget (the {}-character default less a {}-character \
+             envelope reserve)",
+            max_chars + budget.envelope_reserve,
+            budget.envelope_reserve
+        )
+    };
     let mut remediation = remediations.join("; ");
     if !remediation.is_empty() {
         remediation.push_str("; ");
@@ -578,10 +660,7 @@ fn disclose(payload: &mut Value, max_chars: usize, cuts: &[String], remediations
     let entry = json!({
         "component": "response_budget",
         "reason": "response_bounded",
-        "detail": format!(
-            "the response exceeded its {max_chars}-character budget, so {}",
-            cuts.join("; ")
-        ),
+        "detail": format!("the response exceeded its {ceiling}, so {}", cuts.join("; ")),
         "remediation": remediation,
         "max_chars": max_chars,
     });
@@ -782,6 +861,127 @@ mod tests {
         explaining.insert("compact".to_string(), json!(true));
         assert!(ResponseBudget::from_arguments(&explaining).compact);
         assert!(ResponseBudget::from_arguments(&HashMap::new()).compact);
+    }
+
+    /// An impact row as the daemon serializes it: a raw entity, most of whose
+    /// bytes are four 32-element hash arrays and two retrieval previews.
+    fn impact_row(index: usize) -> Value {
+        let hash = |seed: usize| -> Vec<u64> {
+            (0..32).map(|i| ((seed + i) * 7919 % 256) as u64).collect()
+        };
+        json!({
+            "id": format!("9b9f577c-2cb3-43fd-a59b-ced58218{index:04}"),
+            "name": format!("consumer_{index}"),
+            "file_origin": "src/requests/sessions.py",
+            "span": [10, 40],
+            "fingerprint": {
+                "ast_hash": hash(index),
+                "behavior_hash": hash(index + 1),
+                "equivalence_hash": hash(index + 2),
+                "signature_hash": hash(index + 3),
+            },
+            "metadata": {
+                "embedding_body_preview": "def send(self, request, **kwargs): ".repeat(12),
+                "file_import_context": "module requests.adapters; module requests.sessions; "
+                    .repeat(8),
+            },
+        })
+    }
+
+    fn impact_payload(rows: usize) -> Value {
+        json!({
+            "affected_callers": (0..rows).map(impact_row).collect::<Vec<_>>(),
+            "affected_dependents": (0..rows).map(impact_row).collect::<Vec<_>>(),
+            "affected_contract_consumers": (0..rows / 4).map(impact_row).collect::<Vec<_>>(),
+            "affected_tests": (0..rows).map(impact_row).collect::<Vec<_>>(),
+            "entity_impacts": [{
+                "entity_id": "9b9f577c-2cb3-43fd-a59b-ced5821a4887",
+                "consumer_count": 2,
+                "proven_consumer_count": 0,
+                "consumer_files": ["src/requests/auth.py", "src/requests/sessions.py"],
+            }],
+        })
+    }
+
+    /// `impact_analysis` returned 416,567 characters for one method because the
+    /// shape named a collection the response does not carry, so every rung of
+    /// the ladder walked an absent array and cut nothing. The buckets are the
+    /// ones an `ImpactReport` actually serializes.
+    #[test]
+    fn impact_analysis_is_bounded_on_a_large_fan_in_entity() {
+        let mut payload = impact_payload(33);
+        let unbounded = measure(&payload);
+        assert!(
+            unbounded > RESPONSE_DEFAULT_MAX_CHARS,
+            "fixture must start over budget, measured {unbounded}"
+        );
+        let budget = ResponseBudget::default();
+        enforce(&mut payload, "impact_analysis", &budget).expect("budgeted");
+        let after = measure(&payload);
+        assert!(
+            after <= budget.max_chars,
+            "impact_analysis stayed at {after} characters against a {} budget",
+            budget.max_chars
+        );
+        // The answer survives the cut.
+        assert_eq!(payload["entity_impacts"][0]["consumer_count"], json!(2));
+    }
+
+    /// Compact mode is the default, and on this tool it is what sheds the bulk.
+    #[test]
+    fn compact_mode_sheds_impact_fingerprints_and_retrieval_metadata() {
+        let mut payload = impact_payload(4);
+        enforce(&mut payload, "impact_analysis", &ResponseBudget::default()).expect("budgeted");
+        let row = &payload["affected_callers"][0];
+        assert!(
+            row.get("fingerprint").is_none(),
+            "fingerprint survived: {row}"
+        );
+        assert!(row.get("metadata").is_none(), "metadata survived: {row}");
+        assert_eq!(row["name"], json!("consumer_0"), "identity must survive");
+    }
+
+    /// One response named two budgets and explained neither: the envelope
+    /// published 30000 while the arm that cut disclosed 28000. The disclosure
+    /// now carries the arithmetic joining them.
+    #[test]
+    fn a_default_budget_discloses_the_envelope_reserve_it_was_cut_by() {
+        let mut payload = locate_payload(40, 900);
+        let budget = ResponseBudget::default().less_envelope_reserve();
+        enforce(&mut payload, "semantic_locate", &budget).expect("budgeted");
+        let detail = payload["degradations"][0]["detail"]
+            .as_str()
+            .expect("a cut was disclosed")
+            .to_string();
+        assert!(
+            detail.contains("28000-character budget"),
+            "must name what it enforced: {detail}"
+        );
+        assert!(
+            detail.contains("30000-character default")
+                && detail.contains("2000-character envelope reserve"),
+            "must name the published default and the reserve between them: {detail}"
+        );
+        assert_eq!(payload["degradations"][0]["max_chars"], json!(28_000));
+    }
+
+    /// A caller who named a ceiling is told that ceiling and nothing else: there
+    /// is no reserve on a caller-named budget, so naming one would invent a
+    /// number.
+    #[test]
+    fn a_caller_named_budget_discloses_one_number() {
+        let mut args = HashMap::new();
+        args.insert("max_chars".to_string(), json!(9_000));
+        let budget = ResponseBudget::from_arguments(&args).less_envelope_reserve();
+        assert_eq!(budget.envelope_reserve, 0);
+        let mut payload = locate_payload(40, 900);
+        enforce(&mut payload, "semantic_locate", &budget).expect("budgeted");
+        let detail = payload["degradations"][0]["detail"]
+            .as_str()
+            .expect("a cut was disclosed")
+            .to_string();
+        assert!(detail.contains("9000-character budget"), "{detail}");
+        assert!(!detail.contains("envelope reserve"), "{detail}");
     }
 
     /// The reserve is this server's arithmetic about its own default. A caller

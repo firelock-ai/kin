@@ -6503,6 +6503,20 @@ fn validate_notifier_bundle_shape(members: &[BundleMember]) -> Result<()> {
     Ok(())
 }
 
+/// Documentation members a release archive carries and no install consumes.
+///
+/// The v0.5.40 archive shipped four executables and no words, and both arms of
+/// the isolated stranger run had to guess where the three binaries and the
+/// shared library go. These files answer that, travel with the bytes, and are
+/// installed nowhere: `kin update` skips them here, `scripts/install.sh` moves a
+/// fixed list of binaries and never sees them, and
+/// `scripts/release-archive-shape.cjs` admits them at the archive root.
+///
+/// Adding a name here without adding it to the archive shape (or the reverse)
+/// is the failure this pair exists to prevent, so the two lists name each other.
+pub(crate) const RELEASE_ARCHIVE_DOC_FILES: &[&str] =
+    &["README.md", "INSTALL.md", "checksums-sha256.txt"];
+
 const MACOS_COMPONENTS: &[ComponentSpec] = &[
     // Keep the currently running executable last in the swap order. If a
     // platform refuses to rename it, every earlier swap is rolled back.
@@ -7689,6 +7703,14 @@ where
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             anyhow::bail!("release archive contains a non-UTF-8 file name");
         };
+        if RELEASE_ARCHIVE_DOC_FILES.contains(&name) {
+            // Documentation the archive carries for a human, skipped rather than
+            // installed. It is listed here and nowhere else on purpose: an
+            // update must still abort on any name it does not recognise, which
+            // is the property that keeps a stray release file from silently
+            // becoming an installed component.
+            return Ok(());
+        }
         let Some(component) = spec.iter().copied().find(|item| item.name == name) else {
             anyhow::bail!(
                 "release archive contains unexpected file '{}'",
@@ -13835,6 +13857,62 @@ cwd = {:?}
         .expect_err("missing VFS files must reject the archive");
         let message = format!("{err:#}");
         assert!(message.contains("kin-vfs"), "message: {message}");
+    }
+
+    /// The archive now carries words as well as executables, and an update must
+    /// pass over them rather than refuse the release or install a README into
+    /// `~/.kin/bin`.
+    #[test]
+    fn documentation_members_are_skipped_and_unknown_names_still_abort() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = make_tar_gz(&[
+            ("kin-linux-x86_64/kin", b"kin"),
+            ("kin-linux-x86_64/kin-daemon", b"daemon"),
+            ("kin-linux-x86_64/kin-vfs", b"vfs"),
+            ("kin-linux-x86_64/libkin_vfs_shim.so", b"shim"),
+            ("kin-linux-x86_64/README.md", b"# Kin"),
+            ("kin-linux-x86_64/INSTALL.md", b"# Install"),
+            ("kin-linux-x86_64/checksums-sha256.txt", b"abc  kin"),
+        ]);
+        stage_archive(
+            &archive,
+            "kin-linux-x86_64.tar.gz",
+            tmp.path(),
+            LINUX_COMPONENTS,
+        )
+        .expect("an archive carrying its own documentation must stage");
+        for doc in RELEASE_ARCHIVE_DOC_FILES {
+            assert!(
+                !tmp.path().join("bin").join(doc).exists(),
+                "{doc} was installed as a binary"
+            );
+            assert!(
+                !tmp.path().join("lib").join(doc).exists(),
+                "{doc} was installed as a library"
+            );
+        }
+        assert_eq!(fs::read(tmp.path().join("bin/kin")).unwrap(), b"kin");
+
+        // The property the skip list must not cost: anything unrecognised
+        // still stops the update rather than being ignored with it.
+        let stray = make_tar_gz(&[
+            ("kin-linux-x86_64/kin", b"kin"),
+            ("kin-linux-x86_64/kin-daemon", b"daemon"),
+            ("kin-linux-x86_64/kin-vfs", b"vfs"),
+            ("kin-linux-x86_64/libkin_vfs_shim.so", b"shim"),
+            ("kin-linux-x86_64/NOTES.md", b"stray"),
+        ]);
+        let error = stage_archive(
+            &stray,
+            "kin-linux-x86_64.tar.gz",
+            tempfile::tempdir().unwrap().path(),
+            LINUX_COMPONENTS,
+        )
+        .expect_err("an unmanaged member must still abort the staging");
+        assert!(
+            format!("{error:#}").contains("unexpected file"),
+            "error: {error:#}"
+        );
     }
 
     /// A macOS release archive carries KinNotifier.app as a directory. The

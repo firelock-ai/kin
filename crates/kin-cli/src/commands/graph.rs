@@ -468,6 +468,37 @@ fn build_graph_status_response(
         total_relations,
         unique_files.len()
     ));
+    // The answer to the first question anyone asks after a conversion, stated
+    // once, with a label.
+    //
+    // Four counters on this screen bear on repository coverage (files that
+    // produced entities, supported inputs, admitted files, files awaiting an
+    // enrichment facet) and none of them said which one answers it. A stranger
+    // reading `Files: 66` beside `Supported inputs: 141` beside `213 admitted
+    // regular files` concluded, correctly, that the output could not tell them
+    // what fraction of the repository they could query. Anyone who cannot
+    // answer that has no way to calibrate how much to trust an empty result.
+    let admitted = health
+        .repository_artifact_coverage
+        .enrichable_artifact_count;
+    let supported = health.supported_entity_source_file_count;
+    if admitted > 0 {
+        lines.push(format!(
+            "Repository coverage: {} of {admitted} admitted files produced entities ({:.0}%)",
+            unique_files.len(),
+            (unique_files.len() as f64 / admitted as f64) * 100.0
+        ));
+        // Why the other counters differ, as arithmetic rather than an inference
+        // left to the reader. `Supported inputs` is an upper bound on coverage
+        // and was read as a contradiction of it.
+        if supported >= unique_files.len() {
+            lines.push(format!(
+                "  of the {admitted} admitted, {supported} carry a full language adapter; \
+                 {} of those produced no entity",
+                supported - unique_files.len()
+            ));
+        }
+    }
     lines.push(format!(
         "Entity-to-entity rels/entity: {:.2}",
         if entity_count == 0 {
@@ -623,8 +654,12 @@ fn build_graph_status_response(
         "All graph relations excluding CoChanges: {} ({:.2}/entity)",
         health.semantic_relation_count, health.semantic_relation_density_excluding_cochanges
     ));
+    // Named for what it measures. "Supported inputs: 141" beside "Files: 66"
+    // reads as a contradiction until the line says the two count different
+    // things: what an adapter can parse, and what actually produced an entity.
     lines.push(format!(
-        "Supported inputs: {} full-adapter, {} shallow",
+        "Supported inputs: {} admitted files a full adapter parses, {} a shallow one (an upper \
+         bound on coverage, not a count of files that produced entities)",
         health.supported_entity_source_file_count, health.supported_shallow_source_file_count
     ));
     lines.push(format!(
