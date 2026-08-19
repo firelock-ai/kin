@@ -587,6 +587,7 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
     # census is what would otherwise let a new job's NAME appear unreviewed.
     ".github/workflows/rc-build.yml": {
         "build": "RC Build (${{ matrix.artifact }})",
+        "capability": "RC Capability (${{ matrix.os }})",
     },
     ".github/workflows/registry-index-migrate.yml": {
         "migrate": None,
@@ -666,6 +667,10 @@ EXPECTED_DYNAMIC_JOB_CONTEXT_SHA256 = {
         ".github/workflows/rc-build.yml",
         "build",
     ): "8dc0699fb69599edbca87492f3f3a895aefa3bea8384c86d8fc11fef99f9d52a",
+    (
+        ".github/workflows/rc-build.yml",
+        "capability",
+    ): "3e7512c3b44ab447531be464599f6237bff7efe798d54728c012676a7c3aed23",
     (
         ".github/workflows/release.yml",
         "build",
