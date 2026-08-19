@@ -60,11 +60,24 @@ jobs:
     # conclusion veto through it. This trigger therefore decides only when to
     # look, never whether the commit is releasable, which is exactly the
     # division the scheduled path already runs under.
+    #
+    # The queue's CI run is the occasion that matters now that the mint keys
+    # off the merge-group-proven sha. It concludes when the landing does,
+    # roughly half an hour before the landing push's own CI run concludes, and
+    # waiting for the later one was the single largest stretch of pure waiting
+    # in the release chain. Both are kept: a landing that produced no queue
+    # build still has to be looked at, and a merge-group completion that
+    # arrives before main carries the commit resolves to a clean no-op that the
+    # next occasion picks up. The trigger still decides only when to look.
     if: >-
       github.event_name != 'workflow_run' ||
       (
         github.event.workflow_run.event == 'push' &&
         github.event.workflow_run.head_branch == 'main'
+      ) ||
+      (
+        github.event.workflow_run.event == 'merge_group' &&
+        startsWith(github.event.workflow_run.head_branch, 'gh-readonly-queue/main/')
       )
     runs-on: ubuntu-latest
     # The automatic path waits for release-critical checks to settle, so the
@@ -768,13 +781,29 @@ jobs:
         # Evidence is resolved through workflow provenance, not through the
         # context name. A merge-queue landing publishes the same context names
         # twice on one sha, once from the queue's merge_group build and again
-        # from the push build of the commit that landed, and only the push build
-        # runs the legs the queue deliberately skips. Selecting by name alone
-        # would read those two as ambiguous authority, or would accept the
-        # queue's skipped Windows leg as the release proof. Each required context
-        # is therefore matched against its exact workflow id, path, push event,
+        # from the push build of the commit that landed. Selecting by name alone
+        # would read those two as ambiguous authority. Each required context is
+        # therefore matched against its exact workflow id, path, admitted build,
         # and head sha, and must be unique within that provenance, so a rerun of
-        # the push build remains ambiguous authority.
+        # one build remains ambiguous authority.
+        #
+        # The queue's build is the authority when it exists. With SQUASH
+        # merging the queue's speculative commit IS the commit pushed to main,
+        # so the merge-group build and the landing push prove one tree, and the
+        # queue's is the one that actually gated the landing. That identity is
+        # asserted rather than assumed: the queue ref carries the base sha it
+        # was built on, the landing commit's first parent is that same base,
+        # and the parent is read from checked-out protected history rather than
+        # from the endpoint being judged. The landing push stays admissible and
+        # becomes the authority only when no merge-group build exists at this
+        # sha at all, so a commit that reached main without a queue build is
+        # still releasable on exactly the evidence that used to carry it.
+        # Exactly one tier is authority per release; crediting both would make
+        # every duplicated context ambiguous and refuse every queue landing.
+        # The other tier is kept as corroboration: a completed landing-push
+        # build of a required context that failed still refuses, because the
+        # same tree failing a full pass is a verdict, while an unfinished one
+        # is never waited for.
         #
         # The automatic triggers can reach a commit whose release-critical checks
         # are still running, so absent and unfinished evidence is retried. Every
@@ -797,8 +826,35 @@ jobs:
             cargo-deny
             gitleaks (full history)
             Windows installer + vector release build
+          # The reviewed mirror of ruleset 19746451 "Require status checks on
+          # main", which is live GitHub configuration no test in this
+          # repository can read and which is what the merge queue waits on. It
+          # is a superset of REQUIRED_CHECKS: a context it gates but this mint
+          # does not veto on still has to be published by an admitted build, or
+          # the queue waits on a name nobody produces with every visible check
+          # green, which is a silent hang rather than a failure. Reading the
+          # mirror against the check-runs the sha carries turns that hang into
+          # a named refusal here.
+          RULESET_REQUIRED_CHECKS: |
+            Check & Test (ubuntu-latest)
+            Check & Test (macos-latest)
+            DCO Sign-off
+            cargo-deny
+            gitleaks (full history)
+            Windows installer + vector release build
+            PR text hygiene
+            Falsify guards
+            Feature permutation tests (ubuntu-latest)
+            Feature permutation tests (macos-latest)
         run: |
           set -euo pipefail
+          # The landing commit's first parent, read from the protected history
+          # this job checked out rather than from the API answer being judged.
+          # The merge queue names the base it built on inside the queue ref, so
+          # this is the one binding between "the tree the queue proved" and
+          # "the commit being released" that a wrong API answer cannot satisfy.
+          RELEASE_PARENT_SHA="$(git rev-parse "${SHA}^")"
+          export RELEASE_PARENT_SHA
           gh api "repos/$REPO/actions/runs/$CURRENT_RUN_ID" \
             -q '{
               id: .id,
@@ -842,7 +898,7 @@ jobs:
               > workflow_runs.ndjson || { echo "::error::failed to fetch workflow runs for $SHA"; exit 1; }
             set +e
             python3 - <<'PY'
-          import json, os, sys
+          import json, os, re, sys
 
           def read_ndjson(path):
               records = []
@@ -871,41 +927,38 @@ jobs:
               for check in os.environ["REQUIRED_CHECKS"].splitlines()
               if check.strip()
           ]
-          # Workflow id, path, event, and branch. The branch is load-bearing: a
-          # merge-queue landing produces a push run of the same workflow at the
-          # same sha from the queue's own ref as well as from main, and only the
-          # run on main is release evidence.
+          ruleset_required = [
+              check.strip()
+              for check in os.environ["RULESET_REQUIRED_CHECKS"].splitlines()
+              if check.strip()
+          ]
+          # Producer identity only: workflow id and path. Which build proves
+          # this release is a single tier decision made once, below, against
+          # the queue ref and the landing branch together. Binding an event
+          # into this table is what left the mint unable to read the queue
+          # build that actually gated the landing, and made every release wait
+          # on a second full pass of a tree already proven.
           release_branch = "main"
           expected_provenance = {
               "Check & Test (ubuntu-latest)": (
                   245803170,
                   ".github/workflows/ci.yml",
-                  "push",
-                  release_branch,
               ),
               "Check & Test (macos-latest)": (
                   245803170,
                   ".github/workflows/ci.yml",
-                  "push",
-                  release_branch,
               ),
               "Falsify guards": (
                   245803170,
                   ".github/workflows/ci.yml",
-                  "push",
-                  release_branch,
               ),
               "Feature permutation tests (ubuntu-latest)": (
                   245803170,
                   ".github/workflows/ci.yml",
-                  "push",
-                  release_branch,
               ),
               "Feature permutation tests (macos-latest)": (
                   245803170,
                   ".github/workflows/ci.yml",
-                  "push",
-                  release_branch,
               ),
               # Uppercase `Sign-off` is the skipped-on-push CI job. The
               # pull_request_target DCO workflow emits lowercase `sign-off`
@@ -913,29 +966,26 @@ jobs:
               "DCO Sign-off": (
                   245803170,
                   ".github/workflows/ci.yml",
-                  "push",
-                  release_branch,
               ),
               "cargo-deny": (
                   251549972,
                   ".github/workflows/sast.yml",
-                  "push",
-                  release_branch,
               ),
               "gitleaks (full history)": (
                   293452372,
                   ".github/workflows/secret-scan.yml",
-                  "push",
-                  release_branch,
               ),
               "Windows installer + vector release build": (
                   245803170,
                   ".github/workflows/ci.yml",
-                  "push",
-                  release_branch,
               ),
           }
+          # ci.yml is the anchor because it is the workflow the merge queue
+          # builds under a merge_group event, and its run is what names the
+          # queue ref the rest of the queue's evidence was published on.
+          queue_anchor_workflow = (245803170, ".github/workflows/ci.yml")
           expected_sha = os.environ["SHA"]
+          release_parent_sha = os.environ["RELEASE_PARENT_SHA"]
           trigger_sha = os.environ["TRIGGER_SHA"]
           # A required context name is not authority on its own. Only the
           # GitHub Actions App may write one, pinned by numeric id as well as
@@ -963,6 +1013,8 @@ jobs:
           downgraded = []
           discounted = []
           unwaited = []
+          corroborated = []
+          corroboration_unwaited = []
 
           if required != list(expected_provenance):
               errors.append("required check order does not match its provenance contract")
@@ -1024,15 +1076,111 @@ jobs:
                       f"{workflow.get('id')}"
                   )
 
-          for name in required:
-              expected_workflow_id, expected_path, expected_event, expected_branch = (
-                  expected_provenance[name]
+          # Resolve which build proves this release, once, before any context
+          # is judged. The queue ref is taken from the merge_group run of the
+          # anchor workflow rather than guessed from a branch-name shape, so a
+          # branch that merely looks like a queue ref cannot nominate itself.
+          # Then the ref's embedded base sha is required to equal this
+          # release's first parent, which is the assertion that makes crediting
+          # the queue build a proof rather than an assumption.
+          queue_ref_pattern = re.compile(
+              r"^gh-readonly-queue/"
+              + re.escape(release_branch)
+              + r"/pr-[0-9]+-([0-9a-f]{40})$"
+          )
+          queue_anchors = [
+              workflow
+              for workflow in workflow_runs
+              if (
+                  workflow.get("workflow_id"),
+                  workflow.get("path"),
+              ) == queue_anchor_workflow
+              and workflow.get("event") == "merge_group"
+              # A superseded speculative group is cancelled and gated nothing.
+              # It is neither evidence nor a competing authority.
+              and workflow.get("conclusion") != "cancelled"
+          ]
+          queue_ref = None
+          if len(queue_anchors) > 1:
+              errors.append(
+                  "ambiguous merge-group evidence: "
+                  f"{len(queue_anchors)} uncancelled merge_group runs of "
+                  f"{queue_anchor_workflow[1]} at {expected_sha}"
               )
+          elif queue_anchors:
+              anchor = queue_anchors[0]
+              anchor_branch = anchor.get("head_branch") or ""
+              anchor_base = queue_ref_pattern.match(anchor_branch)
+              if anchor_base is None:
+                  errors.append(
+                      "merge-group evidence is not on a merge-queue ref for "
+                      f"{release_branch}: {anchor_branch!r}"
+                  )
+              elif anchor.get("head_sha") != expected_sha:
+                  errors.append(
+                      "merge-group evidence sha mismatch: queue build "
+                      f"{anchor.get('id')} proved {anchor.get('head_sha')}, "
+                      f"release commit is {expected_sha}"
+                  )
+              elif anchor_base.group(1) != release_parent_sha:
+                  errors.append(
+                      "merge-group evidence proved a different tree: queue ref "
+                      f"{anchor_branch} was built on {anchor_base.group(1)}, "
+                      f"release commit {expected_sha} has parent "
+                      f"{release_parent_sha}"
+                  )
+              else:
+                  queue_ref = anchor_branch
+          authority_tier = "merge_group" if queue_ref is not None else "push"
+          # The refs a release may be proved from. A run sitting on one of
+          # these that is still not evidence is an authority conflict rather
+          # than an unrelated build, because it claims a required context name
+          # on a ref this release is being proved from.
+          admitted_branches = {release_branch}
+          if queue_ref is not None:
+              admitted_branches.add(queue_ref)
+
+          def evidence_tier(workflow):
+              if workflow is None:
+                  return None
+              if workflow.get("head_sha") != expected_sha:
+                  return None
+              if workflow.get("conclusion") == "cancelled":
+                  return None
+              if queue_ref is not None and workflow.get("head_branch") == queue_ref:
+                  # secret-scan.yml publishes `gitleaks (full history)` from a
+                  # push to the queue ref rather than from a merge_group event,
+                  # so the admitted ref is the tier and the event name is not.
+                  if workflow.get("event") in ("merge_group", "push"):
+                      return "merge_group"
+                  return None
+              if (
+                  workflow.get("event") == "push"
+                  and workflow.get("head_branch") == release_branch
+              ):
+                  return "push"
+              return None
+
+          def producer_of(run):
+              producers = workflows_by_suite.get(run.get("check_suite_id"), [])
+              return producers[0] if len(producers) == 1 else None
+
+          def origin_of(producer, suite_id):
+              if producer is None:
+                  return f"no unique workflow run for suite {suite_id}"
+              return (
+                  f"{producer.get('path')} run {producer.get('id')} "
+                  f"({producer.get('event')} on {producer.get('head_branch')})"
+              )
+
+          for name in required:
+              expected_workflow_id, expected_path = expected_provenance[name]
+              expected_producer = (expected_workflow_id, expected_path)
               expected_identity = (
                   expected_workflow_id,
                   expected_path,
-                  expected_event,
-                  expected_branch,
+                  authority_tier,
+                  queue_ref if queue_ref is not None else release_branch,
                   expected_sha,
               )
               named_runs = runs_by_name.get(name, [])
@@ -1045,7 +1193,8 @@ jobs:
                       )
 
               matching_runs = []
-              off_release_branch = 0
+              corroborating_runs = []
+              off_admitted_builds = 0
               for run in named_runs:
                   matching_workflows = workflows_by_suite.get(
                       run.get("check_suite_id"), []
@@ -1058,6 +1207,7 @@ jobs:
                       )
                       continue
                   workflow = matching_workflows[0]
+                  tier = evidence_tier(workflow)
                   identity = (
                       workflow.get("workflow_id"),
                       workflow.get("path"),
@@ -1065,28 +1215,48 @@ jobs:
                       workflow.get("head_branch"),
                       workflow.get("head_sha"),
                   )
-                  if identity == expected_identity:
-                      matching_runs.append((run, workflow))
-                  elif workflow.get("head_branch") == expected_branch:
-                      # Produced on the release branch itself, but not by the
-                      # reviewed producer. A second writer of a required context
-                      # name is an authority conflict, never a fallback.
+                  if tier is None:
+                      if (
+                          workflow.get("head_branch") in admitted_branches
+                          and workflow.get("conclusion") != "cancelled"
+                      ):
+                          # Produced on a ref this release is proved from, but
+                          # not by an admitted build. A second writer of a
+                          # required context name is an authority conflict,
+                          # never a fallback. A cancelled run is the exception
+                          # and is counted below: the queue superseded it, so
+                          # it gated nothing and claims nothing.
+                          errors.append(
+                              f"required check workflow provenance mismatch: {name} "
+                              f"expected={expected_identity} actual={identity}"
+                          )
+                      else:
+                          # Produced somewhere neither tier admits, which is
+                          # what an unrelated queue entry's build does at this
+                          # sha. Not this release's evidence, and not an
+                          # anomaly either.
+                          off_admitted_builds += 1
+                      continue
+                  if (
+                      workflow.get("workflow_id"),
+                      workflow.get("path"),
+                  ) != expected_producer:
                       errors.append(
                           f"required check workflow provenance mismatch: {name} "
                           f"expected={expected_identity} actual={identity}"
                       )
+                      continue
+                  if tier == authority_tier:
+                      matching_runs.append((run, workflow))
                   else:
-                      # Produced on another branch, which is what a merge-queue
-                      # build does at this sha before the landing push. Not this
-                      # release's evidence, and not an anomaly either.
-                      off_release_branch += 1
+                      corroborating_runs.append((run, workflow))
 
               if not matching_runs:
                   pending.append(
                       f"missing required check: {name} "
                       f"(expected provenance {expected_identity}, "
                       f"{len(named_runs)} same-named check-runs, "
-                      f"{off_release_branch} produced off the release branch)"
+                      f"{off_admitted_builds} produced off the admitted builds)"
                   )
                   continue
               if len(matching_runs) != 1:
@@ -1095,6 +1265,30 @@ jobs:
                       f"({len(matching_runs)} check-runs under one provenance)"
                   )
                   continue
+
+              # The other tier built the same tree, so its verdict on this
+              # context is a real result even though the mint no longer waits
+              # for it. A completed failure refuses, which is exactly what the
+              # landing-push authority used to do; an unfinished one is
+              # announced and never waited for, because waiting is the cost
+              # this rekey exists to remove.
+              for other_run, other_workflow in corroborating_runs:
+                  other_origin = origin_of(
+                      other_workflow, other_run.get("check_suite_id")
+                  )
+                  if other_run.get("status") != "completed":
+                      corroboration_unwaited.append(
+                          f"{name} (status={other_run.get('status')}, "
+                          f"from {other_origin})"
+                      )
+                  elif other_run.get("conclusion") not in non_failing_optional:
+                      errors.append(
+                          f"corroborating required check not green: {name} "
+                          f"(conclusion={other_run.get('conclusion')}, "
+                          f"from {other_origin})"
+                      )
+                  else:
+                      corroborated.append(name)
 
               run, workflow = matching_runs[0]
               allowed_conclusions = (
@@ -1147,20 +1341,61 @@ jobs:
                       )
                   )
 
-          # A check-run is this release's evidence only when its producing
-          # workflow run is the landing push on the release branch. The merge
-          # queue builds the same workflows at this exact sha on its own ref,
-          # and for a solo queue entry the speculative sha IS the landing sha,
-          # so a queue job the queue never waited for concludes after the merge
-          # on the commit being released, having gated nothing. Gate 1 already
-          # discounts those for required contexts. The sweep discounts them the
-          # same way instead of letting one poison the mint.
+          # Ruleset 19746451 gates the merge queue, and it is live GitHub
+          # configuration this repository cannot read from a test. A context it
+          # requires that no admitted build publishes any more does not fail
+          # anywhere: the queue waits on the name forever with every visible
+          # check green. Judging the reviewed mirror against the check-runs
+          # this sha actually carries is what makes that state a named
+          # refusal. It runs only under queue authority, because the
+          # landing-push fallback does not publish the queue-only contexts and
+          # refusing there would brick the very path that exists so a commit
+          # without a queue build stays releasable.
+          missing_from_ruleset = sorted(set(required) - set(ruleset_required))
+          if missing_from_ruleset:
+              errors.append(
+                  "mint requires a context the reviewed main ruleset does not "
+                  f"gate: {missing_from_ruleset}"
+              )
+          if queue_ref is not None:
+              for name in ruleset_required:
+                  if name in required:
+                      continue
+                  admitted = [
+                      run
+                      for run in runs_by_name.get(name, [])
+                      if evidence_tier(producer_of(run)) == authority_tier
+                  ]
+                  if not admitted:
+                      errors.append(
+                          "ruleset-required context has no admitted build at "
+                          f"this sha: {name}; the merge queue waits on it and "
+                          "nothing published it"
+                      )
+                      continue
+                  for run in admitted:
+                      if run.get("status") != "completed":
+                          pending.append(
+                              f"ruleset-required context not completed: {name} "
+                              f"(status={run.get('status')})"
+                          )
+                      elif run.get("conclusion") not in non_failing_optional:
+                          errors.append(
+                              f"ruleset-required context not green: {name} "
+                              f"(conclusion={run.get('conclusion')})"
+                          )
+
+          # A check-run is this release's evidence when its producing workflow
+          # run is one of the two admitted builds of this exact sha: the queue
+          # build that gated the landing, or the landing push itself. Anything
+          # else at this sha, such as an unrelated queue entry's build, gated
+          # nothing and is discounted rather than allowed to poison the mint.
+          # Both admitted builds feed the sweep even though only one is
+          # authority, so rekeying the gate widened what gets disclosed and
+          # darkened nothing.
           evidence_workflows = set()
           for workflow in workflow_runs:
-              if (
-                  workflow.get("event") == "push"
-                  and workflow.get("head_branch") == release_branch
-              ):
+              if evidence_tier(workflow) is not None:
                   evidence_workflows.add(
                       (workflow.get("workflow_id"), workflow.get("path"))
                   )
@@ -1175,8 +1410,7 @@ jobs:
                   and run.get("check_suite_id") in release_tag_suite_ids
               ):
                   continue
-              producers = workflows_by_suite.get(run.get("check_suite_id"), [])
-              producer = producers[0] if len(producers) == 1 else None
+              producer = producer_of(run)
               if name == "Mint release tag":
                   # The mint's own job name from a producer that is not the
                   # reviewed release-tag workflow. Never release evidence and
@@ -1188,21 +1422,8 @@ jobs:
                       f"conclusion={run.get('conclusion')})"
                   )
                   continue
-              if producer is None:
-                  origin = (
-                      "no unique workflow run for suite "
-                      f"{run.get('check_suite_id')}"
-                  )
-              else:
-                  origin = (
-                      f"{producer.get('path')} run {producer.get('id')} "
-                      f"({producer.get('event')} on {producer.get('head_branch')})"
-                  )
-              is_evidence = (
-                  producer is not None
-                  and producer.get("event") == "push"
-                  and producer.get("head_branch") == release_branch
-              )
+              origin = origin_of(producer, run.get("check_suite_id"))
+              is_evidence = evidence_tier(producer) is not None
               if not is_evidence:
                   discounted.append(
                       {
@@ -1251,6 +1472,12 @@ jobs:
           # nobody was told about. Announcing on the retry passes instead would
           # repeat every line up to sixty times and train the reader to skip it.
           announcements = []
+          if queue_ref is None:
+              announcements.append(
+                  "admitting on landing-push evidence: no merge-group build "
+                  f"exists at {expected_sha}, so the queue proved nothing this "
+                  "mint could key on"
+              )
           for path, run_id, state in sorted(set(degraded_producers)):
               announcements.append(
                   f"admitting over a producing run that {state}: "
@@ -1271,10 +1498,10 @@ jobs:
                       f"evidence: {entry['name']} "
                       f"(conclusion={entry['conclusion']}, from {entry['origin']}); "
                       + (
-                          "the landing push build on the release branch is the "
-                          "evidence"
+                          "an admitted build of that workflow at this sha is "
+                          "the evidence"
                           if entry["twin"]
-                          else "it has no build on the release branch at this sha"
+                          else "it has no admitted build at this sha"
                       )
                   )
           for line in announcements:
@@ -1285,10 +1512,19 @@ jobs:
                   f"not waiting for a check no required context covers: {item}"
               )
               print(f"::notice::{not_waited[-1]}")
+          for item in corroboration_unwaited:
+              not_waited.append(
+                  "not waiting for the other admitted build of a required "
+                  f"context: {item}"
+              )
+              print(f"::notice::{not_waited[-1]}")
 
           verdict = (
               f"verified {len(required)} required checks against their workflow "
-              f"provenance; {len(check_runs)} check-runs on the sha, "
+              f"provenance on the {authority_tier} evidence for {expected_sha}"
+              + (f" (queue ref {queue_ref})" if queue_ref is not None else "")
+              + f"; {len(check_runs)} check-runs on the sha, "
+              f"{len(corroborated)} corroborated by the other admitted build, "
               f"{len(discounted)} not this release's evidence, "
               f"{len(downgraded)} red and covered by no required context, "
               f"{len(unwaited)} unfinished and not waited for"

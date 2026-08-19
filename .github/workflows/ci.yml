@@ -526,16 +526,17 @@ jobs:
     # Deliberately off the pull-request path. This leg cold-builds the whole
     # dependency graph in the release profile for x86_64-pc-windows-msvc and
     # measured 20 to 25 minutes per round, longer than any other job, so it set
-    # the floor for every land-and-iterate cycle. It now runs on each push to
-    # main, which is exactly the commit release proof reads: release-tag.yml
-    # names this check in REQUIRED_CHECKS and refuses to mint a tag unless it is
-    # present and green on the release sha. On a pull request the job reports
-    # skipped, which satisfies the required context the same way the
-    # documentation-only path already relies on.
+    # the floor for every land-and-iterate cycle. Keeping it off pull requests
+    # is what protects that cycle; keeping it off the merge queue protected
+    # nothing and cost the release its evidence. release-tag.yml now keys the
+    # mint off the merge-group-proven sha, and the queue's build is only a
+    # sufficient proof if it runs every leg the mint then trusts, so this job
+    # runs on the queue as well as on the landing push. On a pull request it
+    # still reports skipped, which satisfies the required context the same way
+    # the documentation-only path already relies on.
     if: >-
       ${{ !cancelled()
       && github.event_name != 'pull_request'
-      && github.event_name != 'merge_group'
       && needs.changes.outputs.docs_only != 'true' }}
     runs-on: windows-latest
     timeout-minutes: 60
