@@ -38,6 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Place watcher events by repository containment, not by path spelling (#948)
 - Build release-candidate archives without a tag (#940)
 - Bind a receiver-method call only to an owner its file names (#950)
+- Record call sites in relation evidence and paint them in kin refs (#951)
 
 
 ## [0.5.40] - 2026-08-18
