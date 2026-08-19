@@ -12,6 +12,11 @@
 # conscious decision to keep a name out of the registry, not a place to silence a
 # real gap.
 #
+# Set by scripts/ci-install-language-servers.sh only after it proves both
+# language-server binaries are executable, and read by the reference-enrichment
+# proof so a skip on a provisioned runner fails instead of reading as a fast
+# pass. Nothing an operator sets, and no runtime behaviour keys on it.
+KIN_CI_LANGUAGE_SERVERS_INSTALLED
 KIN_AGENT_TEST_KIN_BIN
 KIN_GIT_TEST_NO_SYMLINK_PRIVILEGE
 KIN_INIT_INTERRUPTED_TEST_BARRIER
