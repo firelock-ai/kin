@@ -56,6 +56,24 @@ fn should_enable_lsp_enrichment(config_enabled: bool, filesystem_reconcile_disab
     config_enabled && !filesystem_reconcile_disabled
 }
 
+/// Whether the daemon opens its enrichment channel at startup.
+///
+/// Taken ONCE, during startup, and that is the whole reason a language server
+/// installed while a daemon is already running may not reach it. With no server
+/// discovered here the channel is never created, so no enrichment message is
+/// ever sent for the life of the process and no adapter is ever consulted. That
+/// is the state the container behind the v0.5.42 stranger run was in: the Python
+/// adapter did not fail to start, it was never reached.
+///
+/// When discovery DID find a server the channel exists and each language's
+/// server is started lazily on first use, so a server installed afterwards is
+/// picked up with no restart. Both halves are true, and only the pessimistic one
+/// is safe for a surface to print, because a fresh install is exactly the host
+/// where discovery finds nothing.
+fn enrichment_channel_opens(enrichment_enabled: bool, servers_discovered: usize) -> bool {
+    enrichment_enabled && servers_discovered > 0
+}
+
 /// Acquire the process-lifetime repository authority before daemon state opens.
 pub fn acquire_daemon_authority(
     kin_root: &std::path::Path,
@@ -268,6 +286,194 @@ pub(crate) fn reset_vector_index_and_requeue_after_contention_for_test(
 
     reset_vector_index_and_requeue_under_guard(state);
     Ok(())
+}
+
+/// The language server this build starts for `language`, if any.
+///
+/// One map, read by both the incremental and the sweep enrichment paths below.
+/// It used to be two `match` blocks three hundred lines apart, and they agreed
+/// only because nobody had added a language since they were written. Adding a
+/// language to a single copy is invisible in review and worse at runtime: the
+/// sweep would enrich files the incremental path ignored, so the edges would
+/// appear only after a full re-ingest and vanish on the next incremental pass.
+///
+/// This map is also the referent of the claim in
+/// `kin_core::reference_coverage::ENRICHABLE_LANGUAGES`, that the daemon wires
+/// an adapter for exactly those languages. A test in this module fails when the
+/// two disagree, because they already disagreed once: JavaScript and TypeScript
+/// were absent here while kin-lsp carried a working adapter for both, so a
+/// JavaScript repository was told its reference edges were `unsupported` and
+/// cross-file resolution fell back to matching bare names.
+///
+/// The returned triple is exactly what `LspServer::start` takes: the command,
+/// its arguments, and the initialization options for this workspace.
+/// Public because it is this build's whole answer to "which server do you start
+/// for this language", and two surfaces outside the enrichment loop need that
+/// answer to agree with it: the provisioning advice that tells an operator what
+/// to install, and the proof that starts a real server against a fixture.
+pub fn lsp_adapter_for(
+    language: kin_model::LanguageId,
+    workspace_root: &std::path::Path,
+) -> Option<(String, Vec<String>, Option<serde_json::Value>)> {
+    use kin_lsp::adapters::LspAdapter;
+
+    fn describe(
+        adapter: &dyn LspAdapter,
+        workspace_root: &std::path::Path,
+    ) -> (String, Vec<String>, Option<serde_json::Value>) {
+        (
+            adapter.server_command().to_string(),
+            adapter.server_args(),
+            adapter.initialization_options(workspace_root),
+        )
+    }
+
+    match language {
+        kin_model::LanguageId::Rust => Some(describe(
+            &kin_lsp::adapters::rust_analyzer::RustAnalyzerAdapter,
+            workspace_root,
+        )),
+        kin_model::LanguageId::Python => Some(describe(
+            &kin_lsp::adapters::python::PyrightAdapter,
+            workspace_root,
+        )),
+        // One adapter serves both. `typescript-language-server` resolves a
+        // CommonJS `require` chain through the same tsserver project model it
+        // uses for TypeScript imports, which is why kin-lsp's discovery table
+        // maps both language names onto the same binary.
+        kin_model::LanguageId::TypeScript | kin_model::LanguageId::JavaScript => Some(describe(
+            &kin_lsp::adapters::typescript::TypeScriptAdapter,
+            workspace_root,
+        )),
+        _ => None,
+    }
+}
+
+/// Every language this build knows about.
+///
+/// Written as an exhaustive `match` rather than a hand-kept array so a new
+/// `LanguageId` variant fails to compile here instead of silently escaping the
+/// coverage assertions below. A list that quietly stops enumerating everything
+/// is the shape of guard that passes forever.
+#[cfg(test)]
+fn all_known_languages() -> Vec<kin_model::LanguageId> {
+    use kin_model::LanguageId::*;
+    let every = [
+        TypeScript, JavaScript, Python, Go, Java, Rust, C, Cpp, CSharp, Ruby, Php, Swift, Kotlin,
+        Hcl,
+    ];
+    for language in every {
+        // Exhaustive on purpose: adding a variant breaks this arm, which is the
+        // point. The body is a no-op; the compiler is the assertion.
+        match language {
+            TypeScript | JavaScript | Python | Go | Java | Rust | C | Cpp | CSharp | Ruby | Php
+            | Swift | Kotlin | Hcl => {}
+        }
+    }
+    every.to_vec()
+}
+
+#[cfg(test)]
+mod adapter_wiring_tests {
+    use super::{all_known_languages, lsp_adapter_for};
+    use kin_core::reference_coverage::ENRICHABLE_LANGUAGES;
+    use kin_model::LanguageId;
+    use std::path::Path;
+
+    /// `ENRICHABLE_LANGUAGES` documents itself as the set the daemon wires an
+    /// adapter for. This is that sentence as an assertion, in both directions.
+    ///
+    /// It failed before this test existed: JavaScript and TypeScript had a
+    /// complete adapter in kin-lsp and no arm in the daemon's map, so a
+    /// JavaScript repository read `reference_enrichment: "unsupported"` and its
+    /// cross-file calls were resolved by matching bare names.
+    #[test]
+    fn the_adapter_map_and_the_enrichable_set_name_the_same_languages() {
+        let root = Path::new("/nonexistent-workspace");
+        for language in all_known_languages() {
+            let wired = lsp_adapter_for(language, root).is_some();
+            let declared = ENRICHABLE_LANGUAGES.contains(&language);
+            assert_eq!(
+                wired, declared,
+                "{language}: daemon wires an adapter = {wired}, ENRICHABLE_LANGUAGES says {declared}"
+            );
+        }
+    }
+
+    /// Both JavaScript and TypeScript resolve to one server binary.
+    ///
+    /// Pinned because the two are separate `LanguageId` values reaching one
+    /// adapter, and a future edit that gives JavaScript its own arm would be
+    /// invisible to the set-equality test above while breaking every `.js`
+    /// repository that has `typescript-language-server` installed.
+    #[test]
+    fn javascript_and_typescript_share_one_server_binary() {
+        let root = Path::new("/nonexistent-workspace");
+        let (js_cmd, js_args, _) =
+            lsp_adapter_for(LanguageId::JavaScript, root).expect("JavaScript must be wired");
+        let (ts_cmd, ts_args, _) =
+            lsp_adapter_for(LanguageId::TypeScript, root).expect("TypeScript must be wired");
+        assert_eq!(js_cmd, "typescript-language-server");
+        assert_eq!(js_cmd, ts_cmd);
+        assert_eq!(js_args, ts_args);
+        assert_eq!(js_args, vec!["--stdio".to_string()]);
+    }
+
+    /// The commands the map hands `LspServer::start` are the binary names a
+    /// host actually installs, so the provisioning advice and the runtime agree.
+    #[test]
+    fn wired_languages_name_the_binaries_an_operator_installs() {
+        let root = Path::new("/nonexistent-workspace");
+        for (language, expected) in [
+            (LanguageId::Rust, "rust-analyzer"),
+            (LanguageId::Python, "pyright-langserver"),
+            (LanguageId::TypeScript, "typescript-language-server"),
+            (LanguageId::JavaScript, "typescript-language-server"),
+        ] {
+            let (cmd, _, _) =
+                lsp_adapter_for(language, root).unwrap_or_else(|| panic!("{language} not wired"));
+            assert_eq!(cmd, expected, "{language} server command");
+        }
+    }
+
+    /// The startup gate behind the restart advice `kin doctor` prints.
+    ///
+    /// Asserted rather than reasoned about, because it is a user-facing claim:
+    /// a host that had no language server when its daemon started does not gain
+    /// enrichment when one is installed, and that is exactly the host doing the
+    /// installing. If this predicate ever stops keying on the discovered count,
+    /// the advice becomes wrong in the direction that leaves an operator
+    /// waiting for edges that will never arrive.
+    #[test]
+    fn no_server_at_startup_means_no_enrichment_channel_for_this_daemon() {
+        use super::enrichment_channel_opens;
+
+        assert!(
+            !enrichment_channel_opens(true, 0),
+            "with enrichment enabled and no server discovered the channel must stay closed"
+        );
+        assert!(
+            enrichment_channel_opens(true, 1),
+            "one discovered server is enough to open the channel"
+        );
+        assert!(
+            !enrichment_channel_opens(false, 3),
+            "disabled enrichment must not open a channel however many servers exist"
+        );
+    }
+
+    /// A language with no adapter stays unwired, so `Unsupported` remains a
+    /// truthful state rather than a default nobody maintains.
+    #[test]
+    fn an_unwired_language_has_no_adapter() {
+        let root = Path::new("/nonexistent-workspace");
+        for language in [LanguageId::Ruby, LanguageId::Swift, LanguageId::Hcl] {
+            assert!(
+                lsp_adapter_for(language, root).is_none(),
+                "{language} must not be wired without being declared enrichable"
+            );
+        }
+    }
 }
 
 /// Poll `workspace/symbol` with an empty query until the LSP server responds
@@ -1205,13 +1411,25 @@ pub async fn run_with_authority_on(
         return Err(error.into());
     }
 
+    // Publish which language servers this host has, so every answer this daemon
+    // serves reports the same fact the enrichment path acts on. Without it the
+    // absence-trust gate cannot tell a language whose program a server resolved
+    // from one nothing resolved, and it certified an absence over the latter.
+    //
+    // A cheap PATH lookup rather than `discover_servers`, which runs `--version`
+    // on every server it finds, and published unconditionally: a daemon with
+    // enrichment switched off produces no reference edge either, so its answers
+    // must not claim otherwise.
+    kin_mcp::edge_coverage::publish_installed_language_servers(
+        kin_core::reference_coverage::installed_language_servers(),
+    );
+
     // Set up LSP enrichment channel before wrapping state in Arc.
-    let lsp_rx = if should_enable_lsp_enrichment(
-        config.lsp_enabled,
-        state.filesystem_reconcile_disabled(),
-    ) {
+    let enrichment_enabled =
+        should_enable_lsp_enrichment(config.lsp_enabled, state.filesystem_reconcile_disabled());
+    let lsp_rx = if enrichment_enabled {
         let discovered = kin_lsp::discovery::discover_servers();
-        if !discovered.is_empty() {
+        if enrichment_channel_opens(enrichment_enabled, discovered.len()) {
             info!(
                 count = discovered.len(),
                 languages = ?discovered.iter().map(|s| format!("{}", s.language)).collect::<Vec<_>>(),
@@ -1221,7 +1439,10 @@ pub async fn run_with_authority_on(
             state.lsp_enrichment_tx = Some(tx);
             Some(rx)
         } else {
-            info!("no LSP servers found — enrichment disabled");
+            info!(
+                "no LSP servers found, so enrichment is disabled for the life of this daemon; \
+                 install one and restart to enable it"
+            );
             None
         }
     } else {
@@ -2199,28 +2420,7 @@ pub async fn run_with_authority_on(
 
                         // Lazily start LSP server for this language.
                         if !servers.contains_key(&lang) {
-                            use kin_lsp::adapters::LspAdapter;
-                            let adapter = match lang {
-                                kin_model::LanguageId::Rust => {
-                                    let a = kin_lsp::adapters::rust_analyzer::RustAnalyzerAdapter;
-                                    Some((
-                                        a.server_command().to_string(),
-                                        a.server_args(),
-                                        a.initialization_options(&lsp_root),
-                                    ))
-                                }
-                                kin_model::LanguageId::Python => {
-                                    let a = kin_lsp::adapters::python::PyrightAdapter;
-                                    Some((
-                                        a.server_command().to_string(),
-                                        a.server_args(),
-                                        a.initialization_options(&lsp_root),
-                                    ))
-                                }
-                                _ => None,
-                            };
-
-                            if let Some((cmd, args, init_opts)) = adapter {
+                            if let Some((cmd, args, init_opts)) = lsp_adapter_for(lang, &lsp_root) {
                                 let args_refs: Vec<&str> =
                                     args.iter().map(|s| s.as_str()).collect();
                                 match kin_lsp::lifecycle::LspServer::start(
@@ -2488,29 +2688,9 @@ pub async fn run_with_authority_on(
 
                             // Lazily start LSP server for this language (same as incremental).
                             if !servers.contains_key(&lang) {
-                                use kin_lsp::adapters::LspAdapter;
-                                let adapter = match lang {
-                                    kin_model::LanguageId::Rust => {
-                                        let a =
-                                            kin_lsp::adapters::rust_analyzer::RustAnalyzerAdapter;
-                                        Some((
-                                            a.server_command().to_string(),
-                                            a.server_args(),
-                                            a.initialization_options(&lsp_root),
-                                        ))
-                                    }
-                                    kin_model::LanguageId::Python => {
-                                        let a = kin_lsp::adapters::python::PyrightAdapter;
-                                        Some((
-                                            a.server_command().to_string(),
-                                            a.server_args(),
-                                            a.initialization_options(&lsp_root),
-                                        ))
-                                    }
-                                    _ => None,
-                                };
-
-                                if let Some((cmd, args, init_opts)) = adapter {
+                                if let Some((cmd, args, init_opts)) =
+                                    lsp_adapter_for(lang, &lsp_root)
+                                {
                                     let args_refs: Vec<&str> =
                                         args.iter().map(|s| s.as_str()).collect();
                                     match kin_lsp::lifecycle::LspServer::start(

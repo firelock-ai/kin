@@ -39,9 +39,57 @@ use serde::{Deserialize, Serialize};
 /// external language server. The daemon wires an adapter for exactly these
 /// languages, so every other language carries no such edge by construction, no
 /// matter what is installed on the host.
-pub const ENRICHABLE_LANGUAGES: &[LanguageId] = &[LanguageId::Rust, LanguageId::Python];
+///
+/// JavaScript and TypeScript are one entry each rather than one shared entry,
+/// because this list is read per language the repository actually holds and a
+/// JavaScript-only repository must not be told its enrichment rides on a
+/// TypeScript row. Both resolve to the same adapter and the same server binary.
+///
+/// "The daemon wires an adapter for exactly these" is an assertion, not a
+/// comment: `kin_daemon` holds one adapter map and a test there fails if the
+/// two sets ever disagree. They disagreed silently before, which is how a
+/// JavaScript repository read `unsupported` while the adapter it needed already
+/// existed in kin-lsp.
+pub const ENRICHABLE_LANGUAGES: &[LanguageId] = &[
+    LanguageId::Rust,
+    LanguageId::Python,
+    LanguageId::TypeScript,
+    LanguageId::JavaScript,
+];
+
+/// The binaries that provide each enrichable language's server.
+///
+/// Mirrors `kin_lsp::discovery::KNOWN_SERVERS` for exactly the languages
+/// [`ENRICHABLE_LANGUAGES`] names, and is the ONE table every surface reads:
+/// the doctor row that reports the gap, the install recipes that close it, and
+/// the trust gate that decides whether an empty answer may be certified. Those
+/// three used to be able to disagree, and a probe looking for a binary the
+/// installer never provides is a gap that reports itself closed.
+///
+/// Probed with a `PATH` lookup rather than through
+/// `kin_lsp::discovery::discover_servers`, which runs `--version` on every
+/// server it finds; a query path must not spawn subprocesses.
+pub const LANGUAGE_SERVER_BINARIES: &[(LanguageId, &[&str])] = &[
+    (LanguageId::Rust, &["rust-analyzer"]),
+    (LanguageId::Python, &["pyright-langserver", "pylsp"]),
+    (
+        LanguageId::TypeScript,
+        &["typescript-language-server", "vtsls"],
+    ),
+    (LanguageId::JavaScript, &["typescript-language-server"]),
+];
+
+/// Languages whose enrichment server is present on this host.
+pub fn installed_language_servers() -> HashSet<LanguageId> {
+    LANGUAGE_SERVER_BINARIES
+        .iter()
+        .filter(|(_, binaries)| binaries.iter().any(|binary| which::which(binary).is_ok()))
+        .map(|(language, _)| *language)
+        .collect()
+}
 
 /// Whether cross-file reference evidence is available for one language.
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReferenceEnrichment {
@@ -789,6 +837,28 @@ fn read_count(entity: &Entity, key: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Every enrichable language must name the binaries that provide its
+    /// server, and nothing else may.
+    ///
+    /// The two lists feed different surfaces: one decides whether an adapter
+    /// exists, the other decides whether an operator can close the gap and
+    /// whether the trust gate may certify an absence. A language in one and not
+    /// the other is a surface reporting about a language no other surface can
+    /// act on.
+    #[test]
+    fn the_binaries_table_covers_exactly_the_enrichable_languages() {
+        let tabled: std::collections::HashSet<LanguageId> = LANGUAGE_SERVER_BINARIES
+            .iter()
+            .map(|(language, _)| *language)
+            .collect();
+        let enrichable: std::collections::HashSet<LanguageId> =
+            ENRICHABLE_LANGUAGES.iter().copied().collect();
+        assert_eq!(tabled, enrichable);
+        for (language, binaries) in LANGUAGE_SERVER_BINARIES {
+            assert!(!binaries.is_empty(), "{language} names no server binary");
+        }
+    }
     use super::*;
     use kin_db::InMemoryGraph;
     use kin_model::entity::{

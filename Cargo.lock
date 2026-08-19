@@ -3205,6 +3205,7 @@ dependencies = [
  "tracing",
  "unicode-normalization",
  "uuid",
+ "which 8.0.4",
  "winapi-util",
  "windows-sys 0.61.2",
 ]

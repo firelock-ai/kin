@@ -51,9 +51,13 @@
 //! per-entity `has_references: false` rows are absences inside a populated
 //! response.
 
+use std::collections::HashSet;
+
 use serde_json::{json, Map, Value};
 
-use kin_core::reference_coverage::{ReferenceEnrichment, ENRICHABLE_LANGUAGES};
+use kin_core::reference_coverage::{
+    reference_enrichment_for, ReferenceEnrichment, ENRICHABLE_LANGUAGES,
+};
 use kin_model::entity::Entity;
 use kin_model::graph::{EntityFilter, EntityStore};
 use kin_model::ids::{EntityId, FilePathId, LanguageId};
@@ -481,23 +485,157 @@ fn attach_reference_resolution<S: EntityStore>(
 /// trust gate has to be able to read: an absence over a language whose reference
 /// edges are unproducible cannot be certified by any amount of scanning.
 ///
-/// Only the unsupported half is published as a verdict. Whether an installed
-/// server actually backs a wired adapter is a HOST fact this observation does not
-/// probe (the CLI's status path does, through `which`), so a wired language
-/// reports [`ReferenceEnrichment::Unknown`] rather than claiming an availability
-/// nothing here checked. That variant carries the wire string, so this gate and
-/// the status surfaces cannot drift on what an unprobed language looks like.
-/// The weakest language governs, matching how the class states above merge: one
-/// unsupported language in a batch makes the batch's reference evidence
-/// unproducible.
+/// A wired adapter is only half of it, and this used to publish only that half.
+/// Whether a server is actually installed is a HOST fact, and it decides the
+/// same question: on a host with none, nothing resolves the program behind the
+/// declarations, exactly as on a build that wires no adapter. Publishing
+/// `Unknown` for every wired language made the trust gate read "nobody checked"
+/// as "fine", so a Python absence was certified as authoritative on a host that
+/// could not have produced a single reference edge.
+///
+/// That was survivable only because the wired set was small and the gate's other
+/// half happened to catch the case people hit. It stopped being survivable when
+/// JavaScript and TypeScript were wired: the express-shaped absence FIR-2430
+/// blocked, with the advice "safe to treat the target as genuinely absent", went
+/// straight back to certifying because the build limit had lifted while the host
+/// limit had not.
+///
+/// So the host is probed here now, through the same `PATH` lookup and the same
+/// table the doctor row and the install recipes read. The weakest language
+/// governs, matching how the class states above merge: one unsupported language
+/// in a batch makes the batch's reference evidence unproducible, and one missing
+/// server makes it unproduced.
 fn reference_enrichment(languages: &[LanguageId]) -> Value {
+    let Some(servers) = published_language_servers() else {
+        // Nobody published the host state, so nothing is established about any
+        // language's server. Still report the build limit, which is knowable
+        // from this process alone and is what makes an unwired language's
+        // absence uncertifiable.
+        return json!(build_only_reference_enrichment(languages));
+    };
+    json!(weakest_reference_enrichment(languages, &servers))
+}
+
+/// What is knowable without the host: whether this build wires an adapter.
+fn build_only_reference_enrichment(languages: &[LanguageId]) -> ReferenceEnrichment {
     if languages
         .iter()
         .any(|language| !ENRICHABLE_LANGUAGES.contains(language))
     {
-        json!(ReferenceEnrichment::Unsupported)
+        ReferenceEnrichment::Unsupported
     } else {
-        json!(ReferenceEnrichment::Unknown)
+        ReferenceEnrichment::Unknown
+    }
+}
+
+/// [`reference_enrichment`] with the host state given rather than probed.
+///
+/// Split out so a test states the whole environment it is asserting against. A
+/// test that inherited the developer's `PATH` would assert something different
+/// on a laptop with pyright than on a runner without it, and the version that
+/// silently stops checking is the one that runs in CI.
+fn weakest_reference_enrichment(
+    languages: &[LanguageId],
+    servers_found: &HashSet<LanguageId>,
+) -> ReferenceEnrichment {
+    languages
+        .iter()
+        .map(|language| reference_enrichment_for(*language, servers_found))
+        .min_by_key(|state| match state {
+            // Weakest first: an unproducible class outranks an unproduced one,
+            // which outranks an unread one, which outranks a working server.
+            ReferenceEnrichment::Unsupported => 0,
+            ReferenceEnrichment::NoLanguageServer => 1,
+            ReferenceEnrichment::Unknown => 2,
+            ReferenceEnrichment::Available => 3,
+        })
+        .unwrap_or(ReferenceEnrichment::Unknown)
+}
+
+/// Which languages have an enrichment server on this host, as PUBLISHED by the
+/// process that knows, or `None` when nobody published it.
+///
+/// Deliberately not a `PATH` probe taken here. Reading the host from inside a
+/// query function makes every answer, and every test of one, depend on the
+/// machine it runs on: the same assertion passes on a laptop carrying pyright
+/// and fails on a runner without it, and a local gate goes green for a reason
+/// that has nothing to do with the change under test. That is not hypothetical.
+/// It is how `daemon_mcp_bulk_reachability_uses_exact_federated_authority`
+/// passed here and failed in CI on the first attempt at this.
+///
+/// The daemon publishes it once at startup, which is the same moment it decides
+/// whether to open its enrichment channel at all, so the value a query reads is
+/// the same fact the enrichment path acted on. Unpublished reads as unknown, and
+/// unknown establishes nothing, which is the conservative reading this module
+/// takes everywhere else.
+fn published_language_servers() -> Option<HashSet<LanguageId>> {
+    #[cfg(test)]
+    if let Some(servers) = test_support::server_override() {
+        return Some(servers);
+    }
+    PUBLISHED_SERVERS
+        .read()
+        .ok()
+        .and_then(|servers| servers.clone())
+}
+
+static PUBLISHED_SERVERS: std::sync::RwLock<Option<HashSet<LanguageId>>> =
+    std::sync::RwLock::new(None);
+
+/// Publish which languages have an enrichment server on this host.
+///
+/// Called by the daemon at startup, beside the discovery that decides whether
+/// enrichment runs. Until it is called, every observation reports its languages'
+/// enrichment as unknown and the absence-trust gate stays silent about it, which
+/// is the behaviour a process that never looked should have.
+pub fn publish_installed_language_servers(servers: HashSet<LanguageId>) {
+    if let Ok(mut slot) = PUBLISHED_SERVERS.write() {
+        *slot = Some(servers);
+    }
+}
+
+/// Lets a test state which language servers its host has.
+///
+/// Without this every assertion about enrichment would inherit the developer's
+/// `PATH`: the same test would assert one thing on a laptop carrying pyright and
+/// another on a runner without it, and the version that quietly stops checking
+/// is the one that runs in CI. The override is thread-local, so it holds for the
+/// test that set it whether the suite runs threaded under `cargo test` or one
+/// process per test under nextest.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::{HashSet, LanguageId};
+    use std::cell::RefCell;
+
+    thread_local! {
+        static SERVERS: RefCell<Option<HashSet<LanguageId>>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn server_override() -> Option<HashSet<LanguageId>> {
+        SERVERS.with(|servers| servers.borrow().clone())
+    }
+
+    /// Restores the previous host on drop, including on unwind, so one test's
+    /// environment never leaks into the next on a reused thread.
+    pub(crate) struct HostGuard(Option<HashSet<LanguageId>>);
+
+    impl Drop for HostGuard {
+        fn drop(&mut self) {
+            SERVERS.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+
+    /// Declare, for the rest of this scope, that the host carries exactly
+    /// `servers`. Bind the guard: dropping it immediately restores the host.
+    #[must_use = "binding the guard is what keeps the declared host in force"]
+    pub(crate) fn scoped_language_servers(servers: &[LanguageId]) -> HostGuard {
+        HostGuard(SERVERS.with(|slot| slot.borrow_mut().replace(servers.iter().copied().collect())))
+    }
+
+    /// Run `body` on a host carrying exactly `servers`.
+    pub(crate) fn with_language_servers<T>(servers: &[LanguageId], body: impl FnOnce() -> T) -> T {
+        let _guard = scoped_language_servers(servers);
+        body()
     }
 }
 
@@ -769,35 +907,147 @@ mod tests {
         assert_eq!(python["classes"]["calls"], json!("absent"));
     }
 
-    /// The build fact the scan cannot see. JavaScript has no language-server
-    /// adapter in this build, so its reference edges are unproducible rather
-    /// than merely unobserved, and the observation has to say so or the trust
-    /// gate reads an unproducible class as a scanned-and-empty one.
+    /// The build fact the scan cannot see. Ruby has no language-server adapter
+    /// in this build, so its reference edges are unproducible rather than merely
+    /// unobserved, and the observation has to say so or the trust gate reads an
+    /// unproducible class as a scanned-and-empty one.
+    ///
+    /// This case used to be written with JavaScript, which was true until
+    /// JavaScript and TypeScript were wired: kin-lsp already carried a working
+    /// adapter for both, so an express-shaped repository was told its reference
+    /// edges could never exist while the only thing missing was a server on the
+    /// host. `Unsupported` is deliberately not an actionable gap, so the
+    /// difference is what a reader is told to do about it.
     #[test]
     fn a_language_with_no_adapter_reports_reference_enrichment_unsupported() {
-        let store = InMemoryGraph::new();
-        let target = entity(
-            "createApplication",
-            "lib/express.js",
-            LanguageId::JavaScript,
+        // Stated rather than inherited: on a host carrying every server, the
+        // only thing that can still report `unsupported` is a build limit.
+        test_support::with_language_servers(
+            &[
+                LanguageId::Rust,
+                LanguageId::Python,
+                LanguageId::TypeScript,
+                LanguageId::JavaScript,
+            ],
+            || {
+                let store = InMemoryGraph::new();
+                let target = entity("render_note", "app/notes.rb", LanguageId::Ruby);
+                store.upsert_entity(&target).unwrap();
+
+                let coverage = observe_cross_file_reference_coverage(
+                    &store,
+                    &target,
+                    &[RelationKind::References],
+                );
+                assert_eq!(coverage["reference_enrichment"], json!("unsupported"));
+
+                // Positive control: a language this build DOES wire an adapter
+                // for, whose server is installed, must not be reported
+                // unsupported, or the field says the same thing about every
+                // language and gates nothing.
+                let python = entity("parse_note", "nk/parsing.py", LanguageId::Python);
+                store.upsert_entity(&python).unwrap();
+                let coverage = observe_cross_file_reference_coverage(
+                    &store,
+                    &python,
+                    &[RelationKind::References],
+                );
+                assert_eq!(coverage["reference_enrichment"], json!("available"));
+            },
         );
-        store.upsert_entity(&target).unwrap();
+    }
 
-        let coverage =
-            observe_cross_file_reference_coverage(&store, &target, &[RelationKind::References]);
-        assert_eq!(coverage["reference_enrichment"], json!("unsupported"));
+    /// The host half, which decides the same question the build half does.
+    ///
+    /// A wired language whose server is missing produces no reference edge
+    /// either, and until this was published the observation said `unknown` and
+    /// the trust gate read that as fine.
+    #[test]
+    fn a_wired_language_with_no_server_installed_reports_no_language_server() {
+        test_support::with_language_servers(&[], || {
+            let store = InMemoryGraph::new();
+            let target = entity("parse_note", "nk/parsing.py", LanguageId::Python);
+            store.upsert_entity(&target).unwrap();
+            let coverage =
+                observe_cross_file_reference_coverage(&store, &target, &[RelationKind::References]);
+            assert_eq!(
+                coverage["reference_enrichment"],
+                json!("no_language_server")
+            );
+        });
+    }
 
-        // Positive control: a language this build DOES wire an adapter for must
-        // not be reported unsupported, or the field says the same thing about
-        // every language and gates nothing.
-        let python = entity("parse_note", "nk/parsing.py", LanguageId::Python);
-        store.upsert_entity(&python).unwrap();
-        let coverage =
-            observe_cross_file_reference_coverage(&store, &python, &[RelationKind::References]);
+    /// The weakest language governs, so one unresolvable language in a batch
+    /// cannot be lifted by a resolvable sibling.
+    #[test]
+    fn the_weakest_language_governs_a_batch() {
+        use super::weakest_reference_enrichment;
+        let all: HashSet<LanguageId> = [
+            LanguageId::Rust,
+            LanguageId::Python,
+            LanguageId::TypeScript,
+            LanguageId::JavaScript,
+        ]
+        .into_iter()
+        .collect();
+        let none: HashSet<LanguageId> = HashSet::new();
+
         assert_eq!(
-            coverage["reference_enrichment"],
-            json!("unknown"),
-            "a wired adapter's server is a host fact this scan does not probe"
+            weakest_reference_enrichment(&[LanguageId::Python, LanguageId::Ruby], &all),
+            ReferenceEnrichment::Unsupported,
+            "an unwired language drags the batch down"
+        );
+        assert_eq!(
+            weakest_reference_enrichment(&[LanguageId::Python, LanguageId::JavaScript], &none),
+            ReferenceEnrichment::NoLanguageServer
+        );
+        assert_eq!(
+            weakest_reference_enrichment(&[LanguageId::Python, LanguageId::JavaScript], &all),
+            ReferenceEnrichment::Available
+        );
+        assert_eq!(
+            weakest_reference_enrichment(&[], &all),
+            ReferenceEnrichment::Unknown,
+            "no language observed establishes nothing"
+        );
+    }
+
+    /// JavaScript is wired now, so an express-shaped repository must no longer
+    /// read `unsupported` here.
+    ///
+    /// Pinned as its own case rather than folded into the control above,
+    /// because this exact string on this exact shape of repository is what the
+    /// npm-0541 verdict recorded, and a regression would restore a state that
+    /// tells a reader there is nothing to be done.
+    #[test]
+    fn an_express_shaped_repository_no_longer_reports_reference_enrichment_unsupported() {
+        test_support::with_language_servers(
+            &[LanguageId::TypeScript, LanguageId::JavaScript],
+            || {
+                let store = InMemoryGraph::new();
+                for (name, path, language) in [
+                    (
+                        "createApplication",
+                        "lib/express.js",
+                        LanguageId::JavaScript,
+                    ),
+                    ("Router", "lib/router/index.ts", LanguageId::TypeScript),
+                ] {
+                    let target = entity(name, path, language);
+                    store.upsert_entity(&target).unwrap();
+                    let coverage = observe_cross_file_reference_coverage(
+                        &store,
+                        &target,
+                        &[RelationKind::References],
+                    );
+                    assert_eq!(
+                        coverage["reference_enrichment"],
+                        json!("available"),
+                        "{language} is wired and its server is installed here, so nothing about \
+                         this build or host stops its reference edges existing"
+                    );
+                }
+            },
         );
     }
 

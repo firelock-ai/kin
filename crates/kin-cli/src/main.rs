@@ -1139,6 +1139,13 @@ enum Command {
         /// Apply safe automatic repairs (shell hook, MCP configs, config dirs)
         #[arg(long, default_value_t = false)]
         fix: bool,
+        /// Install the missing language servers this build enriches with
+        ///
+        /// Each install is a network download into a shared prefix (npm global,
+        /// or the active rustup toolchain), so it never runs unasked: an
+        /// interactive run asks first, and a scripted one needs this flag.
+        #[arg(long = "install-language-servers", default_value_t = false)]
+        install_language_servers: bool,
         /// Emit the machine-readable health report as JSON
         #[arg(long, default_value_t = false)]
         json: bool,
@@ -1173,6 +1180,13 @@ enum Command {
         /// actually call Kin (for a scripted install with no repository yet)
         #[arg(long, global = true)]
         skip_mcp_check: bool,
+        /// Install the missing language servers this build enriches with
+        ///
+        /// Each install is a network download into a shared prefix (npm global,
+        /// or the active rustup toolchain), so it never runs unasked: an
+        /// interactive run asks first, and a scripted one needs this flag.
+        #[arg(long = "install-language-servers", global = true)]
+        install_language_servers: bool,
         /// Skip the wizard and only run the first-run health check
         #[arg(long, default_value_t = false)]
         check: bool,
@@ -3588,6 +3602,7 @@ fn main() -> Result<()> {
                 },
                 Command::Doctor {
                     fix,
+                    install_language_servers,
                     json,
                     drift,
                     heal,
@@ -3602,7 +3617,7 @@ fn main() -> Result<()> {
                         commands::capabilities::require_ready("doctor --drift")?;
                         commands::drift::run(json).await
                     } else {
-                        commands::setup::doctor(fix, json).await
+                        commands::setup::doctor(fix, install_language_servers, json).await
                     }
                 }
                 Command::Vfs { action } => match action {
@@ -3659,11 +3674,12 @@ fn main() -> Result<()> {
                     auto_daemon,
                     no_interactive,
                     skip_mcp_check,
+                    install_language_servers,
                     check,
                 } => match action {
                     Some(SetupAction::Status { json }) => commands::setup::status(json).await,
                     Some(SetupAction::Doctor { fix, json }) => {
-                        commands::setup::doctor(fix, json).await
+                        commands::setup::doctor(fix, install_language_servers, json).await
                     }
                     Some(SetupAction::Ledger { json }) => commands::setup::ledger_status(json),
                     Some(SetupAction::Uninstall {
@@ -3674,7 +3690,7 @@ fn main() -> Result<()> {
                     }) => commands::setup::uninstall(all, dry_run, force, json).await,
                     // `kin setup --check` is shorthand for the first-run health
                     // check without running the wizard.
-                    None if check => commands::setup::doctor(false, false).await,
+                    None if check => commands::setup::doctor(false, false, false).await,
                     None => {
                         commands::setup::run_wizard(commands::setup::WizardOptions {
                             mode,
@@ -3683,6 +3699,7 @@ fn main() -> Result<()> {
                             no_interactive,
                             intent,
                             skip_mcp_check,
+                            install_language_servers,
                         })
                         .await
                     }

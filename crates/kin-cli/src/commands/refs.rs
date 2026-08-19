@@ -872,8 +872,9 @@ fn display_read_path(_layout: &kin_core::KinLayout, rel_path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_bulk_refs_response, build_refs_response, parse_relation_kinds,
-        refs_not_found_guidance, BulkRefsRequest, BulkRefsResponse, RefsRequest,
+        build_bulk_refs_response, build_refs_response, collect_graph_references,
+        parse_relation_kinds, refs_not_found_guidance, BulkRefsRequest, BulkRefsResponse,
+        ReferenceLinesAbsent, RefsRequest, RelationResolution,
     };
     use kin_model::RelationKind;
 
@@ -963,6 +964,151 @@ mod tests {
         assert_eq!(row["receiver_name_candidate_count"], 3, "{row}");
         assert_eq!(row["has_references"], true, "{row}");
         assert_eq!(response.with_references, 1);
+    }
+
+    /// A language-server edge reaches the reference surface as a RESOLVED
+    /// caller, and a same-named bare-name guess beside it does not.
+    ///
+    /// This is the last hop of FIR-2464. The daemon now wires JavaScript and
+    /// TypeScript and starts a server for them, and the enrichment layer is
+    /// proved against real servers in
+    /// `crates/kin-daemon/tests/lsp_reference_enrichment.rs`. What that proof
+    /// does not reach is what `find_references` and `kin refs` DO with the
+    /// resulting edge, which is what an agent actually reads. Both rows are
+    /// built here from one graph so the difference is the edge rather than the
+    /// fixture.
+    ///
+    /// It also pins a gap rather than papering over it. kin-lsp constructs
+    /// every enrichment relation with `evidence: Vec::new()`
+    /// (kin-lsp/src/enrichment.rs:218, :320, :426, :503), so an LSP-resolved
+    /// caller arrives with no source span and its `reference_lines` come back
+    /// empty with `NoEvidenceSpan`. The row is honest about that rather than
+    /// silent, and this assertion is what will fail, loudly and in the right
+    /// place, on the day kin-lsp starts populating spans.
+    #[test]
+    fn an_lsp_edge_reaches_the_reference_surface_as_resolved_and_a_name_guess_does_not() {
+        use kin_db::InMemoryGraph;
+        use kin_model::relation::{Relation, RelationOrigin};
+        use kin_model::{
+            Entity, EntityId, EntityKind, EntityMetadata, EntityRole, EntityStore, FilePathId,
+            FingerprintAlgorithm, GraphNodeId, Hash256, LanguageId, SemanticFingerprint,
+            Visibility,
+        };
+
+        fn entity(name: &str, rel_path: &str) -> Entity {
+            Entity {
+                id: EntityId::new(),
+                kind: EntityKind::Function,
+                name: name.to_string(),
+                language: LanguageId::JavaScript,
+                fingerprint: SemanticFingerprint {
+                    algorithm: FingerprintAlgorithm::V1TreeSitter,
+                    ast_hash: Hash256::from_bytes([0; 32]),
+                    signature_hash: Hash256::from_bytes([0; 32]),
+                    behavior_hash: Hash256::from_bytes([0; 32]),
+                    equivalence_hash: kin_model::Hash256::from_bytes([0; 32]),
+                    stability_score: 1.0,
+                },
+                file_origin: Some(FilePathId::new(rel_path)),
+                span: None,
+                signature: name.to_string(),
+                visibility: Visibility::Public,
+                role: EntityRole::Source,
+                doc_summary: None,
+                metadata: EntityMetadata::default(),
+                lineage_parent: None,
+                created_in: None,
+                superseded_by: None,
+            }
+        }
+
+        let graph = InMemoryGraph::new();
+        let target = entity("handle", "lib/router.js");
+        graph.upsert_entity(&target).unwrap();
+
+        // The caller a language server resolved: origin Lsp.
+        let resolved_caller = entity("listen", "lib/app.js");
+        graph.upsert_entity(&resolved_caller).unwrap();
+        graph
+            .upsert_relation(&Relation {
+                id: kin_model::ids::RelationId::new(),
+                kind: RelationKind::Calls,
+                src: GraphNodeId::Entity(resolved_caller.id),
+                dst: GraphNodeId::Entity(target.id),
+                confidence: 0.95,
+                origin: RelationOrigin::Lsp,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+
+        // The caller the bare-name fallback produced: a receiver-method guess.
+        let guessed_caller = entity("dispatch", "lib/other.js");
+        graph.upsert_entity(&guessed_caller).unwrap();
+        graph
+            .upsert_relation(&Relation {
+                id: kin_model::ids::RelationId::new(),
+                kind: RelationKind::Calls,
+                src: GraphNodeId::Entity(guessed_caller.id),
+                dst: GraphNodeId::Entity(target.id),
+                confidence: kin_index::resolution::RECEIVER_NAME_FANOUT_CONFIDENCE,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+
+        let collected =
+            collect_graph_references(&graph, &target.id, &[RelationKind::Calls]).unwrap();
+
+        let resolved = collected
+            .references
+            .iter()
+            .find(|entry| entry.entity_id == resolved_caller.id)
+            .expect("the language-server caller must appear");
+        assert_eq!(
+            resolved.resolution,
+            RelationResolution::TypeResolved,
+            "an Lsp-origin edge must reach the reference surface as type_resolved"
+        );
+        assert!(
+            resolved.resolution.is_proven(),
+            "a type_resolved caller must be countable as evidence of use"
+        );
+        assert!(
+            !resolved.receiver_name_guess,
+            "a language-server edge is not a receiver-name guess"
+        );
+        // The gap named above, asserted rather than assumed. Delete this pair
+        // and assert real line numbers on the day kin-lsp carries spans.
+        assert!(
+            resolved.reference_lines.is_empty(),
+            "kin-lsp emits no evidence span today; if this now has lines, the surrounding \
+             doc comment and the FIR-2464 report are out of date"
+        );
+        assert_eq!(
+            resolved.reference_lines_absent,
+            Some(ReferenceLinesAbsent::NoEvidenceSpan),
+            "an absent line list must say WHY it is absent rather than reading as no evidence"
+        );
+
+        let guessed = collected
+            .references
+            .iter()
+            .find(|entry| entry.entity_id == guessed_caller.id)
+            .expect("the guessed caller must still appear, marked");
+        assert_eq!(
+            guessed.resolution,
+            RelationResolution::NameOnly,
+            "a receiver-name fan-out edge stays a candidate"
+        );
+        assert!(
+            !guessed.resolution.is_proven(),
+            "a name-only caller must not be countable as evidence of use"
+        );
+        assert!(guessed.receiver_name_guess);
     }
 
     /// `kin refs` must answer only from graph-owned relation edges. A reference

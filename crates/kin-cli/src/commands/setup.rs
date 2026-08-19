@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use crate::commands::language_servers;
+
 // ---------------------------------------------------------------------------
 // Embedded shell hooks (from kin-vfs/shell/)
 // ---------------------------------------------------------------------------
@@ -1029,6 +1031,12 @@ pub struct WizardOptions {
     /// there is nothing for a tool call to answer about. The skip is printed
     /// per client rather than silently dropping the section.
     pub skip_mcp_check: bool,
+    /// Install the language servers Kin enriches with, without asking.
+    ///
+    /// Needed because the install is a network download into a shared prefix.
+    /// Without it an interactive run asks and a scripted one prints the command
+    /// and changes nothing.
+    pub install_language_servers: bool,
 }
 
 /// First-run intent — what the user wants out of Kin. Each intent maps to a
@@ -11846,6 +11854,14 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
 
     print_intent_followups(&plan, interactive);
 
+    // Language servers are what turn Kin's cross-file answers from bare-name
+    // matches into resolved ones, and setup is the one moment a person is
+    // present to consent to the download. Skipping this step is what shipped
+    // before: the adapter was wired, no server was installed, the daemon logged
+    // the failed start at debug level, and every cross-file call fell back to
+    // matching names.
+    provision_language_servers_in_wizard(&opts, interactive);
+
     report_notification_identity(interactive);
 
     // The final checklist is the real first-run health engine — not a parallel
@@ -11859,6 +11875,29 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     print_next_steps(intent, plan.install_shell_hook, &configured_assistants);
 
     Ok(())
+}
+
+/// Offer the missing language servers during first-run setup.
+///
+/// Interactive runs ask per install command with the download disclosed.
+/// Non-interactive runs print the command and change nothing unless
+/// `--install-language-servers` was passed, because an unattended install
+/// should never spend a user's bandwidth on a prefix they share with the rest
+/// of their toolchain.
+fn provision_language_servers_in_wizard(opts: &WizardOptions, interactive: bool) {
+    let missing = language_servers::missing_enrichable_languages();
+    if missing.is_empty() {
+        return;
+    }
+    println!();
+    println!("Language servers (cross-file reference edges):");
+    let consent = language_servers::InstallConsent::resolve(
+        opts.install_language_servers,
+        interactive && !opts.install_language_servers,
+    );
+    for line in apply_language_server_provisioning(&missing, consent) {
+        println!("  {} {line}", style("✓").green());
+    }
 }
 
 /// Get the notification identity working, and say so when it cannot be.
@@ -12654,11 +12693,118 @@ fn print_human_report(report: &crate::commands::health::HealthReport) {
     }
 }
 
+/// Provision the language servers behind Kin's cross-file reference edges, and
+/// report each one in the operator's own words.
+///
+/// Shared by the wizard and by `kin doctor --fix` so a person gets the same
+/// disclosure, the same prompt, and the same restart advice on both paths. The
+/// returned lines are the "what was applied" list both surfaces already print;
+/// anything not applied is printed here instead, because a declined or failed
+/// install is a fact the operator needs and an empty applied-list is not.
+fn apply_language_server_provisioning(
+    missing: &[kin_model::LanguageId],
+    consent: language_servers::InstallConsent,
+) -> Vec<String> {
+    use language_servers::{InstallConsent, InstallOutcome};
+
+    if missing.is_empty() {
+        return Vec::new();
+    }
+
+    if consent == InstallConsent::Withheld {
+        // Nobody to ask and no flag. Say what is missing and what closes it,
+        // and change nothing. Printing the command is the whole value here: the
+        // gap was already reported, the command was not.
+        println!(
+            "  {} no language server for {}; cross-file reference edges are unavailable for {}",
+            style("!").yellow(),
+            missing
+                .iter()
+                .map(|language| language.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            if missing.len() == 1 { "it" } else { "them" }
+        );
+        for command in language_servers::install_commands_for(missing) {
+            println!("      {command}");
+        }
+        println!(
+            "      or re-run with --install-language-servers to have Kin run {}",
+            if missing.len() == 1 { "it" } else { "them" }
+        );
+        return Vec::new();
+    }
+
+    let reports = language_servers::provision(
+        missing,
+        consent,
+        |recipe| recipe.installed(),
+        |recipe| recipe.installer_available(),
+        |recipe| {
+            println!();
+            println!(
+                "  Kin can enrich {} with cross-file reference edges, but its language server is \
+                 not installed.",
+                recipe.language
+            );
+            println!("    Command:    {}", recipe.command_line());
+            println!("    This will:  {}", recipe.disclosure);
+            prompt_yn("  Install it now?", false, true)
+        },
+        language_servers::run_install,
+    );
+
+    let mut applied = Vec::new();
+    let mut installed_any = false;
+    for report in reports {
+        match report.outcome {
+            InstallOutcome::AlreadyPresent => {}
+            InstallOutcome::Installed { command } => {
+                installed_any = true;
+                applied.push(format!(
+                    "installed the {} language server (`{command}`)",
+                    report.language
+                ));
+            }
+            // A zero exit that left the binary unreachable is reported as the
+            // gap it still is. Counting it as applied is how a closed-looking
+            // row keeps an open gap.
+            InstallOutcome::RanButStillMissing { command } => println!(
+                "  {} `{command}` succeeded but no {} server is on PATH; check that your npm \
+                 global prefix is on PATH",
+                style("✗").red(),
+                report.language
+            ),
+            InstallOutcome::Failed { command, reason } => println!(
+                "  {} could not install the {} language server: {reason} (`{command}`)",
+                style("✗").red(),
+                report.language
+            ),
+            InstallOutcome::Declined { command } => println!(
+                "  {} skipped the {} language server; run `{command}` to install it later",
+                style("-").dim(),
+                report.language
+            ),
+            InstallOutcome::NoInstaller { program, command } => println!(
+                "  {} `{program}` is not installed, so Kin cannot run `{command}` to provision \
+                 the {} language server",
+                style("✗").red(),
+                report.language
+            ),
+        }
+    }
+
+    if installed_any {
+        println!("  {}", language_servers::RESTART_AFTER_INSTALL);
+    }
+    applied
+}
+
 // ---------------------------------------------------------------------------
 // `kin setup doctor`
 // ---------------------------------------------------------------------------
 
-pub async fn doctor(fix: bool, json: bool) -> Result<()> {
+pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Result<()> {
     let report = crate::commands::health::run_health_checks().await;
 
     if !fix {
@@ -12778,6 +12924,46 @@ pub async fn doctor(fix: bool, json: bool) -> Result<()> {
             Ok(Some(url)) => applied.push(format!("started kin-daemon ({url})")),
             Ok(None) => {}
             Err(e) => println!("  {} kin-daemon start failed: {e}", style("✗").red()),
+        }
+    }
+
+    // Install the language servers this build enriches with, when the operator
+    // asked for it. Deliberately NOT part of the unconditional "safe repairs"
+    // set above: every other repair here writes a file Kin already owns, while
+    // this one downloads packages into a shared global prefix. `--fix` alone
+    // prints the command; `--fix --install-language-servers` runs it, and an
+    // interactive `--fix` asks.
+    //
+    // The gap comes from the health report rather than from a fresh probe, so
+    // the repair is scoped to the languages the row actually flagged.
+    // Pending and Stale are exactly the two states the coverage row takes when
+    // a language-server gap was actually OBSERVED. `Unsupported` is what it
+    // reports outside a Kin repository, or with no daemon and nothing missing,
+    // and offering an install off the back of that would turn a "nothing to
+    // measure here" row into a prompt to download packages.
+    let language_server_gap = report.checks.iter().any(|c| {
+        c.id == "reference_edge_coverage"
+            && matches!(
+                c.status,
+                crate::commands::health::HealthStatus::Pending
+                    | crate::commands::health::HealthStatus::Stale
+            )
+    });
+    if language_server_gap {
+        let missing = language_servers::missing_enrichable_languages();
+        if missing.is_empty() {
+            // The row is unhealthy for a reason no install closes (an
+            // unsupportable absence, or a graph that could not be read). Saying
+            // nothing here is right: offering an install that changes nothing
+            // is worse than leaving the row's own detail to speak.
+        } else {
+            let consent = language_servers::InstallConsent::resolve(
+                install_language_servers,
+                !install_language_servers && is_tty(),
+            );
+            for line in apply_language_server_provisioning(&missing, consent) {
+                applied.push(line);
+            }
         }
     }
 
@@ -14337,6 +14523,7 @@ mod tests {
             no_interactive: true,
             intent: None,
             skip_mcp_check: false,
+            install_language_servers: false,
         }
     }
 

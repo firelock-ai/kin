@@ -39,16 +39,49 @@ use common::Command;
 /// Wall-clock bound for one four-frame stdio session against a live daemon.
 const SESSION_BOUND: Duration = Duration::from_secs(60);
 
-/// How long ambient admission gets to pick up a host write before the fixture
-/// gives up. The loop polls at 100ms and the file is three functions.
-const ADMISSION_BOUND: Duration = Duration::from_secs(60);
+/// How long the fixture waits for the daemon to record that it admitted the
+/// host write.
+///
+/// Deliberately generous rather than tuned. The wait below is event driven, so
+/// this bound never paces a passing run: it is only how long a run that is
+/// going to fail spends proving it. A loaded runner reconciling several seconds
+/// late is the case a tighter bound turned into a red queue entry.
+const ADMISSION_BOUND: Duration = Duration::from_secs(120);
+
+/// How long the fixture waits for the daemon to record that its file watcher is
+/// registered, before making the host write that watcher has to observe.
+const WATCHER_BOUND: Duration = Duration::from_secs(90);
+
+/// How long the counters get to catch up with the admission the daemon just
+/// recorded. Short on purpose: a bound long enough to hide a missing admission
+/// would put back the ambiguity the wait above exists to remove.
+const COUNT_SETTLE_BOUND: Duration = Duration::from_secs(30);
+
+/// What the daemon logs once `FileWatcher::new` has registered the watch
+/// (`crates/kin-index/src/watcher.rs`, immediately after `watch()` returns).
+const WATCHER_RECORD: &str = "started file watcher";
+
+/// What the reconciliation loop logs once it has admitted a working-copy change
+/// into repository authority (`crates/kin-daemon/src/loop_runner.rs`).
+const ADMISSION_RECORD: &str = "admitted exact workspace tree into repository authority";
+
+/// How long the fixture will keep repeating a session while `kin_graph_status`
+/// refuses to sample its counts. Generous against the few hundred milliseconds
+/// this repository's four vectors take, so expiry means the lock is never being
+/// yielded rather than that embedding was merely busy.
+const RETRY_BOUND: Duration = Duration::from_secs(30);
 
 struct IsolatedDaemon {
     child: Option<common::RuntimeOwnedChild>,
+    log: std::path::PathBuf,
 }
 
 impl IsolatedDaemon {
-    fn spawn(repo: &Path, runtime: &common::IsolatedDaemonRuntime) -> Self {
+    /// Spawn the daemon with its own log kept OUTSIDE the repository, so that
+    /// reading the daemon's record of its own progress cannot itself produce
+    /// the watcher events this fixture is about.
+    fn spawn(repo: &Path, log: &Path, runtime: &common::IsolatedDaemonRuntime) -> Self {
+        let sink = fs::File::create(log).expect("create the daemon log");
         let mut command = runtime.daemon_command();
         let child = command
             .arg("--repo")
@@ -57,12 +90,69 @@ impl IsolatedDaemon {
             .arg("0")
             .env("KIN_DAEMON_DISABLE_LSP", "1")
             .env("KIN_DAEMON_IDLE_TIMEOUT_SECS", "0")
+            // The waits below read the daemon's own INFO records, so ask for
+            // them explicitly rather than inheriting whatever the ambient
+            // filter happens to be.
+            .env("RUST_LOG", "info")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(sink))
             .spawn_owned()
             .expect("spawn isolated kin-daemon");
-        Self { child: Some(child) }
+        Self {
+            child: Some(child),
+            log: log.to_path_buf(),
+        }
+    }
+
+    /// Wait until the daemon records that its file watcher is registered.
+    ///
+    /// Serving is not watching. The daemon publishes `.kin/daemon.port` and
+    /// retires its warming surface in `run_with_authority_on` BEFORE it spawns
+    /// the reconciliation loop, and that loop is what calls `FileWatcher::new`;
+    /// the loop then deliberately admits nothing at startup, because
+    /// working-copy content crosses into authority only through a watcher
+    /// observed edit or an explicit seam. So a host write made between those
+    /// two points raises no event and nothing ever replays it, and the wait for
+    /// admission afterwards can only burn its whole bound.
+    ///
+    /// Measured on this host the gap is a few milliseconds and the fixture won
+    /// it by 5 to 113ms when it won; the runs that failed are exactly the runs
+    /// where it lost. Waiting for the daemon to say the watch exists removes
+    /// the race rather than widening a bound around it.
+    fn wait_until_watching(&self) {
+        self.wait_for_record(
+            WATCHER_RECORD,
+            0,
+            WATCHER_BOUND,
+            "register its file watcher",
+        );
+    }
+
+    /// Byte offset the log has reached, so a later wait only considers records
+    /// written after this point and cannot match an older line.
+    fn log_offset(&self) -> u64 {
+        fs::metadata(&self.log).map(|meta| meta.len()).unwrap_or(0)
+    }
+
+    /// Poll the daemon's log for `record`, considering only bytes at or after
+    /// `from`. The bound expiring is a real failure that names the record that
+    /// never arrived and quotes what the daemon did say instead.
+    fn wait_for_record(&self, record: &str, from: u64, bound: Duration, what: &str) {
+        let deadline = Instant::now() + bound;
+        loop {
+            let text = fs::read_to_string(&self.log).unwrap_or_default();
+            let tail = text.get(from as usize..).unwrap_or(&text);
+            if tail.contains(record) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the daemon did not {what} within {bound:?}: its log carries no {record:?} \
+                 record after byte {from}. What it did log:\n{tail}"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 
     fn wait_until_serving(&mut self, kin_root: &Path) -> u16 {
@@ -141,6 +231,10 @@ fn seed_repository(repo: &Path) {
     run_git(repo, &["add", "--all"]);
     run_git(repo, &["commit", "-m", "storage"]);
 }
+
+/// Where that file is written. Named here because the wait for admission
+/// re-arms the same path rather than only polling it.
+const UNCOMMITTED_PATH: &str = "src/link_graph.rs";
 
 /// The file the agent wrote and then located. Named for the transcript's
 /// `link_graph.py`, which is the write whose entities the second locate found
@@ -321,8 +415,41 @@ fn live_entity_count(repo: &Path, home: &Path, port: u16) -> u64 {
 }
 
 /// Wait until ambient admission has taken the host write into the live graph.
-fn wait_for_live_growth(repo: &Path, home: &Path, port: u16, above: u64) -> u64 {
-    let deadline = Instant::now() + ADMISSION_BOUND;
+///
+/// Event driven, on the daemon's own record of the admission it performed,
+/// rather than a poll that can only ever report that a count has not moved.
+/// A poll cannot tell "the reconciliation pass is still running" from "no
+/// event was ever raised, so no pass will ever run", and those two are the
+/// whole question: they differ by whether the watcher existed when the write
+/// landed. `wait_until_watching` above now guarantees it did, and this wait
+/// reads the consequence.
+///
+/// `since` is the log offset taken immediately before the write, so an
+/// admission recorded earlier in this daemon's life cannot satisfy it.
+///
+/// A passing run costs exactly as long as admission actually took, so the
+/// generous bound is spent only by a run that is going to fail, and that
+/// failure names the record that never arrived instead of timing out vaguely.
+fn wait_for_live_growth(
+    daemon: &IsolatedDaemon,
+    repo: &Path,
+    home: &Path,
+    port: u16,
+    above: u64,
+    since: u64,
+) -> u64 {
+    daemon.wait_for_record(
+        ADMISSION_RECORD,
+        since,
+        ADMISSION_BOUND,
+        "admit the host write",
+    );
+
+    // The daemon publishes its record and its counters a moment apart, so this
+    // closes that last gap and nothing more. It is deliberately short: it must
+    // not be able to stand in for the wait above, because a bound long enough
+    // to hide a missing admission is the bug this test kept reporting.
+    let deadline = Instant::now() + COUNT_SETTLE_BOUND;
     loop {
         let live = live_entity_count(repo, home, port);
         if live > above {
@@ -330,14 +457,55 @@ fn wait_for_live_growth(repo: &Path, home: &Path, port: u16, above: u64) -> u64 
         }
         assert!(
             Instant::now() < deadline,
-            "ambient admission never took the host write: live entity count stayed at {live}, \
-             above={above}; graph status said:\n{}",
+            "the daemon recorded admitting the host write, but the live entity count stayed at \
+             {live} against above={above}; graph status said:\n{}",
             stdout_of(
                 &kin_against_daemon(repo, home, port, &["graph", "status"]),
                 "kin graph status"
             )
         );
         thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Whether `kin_graph_status` refused this call and asked to be repeated.
+///
+/// `crates/kin-daemon/src/api.rs:2084` fails the call outright when the
+/// embedding-work lock is held, because every count the payload reports has to
+/// describe one instant and it cannot sample them while embedding is moving.
+/// The answer carries that instruction and no observation.
+fn asks_for_retry(payload: &serde_json::Value) -> bool {
+    payload
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|message| message.contains("retry kin_graph_status"))
+}
+
+/// Drive the session, repeating it while the daemon answers with that refusal.
+///
+/// Re-arming the host write above re-parses and re-embeds the file, so the
+/// window in which the status call can land on a held embedding lock is wider
+/// than it was, but the refusal predates this: any write admitted shortly
+/// before the session could always meet it. Reading that refusal as a payload
+/// is asserting on the absence of an answer, so the fixture takes the retry the
+/// tool asked for. The bound is what keeps this a discriminator rather than a
+/// mask: a daemon that never yields the lock still fails, naming how many times
+/// it refused.
+fn settled_mcp_session(repo: &Path, home: &Path, port: u16) -> Vec<(u64, serde_json::Value)> {
+    let deadline = Instant::now() + RETRY_BOUND;
+    let mut refusals = 0_u32;
+    loop {
+        let session = run_mcp_session(repo, home, port);
+        let status = payload(&session, 2, "kin_graph_status");
+        if !asks_for_retry(&status) {
+            return session;
+        }
+        refusals += 1;
+        assert!(
+            Instant::now() < deadline,
+            "kin_graph_status refused {refusals} times without ever sampling its counts: {status}"
+        );
+        thread::sleep(Duration::from_millis(200));
     }
 }
 
@@ -381,16 +549,24 @@ fn mcp_status_and_locate_disclose_live_only_entities_and_then_stop_once_a_commit
     );
 
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    let mut daemon = IsolatedDaemon::spawn(&repo, &runtime);
+    // Kept beside the repository rather than inside it: the fixture reads this
+    // file while the daemon is watching, and a log under the working copy would
+    // be a source of the very events under test.
+    let daemon_log = root.path().join("kin-daemon.log");
+    let mut daemon = IsolatedDaemon::spawn(&repo, &daemon_log, &runtime);
     let port = daemon.wait_until_serving(&repo.join(".kin"));
+    // Serving is not watching, and the write below is the one the watcher has
+    // to see. Nothing replays an event raised before the watch existed.
+    daemon.wait_until_watching();
 
+    let before_write = daemon.log_offset();
     // The transcript's first move: write a file, through nothing but the
     // filesystem, exactly as an agent's `write_file` tool does.
-    fs::write(repo.join("src/link_graph.rs"), UNCOMMITTED_SOURCE)
+    fs::write(repo.join(UNCOMMITTED_PATH), UNCOMMITTED_SOURCE)
         .expect("write the uncommitted source");
-    let live = wait_for_live_growth(&repo, &home, port, durable_at_init);
+    let live = wait_for_live_growth(&daemon, &repo, &home, port, durable_at_init, before_write);
 
-    let uncommitted = run_mcp_session(&repo, &home, port);
+    let uncommitted = settled_mcp_session(&repo, &home, port);
     let status = payload(&uncommitted, 2, "kin_graph_status");
     let locate = payload(&uncommitted, 3, "semantic_locate");
 
@@ -457,7 +633,7 @@ fn mcp_status_and_locate_disclose_live_only_entities_and_then_stop_once_a_commit
     );
     stdout_of(&commit, "kin commit");
 
-    let recorded = run_mcp_session(&repo, &home, port);
+    let recorded = settled_mcp_session(&repo, &home, port);
     let status_after = payload(&recorded, 2, "kin_graph_status");
     let locate_after = payload(&recorded, 3, "semantic_locate");
 
