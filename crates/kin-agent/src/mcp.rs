@@ -131,6 +131,11 @@ impl ToolOutcome {
             "envelope_version",
             "runtime",
             "graph_as_of",
+            // The trace sidecar is the artifact FIR-2421 was reconstructed
+            // from, and it recorded entity counts rising through a session
+            // whose work was never recorded. Summarizing durability beside them
+            // is what lets the next run's trace answer that on its own.
+            "durability",
             "graph_state",
             "semantic_coverage",
         ] {

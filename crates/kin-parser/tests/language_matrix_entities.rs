@@ -612,6 +612,199 @@ fn typescript_relational_shape() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// The CommonJS export surface.
+//
+// express's `lib/utils.js` exports nine names. Six are function literals and
+// three are call results, and the three produced no entity at all: not an
+// unresolved reference the absence machinery could hedge about, but nothing to
+// hedge about. An export sweep run from the graph returned six and reported
+// nothing missing.
+// ---------------------------------------------------------------------------
+
+/// The shape of express's `lib/utils.js`: require bindings at the top, then
+/// nine exports whose right-hand sides are a call on a required module, two
+/// factory calls, a member access, an identifier, a re-exported dependency and
+/// three function literals.
+const EXPORT_SURFACE_JS: &str = r#"
+var { METHODS } = require('node:http');
+var etag = require('etag');
+var bodyParser = require('body-parser');
+
+exports.methods = METHODS.map((method) => method.toLowerCase());
+exports.etag = createETagGenerator({ weak: false });
+exports.wetag = createETagGenerator({ weak: true });
+exports.json = bodyParser.json;
+exports.Router = Router;
+exports.static = require('serve-static');
+exports.normalizeType = function(type) { return acceptParams(type); };
+exports.compileETag = function(val) { return wrap(val); };
+exports.compileQueryParser = function compileQueryParser(val) { return wrap(val); };
+"#;
+
+/// The TypeScript mirror. Both adapters share `extract_js_assignment_function`,
+/// so a divergence here means one of them answers a question about the same
+/// CommonJS source differently from the other.
+const EXPORT_SURFACE_TS: &str = r#"
+var { METHODS } = require('node:http');
+var etag = require('etag');
+var bodyParser = require('body-parser');
+
+exports.methods = METHODS.map((method: string) => method.toLowerCase());
+exports.etag = createETagGenerator({ weak: false });
+exports.wetag = createETagGenerator({ weak: true });
+exports.json = bodyParser.json;
+exports.Router = Router;
+exports.static = require('serve-static');
+exports.normalizeType = function(type: string) { return acceptParams(type); };
+exports.compileETag = function(val: string) { return wrap(val); };
+exports.compileQueryParser = function compileQueryParser(val: string) { return wrap(val); };
+"#;
+
+/// Every name a CommonJS module exports must be reachable from the graph, and
+/// its kind must say what it is.
+fn assert_export_surface(out: &ParseOutput, lang: &str) {
+    let named: Vec<(EntityKind, &str)> = out
+        .entities
+        .iter()
+        .map(|e| (e.kind, e.name.as_str()))
+        .collect();
+
+    // A call result, a member access and a bare identifier are exports as much
+    // as a function literal is. Each is a value, so each is kinded Constant.
+    for want in [
+        (EntityKind::Constant, "methods"),
+        (EntityKind::Constant, "etag"),
+        (EntityKind::Constant, "wetag"),
+        (EntityKind::Constant, "json"),
+        (EntityKind::Constant, "Router"),
+        (EntityKind::Function, "normalizeType"),
+        (EntityKind::Function, "compileETag"),
+        (EntityKind::Function, "compileQueryParser"),
+    ] {
+        assert!(
+            named.contains(&want),
+            "{lang}: missing export {want:?}; have {named:?}"
+        );
+    }
+
+    // Every one of them is public; an export sweep keys on that.
+    for e in &out.entities {
+        assert_eq!(
+            e.visibility,
+            kin_model::Visibility::Public,
+            "{lang}: export {:?} should be public",
+            e.name
+        );
+    }
+
+    // `exports.static = require('serve-static')` is a re-exported dependency.
+    // It reaches the graph as an import specifier under that name, so a
+    // constant beside it would count the same dependency line twice.
+    assert!(
+        !named.iter().any(|(_, n)| *n == "static"),
+        "{lang}: a require re-export must stay an import; have {named:?}"
+    );
+    let static_specifiers: Vec<&str> = out
+        .imports
+        .iter()
+        .filter(|i| i.module_path == "serve-static")
+        .flat_map(|i| i.specifiers.iter().map(|s| s.local_name.as_str()))
+        .collect();
+    assert_eq!(
+        static_specifiers,
+        vec!["static"],
+        "{lang}: serve-static should bind one specifier"
+    );
+
+    // The factory a call-result export is built from is the edge that makes it
+    // reachable from the code that produces it.
+    let calls: Vec<(&str, &str)> = out
+        .relations
+        .iter()
+        .filter(|r| r.kind == kin_model::RelationKind::Calls)
+        .map(|r| (r.src_name.as_str(), r.dst_name.as_str()))
+        .collect();
+    for want in [
+        ("etag", "createETagGenerator"),
+        ("wetag", "createETagGenerator"),
+        ("methods", "map"),
+    ] {
+        assert!(
+            calls.contains(&want),
+            "{lang}: missing Calls {want:?}; have {calls:?}"
+        );
+    }
+
+    // Nine exports in, nine reachable out. Reverting the rule that admits a
+    // non-function right-hand side drops this to six.
+    let exported = [
+        "methods",
+        "etag",
+        "wetag",
+        "json",
+        "Router",
+        "static",
+        "normalizeType",
+        "compileETag",
+        "compileQueryParser",
+    ];
+    let reachable = exported
+        .iter()
+        .filter(|name| {
+            named.iter().any(|(_, n)| n == *name)
+                || out
+                    .imports
+                    .iter()
+                    .any(|i| i.specifiers.iter().any(|s| s.local_name == **name))
+        })
+        .count();
+    assert_eq!(
+        reachable,
+        exported.len(),
+        "{lang}: {reachable} of {} exports reachable; have {named:?}",
+        exported.len()
+    );
+}
+
+#[test]
+fn javascript_commonjs_export_surface() {
+    assert_export_surface(
+        &extract(&JavaScriptAdapter, "utils.js", EXPORT_SURFACE_JS),
+        "javascript",
+    );
+}
+
+#[test]
+fn typescript_commonjs_export_surface() {
+    assert_export_surface(
+        &extract(&TypeScriptAdapter, "utils.ts", EXPORT_SURFACE_TS),
+        "typescript",
+    );
+}
+
+/// `export const X = f(...)` is the ESM form of the same export. It already
+/// produced an entity, and this pins that, so the CommonJS rule and the ESM
+/// path cannot drift into different answers about the same export.
+#[test]
+fn esm_export_const_from_a_call_result_is_a_constant() {
+    let src = "export const etag = createETagGenerator({ weak: false });";
+    for (lang, out) in [
+        ("javascript", extract(&JavaScriptAdapter, "utils.js", src)),
+        ("typescript", extract(&TypeScriptAdapter, "utils.ts", src)),
+    ] {
+        let named: Vec<(EntityKind, &str)> = out
+            .entities
+            .iter()
+            .map(|e| (e.kind, e.name.as_str()))
+            .collect();
+        assert!(
+            named.contains(&(EntityKind::Constant, "etag")),
+            "{lang}: ESM call-result export missing; have {named:?}"
+        );
+    }
+}
+
 #[test]
 #[ignore = "YELLOW: Ruby empty-body method keeps a trailing `end` in the signature (`def helper end`) because there is no `body` field to cut before"]
 fn ruby_empty_body_method_signature_should_exclude_end() {

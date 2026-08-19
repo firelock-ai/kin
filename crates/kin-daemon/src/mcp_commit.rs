@@ -1776,6 +1776,13 @@ fn finalize_committed_transaction(
     timed_finalize_step("install_authority_graph", || {
         install_authority_graph(state.graph.as_ref(), &authority.graph, &committed)
     })?;
+    // The live graph now carries what authority carries, so this is the moment
+    // the two are level and the only honest place to record the durable side's
+    // count (FIR-2421). Taken from the authority graph rather than the live one:
+    // an ambient admission may already have added entities to the live graph
+    // that this commit did not publish, and reading the live count here would
+    // record those as durable.
+    state.record_durable_entity_count(authority.graph.entity_count() as u64);
     let layouts = timed_finalize_step("rebuild_changed_layouts", || {
         if planned_layouts.is_empty() && committed.file_count > 0 {
             rebuild_changed_layouts(state, &authority, &committed.change)

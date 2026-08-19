@@ -1046,6 +1046,30 @@ pub fn resolve_idle_timeout_floor(
 pub struct DaemonState {
     pub layout: KinLayout,
     pub graph: Arc<kin_db::InMemoryGraph>,
+    /// Entities durable repository authority carried the last time this daemon
+    /// levelled its query graph with authority, or `u64::MAX` when it never
+    /// has (FIR-2421).
+    ///
+    /// The live graph above admits host content continuously and records none
+    /// of it: an ambient admission publishes the exact workspace tree and then
+    /// writes derived entities into the live graph alone, so the entity layer
+    /// is rebuilt from zero on the next open. Serving a populated
+    /// `entity_count` without this to compare against is what let a real agent
+    /// read `entity_count: 14`, locate a class it had just written, and
+    /// conclude its work was in the graph.
+    ///
+    /// Recorded where the levelling actually happens and nowhere else: at open,
+    /// from the durable workspace snapshot the query graph is built out of, and
+    /// after a commit installs authority onto the live graph. A path that
+    /// levels without recording leaves this BELOW the live count, which reads
+    /// as uncommitted work that is in fact recorded. That direction is a false
+    /// alarm; the reverse, reporting recorded work that is not, is the defect
+    /// being fixed, and [`kin_mcp::Durability::observe`] refuses to derive a
+    /// count at all once this rises above the live count.
+    ///
+    /// `u64::MAX` rather than an `Option` so the sentinel and the counter share
+    /// one atomic read; [`Self::durable_entity_count`] is the only reader.
+    durable_entity_count: AtomicU64,
     pub blobs: Arc<BlobStore>,
     /// Why the derived ingestion CAS could not be hydrated from graph
     /// authority when this state was opened, if it could not.
@@ -2324,6 +2348,7 @@ impl DaemonState {
             cached_repo_id,
             cached_workspace_id: Some(workspace_id),
             is_shutdown: AtomicBool::new(false),
+            durable_entity_count: AtomicU64::new(loaded_entity_count as u64),
             persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
             mass_deletion_blocked: AtomicBool::new(false),
             retired_graph_only_members: Default::default(),
@@ -2546,6 +2571,7 @@ impl DaemonState {
             cached_repo_id: repo_id.to_string(),
             cached_workspace_id: None,
             is_shutdown: AtomicBool::new(false),
+            durable_entity_count: AtomicU64::new(loaded_entity_count as u64),
             persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
             mass_deletion_blocked: AtomicBool::new(false),
             retired_graph_only_members: Default::default(),
@@ -4879,6 +4905,36 @@ impl DaemonState {
         }
         sync_directory_metadata(parent).map_err(DaemonError::Io)?;
         Ok(())
+    }
+
+    /// How many entities durable repository authority carried when this daemon
+    /// last levelled its query graph with authority, or `None` when it never
+    /// has (FIR-2421).
+    ///
+    /// `None` is a real answer and must not be collapsed to zero. A daemon that
+    /// never levelled cannot say how much of its live graph is recorded, and
+    /// zero would report all of it as uncommitted.
+    pub fn durable_entity_count(&self) -> Option<u64> {
+        match self.durable_entity_count.load(Ordering::Relaxed) {
+            u64::MAX => None,
+            count => Some(count),
+        }
+    }
+
+    /// Record that the live query graph now carries everything durable
+    /// authority carries, and how much that is.
+    ///
+    /// Called from the paths that actually level the two: opening a graph out
+    /// of a durable workspace snapshot, and installing a committed authority
+    /// graph onto the live one. It takes the count rather than reading it back
+    /// off the live graph so the number is the durable side's, not a live side
+    /// an ambient admission may already have moved.
+    pub fn record_durable_entity_count(&self, count: u64) {
+        // The sentinel is a value the counter can never legitimately reach, so
+        // clamping is the only way a real store could ever be read as "never
+        // levelled". A repository with `u64::MAX` entities does not exist.
+        self.durable_entity_count
+            .store(count.min(u64::MAX - 1), Ordering::Relaxed);
     }
 
     /// Read the current durable authority head from

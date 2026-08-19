@@ -625,6 +625,43 @@ fn extract_js_assignment_target(
             return;
         }
 
+        // `exports.X = <expr>` and `module.exports.X = <expr>` export X
+        // whatever the right-hand side is. A function literal is named by the
+        // tail of this function; every other right-hand side produced no entity
+        // at all, so express's `exports.etag = createETagGenerator({ weak: false })`
+        // was absent from the graph rather than merely unlinked. That is worse
+        // than an unresolved reference: an export sweep run from the graph over
+        // `lib/utils.js` returns six of its nine exports and reports nothing
+        // missing, because from the graph's side there is nothing to hedge about.
+        if matches!(receiver_path.as_str(), "exports" | "module.exports")
+            && !property.is_empty()
+            && !is_js_function_like_node(value)
+            // A `require(...)` re-export already reaches the graph as a
+            // `FileImport` specifier under this same name. Emitting a constant
+            // beside it would double every re-exported dependency, which is the
+            // shape that buried express's functions under 451 constants.
+            && js_require_target(value, source).is_none()
+        {
+            entities.push(ExtractedEntity {
+                kind: if value.kind() == "class" {
+                    EntityKind::Class
+                } else {
+                    EntityKind::Constant
+                },
+                name: property.clone(),
+                signature: node_signature(stmt, source),
+                visibility: Visibility::Public,
+                doc_summary: extract_preceding_comment(stmt, source),
+                fingerprint: compute_fingerprint(stmt, source),
+                span: span_from_node(stmt, file_id),
+            });
+            // The factory an export is built from is the one edge that makes
+            // it reachable: `exports.etag` calls `createETagGenerator`. The
+            // statement is what gets walked rather than the value, because the
+            // walk tests a node's children and the value here IS the call.
+            extract_calls_from_context(stmt, source, property, None, relations);
+        }
+
         // `module.exports = { parse() {}, print() {} }` is the CommonJS way of
         // exporting a set of functions. Give each property its own entity so
         // `require('./m').parse` has something to bind to.
@@ -1776,24 +1813,142 @@ exports.static = require('serve-static');
     }
 
     #[test]
-    fn parse_js_value_assignment_skipped() {
-        // exports.Router = Router — value assignment, not a function → should NOT produce entity
+    fn parse_js_value_assignment_is_an_exported_constant() {
+        // `exports.Router = Router` exports Router. The value is not callable
+        // here, so it is a Constant rather than a Function, but it is an export
+        // and has to exist: producing nothing leaves the name unaskable and an
+        // export sweep short by one with nothing to report.
         let adapter = JavaScriptAdapter;
         let source = b"exports.Router = Router;";
         let tree = adapter.parse(source).unwrap();
         let file_id = FilePathId::new("test.js");
         let output = adapter.extract(&tree, source, &file_id).unwrap();
-        let funcs: Vec<_> = output
+        let named: Vec<(EntityKind, &str)> = output
             .entities
             .iter()
-            .filter(|e| e.kind == EntityKind::Function)
+            .map(|e| (e.kind, e.name.as_str()))
             .collect();
-        assert_eq!(
-            funcs.len(),
-            0,
-            "value assignments should not produce entities, got {:?}",
-            funcs
+        assert_eq!(named, vec![(EntityKind::Constant, "Router")]);
+        assert_eq!(output.entities[0].visibility, Visibility::Public);
+    }
+
+    #[test]
+    fn parse_js_exports_call_result_is_an_exported_constant() {
+        // express `lib/utils.js:40`. The right-hand side is a call, so before
+        // the export rule this statement produced no entity at all.
+        let adapter = JavaScriptAdapter;
+        let source = b"exports.etag = createETagGenerator({ weak: false });";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let named: Vec<(EntityKind, &str)> = output
+            .entities
+            .iter()
+            .map(|e| (e.kind, e.name.as_str()))
+            .collect();
+        assert_eq!(named, vec![(EntityKind::Constant, "etag")]);
+        assert_eq!(output.entities[0].visibility, Visibility::Public);
+        assert!(
+            output.entities[0].signature.contains("createETagGenerator"),
+            "the assignment is the body of a call-result export, got {:?}",
+            output.entities[0].signature
         );
+        let calls: Vec<(&str, &str)> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Calls)
+            .map(|r| (r.src_name.as_str(), r.dst_name.as_str()))
+            .collect();
+        assert_eq!(calls, vec![("etag", "createETagGenerator")]);
+    }
+
+    #[test]
+    fn parse_js_module_exports_property_call_result_is_an_exported_constant() {
+        // `module.exports.X` is the same export written the long way; the
+        // receiver path carries the dot, so a bare `exports` match misses it.
+        let adapter = JavaScriptAdapter;
+        let source = b"module.exports.wetag = createETagGenerator({ weak: true });";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let named: Vec<(EntityKind, &str)> = output
+            .entities
+            .iter()
+            .map(|e| (e.kind, e.name.as_str()))
+            .collect();
+        assert_eq!(named, vec![(EntityKind::Constant, "wetag")]);
+    }
+
+    #[test]
+    fn parse_js_exports_class_expression_is_kinded_class() {
+        let adapter = JavaScriptAdapter;
+        let source = b"exports.Router = class {};";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let named: Vec<(EntityKind, &str)> = output
+            .entities
+            .iter()
+            .map(|e| (e.kind, e.name.as_str()))
+            .collect();
+        assert_eq!(named, vec![(EntityKind::Class, "Router")]);
+    }
+
+    #[test]
+    fn parse_js_exports_require_reexport_stays_an_import() {
+        // `exports.static = require('serve-static')` already reaches the graph
+        // as an import specifier named `static`. A constant beside it would
+        // double every re-exported dependency, which is the shape that buried
+        // express's functions under 451 constants.
+        let adapter = JavaScriptAdapter;
+        let source = b"exports.static = require('serve-static');";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        assert!(
+            output.entities.is_empty(),
+            "a require re-export is a dependency line, got {:?}",
+            output
+                .entities
+                .iter()
+                .map(|e| (e.kind, e.name.as_str()))
+                .collect::<Vec<_>>()
+        );
+        let specifiers: Vec<&str> = output
+            .imports
+            .iter()
+            .filter(|i| i.module_path == "serve-static")
+            .flat_map(|i| i.specifiers.iter().map(|s| s.local_name.as_str()))
+            .collect();
+        assert_eq!(specifiers, vec!["static"]);
+    }
+
+    #[test]
+    fn parse_js_export_rule_fires_only_on_the_export_namespace() {
+        // Only `exports` and `module.exports` are the module's export surface.
+        // `window.handler = createHandler()` assigns to a global, and
+        // `module.exports = createApplication()` replaces the whole export
+        // rather than naming one, so neither yields an exported property: the
+        // second would otherwise be recorded under the name `exports`.
+        let adapter = JavaScriptAdapter;
+        for source in [
+            &b"window.handler = createHandler();"[..],
+            &b"module.exports = createApplication();"[..],
+        ] {
+            let tree = adapter.parse(source).unwrap();
+            let file_id = FilePathId::new("test.js");
+            let output = adapter.extract(&tree, source, &file_id).unwrap();
+            assert!(
+                output.entities.is_empty(),
+                "{:?} is not an exported property, got {:?}",
+                std::str::from_utf8(source).unwrap(),
+                output
+                    .entities
+                    .iter()
+                    .map(|e| (e.kind, e.name.as_str()))
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]
