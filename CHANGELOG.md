@@ -26,6 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Say whether an MCP answer's graph is recorded or live-only (#933)
 - Give a CommonJS export assigned from a call result an entity (#934)
 - Route every absence through one gate, so a name filter cannot certify what a reference query refused (#935)
+- Size the daemon idle window against a store's measured boot, and let locate return test-role entities on request (#936)
+- End a trace walk at an external reference target and at a type-annotation edge (#937)
 
 
 ## [0.5.40] - 2026-08-18
