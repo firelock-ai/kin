@@ -41,6 +41,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// The canonical selector name.
 pub const RESOURCE_PROFILE_ENV: &str = "KIN_RESOURCE_PROFILE";
 
+/// Records the value [`apply_product_default`] wrote, so a child process can
+/// tell an inherited product default from an operator's choice.
+///
+/// Provenance does not survive a spawn on its own. A kin binary that selects the
+/// default writes it into its own environment, because that is where kin-infer
+/// and kin-db read it, and every process it spawns then inherits a set variable
+/// that looks exactly like an export the operator typed. The daemon is spawned
+/// by the CLI, so on a host where nobody set anything the daemon saw a present
+/// value, left the atomic false, and `kin resources inspect` reported the ship
+/// default as an operator override.
+///
+/// The marker carries the VALUE rather than a bare flag. A caller that overrides
+/// the profile for a child (a benchmark harness pinning `proof`) passes the new
+/// value without touching the marker, so the two disagree and the child
+/// correctly reads its profile as chosen for it. Trusting a bare flag would
+/// report that override as kin's own default.
+pub const RESOURCE_PROFILE_PRODUCT_DEFAULT_ENV: &str = "KIN_RESOURCE_PROFILE_PRODUCT_DEFAULT";
+
 /// The profile a kin binary selects when the operator has not chosen one.
 ///
 /// `interactive` carries the two Metal kernel levers that preserve embedding
@@ -79,7 +97,32 @@ pub fn apply_product_default() {
     let current = std::env::var(RESOURCE_PROFILE_ENV).ok();
     if let Some(profile) = product_default_for(current.as_deref()) {
         std::env::set_var(RESOURCE_PROFILE_ENV, profile);
+        std::env::set_var(RESOURCE_PROFILE_PRODUCT_DEFAULT_ENV, profile);
         PRODUCT_SELECTED.store(true, Ordering::Relaxed);
+        return;
+    }
+    PRODUCT_SELECTED.store(
+        inherited_product_default(current.as_deref(), |key| std::env::var(key).ok()),
+        Ordering::Relaxed,
+    );
+}
+
+/// Whether a value already present in the environment is one a kin parent
+/// selected rather than one the operator chose.
+///
+/// Pure over its lookup so both sides are testable without touching the process
+/// environment. True only when the marker names the value actually in effect:
+/// a marker naming something else is a stale inheritance from a parent whose
+/// value was overridden on the way down, and it is not evidence about this one.
+pub fn inherited_product_default<F>(current: Option<&str>, lookup: F) -> bool
+where
+    F: Fn(&str) -> Option<String>,
+{
+    match current {
+        None => false,
+        Some(current) => {
+            lookup(RESOURCE_PROFILE_PRODUCT_DEFAULT_ENV).is_some_and(|marked| marked == current)
+        }
     }
 }
 
@@ -100,6 +143,59 @@ pub fn reset_product_selected_for_tests() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `KIN_*` name this code sets must be in the central registry, or every
+    /// kin invocation warns that it is probably a typo.
+    ///
+    /// Nothing connects a `set_var` to the registry at compile time, and the
+    /// registry's own doc-drift test only compares the registry against the
+    /// generated doc, so an unregistered name is invisible to every local gate.
+    /// It surfaces only when a real binary runs: the audit warning went to the
+    /// output of `kin ... --json`, and the install proof failed parsing it with
+    /// "Unexpected non-whitespace character after JSON at position 4". This test
+    /// is the connection that was missing.
+    #[test]
+    fn the_provenance_marker_is_a_registered_environment_variable() {
+        for name in [RESOURCE_PROFILE_ENV, RESOURCE_PROFILE_PRODUCT_DEFAULT_ENV] {
+            assert!(
+                kin_core::env_registry::is_known(name),
+                "{name} is set by this module but is not in the env registry, so every kin \
+                 invocation will warn that it is probably a typo and corrupt any JSON output"
+            );
+        }
+    }
+
+    #[test]
+    fn an_inherited_marker_naming_the_active_value_is_kins_own_default() {
+        // The shape a spawned daemon sees: the CLI wrote both, and the child
+        // inherited both.
+        assert!(inherited_product_default(Some("interactive"), |key| {
+            (key == RESOURCE_PROFILE_PRODUCT_DEFAULT_ENV).then(|| "interactive".to_string())
+        }));
+    }
+
+    #[test]
+    fn a_marker_naming_a_different_value_is_not_evidence_about_this_one() {
+        // A harness pinning `proof` for a child passes the value without
+        // touching the marker. Reading a bare flag here would report the
+        // harness's explicit pin as kin's ship default.
+        assert!(!inherited_product_default(Some("proof"), |key| {
+            (key == RESOURCE_PROFILE_PRODUCT_DEFAULT_ENV).then(|| "interactive".to_string())
+        }));
+    }
+
+    #[test]
+    fn a_present_value_with_no_marker_is_the_operators() {
+        assert!(!inherited_product_default(Some("interactive"), |_| None));
+    }
+
+    #[test]
+    fn an_absent_selector_is_never_inherited() {
+        // Nothing is in effect yet, so there is nothing a marker could describe.
+        assert!(!inherited_product_default(None, |_| Some(
+            "interactive".to_string()
+        )));
+    }
 
     #[test]
     fn absent_selector_takes_the_product_default() {

@@ -3269,7 +3269,8 @@ impl std::fmt::Display for PortWaitError {
             Self::StillStarting => write!(
                 f,
                 "daemon is still starting and has not reported a port yet; it was left running \
-                 rather than killed. Wait for it, or stop it with `kin daemon stop`"
+                 rather than killed and is still loading. Retry in a moment, or stop it with \
+                 `kin daemon stop`"
             ),
             Self::Unwatchable(error) => write!(f, "cannot observe the daemon process: {error}"),
         }
@@ -3277,6 +3278,67 @@ impl std::fmt::Display for PortWaitError {
 }
 
 impl std::error::Error for PortWaitError {}
+
+/// Patience for a live daemon that has not reported a port yet, when nothing is
+/// recorded about this store.
+///
+/// It matches the CLI's readiness default rather than being chosen separately.
+/// Both bound the same thing on the same daemon: a caller waiting for a live
+/// child to finish loading its graph. A dead child is detected by
+/// [`startup_disposition`] independently of any deadline, so this number bounds
+/// only patience.
+pub const DAEMON_STARTUP_PATIENCE_DEFAULT_SECS: u64 = 300;
+
+/// Multiple of a store's recorded boot cost to wait before giving up.
+///
+/// Boot cost varies by more than a factor of two run to run on one store under
+/// ordinary host load. Five separate boots of psf/requests measured 48.9 s,
+/// 50.8 s, 57.7 s, 68.4 s and 71.1 s, and the same host was carrying a build.
+/// A multiple, not a margin, is what survives that spread. It is smaller than
+/// [`CLI_IDLE_BOOT_MULTIPLE`] because the two answer different questions: the
+/// idle window decides how long a warm daemon is worth keeping, and this only
+/// decides how long to wait for one that is provably alive.
+pub const DAEMON_STARTUP_PATIENCE_MULTIPLE: u64 = 4;
+
+/// Ceiling on the scaled wait. A repository slow enough to need longer than this
+/// has a problem a longer wait does not fix.
+pub const DAEMON_STARTUP_PATIENCE_MAX_SECS: u64 = 1_800;
+
+/// Environment override, shared with the CLI's readiness wait because it is the
+/// same question about the same daemon.
+pub const DAEMON_STARTUP_PATIENCE_ENV: &str = "KIN_DAEMON_READY_TIMEOUT_SECS";
+
+/// How long to wait for a live daemon to report its port, given what this store
+/// cost to boot last time.
+///
+/// Reads the same record [`record_boot_cost`] writes and [`cli_idle_window`]
+/// sizes the idle window from, so the MCP revival path and the CLI spawn path
+/// price their waits off one measured fact rather than two.
+///
+/// Pure over both inputs so the policy is testable without a daemon or a process
+/// environment. An operator override wins outright, including a deliberately
+/// short one. Otherwise the floor is the default, and a store whose recorded boot
+/// already exceeds a quarter of it raises the wait to a multiple of what it
+/// actually costs.
+pub fn daemon_startup_patience(recorded_ms: Option<u64>, override_secs: Option<u64>) -> Duration {
+    if let Some(secs) = override_secs {
+        return Duration::from_secs(secs);
+    }
+    let scaled = recorded_ms
+        .map(|ms| (ms / 1_000).saturating_mul(DAEMON_STARTUP_PATIENCE_MULTIPLE))
+        .unwrap_or(0);
+    Duration::from_secs(scaled.clamp(
+        DAEMON_STARTUP_PATIENCE_DEFAULT_SECS,
+        DAEMON_STARTUP_PATIENCE_MAX_SECS,
+    ))
+}
+
+/// Read the operator's patience override, ignoring a value that is not a number.
+pub fn daemon_startup_patience_override() -> Option<u64> {
+    std::env::var(DAEMON_STARTUP_PATIENCE_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
 
 /// Poll the port file until the daemon publishes its bound port.
 ///
@@ -6397,6 +6459,69 @@ mod tests {
             "the detached holder is still holding its spawner's stdout open {} seconds after the \
              spawner exited",
             DETACHED_CLOSE_BUDGET.as_secs()
+        );
+    }
+    /// The MCP revival path gave up after 15 s on a store whose daemon takes
+    /// 48 s to 71 s to report a port, then told the caller to restart. Nothing
+    /// about the wait was measured; the number was a constant.
+    #[test]
+    fn startup_patience_never_falls_below_the_cli_default() {
+        assert_eq!(
+            daemon_startup_patience(None, None),
+            Duration::from_secs(DAEMON_STARTUP_PATIENCE_DEFAULT_SECS)
+        );
+        // A fast store does not buy a shorter wait: a dead child is detected by
+        // its exit, not by this deadline, so shortening it only breaks slow
+        // boots.
+        assert_eq!(
+            daemon_startup_patience(Some(3_000), None),
+            Duration::from_secs(DAEMON_STARTUP_PATIENCE_DEFAULT_SECS)
+        );
+    }
+
+    #[test]
+    fn startup_patience_scales_with_a_slow_stores_recorded_cost() {
+        // Four times a 200 s boot is 800 s, above the floor and below the
+        // ceiling, so the recorded cost is what decides.
+        assert_eq!(
+            daemon_startup_patience(Some(200_000), None),
+            Duration::from_secs(800)
+        );
+        // And it is capped, because a store slower than this has a problem a
+        // longer wait does not fix.
+        assert_eq!(
+            daemon_startup_patience(Some(9_000_000), None),
+            Duration::from_secs(DAEMON_STARTUP_PATIENCE_MAX_SECS)
+        );
+    }
+
+    #[test]
+    fn an_operator_override_wins_outright() {
+        assert_eq!(
+            daemon_startup_patience(Some(200_000), Some(30)),
+            Duration::from_secs(30)
+        );
+    }
+
+    /// The revival wait and the CLI idle window read ONE record, the one the
+    /// daemon writes when it finishes opening a store. Two lanes measured the
+    /// same fact the same night; this asserts the second one reuses the first
+    /// rather than adding a parallel file that can disagree with it.
+    #[test]
+    fn the_revival_wait_prices_off_the_recorded_open_the_cli_also_reads() {
+        let dir = tempfile::tempdir().expect("temp kin root");
+        assert_eq!(read_boot_cost(dir.path()), None);
+        assert_eq!(
+            daemon_startup_patience(read_boot_cost(dir.path()).map(|c| c.total_ms), None),
+            Duration::from_secs(DAEMON_STARTUP_PATIENCE_DEFAULT_SECS),
+            "an unmeasured store answers with the default, never a shorter wait"
+        );
+
+        record_boot_cost(dir.path(), 200_000);
+        assert_eq!(
+            daemon_startup_patience(read_boot_cost(dir.path()).map(|c| c.total_ms), None),
+            Duration::from_secs(800),
+            "a measured store raises the wait to a multiple of its own open"
         );
     }
 }

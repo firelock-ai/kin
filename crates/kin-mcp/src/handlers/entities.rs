@@ -1505,6 +1505,7 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
         default_reference_kinds()
     };
 
+    let addressed_by_name = get_optional_string_param(args, "entity_id").is_none();
     let target = if let Some(entity_id_str) = get_optional_string_param(args, "entity_id") {
         let entity_id = parse_entity_id(&entity_id_str)?;
         store.get_entity(&entity_id).map_err(McpError::graph)?
@@ -1680,6 +1681,39 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     });
     result[crate::edge_coverage::EDGE_COVERAGE_KEY] = edge_coverage;
     disclose_withheld_candidates(&mut result);
+
+    // Say that a bare name was resolved, and to how many candidates.
+    //
+    // A repository holding both `Database.resolve` and `LinkGraph.resolve`
+    // answered `find_references(query: "resolve")` with one of them and its
+    // reference list, and nothing in the response said the other existed. The
+    // answer was right, and a rename driven by it on a colliding name is a
+    // rename driven by an unannounced guess. `trace_data_flow` already reports
+    // this as `focal_resolution`; the shape is copied deliberately so the two
+    // tools answer the same question with the same key.
+    let same_name_candidates = same_name_entity_count(store, &target.name)?;
+    result["focal_resolution"] = serde_json::json!({
+        "addressed_by": if addressed_by_name { "name" } else { "entity_id" },
+        "same_name_candidates": same_name_candidates,
+    });
+    if addressed_by_name && same_name_candidates > 1 {
+        let entry = serde_json::json!({
+            "component": "focal_resolution",
+            "reason": "ambiguous_name",
+            "detail": format!(
+                "{same_name_candidates} entities are named '{}', and this answer describes the \
+                 one reported as focal_entity. Address it by entity_id to pin the choice.",
+                target.name
+            ),
+        });
+        match result
+            .get_mut("degradations")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            Some(existing) => existing.push(entry),
+            None => result["degradations"] = serde_json::Value::Array(vec![entry]),
+        }
+    }
 
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
@@ -4953,6 +4987,56 @@ mod tests {
         assert_eq!(verbose_refs[0]["signature"], "fn caller()");
     }
 
+    /// A bare name that matches several entities is resolved to one of them and
+    /// says so.
+    ///
+    /// A repository holding both `Database.resolve` and `LinkGraph.resolve`
+    /// answered `find_references(query: "resolve")` with one of them and its
+    /// reference list, and nothing in the response mentioned that the other
+    /// existed. The answer was correct; a rename driven by it on a colliding
+    /// name is a rename driven by an unannounced guess.
+    #[tokio::test]
+    async fn find_references_reports_an_ambiguous_name_resolution() {
+        let store = InMemoryGraph::new();
+        let one = make_entity("resolve", "src/database.rs");
+        let two = make_entity("resolve", "src/link_graph.rs");
+        store.upsert_entity(&one).unwrap();
+        store.upsert_entity(&two).unwrap();
+
+        let mut args = HashMap::new();
+        args.insert("query".to_string(), serde_json::json!("resolve"));
+        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+
+        assert_eq!(body["focal_resolution"]["addressed_by"], "name");
+        assert_eq!(
+            body["focal_resolution"]["same_name_candidates"], 2,
+            "two entities carry this name and the response must say so: {body}"
+        );
+        let degradations = body["degradations"]
+            .as_array()
+            .unwrap_or_else(|| panic!("an ambiguous resolution must degrade: {body}"));
+        assert!(
+            degradations
+                .iter()
+                .any(|entry| entry["reason"] == "ambiguous_name"),
+            "the ambiguity must be named, not left to focal_entity: {body}"
+        );
+
+        // Addressing the same entity by id is not ambiguous and must not
+        // degrade: the caller already pinned the choice.
+        let mut pinned = HashMap::new();
+        pinned.insert(
+            "entity_id".to_string(),
+            serde_json::json!(one.id.to_string()),
+        );
+        let exact = parsed_response(&handle_find_references(&pinned, &store, None).await.unwrap());
+        assert_eq!(exact["focal_resolution"]["addressed_by"], "entity_id");
+        assert!(
+            exact.get("degradations").is_none(),
+            "pinning by id resolves nothing and must not degrade: {exact}"
+        );
+    }
+
     /// One row per REFERENCING ENTITY, and `total_upstream` counting those
     /// entities rather than the files they sit in.
     ///
@@ -7619,6 +7703,7 @@ mod tests {
             max_chars: RESPONSE_MAX_MAX_CHARS,
             compact: false,
             explicit_max_chars: true,
+            envelope_reserve: 0,
         }
     }
 

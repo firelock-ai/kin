@@ -59,11 +59,20 @@ const LINUX_LISTING = [
 // artifact prefix at all.
 const WINDOWS_LISTING = ["kin.exe", "kin-daemon.exe", "kin-vfs.exe"];
 
-const MACOS_FILES = ["kin", "kin-daemon", "kin-vfs", "libkin_vfs_shim.dylib"];
-const LINUX_FILES = ["kin", "kin-daemon", "kin-vfs", "libkin_vfs_shim.so"];
+// Documentation members ride on every family, so the per-family expectations
+// below are the executables plus these, sorted.
+const DOC_FILES = ["INSTALL.md", "README.md", "checksums-sha256.txt"];
+const MACOS_FILES = ["kin", "kin-daemon", "kin-vfs", "libkin_vfs_shim.dylib", ...DOC_FILES].sort();
+const LINUX_FILES = ["kin", "kin-daemon", "kin-vfs", "libkin_vfs_shim.so", ...DOC_FILES].sort();
 // Sorted the way the classifier returns names, which puts the bare CLI between
 // the hyphenated binaries and the underscored shim.
-const WINDOWS_FILES = ["kin-daemon.exe", "kin-vfs.exe", "kin.exe", "kin_vfs_shim.dll"];
+const WINDOWS_FILES = [
+  "kin-daemon.exe",
+  "kin-vfs.exe",
+  "kin.exe",
+  "kin_vfs_shim.dll",
+  ...DOC_FILES,
+].sort();
 
 function tempRoot() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "release-archive-shape-"));
