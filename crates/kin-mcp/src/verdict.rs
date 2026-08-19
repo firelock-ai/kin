@@ -113,7 +113,13 @@ impl Verdict {
         envelope: &Envelope,
         negative: Option<&Value>,
     ) -> Option<Self> {
-        let makes_absence_claim = negative.is_some();
+        // A qualifier now rides every retrieval answer, so its presence no longer
+        // means an absence is being claimed. The object says which it is, and
+        // reading that rather than its existence is what keeps
+        // `safe_to_conclude_absent` false on a populated answer.
+        let makes_absence_claim = negative.is_some_and(|negative| {
+            negative.get("interpretation").and_then(Value::as_str) != Some("qualified_answer")
+        });
         let readings = [
             (
                 "absence_gate",
@@ -201,6 +207,27 @@ impl Verdict {
         let Some(completeness) = completeness else {
             return;
         };
+        // `status` follows the verdict too. It reads as a claim that the answer
+        // is whole, whatever it was derived from, and the stranger's report named
+        // it first: `status: "complete"` sat directly above a `classes` map
+        // marking two of three entries absent, and above a `negative` refusing
+        // the same zero. The evidence it was computed from is not lost, because
+        // `classes`, `decided_by` and `limits` are published unchanged beside it;
+        // what changes is that the one-word summary can no longer say "whole"
+        // while the response's verdict says otherwise.
+        //
+        // `partial` when something was actually observed absent, `unknown`
+        // otherwise, because a verdict refused for a reason no class captures is
+        // not evidence that a class was missing.
+        completeness.status = if completeness
+            .classes
+            .values()
+            .any(|state| state.as_str() == Some("absent"))
+        {
+            "partial".to_string()
+        } else {
+            "unknown".to_string()
+        };
         completeness.bound = "at_least".to_string();
         if let Some(counted) = completeness.counted.as_mut().and_then(Value::as_object_mut) {
             counted.insert("exact".to_string(), json!(false));
@@ -253,12 +280,14 @@ impl Verdict {
 /// non-empty answer a floor.
 fn absence_gate_reading(tool: &str, payload: &Value, negative: Option<&Value>) -> Reading {
     if let Some(negative) = negative {
-        return match negative
-            .get("safe_to_conclude_absent")
-            .and_then(Value::as_bool)
-        {
-            Some(true) => Reading::Certified,
-            Some(false) => Reading::Inconclusive(
+        // `trust`, not `safe_to_conclude_absent`. The two answer different
+        // questions and only the first is this response's verdict: a populated
+        // answer sets `safe_to_conclude_absent` false because it claims no
+        // absence, and reading that as the gate refusing made every answer with
+        // rows inconclusive on its own success.
+        return match negative.get("trust").and_then(Value::as_str) {
+            Some("authoritative") => Reading::Certified,
+            Some(_) => Reading::Inconclusive(
                 negative
                     .get("trust_reason")
                     .and_then(Value::as_str)
@@ -297,11 +326,31 @@ fn edge_coverage_reading(tool: &str, payload: &Value) -> Reading {
         .filter(|language| !language.trim().is_empty())
         .unwrap_or("an unreported language");
 
-    if coverage.get("reference_enrichment").and_then(Value::as_str) == Some("unsupported") {
-        return Reading::Inconclusive(format!(
-            "reference_enrichment_unsupported: this build wires no language-server adapter for \
-             {language}, so cross-file reference and override edges cannot exist for it at all"
-        ));
+    // The same reading [`crate::negative::absence_coverage_gap`] takes, on
+    // purpose. `available` is the only enrichment state that licenses a
+    // certification; every other state means nothing established that this host
+    // can produce reference edges for the language, and two inputs that read one
+    // observation differently are the disagreement this module exists to end.
+    match coverage
+        .get("reference_enrichment")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+    {
+        "available" => {}
+        "unsupported" => {
+            return Reading::Inconclusive(format!(
+                "reference_enrichment_unsupported: this build wires no language-server adapter \
+                 for {language}, so cross-file reference and override edges cannot exist for it \
+                 at all"
+            ))
+        }
+        "no_language_server" => {
+            return Reading::Inconclusive(format!(
+                "reference_enrichment_no_language_server: an adapter is wired for {language} but \
+                 no language server for it is installed on this host"
+            ))
+        }
+        _ => {}
     }
     if coverage.get("scope_entities").and_then(Value::as_u64) == Some(0) {
         return Reading::Inconclusive(format!(
