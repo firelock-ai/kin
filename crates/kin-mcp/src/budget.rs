@@ -272,7 +272,16 @@ fn shape_for(tool: &str) -> Option<ResponseShape> {
             narrow_param: "depth",
         },
         "get_context_pack" | "trace_computation" => ResponseShape {
-            collections: &["dependencies", "transitive_deps", "tests", "contracts"],
+            // `dependents` sheds beside `dependencies`: it is the same section
+            // split by direction, and a group the budget cannot trim is a group
+            // that can push a response past its cap on its own.
+            collections: &[
+                "dependencies",
+                "dependents",
+                "transitive_deps",
+                "tests",
+                "contracts",
+            ],
             body_keys: &["body"],
             explain_keys: &["projection"],
             top_explain_keys: &[],

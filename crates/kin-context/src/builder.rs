@@ -236,19 +236,31 @@ impl Default for ContextOptions {
 /// the candidate total beside the kept count.
 pub const SAME_FILE_FALLBACK_MAX: usize = 6;
 
-/// Why a row is in a pack's dependency section.
+/// Why a row is in a pack's dependency section, and which way it points.
 ///
-/// The two are not interchangeable. An edge row is a dependency the graph
-/// asserts; a same-file row is a neighbour the builder reached for because the
-/// focal had no dependency edge at all. A class whose only edges are `Contains`
-/// produces same-file rows, and without this distinction a caller reads them as
-/// the class's dependencies.
+/// The three are not interchangeable. A dependency rides an edge LEAVING the
+/// focal, so the focal needs it. A dependent rides an edge ARRIVING at the
+/// focal, so it needs the focal; changing the focal is what breaks it. A
+/// same-file row is a neighbour the builder reached for because the focal had
+/// no dependency edge in either direction. A class whose only edges are
+/// `Contains` produces same-file rows, and without this distinction a caller
+/// reads them as the class's dependencies.
+///
+/// Direction is not decoration. Every relation kind [`is_dependency_edge`]
+/// accepts runs src-depends-on-dst, so the endpoint alone cannot say which
+/// question a row answers: "what does this need to run" and "what breaks if I
+/// change this" are opposite queries served by opposite edges. Collapsing them
+/// reported a caller as a callee.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DependencyRelation {
-    /// The entity reaches the focal over a real dependency edge.
+    /// The focal reaches this entity over a real dependency edge. The focal
+    /// depends on it.
     DependencyEdge,
-    /// The focal carried no dependency edge, so this row is an entity that
-    /// shares the focal's file. Not a dependency.
+    /// This entity reaches the focal over a real dependency edge. It depends on
+    /// the focal. Not a dependency of the focal.
+    DependentEdge,
+    /// The focal carried no dependency edge in either direction, so this row is
+    /// an entity that shares the focal's file. Not a dependency.
     SameFileNeighbor,
 }
 
@@ -258,7 +270,23 @@ impl DependencyRelation {
     pub fn as_str(self) -> &'static str {
         match self {
             DependencyRelation::DependencyEdge => "dependency_edge",
+            DependencyRelation::DependentEdge => "dependent_edge",
             DependencyRelation::SameFileNeighbor => "same_file_neighbor",
+        }
+    }
+
+    /// Sort bucket for the pack's dependency section: what the focal needs
+    /// first, then what needs the focal, then the fallback neighbours.
+    ///
+    /// A pack whose focal had one callee and nine callers listed the callee
+    /// tenth, because the section was ordered on relation weight alone and
+    /// weight does not know direction. The one row that answers "what does this
+    /// need" must not sit below nine rows that answer a different question.
+    pub fn sort_rank(self) -> u8 {
+        match self {
+            DependencyRelation::DependencyEdge => 0,
+            DependencyRelation::DependentEdge => 1,
+            DependencyRelation::SameFileNeighbor => 2,
         }
     }
 }
@@ -296,6 +324,7 @@ pub struct DependencySelection {
     fallback: bool,
     same_file_candidates: usize,
     same_file_neighbors: Vec<EntityId>,
+    dependents: Vec<EntityId>,
 }
 
 impl DependencySelection {
@@ -308,10 +337,17 @@ impl DependencySelection {
         }
     }
 
-    /// Why one dependency row is in the pack.
+    /// Why one dependency-section row is in the pack, and which way it points.
+    ///
+    /// An entity joined to the focal by edges in BOTH directions is reported as
+    /// a dependency. It is genuinely one, and the stronger claim is the one a
+    /// reader acts on: dropping it would break the focal, which the weaker
+    /// label does not say.
     pub fn relation_for(&self, entity_id: &EntityId) -> DependencyRelation {
         if self.same_file_neighbors.contains(entity_id) {
             DependencyRelation::SameFileNeighbor
+        } else if self.dependents.contains(entity_id) {
+            DependencyRelation::DependentEdge
         } else {
             DependencyRelation::DependencyEdge
         }
@@ -520,15 +556,43 @@ where
 
     // A direct *dependency* must ride a real dependency edge (Calls, Imports,
     // UsesType, …), not git co-change or structural plumbing. Without this gate
-    // the "dependencies" section is dominated by `CoChanges` neighbours and
-    // same-file containment noise rather than the entity's actual callees
-    // An entity counts as a dependency if *any* of its edges to the
-    // focal is a dependency edge.
-    let direct_dep_ids: Vec<EntityId> = direct_relations
-        .iter()
-        .filter(|r| is_dependency_edge(&r.kind))
-        .filter_map(direct_neighbor)
+    // the dependency section is dominated by `CoChanges` neighbours and
+    // same-file containment noise rather than the entity's actual callees.
+    //
+    // Every kind `is_dependency_edge` accepts runs src-depends-on-dst, so the
+    // edge's direction is the whole of the answer: an edge leaving the focal
+    // names something the focal needs, and an edge arriving names something
+    // that needs the focal. Reading the non-focal endpoint without the
+    // direction is how nine callers reached a caller as nine "dependencies".
+    let dependency_edge_relations = || {
+        direct_relations
+            .iter()
+            .filter(|r| is_dependency_edge(&r.kind))
+    };
+    let focal_node = GraphNodeId::Entity(*focal_id);
+    // focal --dep--> X: the focal needs X.
+    let dependency_ids: Vec<EntityId> = dependency_edge_relations()
+        .filter(|r| r.src == focal_node)
+        .filter_map(|r| r.dst.as_entity())
         .collect();
+    // Y --dep--> focal: Y needs the focal. Both directions stay in the section,
+    // because dropping the arriving edges would hide real graph truth behind
+    // the same-file fallback on exactly the entities that have callers and no
+    // callees. They are labelled, not withheld.
+    let dependent_ids: Vec<EntityId> = dependency_edge_relations()
+        .filter(|r| r.dst == focal_node)
+        .filter_map(|r| r.src.as_entity())
+        .filter(|id| !dependency_ids.contains(id))
+        .collect();
+    // The union keeps the section's membership, the fallback trigger, and the
+    // work/annotation scope exactly as they were; only the labels and the order
+    // within the section change.
+    let direct_dep_ids: Vec<EntityId> = dependency_ids
+        .iter()
+        .copied()
+        .chain(dependent_ids.iter().copied())
+        .collect();
+    selection.dependents = dependent_ids;
 
     // BFS only follows outgoing edges, so entities with only incoming edges to
     // the focal (e.g. test entities with a Tests relation pointing at the focal)
@@ -727,6 +791,15 @@ where
             }
         }
     }
+
+    // Order the section by what each row answers, not by relation weight alone.
+    //
+    // Weight ranks a `Calls` edge above a `References` edge whichever way it
+    // points, so a focal with one callee and nine callers listed the callee
+    // last. `sort_by_key` is stable, so weight order survives inside each
+    // bucket and this only lifts the rows that answer "what does this need"
+    // above the rows that answer "what needs this".
+    dep_entries.sort_by_key(|entry| selection.relation_for(&entry.entity_id).sort_rank());
 
     // 4. Gather active work items scoped to focal and direct dependencies.
     let mut work_entries = Vec::new();
@@ -1871,6 +1944,146 @@ mod tests {
                 .iter()
                 .all(|entry| entry.entity_id != sibling.id),
             "a same-file sibling must not join a pack that has real edges"
+        );
+    }
+
+    /// The greenfield stranger's pack listed nine callers under "dependencies"
+    /// and put the one real callee tenth. Direction is the whole of the answer:
+    /// every kind `is_dependency_edge` accepts runs src-depends-on-dst, so an
+    /// edge leaving the focal names what the focal needs and an edge arriving
+    /// names what needs the focal. Reading only the non-focal endpoint reported
+    /// callers as callees, and ordering on relation weight alone buried the one
+    /// row that answered the question asked.
+    #[test]
+    fn one_dependency_leads_the_section_and_nine_dependents_are_labelled_as_such() {
+        use kin_model::relation::{Relation, RelationKind, RelationOrigin};
+
+        let store = kin_db::InMemoryGraph::new();
+        let calls = |src: EntityId, dst: EntityId| {
+            store
+                .upsert_relation(&Relation {
+                    id: kin_model::ids::RelationId::new(),
+                    kind: RelationKind::Calls,
+                    src: GraphNodeId::Entity(src),
+                    dst: GraphNodeId::Entity(dst),
+                    confidence: 1.0,
+                    origin: RelationOrigin::Parsed,
+                    created_in: None,
+                    import_source: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        };
+
+        let focal = make_file_entity("save_note", EntityKind::Function, "src/store.py");
+        // The one entity the focal needs.
+        let dependency = make_file_entity("serialize", EntityKind::Function, "src/codec.py");
+        store.upsert_entity(&focal).unwrap();
+        store.upsert_entity(&dependency).unwrap();
+        calls(focal.id, dependency.id);
+
+        // Nine entities that need the focal.
+        let mut dependents = Vec::new();
+        for index in 0..9 {
+            let caller = make_file_entity(
+                &format!("handle_request_{index}"),
+                EntityKind::Function,
+                &format!("src/api_{index}.py"),
+            );
+            store.upsert_entity(&caller).unwrap();
+            calls(caller.id, focal.id);
+            dependents.push(caller);
+        }
+
+        let (pack, selection) =
+            build_context_pack_with_provenance(&store, &focal.id, &ContextOptions::default())
+                .unwrap();
+
+        assert_eq!(selection.source(), DependencySource::DependencyEdges);
+        assert_eq!(
+            pack.dependency_signatures.len(),
+            10,
+            "both directions stay in the pack; only the labels and the order change"
+        );
+
+        // Labels first, then order. The order is DERIVED from the labels, so
+        // asserting it first would report a mislabelling as a sort bug and hide
+        // which of the two actually broke.
+        assert_eq!(
+            selection.relation_for(&dependency.id),
+            DependencyRelation::DependencyEdge,
+            "an edge leaving the focal is a dependency"
+        );
+        for caller in &dependents {
+            assert_eq!(
+                selection.relation_for(&caller.id),
+                DependencyRelation::DependentEdge,
+                "'{}' calls the focal, so it depends on the focal; reporting it as a \
+                 dependency inverts the claim a caller acts on",
+                caller.name
+            );
+        }
+        let labelled_dependencies = pack
+            .dependency_signatures
+            .iter()
+            .filter(|entry| {
+                selection.relation_for(&entry.entity_id) == DependencyRelation::DependencyEdge
+            })
+            .count();
+        assert_eq!(
+            labelled_dependencies, 1,
+            "exactly one row rides an edge that leaves the focal"
+        );
+
+        assert_eq!(
+            pack.dependency_signatures[0].entity_id, dependency.id,
+            "the one entity the focal depends on must lead the section, not trail nine callers"
+        );
+    }
+
+    /// An entity joined to the focal in both directions is a dependency: the
+    /// focal really does need it, and that is the claim a reader acts on when
+    /// deciding what may be removed.
+    #[test]
+    fn a_mutual_edge_is_reported_as_a_dependency_not_a_dependent() {
+        use kin_model::relation::{Relation, RelationKind, RelationOrigin};
+
+        let store = kin_db::InMemoryGraph::new();
+        let calls = |src: EntityId, dst: EntityId| {
+            store
+                .upsert_relation(&Relation {
+                    id: kin_model::ids::RelationId::new(),
+                    kind: RelationKind::Calls,
+                    src: GraphNodeId::Entity(src),
+                    dst: GraphNodeId::Entity(dst),
+                    confidence: 1.0,
+                    origin: RelationOrigin::Parsed,
+                    created_in: None,
+                    import_source: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        };
+
+        let focal = make_file_entity("ping", EntityKind::Function, "src/a.py");
+        let peer = make_file_entity("pong", EntityKind::Function, "src/b.py");
+        store.upsert_entity(&focal).unwrap();
+        store.upsert_entity(&peer).unwrap();
+        calls(focal.id, peer.id);
+        calls(peer.id, focal.id);
+
+        let (pack, selection) =
+            build_context_pack_with_provenance(&store, &focal.id, &ContextOptions::default())
+                .unwrap();
+
+        assert_eq!(
+            pack.dependency_signatures.len(),
+            1,
+            "one entity produces one row however many edges join it to the focal"
+        );
+        assert_eq!(
+            selection.relation_for(&peer.id),
+            DependencyRelation::DependencyEdge
         );
     }
 

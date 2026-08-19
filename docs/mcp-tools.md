@@ -128,9 +128,17 @@ boundary you can rely on.
 - **`get_entity`**: Fetch metadata about a specific entity (kind, language, path, line range, signature) without its source body.
 - **`get_entity_source` / `get_entity_body`**: Retrieve the implementation source of an entity, served from the graph.
 - **`get_entity_sources`**: The batch form of `get_entity_source`. Hand it up to 50 entity IDs in priority order and it returns each entity's metadata plus its body in one budgeted call, which replaces the N separate round-trips and N response envelopes those reads would otherwise cost. Bodies fill in the order you list the IDs until the shared `token_budget` is reached, and entities past that point come back signature-only with `omitted=true`.
-- **`get_context_pack`**: Package a target entity alongside its caller/import neighborhood into a single prompt-friendly bundle.
+- **`get_context_pack`**: Package a target entity alongside its caller/import neighborhood into a single prompt-friendly bundle. The two directions come back as separate named groups: `dependencies` is what the focal needs to run, `dependents` is what breaks if you change it, and every row carries a `relation` saying which way its edge points.
 - **`explore_codebase`**: Get a one-shot map of the codebase via a selectable strategy (e.g. `overview`: entity counts by kind and language, plus the top public declarations).
 - **`graph_neighborhood`**: Return the dependency neighborhood of an entity, traversed to a given depth. The neighborhood covers what it depends on and what depends on it. `direction` selects which side to walk: `out` for dependencies, `in` for dependents (blast radius), `both` (default) for the merged neighborhood; every returned edge is tagged with the direction it was traversed in.
+
+**On a new or very small repository, expect the value curve to start later.** Kin ranks on
+cross-file structure, and a project of a few files has little of it yet. `kin commit`,
+`kin graph status`, `trace_data_flow`, and `get_entity_source` earn their keep from the
+first checkpoint. `semantic_locate` by description does not, until the graph is bigger, so
+ask by exact name at that size. Below the ranker's fusion constant `semantic_locate`
+discloses the limit itself, as a `corpus_scale` entry in `degradations`, so the weakness is
+reported rather than served as a confident answer.
 
 ---
 

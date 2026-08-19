@@ -430,6 +430,17 @@ processes that do not inherit your `PATH`.)
 > on by default, so these tools have a live graph to query. `semantic_locate` returns an
 > explicit error in offline / no-daemon mode.
 
+### What to ask for on a brand new project
+
+Adjust the ask when the repository is one you just started. Kin ranks on cross-file
+structure, and a five-file project has the least of it. The tools that pay off from the
+first checkpoint are `kin commit`, `kin graph status` to watch the graph fill in,
+`trace_data_flow` for how the pieces wire together, and `get_entity_source` for reading
+code back. Description-shaped `semantic_locate` queries need more entities than a new
+project has, so ask by exact name at that size and let ranked retrieval earn your trust as
+the graph grows. When the graph is small enough for this to bite, `semantic_locate` says so
+in its `degradations` array rather than leaving you to find out from a weak answer.
+
 For the full tool surface, see the [MCP Tools Reference](mcp-tools.md). To wire up a
 client by hand (or use the npm wrapper), see
 [Advanced configuration](#9-advanced-configuration).

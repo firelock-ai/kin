@@ -81,8 +81,15 @@ pub struct ContextTarget {
 pub struct ContextDependencySelection {
     /// `dependency_edges` or `same_file_fallback`.
     pub source: String,
-    /// Rows in `pack.dependency_signatures`.
+    /// Rows in `pack.dependency_signatures` the focal depends on, plus any
+    /// same-file fallback rows. This is the count the `Dependencies` line
+    /// reports.
     pub returned: usize,
+    /// Rows in `pack.dependency_signatures` that depend on the focal instead.
+    /// They ride real edges and stay in the pack; they are simply not
+    /// dependencies, and counting them as such reported callers as callees.
+    #[serde(default)]
+    pub dependents_returned: usize,
     /// Same-file neighbours the fallback had to choose from. Zero when the
     /// fallback did not run.
     pub same_file_candidates: usize,
@@ -200,6 +207,8 @@ pub fn build_context_response(
 
     let (pack, selection) =
         kin_context::build_context_pack_with_provenance(graph, &target.id, &opts)?;
+    let dependents_returned = count_dependents(&pack, &selection);
+    let dependencies_returned = pack.dependency_signatures.len() - dependents_returned;
 
     let mut lines = vec![
         format!("Context pack for '{}' ({:?}):", target.name, target.kind),
@@ -211,9 +220,10 @@ pub fn build_context_response(
         format!("  Focal: {} entries", pack.focal_entities.len()),
         format!(
             "  Dependencies: {} entries{}",
-            pack.dependency_signatures.len(),
-            dependency_selection_note(&selection, pack.dependency_signatures.len())
+            dependencies_returned,
+            dependency_selection_note(&selection, dependencies_returned)
         ),
+        format!("  Dependents: {} entries", dependents_returned),
         format!("  Transitive: {} entries", pack.transitive_deps.len()),
         format!("  Contracts: {} entries", pack.contracts.len()),
         format!("  Tests: {} entries", pack.tests.len()),
@@ -242,12 +252,31 @@ pub fn build_context_response(
         }),
         dependency_selection: Some(ContextDependencySelection {
             source: selection.source().as_str().to_string(),
-            returned: pack.dependency_signatures.len(),
+            returned: dependencies_returned,
+            dependents_returned,
             same_file_candidates: selection.same_file_candidates(),
             same_file_dropped: selection.same_file_dropped(),
         }),
         pack: Some(pack),
     })
+}
+
+/// Rows in the pack's dependency section that depend on the focal.
+///
+/// Counted off the rows themselves rather than tracked as a separate total, so
+/// the number cannot drift from the list it describes when the token budget
+/// drops a row.
+fn count_dependents(
+    pack: &kin_model::context::ContextPack,
+    selection: &kin_context::DependencySelection,
+) -> usize {
+    pack.dependency_signatures
+        .iter()
+        .filter(|entry| {
+            selection.relation_for(&entry.entity_id)
+                == kin_context::DependencyRelation::DependentEdge
+        })
+        .count()
 }
 
 /// The parenthetical after the dependency count in the human rendering.
