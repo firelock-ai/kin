@@ -127,6 +127,9 @@ jobs:
           bash -n ./scripts/verify-npm-release.sh
           bash -n ./scripts/assert-windows-init-contract.sh
           bash -n ./scripts/windows-authority-legs.sh
+          bash -n ./scripts/test-windows-authority-legs.sh
+          bash -n ./scripts/release-policy-gate.sh
+          bash -n ./scripts/test-release-policy-gate.sh
           bash -n ./scripts/verify-base-image-pins.sh
           # install.sh is the public installer users pipe straight into a shell,
           # and the one with no pull-request syntax check. Its only `sh -n` runs
@@ -796,6 +799,14 @@ jobs:
       - name: Report the documentation-only fast path
         run: echo "documentation-only diff; build and test validation not applicable"
 
+  # The macOS half of this job moved to `check-macos` + `check-macos-aggregate`
+  # below, so this one now carries the ubuntu-latest context alone. The matrix
+  # stays, with one value, because it is what makes the display name expand to
+  # `Check & Test (ubuntu-latest)`, the exact required context name, and what
+  # keeps a SKIPPED job from expanding at all. The `runner.os == 'Linux'`
+  # conditions further down are now always true and are kept rather than
+  # deleted: they document which steps are Linux-only by intent, and they are
+  # what would keep this job honest if a platform were ever added back.
   check:
     name: Check & Test
     needs: changes
@@ -812,7 +823,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest]
     steps:
       - uses: actions/checkout@v7
 
@@ -957,9 +968,30 @@ jobs:
       - name: Validate mandatory Homebrew release outcome gate
         run: python3 scripts/test-homebrew-release-gate.py
 
+      # Every validator below polices a repo-global invariant, so a break in one
+      # is a property of the tree rather than of the change under test and the
+      # identical failure lands on every open pull request and every queue entry
+      # at once. On 2026-08-19 a kin-vfs pin that had drifted between
+      # release.yml and rc-build.yml failed this step 70 times and ejected 32
+      # queue entries; four of the seven pull requests it ejected touched
+      # nothing release-related and could neither have caused the drift nor
+      # fixed it. The gate runs the same validators and routes their failure:
+      # hard for anything reaching release machinery, for the release pull
+      # request, for a push, and for a diff it cannot read, and a warning
+      # annotation otherwise. The invocations stay here rather than moving into
+      # the gate because the assertion-reachability gate reads this file to
+      # prove each suite still runs on pull requests.
       - name: Validate automatic release policy
         if: runner.os == 'Linux'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KIN_POLICY_EVENT: ${{ github.event_name }}
+          KIN_POLICY_HEAD_REF: ${{ github.head_ref }}
+          KIN_POLICY_REPOSITORY: ${{ github.repository }}
+          KIN_POLICY_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          KIN_POLICY_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
         run: |
+          bash scripts/release-policy-gate.sh <<'RELEASE_POLICY'
           python3 scripts/test-release-workflow-authority.py
           node --test \
             scripts/check-glibc-floor.test.mjs \
@@ -972,6 +1004,7 @@ jobs:
           node --check scripts/check-release-version.mjs
           node --check scripts/prepare-release.mjs
           node --check scripts/release-intent.mjs
+          RELEASE_POLICY
 
       # rc-build.yml builds release-candidate archives from a copy of
       # release.yml's build job, so the archive stranger and the preflight Linux
@@ -1052,63 +1085,41 @@ jobs:
           # nothing.
           python3 scripts/falsify-hydration-semantics.py "$poisoned"
 
-      # TEMPORARY debt allow-list; burn entries down and delete each allow once its
-      # lint is clean. No additions without lead sign-off.
-      # Enumerated from `cargo clippy --all-targets --all-features` on main against
-      # the CI toolchain (rustc/clippy 1.96.0, the channel in rust-toolchain.toml):
-      # 45 distinct clippy lints (the 1.96 bump from 1.94 added collapsible_match,
-      # manual_checked_ops, useless_conversion). The `--` keeps these allows AFTER the
-      # RUSTFLAGS=-Dwarnings group so each specific lint overrides it. (The ArtifactId
-      # deprecation is now enforced. Its `-A deprecated` rustc allow was removed once the
-      # graph-assigned ArtifactId migration landed.)
+      # Two gates that ROUTE a failure rather than merely reporting one: the
+      # release-policy gate decides whether a repo-global break belongs to the
+      # change under test, and the Windows leg helpers decide whether a leg's
+      # test selection was real. Each is driven in both directions here, the arm
+      # it must accept and the arm it must refuse, because a routing gate that
+      # only ever passes is indistinguishable from one that has stopped
+      # deciding. Both run after the toolchain step because the leg helpers
+      # resolve a compilation unit through cargo.
+      - name: Falsify the release policy and Windows leg gates
+        if: runner.os == 'Linux'
+        run: |
+          bash scripts/test-release-policy-gate.sh
+          bash scripts/test-windows-authority-legs.sh
+
+      # The debt allow-list lives in .github/clippy-allowed-lints.txt, with its
+      # own provenance note. Two jobs run clippy now, one per platform, and only
+      # the macOS one lints macOS-gated code; two inline copies of a 45-entry
+      # list would drift, and the drift would be invisible until the platform
+      # whose copy lost an allow went red for a lint nobody meant to enforce.
       - name: Clippy
-        run: >
-          cargo clippy --all-targets --all-features --
-          -A clippy::await_holding_lock
-          -A clippy::bool_assert_comparison
-          -A clippy::clone_on_copy
-          -A clippy::collapsible_if
-          -A clippy::collapsible_match
-          -A clippy::derivable_impls
-          -A clippy::doc_lazy_continuation
-          -A clippy::doc_overindented_list_items
-          -A clippy::field_reassign_with_default
-          -A clippy::filter_map_bool_then
-          -A clippy::for_kv_map
-          -A clippy::format_in_format_args
-          -A clippy::if_same_then_else
-          -A clippy::int_plus_one
-          -A clippy::io_other_error
-          -A clippy::items_after_test_module
-          -A clippy::large_enum_variant
-          -A clippy::len_zero
-          -A clippy::manual_checked_ops
-          -A clippy::manual_contains
-          -A clippy::manual_is_multiple_of
-          -A clippy::manual_map
-          -A clippy::manual_pattern_char_comparison
-          -A clippy::manual_strip
-          -A clippy::map_entry
-          -A clippy::match_single_binding
-          -A clippy::missing_const_for_thread_local
-          -A clippy::needless_borrow
-          -A clippy::needless_option_as_deref
-          -A clippy::needless_question_mark
-          -A clippy::needless_return
-          -A clippy::new_without_default
-          -A clippy::only_used_in_recursion
-          -A clippy::ptr_arg
-          -A clippy::redundant_closure
-          -A clippy::redundant_field_names
-          -A clippy::regex_creation_in_loops
-          -A clippy::result_large_err
-          -A clippy::too_many_arguments
-          -A clippy::type_complexity
-          -A clippy::unnecessary_cast
-          -A clippy::unnecessary_map_or
-          -A clippy::unnecessary_sort_by
-          -A clippy::unnecessary_unwrap
-          -A clippy::useless_conversion
+        shell: bash
+        run: |
+          set -euo pipefail
+          allows="$(grep -Ev '^(#|$)' .github/clippy-allowed-lints.txt | tr '\n' ' ')"
+          words="$(printf '%s\n' "$allows" | wc -w | tr -d ' ')"
+          if [ "$words" -lt 2 ]; then
+            echo "::error title=Empty clippy debt list::.github/clippy-allowed-lints.txt carries no allows"
+            echo "Clippy would run with the RUSTFLAGS -D warnings group and nothing" >&2
+            echo "overriding it, so every entry on the debt list would go red at once." >&2
+            exit 1
+          fi
+          echo "clippy debt allow-list: $((words / 2)) lints"
+          # The allow list is a word list, and splitting it is the point.
+          # shellcheck disable=SC2086
+          cargo clippy --all-targets --all-features -- $allows
 
       - name: Check Runtime Boundaries
         run: bash scripts/check_runtime_boundaries.sh
@@ -1195,6 +1206,160 @@ jobs:
       - name: Doc tests
         # nextest does not run doctests; keep them covered explicitly.
         run: cargo test --doc --locked
+
+  # The macOS half of Check & Test, sharded.
+  #
+  # `Check & Test (macos-latest)` was the last required check to report on 83%
+  # of merge_group runs and 73% of pull-request runs, at ~21.9 min. Of that,
+  # 14.2 min is the `Test` step alone: 6454 tests in 801.6s, against 7.5 min for
+  # the identical suite on ubuntu-latest, because macos-latest is a three-core
+  # arm64 runner and nextest ran the suite as a single partition. Splitting the
+  # partition is the whole point of this job.
+  #
+  # What this job carries is what macOS can answer differently from ubuntu:
+  # clippy over macOS-gated code, the build, the tests, and the doctests. The
+  # steps it does not carry are the source-reading gates whose result cannot
+  # depend on the runner at all, from the README language count through the
+  # zero-file-search and hydration guards. `Check & Test (ubuntu-latest)` is a
+  # required context and runs every one of them, so none is lost; running them a
+  # second time bought nothing but macOS minutes at ten times the billing rate.
+  #
+  # Within that set, shard 1 runs everything and shard 2 runs its own build and
+  # its own partition. Nothing before `Test` can differ between the shards, so
+  # repeating it would only pay twice for one answer, and the build is the one
+  # thing a partition genuinely needs of its own.
+  #
+  # This job publishes no required context. `check-macos-aggregate` below does,
+  # and it fails unless every shard here succeeded.
+  check-macos:
+    name: Check & Test macOS shard
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+    runs-on: macos-latest
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    strategy:
+      # A shard that dies must not take its sibling with it. With fail-fast on,
+      # one red shard cancels the other, the aggregate reads `cancelled` for a
+      # partition that was passing, and the run reports one cause where there
+      # may be two.
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+        with:
+          components: clippy, rustfmt
+
+      - name: Verify kin cargo registry config
+        run: |
+          test -f .cargo/config.toml
+          grep -q '^\[registries\.kin\]' .cargo/config.toml
+          if grep -q '^\[patch\.kin\]' .cargo/config.toml; then echo "::error::[patch.kin] git pins must be removed. kin-* resolve from the Kin registry"; exit 1; fi
+
+      # Same trusted-ref scoping as every other cached job: restore always, save
+      # only from main. Both shards restore the same main entry, so the second
+      # one is not paying for the first one's warmth.
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # See .github/clippy-allowed-lints.txt. This is the only clippy pass over
+      # macOS-gated code, which is why it stays on the macOS side rather than
+      # being left to the ubuntu leg.
+      - name: Clippy
+        if: matrix.shard == 1
+        shell: bash
+        run: |
+          set -euo pipefail
+          allows="$(grep -Ev '^(#|$)' .github/clippy-allowed-lints.txt | tr '\n' ' ')"
+          words="$(printf '%s\n' "$allows" | wc -w | tr -d ' ')"
+          if [ "$words" -lt 2 ]; then
+            echo "::error title=Empty clippy debt list::.github/clippy-allowed-lints.txt carries no allows"
+            echo "Clippy would run with the RUSTFLAGS -D warnings group and nothing" >&2
+            echo "overriding it, so every entry on the debt list would go red at once." >&2
+            exit 1
+          fi
+          echo "clippy debt allow-list: $((words / 2)) lints"
+          # The allow list is a word list, and splitting it is the point.
+          # shellcheck disable=SC2086
+          cargo clippy --all-targets --all-features -- $allows
+
+      - name: Build
+        run: cargo build --all-targets --locked
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      # `--partition count:N/M` splits the suite by test, deterministically, so
+      # the two shards together run exactly the set one unpartitioned run ran.
+      # The aggregate below is what makes "together" enforceable: a shard that
+      # never reported cannot leave its partition silently unrun.
+      - name: Test
+        run: cargo nextest run --locked --partition count:${{ matrix.shard }}/2
+
+      # nextest does not run doctests, so partitioning cannot cover them and one
+      # shard has to. They are a 0.9 min step and splitting them would cost more
+      # in a second cold `cargo test --doc` than it could save.
+      - name: Doc tests
+        if: matrix.shard == 1
+        run: cargo test --doc --locked
+
+  # The required context for macOS. Its display name plus its one matrix value
+  # compose to `Check & Test (macos-latest)`, byte for byte what ruleset
+  # 19746451, release-tag.yml's REQUIRED_CHECKS and expected_provenance tables,
+  # scripts/test-release-workflow-authority.py, and docs/release-bot.md all name.
+  # Nothing about that string changes; only the job producing it does.
+  #
+  # The matrix is not decoration. A skipped matrix job never expands, so on a
+  # documentation-only diff this publishes the bare `Check & Test` name and
+  # leaves `check-docs-only` as the sole producer of the expanded one, exactly
+  # as the real and stub `check` jobs already behave. Without the matrix, a
+  # skipped aggregate would publish `Check & Test (macos-latest)` as `skipped`
+  # beside the stub's success, and two check runs under one required name is the
+  # ambiguity the release mint refuses on.
+  #
+  # It runs on ubuntu-latest deliberately: it compiles nothing and spends
+  # seconds, and macOS bills at ten times the rate. The matrix value names the
+  # platform this context speaks for, not the platform it runs on.
+  check-macos-aggregate:
+    name: Check & Test
+    needs: [changes, check-macos]
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      matrix:
+        os: [macos-latest]
+    steps:
+      # `needs.<job>.result` for a matrix job is the roll-up of every leg, so
+      # this is `success` only when both shards succeeded. Requiring exactly
+      # `success` is what makes a SKIPPED or CANCELLED shard fail this check
+      # rather than pass it: a shard that never ran left half the macOS suite
+      # unexecuted, and a required context that goes green on that is worse than
+      # no context at all.
+      - name: Require every macOS shard to have succeeded
+        env:
+          SHARDS: ${{ needs.check-macos.result }}
+        run: |
+          set -euo pipefail
+          if [ "$SHARDS" != "success" ]; then
+            echo "::error title=macOS shards did not pass::the sharded macOS Check & Test legs reported '$SHARDS'"
+            echo "Every partition of the macOS suite has to report success for this" >&2
+            echo "context to be evidence that the suite ran. 'skipped' and 'cancelled'" >&2
+            echo "mean a partition did not run at all." >&2
+            exit 1
+          fi
+          echo "every macOS Check & Test shard succeeded"
 
   # Two sets of steps used to run inside Check & Test and gate nothing that
   # needed them to be there. Both sat on the merge queue's critical path: five

@@ -1,0 +1,62 @@
+# TEMPORARY debt allow-list; burn entries down and delete each allow once its
+# lint is clean. No additions without lead sign-off.
+#
+# Enumerated from `cargo clippy --all-targets --all-features` on main against
+# the CI toolchain (rustc/clippy 1.96.0, the channel in rust-toolchain.toml):
+# 45 distinct clippy lints (the 1.96 bump from 1.94 added collapsible_match,
+# manual_checked_ops, useless_conversion). Every consumer passes these AFTER a
+# `--`, which is what keeps each specific allow overriding the
+# RUSTFLAGS=-Dwarnings group. (The ArtifactId deprecation is now enforced. Its
+# `-A deprecated` rustc allow was removed once the graph-assigned ArtifactId
+# migration landed.)
+#
+# The list lives in a file rather than inline in ci.yml because two jobs now run
+# clippy, one per platform, and macOS-gated code is linted only by the macOS
+# one. Two inline copies would drift, and the drift would be invisible: the
+# platform whose copy still allowed a lint would stay green while the other went
+# red for a lint nobody meant to enforce yet.
+-A clippy::await_holding_lock
+-A clippy::bool_assert_comparison
+-A clippy::clone_on_copy
+-A clippy::collapsible_if
+-A clippy::collapsible_match
+-A clippy::derivable_impls
+-A clippy::doc_lazy_continuation
+-A clippy::doc_overindented_list_items
+-A clippy::field_reassign_with_default
+-A clippy::filter_map_bool_then
+-A clippy::for_kv_map
+-A clippy::format_in_format_args
+-A clippy::if_same_then_else
+-A clippy::int_plus_one
+-A clippy::io_other_error
+-A clippy::items_after_test_module
+-A clippy::large_enum_variant
+-A clippy::len_zero
+-A clippy::manual_checked_ops
+-A clippy::manual_contains
+-A clippy::manual_is_multiple_of
+-A clippy::manual_map
+-A clippy::manual_pattern_char_comparison
+-A clippy::manual_strip
+-A clippy::map_entry
+-A clippy::match_single_binding
+-A clippy::missing_const_for_thread_local
+-A clippy::needless_borrow
+-A clippy::needless_option_as_deref
+-A clippy::needless_question_mark
+-A clippy::needless_return
+-A clippy::new_without_default
+-A clippy::only_used_in_recursion
+-A clippy::ptr_arg
+-A clippy::redundant_closure
+-A clippy::redundant_field_names
+-A clippy::regex_creation_in_loops
+-A clippy::result_large_err
+-A clippy::too_many_arguments
+-A clippy::type_complexity
+-A clippy::unnecessary_cast
+-A clippy::unnecessary_map_or
+-A clippy::unnecessary_sort_by
+-A clippy::unnecessary_unwrap
+-A clippy::useless_conversion

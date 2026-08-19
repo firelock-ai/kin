@@ -495,10 +495,43 @@ REAL_CHECK_JOB_AUTHORITY = textwrap.dedent(
         CARGO_PROFILE_TEST_DEBUG: "0"
       strategy:
         matrix:
-          os: [ubuntu-latest, macos-latest]
+          os: [ubuntu-latest]
       steps:
     """
 ).rstrip()
+# The macOS shards publish `Check & Test macOS shard (1)` and `(2)`, which no
+# ruleset requires, and the aggregate is what publishes the required
+# `Check & Test (macos-latest)`. Two properties make that safe and both are
+# pinned here, because neither is observable from the required context's name:
+# the aggregate carries a one-value matrix, without which a SKIPPED aggregate
+# would publish the expanded name beside the documentation-only stub's and put
+# two check runs under one required name; and it admits only `success` from the
+# shard roll-up, without which a skipped or cancelled shard would leave half the
+# macOS suite unrun behind a green required context.
+MACOS_SHARD_AGGREGATE_AUTHORITY = textwrap.dedent(
+    """\
+    check-macos-aggregate:
+      name: Check & Test
+      needs: [changes, check-macos]
+      if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+      runs-on: ubuntu-latest
+      timeout-minutes: 5
+      strategy:
+        matrix:
+          os: [macos-latest]
+      steps:
+    """
+).rstrip()
+# Indented as `classifier_active_job_source` renders a dedented job block, which
+# is the form these are matched against.
+MACOS_SHARD_RUNNER = "  runs-on: macos-latest"
+MACOS_SHARD_INDEPENDENT_LEGS = "    fail-fast: false"
+MACOS_SHARD_MATRIX = "      shard: [1, 2]"
+MACOS_SHARD_PARTITION = (
+    "      run: cargo nextest run --locked --partition count:${{ matrix.shard }}/2"
+)
+MACOS_SHARD_DOCTESTS = "      run: cargo test --doc --locked"
+MACOS_SHARD_SUCCESS_GATE = 'if [ "$SHARDS" != "success" ]; then'
 CI_JOB_DISPLAY_NAMES = {
     "dco": "DCO Sign-off",
     "npm-launchers": "npm launcher tests",
@@ -509,6 +542,13 @@ CI_JOB_DISPLAY_NAMES = {
     "changes": "Classify diff scope",
     "check-docs-only": "Check & Test",
     "check": "Check & Test",
+    # The macOS half of Check & Test, split so its 14.2-minute test step can run
+    # as two nextest partitions. The shard job publishes a name of its own and
+    # is required by nothing; the aggregate publishes `Check & Test` with a
+    # one-value matrix, which expands to the release-required
+    # `Check & Test (macos-latest)` and is what the ruleset names.
+    "check-macos": "Check & Test macOS shard",
+    "check-macos-aggregate": "Check & Test",
     # Both were steps inside `check` and are jobs so they stop sitting on the
     # merge queue's critical path. Neither is a required context until the
     # branch ruleset names it, so each is listed here to be reviewed as a
@@ -680,9 +720,16 @@ EXPECTED_DYNAMIC_JOB_CONTEXT_SHA256 = {
     ): "495829aee07c97dfd59924fcac7ff3ddb57be574ffd0bf741adc93a37425b492",
 }
 REQUIRED_CHECK_JOB_PRODUCERS = {
+    # Three producers, one per required expansion plus the documentation-only
+    # stub. `check` carries ubuntu-latest, `check-macos-aggregate` carries
+    # macos-latest and is green only when every `check-macos` shard succeeded,
+    # and `check-docs-only` publishes both names on a documentation-only diff.
+    # The real jobs and the stub stay mutually exclusive by condition, so no two
+    # of them ever publish the same expanded name on one event.
     "Check & Test": {
         (".github/workflows/ci.yml", "check-docs-only"),
         (".github/workflows/ci.yml", "check"),
+        (".github/workflows/ci.yml", "check-macos-aggregate"),
     },
     "Falsify guards": {
         (".github/workflows/ci.yml", "falsify-guards"),
@@ -4156,6 +4203,54 @@ def assert_check_consumer_authority(workflow: str) -> None:
             "Check & Test consumer authority requires the exact real check admission "
             "and matrix contract"
         )
+
+
+def assert_macos_shard_authority(workflow: str) -> None:
+    """Pin the sharded macOS producer of `Check & Test (macos-latest)`.
+
+    Sharding a required context is the cheapest possible way to lose half a test
+    suite. The shards publish names no ruleset requires, so nothing outside this
+    file notices what they run; the aggregate publishes the name the ruleset
+    does require, and it is a five-second job that compiles nothing. Everything
+    that makes it evidence rather than decoration is asserted here, because none
+    of it is visible from the context name:
+
+    the aggregate admits only `success` from the shard roll-up, so a SKIPPED or
+    CANCELLED shard fails it instead of passing it; it carries a one-value matrix,
+    so a skipped aggregate publishes the bare name and cannot put a second check
+    run under the required expanded one beside the documentation-only stub; the
+    shards run the partitions, which together are the suite one unpartitioned run
+    ran; one shard still runs the doctests nextest does not run; and fail-fast is
+    off, so a red shard cannot cancel a sibling that was passing.
+    """
+
+    blocks = workflow_job_blocks(workflow)
+    shards = blocks.get("check-macos")
+    aggregate = blocks.get("check-macos-aggregate")
+    if shards is None or aggregate is None:
+        raise AssertionError(
+            "macOS shard authority requires both the shard job and its aggregate"
+        )
+    if real_check_job_authority_source(aggregate) != MACOS_SHARD_AGGREGATE_AUTHORITY:
+        raise AssertionError(
+            "macOS shard authority requires the exact reviewed aggregate admission "
+            "and matrix contract"
+        )
+
+    active_shards = classifier_active_job_source(shards)
+    for policy in (
+        MACOS_SHARD_RUNNER,
+        MACOS_SHARD_INDEPENDENT_LEGS,
+        MACOS_SHARD_MATRIX,
+        MACOS_SHARD_PARTITION,
+        MACOS_SHARD_DOCTESTS,
+    ):
+        require(active_shards, policy, "macOS shard authority")
+    require(
+        classifier_active_job_source(aggregate),
+        MACOS_SHARD_SUCCESS_GATE,
+        "macOS shard authority",
+    )
 
 
 def execute_docs_only_classifier(
@@ -11129,9 +11224,92 @@ def main() -> None:
         ),
     )
     assert_check_consumer_authority(ci_workflow)
+    assert_macos_shard_authority(ci_workflow)
     consumer_blocks = workflow_job_blocks(ci_workflow)
     docs_only_check = consumer_blocks["check-docs-only"]
     real_check = consumer_blocks["check"]
+    macos_shards = consumer_blocks["check-macos"]
+    macos_aggregate = consumer_blocks["check-macos-aggregate"]
+
+    for label, old, new in (
+        (
+            "the aggregate accepts a shard result that is not success",
+            'if [ "$SHARDS" != "success" ]; then',
+            'if [ "$SHARDS" = "failure" ]; then',
+        ),
+        (
+            "the aggregate loses the matrix that keeps a skip from expanding",
+            "        os: [macos-latest]",
+            "        os: []",
+        ),
+        (
+            "the aggregate stops waiting on the shards",
+            "    needs: [changes, check-macos]",
+            "    needs: changes",
+        ),
+        (
+            "the aggregate takes the display name of the shard job",
+            "    name: Check & Test",
+            "    name: Check & Test macOS aggregate",
+        ),
+    ):
+        if macos_aggregate.count(old) != 1:
+            raise AssertionError(
+                f"macOS shard falsification could not identify {label}"
+            )
+        mutant_workflow = ci_workflow.replace(
+            macos_aggregate, macos_aggregate.replace(old, new, 1), 1
+        )
+        expect_assertion(
+            label,
+            "macOS shard authority",
+            lambda mutant_workflow=mutant_workflow: assert_macos_shard_authority(
+                mutant_workflow
+            ),
+        )
+
+    for label, old, new in (
+        (
+            "a shard stops partitioning and both legs run the whole suite",
+            "        run: cargo nextest run --locked "
+            "--partition count:${{ matrix.shard }}/2",
+            "        run: cargo nextest run --locked",
+        ),
+        (
+            "the doctest pass nextest cannot run disappears",
+            "        run: cargo test --doc --locked",
+            "        run: echo doctests skipped",
+        ),
+        (
+            "one red shard is allowed to cancel its passing sibling",
+            "      fail-fast: false",
+            "      fail-fast: true",
+        ),
+        (
+            "the shards leave macOS",
+            "    runs-on: macos-latest",
+            "    runs-on: ubuntu-latest",
+        ),
+        (
+            "the shard count changes without the partition denominator",
+            "        shard: [1, 2]",
+            "        shard: [1, 2, 3]",
+        ),
+    ):
+        if macos_shards.count(old) != 1:
+            raise AssertionError(
+                f"macOS shard falsification could not identify {label}"
+            )
+        mutant_workflow = ci_workflow.replace(
+            macos_shards, macos_shards.replace(old, new, 1), 1
+        )
+        expect_assertion(
+            label,
+            "macOS shard authority",
+            lambda mutant_workflow=mutant_workflow: assert_macos_shard_authority(
+                mutant_workflow
+            ),
+        )
 
     docs_only_condition = (
         "    if: ${{ !cancelled() && needs.changes.outputs.docs_only == 'true' }}"
@@ -11228,9 +11406,13 @@ def main() -> None:
             "    runs-on: ubuntu-latest",
         ),
         (
+            # Restoring the two-platform matrix is the specific regression to
+            # catch: `check` would publish `Check & Test (macos-latest)` again,
+            # beside the aggregate's, and put two check runs under one required
+            # context name.
             "real Check & Test matrix changed",
-            "        os: [ubuntu-latest, macos-latest]",
             "        os: [ubuntu-latest]",
+            "        os: [ubuntu-latest, macos-latest]",
         ),
     ):
         if real_check.count(old) != 1:
@@ -12366,10 +12548,11 @@ def main() -> None:
 
     ci_path = WORKFLOWS / "ci.yml"
     check_start = ci_workflow.index("\n  check:")
-    # `falsify-guards` and `feature-tests` sit between `check` and `coverage`,
-    # so slicing to `coverage:` would hand this falsification three jobs and
-    # count save lines that are not the check job's.
-    check_end = ci_workflow.index("\n  falsify-guards:", check_start)
+    # The slice has to stop at the very next job. `check-macos` follows `check`
+    # and caches too, and `falsify-guards` and `feature-tests` follow that, so
+    # slicing to any of them would hand this falsification several jobs and count
+    # save lines that are not the check job's.
+    check_end = ci_workflow.index("\n  check-macos:", check_start)
     check_job = ci_workflow[check_start:check_end]
     save_line = f"          {MAIN_ONLY_CACHE_SAVE}\n"
     if check_job.count(save_line) != 1:
