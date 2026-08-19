@@ -31,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Resolve JavaScript module specifiers and count the edges they produce (#938)
 - chore(ci): pin kin-actions v0.1.31 (#944)
 - Pin kin-vfs-core 0.4.5 and the kin-vfs release checkout to the composed mount landing (#942)
+- Hold the Git capture lease before the name a reap tests exists (#943)
+- Give the MCP belt calls that retire and relocate source, and pin what a retirement takes with it (#939)
 
 
 ## [0.5.40] - 2026-08-18
