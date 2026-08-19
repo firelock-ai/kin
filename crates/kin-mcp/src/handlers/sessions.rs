@@ -664,8 +664,20 @@ pub async fn handle_transaction_begin(
 }
 
 pub const TRANSACTION_STAGE_DESC: &str = "\
-Stage one or more mutation operations onto an active transaction. Two verbs admit source, \
-and which one you want depends on whether the graph has seen the file before. \
+Stage one or more mutation operations onto an active transaction. Four verbs move source, \
+and which one you want depends on what is happening to the file. Use 'create' to admit one \
+the graph has never seen, 'update' to change an entity inside one it holds, 'delete' to \
+retire one outright, and 'rename' to move one. \
+Use verb 'delete' (or 'remove') with `target` set to a repository-relative path to retire a \
+tracked file: {verb: \"delete\", target: \"<repository-relative path>\", description: \"...\"}. \
+It takes the file, every entity derived from it, and every edge incident to those entities \
+out of the graph in one change, and the commit removes the working file. Send no body; a \
+delete carrying text is refused rather than guessed at. Deleting the file with some other \
+tool does NOT retire it, for the same reason writing one does not admit it. \
+Use verb 'rename' (or 'move') with `target` and `destination` to relocate a tracked file: \
+{verb: \"rename\", target: \"<current path>\", destination: \"<new path>\", description: \"...\"}. \
+Entity ids, history, and every incoming reference survive the move, which is what you lose \
+if you delete and re-create instead. The destination must not be tracked already. \
 Use verb 'create' (or 'add'/'insert') to admit a file the graph has never seen: \
 {verb: \"create\", target: \"<repository-relative path, e.g. src/parser.py>\", \
 body: \"<the file's complete source text>\", description: \"...\"}. This is the ONLY \
@@ -740,20 +752,56 @@ pub async fn handle_transaction_stage<G: GraphStore>(
     // conflicting create between stage and commit, and commit remains the
     // authority that catches that race.
     for (idx, operation) in operations.iter().enumerate() {
-        if !crate::session::is_new_source_file(operation) {
+        if crate::session::is_new_source_file(operation) {
+            let target = operation.target.trim();
+            let Ok(path) = kin_model::RepoPath::from_utf8(target.to_string()) else {
+                continue;
+            };
+            if store.artifact_id_at_path(&path).is_some() {
+                return Err(crate::error::McpError::InvalidParams(format!(
+                    "operation #{idx} ('create'): {target:?} is already tracked by repository \
+                     authority, so it cannot be created; 'create' admits only source the graph \
+                     has never seen. Edit it with verb 'update' naming an entity inside it, or \
+                     create a path that does not exist yet"
+                )));
+            }
             continue;
         }
-        let target = operation.target.trim();
-        let Ok(path) = kin_model::RepoPath::from_utf8(target.to_string()) else {
-            continue;
-        };
-        if store.artifact_id_at_path(&path).is_some() {
-            return Err(crate::error::McpError::InvalidParams(format!(
-                "operation #{idx} ('create'): {target:?} is already tracked by repository \
-                 authority, so it cannot be created; 'create' admits only source the graph has \
-                 never seen. Edit it with verb 'update' naming an entity inside it, or create a \
-                 path that does not exist yet"
-            )));
+        // A retirement and a rename are the mirror image: they name a path the
+        // graph must already hold, and the same snapshot answers both. A
+        // retirement of a path nothing tracks is not a harmless no-op, because
+        // the caller believes a file left the graph and it never did.
+        if crate::session::is_retired_source_file(operation)
+            || crate::session::is_renamed_source_file(operation)
+        {
+            let verb = operation.verb.trim().to_lowercase();
+            let target = operation.target.trim();
+            let Ok(path) = kin_model::RepoPath::from_utf8(target.to_string()) else {
+                continue;
+            };
+            if store.artifact_id_at_path(&path).is_none() {
+                return Err(crate::error::McpError::InvalidParams(format!(
+                    "operation #{idx} ('{verb}'): {target:?} is not tracked by repository \
+                     authority, so there is nothing to {verb}. Name a repository-relative path \
+                     the graph already holds; kin_graph_status and semantic_locate report what \
+                     it holds"
+                )));
+            }
+            let Some(destination) = operation.destination.as_deref().map(str::trim) else {
+                continue;
+            };
+            let Ok(destination_path) = kin_model::RepoPath::from_utf8(destination.to_string())
+            else {
+                continue;
+            };
+            if store.artifact_id_at_path(&destination_path).is_some() {
+                return Err(crate::error::McpError::InvalidParams(format!(
+                    "operation #{idx} ('{verb}'): {destination:?} is already tracked by \
+                     repository authority, so {target:?} cannot move onto it; a rename may not \
+                     overwrite a file. Retire the destination first, or pick a path that does \
+                     not exist yet"
+                )));
+            }
         }
     }
 
@@ -955,9 +1003,25 @@ fn offline_only_uncommittable_operations(operations: &[McpMutationOperation]) ->
     operations
         .iter()
         .enumerate()
-        .filter(|(_, op)| crate::session::carries_source_body(op))
+        .filter(|(_, op)| {
+            crate::session::carries_source_body(op)
+                || crate::session::is_retired_source_file(op)
+                || crate::session::is_renamed_source_file(op)
+        })
         .map(|(idx, op)| {
-            let shape = if op.payload.is_some() {
+            // A retirement and a rename carry no body, so the body-shaped
+            // refusal above cannot see them, and the in-process delta builder
+            // has no arm for either: both would land as `ops_applied: 0`,
+            // `empty: true`, which is a refusal wearing the costume of a
+            // no-op transaction. They need the daemon for the same reason a
+            // body edit does. A tree transition has to reach repository
+            // authority and the working copy has to be projected to match, and
+            // this path can do neither.
+            let shape = if crate::session::is_retired_source_file(op) {
+                "a payload-less retirement (target naming a tracked path)"
+            } else if crate::session::is_renamed_source_file(op) {
+                "a payload-less rename (target plus destination)"
+            } else if op.payload.is_some() {
                 "an entity payload plus a source body"
             } else {
                 "a payload-less source update (target plus body)"
@@ -970,9 +1034,9 @@ fn offline_only_uncommittable_operations(operations: &[McpMutationOperation]) ->
             };
             format!(
                 "operation #{idx} ('{}'): {shape} for target '{target}' requires the daemon \
-                 commit path, which plans the exact span edit and projects the new source into \
-                 the working file; the in-process commit path has no projection and would report \
-                 success while discarding the body",
+                 commit path, which carries the tree transition into repository authority and \
+                 projects the working copy to match; the in-process commit path has no \
+                 projection and would report success while discarding it",
                 op.verb,
             )
         })

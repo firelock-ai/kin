@@ -55,18 +55,67 @@ fn destructive_idempotent(title: &str) -> ToolAnnotations {
 
 /// Honest JSON Schema for one transaction operation.
 ///
-/// The product daemon accepts three materially different shapes. A source-body
-/// edit and a new source file are both intentionally payload-less; structured
-/// entity/relation mutations require `payload`. Keeping these as disjoint
-/// `oneOf` branches prevents MCP clients from being told that the preferred
-/// source-edit form is invalid.
+/// The product daemon accepts five materially different shapes. A source-body
+/// edit, a new source file, a retirement, and a rename are all intentionally
+/// payload-less; structured entity/relation mutations require `payload`.
+/// Keeping these as disjoint `oneOf` branches prevents MCP clients from being
+/// told that the preferred source-edit form is invalid.
 ///
-/// The branches cannot both match one operation: the two payload-less branches
+/// No two branches can match one operation: the four payload-less branches
 /// carry disjoint verb enums, and the structured branch requires `payload`,
-/// which neither of the others accepts.
+/// which none of the others accepts.
 fn transaction_operation_schema() -> serde_json::Value {
     serde_json::json!({
         "oneOf": [
+            {
+                "title": "Retired source file",
+                "type": "object",
+                "properties": {
+                    "verb": {
+                        "type": "string",
+                        "enum": ["delete", "remove"],
+                        "description": "Retire a tracked file. This is the only operation that removes a file, along with every entity derived from it and every edge incident to those entities."
+                    },
+                    "target": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Repository-relative path of the file to retire, such as \"src/parser.py\". It must be a path repository authority already tracks; a path the graph has never seen is refused."
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Human-readable explanation of this change."
+                    }
+                },
+                "required": ["verb", "target", "description"],
+                "additionalProperties": false
+            },
+            {
+                "title": "Renamed source file",
+                "type": "object",
+                "properties": {
+                    "verb": {
+                        "type": "string",
+                        "enum": ["rename", "move"],
+                        "description": "Relocate a tracked file. Entity identity, history, and incoming edges survive the move, which is what separates this from a delete followed by a create."
+                    },
+                    "target": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Repository-relative path the file lives at now. It must be a path repository authority already tracks."
+                    },
+                    "destination": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Repository-relative path the file moves to. It must not be tracked already, and it follows the same path rules as `target`: no leading slash, no \"..\", and no Kin or Git control component."
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Human-readable explanation of this change."
+                    }
+                },
+                "required": ["verb", "target", "destination", "description"],
+                "additionalProperties": false
+            },
             {
                 "title": "New source file",
                 "type": "object",
@@ -1623,7 +1672,43 @@ mod tests {
             let variants = tool["inputSchema"]["properties"]["operations"]["items"]["oneOf"]
                 .as_array()
                 .expect("transaction operations must be disjoint oneOf variants");
-            assert_eq!(variants.len(), 3, "{tool_name}");
+            assert_eq!(variants.len(), 5, "{tool_name}");
+
+            let retirement = variants
+                .iter()
+                .find(|variant| variant["title"] == "Retired source file")
+                .expect("payload-less retirement branch");
+            assert_eq!(
+                required_set(retirement),
+                ["description", "target", "verb"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+            );
+            assert!(
+                retirement["properties"].get("payload").is_none(),
+                "payload-less retirement branch must reject payload"
+            );
+            assert!(
+                retirement["properties"].get("body").is_none(),
+                "a retirement carries no body; accepting one would let a delete read as an edit"
+            );
+
+            let rename = variants
+                .iter()
+                .find(|variant| variant["title"] == "Renamed source file")
+                .expect("payload-less rename branch");
+            assert_eq!(
+                required_set(rename),
+                ["description", "destination", "target", "verb"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+            );
+            assert!(
+                rename["properties"].get("payload").is_none(),
+                "payload-less rename branch must reject payload"
+            );
 
             let new_source_file = variants
                 .iter()

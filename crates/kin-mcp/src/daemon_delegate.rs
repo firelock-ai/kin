@@ -3163,6 +3163,7 @@ mod tests {
             target: String::new(),
             payload,
             body: None,
+            destination: None,
             description: String::new(),
         }
     }
@@ -3197,7 +3198,8 @@ mod tests {
             "`description` (string, REQUIRED)",
             "`body` (string, optional)",
             "`payload` (object, optional)",
-            "create/add/upsert/insert, update/modify, or delete/remove",
+            "`destination` (string, optional)",
+            "create/add/upsert/insert, update/modify, delete/remove, or rename/move",
         ] {
             assert!(err.contains(expected), "refusal omits {expected:?}: {err}");
         }
