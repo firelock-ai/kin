@@ -120,8 +120,14 @@ chmod +x "$WORK/bin/cargo"
 
 export PATH="$WORK/bin:$PATH"
 export CARGO_TARGET_DIR="$WORK/target"
-export KIN_WINDOWS_LEG_CACHE_DIR="$WORK/leg-cache"
-mkdir -p "$KIN_WINDOWS_LEG_CACHE_DIR"
+
+# KIN_WINDOWS_LEG_CACHE_DIR is deliberately NOT set. Pinning it here was how the
+# memo's own assertion came to prove nothing: the helpers create the directory
+# themselves when the variable is empty, that is the path CI takes, and an
+# earlier version created a fresh one per call and missed every time. A test
+# that supplies the directory exercises neither. The override is covered
+# separately at the end.
+unset KIN_WINDOWS_LEG_CACHE_DIR
 
 cd "$FIXTURE"
 
@@ -152,14 +158,23 @@ cargo_entries() {
 # stage's, so nothing here is judged through `head`, `tail`, or a pipe.
 LAST_OUTPUT=""
 
+# The positive arm calls the helpers DIRECTLY, in this shell, because that is
+# how ci.yml calls them and because the memo depends on it: the helpers export
+# their cache directory, and an export made inside a command substitution dies
+# with the subshell. Running the positive arm through substitutions is what let
+# a memo that missed every single time read as a passing assertion. The cost is
+# that a helper's hard `exit` takes this file with it, so the label is printed
+# BEFORE the call and the run's last line names where it stopped.
 expect_pass() {
   local label="$1"
   shift
+  echo "  running: $label"
   local status=0
-  LAST_OUTPUT="$( "$@" 2>&1 )" || status=$?
+  "$@" > "$WORK/last.log" 2>&1 || status=$?
+  LAST_OUTPUT="$(cat "$WORK/last.log")"
   if [ "$status" -ne 0 ]; then
     fail "$label did not pass (exit $status)"
-    printf '%s\n' "$LAST_OUTPUT" >&2
+    cat "$WORK/last.log" >&2
     return 1
   fi
   report "$label"
@@ -290,6 +305,39 @@ expect_refusal "a target that lists zero tests" \
   "listed zero tests" \
   run_nonempty_target "no tests at all" --lib
 cd "$FIXTURE"
+
+echo "cache directory arm"
+
+# The helpers must have created the directory themselves, in THIS shell, which
+# is what makes the memo survive between legs. If they created it inside a
+# command substitution the variable would be unset here and every leg would have
+# built its own.
+if [ -n "${KIN_WINDOWS_LEG_CACHE_DIR:-}" ] && [ -d "$KIN_WINDOWS_LEG_CACHE_DIR" ]; then
+  report "the helpers created and exported one cache directory"
+else
+  fail "no cache directory survived the legs; the memo cannot persist"
+fi
+
+entries="$(find "$KIN_WINDOWS_LEG_CACHE_DIR" -type f | wc -l | tr -d ' ')"
+if [ "$entries" -ge 2 ]; then
+  report "the cache holds $entries resolved units"
+else
+  fail "the cache holds $entries entries after several distinct units"
+fi
+
+# The override still works, and a caller-supplied directory is used rather than
+# a fresh one.
+override="$WORK/explicit-cache"
+mkdir -p "$override"
+(
+  export KIN_WINDOWS_LEG_CACHE_DIR="$override"
+  run_required_filter "override cache" "unit_" --lib > /dev/null 2>&1
+)
+if [ "$(find "$override" -type f | wc -l | tr -d ' ')" -ge 1 ]; then
+  report "an explicit cache directory is honoured"
+else
+  fail "an explicit KIN_WINDOWS_LEG_CACHE_DIR was ignored"
+fi
 
 if [ "$failures" -ne 0 ]; then
   echo "windows authority leg helpers: $failures assertion(s) failed" >&2

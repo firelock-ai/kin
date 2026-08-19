@@ -83,12 +83,23 @@ _leg_count_lines() {
 # current directory, so the same arguments in two directories are two units; and
 # without the prefix an empty argument vector keys the cache DIRECTORY itself,
 # which `-s` reports as non-empty and `cat` then reads as a resolved unit.
-_leg_cache_dir() {
+#
+# Where the directory is created is what decides whether the memo works at all.
+# A command substitution runs in a subshell, so an export made inside one is
+# discarded the moment it returns. The first version of this returned the
+# directory on stdout and every caller read it as `$(_leg_cache_dir)`, so each
+# call minted a FRESH mktemp directory the next call could not see. The memo
+# missed every time, the helpers fell back to one cargo entry per leg, and the
+# job stayed green while giving the saving back. Measured on run 32276720780:
+# eight `Finished test profile` lines in a job whose eight legs name a single
+# compilation unit. This is why the initialiser sets a variable instead of
+# printing one, and why the bottom of this file calls it at source time, in the
+# shell that sourced it.
+_leg_cache_dir_init() {
   if [ -z "${KIN_WINDOWS_LEG_CACHE_DIR:-}" ]; then
     KIN_WINDOWS_LEG_CACHE_DIR="$(mktemp -d)"
     export KIN_WINDOWS_LEG_CACHE_DIR
   fi
-  printf '%s\n' "$KIN_WINDOWS_LEG_CACHE_DIR"
 }
 
 _leg_cache_key() {
@@ -103,7 +114,8 @@ _leg_cache_key() {
 # instead of being swallowed by the capture.
 resolve_leg_unit() {
   local cache artifacts executables manifests count
-  cache="$(_leg_cache_dir)/$(_leg_cache_key "$@")"
+  _leg_cache_dir_init
+  cache="$KIN_WINDOWS_LEG_CACHE_DIR/$(_leg_cache_key "$@")"
   if [ -f "$cache" ] && [ -s "$cache" ]; then
     cat "$cache"
     return 0
@@ -277,3 +289,12 @@ compile_required_target() {
   fi
   echo "$label: compiled and listed required test '$required_test'"
 }
+
+# Initialise the memo HERE, at source time, in the shell that sourced this file.
+# `resolve_leg_unit` is always reached through a command substitution, because
+# every helper reads its stdout, and an export made inside a substitution dies
+# with the subshell that made it. Initialising there produced a fresh directory
+# per call and a memo that missed every time, which is invisible: the helpers
+# fall back to one cargo entry per leg and the job stays green. A `source` runs
+# in the caller's shell, so this is the one place the export survives.
+_leg_cache_dir_init
