@@ -168,7 +168,7 @@ pub async fn run(path: Option<String>, json: bool, no_enrich: bool) -> Result<()
     // Runs before the result is printed so what a reader is told about their
     // repository is true of the repository they now have.
     if !no_enrich {
-        enrich_after_init(result.layout.working_dir()).await;
+        enrich_after_init(result.layout.root()).await;
     }
 
     if json {
@@ -196,8 +196,13 @@ const ENRICH_BUDGET: std::time::Duration = std::time::Duration::from_secs(900);
 /// language server was missing, slow, or broken would turn an enrichment
 /// shortfall into a conversion failure. The shortfall is visible afterwards:
 /// `kin doctor` reports the enrichment gap and names the command that closes it.
-async fn enrich_after_init(working_dir: &Path) {
-    let url = match crate::daemon_client::ensure_daemon_running(working_dir).await {
+/// `kin_root` is the `.kin` directory, which is what `ensure_daemon_running`
+/// takes. Passing the working directory instead resolves a store that is not
+/// there and fails with a version error naming a layout nothing wrote, which is
+/// exactly how this read as "no daemon could be started" on a repository whose
+/// store had just been created successfully.
+async fn enrich_after_init(kin_root: &Path) {
+    let url = match crate::daemon_client::ensure_daemon_running(kin_root).await {
         Ok(url) => url,
         Err(error) => {
             eprintln!(
@@ -269,7 +274,15 @@ async fn enrich_after_init(working_dir: &Path) {
             .get("sweeps_completed")
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
-        if completed > baseline {
+        let running = status
+            .get("running")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        // Both, not either. The counter says a sweep ended; `running` says none
+        // is in flight now. Returning on the counter alone hands back a graph a
+        // later sweep is still mutating, and a query issued into that window
+        // fails to resolve entities it resolves fine before and after.
+        if completed > baseline && !running {
             println!("  cross-file enrichment complete ({done}/{total} files)");
             return;
         }

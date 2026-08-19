@@ -11139,17 +11139,20 @@ async fn lsp_sweep(
             &state.layout.working_dir().display().to_string(),
         ));
     }
+    // Read BEFORE queueing. This is the count a waiter must see exceeded, and
+    // it has to describe the moment before this sweep exists, whether this call
+    // queued one or found one already running.
     let queued_after = state
         .lsp_sweeps_completed
         .load(std::sync::atomic::Ordering::SeqCst);
-    state.queue_lsp_sweep();
+    let queued = state.queue_lsp_sweep();
     // `sweeps_completed` at the moment of queueing is what makes the wait
     // correct. A caller that polls `running` alone races the worker: it can read
     // idle before the message is picked up and conclude the sweep it just asked
     // for has finished. Handing back the count it must exceed removes the race
     // without the caller having to know the worker exists.
     Ok(Json(json!({
-        "status": "sweep_queued",
+        "status": if queued { "sweep_queued" } else { "sweep_already_running" },
         "sweeps_completed": queued_after,
         "enrichment_available": state.lsp_enrichment_tx.is_some(),
     })))

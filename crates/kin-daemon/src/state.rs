@@ -5417,17 +5417,32 @@ impl DaemonState {
     /// no cross-file reference edge was ever produced. The daemon now queues one
     /// at startup when servers are present and the graph holds files with no
     /// language-server evidence yet.
-    pub fn queue_lsp_sweep(&self) {
+    pub fn queue_lsp_sweep(&self) -> bool {
         if self.filesystem_reconcile_disabled() {
-            return;
+            return false;
+        }
+        // One sweep at a time. The daemon queues one at startup and a caller may
+        // queue another, and two sweeps over one graph is not merely wasteful:
+        // a waiter that captured its baseline before the second was queued sees
+        // the FIRST one finish, returns, and hands back a graph the second is
+        // still mutating. That is what left `kin init` reporting a converged
+        // repository while a sweep ran on underneath it.
+        if self
+            .lsp_sweep_running
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return false;
         }
         if let Some(ref tx) = self.lsp_enrichment_tx {
             if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
                 tx.try_send(LspEnrichmentMessage::Sweep)
             {
                 warn!("LSP enrichment channel full, sweep request dropped");
+                return false;
             }
+            return true;
         }
+        false
     }
 
     /// Return the current reconciliation status as a human-readable string.
