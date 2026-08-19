@@ -32,6 +32,13 @@ pub enum HealthStatus {
     /// needing attention, because the surface is not answering at full strength
     /// yet, but it never blocks readiness: nothing is wrong and nothing is lost.
     Pending,
+    /// A real shortfall in the machine or container Kin was asked to run on,
+    /// rather than in the install. It reads red because ignoring it costs the
+    /// reader work, and it never blocks readiness because nothing about the
+    /// install is wrong: a host below a measured cost is a fact about the host,
+    /// and a gate that failed on one would fail every correct install on a
+    /// small machine.
+    Degraded,
     Unsupported,
 }
 
@@ -99,6 +106,10 @@ fn is_failing(status: &HealthStatus) -> bool {
 /// install is expected to be doing on its way to ready, not ground a ready
 /// install lost, and a gate that cannot tell those apart fails every fresh
 /// install for succeeding.
+///
+/// `Degraded` sits outside it too, for the opposite reason. It names ground the
+/// host never had rather than ground a correct install lost, and a gate that
+/// failed on one would fail every correct install on a small machine.
 fn blocks_readiness(check: &HealthCheck) -> bool {
     is_failing(&check.status)
         || (check.id == "semantic_query_readiness" && matches!(check.status, HealthStatus::Stale))
@@ -140,7 +151,8 @@ impl HealthReport {
                 HealthStatus::Missing
                 | HealthStatus::Misconfigured
                 | HealthStatus::Stale
-                | HealthStatus::Pending => summary.attention += 1,
+                | HealthStatus::Pending
+                | HealthStatus::Degraded => summary.attention += 1,
             }
         }
         summary
@@ -2985,6 +2997,25 @@ const MEASURED_COMMIT_PEAKS: &[MeasuredCommitPeak] = &[
     },
 ];
 
+/// How far above the quoted peak a ceiling has to sit, as a percentage of that
+/// peak, before this check calls it ok.
+///
+/// The quoted row is a floor rather than a bound. The store in front of the
+/// check is at least as large as the row's store, and a larger store peaks
+/// higher: `psf/requests` holds barely more than twice `expressjs/express`'s
+/// store and peaks 13.6% above it, because a commit prepares the whole
+/// repository successor in memory and the fixed part of that dominates. So a
+/// ceiling merely level with the quoted peak is the edge rather than headroom,
+/// and calling that ok is what told an isolated stranger run its 12288 MiB
+/// container was fine six hours before a commit was killed at 12283 MiB.
+///
+/// The number rounds the observed spread up, because the safe direction for a
+/// warning is to advise headroom nobody needs rather than to stay quiet about a
+/// ceiling somebody does. `the_comfort_margin_covers_the_spread_the_table_shows`
+/// holds it to the table, so a row measured later that spreads wider fails a
+/// test instead of quietly narrowing the band this exists to open.
+const COMMIT_PEAK_COMFORT_MARGIN_PERCENT: u64 = 14;
+
 /// Report whether this machine has the memory a commit on this store has been
 /// measured to need.
 ///
@@ -2993,8 +3024,13 @@ const MEASURED_COMMIT_PEAKS: &[MeasuredCommitPeak] = &[
 /// commit is attempted. This is that reading, published where a user looks
 /// before they are surprised rather than after.
 ///
-/// It is advisory by construction and can only ever be `Stale`, never a
-/// failure. A ceiling below a measured peak is a fact about a machine, not a
+/// It reports three bands. A ceiling clear of the quoted peak is healthy, one
+/// merely level with it is `Stale`, and one below it is `Degraded`. The middle
+/// band exists because the quoted peak is a floor for a store at least the
+/// quoted size, so parity with it is the edge rather than headroom.
+///
+/// It is advisory by construction and never blocks readiness, whichever band it
+/// lands in. A ceiling below a measured peak is a fact about a machine, not a
 /// broken install, and a check that failed readiness on it would fail every
 /// correct install on a small host.
 fn check_commit_memory_headroom() -> HealthCheck {
@@ -3046,38 +3082,82 @@ fn commit_memory_headroom_check_for(
         );
     };
     let needed = format_health_bytes(measured.peak_bytes);
-    if evidence.limit_bytes >= measured.peak_bytes {
+    let measured_store = format_health_bytes(measured.store_bytes);
+    let store_size = format_health_bytes(store.bytes);
+    let ratio = format_store_ratio(store.bytes, measured.store_bytes);
+    let comfortable = measured.peak_bytes.saturating_add(
+        measured
+            .peak_bytes
+            .saturating_mul(COMMIT_PEAK_COMFORT_MARGIN_PERCENT)
+            / 100,
+    );
+    if evidence.limit_bytes >= comfortable {
         return HealthCheck::new(
             ID,
             LABEL,
             HealthStatus::Healthy,
             format!(
-                "{available} of memory available; a commit on {} ({} store) was measured peaking \
-                 at {needed}, and this {} store is at least that size",
-                measured.repository,
-                format_health_bytes(measured.store_bytes),
-                format_health_bytes(store.bytes)
+                "{available} of memory available; a commit on {} ({measured_store} store) was \
+                 measured peaking at {needed}, and this ceiling clears that peak by at least \
+                 {}%. This {store_size} store is {ratio} the measured one",
+                measured.repository, COMMIT_PEAK_COMFORT_MARGIN_PERCENT
             ),
         );
     }
+    let (status, opening) = if evidence.limit_bytes >= measured.peak_bytes {
+        (
+            HealthStatus::Stale,
+            format!(
+                "{available} of memory available is parity with the {needed} peak a commit on {} \
+                 ({measured_store} store) was measured at, not headroom over it",
+                measured.repository
+            ),
+        )
+    } else {
+        (
+            HealthStatus::Degraded,
+            format!(
+                "only {available} of memory is available here, below the {needed} peak a commit \
+                 on {} ({measured_store} store) was already measured at",
+                measured.repository
+            ),
+        )
+    };
+    // The floor clause is claimed only where it is true. On a store no larger
+    // than the measured one the row is the measurement for that size, and
+    // saying it understates would be inventing a margin the table never showed.
+    let floor_note = if store.bytes > measured.store_bytes {
+        ", and a larger store peaks higher, so that measurement is a floor here rather than a bound"
+    } else {
+        ""
+    };
     HealthCheck::new(
         ID,
         LABEL,
-        HealthStatus::Stale,
+        status,
         format!(
-            "only {available} of memory is available here, and a commit on {} ({} store) was \
-             measured peaking at {needed}; this store is {}, so a commit can be killed \
-             mid-transaction and report a closed connection. {}",
-            measured.repository,
-            format_health_bytes(measured.store_bytes),
-            format_health_bytes(store.bytes),
+            "{opening}. This {store_size} store is {ratio} the measured one{floor_note}, so a \
+             commit here can be killed mid-transaction and report a closed connection. Do this \
+             write on a smaller repository or a larger machine. {}",
             crate::commands::commit_progress::COMMIT_MEMORY_REMEDY,
         ),
     )
     .with_manual_fix(
-        "Run the commit on a machine or container with more memory, or raise this container's \
-         memory limit.",
+        "Run the commit on a machine or container with more memory, raise this container's memory \
+         limit, or do this write on a smaller repository.",
     )
+}
+
+/// How many times the measured store this store is.
+///
+/// The ratio is what turns a quoted peak into a floor: a reader whose store is
+/// twice the measured one is being told the least their commit can cost, not
+/// the most.
+fn format_store_ratio(store_bytes: u64, measured_bytes: u64) -> String {
+    if measured_bytes == 0 {
+        return "an unknown multiple of".to_string();
+    }
+    format!("{:.1}x", store_bytes as f64 / measured_bytes as f64)
 }
 
 fn format_health_bytes(bytes: u64) -> String {
@@ -3211,20 +3291,20 @@ mod tests {
 
     /// The reading a user needed BEFORE the commit that killed their daemon.
     ///
-    /// A one-file commit on a 922 MiB store peaked at 12283 MiB against a
-    /// 12288 MiB ceiling, and the only warning anyone got was a closed socket
-    /// afterward. The store size that decides it is knowable the whole time.
+    /// A ceiling under a peak already measured for a store no larger than this
+    /// one is the band that reads red: nothing about the install is wrong, and
+    /// the write is still going to die.
     ///
     /// Falsify by comparing against `store.bytes` instead of the measured peak,
     /// or by returning `Healthy` unconditionally: the constrained arm then
     /// passes silently, which is the state this check exists to end.
     #[test]
-    fn doctor_warns_when_this_machines_ceiling_is_below_a_measured_commit_peak() {
+    fn doctor_reads_a_ceiling_below_a_measured_commit_peak_as_degraded() {
         let check =
-            commit_memory_headroom_check_for(&footprint(922 * MIB), &memory(8 * 1024 * MIB));
+            commit_memory_headroom_check_for(&footprint(1844 * MIB), &memory(8 * 1024 * MIB));
         assert!(
-            matches!(check.status, HealthStatus::Stale),
-            "a ceiling under a measured peak needs attention: {:?}",
+            matches!(check.status, HealthStatus::Degraded),
+            "a ceiling under a measured peak is over parity, not at it: {:?}",
             check.status
         );
         assert!(
@@ -3233,9 +3313,106 @@ mod tests {
             check.detail
         );
         assert!(
+            check.detail.contains("2.0x the measured one"),
+            "the reader cannot judge a floor without the store ratio: {}",
+            check.detail
+        );
+        assert!(
             check.manual_fix.is_some(),
             "a warning a reader cannot act on is noise"
         );
+    }
+
+    /// Parity with a measured peak is the edge, and it used to round up to ok.
+    ///
+    /// A one-file commit on a 922 MiB store peaked at 12283 MiB against a
+    /// 12288 MiB ceiling. `kin doctor` had both numbers and called it ok six
+    /// hours before the commit was killed, because it compared with `>=` and
+    /// 12288 clears 12283. Amber is the whole finding: it costs a reader
+    /// nothing to move the write to a smaller repository, and it costs them the
+    /// write not to.
+    ///
+    /// Falsify by restoring the `>=` comparison against the bare peak: both
+    /// arms below go `Healthy` again and the assertions name the status.
+    #[test]
+    fn doctor_reads_a_ceiling_at_a_measured_commit_peak_as_parity_rather_than_ok() {
+        let exactly_at = commit_memory_headroom_check_for(
+            &footprint(1844 * MIB),
+            &memory(MEASURED_COMMIT_PEAKS[1].peak_bytes),
+        );
+        assert!(
+            matches!(exactly_at.status, HealthStatus::Stale),
+            "a ceiling exactly at the measured peak is parity, not headroom: {:?}",
+            exactly_at.status
+        );
+
+        // The container the isolated stranger run actually had: 5 MiB of margin
+        // on a 12 GiB budget, which is arithmetic rather than headroom.
+        let stranger =
+            commit_memory_headroom_check_for(&footprint(1844 * MIB), &memory(12288 * MIB));
+        assert!(
+            matches!(stranger.status, HealthStatus::Stale),
+            "12288 MiB over a 12283 MiB peak is parity: {:?}",
+            stranger.status
+        );
+        assert!(
+            stranger.detail.contains("parity"),
+            "the row has to say what band it is in: {}",
+            stranger.detail
+        );
+        assert!(
+            stranger.detail.contains("psf/requests") && stranger.detail.contains("12.0 GiB"),
+            "parity must quote the peak it is at parity with: {}",
+            stranger.detail
+        );
+        assert!(
+            stranger.detail.contains("2.0x the measured one")
+                && stranger.detail.contains("floor here rather than a bound"),
+            "a bigger store makes the quoted peak a floor, and the reader is owed that: {}",
+            stranger.detail
+        );
+        assert!(
+            stranger.detail.contains("smaller repository"),
+            "the row exists to redirect the write before the kill: {}",
+            stranger.detail
+        );
+        assert!(
+            stranger.manual_fix.is_some(),
+            "a warning a reader cannot act on is noise"
+        );
+    }
+
+    /// Neither warning band may fail an install.
+    ///
+    /// The install proof computes its own aggregate from the check statuses and
+    /// fails a fresh install whose report disagrees with it, so a headroom band
+    /// that blocked readiness would fence a release at tag time, where no fix on
+    /// `main` can reach it. Both bands are asserted here rather than trusted to
+    /// the enum, because `blocks_readiness` is where that would go wrong.
+    #[test]
+    fn no_commit_headroom_band_blocks_aggregate_readiness() {
+        for limit in [
+            MEASURED_COMMIT_PEAKS[1].peak_bytes,
+            12288 * MIB,
+            8 * 1024 * MIB,
+        ] {
+            let check = commit_memory_headroom_check_for(&footprint(1844 * MIB), &memory(limit));
+            assert!(
+                !matches!(check.status, HealthStatus::Healthy),
+                "the fixture must exercise a warning band: {:?}",
+                check.status
+            );
+            assert!(
+                !blocks_readiness(&check),
+                "a small machine is not a broken install: {:?}",
+                check.status
+            );
+            let report = assemble_health_report("test".to_string(), vec![check]);
+            assert!(
+                report.healthy,
+                "commit headroom must never flip the aggregate the install proof reads"
+            );
+        }
     }
 
     /// A machine with the headroom is told so, quoting the same measurement.
@@ -3249,6 +3426,68 @@ mod tests {
             check.status
         );
         assert!(check.detail.contains("psf/requests"), "{}", check.detail);
+        assert!(
+            check.detail.contains("clears that peak by at least"),
+            "ok has to say what it cleared, or it is the rounding again: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("1.0x the measured one"),
+            "the store ratio belongs in every band: {}",
+            check.detail
+        );
+    }
+
+    /// The comfort margin is read off the table, so it cannot fall behind it.
+    ///
+    /// The margin exists because a larger store peaks higher than the row the
+    /// check quotes. The table itself measures how much higher, and a row added
+    /// later that spreads wider than the constant would silently shrink the
+    /// amber band back toward the rounding this replaced.
+    #[test]
+    fn the_comfort_margin_covers_the_spread_the_table_shows() {
+        let widest = MEASURED_COMMIT_PEAKS
+            .windows(2)
+            .map(|pair| {
+                let (lower, higher) = (pair[0].peak_bytes, pair[1].peak_bytes);
+                if higher <= lower {
+                    0
+                } else {
+                    ((higher - lower) * 100).div_ceil(lower)
+                }
+            })
+            .max()
+            .unwrap_or(0);
+        assert!(
+            COMMIT_PEAK_COMFORT_MARGIN_PERCENT >= widest,
+            "the table measures a {widest}% spread between adjacent peaks and the comfort margin \
+             is {COMMIT_PEAK_COMFORT_MARGIN_PERCENT}%, so a store past the quoted row can peak \
+             above a ceiling this check calls ok"
+        );
+    }
+
+    /// The table has to be ordered and real for the lookup to mean anything.
+    ///
+    /// The check walks it in reverse to find the largest row a store reaches. A
+    /// row inserted out of order would quote the wrong measurement without
+    /// failing anything, and a zero store would divide the ratio by nothing.
+    #[test]
+    fn the_measured_table_is_ordered_and_carries_no_empty_rows() {
+        for point in MEASURED_COMMIT_PEAKS {
+            assert!(
+                point.store_bytes > 0 && point.peak_bytes > 0,
+                "{} carries an empty measurement",
+                point.repository
+            );
+        }
+        for pair in MEASURED_COMMIT_PEAKS.windows(2) {
+            assert!(
+                pair[1].store_bytes > pair[0].store_bytes,
+                "the table must be smallest store first: {} is not above {}",
+                pair[1].repository,
+                pair[0].repository
+            );
+        }
     }
 
     /// Below the smallest measured store nothing is claimed at all.
