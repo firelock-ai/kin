@@ -672,8 +672,11 @@ Use verb 'delete' (or 'remove') with `target` set to a repository-relative path 
 tracked file: {verb: \"delete\", target: \"<repository-relative path>\", description: \"...\"}. \
 It takes the file, every entity derived from it, and every edge incident to those entities \
 out of the graph in one change, and the commit removes the working file. Send no body; a \
-delete carrying text is refused rather than guessed at. Deleting the file with some other \
-tool does NOT retire it, for the same reason writing one does not admit it. \
+delete carrying text is refused rather than guessed at. Removing the file with some other \
+tool is not the same thing: the daemon retires a delete it observes, but whether it \
+observes one depends on the working copy delivering a notification, and a mount or a \
+projection may deliver none. Only this operation publishes the retirement as a change you \
+can review. \
 Use verb 'rename' (or 'move') with `target` and `destination` to relocate a tracked file: \
 {verb: \"rename\", target: \"<current path>\", destination: \"<new path>\", description: \"...\"}. \
 Entity ids, history, and every incoming reference survive the move, which is what you lose \

@@ -3262,11 +3262,22 @@ mod tests {
             crossing(state.graph.as_ref()),
             "the fixture produced no cross-file edge, so nothing below proves one was evicted"
         );
-        let queued_before = state.graph.pending_embeddings();
-        assert!(
-            queued_before > 0,
-            "the fixture queued no embeddings, so the queue assertion below proves nothing"
-        );
+        // The embedding queue only exists in a build that carries the vector
+        // feature, and `pending_embeddings` is a constant zero without it, so
+        // the fixture guard below would refuse a build that simply has no queue
+        // to evict from. Gated rather than softened: a zero that means "no
+        // queue" and a zero that means "the eviction did not happen" are
+        // different answers, and a guard that cannot tell them apart is not a
+        // guard.
+        #[cfg(feature = "vector")]
+        let queued_before = {
+            let queued = state.graph.pending_embeddings();
+            assert!(
+                queued > 0,
+                "the fixture queued no embeddings, so the queue assertion below proves nothing"
+            );
+            queued
+        };
 
         let retire = sessions
             .begin_transaction(TEST_SESSION, "file:pkg/util.py")
@@ -3311,6 +3322,7 @@ mod tests {
         // What the vector index is fed from. kin-db drops the retrieval key for
         // every removed entity in the same call that removes it, so a store
         // that never built an index still shows the eviction here.
+        #[cfg(feature = "vector")]
         assert!(
             state.graph.pending_embeddings() < queued_before,
             "the retired entities are still queued for embedding: {} of {queued_before}",
