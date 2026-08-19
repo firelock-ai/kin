@@ -835,7 +835,7 @@ pub async fn stop(all: bool, machine: bool, json: bool) -> Result<()> {
         };
         stop_all(scope, json, false).await
     } else {
-        stop_current_repo(json).await
+        stop_current_repo(json, false).await
     }
 }
 
@@ -1040,7 +1040,14 @@ fn retire_worker_endpoint(
     }
 }
 
-async fn stop_current_repo(json: bool) -> Result<()> {
+/// Stop this repository's worker daemon, and only this repository's.
+///
+/// `quiet` suppresses the report. `kin init`'s conversion phase uses it: that
+/// phase ends by stopping the daemon it started, and a second command's report
+/// on stdout there is not chatty output, it corrupts `kin init --json`. Never
+/// widened to a machine-wide stop for that caller, which would take down other
+/// lanes' daemons to tidy up after one conversion.
+async fn stop_current_repo(json: bool, quiet: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let Some(layout) = kin_core::KinLayout::discover(&cwd) else {
         bail!(
@@ -1066,9 +1073,13 @@ async fn stop_current_repo(json: bool) -> Result<()> {
                 "stopped": [],
                 "all_stopped": true,
             });
-            println!("{}", serde_json::to_string_pretty(&payload)?);
+            if !quiet {
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+            }
         } else {
-            println!("No worker daemon running for repo '{label}' (nothing to stop).");
+            if !quiet {
+                println!("No worker daemon running for repo '{label}' (nothing to stop).");
+            }
         }
         return Ok(());
     };
@@ -1082,7 +1093,15 @@ async fn stop_current_repo(json: bool) -> Result<()> {
         outcome,
         preserved_endpoint,
     }];
+    if quiet {
+        return Ok(());
+    }
     finish_stop("current-repo", &report, json)
+}
+
+/// Stop this repository's worker daemon without writing a report to stdout.
+pub(crate) async fn stop_current_repo_quiet() -> Result<()> {
+    stop_current_repo(false, true).await
 }
 
 /// Resolve the pid of the current repo's worker daemon, the way the daemon
