@@ -6034,34 +6034,25 @@ mod tests {
         );
     }
 
-    /// FIR-2463 case (a), the shape a stranger hit on shipped v0.5.42 bytes.
+    /// The one call site of `send` in the psf/requests shape, at whatever
+    /// resolution confidence the caller chooses, answered on the daemon
+    /// authority path so no cross-repo gap can stand in for the thing under
+    /// test.
     ///
-    /// `find_references(HTTPAdapter.send)` on psf/requests answered
-    /// `total_upstream: 0` and `counts.referencing_entities: 0` while the same
-    /// payload carried the one real caller, `Session.send` at
-    /// `sessions.py:784`, in `candidates` as `resolution: name_only`. A reader
-    /// of the headline deletes working code and a reader of the array keeps it,
-    /// off one response.
-    ///
-    /// The fixture is Rust on a graph that links calls across files, so the
-    /// coverage gate and the enrichment gate both clear and the WITHHELD ROW is
-    /// the only thing left that can move the verdict. That is what makes this
-    /// discriminating rather than a fixture that is inconclusive for four
-    /// reasons at once.
-    #[tokio::test]
-    async fn a_withheld_caller_refuses_the_zero_it_was_held_out_of() {
+    /// `Session.send` calls `HTTPAdapter.send` at `sessions.py:784` through a
+    /// receiver whose type nothing at the site settles. At the receiver-name
+    /// tier that row is withheld from the headline; at the parser-certain tier
+    /// the identical row is an ordinary caller. Nothing else about the graph
+    /// changes between the two, which is what makes the pair a discriminator
+    /// rather than two fixtures that happen to differ.
+    async fn requests_shape_response(confidence: f32) -> serde_json::Value {
         let store = InMemoryGraph::new();
         let target = make_entity("send", "src/requests/adapters.rs");
         let caller = make_entity("Session.send", "src/requests/sessions.rs");
         store.upsert_entity(&target).unwrap();
         store.upsert_entity(&caller).unwrap();
 
-        let mut relation = make_relation_at(
-            caller.id,
-            target.id,
-            RelationKind::Calls,
-            kin_index::resolution::RECEIVER_NAME_FANOUT_CONFIDENCE,
-        );
+        let mut relation = make_relation_at(caller.id, target.id, RelationKind::Calls, confidence);
         relation.evidence = vec![RelationEvidence {
             source_span: Some(kin_model::entity::SourceSpan {
                 file: FilePathId::new("src/requests/sessions.rs"),
@@ -6075,16 +6066,91 @@ mod tests {
             ..RelationEvidence::default()
         }];
         store.upsert_relation(&relation).unwrap();
+        let registered_root = graph_root(&store);
+
+        let spine = kin_spine::InMemorySpineBackend::new();
+        spine.register_repo(
+            "requests",
+            vec![spine_entry("requests", &target)],
+            &registered_root,
+        );
+        spine.refresh_cross_repo_edges("requests", &[], &[], &["requests".to_string()]);
 
         let args = HashMap::from([(
             "entity_id".to_string(),
             serde_json::json!(target.id.to_string()),
         )]);
-        let response = parsed_response(&crate::finalize_with_envelope(
-            handle_find_references(&args, &store, None).await.unwrap(),
+        parsed_response(&crate::finalize_with_envelope(
+            handle_find_references_with_authority(
+                &args,
+                &store,
+                FindReferencesAuthority {
+                    repo_id: "requests",
+                    graph_root: &registered_root,
+                    spine: Some(&spine),
+                },
+                None,
+            )
+            .await
+            .unwrap(),
             structurally_ready_envelope(),
             "find_references",
-        ));
+        ))
+    }
+
+    /// The control for [`a_withheld_caller_refuses_the_zero_it_was_held_out_of`]:
+    /// the same fixture with the one relation at the parser-certain tier. The
+    /// row is counted, nothing is withheld, and the one verdict certifies.
+    ///
+    /// Without this the refusal above proves only that the verdict CAN say
+    /// inconclusive on this fixture, which a hardcoded refusal would satisfy
+    /// too.
+    #[tokio::test]
+    async fn a_proven_caller_on_the_same_fixture_certifies() {
+        let response = requests_shape_response(1.0).await;
+
+        assert_eq!(response["total_upstream"], 1, "{response:#}");
+        assert_eq!(response["unconfirmed_candidates"], 0, "{response:#}");
+        assert!(response["candidates"].as_array().unwrap().is_empty());
+        assert_eq!(
+            response["_kin"]["verdict"]["state"], "certified",
+            "one confidence value apart from the refusal above: {}",
+            response["_kin"]["verdict"]
+        );
+        assert_eq!(
+            response["_kin"]["verdict"]["inputs"]["withheld_candidates"], "certified",
+            "{}",
+            response["_kin"]["verdict"]
+        );
+        assert_eq!(response["_kin"]["completeness"]["bound"], "exact");
+        assert!(
+            crate::verdict::disagreements(&response).is_empty(),
+            "{:?}",
+            crate::verdict::disagreements(&response)
+        );
+    }
+
+    /// FIR-2463 case (a), the shape a stranger hit on shipped v0.5.42 bytes.
+    ///
+    /// `find_references(HTTPAdapter.send)` on psf/requests answered
+    /// `total_upstream: 0` and `counts.referencing_entities: 0` while the same
+    /// payload carried the one real caller, `Session.send` at
+    /// `sessions.py:784`, in `candidates` as `resolution: name_only`. A reader
+    /// of the headline deletes working code and a reader of the array keeps it,
+    /// off one response.
+    ///
+    /// The fixture is Rust on a graph that links calls across files, on the
+    /// daemon authority path with a registered spine, so the coverage gate, the
+    /// enrichment gate and the cross-repo gate all clear. The CONFIDENCE on the
+    /// one relation is the only input left that can move the verdict, and
+    /// [`a_proven_caller_on_the_same_fixture_certifies`] runs the identical
+    /// fixture at the parser-certain tier and gets the opposite verdict. A
+    /// hardcoded `inconclusive` fails there and a hardcoded `certified` fails
+    /// here.
+    #[tokio::test]
+    async fn a_withheld_caller_refuses_the_zero_it_was_held_out_of() {
+        let response =
+            requests_shape_response(kin_index::resolution::RECEIVER_NAME_FANOUT_CONFIDENCE).await;
 
         assert_eq!(
             response["total_upstream"], 0,
