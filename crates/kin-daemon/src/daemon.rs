@@ -1253,6 +1253,31 @@ async fn run_idle_monitor(
     }
 }
 
+/// Whether this file's entities already carry language-server evidence.
+///
+/// The sweep's resumability rests on this: `RelationOrigin::Lsp` is written only
+/// by enrichment, so an entity holding one is an entity a server has already
+/// answered about. Asked per file rather than per entity so one enriched entity
+/// stands for its file, which matches the unit the sweep works in.
+///
+/// A file whose entities genuinely have no cross-file edges is re-queried on
+/// every pass. That is the honest trade: the alternative is a completion marker
+/// that would claim a file was done when a killed pass never reached it.
+fn file_already_enriched(state: &DaemonState, entities: &[&kin_model::Entity]) -> bool {
+    use kin_model::EntityStore;
+    entities.iter().any(|entity| {
+        state
+            .graph
+            .get_all_relations_for_entity(&entity.id)
+            .map(|relations| {
+                relations
+                    .iter()
+                    .any(|relation| relation.origin == kin_model::RelationOrigin::Lsp)
+            })
+            .unwrap_or(false)
+    })
+}
+
 fn install_lsp_relations(state: &DaemonState, relations: &[kin_model::Relation]) -> usize {
     if relations.is_empty() {
         return 0;
@@ -1455,6 +1480,25 @@ pub async fn run_with_authority_on(
     };
 
     let state = Arc::new(state);
+
+    // Nothing used to trigger a sweep. The enrichment worker started, blocked on
+    // a channel, and waited: the incremental path fires only on watcher
+    // file-change events, and the only caller of `queue_lsp_sweep` was
+    // `POST /lsp/sweep`, which nothing in the product calls. So a freshly
+    // converted repository sat with a running server, a wired adapter and zero
+    // cross-file reference edges, and the first daemon after `kin init` was
+    // signalled 189 ms after its enrichment worker started, taking the intent
+    // with it.
+    //
+    // Queued here, after the channel exists and before the listener binds, so a
+    // daemon that comes up for any reason converges the graph it was handed. The
+    // sweep skips files that already carry language-server evidence, so this is
+    // cheap on a converged repository, resumable after a kill, and safe to queue
+    // on every start.
+    if enrichment_enabled && state.lsp_enrichment_tx.is_some() {
+        info!("queueing an LSP sweep so a graph with unenriched files converges");
+        state.queue_lsp_sweep();
+    }
 
     // Bind the API listener so the daemon owns port selection. With
     // config.api_port == 0 the OS assigns a free ephemeral port; we then publish
@@ -2685,6 +2729,26 @@ pub async fn run_with_authority_on(
                                 _ => None,
                             };
                             let Some(lang) = language else { continue };
+
+                            // Skip a file this graph already holds language-server
+                            // evidence for. This is what makes the sweep idempotent
+                            // and resumable: a pass killed halfway leaves the files
+                            // it finished carrying Lsp-origin edges, so the next
+                            // pass starts where the last one stopped instead of
+                            // re-querying the server for every entity again. On the
+                            // requests corpus a full pass is about three minutes,
+                            // so re-running one from scratch on every daemon start
+                            // is not a cost anyone would accept, and a sweep nobody
+                            // dares run is a sweep that never runs.
+                            if file_already_enriched(&lsp_state, file_entities) {
+                                files_processed += 1;
+                                debug!(
+                                    file = %file_id.0,
+                                    progress = %format!("{files_processed}/{total_files}"),
+                                    "sweep skipped an already-enriched file"
+                                );
+                                continue;
+                            }
 
                             // Lazily start LSP server for this language (same as incremental).
                             if !servers.contains_key(&lang) {

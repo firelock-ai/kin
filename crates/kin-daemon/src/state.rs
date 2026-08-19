@@ -688,7 +688,6 @@ pub enum LspEnrichmentMessage {
     /// Incremental: enrich only these specific changed entities.
     Incremental(LspEnrichmentRequest),
     /// Cold sweep: enrich ALL entities in the graph, file by file.
-    /// Triggered after init/migrate/reconcile.
     Sweep,
 }
 
@@ -5386,7 +5385,14 @@ impl DaemonState {
     }
 
     /// Queue a cold sweep that enriches ALL entities in the graph via LSP.
-    /// Triggered after init/migrate/reconcile. No-op if LSP enrichment is not available.
+    ///
+    /// No-op if LSP enrichment is not available. This used to claim it was
+    /// "triggered after init/migrate/reconcile" and none of those triggered it:
+    /// the only caller was `POST /lsp/sweep`, so on a freshly converted
+    /// repository the enrichment worker sat blocked on a channel nothing fed and
+    /// no cross-file reference edge was ever produced. The daemon now queues one
+    /// at startup when servers are present and the graph holds files with no
+    /// language-server evidence yet.
     pub fn queue_lsp_sweep(&self) {
         if self.filesystem_reconcile_disabled() {
             return;

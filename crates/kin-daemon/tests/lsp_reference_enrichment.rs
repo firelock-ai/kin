@@ -460,3 +460,144 @@ fn javascript_no_longer_reports_the_unsupported_state_it_shipped_with() {
         "an unwired language must still report Unsupported"
     );
 }
+
+/// DIAGNOSTIC: what pyright answers for the two real requests dispatch shapes.
+///
+/// Faithful to the annotations the real source carries, because they are what
+/// decides the answer and an unannotated fixture asks a different question:
+/// `get_adapter` is declared `-> BaseAdapter` (sessions.py:870) and
+/// `Response.connection` is declared `HTTPAdapter` (models.py:750).
+#[tokio::test(flavor = "multi_thread")]
+async fn diagnostic_what_pyright_answers_for_the_requests_dispatch_shapes() {
+    const TEST: &str = "diagnostic_what_pyright_answers_for_the_requests_dispatch_shapes";
+    let Some((command, args)) = server_command_or_skip(LanguageId::Python, TEST) else {
+        return;
+    };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    std::fs::write(
+        root.join("adapters.py"),
+        "class BaseAdapter:\n\
+         \x20   def send(self, request, **kwargs):\n\
+         \x20       raise NotImplementedError\n\
+         \n\
+         \n\
+         class HTTPAdapter(BaseAdapter):\n\
+         \x20   def send(self, request, **kwargs):\n\
+         \x20       return \"http\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("models.py"),
+        "from adapters import HTTPAdapter\n\
+         \n\
+         \n\
+         class Response:\n\
+         \x20   connection: HTTPAdapter\n\
+         \n\
+         \x20   def __init__(self):\n\
+         \x20       self.request = None\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("sessions.py"),
+        "from adapters import BaseAdapter, HTTPAdapter\n\
+         \n\
+         \n\
+         class Session:\n\
+         \x20   def __init__(self):\n\
+         \x20       self.adapters = {\"http://\": HTTPAdapter()}\n\
+         \n\
+         \x20   def get_adapter(self, url: str) -> BaseAdapter:\n\
+         \x20       return self.adapters[\"http://\"]\n\
+         \n\
+         \x20   def send(self, request, **kwargs):\n\
+         \x20       adapter = self.get_adapter(url=\"u\")\n\
+         \x20       r = adapter.send(request, **kwargs)\n\
+         \x20       return r\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("auth.py"),
+        "from models import Response\n\
+         \n\
+         \n\
+         class HTTPDigestAuth:\n\
+         \x20   def handle_401(self, r: Response, **kwargs):\n\
+         \x20       _r = r.connection.send(r, **kwargs)\n\
+         \x20       return _r\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("pyrightconfig.json"), "{\"include\": [\".\"]}\n").unwrap();
+
+    let server = start_server(&command, &args, root, LanguageId::Python).await;
+    open_documents(
+        &server,
+        root,
+        &["adapters.py", "models.py", "sessions.py", "auth.py"],
+        "python",
+    )
+    .await;
+
+    for (label, file, line, col) in [
+        (
+            "Session.send (one-hop, get_adapter -> BaseAdapter)",
+            "sessions.py",
+            10u32,
+            8u32,
+        ),
+        (
+            "HTTPDigestAuth.handle_401 (two-hop, r.connection)",
+            "auth.py",
+            4,
+            8,
+        ),
+    ] {
+        let uri = kin_lsp::protocol::path_to_uri(&root.join(file));
+        let prepared = server
+            .client
+            .request(
+                "textDocument/prepareCallHierarchy",
+                serde_json::json!({
+                    "textDocument": {"uri": uri},
+                    "position": {"line": line, "character": col}
+                }),
+            )
+            .await
+            .unwrap_or(serde_json::json!(null));
+        let item = prepared.get(0).cloned().unwrap_or(serde_json::json!(null));
+        if item.is_null() {
+            eprintln!("{label}: prepareCallHierarchy found nothing at {file}:{line}");
+            continue;
+        }
+        let out = server
+            .client
+            .request(
+                "callHierarchy/outgoingCalls",
+                serde_json::json!({"item": item}),
+            )
+            .await;
+        match out {
+            Ok(value) => match value.as_array() {
+                Some(calls) if !calls.is_empty() => {
+                    for call in calls {
+                        let to = &call["to"];
+                        let file = to["uri"]
+                            .as_str()
+                            .unwrap_or("")
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or("");
+                        eprintln!(
+                            "{label}: TARGET {} in {} at line {}",
+                            to["name"], file, to["selectionRange"]["start"]["line"]
+                        );
+                    }
+                }
+                _ => eprintln!("{label}: pyright answered NO outgoing calls"),
+            },
+            Err(e) => eprintln!("{label}: outgoingCalls errored: {e}"),
+        }
+    }
+}
