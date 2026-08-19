@@ -30,14 +30,14 @@ export const RC_WORKFLOW = ".github/workflows/rc-build.yml";
 // package-publish credentials. Without those credentials these steps have
 // nothing to do, so they are absent rather than inert.
 //
-// The Cargo cache, for a different reason. release.yml runs only on a
-// ruleset-protected v* tag, so its cache write is authorized code. rc-build.yml
-// builds whatever ref it is handed, so the same step would let a dispatch write
-// a poisoned entry into a cache that CI and release builds later restore from,
-// and would mean the bytes under proof were assembled partly from cache
-// contents no one reviewed. A candidate compiles cold.
+// A seventh entry, "Cache Cargo registry and build artifacts", used to sit at
+// the head of this list. release.yml no longer carries that step: it never
+// restored, because a tag-scoped cache entry is unreadable from the next tag,
+// and a restore that did work would assemble published bytes partly from cache
+// contents nobody reviewed. Both workflows now compile cold, so the difference
+// this entry described no longer exists and listing it here would report the
+// omission list as stale.
 export const OMITTED_STEPS = [
-  "Cache Cargo registry and build artifacts",
   "Resolve macOS signing credential availability",
   "Import code signing certificate (macOS)",
   "Sign macOS binaries",
@@ -72,15 +72,12 @@ export const DELTAS = [
     to: `          node scripts/write-release-archive-docs.mjs "$ARTIFACT" "$TARGET" "$RC_VERSION"
 `,
   },
-  {
-    label: "apt",
-    from: `        run: sudo apt-get update && sudo apt-get install -y musl-tools
-`,
-    to: `        # DELTA(apt): bounded through the shared helper. An unbounded apt call
-        # holds a job until the runner timeout when a mirror stalls (FIR-2391).
-        run: ./scripts/ci-apt-install.sh musl-tools
-`,
-  },
+  // An "apt" delta used to sit here. rc-build.yml bounded its musl-tools
+  // install through scripts/ci-apt-install.sh while release.yml still called
+  // apt directly, so the candidate was protected from a mirror stall and the
+  // release was not. release.yml now calls the same helper, the two steps are
+  // byte-identical again, and a delta describing a difference that no longer
+  // exists would fail here as an anchor that matches nothing.
   {
     label: "notifier-version",
     from: `            "\${GITHUB_REF_NAME#v}"
