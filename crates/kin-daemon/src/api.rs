@@ -11158,7 +11158,7 @@ async fn lsp_sweep(
     })))
 }
 
-/// GET /lsp/sweep/status — how far the cold sweep has got.
+/// GET /lsp/sweep/status, reporting how far the cold sweep has got.
 ///
 /// A sweep takes minutes on a real repository and used to be unobservable: the
 /// queue endpoint answered once and nothing reported again, so no caller could
