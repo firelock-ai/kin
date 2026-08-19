@@ -26,11 +26,23 @@ concurrency:
 jobs:
   reconcile:
     name: Reconcile release PR
+    # The queue's own CI run concludes when the landing does, roughly half an
+    # hour before the landing push's CI run concludes, so it is the occasion
+    # that removes the wait rather than the one that reports it. Both are kept.
+    # A merge-group completion that arrives before main carries the commit
+    # reconciles a main one commit short, which is not a new class: the branch
+    # is coalescing by construction and every later cycle folds the newer drift
+    # into the same branch well inside the release PR's own queue time.
     if: >-
       github.event_name != 'workflow_run' ||
       (
         github.event.workflow_run.event == 'push' &&
         github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.conclusion == 'success'
+      ) ||
+      (
+        github.event.workflow_run.event == 'merge_group' &&
+        startsWith(github.event.workflow_run.head_branch, 'gh-readonly-queue/main/') &&
         github.event.workflow_run.conclusion == 'success'
       )
     runs-on: ubuntu-latest
@@ -582,8 +594,16 @@ jobs:
             --json headRefOid \
             --jq .headRefOid)"
           [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]]
+          # Wait long enough for GitHub to register the run the App's own pull
+          # request already started. The old twelve-second budget expired
+          # before a busy Actions backend answered, and the activation commit
+          # below then rewrote the head and bought a second full pull-request
+          # CI round on a release the merge queue proves anyway. A minute of
+          # polling costs nothing against a twenty-minute job timeout, and it
+          # is the difference between the release pull request paying one
+          # pre-queue pass and paying two.
           needs_activation=true
-          for attempt in 1 2 3 4 5 6; do
+          for attempt in $(seq 1 15); do
             ci_runs="$(gh api \
               "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?event=pull_request&per_page=30")"
             valid_ci="$(jq -r \
@@ -602,7 +622,7 @@ jobs:
               needs_activation=false
               break
             fi
-            [ "$attempt" -eq 6 ] || sleep 2
+            [ "$attempt" -eq 15 ] || sleep 4
           done
           {
             echo "number=$pr"
@@ -622,6 +642,13 @@ jobs:
           # approval-required run a GITHUB_TOKEN-created pull request leaves
           # behind. This App-authored synchronize event is the narrow,
           # unattended handoff into the ordinary protected PR checks.
+          #
+          # It exists to make the required contexts report at all, never to buy
+          # a full pre-queue pass. The merge queue is what proves this branch,
+          # and the release mint now keys off that queue-proven sha, so a
+          # pull-request run whose heavy jobs report skipped satisfies this
+          # step exactly as a full one does. Do not widen this into a way of
+          # re-running the whole suite before the queue does.
           git commit --allow-empty --signoff \
             -m "Activate protected checks for the automated release PR"
           git push origin "HEAD:refs/heads/${BRANCH}"
