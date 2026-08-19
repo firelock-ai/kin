@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.42] - 2026-08-19
+
+### Changed
+
+- Record only a projection that is actually in force when setup chooses (#953)
+- Abandon v0.5.41: its frozen install proof fails on a recorded-but-unengaged projection the tag cannot receive the fix for (#955)
+
+
 ## [0.5.41] - 2026-08-19
 
 ### Changed
