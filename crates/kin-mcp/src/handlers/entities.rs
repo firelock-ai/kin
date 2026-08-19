@@ -4852,9 +4852,13 @@ mod tests {
             serde_json::json!(["kind"])
         );
 
-        let negative =
-            crate::negative::negative_for("semantic_search", &empty, &ready_daemon_envelope(2))
-                .expect("an empty search carries a negative");
+        let negative = crate::negative::negative_for(
+            "semantic_search",
+            &empty,
+            &ready_daemon_envelope(2),
+            &[],
+        )
+        .expect("an empty search carries a negative");
         assert_eq!(negative["safe_to_conclude_absent"], false);
         assert_eq!(negative["trust"], "inconclusive");
         assert!(
@@ -4880,9 +4884,13 @@ mod tests {
                 ["candidates"],
             0
         );
-        let negative =
-            crate::negative::negative_for("semantic_search", &absent, &ready_daemon_envelope(2))
-                .expect("an empty search carries a negative");
+        let negative = crate::negative::negative_for(
+            "semantic_search",
+            &absent,
+            &ready_daemon_envelope(2),
+            &[],
+        )
+        .expect("an empty search carries a negative");
         assert_eq!(
             negative["safe_to_conclude_absent"], true,
             "a name that matches nothing at all is still a certifiable absence: {negative}"

@@ -6263,6 +6263,7 @@ mod tests {
                 "graph_entity_count": 2,
                 "graph_generation": 1,
             })),
+            &[],
         )
         .expect("impact verdicts are always qualified");
         assert_eq!(negative["kind"], "impact_verdicts");
