@@ -1253,26 +1253,39 @@ async fn run_idle_monitor(
     }
 }
 
-/// Whether this file's entities already carry language-server evidence.
+/// Whether this file's entities already carry language-server evidence they
+/// themselves are the SOURCE of.
 ///
 /// The sweep's resumability rests on this: `RelationOrigin::Lsp` is written only
-/// by enrichment, so an entity holding one is an entity a server has already
-/// answered about. Asked per file rather than per entity so one enriched entity
-/// stands for its file, which matches the unit the sweep works in.
+/// by enrichment, so an entity that is the source of one is an entity a server
+/// has already been asked about. Asked per file rather than per entity so one
+/// enriched entity stands for its file, which matches the unit the sweep works
+/// in.
 ///
-/// A file whose entities genuinely have no cross-file edges is re-queried on
-/// every pass. That is the honest trade: the alternative is a completion marker
-/// that would claim a file was done when a killed pass never reached it.
+/// The direction is the whole correctness of it. `get_all_relations_for_entity`
+/// returns edges where the entity is source OR destination, and the sweep
+/// enriches a file by asking what its entities CALL, so an inbound edge says
+/// only that somebody else was swept. Counting inbound edges skipped exactly the
+/// files that matter: on the requests corpus the test files enrich first and
+/// write Lsp edges INTO `sessions.py`, `auth.py` and `adapters.py`, which were
+/// then skipped as already done while their own outgoing calls had never been
+/// queried once. That is how a sweep reported 37 of 37 complete having never
+/// looked at the three files the whole ticket is about.
+///
+/// A file whose entities genuinely originate no cross-file edges is re-queried
+/// on every pass. That is the honest trade: the alternative is a completion
+/// marker that would claim a file was done when a killed pass never reached it.
 fn file_already_enriched(state: &DaemonState, entities: &[&kin_model::Entity]) -> bool {
     use kin_model::EntityStore;
     entities.iter().any(|entity| {
+        let source = kin_model::GraphNodeId::Entity(entity.id);
         state
             .graph
             .get_all_relations_for_entity(&entity.id)
             .map(|relations| {
-                relations
-                    .iter()
-                    .any(|relation| relation.origin == kin_model::RelationOrigin::Lsp)
+                relations.iter().any(|relation| {
+                    relation.origin == kin_model::RelationOrigin::Lsp && relation.src == source
+                })
             })
             .unwrap_or(false)
     })
@@ -2902,6 +2915,22 @@ pub async fn run_with_authority_on(
                                     relations = file_relations,
                                     progress = format!("{}/{}", files_processed, total_files),
                                     "sweep enriched file"
+                                );
+                            } else {
+                                // A file the sweep visited and got nothing from is a
+                                // finding, not a non-event. Only enriched files used
+                                // to be logged, so a pass could report itself complete
+                                // over 37 files while the three that carried the
+                                // answers produced nothing, and the log said only that
+                                // the other 34 went fine. On the requests corpus that
+                                // is exactly what happened: sessions.py, auth.py and
+                                // adapters.py each yielded zero while a test file
+                                // yielded a thousand.
+                                info!(
+                                    file = %file_id,
+                                    entities = file_entity_refs.len(),
+                                    progress = format!("{}/{}", files_processed, total_files),
+                                    "sweep enriched NOTHING for this file"
                                 );
                             }
 
