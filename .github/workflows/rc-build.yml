@@ -26,19 +26,20 @@ name: RC Build
 #
 # SOURCE OF TRUTH: .github/workflows/release.yml, job `build`. Every step below
 # is a byte-identical copy of that job's step of the same name, except where a
-# comment starting DELTA( names the difference and why. Seven steps are omitted
-# on purpose: the six macOS signing and notarization steps, which need the
-# credentials this workflow deliberately cannot reach, and the Cargo cache.
+# comment starting DELTA( names the difference and why. Six steps are omitted on
+# purpose: the macOS signing and notarization steps, which need the credentials
+# this workflow deliberately cannot reach.
 # scripts/check-rc-build-drift.mjs holds that relationship and fails the pull
 # request when release.yml moves and this file does not.
 #
-# The cache is omitted rather than copied. release.yml runs only on a v* tag,
-# and that tag is ruleset-protected, so its cache write is authorized code. This
-# workflow builds whatever ref it is handed, so the same step would let a
-# dispatch write a poisoned entry into a cache that CI and release builds later
-# restore from. It would also mean the bytes under proof were assembled partly
-# from cache contents no one reviewed, which is the opposite of what a candidate
-# build is for. A candidate compiles cold.
+# Neither workflow caches Cargo. This one never did, because it builds whatever
+# ref it is handed and the same step would let a dispatch write a poisoned entry
+# into a cache that CI and release builds later restore from, and would mean the
+# bytes under proof were assembled partly from cache contents no one reviewed.
+# release.yml has now dropped its own for a related reason: its entry was
+# tag-scoped and unreadable from the next tag, so it never restored, and a
+# restore that worked would have put unreviewed objects into published bytes.
+# A candidate compiles cold, and so does a release.
 #
 # What a candidate archive is NOT:
 #   - not signed and not notarized, so a macOS candidate archive is Gatekeeper
@@ -168,10 +169,16 @@ jobs:
       # musl-static C dependencies (ring, oniguruma, sqlite, tree-sitter) need a
       # musl-targeting C compiler; musl-tools provides musl-gcc. Only the Linux
       # musl legs require it.
+      #
+      # Bounded through the shared helper rather than called directly. A bare
+      # `apt-get update && apt-get install` has no ceiling below the job
+      # timeout: the hosted mirrorlist puts azure.archive.ubuntu.com first and a
+      # stall there trickles bytes slowly enough that no per-fetch timeout
+      # fires. The helper bounds each call, retries three times, and fails over
+      # to archive.ubuntu.com from the second attempt, so a stalled mirror ends
+      # the step with its own error line instead of holding a release build.
       - name: Install musl C toolchain (Linux musl)
         if: ${{ contains(matrix.target, '-linux-musl') }}
-        # DELTA(apt): bounded through the shared helper. An unbounded apt call
-        # holds a job until the runner timeout when a mirror stalls (FIR-2391).
         run: ./scripts/ci-apt-install.sh musl-tools
 
       - name: Install cross (ARM64)
@@ -859,3 +866,358 @@ jobs:
           fi
           printf '\nDownload these archives with: gh run download %s --repo %s\n' \
             "$GITHUB_RUN_ID" "$GITHUB_REPOSITORY" >> "$GITHUB_STEP_SUMMARY"
+
+  # What a candidate build could not say before this job existed: whether the
+  # bytes it produced survive a first install. v0.5.41 built cleanly on all five
+  # platforms and then died at the tag's own doctor health gate, because setup
+  # recorded a mount projection it never engaged and `kin doctor` read the
+  # recorded mode against the running state. That defect is visible the moment
+  # anything installs the archive and asks, and nothing pre-tag ever asked on a
+  # non-Linux platform.
+  #
+  # This job asks, on the archives this run actually built, and it stays inside
+  # the properties that make rc-build.yml safe to dispatch on any ref: it reads
+  # no secret, declares no environment, takes no permission beyond the
+  # workflow's `contents: read`, writes to no cache, and touches no release
+  # asset. It installs through the same scripts/install.sh a stranger runs, over
+  # a file:// base URL, which is that installer's own documented offline path.
+  #
+  # It is deliberately NOT a fourth copy of the capability contract.
+  # install-proof.yml holds that contract and remains the authority; the three
+  # copies that already exist are a known maintenance hazard and this does not
+  # add another. What is asserted here is a named subset that a candidate
+  # install with no agent clients present can legitimately satisfy, plus the
+  # rollup-consistency invariant over the whole report. Every other check is
+  # printed to the job summary and explicitly not asserted, so the summary can
+  # never be read as coverage this job did not provide.
+  capability:
+    name: RC Capability (${{ matrix.os }})
+    needs: build
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `covered` is this row's claim about whether the build matrix above
+          # produces an archive it can install. The first step reads that matrix
+          # and refuses a row whose claim is wrong in either direction, so
+          # adding a build row without enabling its probe fails here rather than
+          # leaving the platform silently unproven, and a probe claiming an
+          # archive that is not built fails instead of reporting a vacuous pass.
+          - os: macos-latest
+            artifact: kin-macos-aarch64
+            covered: true
+            setup-shell: zsh
+          # release.yml publishes kin-windows-x86_64; this workflow deliberately
+          # does not build it (see the header). A Windows candidate therefore
+          # has nothing to install, and this row exists to say so out loud in
+          # the run that would otherwise look like it covered every platform.
+          - os: windows-latest
+            artifact: kin-windows-x86_64
+            covered: false
+            setup-shell: powershell
+
+    steps:
+      # Before the checkout, or it has nothing to act on. Windows otherwise
+      # checks out CRLF, and rc-build run 32275955235 is what that costs: every
+      # line of the workflow carried a trailing \r, the reconciler's exact match
+      # on "  build:" found nothing, and it reported "rc-build.yml has no build
+      # job to read a matrix from". That reads as a verdict about the workflow
+      # and was a fact about the probe. The parser below strips \r as well, so
+      # neither half of the fix depends on the other.
+      - name: Preserve tracked bytes on Windows
+        if: runner.os == 'Windows'
+        shell: bash
+        run: git config --global core.autocrlf false
+
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Reconcile this row's coverage claim against the build matrix
+        shell: bash
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+          COVERED: ${{ matrix.covered }}
+        run: |
+          set -uo pipefail
+          # `-e` is on by default in this shell and must be off across the
+          # reconciler, because a nonzero exit is one of its answers rather than
+          # an accident. Every path below exits explicitly.
+          set +e
+          verdict=kin-coverage-verdict.txt
+          rm -f "$verdict"
+          # Three outcomes that must never be confusable. RECONCILED and
+          # MISMATCH are verdicts about the build matrix. Anything else is
+          # UNREADABLE, which is a fact about this probe and says nothing about
+          # coverage. The verdict is a FILE rather than an exit code alone, so a
+          # reconciler that died before answering cannot be read as one that
+          # answered: run 32275955235 threw exit 1 for a CRLF parse failure,
+          # which is the same exit a real mismatch would have used.
+          VERDICT_FILE="$verdict" node <<'NODE'
+          const fs = require("fs");
+          const write = (line) => fs.writeFileSync(process.env.VERDICT_FILE, `${line}\n`);
+          const unreadable = (why) => { write(`UNREADABLE ${why}`); process.exit(30); };
+          const mismatch = (why) => { write(`MISMATCH ${why}`); process.exit(20); };
+          let lines;
+          try {
+            // Split on either line ending. A CRLF checkout otherwise leaves a
+            // trailing \r on every line and no exact match can land.
+            lines = fs.readFileSync(".github/workflows/rc-build.yml", "utf8").split(/\r?\n/);
+          } catch (error) {
+            unreadable(`this probe could not read .github/workflows/rc-build.yml: ${error.message}`);
+          }
+          const start = lines.indexOf("  build:");
+          if (start === -1) {
+            unreadable("this probe found no '  build:' line in rc-build.yml, so it read no matrix at all");
+          }
+          let end = lines.length;
+          for (let i = start + 1; i < lines.length; i += 1) {
+            if (/^  [A-Za-z_][A-Za-z0-9_-]*:\s*$/.test(lines[i])) { end = i; break; }
+          }
+          const built = lines
+            .slice(start, end)
+            .filter((line) => /^\s+artifact:\s/.test(line))
+            .map((line) => line.trim().slice("artifact:".length).trim());
+          // A parse that silently returned nothing would make every claim below
+          // read as "not built", which is the answer this job exists to stop
+          // anyone from faking. That is a broken probe, not an uncovered
+          // platform, so it reports UNREADABLE rather than a verdict.
+          if (built.length < 2 || !built.includes("kin-linux-x86_64")) {
+            unreadable(`this probe read ${built.length} artifact rows out of the build matrix (${built.join(", ") || "none"})`);
+          }
+          const artifact = process.env.ARTIFACT;
+          const covered = process.env.COVERED === "true";
+          const isBuilt = built.includes(artifact);
+          if (covered && !isBuilt) {
+            mismatch(`this row claims to probe ${artifact}, but the build matrix builds ${built.join(", ")}`);
+          }
+          if (!covered && isBuilt) {
+            mismatch(`the build matrix now builds ${artifact}, so this row must set covered: true and probe it rather than reporting the platform unproven`);
+          }
+          write(`RECONCILED ${artifact} covered=${covered} built=${isBuilt}; the build matrix produces ${built.join(", ")}`);
+          NODE
+          rc=$?
+          if [ ! -f "$verdict" ]; then
+            echo "::error::UNREADABLE: the coverage reconciler exited $rc without writing a verdict. That is a fact about this probe, not a coverage verdict: nothing here says whether $ARTIFACT is built or not."
+            exit 1
+          fi
+          line="$(cat "$verdict")"
+          rm -f "$verdict"
+          case "$line" in
+            RECONCILED*)
+              printf '%s\n' "$line"
+              exit 0
+              ;;
+            MISMATCH*)
+              echo "::error::COVERAGE MISMATCH: ${line#MISMATCH }"
+              exit 1
+              ;;
+            UNREADABLE*)
+              echo "::error::UNREADABLE: ${line#UNREADABLE } (reconciler exit $rc). That is a fact about this probe, not a coverage verdict: nothing here says whether $ARTIFACT is built or not."
+              exit 1
+              ;;
+            *)
+              echo "::error::UNREADABLE: the coverage reconciler wrote a verdict this step does not recognize: $line"
+              exit 1
+              ;;
+          esac
+
+      - name: Record a platform this run builds no archive for
+        if: ${{ !matrix.covered }}
+        shell: bash
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+          PROBE_OS: ${{ matrix.os }}
+        run: |
+          set -euo pipefail
+          {
+            printf '### %s: NOT COVERED\n\n' "$PROBE_OS"
+            printf 'This run built no %s archive, so nothing here installed or probed a\n' "$ARTIFACT"
+            printf 'candidate on %s. The row is present so the absence is stated rather than\n' "$PROBE_OS"
+            printf 'inferred from a job list.\n\n'
+            printf 'What stays unproven until the tag: whether a first install on %s reaches\n' "$PROBE_OS"
+            printf 'a healthy doctor report. That is proved only by release.yml, whose install\n'
+            printf 'proof runs after the archives are published, which is the last gate before\n'
+            printf 'promotion and the one v0.5.41 died on.\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::warning::$PROBE_OS candidate capability is not covered pre-tag: this workflow builds no $ARTIFACT archive"
+
+      - name: Download the candidate archive
+        if: ${{ matrix.covered }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ runner.temp }}/kin-candidate
+
+      - name: Install the candidate through the public installer
+        if: ${{ matrix.covered }}
+        shell: bash
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          set -euo pipefail
+          staged="$RUNNER_TEMP/kin-candidate"
+          # The sidecar is checked before anything runs the bytes. A candidate
+          # travels through an artifact store, and an archive whose digest no
+          # longer matches its sidecar must refuse rather than be probed.
+          want="$(cut -d' ' -f1 < "$staged/${ARTIFACT}.tar.gz.sha256")"
+          have="$(shasum -a 256 "$staged/${ARTIFACT}.tar.gz" | cut -d' ' -f1)"
+          if [ "$want" != "$have" ]; then
+            echo "::error::${ARTIFACT}.tar.gz sidecar says $want, bytes are $have"
+            exit 1
+          fi
+          # The version the candidate stamped into its own binaries. Reading it
+          # from the manifest the build wrote keeps this job from re-deriving a
+          # version the archive might disagree with.
+          version="$(node -e '
+            const fs = require("fs");
+            const manifest = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+            const version = manifest.release_candidate?.version;
+            if (!version) throw new Error("candidate manifest carries no release_candidate.version");
+            process.stdout.write(version);
+          ' "$staged/${ARTIFACT}.provenance.json")"
+          served="$RUNNER_TEMP/kin-candidate-served"
+          mkdir -p "$served/download/v$version"
+          cp "$staged/${ARTIFACT}.tar.gz" "$staged/${ARTIFACT}.tar.gz.sha256" \
+            "$served/download/v$version/"
+          # KIN_BASE_URL is the installer's own offline path, so the archive is
+          # resolved, verified and unpacked by the same code a stranger runs.
+          # KIN_NO_SETUP defers setup to the probe below, which needs to run it
+          # explicitly to capture what it recorded.
+          KIN_NO_SETUP=1 KIN_VERSION="$version" KIN_BASE_URL="file://$served" \
+            sh ./scripts/install.sh
+          echo "$HOME/.kin/bin" >> "$GITHUB_PATH"
+          # The installer resolves the archive name from the host, so a name
+          # this matrix row and the installer disagree about would otherwise
+          # surface as a confusing later failure.
+          test -x "$HOME/.kin/bin/kin"
+          test -x "$HOME/.kin/bin/kin-daemon"
+          echo "installed candidate $version from $ARTIFACT"
+
+      - name: Capture the first-install doctor and setup health surface
+        if: ${{ matrix.covered }}
+        shell: bash
+        env:
+          PROBE_SHELL: ${{ matrix.setup-shell }}
+        run: |
+          set -euo pipefail
+          export SHELL="/bin/$PROBE_SHELL"
+          # A fresh repository so the daemon has something to initialize
+          # against, outside the workspace so the checkout this job made for the
+          # installer never becomes corpus, and captures written outside the
+          # probe repo too: the daemon admits observed new files as they are
+          # written, so a report written into the admitted tree becomes corpus
+          # and the store grows while it is measured.
+          captures="$RUNNER_TEMP/kin-candidate-captures"
+          probe="$RUNNER_TEMP/kin-candidate-probe"
+          mkdir -p "$captures" "$probe"
+          cd "$probe"
+          git init -q && git config user.email ci@firelock.ai && git config user.name ci
+          printf 'def hello():\n    return 42\n' > probe.py
+          git add -A && git commit -qm "probe"
+          kin init > "$captures/kin-init.txt" 2>&1
+          cat "$captures/kin-init.txt"
+          # setup is what records the projection mode, so the doctor reports
+          # below are only meaningful after it has run.
+          kin setup --no-interactive --intent agent --shell "$PROBE_SHELL" \
+            2>&1 | tee "$captures/kin-setup.txt"
+          # An unhealthy report is the finding, not a reason to stop before
+          # anything can read it. Capture the exit status and let the next step
+          # name the failing checks; a doctor that writes no JSON at all still
+          # fails there, and says so.
+          health_status=0
+          kin setup status --json > "$captures/kin-health.json" || health_status=$?
+          doctor_status=0
+          kin doctor --json > "$captures/kin-doctor.json" || doctor_status=$?
+          printf 'kin setup status exit %s, kin doctor exit %s\n' "$health_status" "$doctor_status"
+
+      - name: Judge the candidate health surface
+        if: ${{ matrix.covered }}
+        shell: bash
+        env:
+          PROBE_OS: ${{ matrix.os }}
+          ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require("fs");
+          const captures = `${process.env.RUNNER_TEMP}/kin-candidate-captures`;
+          // The named subset a candidate install with no agent clients present
+          // can legitimately satisfy. projection_mode is the check v0.5.41's
+          // tag reported misconfigured on every fresh macOS and Windows
+          // install; it is in this list for that reason and not by accident.
+          const asserted = [
+            "kin_binary",
+            "kin_daemon_binary",
+            "daemon_running",
+            "repo_init",
+            "shell_path",
+            "setup_ledger",
+            "vfs_projection",
+            "projection_mode",
+          ];
+          const summary = [];
+          const problems = [];
+          for (const name of ["kin-health.json", "kin-doctor.json"]) {
+            const report = JSON.parse(fs.readFileSync(`${captures}/${name}`, "utf8"));
+            if (!Array.isArray(report.checks)) {
+              problems.push(`${name}: checks is missing or malformed`);
+              continue;
+            }
+            const byId = new Map(report.checks.map((check) => [check.id, check]));
+            if (byId.size !== report.checks.length) {
+              problems.push(`${name}: duplicate health-check ids are not authoritative`);
+            }
+            // The rollup has to agree with the checks it summarizes. A release
+            // has already been abandoned over an aggregate that disagreed with
+            // its own list, and that defect is invisible to any check that only
+            // reads `healthy`.
+            const expectedHealthy = !report.checks.some(
+              (check) =>
+                check.status === "missing" ||
+                check.status === "misconfigured" ||
+                (check.id === "semantic_query_readiness" && check.status === "stale")
+            );
+            if (report.healthy !== expectedHealthy) {
+              problems.push(
+                `${name}: aggregate healthy=${report.healthy} disagrees with its checks; expected ${expectedHealthy}`
+              );
+            }
+            for (const id of asserted) {
+              const status = byId.get(id)?.status;
+              if (status === undefined) {
+                problems.push(`${name}: ${id} is missing from the report entirely`);
+              } else if (status === "missing" || status === "misconfigured") {
+                problems.push(`${name}: ${id}=${status}`);
+              }
+            }
+            const rows = report.checks
+              .map((check) => {
+                const judged = asserted.includes(check.id) ? "asserted" : "reported only";
+                return `| ${check.id} | ${check.status} | ${judged} |`;
+              })
+              .join("\n");
+            summary.push(
+              `### ${process.env.PROBE_OS}: ${name}\n\n` +
+                `Candidate archive \`${process.env.ARTIFACT}\`, aggregate healthy=${report.healthy}.\n\n` +
+                `| check | status | this job |\n| --- | --- | --- |\n${rows}\n`
+            );
+          }
+          summary.push(
+            "Checks marked `reported only` are printed rather than judged. " +
+              "install-proof.yml holds the full capability contract and remains the authority; " +
+              "this probe asserts a named subset plus the rollup-consistency invariant, so nothing " +
+              "above should be read as coverage of the whole contract.\n"
+          );
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${summary.join("\n")}\n`);
+          if (problems.length > 0) {
+            for (const problem of problems) console.error(`::error::${problem}`);
+            throw new Error(
+              `the candidate's first-install health surface failed ${problems.length} assertion(s) on ${process.env.PROBE_OS}`
+            );
+          }
+          console.log(`candidate health surface holds on ${process.env.PROBE_OS}`);
+          NODE
