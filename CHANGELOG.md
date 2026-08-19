@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - chore(ci): pin kin-actions v0.1.32 (#963)
+- Report commit-memory parity as a warning and state the cost in INSTALL.md (#959)
+- Name the context pack's two directions and disclose small-corpus ranking (#960)
+- Cut CI wall clock: build Windows legs once, shard the macOS gate, route release-policy failures (#964)
 
 
 ## [0.5.42] - 2026-08-19
