@@ -1,0 +1,847 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+name: RC Build
+
+# A release-candidate archive build that needs no tag.
+#
+# The release proof loop says: preflight the composed build, run the archive
+# stranger on the candidate, then land and tag. The second step could not run
+# before a tag existed. Release-shaped archives were produced only by
+# release.yml, release.yml runs only on a `v*` tag push, and a tag run resolves
+# its workflows from the tag, so nothing landed afterwards can repair it. The
+# archive stranger therefore ran on shipped bytes for v0.5.40, after the cut,
+# and bin/kin-release-preflight skipped its Linux leg with "no Linux archive was
+# given and this host cannot cross-build one" because a macOS host cannot
+# produce a linux-aarch64 archive.
+#
+# This workflow closes that gap. It builds the same archive layouts release.yml
+# builds, for an arbitrary ref, and uploads them as artifacts. It creates no
+# tag, publishes no release, publishes to no registry, and touches no promotion
+# state. It holds no credential: it declares no environment and reads no secret,
+# which is what keeps a dispatch of branch-controlled workflow code away from the
+# Apple and package-publish credentials release.yml gates behind `environment:
+# release` (see the note above `config` in release.yml).
+#
+# SOURCE OF TRUTH: .github/workflows/release.yml, job `build`. Every step below
+# is a byte-identical copy of that job's step of the same name, except where a
+# comment starting DELTA( names the difference and why. Two step groups are
+# omitted on purpose: the six macOS signing and notarization steps, which need
+# the credentials this workflow deliberately cannot reach, and nothing else.
+# scripts/check-rc-build-drift.mjs holds that relationship and fails the pull
+# request when release.yml moves and this file does not.
+#
+# What a candidate archive is NOT:
+#   - not signed and not notarized, so a macOS candidate archive is Gatekeeper
+#     material only after a real tag builds it. The Linux archives carry no
+#     signature in a release either, so they are unaffected.
+#   - not a release, and its provenance manifest carries no release_tag.
+#   - not built for windows-x86_64 or macos-x86_64. Neither host tool consumes
+#     those, so a candidate says nothing about either archive; the matrix rows
+#     stay in release.yml alone until something reads them here.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: >-
+          Commit sha, branch or tag to build. Defaults to the dispatching ref.
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+# A candidate build is disposable, so a newer dispatch for the same ref
+# supersedes an older one rather than queueing behind it.
+concurrency:
+  group: kin-rc-build-${{ github.event.inputs.ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: RC Build (${{ matrix.artifact }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # These rows are copied from release.yml's build matrix. The
+          # windows-x86_64 and macos-x86_64 rows are deliberately absent: see
+          # the header. Keeping the row shape identical is what lets a missing
+          # row be added here by copying one line.
+          #
+          # DELTA(skip_vfs): every row declares it. Three shared steps read
+          # matrix.skip_vfs, and release.yml gets the key from the windows row
+          # this matrix does not carry, so without it actionlint rejects those
+          # steps against a matrix type that has no such property. The value is
+          # the same false those steps already saw on every non-windows row.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            vfs_target: x86_64-unknown-linux-gnu
+            artifact: kin-linux-x86_64
+            skip_vfs: false
+            shim_name: libkin_vfs_shim.so
+            cross: false
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            vfs_target: aarch64-unknown-linux-gnu
+            artifact: kin-linux-aarch64
+            skip_vfs: false
+            shim_name: libkin_vfs_shim.so
+            cross: false
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: kin-macos-aarch64
+            skip_vfs: false
+            shim_name: libkin_vfs_shim.dylib
+            cross: false
+
+    steps:
+      - name: Preserve tracked bytes on Windows
+        if: runner.os == 'Windows'
+        shell: bash
+        run: git config --global core.autocrlf false
+
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # DELTA(ref): an empty string leaves actions/checkout on the
+          # dispatching ref, so the default input builds what was dispatched.
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      # ADDED: a candidate has no tag to take a version from, and both the macOS
+      # notifier bundle and the provenance manifest need one. The workspace
+      # package version is what the built binaries stamp into their own static
+      # build identity, so it is the only value those identities can agree with.
+      - name: Resolve the release-candidate identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -e '
+            const fs = require("fs");
+            let inSection = false;
+            let version = null;
+            for (const line of fs.readFileSync("Cargo.toml", "utf8").split("\n")) {
+              const header = line.match(/^\s*\[([^\]]+)\]/);
+              if (header) { inSection = header[1] === "workspace.package"; continue; }
+              if (!inSection) continue;
+              const found = line.match(/^\s*version\s*=\s*"([^"]+)"/);
+              if (found) { version = found[1]; break; }
+            }
+            if (!version) throw new Error("Cargo.toml carries no [workspace.package] version");
+            process.stdout.write(version);
+          ')"
+          # Refuse rather than default. A version read that silently returned
+          # something unversion-shaped would surface later as a static build
+          # identity mismatch attributed to the binaries.
+          case "$version" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::resolved release-candidate version '$version' is not semver-shaped"; exit 1 ;;
+          esac
+          {
+            echo "RC_VERSION=$version"
+            echo "RC_REF=$(git rev-parse HEAD)"
+          } >> "$GITHUB_ENV"
+          echo "release candidate $version at $(git rev-parse HEAD)"
+
+      - name: Install Rust stable
+        uses: ./.github/actions/rust-toolchain
+        with:
+          # On the Linux legs the core (kin, kin-daemon) targets musl and the VFS
+          # leg targets gnu (vfs_target), so both targets must be installed.
+          targets: ${{ matrix.target }}${{ matrix.vfs_target && format(' {0}', matrix.vfs_target) || '' }}
+
+      # musl-static C dependencies (ring, oniguruma, sqlite, tree-sitter) need a
+      # musl-targeting C compiler; musl-tools provides musl-gcc. Only the Linux
+      # musl legs require it.
+      - name: Install musl C toolchain (Linux musl)
+        if: ${{ contains(matrix.target, '-linux-musl') }}
+        # DELTA(apt): bounded through the shared helper. An unbounded apt call
+        # holds a job until the runner timeout when a mirror stalls (FIR-2391).
+        run: ./scripts/ci-apt-install.sh musl-tools
+
+      - name: Install cross (ARM64)
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Checkout kin-vfs
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: firelock-ai/kin-vfs
+          path: kin-vfs
+          # Release inputs must never move under an unchanged Kin tag.
+          ref: a1ba0a3a2556011c508aeb108ff9e2e21addd615
+          persist-credentials: false
+
+      - name: Verify canonical release input bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const childProcess = require("child_process");
+          const crypto = require("crypto");
+          const fs = require("fs");
+          const path = require("path");
+
+          const sha256 = (bytes) =>
+            crypto.createHash("sha256").update(bytes).digest("hex");
+          for (const [label, root] of [["Kin", process.cwd()], ["kin-vfs", path.join(process.cwd(), "kin-vfs")]]) {
+            const tracked = childProcess.execFileSync(
+              "git",
+              ["cat-file", "blob", "HEAD:Cargo.lock"],
+              { cwd: root }
+            );
+            const working = fs.readFileSync(path.join(root, "Cargo.lock"));
+            if (!working.equals(tracked)) {
+              throw new Error(
+                `${label} Cargo.lock working bytes ${sha256(working)} do not match ` +
+                `tracked Git bytes ${sha256(tracked)}; refusing platform-specific release provenance`
+              );
+            }
+            console.log(`Verified canonical ${label} Cargo.lock bytes: ${sha256(tracked)}`);
+          }
+
+          const lockPackages = (lockPath) => fs.readFileSync(lockPath, "utf8")
+            .split("[[package]]")
+            .slice(1)
+            .map((block) => ({
+              name: block.match(/^name = "([^"]+)"/m)?.[1],
+              version: block.match(/^version = "([^"]+)"/m)?.[1],
+              source: block.match(/^source = "([^"]+)"/m)?.[1] ?? null,
+            }));
+          const kinVfsCore = lockPackages(path.join(process.cwd(), "Cargo.lock"))
+            .filter((pkg) => pkg.name === "kin-vfs-core" && pkg.source?.startsWith("sparse+"));
+          const pinnedVfsCore = lockPackages(path.join(process.cwd(), "kin-vfs", "Cargo.lock"))
+            .filter((pkg) => pkg.name === "kin-vfs-core" && pkg.source === null);
+          if (kinVfsCore.length !== 1 || pinnedVfsCore.length !== 1) {
+            throw new Error(
+              `expected one registry Kin kin-vfs-core and one pinned local kin-vfs-core; ` +
+              `found ${kinVfsCore.length} and ${pinnedVfsCore.length}`
+            );
+          }
+          if (kinVfsCore[0].version !== pinnedVfsCore[0].version) {
+            throw new Error(
+              `Kin resolves kin-vfs-core ${kinVfsCore[0].version}, but the pinned release ` +
+              `checkout builds ${pinnedVfsCore[0].version}; update the immutable kin-vfs pin`
+            );
+          }
+          console.log(`Verified Kin/kin-vfs release compatibility at kin-vfs-core ${kinVfsCore[0].version}`);
+          NODE
+
+      - name: Cache Cargo registry and build artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.0.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            kin-vfs/target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
+
+      - name: Assert clean release source
+        shell: bash
+        run: |
+          set -euo pipefail
+          dirty="$(git status --porcelain --untracked-files=all)"
+          if [ -n "$dirty" ]; then
+            printf '%s\n' "$dirty" >&2
+            echo "::error::release checkout is not clean before compilation"
+            exit 1
+          fi
+          vfs_dirty="$(git -C kin-vfs status --porcelain --untracked-files=all)"
+          if [ -n "$vfs_dirty" ]; then
+            printf '%s\n' "$vfs_dirty" >&2
+            echo "::error::pinned kin-vfs checkout is not clean before compilation"
+            exit 1
+          fi
+
+      - name: Build kin-cli + kin-daemon (native)
+        if: ${{ !matrix.cross }}
+        shell: bash
+        run: |
+          # The daemon is the runtime: `kin init` works without it but
+          # `kin status`/`kin search`/the MCP server all require kin-daemon on
+          # PATH, so a clean public install must ship it alongside `kin`.
+          #
+          # Every platform now builds the same default feature set. Windows was
+          # the only leg that stripped it, and dropping that split is what puts
+          # native vector search in the shipped Windows archive.
+          cargo build --locked --release --target "$TARGET" -p kin-cli -p kin-daemon
+        env:
+          TARGET: ${{ matrix.target }}
+
+      - name: Build kin-cli + kin-daemon (cross)
+        if: ${{ matrix.cross }}
+        run: cross build --locked --release --target "$TARGET" -p kin-cli -p kin-daemon
+        env:
+          TARGET: ${{ matrix.target }}
+
+      # KinNotifier.app carries Kin's notification identity. macOS derives a
+      # notification's sender name, icon, and grouping from the posting
+      # process's bundle, so without this the CLI's notifications are credited
+      # to Script Editor. macOS-only: there is no bundle concept elsewhere.
+      - name: Build and assemble KinNotifier.app (macOS)
+        if: ${{ runner.os == 'macOS' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --target "$TARGET" -p kin-notifier-macos
+          crates/kin-notifier-macos/bundle.sh \
+            "target/${TARGET}/release/KinNotifier" \
+            "target/${TARGET}/release" \
+            "$RC_VERSION"
+        env:
+          TARGET: ${{ matrix.target }}
+
+      # kin and kin-daemon are static musl and carry no glibc floor at all. The
+      # VFS pair is the only glibc-linked thing Kin publishes for Linux, and
+      # until now its floor was a property of the runner image: Rust std
+      # references pidfd_spawnp and pidfd_getpid as weak undefined symbols, the
+      # linker binds them to whatever libc the build host exports, and the
+      # ubuntu-24.04 images export them at GLIBC_2.39. v0.5.38 shipped a
+      # linux-aarch64 kin-vfs the Debian 12 loader refused outright for exactly
+      # that reason. Zig ships glibc headers for every version, so building
+      # through it pins the floor to a number under review here rather than to
+      # whichever image the runner label resolves to this month.
+      - name: Install the pinned glibc floor toolchain (Linux)
+        if: ${{ runner.os == 'Linux' && !matrix.cross && !matrix.skip_vfs }}
+        shell: bash
+        env:
+          ZIG_VERSION: "0.13.0"
+          CARGO_ZIGBUILD_VERSION: "0.19.8"
+          # Published by ziglang.org/download/index.json for these exact
+          # tarballs. A release input must be immutable, so the download is
+          # checked rather than trusted.
+          ZIG_SHA256_X86_64: d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea
+          ZIG_SHA256_AARCH64: 041ac42323837eb5624068acd8b00cd5777dac4cf91179e8dad7a7e90dd0c556
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64) zig_arch=x86_64; zig_sha="$ZIG_SHA256_X86_64" ;;
+            aarch64) zig_arch=aarch64; zig_sha="$ZIG_SHA256_AARCH64" ;;
+            *)
+              echo "::error::no pinned zig tarball for Linux $(uname -m); the release cannot pin its glibc floor on this host"
+              exit 1
+              ;;
+          esac
+          tarball="$RUNNER_TEMP/zig-${ZIG_VERSION}.tar.xz"
+          curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused \
+            --location --silent --show-error --fail \
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-${zig_arch}-${ZIG_VERSION}.tar.xz" \
+            --output "$tarball"
+          echo "${zig_sha}  ${tarball}" | sha256sum --check --strict -
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$tarball" -C "$RUNNER_TEMP/zig" --strip-components=1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+          cargo install cargo-zigbuild --locked --version "$CARGO_ZIGBUILD_VERSION"
+
+      - name: Build kin-vfs (native)
+        if: ${{ !matrix.cross && !matrix.skip_vfs }}
+        working-directory: kin-vfs
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The VFS shim is an LD_PRELOAD libc interceptor and is therefore
+          # libc-specific: on Linux it builds against gnu (VFS_TARGET) so it can
+          # preload into the host distro's glibc programs. macOS/Windows have no
+          # vfs_target, so VFS_TARGET falls back to the core target there.
+          # The mount features are what make the shipped driver able to serve a
+          # projection the operating system mounts, rather than only the
+          # injected shim. macOS gets nfs because it carries an NFS client in
+          # the base system; Linux gets fuse below because it carries libfuse
+          # far more widely than a configured NFS client. Neither flag moves the
+          # glibc floor or adds a runtime dependency: building the same tree
+          # with and without them yields an identical shared-library set and an
+          # identical set of referenced GLIBC symbol versions, and fuser links
+          # no library because it mounts through the fusermount3 helper.
+          # --locked still holds: nfsserve and fuser are already in kin-vfs's
+          # tracked lock at the pinned ref.
+          if [ "$RUNNER_OS" != "Linux" ]; then
+            cargo build --locked --release --target "$VFS_TARGET" -p kin-vfs-cli --features nfs
+            cargo build --locked --release --target "$VFS_TARGET" -p kin-vfs-shim
+            exit 0
+          fi
+          # The floor is read out of the guard rather than written here as
+          # well. A build targeting one floor while the guard enforces another
+          # is worse than no guard, and the two drifting apart is exactly the
+          # shape that survives review.
+          floor="$(node "$GITHUB_WORKSPACE/scripts/check-glibc-floor.mjs" --print-floor)"
+          # zig cc does not search Debian/Ubuntu multiarch directories, and the
+          # OpenSSL that kin-vfs-daemon links through reqwest lives in them:
+          # the headers under /usr/include/<multiarch> and the link libraries
+          # under /usr/lib/<multiarch>. Both Linux legs build natively, so the
+          # multiarch triple is the VFS target's architecture.
+          multiarch="${VFS_TARGET%%-*}-linux-gnu"
+          scoped="$(printf '%s' "$VFS_TARGET" | tr - _)"
+          upper="$(printf '%s' "$scoped" | tr '[:lower:]' '[:upper:]')"
+          export "CFLAGS_${scoped}=-I/usr/include/${multiarch}"
+          export "CARGO_TARGET_${upper}_RUSTFLAGS=-L native=/usr/lib/${multiarch}"
+          cargo zigbuild --locked --release --target "${VFS_TARGET}.${floor}" -p kin-vfs-cli --features fuse
+          cargo zigbuild --locked --release --target "${VFS_TARGET}.${floor}" -p kin-vfs-shim
+        env:
+          VFS_TARGET: ${{ matrix.vfs_target || matrix.target }}
+
+      - name: Build kin-vfs (cross)
+        if: ${{ matrix.cross }}
+        working-directory: kin-vfs
+        run: |
+          cross build --locked --release --target "$TARGET" -p kin-vfs-cli
+          cross build --locked --release --target "$TARGET" -p kin-vfs-shim
+        env:
+          TARGET: ${{ matrix.target }}
+
+      - name: Verify native release build provenance
+        if: ${{ !matrix.cross }}
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          case "$RUNNER_ARCH:$TARGET" in
+            X64:x86_64-*|ARM64:aarch64-*) ;;
+            *)
+              echo "Skipping execution of cross-architecture artifact $TARGET on $RUNNER_ARCH; the matching macOS leg executes the same source and lock provenance."
+              exit 0
+              ;;
+          esac
+
+          suffix=""
+          [ "$RUNNER_OS" = "Windows" ] && suffix=".exe"
+          kin_bin="target/$TARGET/release/kin$suffix"
+          daemon_bin="target/$TARGET/release/kin-daemon$suffix"
+          provenance_dir="$RUNNER_TEMP/kin-release-provenance-$TARGET"
+          mkdir -p "$provenance_dir"
+          "$kin_bin" --version | tee "$provenance_dir/kin-version.txt"
+          "$daemon_bin" --version | tee "$provenance_dir/kin-daemon-version.txt"
+          "$kin_bin" bench-meta --json > "$provenance_dir/kin-build-meta.json"
+          expected_sha="$(git rev-parse HEAD)"
+
+          EXPECTED_SHA="$expected_sha" PROVENANCE_DIR="$provenance_dir" node <<'NODE'
+          const crypto = require("crypto");
+          const fs = require("fs");
+          const expected = process.env.EXPECTED_SHA;
+          const dir = process.env.PROVENANCE_DIR;
+          const lines = ["kin-version.txt", "kin-daemon-version.txt"].map((path) =>
+            fs.readFileSync(`${dir}/${path}`, "utf8").trim()
+          );
+          const shas = lines.map((line) => {
+            const match = line.match(/\(([0-9a-f]{40})(-dirty)?\s/);
+            if (!match) throw new Error(`release version line lacks a full build SHA: ${line}`);
+            if (match[2]) throw new Error(`release binary was built dirty: ${line}`);
+            return match[1];
+          });
+          if (shas.some((sha) => sha !== expected) || shas[0] !== shas[1]) {
+            throw new Error(`release binary SHAs ${shas.join(", ")} do not match checkout ${expected}`);
+          }
+
+          const meta = JSON.parse(fs.readFileSync(`${dir}/kin-build-meta.json`, "utf8"));
+          if (process.env.GITHUB_REF_TYPE === "tag") {
+            const expectedVersion = process.env.GITHUB_REF_NAME.replace(/^v/, "");
+            if (meta.kin_version !== expectedVersion) {
+              throw new Error(`kin package version ${meta.kin_version ?? "missing"} does not match release tag ${expectedVersion}`);
+            }
+          }
+          if (meta.kin_commit !== expected || meta.kin_dirty !== false || meta.kin_source_known !== true) {
+            throw new Error("kin bench-meta did not prove a clean, known release source");
+          }
+          const tagLockSha = crypto.createHash("sha256").update(fs.readFileSync("Cargo.lock")).digest("hex");
+          if (meta.dependency_provenance !== tagLockSha) {
+            throw new Error(
+              `embedded Cargo.lock provenance ${meta.dependency_provenance ?? "missing"} ` +
+              `does not match tagged Cargo.lock ${tagLockSha}`
+            );
+          }
+          // Every published archive now carries semantic search. This used to
+          // run only for the one leg that stripped the features, which meant no
+          // leg ever asserted they were PRESENT; a silent feature regression on
+          // any platform would have shipped green. Assert it everywhere.
+          //
+          // `metal` reports the compiled backend rather than the marker cargo
+          // feature (bench_meta.rs `metal_active()` is
+          // `cfg!(target_os = "macos")`), so it is expected on macOS and is a
+          // defect anywhere else.
+          for (const feature of ["vector", "embeddings"]) {
+            if (!meta.feature_flags.includes(feature)) {
+              throw new Error(`release build for ${process.env.TARGET} did not enable ${feature}`);
+            }
+          }
+          const expectMetal = process.env.TARGET.includes("apple-darwin");
+          if (meta.feature_flags.includes("metal") !== expectMetal) {
+            throw new Error(
+              `release build for ${process.env.TARGET} reported metal=${meta.feature_flags.includes("metal")}, expected ${expectMetal}`
+            );
+          }
+          NODE
+
+      - name: Assert release build did not mutate source
+        shell: bash
+        run: |
+          set -euo pipefail
+          dirty="$(git status --porcelain --untracked-files=all)"
+          if [ -n "$dirty" ]; then
+            printf '%s\n' "$dirty" >&2
+            echo "::error::release build mutated the source checkout"
+            exit 1
+          fi
+          vfs_dirty="$(git -C kin-vfs status --porcelain --untracked-files=all)"
+          if [ -n "$vfs_dirty" ]; then
+            printf '%s\n' "$vfs_dirty" >&2
+            echo "::error::release build mutated the pinned kin-vfs checkout"
+            exit 1
+          fi
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir "$ARTIFACT"
+          cp "target/${TARGET}/release/kin" "$ARTIFACT/"
+          # kin-daemon is mandatory (no `|| true`): a daemon-less
+          # archive lets `kin init` succeed but then `kin status`/`kin search`
+          # fail with no daemon on PATH, so a missing daemon must fail the build.
+          cp "target/${TARGET}/release/kin-daemon" "$ARTIFACT/"
+          # kin-vfs (cli + shim) is built under VFS_TARGET, which on Linux is the
+          # gnu triple (the shim is libc-specific) and elsewhere equals TARGET.
+          cp "kin-vfs/target/${VFS_TARGET}/release/kin-vfs" "$ARTIFACT/"
+          cp "kin-vfs/target/${VFS_TARGET}/release/${SHIM_NAME}" "$ARTIFACT/"
+          # KinNotifier.app is macOS-only and is copied whole: -R preserves the
+          # bundle structure and the stapled notarization ticket inside it.
+          if [ -d "target/${TARGET}/release/KinNotifier.app" ]; then
+            cp -R "target/${TARGET}/release/KinNotifier.app" "$ARTIFACT/"
+          fi
+          tar czf "${ARTIFACT}.tar.gz" "$ARTIFACT"
+          # Take the listing once into a file. Piping it into `grep -q` lets grep
+          # exit on its first match, and under `pipefail` the SIGPIPE that raises
+          # on `tar` fails the pipeline, which reads exactly like the member being
+          # absent. Reading a file cannot invert the guard that way.
+          ARCHIVE_LISTING="$RUNNER_TEMP/${ARTIFACT}.listing.txt"
+          tar tzf "${ARTIFACT}.tar.gz" > "$ARCHIVE_LISTING"
+          # All supported Unix surfaces are mandatory release contents.
+          for required in kin kin-daemon kin-vfs "$SHIM_NAME"; do
+            if ! grep -q "/${required}$" "$ARCHIVE_LISTING"; then
+              echo "::error::$required missing from ${ARTIFACT}.tar.gz"
+              exit 1
+            fi
+          done
+          # The notifier is mandatory on macOS. Without it the CLI still runs but
+          # every notification is credited to Script Editor, which is a silent
+          # downgrade rather than a visible failure, so assert it here.
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            if ! grep -q "KinNotifier.app/Contents/MacOS/KinNotifier$" "$ARCHIVE_LISTING"; then
+              echo "::error::KinNotifier.app missing from ${ARTIFACT}.tar.gz"
+              exit 1
+            fi
+          fi
+          shasum -a 256 "${ARTIFACT}.tar.gz" > "${ARTIFACT}.tar.gz.sha256"
+        env:
+          TARGET: ${{ matrix.target }}
+          VFS_TARGET: ${{ matrix.vfs_target || matrix.target }}
+          ARTIFACT: ${{ matrix.artifact }}
+          SHIM_NAME: ${{ matrix.shim_name }}
+
+      # Read the floor back off the bytes that were just packaged. The build
+      # above pins it, and a pin goes quiet the day it stops taking effect,
+      # which is how v0.5.38 published a kin-vfs that no Debian 12 could start
+      # while every check in this workflow stayed green. This step is the half
+      # that cannot pass by accident: it names the highest GLIBC requirement in
+      # each shipped dynamic binary and the symbols that set it, and refuses the
+      # release above the floor.
+      - name: Verify the packaged Linux binaries meet the published glibc floor
+        if: ${{ runner.os == 'Linux' && !matrix.skip_vfs }}
+        shell: bash
+        run: node scripts/check-glibc-floor.mjs "$ARTIFACT/kin-vfs" "$ARTIFACT/$SHIM_NAME"
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+          SHIM_NAME: ${{ matrix.shim_name }}
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path $env:ARTIFACT
+          Copy-Item "target/$env:TARGET/release/kin.exe" "$env:ARTIFACT/"
+          # kin-daemon is mandatory: fail hard if it's missing rather
+          # than ship a daemon-less archive that can `kin init` but nothing else.
+          Copy-Item "target/$env:TARGET/release/kin-daemon.exe" "$env:ARTIFACT/" -ErrorAction Stop
+          Copy-Item "kin-vfs/target/$env:TARGET/release/kin-vfs.exe" "$env:ARTIFACT/" -ErrorAction SilentlyContinue
+          Copy-Item "kin-vfs/target/$env:TARGET/release/$env:SHIM_NAME" "$env:ARTIFACT/" -ErrorAction SilentlyContinue
+          Compress-Archive -Path "$env:ARTIFACT/*" -DestinationPath "$env:ARTIFACT.zip"
+          # Assert the produced zip actually contains kin-daemon.exe.
+          $entries = [System.IO.Compression.ZipFile]::OpenRead("$PWD/$env:ARTIFACT.zip").Entries.Name
+          if ($entries -notcontains "kin-daemon.exe") {
+            Write-Error "kin-daemon.exe missing from $env:ARTIFACT.zip, refusing to publish a daemon-less archive"
+            exit 1
+          }
+          # The POSIX installer builds one archive name for every platform it
+          # detects, "kin-<os>-<arch>.tar.gz", and it detects windows from the
+          # MSYS, MINGW, and CYGWIN uname strings. Piping the documented curl
+          # command into a shell on Windows therefore asked for a tarball this
+          # leg never produced, and every release to date answered that request
+          # with a 404. Publish the same components under that exact name beside
+          # the zip. The zip stays the primary archive: the PowerShell
+          # installer, the npm launcher, and `kin update` all resolve Windows by
+          # that name, and anything already depending on it keeps working.
+          tar -czf "$env:ARTIFACT.tar.gz" "$env:ARTIFACT"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "tar failed to package $env:ARTIFACT.tar.gz"
+            exit 1
+          }
+          $members = @(tar -tzf "$env:ARTIFACT.tar.gz")
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "tar failed to list $env:ARTIFACT.tar.gz"
+            exit 1
+          }
+          $members = @($members | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
+          # The Unix legs wrap their contents in a single "<artifact>/" root and
+          # the release shape rules refuse a member carrying a backslash, so
+          # assert both here rather than discovering a Windows path separator in
+          # the publish job after the archive is already built.
+          $prefix = "$env:ARTIFACT/"
+          foreach ($member in $members) {
+            if ($member.Contains("\")) {
+              Write-Error "$env:ARTIFACT.tar.gz member '$member' uses a Windows path separator"
+              exit 1
+            }
+            if (-not $member.StartsWith($prefix)) {
+              Write-Error "$env:ARTIFACT.tar.gz member '$member' is not under $prefix"
+              exit 1
+            }
+          }
+          $TarNames = @(
+            $members |
+              Where-Object { -not $_.EndsWith("/") } |
+              ForEach-Object { $_.Substring($prefix.Length) } |
+              Sort-Object
+          )
+          $ZipNames = @($entries | Sort-Object)
+          if (Compare-Object -ReferenceObject $ZipNames -DifferenceObject $TarNames) {
+            Write-Error "$env:ARTIFACT.tar.gz and $env:ARTIFACT.zip do not carry the same components"
+            exit 1
+          }
+          if ($TarNames -notcontains "kin-daemon.exe") {
+            Write-Error "kin-daemon.exe missing from $env:ARTIFACT.tar.gz"
+            exit 1
+          }
+          foreach ($ArchivePath in @("$env:ARTIFACT.zip", "$env:ARTIFACT.tar.gz")) {
+            $Hash = (Get-FileHash -Algorithm SHA256 $ArchivePath).Hash.ToLowerInvariant()
+            "$Hash  $ArchivePath" | Set-Content -Encoding ascii "$ArchivePath.sha256"
+          }
+        env:
+          TARGET: ${{ matrix.target }}
+          ARTIFACT: ${{ matrix.artifact }}
+          SHIM_NAME: ${{ matrix.shim_name }}
+
+      - name: Generate artifact provenance manifest
+        shell: bash
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+          TARGET: ${{ matrix.target }}
+          VFS_TARGET: ${{ matrix.vfs_target || matrix.target }}
+          EXPECTED_VFS_COMMIT: a1ba0a3a2556011c508aeb108ff9e2e21addd615
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const childProcess = require("child_process");
+          const crypto = require("crypto");
+          const fs = require("fs");
+          const path = require("path");
+
+          const artifact = process.env.ARTIFACT;
+          const { readUpdateBuildIdentity } = require("./scripts/read-update-build-identity.cjs");
+          const { classifyReleaseArchiveRoot } = require("./scripts/release-archive-shape.cjs");
+          const target = process.env.TARGET;
+          const root = process.cwd();
+          const authorityNames = new Set(
+            target.includes("-windows-")
+              ? ["kin.exe", "kin-daemon.exe"]
+              : ["kin", "kin-daemon"]
+          );
+          const sha256 = (file) =>
+            crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+          const git = (cwd, ...args) =>
+            childProcess.execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+
+          const kinCommit = git(root, "rev-parse", "HEAD");
+          const vfsRoot = path.join(root, "kin-vfs");
+          const vfsCommit = git(vfsRoot, "rev-parse", "HEAD");
+          if (vfsCommit !== process.env.EXPECTED_VFS_COMMIT) {
+            throw new Error(`kin-vfs checkout ${vfsCommit} does not match pinned ${process.env.EXPECTED_VFS_COMMIT}`);
+          }
+
+          const kinLockSha = sha256(path.join(root, "Cargo.lock"));
+          const vfsLockSha = sha256(path.join(vfsRoot, "Cargo.lock"));
+          const buildMetaPath = path.join(
+            process.env.RUNNER_TEMP,
+            `kin-release-provenance-${target}`,
+            "kin-build-meta.json"
+          );
+          const buildMeta = JSON.parse(fs.readFileSync(buildMetaPath, "utf8"));
+          if (buildMeta.kin_commit !== kinCommit || buildMeta.dependency_provenance !== kinLockSha) {
+            throw new Error("embedded build provenance does not match the tagged Kin source and Cargo.lock");
+          }
+
+          // Windows publishes two containers of the same components: the zip
+          // every Windows resolver already asks for, and the tarball the POSIX
+          // installer builds its name from. The zip stays the manifest's
+          // primary archive because `kin update` and the public install proof
+          // both find the platform record by that exact name; the tarball is
+          // inventoried beside it so its bytes are covered by the same
+          // provenance rather than published unaccounted for.
+          const windowsTarget = target.includes("-windows-");
+          const primaryArchive = windowsTarget ? `${artifact}.zip` : `${artifact}.tar.gz`;
+          const additionalArchiveNames = windowsTarget ? [`${artifact}.tar.gz`] : [];
+          const expectedArchives = [primaryArchive, ...additionalArchiveNames].sort();
+          const archives = [`${artifact}.tar.gz`, `${artifact}.zip`]
+            .filter((file) => fs.existsSync(file))
+            .sort();
+          if (JSON.stringify(archives) !== JSON.stringify(expectedArchives)) {
+            throw new Error(`expected final archives ${expectedArchives.join(", ")} for ${artifact}, found ${archives.join(", ") || "none"}`);
+          }
+          const archive = primaryArchive;
+          const archiveRecord = (name) => ({
+            name,
+            sha256: sha256(name),
+            size_bytes: fs.statSync(name).size,
+          });
+          // The content inventory covers the archive's component files. The macOS
+          // notification bundle is a sealed directory rather than a component, so
+          // it is classified and shape-checked here but stays out of the manifest:
+          // an installed updater refuses any inventory name outside its managed
+          // component list, and the bundle's bytes are already covered by the
+          // archive digest, its code signature, and its stapled notarization.
+          const contents = classifyReleaseArchiveRoot(artifact, { target })
+            .files
+            .map((name) => {
+              const file = path.join(artifact, name);
+              const record = {
+                name,
+                sha256: sha256(file),
+                size_bytes: fs.statSync(file).size,
+              };
+              if (authorityNames.has(name)) {
+                record.build_identity = readUpdateBuildIdentity(file);
+              }
+              return record;
+            })
+            .sort((left, right) => left.name.localeCompare(right.name));
+          if (contents.length < 2) {
+            throw new Error(`${artifact} does not contain the mandatory kin and kin-daemon binaries`);
+          }
+          // DELTA(version): a candidate has no tag, so the version both static
+          // build identities must agree on is the workspace package version the
+          // job resolved. The cross-check between kin and kin-daemon is intact;
+          // what a candidate cannot assert is agreement with a tag name.
+          const expectedVersion = process.env.RC_VERSION;
+          const authorityRecords = contents.filter((record) => authorityNames.has(record.name));
+          if (authorityRecords.length !== authorityNames.size) {
+            throw new Error(`${artifact} does not contain both static build-identity authorities`);
+          }
+          const graphVersions = new Set();
+          for (const record of authorityRecords) {
+            const identity = record.build_identity;
+            if (
+              identity.version !== expectedVersion ||
+              identity.commit !== kinCommit ||
+              identity.clean !== true ||
+              identity.source_known !== true ||
+              identity.dependency_provenance !== kinLockSha
+            ) {
+              throw new Error(`${record.name} static build identity does not match the tagged release source`);
+            }
+            graphVersions.add(identity.graph_snapshot_version);
+          }
+          if (graphVersions.size !== 1) {
+            throw new Error(`${artifact} CLI and daemon graph snapshot identities disagree`);
+          }
+
+          const manifest = {
+            schema_version: 2,
+            // DELTA(identity): a candidate manifest names the ref and sha it was
+            // built from. It carries no release_tag, so it can never be mistaken
+            // for a published release's provenance.
+            release_candidate: {
+              ref: process.env.RC_REF,
+              version: process.env.RC_VERSION,
+            },
+            artifact,
+            target,
+            vfs_target: process.env.VFS_TARGET,
+            kin: {
+              commit: kinCommit,
+              cargo_lock_sha256: kinLockSha,
+              embedded_dependency_provenance: buildMeta.dependency_provenance,
+            },
+            kin_vfs: {
+              commit: vfsCommit,
+              dirty: false,
+              cargo_lock_sha256: vfsLockSha,
+            },
+            archive: archiveRecord(archive),
+            ...(additionalArchiveNames.length
+              ? { additional_archives: additionalArchiveNames.map(archiveRecord) }
+              : {}),
+            archive_contents: contents,
+            workflow: {
+              repository: process.env.GITHUB_REPOSITORY,
+              run_id: process.env.GITHUB_RUN_ID,
+              run_attempt: process.env.GITHUB_RUN_ATTEMPT,
+            },
+          };
+          fs.writeFileSync(`${artifact}.provenance.json`, `${JSON.stringify(manifest, null, 2)}\n`);
+          NODE
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: ${{ matrix.artifact }}
+          # DELTA(retention): a candidate is short-lived scratch, and an empty
+          # upload must fail here rather than surface as a missing archive in
+          # whatever consumes the run.
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.tar.gz.sha256
+            ${{ matrix.artifact }}.zip
+            ${{ matrix.artifact }}.zip.sha256
+            ${{ matrix.artifact }}.provenance.json
+
+      # ADDED: the run's own answer to "which bytes did this produce". A
+      # consumer downloads by run id, so the run has to name the sha it built
+      # and the digest of every archive it uploaded.
+      - name: Summarize the candidate archives
+        shell: bash
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          set -euo pipefail
+          {
+            printf '### %s\n\n' "$ARTIFACT"
+            printf '| field | value |\n| --- | --- |\n'
+            printf '| built sha | %s |\n' "$RC_REF"
+            printf '| version | %s |\n' "$RC_VERSION"
+          } >> "$GITHUB_STEP_SUMMARY"
+          found=0
+          for archive in "${ARTIFACT}.tar.gz" "${ARTIFACT}.zip"; do
+            [ -f "$archive" ] || continue
+            found=1
+            printf '| %s sha256 | %s |\n' \
+              "$archive" "$(shasum -a 256 "$archive" | cut -d' ' -f1)" \
+              >> "$GITHUB_STEP_SUMMARY"
+          done
+          # The upload step already refuses an empty artifact; this refuses the
+          # narrower case where the summary would report a build that produced
+          # no archive at all, which would otherwise read as a clean run.
+          if [ "$found" = 0 ]; then
+            echo "::error::no archive was produced for $ARTIFACT"
+            exit 1
+          fi
+          printf '\nDownload these archives with: gh run download %s --repo %s\n' \
+            "$GITHUB_RUN_ID" "$GITHUB_REPOSITORY" >> "$GITHUB_STEP_SUMMARY"
