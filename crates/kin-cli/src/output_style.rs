@@ -89,9 +89,25 @@ fn paint_refs(line: &str) -> String {
         );
     }
 
-    let count = compiled(&COUNT, r"^referenced by (\d+) entities:$");
+    // The headline carries the unconfirmed candidates it held out of itself, so
+    // the count and the rows it is not counting are read together (FIR-2463).
+    // The suffix is optional and the literal tail is captured rather than
+    // rebuilt, because an unmatched line here prints as plain text and loses its
+    // color silently.
+    let count = compiled(
+        &COUNT,
+        r"^referenced by (\d+) entities(?:, plus (\d+)( unconfirmed candidates? not in that count))?:$",
+    );
     if let Some(caps) = count.captures(line) {
-        return format!("referenced by {ACCENT_BOLD}{}{RESET} entities:", &caps[1]);
+        return match (caps.get(2), caps.get(3)) {
+            (Some(unconfirmed), Some(tail)) => format!(
+                "referenced by {ACCENT_BOLD}{}{RESET} entities, plus {ACCENT_BOLD}{}{RESET}{}:",
+                &caps[1],
+                unconfirmed.as_str(),
+                tail.as_str()
+            ),
+            _ => format!("referenced by {ACCENT_BOLD}{}{RESET} entities:", &caps[1]),
+        };
     }
 
     // A row's location omits `:line` when the entity carries no span, the
@@ -405,7 +421,23 @@ mod tests {
             .iter()
             .find(|line| line.starts_with("referenced by "))
             .unwrap_or_else(|| panic!("no count line in {lines:?}"));
-        assert_painted(&paint_refs(count), count, &format!("{ACCENT_BOLD}1"));
+        let painted_count = paint_refs(count);
+        assert_painted(&painted_count, count, &format!("{ACCENT_BOLD}1"));
+        // FIR-2463: the headline names the row it is not counting, on the same
+        // line, and both numbers are painted. An unmatched count line prints as
+        // plain text, so widening the sentence without widening the rule is a
+        // silent regression.
+        assert_eq!(
+            count, "referenced by 1 entities, plus 1 unconfirmed candidate not in that count:",
+            "the headline carries its unconfirmed candidates: {lines:?}"
+        );
+        assert_eq!(
+            painted_count
+                .matches(&format!("{ACCENT_BOLD}1{RESET}"))
+                .count(),
+            2,
+            "both the counted and the unconfirmed number are painted: {painted_count:?}"
+        );
         assert!(
             lines
                 .iter()
