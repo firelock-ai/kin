@@ -594,6 +594,33 @@ pub(crate) fn absence_coverage_gap(tool: &str, payload: &Value) -> Option<String
     (!gaps.is_empty()).then(|| gaps.join("; "))
 }
 
+/// Whether a POPULATED answer from `tool` carries the response's verdict too,
+/// or only its empty answers do.
+///
+/// FIR-2463 asked for one verdict on every retrieval response, and the default
+/// here is yes: an answer that returned rows and says nothing about how far they
+/// can be trusted is the shape that let `graph_neighborhood` frame two inbound
+/// edges as the whole set while `find_references` refused to certify the same
+/// entity over the same edges. An answer with no epistemic claim is not
+/// agreement with the tool beside it, it is a missing claim.
+///
+/// The exemptions are listed rather than left to whichever handler was edited
+/// last, because an accidental exemption is exactly how that shape shipped.
+///
+/// | tool | qualifies a populated answer | why |
+/// |---|---|---|
+/// | `find_references`, `bulk_check_references`, `trace_data_flow`, `graph_neighborhood`, `semantic_search`, `find_dead_code_seeded` | yes | each answers from the graph, and whether its rows are the whole set is exactly the question a caller acts on |
+/// | `semantic_locate` | NO | its page is a bounded ranking rather than an enumeration, so its verdict can never be authoritative at any coverage, and the module already refuses to certify one. Attaching a verdict to every page is the defect FIR-2430 found wearing the opposite costume: a real symbol and a fabricated one came back under the IDENTICAL envelope, so a qualifier there teaches a reader to read a page as a graph claim when it is not one |
+/// | `entity_history` | NO | reads recorded change history, where a populated answer is the history and there is no whole-set question about the graph to answer |
+/// | `dead_code` | NO | its result is the INVERSE claim, and rows are candidates to check rather than an answer whose completeness licenses an action |
+///
+/// An exemption bars the verdict from `negative` only. `_kin.verdict` is still
+/// computed and published for these tools when any input spoke, so the one
+/// verdict is never absent, only carried in one place instead of two.
+fn qualifies_populated_answers(tool: &str) -> bool {
+    !matches!(tool, "semantic_locate" | "entity_history" | "dead_code")
+}
+
 /// Whether `tool` declares anything [`absence_coverage_gap`] can gate, so a
 /// `None` from that gate means "every dependency it declared was observed
 /// present" rather than "it declared none".
@@ -1234,6 +1261,27 @@ fn absence_advice_consequence(
     }
 }
 
+/// The consequence an answer that RETURNED rows carries.
+///
+/// Separate from [`absence_advice_consequence`] because the two say opposite
+/// things about the same verdict. On an empty answer an authoritative verdict
+/// licenses concluding absence; on a populated one it licenses treating the rows
+/// as the whole set and licenses no absence claim at all. Reusing the absence
+/// wording here would put "safe to treat the target as genuinely absent" on an
+/// answer holding results, which is the contradiction one field over.
+fn populated_advice_consequence(trustworthy: bool, trust_reason: &str) -> String {
+    if trustworthy {
+        "These rows are the whole set: every input that could qualify this answer agreed. That \
+         says nothing about anything absent from it."
+            .to_string()
+    } else {
+        format!(
+            "Treat these rows as a lower bound rather than the whole set, and do not conclude \
+             anything from what is missing from them. Limiting factor: {trust_reason}"
+        )
+    }
+}
+
 /// The consequence sentence for a locate page that ranked hits but none the
 /// query named. Distinct from [`absence_consequence`], which speaks about an
 /// empty result: here the rows are real and stay ranked, and what is absent is
@@ -1402,12 +1450,28 @@ fn cross_repo_bulk_gap(payload: &Value) -> Option<String> {
     }
 }
 
-/// Build a confidence-qualified negative for `tool`'s `payload`, enriched from
-/// `envelope`, or `None` when the tool is not negative-capable or it returned a
-/// non-empty result (and is not an `always`-qualify tool).
+/// Build the trust qualifier for `tool`'s `payload`, enriched from `envelope`,
+/// or `None` when the tool is not retrieval.
 ///
 /// The returned object is additive: callers attach it under [`NEGATIVE_KEY`]
 /// beside the existing payload keys, never replacing them.
+///
+/// ## Every retrieval answer carries one, not only the empty ones (FIR-2463)
+///
+/// This used to return `None` the moment a collection came back non-empty, on
+/// the reasoning that there was no absence to qualify. The consequence is that
+/// an answer with rows reached an agent with no epistemic claim attached at all,
+/// and a reader cannot tell "this answer is whole" from "nobody said". On
+/// psf/requests, `graph_neighborhood` walked two inbound edges of
+/// `HTTPAdapter.send` and framed them as complete with no qualifier, in the same
+/// session where `find_references` refused to certify the same entity over the
+/// same edges. Whichever tool you reached for first decided what you believed.
+///
+/// So the split is now between what is CLAIMED, not whether an object exists.
+/// `trust` is the response's one verdict either way. `safe_to_conclude_absent`
+/// answers the narrower question and is false whenever the answer returned rows,
+/// because no absence is being claimed there and a reader must never be able to
+/// read one out of a populated answer.
 pub fn negative_for(
     tool: &str,
     payload: &Value,
@@ -1426,7 +1490,12 @@ pub fn negative_for(
     // this reports rather than filters, and a weak-but-real hit is never dropped
     // to hide a wrong one.
     let ranking_names_nothing = tool == "semantic_locate" && locate_ranking_names_nothing(payload);
-    if count != 0 && !spec.always && !ranking_names_nothing {
+    // Whether this response asserts that something is NOT there. An answer with
+    // rows asserts nothing of the kind, and still gets qualified: the gates
+    // below decide how far its rows can be trusted as the whole set, which is
+    // the question `graph_neighborhood` used to leave unanswered.
+    let mut claims_absence = count == 0 || spec.always || ranking_names_nothing;
+    if !claims_absence && !qualifies_populated_answers(tool) {
         return None;
     }
 
@@ -1481,13 +1550,20 @@ pub fn negative_for(
     // repositories, so it is never the reason a local absence could not be
     // certified. Reporting it as that reason is how a miss inside one file came
     // back explained as a cross-repo root mismatch.
-    if tool == "find_references" {
+    //
+    // Scoped to answers that actually claim an absence. The gate exists to stop
+    // "nothing references this" being read as safe-to-delete proof when the
+    // spine could not answer for other repositories. A populated answer claims
+    // no such thing, and applying it there would report every answer on every
+    // repository with no spine configured as a floor forever, which is the
+    // "mark everything uncertain" regression arriving through a side door.
+    if tool == "find_references" && claims_absence {
         if let Some(reason) = cross_repo_references_gap(payload) {
             push_gap(&mut trustworthy, &mut trust_reason, reason);
         }
     }
 
-    if tool == "bulk_check_references" {
+    if tool == "bulk_check_references" && claims_absence {
         if let Some(reason) = cross_repo_bulk_gap(payload) {
             push_gap(&mut trustworthy, &mut trust_reason, reason);
         }
@@ -1539,12 +1615,19 @@ pub fn negative_for(
         // `limit` of zero empties it while the walk still found neighbors. The
         // pre-truncation total is what decides whether anything was there, so a
         // truncated answer is never dressed up as an absence.
+        //
+        // It stops the ABSENCE framing and no longer stops the qualifier. This
+        // returned `None` until FIR-2463, which is why a neighborhood that walked
+        // 16 entities over 15 relations reached an agent carrying no epistemic
+        // claim at all, in the same session where `find_references` refused to
+        // certify the same entity over the same edges. Whichever tool you reached
+        // for first decided what you believed.
         if payload
             .get("relation_count")
             .and_then(Value::as_u64)
             .is_some_and(|total| total > 0)
         {
-            return None;
+            claims_absence = false;
         }
         let neighborhood_gap = if payload.get("entity_count").and_then(Value::as_u64) == Some(0) {
             kind = "focal_not_in_graph";
@@ -1633,13 +1716,22 @@ pub fn negative_for(
         "unnamed_ranking"
     } else if spec.always {
         "qualified_verdicts"
-    } else {
+    } else if claims_absence {
         "absent_as_indexed"
+    } else {
+        "qualified_answer"
     };
+    if !claims_absence {
+        kind = "qualified_answer";
+        subject = "this answer returned rows, so it asserts no absence; the verdict below says \
+                   how far those rows can be trusted as the whole set";
+    }
     let consequence = if ranking_names_nothing {
         unnamed_ranking_consequence().to_string()
-    } else {
+    } else if claims_absence {
         absence_advice_consequence(tool, spec.always, trustworthy, &trust_reason)
+    } else {
+        populated_advice_consequence(trustworthy, &trust_reason)
     };
 
     let degraded_signals = degraded_signals(tool, payload, envelope);
@@ -1650,7 +1742,13 @@ pub fn negative_for(
     negative.insert("subject".to_string(), json!(subject));
     negative.insert("result_count".to_string(), json!(count));
     negative.insert("interpretation".to_string(), json!(interpretation));
-    negative.insert("safe_to_conclude_absent".to_string(), json!(trustworthy));
+    // Never true on a populated answer. The verdict can be authoritative there,
+    // meaning the rows are the whole set, and that is still not a licence to
+    // conclude anything is absent, so the two fields are computed apart.
+    negative.insert(
+        "safe_to_conclude_absent".to_string(),
+        json!(trustworthy && claims_absence),
+    );
     negative.insert(
         "trust".to_string(),
         json!(if trustworthy {
@@ -1988,8 +2086,15 @@ mod tests {
 
     #[test]
     fn non_empty_result_gets_no_negative() {
+        // FIR-2463: a populated answer is qualified rather than unqualified, and
+        // what it must never do is claim an absence. The qualifier says how far
+        // the rows can be trusted; it does not say anything is missing.
         let payload = json!({ "results": [{ "id": "x" }] });
-        assert!(negative_for("semantic_search", &payload, &Envelope::daemon()).is_none());
+        let negative = negative_for("semantic_search", &payload, &Envelope::daemon())
+            .expect("every retrieval answer carries the response verdict");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert_eq!(negative["interpretation"], json!("qualified_answer"));
+        assert_eq!(negative["result_count"], json!(1));
     }
 
     #[test]
@@ -3499,9 +3604,10 @@ mod tests {
     #[test]
     fn neighborhood_with_a_neighbor_gets_no_negative() {
         let payload = neighborhood_payload("both", 1);
-        assert!(
-            negative_for("graph_neighborhood", &payload, &structural_ready_envelope()).is_none()
-        );
+        let negative = negative_for("graph_neighborhood", &payload, &structural_ready_envelope())
+            .expect("every retrieval answer carries the response verdict");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert_eq!(negative["interpretation"], json!("qualified_answer"));
     }
 
     /// Since the traversal became directional, an empty walk is empty only on
@@ -3608,10 +3714,15 @@ mod tests {
         let mut payload = neighborhood_payload("both", 3);
         payload["entities"] = json!([]);
         payload["relations"] = json!([]);
-        assert!(
-            negative_for("graph_neighborhood", &payload, &structural_ready_envelope()).is_none(),
-            "a walk that found three edges must not report an absence when the caller capped the output"
+        let negative = negative_for("graph_neighborhood", &payload, &structural_ready_envelope())
+            .expect("every retrieval answer carries the response verdict");
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(false),
+            "a walk that found three edges must not report an absence when the caller capped \
+             the output: {negative}"
         );
+        assert_eq!(negative["interpretation"], json!("qualified_answer"));
     }
 
     /// A focal that is not in the graph produces the same empty edge set as an
@@ -3830,7 +3941,10 @@ mod tests {
     fn a_populated_chain_still_gets_no_negative() {
         let mut payload = clean_empty_trace("both");
         payload["chain"] = json!([{ "step": 1, "entity_name": "caller" }]);
-        assert!(negative_for("trace_data_flow", &payload, &structural_ready_envelope()).is_none());
+        let negative = negative_for("trace_data_flow", &payload, &structural_ready_envelope())
+            .expect("every retrieval answer carries the response verdict");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert_eq!(negative["interpretation"], json!("qualified_answer"));
     }
 
     // ---- resolution misses: the answer with no collection to count ----
