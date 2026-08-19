@@ -2282,6 +2282,52 @@ Options:
         assert_eq!(floor_mode("linux"), ProjectionMode::Shim);
     }
 
+    /// The one thing pure inputs cannot prove: that `powershell.exe` and
+    /// `sc.exe` on a real Windows host answer in the shapes these parsers read.
+    ///
+    /// Everything else about ProjFS is tested from fixed text on any platform,
+    /// and that is exactly the coverage which cannot catch Windows printing
+    /// something the parsers do not understand. This runs only where those
+    /// commands exist, and it is named to begin with `windows` because the
+    /// Windows authority CLI leg selects kin-cli lib tests by that substring
+    /// and fails when its filter matches none.
+    ///
+    /// It asserts readability, not configuration: enabled, enabled-but-stopped
+    /// and never-enabled are all correct answers about a runner, and pinning
+    /// one would make this fail on a host that is merely configured
+    /// differently. `Unknown` is the only verdict that means the probe could
+    /// not read this machine at all.
+    #[test]
+    #[cfg(windows)]
+    fn windows_projfs_probe_reads_this_host_rather_than_answering_unknown() {
+        let state = probe_projfs();
+        assert!(
+            !matches!(state, ProjFsState::Unknown(_)),
+            "the ProjFS probe must read this Windows host, got {state:?}"
+        );
+
+        // And the row this platform's doctor prints is built from it, carrying
+        // the agreed text whenever the answer is not Ready.
+        let row = projfs_mode_probe(&state);
+        assert_eq!(row.mode, ProjectionMode::ProjFs);
+        match state {
+            ProjFsState::Ready => assert!(row.available && row.remedy.is_none()),
+            _ => {
+                assert!(!row.available);
+                let remedy = row.remedy.as_deref().unwrap_or_default();
+                assert!(
+                    remedy == PROJFS_FEATURE_OFF || remedy == PROJFS_FILTER_NOT_RUNNING,
+                    "an unavailable ProjFS must carry one of the agreed messages: {remedy}"
+                );
+            }
+        }
+
+        // The mode exists in this platform's order and table, which is what the
+        // rest of the surface reads.
+        assert!(fallback_order(std::env::consts::OS).contains(&ProjectionMode::ProjFs));
+        assert!(requirement(ProjectionMode::ProjFs, std::env::consts::OS).is_some());
+    }
+
     /// Every cell of the per-OS matrix has to answer, and a mode that does not
     /// exist on a platform has to answer differently from one that exists and
     /// is missing. Reporting ProjFS as installable on macOS would send someone
