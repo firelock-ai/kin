@@ -6317,6 +6317,61 @@ mod tests {
             ]),
             "the shortfalls the observation names are disclosed beside the verdict"
         );
+
+        // FIR-2463, and the exact three-verdict shape a stranger quoted off
+        // shipped v0.5.42 bytes. `decided_by` here is `calls` alone, which IS
+        // present, so the completeness signal reached `complete` and `exact`
+        // over the same zero the negative beside it refused to certify, and its
+        // note called that zero the whole set. The substrate reading stays as
+        // measured, because it is the evidence; what a reader acts on follows
+        // the one verdict.
+        assert_eq!(
+            response["_kin"]["verdict"]["state"], "inconclusive",
+            "{}",
+            response["_kin"]["verdict"]
+        );
+        assert_eq!(
+            response["_kin"]["completeness"]["status"], "complete",
+            "the substrate observation is kept, not rewritten: {}",
+            response["_kin"]["completeness"]
+        );
+        assert_eq!(
+            response["_kin"]["completeness"]["decided_by"],
+            serde_json::json!(["calls"]),
+            "{}",
+            response["_kin"]["completeness"]
+        );
+        assert_eq!(
+            response["_kin"]["completeness"]["bound"], "at_least",
+            "a complete substrate cannot make this zero exact while the verdict refuses it: {}",
+            response["_kin"]["completeness"]
+        );
+        assert_eq!(
+            response["_kin"]["completeness"]["counted"]["exact"], false,
+            "{}",
+            response["_kin"]["completeness"]
+        );
+        assert!(
+            !response["_kin"]["completeness"]["note"]
+                .as_str()
+                .unwrap()
+                .contains("the whole set"),
+            "the note that called four wrong dead-code rows the whole set: {}",
+            response["_kin"]["completeness"]
+        );
+        assert!(
+            response["_kin"]["completeness"]["limits"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("verdict_inconclusive")),
+            "the downgrade names itself: {}",
+            response["_kin"]["completeness"]
+        );
+        assert!(
+            crate::verdict::disagreements(&response).is_empty(),
+            "{:?}",
+            crate::verdict::disagreements(&response)
+        );
     }
 
     #[tokio::test]
