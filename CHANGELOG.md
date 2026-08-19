@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cut the release build's dead cache and its 40-minute Intel leg, and probe a candidate's first install (#961)
 - chore(ci): pin kin-actions v0.1.33 (#968)
 - Collapse a retrieval response's three verdict blocks into one (#966)
+- Wait on the daemon's own record instead of a 60s ambient-admission bound (#969)
+- Wire JavaScript and TypeScript reference enrichment, provision the servers, and stop certifying an absence over a language nothing resolved (#967)
 
 
 ## [0.5.42] - 2026-08-19
