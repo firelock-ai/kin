@@ -30,11 +30,11 @@ cannot drift apart.
 | TypeScript | ✓ | calls, contains, extends, implements, references | ✓ (jest) | ✓ | ✓ typescript-language-server |
 | JavaScript | ✓ | calls, contains, extends, references | ✓ | ✓ | ✓ typescript-language-server |
 | Python | ✓ | calls, contains, extends, references | ✓ (pytest) | ✓ | ✓ pyright / pylsp |
-| Go | ✓ | calls, contains, extends, implements, references, sends-message, spawns | ✓ | ✓ | ✓ gopls |
-| Java | ✓ | calls, contains, extends, implements, references | ✓ (junit) | ✓ | ✓ jdtls |
+| Go | ✓ | calls, contains, extends, implements, references, sends-message, spawns | ✓ | ✓ | not wired (gopls adapter exists) |
+| Java | ✓ | calls, contains, extends, implements, references | ✓ (junit) | ✓ | not wired (jdtls adapter exists) |
 | Rust | ✓ | calls, contains, implements, references | ✓ (cargo) | ✓ | ✓ rust-analyzer |
-| C++ | ✓ | calls, contains, extends, imports, references, uses-macro | ✓ | ✓ | ✓ clangd |
-| C | ✓ | calls, imports, references, uses-macro | ✗ | ✓ | ✓ clangd |
+| C++ | ✓ | calls, contains, extends, imports, references, uses-macro | ✓ | ✓ | not wired (clangd adapter exists) |
+| C | ✓ | calls, imports, references, uses-macro | ✗ | ✓ | not wired (clangd adapter exists) |
 | Kotlin | ✓ | calls, contains, extends, implements, references | ✓ | ✓ | ✗ |
 | C# | ✓ | calls, contains, extends, references | ✗ | ✓ | ✗ |
 | Ruby | ✓ | calls, contains, extends, references | ✗ | ✓ | ✗ |
@@ -55,10 +55,47 @@ Treat these as unsupported for semantic extraction today.
 ## LSP enrichment
 
 When the corresponding language server binary is installed, Kin adds
-type-resolved relations on top of the parser output (call hierarchy,
-overrides, uses-type, references, each tagged with LSP origin and a
-confidence weight): Rust, Python, TypeScript, JavaScript, Go, Java, C, C++.
-Enrichment is skipped silently when the server binary is absent.
+type-resolved relations on top of the parser output (call hierarchy, overrides,
+uses-type, references), each tagged with LSP origin and a confidence weight that
+classifies it as `type_resolved` rather than as a name match.
+
+Two facts have to hold together before any of those edges can exist: the daemon
+has to wire an adapter for the language, and a server binary has to be installed
+on the host. The daemon wires **Rust, Python, TypeScript and JavaScript**, which
+is what `kin_core::reference_coverage::ENRICHABLE_LANGUAGES` names and what a
+test in `kin_daemon` holds it to. Every other language carries no reference,
+override or uses-type edge by construction, whatever is installed. kin-lsp does
+carry adapters for Go, Java, C and C++, and the table above says so, but those
+adapters are not reached from the runtime today.
+
+This matters because cross-file resolution without a language server falls back
+to matching bare names, which produces edges that name a plausible destination
+rather than a proven one.
+
+Install the servers with:
+
+```
+npm install -g pyright                                   # Python
+npm install -g typescript-language-server typescript     # TypeScript and JavaScript
+rustup component add rust-analyzer                       # Rust
+```
+
+`kin setup` and `kin doctor --fix` will offer to run these for you. Neither
+installs without consent: interactively they ask once per command with the
+download disclosed, and non-interactively they change nothing unless
+`--install-language-servers` is passed.
+
+A missing server used to be skipped silently. `kin doctor` now reports it as an
+actionable gap naming the language, what the gap costs, and the exact command
+that closes it. Import and call edges are still resolved from source with no
+language server involved, so the loss is bounded to the edge classes that need a
+resolved program.
+
+The daemon discovers servers once at startup. A server installed while a daemon
+is already running is picked up without a restart only if that daemon found at
+least one server when it started; on a host that had none, the enrichment
+channel is never opened, so run `kin daemon stop` and let the next command start
+a fresh one.
 
 ## Everything else
 
