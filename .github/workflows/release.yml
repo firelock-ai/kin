@@ -382,6 +382,24 @@ jobs:
     # Signing credentials are deliberately step-scoped below. The untrusted
     # Cargo build matrix never receives Apple secrets or a write-scoped token.
     # Tagged releases fail closed when any required credential is absent.
+    #
+    # There is no Cargo cache step, and adding one back is a change to what the
+    # shipped bytes are made of rather than a speed tweak. The step that used to
+    # sit before "Assert clean release source" cached ~/.cargo and both target
+    # directories and never restored once. GitHub scopes a cache entry to the
+    # ref that wrote it, this workflow runs only on a v* tag, so every tag wrote
+    # into a scope no later tag could read. Measured on v0.5.41: the exact key
+    # and the prefix restore-key both missed and the step saved anyway, roughly
+    # 1.4 GB per release out of the repository's 10 GB budget, evicting the CI
+    # entries that do restore.
+    #
+    # A cache that did restore would be worse than the dead one. target/ holds
+    # linked objects that go straight into the published binary, "Assert clean
+    # release source" cannot see them because target/ is gitignored, and
+    # "Verify native release build provenance" runs the binary and matches an
+    # embedded commit sha, which a poisoned object still reports correctly. So
+    # a working restore would put unreviewed bytes in a released artifact for
+    # the first time, with no guard able to fail. A release compiles cold.
     env:
       # When true, the macOS leg codesigns and uploads the signed-but-unnotarized
       # zip, and the separate notarize_linux job submits it to Apple Notary via
@@ -525,18 +543,6 @@ jobs:
           }
           console.log(`Verified Kin/kin-vfs release compatibility at kin-vfs-core ${kinVfsCore[0].version}`);
           NODE
-
-      - name: Cache Cargo registry and build artifacts
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.0.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-            kin-vfs/target
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-cargo-
 
       - name: Assert clean release source
         shell: bash

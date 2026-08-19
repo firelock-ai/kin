@@ -30,14 +30,14 @@ export const RC_WORKFLOW = ".github/workflows/rc-build.yml";
 // package-publish credentials. Without those credentials these steps have
 // nothing to do, so they are absent rather than inert.
 //
-// The Cargo cache, for a different reason. release.yml runs only on a
-// ruleset-protected v* tag, so its cache write is authorized code. rc-build.yml
-// builds whatever ref it is handed, so the same step would let a dispatch write
-// a poisoned entry into a cache that CI and release builds later restore from,
-// and would mean the bytes under proof were assembled partly from cache
-// contents no one reviewed. A candidate compiles cold.
+// A seventh entry, "Cache Cargo registry and build artifacts", used to sit at
+// the head of this list. release.yml no longer carries that step: it never
+// restored, because a tag-scoped cache entry is unreadable from the next tag,
+// and a restore that did work would assemble published bytes partly from cache
+// contents nobody reviewed. Both workflows now compile cold, so the difference
+// this entry described no longer exists and listing it here would report the
+// omission list as stale.
 export const OMITTED_STEPS = [
-  "Cache Cargo registry and build artifacts",
   "Resolve macOS signing credential availability",
   "Import code signing certificate (macOS)",
   "Sign macOS binaries",

@@ -26,19 +26,20 @@ name: RC Build
 #
 # SOURCE OF TRUTH: .github/workflows/release.yml, job `build`. Every step below
 # is a byte-identical copy of that job's step of the same name, except where a
-# comment starting DELTA( names the difference and why. Seven steps are omitted
-# on purpose: the six macOS signing and notarization steps, which need the
-# credentials this workflow deliberately cannot reach, and the Cargo cache.
+# comment starting DELTA( names the difference and why. Six steps are omitted on
+# purpose: the macOS signing and notarization steps, which need the credentials
+# this workflow deliberately cannot reach.
 # scripts/check-rc-build-drift.mjs holds that relationship and fails the pull
 # request when release.yml moves and this file does not.
 #
-# The cache is omitted rather than copied. release.yml runs only on a v* tag,
-# and that tag is ruleset-protected, so its cache write is authorized code. This
-# workflow builds whatever ref it is handed, so the same step would let a
-# dispatch write a poisoned entry into a cache that CI and release builds later
-# restore from. It would also mean the bytes under proof were assembled partly
-# from cache contents no one reviewed, which is the opposite of what a candidate
-# build is for. A candidate compiles cold.
+# Neither workflow caches Cargo. This one never did, because it builds whatever
+# ref it is handed and the same step would let a dispatch write a poisoned entry
+# into a cache that CI and release builds later restore from, and would mean the
+# bytes under proof were assembled partly from cache contents no one reviewed.
+# release.yml has now dropped its own for a related reason: its entry was
+# tag-scoped and unreadable from the next tag, so it never restored, and a
+# restore that worked would have put unreviewed objects into published bytes.
+# A candidate compiles cold, and so does a release.
 #
 # What a candidate archive is NOT:
 #   - not signed and not notarized, so a macOS candidate archive is Gatekeeper
