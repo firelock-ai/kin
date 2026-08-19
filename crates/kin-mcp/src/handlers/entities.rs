@@ -4628,6 +4628,13 @@ mod tests {
     /// language-server adapter for JavaScript.
     #[test]
     fn a_javascript_search_absence_is_inconclusive_while_a_python_one_still_certifies() {
+        // A Python developer's machine: pyright installed, no JavaScript server.
+        // Stated rather than inherited, because the whole contrast below is
+        // between a language something resolved and one nothing did, and a test
+        // that read the developer's PATH would assert a different thing on
+        // every host.
+        let _host =
+            crate::edge_coverage::test_support::scoped_language_servers(&[LanguageId::Python]);
         let store = InMemoryGraph::new();
         store
             .upsert_entity(&module_entity(
@@ -4666,7 +4673,7 @@ mod tests {
         assert_eq!(empty["total_matches"], 0);
         let coverage = &empty[crate::edge_coverage::EDGE_COVERAGE_KEY];
         assert_eq!(coverage["language"], "JavaScript");
-        assert_eq!(coverage["reference_enrichment"], "unsupported");
+        assert_eq!(coverage["reference_enrichment"], "no_language_server");
         assert_eq!(
             coverage["scope_entities"], 1,
             "the kind-filtered absence states the coverage of that kind: {coverage}"
@@ -4718,7 +4725,9 @@ mod tests {
         assert_eq!(absent["total_matches"], 0);
         let coverage = &absent[crate::edge_coverage::EDGE_COVERAGE_KEY];
         assert_eq!(coverage["language"], "Python");
-        assert_eq!(coverage["reference_enrichment"], "unknown");
+        // pyright is installed on the host this test declares, which is what
+        // entitles the Python arm below to certify at all.
+        assert_eq!(coverage["reference_enrichment"], "available");
         assert_eq!(coverage["scope_entities"], 2);
         let negative = crate::negative::negative_for(
             "semantic_search",
@@ -4774,6 +4783,9 @@ mod tests {
     /// focal-not-in-graph gap stays the limiting factor a reader is handed.
     #[test]
     fn an_empty_neighborhood_publishes_the_scope_it_walked() {
+        // No language server at all, which is the container the v0.5.42
+        // stranger run used.
+        let _host = crate::edge_coverage::test_support::scoped_language_servers(&[]);
         let store = InMemoryGraph::new();
         let focal = make_entity_in(
             LanguageId::JavaScript,
@@ -4793,7 +4805,11 @@ mod tests {
         assert_eq!(walked["relation_count"], 0);
         let coverage = &walked[crate::edge_coverage::EDGE_COVERAGE_KEY];
         assert_eq!(coverage["language"], "JavaScript");
-        assert_eq!(coverage["reference_enrichment"], "unsupported");
+        // `no_language_server` rather than `unsupported`: this build wires a
+        // JavaScript adapter now, so what leaves the program unresolved is the
+        // host, not the build. Both block certification, and the difference is
+        // whether an operator can do anything about it.
+        assert_eq!(coverage["reference_enrichment"], "no_language_server");
         assert!(
             coverage.get("scope_entities").is_none(),
             "a walk counts no region, so it publishes no count: {coverage}"
@@ -6233,6 +6249,8 @@ mod tests {
     /// enrichment, which is the fact FIR-2404 added to the gate.
     #[tokio::test]
     async fn a_javascript_export_is_not_certified_absent_when_requires_produce_no_edges() {
+        // The express container: no language server installed at all.
+        let _host = crate::edge_coverage::test_support::scoped_language_servers(&[]);
         let graph = InMemoryGraph::new();
         let target = make_entity_in(
             LanguageId::JavaScript,
@@ -6288,8 +6306,8 @@ mod tests {
             response["edge_coverage"]
         );
         assert_eq!(
-            response["edge_coverage"]["reference_enrichment"], "unsupported",
-            "this build wires no adapter for JavaScript: {}",
+            response["edge_coverage"]["reference_enrichment"], "no_language_server",
+            "this build wires a JavaScript adapter, and no server is installed to run it: {}",
             response["edge_coverage"]
         );
         assert_eq!(

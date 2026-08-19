@@ -18,6 +18,7 @@ doctest = false
 test-support = []
 
 [dependencies]
+which = "8"
 kin-model = { workspace = true }
 kin-db = { workspace = true }
 kin-blobs = { workspace = true }

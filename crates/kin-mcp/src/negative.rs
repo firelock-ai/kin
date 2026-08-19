@@ -473,20 +473,52 @@ pub(crate) fn absence_coverage_gap(tool: &str, payload: &Value) -> Option<String
     // nothing resolved the program behind the declarations it filtered, so a
     // name-and-kind miss cannot separate a declaration the repository lacks from
     // one the extractor never admitted as an entity of that kind.
-    if coverage.get("reference_enrichment").and_then(Value::as_str) == Some("unsupported") {
+    // Two ways the program can be unresolved, and the gate blocks on both.
+    //
+    // It used to key on `unsupported` alone, which is the BUILD limit. That was
+    // the same reason with only one of its causes: a wired adapter with no
+    // server installed leaves the program exactly as unresolved, and reading
+    // that state as fine is how a Python absence was certified as authoritative
+    // on a host that could not have produced a single reference edge. Wiring
+    // JavaScript and TypeScript made it visible rather than introducing it: the
+    // express-shaped absence FIR-2430 blocked went straight back to "safe to
+    // treat the target as genuinely absent" the moment the build limit lifted,
+    // because nothing was looking at the host.
+    //
+    // The wording splits three ways, because a correct verdict beside an
+    // unrelated reason is the failure this module exists to prevent. What the
+    // tool claimed decides the first split; whether an operator can DO anything
+    // decides the second. A build limit no amount of installing will move reads
+    // differently from a host gap one command closes.
+    // Fires only on a POSITIVE finding about a real language. `available` means
+    // the program was resolved, and `unknown` means the observation named no
+    // language at all, which is what a focal that never resolved reports. A gate
+    // that fired on `unknown` would answer a question nobody asked, in the words
+    // "nothing established that a language server resolved no resolved language
+    // on this host", and it would displace the real limiting factor a reader
+    // needs. Unmeasured is not a finding anywhere else in this module either.
+    let cause = match coverage.get("reference_enrichment").and_then(Value::as_str) {
+        Some("unsupported") => Some(format!(
+            "this build wires no language-server adapter for {language}"
+        )),
+        Some("no_language_server") => Some(format!(
+            "no language server for {language} is installed on this host, so no cross-file \
+             reference or override edge was ever produced for it"
+        )),
+        _ => None,
+    };
+    if let Some(cause) = cause {
         gaps.push(if requested.is_empty() {
             format!(
-                "entity_index_unresolved: this build wires no language-server adapter for \
-                 {language}, so nothing resolves the program behind its parsed declarations, and \
-                 an empty name/kind filter cannot separate a declaration the repository does not \
-                 have from one the extractor did not admit as an entity of that kind"
+                "entity_index_unresolved: {cause}, so nothing resolves the program behind its \
+                 parsed declarations, and an empty name/kind filter cannot separate a declaration \
+                 the repository does not have from one the extractor did not admit as an entity \
+                 of that kind"
             )
         } else {
             format!(
-                "reference_enrichment_unsupported: this build wires no language-server adapter \
-                 for {language}, so cross-file reference and override edges cannot exist for it \
-                 at all, and an empty result cannot separate a symbol nothing uses from one this \
-                 graph could never have linked"
+                "reference_enrichment_unsupported: {cause}, so an empty result cannot separate a \
+                 symbol nothing uses from one this graph could never have linked"
             )
         });
     }
@@ -569,7 +601,10 @@ pub(crate) fn edge_coverage_degradation_labels(tool: &str, payload: &Value) -> V
     if coverage.get("scope_entities").and_then(Value::as_u64) == Some(0) {
         labels.push("absence_coverage:scope_empty".to_string());
     }
-    if coverage.get("reference_enrichment").and_then(Value::as_str) == Some("unsupported") {
+    if matches!(
+        coverage.get("reference_enrichment").and_then(Value::as_str),
+        Some("unsupported") | Some("no_language_server")
+    ) {
         labels.push("edge_coverage:reference_enrichment_unsupported".to_string());
     }
     labels
@@ -1758,14 +1793,17 @@ mod tests {
             "requested_classes": ["calls", "imports", "references"],
             "classes": { "calls": "present", "imports": "absent", "references": "absent" },
             "cross_file_classes": ["calls"],
-            "reference_enrichment": "unknown",
+            "reference_enrichment": "available",
             "budget_exhausted": false,
             "entities_examined": 2,
         })
     }
 
     /// The scope observation a tool that traverses no edge publishes for an
-    /// absence, over a language this build CAN resolve.
+    /// absence, over a language that IS resolved on this host: the build wires
+    /// an adapter for it and a language server is installed. Both halves have to
+    /// hold, which is why the fixture states the second one rather than leaving
+    /// it unknown; "nobody checked" is not evidence that anything resolved.
     ///
     /// The shape is the one [`crate::edge_coverage::observe_absence_scope`]
     /// emits: no edge classes, because this claim is not about edges, and the
@@ -1780,7 +1818,7 @@ mod tests {
             "requested_classes": [],
             "classes": {},
             "cross_file_classes": [],
-            "reference_enrichment": "unknown",
+            "reference_enrichment": "available",
             "budget_exhausted": false,
             "entities_examined": 0,
             "scan": "skipped_no_edge_dependency",
@@ -1791,12 +1829,19 @@ mod tests {
         observation
     }
 
-    /// The same observation over a language this build wires no adapter for:
-    /// the express shape, where `imports` and `references` cannot exist at all.
+    /// The same observation over a language nothing resolved: the express
+    /// shape, where `imports` and `references` were never produced.
+    ///
+    /// It reports `no_language_server` rather than `unsupported` now. This build
+    /// DOES wire a JavaScript adapter, so what leaves express unresolved is the
+    /// host having no `typescript-language-server`, which is exactly the state
+    /// the container behind the v0.5.42 stranger run was in. Both states block
+    /// certification and they are different facts: one an operator can close
+    /// with a command, the other only a new build can.
     fn unresolvable_language_scope(scope_entities: Option<usize>) -> Value {
         let mut observation = resolvable_language_scope(scope_entities);
         observation["language"] = json!("JavaScript");
-        observation["reference_enrichment"] = json!("unsupported");
+        observation["reference_enrichment"] = json!("no_language_server");
         observation
     }
 
@@ -2628,6 +2673,12 @@ mod tests {
     /// cross-file `Calls` edge and an artifact-level edge and mints no
     /// entity-level `Imports` edge at all. A gate that demanded one would report
     /// every Python absence inconclusive while looking principled.
+    ///
+    /// It carries `reference_enrichment: available` because that is what makes
+    /// the sentence "whose cross-file uses resolve" true. Something has to have
+    /// resolved them, and on Python that something is pyright. The same fixture
+    /// with no server installed is the express case wearing a different
+    /// language, and it must not certify.
     #[test]
     fn a_python_graph_that_resolves_its_imports_still_certifies_an_unused_symbol() {
         let mut payload = authoritative_empty_references("function");
@@ -2639,7 +2690,7 @@ mod tests {
             "requested_classes": ["calls", "imports", "references"],
             "classes": { "calls": "present", "imports": "absent", "references": "absent" },
             "cross_file_classes": ["calls"],
-            "reference_enrichment": "unknown",
+            "reference_enrichment": "available",
             "budget_exhausted": false,
             "entities_examined": 12,
         });

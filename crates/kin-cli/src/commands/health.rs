@@ -2532,7 +2532,7 @@ fn coverage_unreadable(
             language_server_gap_detail(missing_servers)
         ),
     )
-    .with_manual_fix(LANGUAGE_SERVER_FIX)
+    .with_manual_fix(language_server_fix())
 }
 
 /// Turn the measurement into a verdict, split from its fetch so the rule is
@@ -2592,12 +2592,25 @@ pub(crate) fn reference_edge_coverage_health(
     // query it answers is still true about the edges it holds. What it cannot do
     // is support a claim that something is unused, so this needs attention
     // without failing readiness.
-    HealthCheck::new(
+    let check = HealthCheck::new(
         ID,
         LABEL,
         HealthStatus::Pending,
         format!("{}; {}", gaps.join("; "), summary),
-    )
+    );
+    // A missing server is the one gap on this row an operator can actually
+    // close, so it is the only case that carries a fix, and the fix names the
+    // command for the languages THIS repository holds rather than for every
+    // language the build wires. `unsupportable_absence_reasons` covers gaps a
+    // host cannot install its way out of; offering an install for those would
+    // be a fix that changes nothing.
+    if missing_servers.is_empty() {
+        check
+    } else {
+        check.with_manual_fix(crate::commands::language_servers::install_fix_line(
+            &missing_servers,
+        ))
+    }
     .with_manual_fix(
         "re-admit the repository so relation extraction runs again (`kin reconcile --admit`), and \
          treat any \"unused\" answer as unverified until cross-file edges resolve",
@@ -2809,8 +2822,8 @@ async fn check_semantic_query_readiness() -> HealthCheck {
 fn missing_language_servers(
     installed: &std::collections::HashSet<kin_model::LanguageId>,
 ) -> Vec<String> {
-    crate::commands::graph::LANGUAGE_SERVER_BINARIES
-        .iter()
+    crate::commands::language_servers::language_server_binaries()
+        .into_iter()
         .filter(|(language, _)| !installed.contains(language))
         .map(|(language, binaries)| format!("{language} ({})", binaries.join(" or ")))
         .collect()
@@ -2827,8 +2840,8 @@ fn language_server_gap_detail(missing: &[String]) -> String {
          import and call edges are still resolved from source. Languages outside {} gain no \
          reference edges in this build either",
         missing.join(", "),
-        crate::commands::graph::LANGUAGE_SERVER_BINARIES
-            .iter()
+        crate::commands::language_servers::language_server_binaries()
+            .into_iter()
             .map(|(language, _)| language.to_string())
             .collect::<Vec<_>>()
             .join("/")
@@ -2951,9 +2964,21 @@ fn embedding_model_check_from(
     ))
 }
 
-const LANGUAGE_SERVER_FIX: &str =
-    "install a language server for the named language (for example `npm i -g pyright` or \
-     `rustup component add rust-analyzer`), then restart the daemon";
+/// The fix for the fallback row, which probes every wired language because it
+/// could not read the graph to learn which ones this repository holds.
+///
+/// Built rather than written out, so the commands here and the ones the
+/// measured row prints come from one table. A hand-written example command is
+/// how `npm i -g pyright` ended up beside a probe for `pyright-langserver`
+/// without anything checking that the package provides the binary.
+fn language_server_fix() -> String {
+    let every: Vec<String> = crate::commands::language_servers::language_server_binaries()
+        .into_iter()
+        .map(|(language, _)| language.to_string())
+        .collect();
+    let names: Vec<&str> = every.iter().map(String::as_str).collect();
+    crate::commands::language_servers::install_fix_line(&names)
+}
 
 /// Report the active retrieval quality profile and the effective lever set,
 /// so an operator can see at a glance whether they are getting full
@@ -3590,9 +3615,9 @@ mod tests {
     #[test]
     fn doctor_reports_no_gap_once_every_wired_language_server_is_installed() {
         let installed: std::collections::HashSet<kin_model::LanguageId> =
-            crate::commands::graph::LANGUAGE_SERVER_BINARIES
-                .iter()
-                .map(|(language, _)| *language)
+            crate::commands::language_servers::language_server_binaries()
+                .into_iter()
+                .map(|(language, _)| language)
                 .collect();
         let missing = missing_language_servers(&installed);
         assert!(missing.is_empty(), "{missing:?}");
