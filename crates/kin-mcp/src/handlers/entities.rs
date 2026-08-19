@@ -102,15 +102,70 @@ pub fn handle_semantic_search<G: GraphStore>(
             ..filter.clone()
         };
         let scoped = store.query_entities(&scope).map_err(McpError::graph)?;
-        payload[crate::edge_coverage::EDGE_COVERAGE_KEY] =
-            crate::edge_coverage::observe_absence_scope(
-                &crate::edge_coverage::languages_of(&scoped),
-                Some(scoped.len()),
+        let mut observation = crate::edge_coverage::observe_absence_scope(
+            &crate::edge_coverage::languages_of(&scoped),
+            Some(scoped.len()),
+        );
+
+        // FIR-2452. The scope above removes the name and keeps the narrowing
+        // filters, so it cannot see an answer that the narrowing filters emptied.
+        // That is the answer the stranger run got: `query: "request", kind:
+        // "method"` on psf/requests returned zero and certified the absence,
+        // because the scope held every method in the repository and Python is a
+        // language this build enriches, so every gate read healthy. Asking the
+        // name's own side is what separates the two: the store's pattern index
+        // returns its exact-name and token hits and returns EARLY on any hit
+        // without reaching its substring fallback, and the kind predicate then
+        // removed every candidate it had returned.
+        //
+        // Paid only when a narrowing filter was actually applied and only on the
+        // empty path. With no narrowing filter this query IS the name query, its
+        // count is the zero already in hand, and running it again would buy
+        // nothing.
+        let narrowed_by = narrowing_filters_of(&filter);
+        if !narrowed_by.is_empty() {
+            let name_only = kin_model::graph::EntityFilter {
+                kinds: None,
+                languages: None,
+                roles: None,
+                ..filter.clone()
+            };
+            let candidates = store.query_entities(&name_only).map_err(McpError::graph)?;
+            crate::edge_coverage::attach_name_filter_scope(
+                &mut observation,
+                &narrowed_by,
+                candidates.len(),
             );
+        }
+
+        payload[crate::edge_coverage::EDGE_COVERAGE_KEY] = observation;
     }
 
     let json = serde_json::to_string_pretty(&payload).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
+}
+
+/// The narrowing filters a search request applied beside its name pattern, named
+/// as the caller asked for them.
+///
+/// These are the filters that can empty an answer the name pattern did not, so
+/// naming them is what lets an absence verdict say which one removed the
+/// candidates instead of reporting an unattributed miss. `role` is listed
+/// separately from `kind` because `kind: "test"` resolves to a role filter with
+/// no kind filter at all, so reporting it as a kind would name a predicate the
+/// query never applied.
+fn narrowing_filters_of(filter: &kin_model::graph::EntityFilter) -> Vec<&'static str> {
+    let mut applied = Vec::new();
+    if filter.kinds.is_some() {
+        applied.push("kind");
+    }
+    if filter.languages.is_some() {
+        applied.push("language");
+    }
+    if filter.roles.is_some() {
+        applied.push("role");
+    }
+    applied
 }
 
 pub const SEMANTIC_LOCATE_DESC: &str = "\
@@ -4738,6 +4793,113 @@ mod tests {
         .expect("an empty search carries a negative");
         assert_eq!(negative["safe_to_conclude_absent"], true);
         assert_eq!(negative["trust"], "authoritative");
+    }
+
+    /// The reported call from the v0.5.41 stranger run, end to end (FIR-2452).
+    ///
+    /// `semantic_search(query: "request", kind: "method")` on psf/requests
+    /// answered zero and reported `safe_to_conclude_absent: true` with "safe to
+    /// treat the target as genuinely absent/unused", about a name the graph
+    /// resolves. Nothing that existed could see it: the store is Python, which
+    /// this build enriches, the scope holds entities, and the tool traverses no
+    /// edge, so every gate correctly read healthy. The name's own side is the
+    /// only place the miss is visible.
+    #[test]
+    fn a_search_whose_kind_filter_removed_every_name_match_certifies_nothing() {
+        let store = InMemoryGraph::new();
+        // `requests.api.request` is a function, and it is what the name matches.
+        store
+            .upsert_entity(&make_entity_in(
+                LanguageId::Python,
+                "request",
+                "requests/api.py",
+            ))
+            .unwrap();
+        store
+            .upsert_entity(&make_entity_in(
+                LanguageId::Python,
+                "render_page",
+                "app/views.py",
+            ))
+            .unwrap();
+        // A method the kind filter DOES select, so the region it narrows to is
+        // populated and the older scope gate stays quiet. That is the case this
+        // test is about: on psf/requests the scope held every method in the
+        // repository, which is why nothing refused to certify.
+        let mut method = make_entity_in(LanguageId::Python, "send", "requests/sessions.py");
+        method.kind = EntityKind::Method;
+        store.upsert_entity(&method).unwrap();
+
+        let empty = parsed_response(
+            &handle_semantic_search(&search_args("request", Some("method")), &store).unwrap(),
+        );
+        assert_eq!(empty["total_matches"], 0);
+        let coverage = &empty[crate::edge_coverage::EDGE_COVERAGE_KEY];
+        // Every signal the older gates read is healthy here, which is the point.
+        assert_eq!(coverage["language"], "Python");
+        assert_eq!(coverage["reference_enrichment"], "unknown");
+        assert_eq!(
+            coverage["scope_entities"], 1,
+            "the region the kind filter selected is populated: {coverage}"
+        );
+        assert_eq!(
+            coverage[crate::edge_coverage::NAME_FILTER_KEY]["candidates"],
+            1,
+            "the name matched a declaration on its own: {coverage}"
+        );
+        assert_eq!(
+            coverage[crate::edge_coverage::NAME_FILTER_KEY]["narrowed_by"],
+            serde_json::json!(["kind"])
+        );
+
+        let negative =
+            crate::negative::negative_for("semantic_search", &empty, &ready_daemon_envelope(2))
+                .expect("an empty search carries a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], false);
+        assert_eq!(negative["trust"], "inconclusive");
+        assert!(
+            negative["trust_reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("name_filter_narrowed_to_zero"),
+            "{negative}"
+        );
+
+        // Positive control on the same store and the same kind filter: a name
+        // nothing carries matches nothing on its own, so no filter removed
+        // anything and the absence is still certifiable. Without this the fix
+        // would be indistinguishable from marking every kind-filtered answer
+        // uncertain.
+        let absent = parsed_response(
+            &handle_semantic_search(&search_args("zzz_not_a_symbol", Some("method")), &store)
+                .unwrap(),
+        );
+        assert_eq!(absent["total_matches"], 0);
+        assert_eq!(
+            absent[crate::edge_coverage::EDGE_COVERAGE_KEY][crate::edge_coverage::NAME_FILTER_KEY]
+                ["candidates"],
+            0
+        );
+        let negative =
+            crate::negative::negative_for("semantic_search", &absent, &ready_daemon_envelope(2))
+                .expect("an empty search carries a negative");
+        assert_eq!(
+            negative["safe_to_conclude_absent"], true,
+            "a name that matches nothing at all is still a certifiable absence: {negative}"
+        );
+
+        // And a query that applied no narrowing filter publishes no name-filter
+        // observation at all, because that query IS the name query and counting
+        // it twice would buy nothing.
+        let unfiltered = parsed_response(
+            &handle_semantic_search(&search_args("zzz_not_a_symbol", None), &store).unwrap(),
+        );
+        assert!(
+            unfiltered[crate::edge_coverage::EDGE_COVERAGE_KEY]
+                .get(crate::edge_coverage::NAME_FILTER_KEY)
+                .is_none(),
+            "no narrowing filter, no second count: {unfiltered}"
+        );
     }
 
     /// A filter that selected a region the extractor never populated says

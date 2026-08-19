@@ -6208,6 +6208,70 @@ mod tests {
         assert_eq!(rows[0]["span"]["start_line"], 41);
     }
 
+    /// FIR-2452 clause 2, on the real handler output. `impact_analysis` emits
+    /// used/unused verdicts and was the only retrieval surface publishing no
+    /// coverage observation, so the gate every sibling passes had nothing to read
+    /// and the tool with the highest blast radius per wrong absence carried no
+    /// rail at all.
+    #[tokio::test]
+    async fn impact_analysis_handler_publishes_the_coverage_its_verdicts_rest_on() {
+        let callee = impact_probe_entity("callee_probe_2452", None);
+        let caller = impact_probe_entity("caller_probe_2452", Some(41));
+
+        let mut store = EmptyStore::default();
+        store.insert_test_entity(callee.clone());
+        store.insert_test_entity(caller.clone());
+        store.insert_test_calls_relation(&caller, &callee);
+
+        let args = HashMap::from([
+            (
+                "entity_ids".to_string(),
+                serde_json::json!([callee.id.to_string()]),
+            ),
+            ("include_traffic".to_string(), serde_json::json!(false)),
+        ]);
+        let sessions = SessionRegistry::new();
+
+        let value = tool_result_json(
+            review::handle_impact_analysis(&args, &store, &sessions)
+                .await
+                .unwrap(),
+        );
+
+        let coverage = &value[crate::edge_coverage::EDGE_COVERAGE_KEY];
+        assert!(
+            !coverage.is_null(),
+            "the verdicts are read off cross-file reference edges, so the answer states \
+             what it observed about them: {value}"
+        );
+        assert_eq!(
+            coverage["requested_classes"],
+            serde_json::json!(["calls", "imports", "references"]),
+            "the observation covers exactly what negative::absence_cross_file_classes \
+             declares this tool reads: {coverage}"
+        );
+
+        // The rail itself: the negative is attached whatever the blast radius
+        // holds, because a `consumer_count: 0` row beside a populated report is
+        // still the verdict a caller acts on.
+        let negative = crate::negative::negative_for(
+            "impact_analysis",
+            &value,
+            &crate::envelope::Envelope::daemon().with_health(&serde_json::json!({
+                "graph_loaded": true,
+                "initialized": true,
+                "graph_entity_count": 2,
+                "graph_generation": 1,
+            })),
+        )
+        .expect("impact verdicts are always qualified");
+        assert_eq!(negative["kind"], "impact_verdicts");
+        assert!(
+            negative.get("safe_to_conclude_absent").is_some(),
+            "the flag find_references carries is the one this tool most needed: {negative}"
+        );
+    }
+
     /// The measurement FIR-2408 asked for, taken on the real handler output
     /// rather than a hand-built payload.
     ///

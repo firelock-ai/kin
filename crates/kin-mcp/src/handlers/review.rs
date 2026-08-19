@@ -45,7 +45,13 @@ semantic_review when you want diff + impact + risk together in a single report. 
 Per-entity counts separate `consumer_count` (every inbound edge) from \
 `proven_consumer_count` (only edges resolved above `name_only`), and each ranked path \
 step carries its own `resolution`. Read a used/unused claim against the proven count: a \
-call edge matched by bare method name is a candidate, not a fact.";
+call edge matched by bare method name is a candidate, not a fact. The response also \
+carries an additive `negative` object whose `safe_to_conclude_absent` flag says whether \
+this graph could have seen the impact it reports missing: the verdicts are read off \
+cross-file call, import and reference edges, so on a language whose reference edges this \
+build cannot produce, or on a graph holding none of them, an empty blast radius means \
+the query could not observe what it was asked about rather than that nothing depends on \
+the change. Check it before reading a zero consumer count as safe to change.";
 
 /// The blast-radius buckets of an [`kin_review::ImpactReport`] that serialize as
 /// arrays of raw entities, paired with their key in the response object.
@@ -171,9 +177,47 @@ pub async fn handle_impact_analysis<G: GraphStore>(
             serde_json::json!(format!("spine_unavailable: {reason}"));
     }
 
+    // FIR-2452. Every `entity_impacts` row carrying no consumers is a
+    // used/unused verdict a caller reads before changing or deleting something,
+    // and it is read off the same cross-file reference edges `find_references`
+    // reads. Until this observation existed, `impact_analysis` was the one
+    // retrieval surface with no `negative` object at all, so the tool with the
+    // highest blast radius per wrong absence was the only one outside the gate
+    // every smaller one passes.
+    //
+    // The languages are the CHANGED entities' own. A verdict covers all of them
+    // and the weakest governs, which is the same rule the batch reachability
+    // surface applies for the same reason: one language whose reference edges
+    // were never produced must not have its absences certified by a sibling
+    // language that links cleanly. Unresolvable ids contribute no language
+    // rather than a guessed one.
+    let impact_languages = crate::edge_coverage::languages_of(
+        &impact
+            .changed_ids
+            .iter()
+            .filter_map(|id| store.get_entity(id).ok().flatten())
+            .collect::<Vec<_>>(),
+    );
+    result[crate::edge_coverage::EDGE_COVERAGE_KEY] =
+        crate::edge_coverage::observe_cross_file_reference_coverage_for_languages(
+            store,
+            &impact_languages,
+            &IMPACT_REFERENCE_KINDS,
+        );
+
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
 }
+
+/// The cross-file reference classes an impact verdict is read off, matching what
+/// [`crate::negative::absence_cross_file_classes`] declares `impact_analysis`
+/// depends on. Declaring one set and observing another is how a gate comes to
+/// judge a class the answer never measured.
+const IMPACT_REFERENCE_KINDS: [kin_model::relation::RelationKind; 3] = [
+    kin_model::relation::RelationKind::Calls,
+    kin_model::relation::RelationKind::Imports,
+    kin_model::relation::RelationKind::References,
+];
 
 pub const SEMANTIC_REVIEW_DESC: &str = "\
 Produce a complete semantic review of a change in one call: the entity-level diff, the \

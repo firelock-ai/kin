@@ -74,6 +74,11 @@ pub const EDGE_COVERAGE_KEY: &str = "edge_coverage";
 /// instead of an unqualified "1".
 pub const REFERENCE_RESOLUTION_KEY: &str = "reference_resolution";
 
+/// Key inside the observation carrying what the query's NAME FILTER selected on
+/// its own, for an answer whose narrowing filters could have emptied it. Read by
+/// [`crate::negative`].
+pub const NAME_FILTER_KEY: &str = "name_filter";
+
 /// How many entities may have their relations read while looking for a witness.
 ///
 /// A healthy graph answers in single digits, so this bound is only reached on a
@@ -359,6 +364,38 @@ pub fn observe_absence_scope(languages: &[LanguageId], scope_entities: Option<us
         observation["scope_entities"] = json!(count);
     }
     observation
+}
+
+/// Record what the query's NAME FILTER selected on its own, beside the scope
+/// [`observe_absence_scope`] already measured.
+///
+/// The two counts answer different questions and an absence needs both. The
+/// scope count removes the NAME and keeps the narrowing filters, so it says
+/// whether the region the caller asked about is populated at all. This one
+/// removes the NARROWING FILTERS and keeps the name, so it says whether the name
+/// resolved to anything before those filters were applied.
+///
+/// Only the second can see the case FIR-2452 was filed for. On psf/requests,
+/// `semantic_search(query: "request", kind: "method")` answered zero while the
+/// scope held every method in the repository and Python is a language this build
+/// enriches, so every gate that existed read healthy and the answer certified
+/// `safe_to_conclude_absent: true` about a name the graph resolves. What
+/// actually happened is visible only from the name's own side: the store's
+/// pattern index returns its exact-name and token hits and returns EARLY on any
+/// hit, never reaching its substring fallback, and the kind predicate then
+/// removed every candidate it had returned. That is absence of a MATCH, and the
+/// observation has to carry it before the gate can refuse to call it absence of
+/// a THING.
+///
+/// `narrowed_by` names the filters that were applied, so the verdict can say
+/// which ones removed the candidates rather than reporting an unattributed miss.
+/// Attached only when a narrowing filter was actually applied: with none, this
+/// query IS the name query and a second count would restate the first.
+pub fn attach_name_filter_scope(observation: &mut Value, narrowed_by: &[&str], candidates: usize) {
+    observation[NAME_FILTER_KEY] = json!({
+        "narrowed_by": narrowed_by,
+        "candidates": candidates,
+    });
 }
 
 /// The distinct languages a resolved entity set spans, in first-seen order.
