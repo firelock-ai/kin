@@ -36,7 +36,13 @@ On an empty result the response carries an additive `negative` object: its \
 (daemon-owned graph, initialized and loaded, holding entities, no degraded signals) \
 or merely \"not indexed yet\" — check it before treating \"none found\" as ground \
 truth. This filter reads the entity index rather than the vector index, so its \
-absence is gated on the graph being complete, not on embedding coverage.";
+absence is gated on the graph being complete, not on embedding coverage. An empty \
+answer also carries `edge_coverage`, naming the languages the filter's own scope \
+spans and how many entities it holds with the name pattern removed, and the absence \
+is NOT certified when that scope is empty or when its language is one this build \
+wires no language-server adapter for: nothing then resolves the program behind the \
+declarations, so a miss cannot separate a symbol the repository lacks from one the \
+extractor never admitted as an entity of that kind.";
 
 pub fn handle_semantic_search<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
@@ -48,13 +54,13 @@ pub fn handle_semantic_search<G: GraphStore>(
     let entities = store.query_entities(&filter).map_err(McpError::graph)?;
     let total_matches = entities.len();
 
-    let json = if compact {
+    let mut payload = if compact {
         let limited: Vec<_> = entities
             .into_iter()
             .take(limit)
             .map(CompactSearchResult::from)
             .collect();
-        serde_json::to_string_pretty(&CompactSearchResponse {
+        serde_json::to_value(CompactSearchResponse {
             query,
             limit,
             total_matches,
@@ -68,7 +74,7 @@ pub fn handle_semantic_search<G: GraphStore>(
             .take(limit)
             .map(SemanticSearchResult::from)
             .collect();
-        serde_json::to_string_pretty(&SemanticSearchResponse {
+        serde_json::to_value(SemanticSearchResponse {
             query,
             limit,
             total_matches,
@@ -78,6 +84,32 @@ pub fn handle_semantic_search<G: GraphStore>(
         .map_err(McpError::Json)?
     };
 
+    // FIR-2430. An empty search is a claim about the region this filter selected,
+    // and until this observation existed the claim was certified from daemon
+    // health alone: `semantic_search(query: "utils", kind: "module")` on
+    // expressjs/express reported `safe_to_conclude_absent: true` while
+    // `lib/utils.js` sat in the tree holding nine entities, minutes after
+    // `find_references` had refused to certify an absence on the same repository
+    // because JavaScript has no reference enrichment in this build.
+    //
+    // The scope query is the same filter with the name pattern removed, so the
+    // count is the coverage of the kind/language/role the caller asked about
+    // rather than of the name they asked for. Paid only on the empty path, which
+    // is the only answer whose trust depends on it.
+    if total_matches == 0 {
+        let scope = kin_model::graph::EntityFilter {
+            name_pattern: None,
+            ..filter.clone()
+        };
+        let scoped = store.query_entities(&scope).map_err(McpError::graph)?;
+        payload[crate::edge_coverage::EDGE_COVERAGE_KEY] =
+            crate::edge_coverage::observe_absence_scope(
+                &crate::edge_coverage::languages_of(&scoped),
+                Some(scoped.len()),
+            );
+    }
+
+    let json = serde_json::to_string_pretty(&payload).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
 }
 
@@ -2616,7 +2648,12 @@ value is that it fuses three steps — semantic_search, then a reference count p
 then the dead filter — into one response, so you don't loop find_references over every \
 candidate and exhaust your round-trips on a large repo. Use dead_code instead when you \
 want a whole-repo or file-scoped sweep rather than a concept-seeded one, and \
-bulk_check_references when you already hold the exact set of entity IDs to classify.";
+bulk_check_references when you already hold the exact set of entity IDs to classify. \
+When the seed matches nothing the response carries an additive `negative` object beside \
+an `edge_coverage` naming the languages the graph holds, and that absence is not \
+certified on a language this build wires no language-server adapter for, because a seed \
+that matched no declaration cannot then separate a symbol the repository lacks from one \
+the extractor never admitted.";
 
 /// Seeded find-dead-code primitive: `semantic_search(query)` + per-candidate
 /// reference counting + dead-filter, returned as one structured response, so
@@ -2724,11 +2761,26 @@ pub fn handle_find_dead_code_seeded<G: GraphStore>(
     });
 
     let total_searched = candidates.len();
-    let result = serde_json::json!({
+    let mut result = serde_json::json!({
         "query": trimmed,
         "total_searched": total_searched,
         "candidates": candidates,
     });
+
+    // The seed match is the same name filter over the same entity index
+    // `semantic_search` reads, so an empty seed carries the same observation and
+    // answers to the same gate (FIR-2430). The scope is the whole graph because
+    // the seed filter constrains nothing but the name.
+    if total_searched == 0 {
+        let scoped = store
+            .query_entities(&kin_model::graph::EntityFilter::default())
+            .map_err(McpError::graph)?;
+        result[crate::edge_coverage::EDGE_COVERAGE_KEY] =
+            crate::edge_coverage::observe_absence_scope(
+                &crate::edge_coverage::languages_of(&scoped),
+                Some(scoped.len()),
+            );
+    }
 
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
@@ -3371,7 +3423,9 @@ a directional ordered chain with bodies inlined, use trace_data_flow. \
 When no neighbors come back, the additive `negative` object's `safe_to_conclude_absent` \
 flag says whether that absence is authoritative or merely \"not indexed yet\", and its \
 `subject` scopes the absence to the side that was walked, so an empty 'in' result is never \
-read as \"no dependencies\". A focal that is not in the graph is reported as that gap \
+read as \"no dependencies\". A walk that expanded no edge also carries `edge_coverage` \
+naming the focal's language, and the absence is not certified when this build wires no \
+language-server adapter for it. A focal that is not in the graph is reported as that gap \
 rather than as an isolated entity. Every edge also carries `resolution` \
 (`type_resolved`, `import_scoped`, `name_only`) saying how strongly its destination was \
 proven; a `name_only` edge was matched by bare name and is a candidate, not structure you \
@@ -3506,7 +3560,7 @@ pub fn handle_graph_neighborhood<G: GraphStore>(
     // Cap relations to match the entity limit to avoid unbounded output.
     relations.truncate(limit * 3);
 
-    let result = serde_json::json!({
+    let mut result = serde_json::json!({
         "focal_id": entity_id.to_string(),
         "direction": direction,
         "depth": depth,
@@ -3516,6 +3570,22 @@ pub fn handle_graph_neighborhood<G: GraphStore>(
         "entities": entities,
         "relations": relations,
     });
+
+    // A walk that expanded no edge is claiming the focal has no neighbors on the
+    // side that was walked, and for an incoming walk that is the same claim
+    // `find_references` makes. It answers to the same gate (FIR-2430), scoped to
+    // the focal's own language. A focal that did not resolve names no language,
+    // and the observation says so rather than guessing one, so the
+    // focal-not-in-graph gap stays the limiting factor a reader is handed.
+    if total_relations == 0 {
+        let focal_languages = store
+            .get_entity(&entity_id)
+            .map_err(McpError::graph)?
+            .map(|entity| vec![entity.language])
+            .unwrap_or_default();
+        result[crate::edge_coverage::EDGE_COVERAGE_KEY] =
+            crate::edge_coverage::observe_absence_scope(&focal_languages, None);
+    }
 
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
@@ -4285,6 +4355,233 @@ mod tests {
         assert_eq!(env["total_requested"], 50);
         assert_eq!(env["returned"], 0);
         assert_eq!(env["results"][0]["reason"], "not_found");
+    }
+
+    fn search_args(query: &str, kind: Option<&str>) -> HashMap<String, serde_json::Value> {
+        let mut args = HashMap::new();
+        args.insert("query".to_string(), serde_json::json!(query));
+        if let Some(kind) = kind {
+            args.insert("kind".to_string(), serde_json::json!(kind));
+        }
+        args
+    }
+
+    /// A daemon envelope reporting the graph initialized, loaded and populated:
+    /// the state in which a structural absence is otherwise certifiable, so the
+    /// verdicts below turn on the scope observation and nothing else.
+    fn ready_daemon_envelope(entity_count: u64) -> crate::envelope::Envelope {
+        crate::envelope::Envelope::daemon().with_health(&serde_json::json!({
+            "graph_loaded": true,
+            "initialized": true,
+            "graph_entity_count": entity_count,
+            "graph_generation": 1,
+        }))
+    }
+
+    fn module_entity(language: LanguageId, name: &str, file: &str) -> Entity {
+        let mut entity = make_entity_in(language, name, file);
+        entity.kind = EntityKind::Module;
+        entity
+    }
+
+    /// FIR-2430, end to end through the handler that built the bad answer.
+    ///
+    /// The store is shaped like expressjs/express as the stranger run found it:
+    /// JavaScript, with a `Module` entity for one file and none for
+    /// `lib/utils.js`, which still holds entities of other kinds. That is the
+    /// state in which `semantic_search(query: "utils", kind: "module")` returned
+    /// zero and stamped it `safe_to_conclude_absent: true`, `trust:
+    /// "authoritative"`, minutes after `find_references` refused to certify an
+    /// absence on the same repository because this build wires no
+    /// language-server adapter for JavaScript.
+    #[test]
+    fn a_javascript_search_absence_is_inconclusive_while_a_python_one_still_certifies() {
+        let store = InMemoryGraph::new();
+        store
+            .upsert_entity(&module_entity(
+                LanguageId::JavaScript,
+                "express",
+                "lib/express.js",
+            ))
+            .unwrap();
+        store
+            .upsert_entity(&make_entity_in(
+                LanguageId::JavaScript,
+                "createETagGenerator",
+                "lib/utils.js",
+            ))
+            .unwrap();
+
+        // Positive control on the same call: a module that IS in the graph comes
+        // back populated and carries no scope observation, because an answer
+        // that returned a row proved the region can answer.
+        let found = parsed_response(
+            &handle_semantic_search(&search_args("express", Some("module")), &store).unwrap(),
+        );
+        assert_eq!(found["total_matches"], 1);
+        assert!(
+            found.get(crate::edge_coverage::EDGE_COVERAGE_KEY).is_none(),
+            "a populated answer needs no scope observation: {found}"
+        );
+
+        // The reported call, verbatim. The region is populated (one module), so
+        // what stops the certification is that nothing resolves the program
+        // behind these declarations, which is exactly what the stranger's own
+        // find_references had just said about the same repository.
+        let empty = parsed_response(
+            &handle_semantic_search(&search_args("utils", Some("module")), &store).unwrap(),
+        );
+        assert_eq!(empty["total_matches"], 0);
+        let coverage = &empty[crate::edge_coverage::EDGE_COVERAGE_KEY];
+        assert_eq!(coverage["language"], "JavaScript");
+        assert_eq!(coverage["reference_enrichment"], "unsupported");
+        assert_eq!(
+            coverage["scope_entities"], 1,
+            "the kind-filtered absence states the coverage of that kind: {coverage}"
+        );
+        let negative =
+            crate::negative::negative_for("semantic_search", &empty, &ready_daemon_envelope(2))
+                .expect("an empty search carries a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], false);
+        assert_eq!(negative["trust"], "inconclusive");
+        assert!(
+            negative["trust_reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("entity_index_unresolved"),
+            "{negative}"
+        );
+
+        // The other direction on the same code path. Python is a language this
+        // build wires an adapter for, so a name nothing carries is still a
+        // certifiable absence and the fix has not degraded into marking
+        // everything uncertain.
+        let python = InMemoryGraph::new();
+        python
+            .upsert_entity(&module_entity(LanguageId::Python, "utils", "app/utils.py"))
+            .unwrap();
+        python
+            .upsert_entity(&make_entity_in(
+                LanguageId::Python,
+                "render_page",
+                "app/views.py",
+            ))
+            .unwrap();
+        let found = parsed_response(
+            &handle_semantic_search(&search_args("utils", Some("module")), &python).unwrap(),
+        );
+        assert_eq!(
+            found["total_matches"], 1,
+            "control: the module the Python graph holds is findable, so the absence below \
+             is a real absence rather than a broken filter"
+        );
+
+        let absent = parsed_response(
+            &handle_semantic_search(&search_args("zzz_not_a_symbol", None), &python).unwrap(),
+        );
+        assert_eq!(absent["total_matches"], 0);
+        let coverage = &absent[crate::edge_coverage::EDGE_COVERAGE_KEY];
+        assert_eq!(coverage["language"], "Python");
+        assert_eq!(coverage["reference_enrichment"], "unknown");
+        assert_eq!(coverage["scope_entities"], 2);
+        let negative =
+            crate::negative::negative_for("semantic_search", &absent, &ready_daemon_envelope(2))
+                .expect("an empty search carries a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], true);
+        assert_eq!(negative["trust"], "authoritative");
+    }
+
+    /// A filter that selected a region the extractor never populated says
+    /// nothing about the repository, whatever language it is over.
+    #[test]
+    fn a_search_filtered_into_an_unpopulated_region_certifies_nothing() {
+        let store = InMemoryGraph::new();
+        store
+            .upsert_entity(&make_entity_in(
+                LanguageId::Python,
+                "render_page",
+                "app/views.py",
+            ))
+            .unwrap();
+
+        let empty = parsed_response(
+            &handle_semantic_search(&search_args("utils", Some("module")), &store).unwrap(),
+        );
+        assert_eq!(
+            empty[crate::edge_coverage::EDGE_COVERAGE_KEY]["scope_entities"],
+            0,
+            "this graph holds no module entity at all: {empty}"
+        );
+        let negative =
+            crate::negative::negative_for("semantic_search", &empty, &ready_daemon_envelope(1))
+                .expect("an empty search carries a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], false);
+        assert!(
+            negative["trust_reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("absence_scope_empty"),
+            "{negative}"
+        );
+    }
+
+    /// The neighborhood publishes the same observation, and a focal that did not
+    /// resolve names no language rather than borrowing one, so the
+    /// focal-not-in-graph gap stays the limiting factor a reader is handed.
+    #[test]
+    fn an_empty_neighborhood_publishes_the_scope_it_walked() {
+        let store = InMemoryGraph::new();
+        let focal = make_entity_in(
+            LanguageId::JavaScript,
+            "createETagGenerator",
+            "lib/utils.js",
+        );
+        let focal_id = focal.id;
+        store.upsert_entity(&focal).unwrap();
+
+        let mut args = HashMap::new();
+        args.insert(
+            "entity_id".to_string(),
+            serde_json::json!(focal_id.to_string()),
+        );
+        args.insert("direction".to_string(), serde_json::json!("in"));
+        let walked = parsed_response(&handle_graph_neighborhood(&args, &store).unwrap());
+        assert_eq!(walked["relation_count"], 0);
+        let coverage = &walked[crate::edge_coverage::EDGE_COVERAGE_KEY];
+        assert_eq!(coverage["language"], "JavaScript");
+        assert_eq!(coverage["reference_enrichment"], "unsupported");
+        assert!(
+            coverage.get("scope_entities").is_none(),
+            "a walk counts no region, so it publishes no count: {coverage}"
+        );
+        let negative =
+            crate::negative::negative_for("graph_neighborhood", &walked, &ready_daemon_envelope(1))
+                .expect("an empty walk carries a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], false);
+
+        let mut missing = HashMap::new();
+        missing.insert(
+            "entity_id".to_string(),
+            serde_json::json!(EntityId::new().to_string()),
+        );
+        let unresolved = parsed_response(&handle_graph_neighborhood(&missing, &store).unwrap());
+        assert_eq!(
+            unresolved[crate::edge_coverage::EDGE_COVERAGE_KEY]["language"],
+            "no resolved language"
+        );
+        let negative = crate::negative::negative_for(
+            "graph_neighborhood",
+            &unresolved,
+            &ready_daemon_envelope(1),
+        )
+        .expect("an unresolved focal carries a negative");
+        assert!(
+            negative["trust_reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("focal_not_in_graph"),
+            "the focal miss stays the limiting factor: {negative}"
+        );
     }
 
     #[test]
