@@ -133,10 +133,12 @@ struct ActiveTransaction {
     opened: std::time::Instant,
     phase: Option<&'static str>,
     phase_entered: std::time::Instant,
+    /// Largest resident set any beat has seen since this transaction opened.
+    peak_rss_bytes: Option<u64>,
 }
 
 impl ActiveTransaction {
-    fn record(&self) -> OpenTransaction {
+    fn record(&self, rss_bytes: Option<u64>) -> OpenTransaction {
         OpenTransaction {
             pid: std::process::id(),
             operation: self.operation.to_string(),
@@ -144,8 +146,32 @@ impl ActiveTransaction {
             elapsed_secs: self.opened.elapsed().as_secs(),
             phase_elapsed_secs: self.phase_entered.elapsed().as_secs(),
             beat_unix: unix_now(),
+            rss_bytes,
+            peak_rss_bytes: self.peak_rss_bytes,
         }
     }
+}
+
+/// This process's resident set right now, or `None` when it cannot be sampled.
+///
+/// Absent rather than zero on every failure. A commit that reports "the daemon
+/// was using 0 bytes" is worse than one that reports nothing, because the first
+/// is a measurement a reader will act on and it is wrong.
+///
+/// The pid comes from `sysinfo::get_current_pid` for the same reason
+/// `sample_process_cpu` uses it: the zero-file-search guard reads a
+/// `process::`-prefixed path as a subprocess launch, and the crate's own
+/// accessor states the intent without arguing with a guard that is right to be
+/// blunt.
+fn sample_own_rss_bytes() -> Option<u64> {
+    let pid = sysinfo::get_current_pid().ok()?;
+    let mut system = sysinfo::System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[pid]),
+        true,
+        sysinfo::ProcessRefreshKind::nothing().with_memory(),
+    );
+    Some(system.process(pid)?.memory())
 }
 
 fn active() -> &'static Mutex<Option<ActiveTransaction>> {
@@ -155,13 +181,19 @@ fn active() -> &'static Mutex<Option<ActiveTransaction>> {
 
 /// Publish the marker for whatever is currently open. A no-op when nothing is.
 fn publish_beat() {
-    let Ok(guard) = active().lock() else {
+    // Sampled before the lock is taken. The refresh walks the OS process table
+    // and `enter_phase` waits on this same mutex from the commit path, so
+    // holding it across the sample would put a process-table read between every
+    // phase and the next.
+    let rss_bytes = sample_own_rss_bytes();
+    let Ok(mut guard) = active().lock() else {
         return;
     };
-    let Some(transaction) = guard.as_ref() else {
+    let Some(transaction) = guard.as_mut() else {
         return;
     };
-    let record = transaction.record();
+    transaction.peak_rss_bytes = transaction.peak_rss_bytes.max(rss_bytes);
+    let record = transaction.record(rss_bytes);
     let kin_root = transaction.kin_root.clone();
     let phase = transaction.phase;
     let phase_elapsed_ms = transaction.phase_entered.elapsed().as_millis();
@@ -226,6 +258,7 @@ impl TransactionGuard {
                 opened: now,
                 phase: None,
                 phase_entered: now,
+                peak_rss_bytes: None,
             });
         }
         ensure_beat_thread();
@@ -361,6 +394,8 @@ mod tests {
             elapsed_secs: 400,
             phase_elapsed_secs: 300,
             beat_unix: unix_now().saturating_sub(BEAT_STALE_AFTER.as_secs() + 5),
+            rss_bytes: None,
+            peak_rss_bytes: None,
         };
         write_marker(&kin_root, &record);
 

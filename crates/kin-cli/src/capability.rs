@@ -4,11 +4,18 @@
 //! Machine capability detection for adaptive locate behavior.
 //!
 //! Determines the [`LocateProfile`] tier from effective CPU cores + available
-//! RAM. Lower tiers trade recall for latency on constrained hardware (shallower
-//! multihop, no reranker / PRF / LTR), so the tier changes retrieval quality —
-//! that downgrade is surfaced, never silent (see [`LocateProfile::name`] /
+//! RAM. Lower tiers narrow the graph multihop budget (shallower depth, a
+//! smaller frontier, a shorter timeout), which trades recall for latency on
+//! constrained hardware, so the tier changes retrieval quality and that
+//! downgrade is surfaced, never silent (see [`LocateProfile::name`] /
 //! [`LocateProfile::disabled_signals`], reported as a `capability_tier`
 //! degradation on every `kin locate` result).
+//!
+//! The multihop budget is the whole of it. The tier does not select between a
+//! fused and a lexical retrieval arm, and it does not gate the cross-encoder,
+//! which [`crate::retrieval_profile::RetrievalProfile`] owns. Entity-granularity
+//! fusion, the lexical parity floor and the calibrated embedding seed floor are
+//! `accuracy-v2` defaults and run on every tier.
 //!
 //! Detection is container-aware: cores and RAM are capped by the active cgroup
 //! v2 (`cpu.max` / `memory.max`) or v1 (CFS quota / `memory.limit_in_bytes`)
@@ -91,18 +98,6 @@ impl LocateProfile {
         }
     }
 
-    pub fn prf_enabled(&self) -> bool {
-        matches!(self, Self::Standard | Self::Performance)
-    }
-
-    pub fn ltr_enabled(&self) -> bool {
-        matches!(self, Self::Performance)
-    }
-
-    pub fn reranker_enabled(&self) -> bool {
-        matches!(self, Self::Standard | Self::Performance)
-    }
-
     /// Stable lowercase tier name. Also the exact token accepted by the
     /// `KIN_LOCATE_PROFILE` override, so surfaced output names the lever a user
     /// would set to change it.
@@ -121,19 +116,29 @@ impl LocateProfile {
     /// smaller machine really does return lower-recall results, and the caller
     /// can see exactly which signals were dropped rather than inferring it from
     /// differing results across machines.
+    ///
+    /// It names the graph multihop budget and nothing else, because that budget
+    /// is the only thing the tier actually gates. This list used to also claim
+    /// `reranker`, `prf` and `ltr`. None of the three was ever read from the
+    /// tier: `prf` has no implementation anywhere in the tree, and `reranker`
+    /// and `ltr` are the same cross-encoder, owned by
+    /// [`crate::retrieval_profile::RetrievalProfile`] and off unconditionally
+    /// under the default `accuracy-v2` on every tier, the proof machine
+    /// included. So the entry told a below-tier operator that three signals had
+    /// been withdrawn when two were running exactly as they run everywhere and
+    /// the third does not exist, and then advised buying hardware that would
+    /// not have changed any of them. A disclosure that overstates the downgrade
+    /// is the same defect as one that hides it.
     pub fn disabled_signals(&self) -> Vec<&'static str> {
         let mut off = Vec::new();
-        if !self.reranker_enabled() {
-            off.push("reranker");
-        }
-        if !self.prf_enabled() {
-            off.push("prf");
-        }
-        if !self.ltr_enabled() {
-            off.push("ltr");
-        }
         if self.multihop_max_depth() < Self::Performance.multihop_max_depth() {
             off.push("multihop_depth");
+        }
+        if self.multihop_frontier_limit() < Self::Performance.multihop_frontier_limit() {
+            off.push("multihop_frontier");
+        }
+        if self.multihop_timeout_ms() < Self::Performance.multihop_timeout_ms() {
+            off.push("multihop_timeout");
         }
         off
     }
@@ -558,15 +563,43 @@ mod tests {
     #[test]
     fn performance_disables_nothing_lower_tiers_do() {
         assert!(LocateProfile::Performance.disabled_signals().is_empty());
-        // Standard keeps reranker + PRF but loses LTR and full multihop depth.
-        let standard = LocateProfile::Standard.disabled_signals();
-        assert!(standard.contains(&"ltr"));
-        assert!(standard.contains(&"multihop_depth"));
-        assert!(!standard.contains(&"reranker"));
-        // Minimal loses every learned signal.
-        let minimal = LocateProfile::Minimal.disabled_signals();
-        for sig in ["reranker", "prf", "ltr", "multihop_depth"] {
-            assert!(minimal.contains(&sig), "minimal should disable {sig}");
+        // Every sub-Performance tier narrows all three multihop bounds.
+        for tier in [LocateProfile::Standard, LocateProfile::Minimal] {
+            let off = tier.disabled_signals();
+            for sig in ["multihop_depth", "multihop_frontier", "multihop_timeout"] {
+                assert!(off.contains(&sig), "{} should narrow {sig}", tier.name());
+            }
+        }
+    }
+
+    /// The tier may only claim what it actually gates.
+    ///
+    /// `reranker`, `prf` and `ltr` were reported here for tiers that never
+    /// gated them, which told a below-tier operator that three signals had been
+    /// withdrawn when two run identically on every tier and the third is not
+    /// implemented at all. Nothing in the tree reads a tier to decide any of
+    /// them, so a disclosure naming them cannot be true.
+    #[test]
+    fn the_tier_claims_no_signal_it_does_not_gate() {
+        for tier in [
+            LocateProfile::Minimal,
+            LocateProfile::Standard,
+            LocateProfile::Performance,
+        ] {
+            for phantom in ["reranker", "prf", "ltr"] {
+                assert!(
+                    !tier.disabled_signals().contains(&phantom),
+                    "{} must not claim to disable {phantom}, which no tier gates",
+                    tier.name()
+                );
+            }
+            for signal in tier.disabled_signals() {
+                assert!(
+                    signal.starts_with("multihop_"),
+                    "{} reports {signal}, which is not a multihop bound",
+                    tier.name()
+                );
+            }
         }
     }
 
