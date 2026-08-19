@@ -72,15 +72,12 @@ export const DELTAS = [
     to: `          node scripts/write-release-archive-docs.mjs "$ARTIFACT" "$TARGET" "$RC_VERSION"
 `,
   },
-  {
-    label: "apt",
-    from: `        run: sudo apt-get update && sudo apt-get install -y musl-tools
-`,
-    to: `        # DELTA(apt): bounded through the shared helper. An unbounded apt call
-        # holds a job until the runner timeout when a mirror stalls (FIR-2391).
-        run: ./scripts/ci-apt-install.sh musl-tools
-`,
-  },
+  // An "apt" delta used to sit here. rc-build.yml bounded its musl-tools
+  // install through scripts/ci-apt-install.sh while release.yml still called
+  // apt directly, so the candidate was protected from a mirror stall and the
+  // release was not. release.yml now calls the same helper, the two steps are
+  // byte-identical again, and a delta describing a difference that no longer
+  // exists would fail here as an anchor that matches nothing.
   {
     label: "notifier-version",
     from: `            "\${GITHUB_REF_NAME#v}"

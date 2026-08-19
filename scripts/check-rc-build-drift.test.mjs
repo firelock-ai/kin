@@ -118,19 +118,19 @@ test("a candidate-only step missing from rc-build.yml is reported", () => {
 
 test("a delta whose anchor stopped matching is reported by label", () => {
   const mutated = release.replace(
-    "        run: sudo apt-get update && sudo apt-get install -y musl-tools",
-    "        run: sudo apt-get update && sudo apt-get install -y musl-tools pkg-config"
+    '          node scripts/write-release-archive-docs.mjs "$ARTIFACT" "$TARGET" "${GITHUB_REF_NAME#v}"',
+    '          node scripts/write-release-archive-docs.mjs "$ARTIFACT" "$TARGET" "${GITHUB_REF_NAME#v}" --extra'
   );
   assert.notEqual(mutated, release);
   const problems = check(mutated, rc);
   // Two complaints, and both are wanted: the delta stopped applying, and the
   // block it would have produced no longer matches.
   assert.ok(
-    problems.some((problem) => /delta "apt" matched 0 times/.test(problem)),
+    problems.some((problem) => /delta "archive-docs-version" matched 0 times/.test(problem)),
     problems.join("\n")
   );
   assert.ok(
-    problems.some((problem) => /Install musl C toolchain/.test(problem)),
+    problems.some((problem) => /Package \(Unix\)/.test(problem)),
     problems.join("\n")
   );
 });

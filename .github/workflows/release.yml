@@ -376,6 +376,14 @@ jobs:
     name: Build (${{ matrix.artifact }})
     needs: config
     runs-on: ${{ matrix.os }}
+    # rc-build.yml bounds the identical compile at 90, and this job had no bound
+    # at all, so it inherited the 360-minute default while holding
+    # `kin-release-promotion` with cancel-in-progress: false. A hung leg could
+    # block every release-channel mutation for six hours. The slowest leg ever
+    # measured is 40m03s, so 90 leaves better than twice that headroom. This
+    # bounds execution rather than queue time, so it is not a runner-label
+    # safety net; it is the ceiling on a build that stops making progress.
+    timeout-minutes: 90
     environment: release
     # Every advertised platform is release-blocking. A public release must not
     # be created without one of the archives consumed by the installers.
@@ -498,9 +506,17 @@ jobs:
       # musl-static C dependencies (ring, oniguruma, sqlite, tree-sitter) need a
       # musl-targeting C compiler; musl-tools provides musl-gcc. Only the Linux
       # musl legs require it.
+      #
+      # Bounded through the shared helper rather than called directly. A bare
+      # `apt-get update && apt-get install` has no ceiling below the job
+      # timeout: the hosted mirrorlist puts azure.archive.ubuntu.com first and a
+      # stall there trickles bytes slowly enough that no per-fetch timeout
+      # fires. The helper bounds each call, retries three times, and fails over
+      # to archive.ubuntu.com from the second attempt, so a stalled mirror ends
+      # the step with its own error line instead of holding a release build.
       - name: Install musl C toolchain (Linux musl)
         if: ${{ contains(matrix.target, '-linux-musl') }}
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        run: ./scripts/ci-apt-install.sh musl-tools
 
       - name: Install cross (ARM64)
         if: matrix.cross

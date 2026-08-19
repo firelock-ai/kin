@@ -169,10 +169,16 @@ jobs:
       # musl-static C dependencies (ring, oniguruma, sqlite, tree-sitter) need a
       # musl-targeting C compiler; musl-tools provides musl-gcc. Only the Linux
       # musl legs require it.
+      #
+      # Bounded through the shared helper rather than called directly. A bare
+      # `apt-get update && apt-get install` has no ceiling below the job
+      # timeout: the hosted mirrorlist puts azure.archive.ubuntu.com first and a
+      # stall there trickles bytes slowly enough that no per-fetch timeout
+      # fires. The helper bounds each call, retries three times, and fails over
+      # to archive.ubuntu.com from the second attempt, so a stalled mirror ends
+      # the step with its own error line instead of holding a release build.
       - name: Install musl C toolchain (Linux musl)
         if: ${{ contains(matrix.target, '-linux-musl') }}
-        # DELTA(apt): bounded through the shared helper. An unbounded apt call
-        # holds a job until the runner timeout when a mirror stalls (FIR-2391).
         run: ./scripts/ci-apt-install.sh musl-tools
 
       - name: Install cross (ARM64)
