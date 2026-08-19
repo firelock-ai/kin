@@ -1427,7 +1427,7 @@ pub async fn run_with_authority_on(
             Some(rx)
         } else {
             info!(
-                "no LSP servers found — enrichment disabled for the life of this daemon; \
+                "no LSP servers found, so enrichment is disabled for the life of this daemon; \
                  install one and restart to enable it"
             );
             None

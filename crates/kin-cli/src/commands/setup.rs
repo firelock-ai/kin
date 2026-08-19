@@ -12936,9 +12936,18 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
     //
     // The gap comes from the health report rather than from a fresh probe, so
     // the repair is scoped to the languages the row actually flagged.
+    // Pending and Stale are exactly the two states the coverage row takes when
+    // a language-server gap was actually OBSERVED. `Unsupported` is what it
+    // reports outside a Kin repository, or with no daemon and nothing missing,
+    // and offering an install off the back of that would turn a "nothing to
+    // measure here" row into a prompt to download packages.
     let language_server_gap = report.checks.iter().any(|c| {
         c.id == "reference_edge_coverage"
-            && !matches!(c.status, crate::commands::health::HealthStatus::Healthy)
+            && matches!(
+                c.status,
+                crate::commands::health::HealthStatus::Pending
+                    | crate::commands::health::HealthStatus::Stale
+            )
     });
     if language_server_gap {
         let missing = language_servers::missing_enrichable_languages();
