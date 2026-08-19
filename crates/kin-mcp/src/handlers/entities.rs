@@ -6178,6 +6178,12 @@ mod tests {
         );
 
         let annotated = InMemoryGraph::new();
+        // The witness is what makes this fixture's `calls` class present, and
+        // therefore its completeness `complete` and its bound `exact`. Without
+        // it both runs below read `partial`/`at_least` for reasons that have
+        // nothing to do with type edges, and the comparison could not detect a
+        // label that decided either.
+        seed_cross_file_call_witness(&annotated);
         let focal = make_entity("ParsedNote", "src/notes.py");
         let repo_type = make_entity("WikiLink", "src/links.py");
         annotated.upsert_entity(&focal).unwrap();
@@ -6189,22 +6195,52 @@ mod tests {
                 RelationKind::UsesType,
             ))
             .unwrap();
-        let mut args = HashMap::new();
-        args.insert("focal".to_string(), serde_json::json!(focal.id.to_string()));
-        let withheld = parsed_response(&crate::finalize_with_envelope(
-            handle_trace_data_flow(&args, &annotated).unwrap(),
-            populated_ready_envelope(),
-            "trace_data_flow",
-        ));
+        let annotated_trace = |include_type_edges: bool| {
+            let mut args = HashMap::new();
+            args.insert("focal".to_string(), serde_json::json!(focal.id.to_string()));
+            args.insert(
+                "include_type_edges".to_string(),
+                serde_json::json!(include_type_edges),
+            );
+            parsed_response(&crate::finalize_with_envelope(
+                handle_trace_data_flow(&args, &annotated).unwrap(),
+                populated_ready_envelope(),
+                "trace_data_flow",
+            ))
+        };
+
+        let withheld = annotated_trace(false);
+        assert_eq!(
+            withheld["_kin"]["completeness"]["status"],
+            serde_json::json!("complete"),
+            "the fixture must start complete or the comparison below cannot detect a flip"
+        );
         let limits = withheld["_kin"]["completeness"]["limits"].to_string();
         assert!(
             limits.contains("type_annotation_edges_not_walked"),
             "a withheld type hop is disclosed: {limits}"
         );
+
+        // Compared against the same walk with the hop taken, rather than
+        // asserted against a literal. `bound` and `status` describe the edge
+        // coverage of the graph under test, which this fixture is too small to
+        // make `complete`, so a literal would be asserting the fixture rather
+        // than the claim. The claim is that the label is disclosure: it must
+        // move neither field.
+        let opened = annotated_trace(true);
+        assert!(
+            !opened["_kin"]["completeness"]["limits"]
+                .to_string()
+                .contains("type_annotation_edges_not_walked"),
+            "the label describes a hop that was withheld, and this one was not"
+        );
         assert_eq!(
-            withheld["_kin"]["completeness"]["bound"],
-            serde_json::json!("exact"),
+            withheld["_kin"]["completeness"]["bound"], opened["_kin"]["completeness"]["bound"],
             "disclosure only: declining a type hop must not make an honest chain read as a floor"
+        );
+        assert_eq!(
+            withheld["_kin"]["completeness"]["status"], opened["_kin"]["completeness"]["status"],
+            "disclosure only: a limit label must not decide the completeness status"
         );
     }
 
