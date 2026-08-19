@@ -70,6 +70,13 @@
       "reason": "The Public Install Proof frozen at this tag fails on all five platforms at the installed capability validation: the tagged binary's locate coverage counts a graph-owned source path as bodied only when an opaque artifact carries a text preview for it, and no HEAD admission path writes such a record for a parsed source file (the daemon keeps one facet per path and clears opaque records on entity paths), so a fresh install's kin locate reports semantic coverage incomplete with a body gap on every store that holds one parsed source file, and the proof's complete-coverage assertion refuses it. The repair, which reads the entity body previews the graph already holds at HEAD, landed on main only after the tag, and both the proof workflow and the binary resolve from the tag, so no later change to main can reach the failing check. Both attempts of the cited run failed with the same signature on all five legs, the only GitHub Release object for this tag is the unpromoted prerelease the workflow publishes before proof, npm and Homebrew were verified untouched at 0.5.37, and the tag never became the finalized Latest release.",
       "superseded_by": "v0.5.39",
       "failed_release_run_id": "32107626360"
+    },
+    {
+      "tag": "v0.5.41",
+      "sha": "14efb5a7b1351cf5cde1a95a473781a9bec9fa96",
+      "reason": "The Public Install Proof frozen at this tag fails on windows-latest, macos-latest and macos-15-intel because the tagged binary's setup records the platform's preferred mount projection without engaging it: the chooser picks nfs on macOS and projfs on Windows, setup records the choice with nothing mounted and no server running, and the tag's own kin doctor then reads the recording as projection_mode=misconfigured, which is fatal under the proof's aggregate-health tolerance rule. The failure is deterministic on every fresh install of these bytes, so retries cannot pass it. The repair, recording only a projection that is in force by installation alone and leaving mount modes to be recorded by kin vfs on at the moment they actually engage, landed on main only after the tag as kin#953, and both the proof workflow and the binary resolve from the tag, so no later change to main can reach the failing check. All release attempts of the cited run failed with the same signature on the same three legs, the ubuntu legs passed, the only GitHub Release object for this tag is the unpromoted prerelease the workflow publishes before proof, npm and Homebrew were verified untouched at 0.5.40, and the tag never became the finalized Latest release.",
+      "superseded_by": "v0.5.42",
+      "failed_release_run_id": "32237324302"
     }
   ]
 }
