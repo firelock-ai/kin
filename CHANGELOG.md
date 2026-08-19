@@ -36,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Report only what the capability tier actually gates (#945)
 - Report a commit whose daemon died in memory terms, and free the graph copies it held at its peak (#946)
 - Place watcher events by repository containment, not by path spelling (#948)
+- Build release-candidate archives without a tag (#940)
 
 
 ## [0.5.40] - 2026-08-18
