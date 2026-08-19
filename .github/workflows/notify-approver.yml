@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   notify:
-    uses: firelock-ai/kin-actions/.github/workflows/notify-approver.yml@v0.1.30
+    uses: firelock-ai/kin-actions/.github/workflows/notify-approver.yml@v0.1.31
     permissions:
       contents: read
       pull-requests: write
