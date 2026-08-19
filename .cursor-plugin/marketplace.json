@@ -5,14 +5,14 @@
     "url": "https://kinlab.ai"
   },
   "metadata": {
-    "description": "Firelock's marketplace for Kin, the semantic system of record for software work.",
+    "description": "Firelock's marketplace for Kin, the system of record for AI-written software.",
     "version": "0.1.0"
   },
   "plugins": [
     {
       "name": "kin",
       "source": "./plugins/kin-cursor",
-      "description": "Semantic code retrieval over a graph of entities, relationships, changes, and provenance. Locate, search, context packs, data-flow tracing, and impact analysis without raw file search."
+      "description": "Kin keeps a living map of the software itself so humans and agents can understand what every change touches. Locate, search, context packs, data-flow tracing, and impact analysis without raw file search."
     }
   ]
 }

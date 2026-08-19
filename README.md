@@ -33,12 +33,12 @@ reaches. The callers of the changed signature come first, then everything
 those callers pull in behind them.
 
 <p align="center">
-  <img src="docs/assets/kin-impact-ripgrep.png" alt="kin impact on ripgrep listing 13 impacted entities within 3 hops of a one-line signature change" width="100%" />
+  <img src="docs/assets/kin-impact-ripgrep.png" alt="kin impact on ripgrep: a one-line signature edit, and Kin surfaces the entities it affects before a compiler runs" width="100%" />
 </p>
 
 Recorded against a prepared graph at ripgrep commit
-`e89fff89ac9af12e8d4ce9d5fd07beb408ca730f`. 13 impacted entities within 3 hops,
-including 3 direct callers of the changed signature. The graph was built
+`e89fff89ac9af12e8d4ce9d5fd07beb408ca730f`. A one-line signature edit, and Kin
+surfaces the entities it affects before a compiler runs. The graph was built
 beforehand. No compiler ran. Exact commands:
 [kinlab.ai/proof](https://kinlab.ai/proof). The raw run directory is not
 public yet, so this is a recipe you can re-run, not a trace you can audit.

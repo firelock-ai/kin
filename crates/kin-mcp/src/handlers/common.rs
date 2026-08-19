@@ -160,7 +160,7 @@ fn daemon_url_from_env() -> Result<String> {
 /// Query the daemon for federated impact analysis, returning the typed struct.
 ///
 /// Returns a [`SpineQuery`] so callers can distinguish a spine that is simply
-/// not configured (local-only — quiet) from one that is configured but
+/// not configured (local-only: quiet) from one that is configured but
 /// unavailable (surface it) and a healthy, possibly-empty answer.
 pub async fn fetch_spine_impact_typed(
     repo_id: &str,
@@ -1033,7 +1033,7 @@ pub struct ReferenceRow {
     /// Graph entity id of the referencing (caller) entity, when it is a
     /// graph-owned local entity. Lets an agent drill a reference straight to the
     /// caller's body (`get_entity_source`/`get_context_pack`) without re-resolving
-    /// the caller by name — the keystone of the no-filesystem reference→body
+    /// the caller by name. That is the keystone of the no-filesystem reference→body
     /// chain. `None` for federated spine xrefs (no local entity).
     pub entity_id: Option<String>,
     pub name: String,
@@ -2263,7 +2263,7 @@ pub fn entity_body_gap_reason(entity: &Entity) -> String {
 
 /// Caps for the inline snippet surfaced on a retrieval hit (`kin locate --json`
 /// symbols, `semantic_locate` entity results): a signature plus the first
-/// several body lines — dense enough for an agent to act on without a follow-up
+/// several body lines, dense enough for an agent to act on without a follow-up
 /// read, but far tighter than the full-body excerpt
 /// ([`MCP_SOURCE_MAX_LINES`]/[`MCP_SOURCE_MAX_CHARS`]) `get_entity_source` and
 /// `get_context_pack` serve. One bound shared by every agent surface so the
