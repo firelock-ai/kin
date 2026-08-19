@@ -116,6 +116,7 @@ export const HEALTH_STATUSES = [
   "stale",
   "misconfigured",
   "pending",
+  "degraded",
   "unsupported",
 ];
 

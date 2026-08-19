@@ -83,7 +83,19 @@ it. The \`.sha256\` file published next to the archive covers the archive itself
 
 const install = `# Installing Kin ${version} (${target})
 
-Two decisions, both answered here.
+Two decisions, both answered here, and one number to plan around first.
+
+## Requirements
+
+A commit prepares the whole repository successor in memory, so its peak follows
+the size of the repository rather than the size of the edit, and on a converted
+repository it can reach 16 GB per repository per write. Give the machine or
+container that much free memory before you commit, because a commit that runs
+out of it is killed mid-transaction.
+
+Run \`kin doctor\` inside the repository to see where you stand. It measures your
+store against the commit peaks Kin has recorded and tells you which side of that
+line you are on, before you spend a write finding out.
 
 ## 1. The executables
 

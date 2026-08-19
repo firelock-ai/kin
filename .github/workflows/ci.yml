@@ -109,6 +109,7 @@ jobs:
             ./scripts/prepare-release.test.mjs \
             ./scripts/read-update-build-identity.test.cjs \
             ./scripts/release-archive-shape.test.cjs \
+            ./scripts/write-release-archive-docs.test.mjs \
             ./scripts/release-order.test.mjs \
             ./scripts/release-hold-alarm.test.mjs \
             ./scripts/advisory-sweep.test.mjs \
@@ -968,7 +969,8 @@ jobs:
             scripts/check-release-version.test.mjs \
             scripts/extract-release-notes.test.mjs \
             scripts/prepare-release.test.mjs \
-            scripts/release-archive-shape.test.cjs
+            scripts/release-archive-shape.test.cjs \
+            scripts/write-release-archive-docs.test.mjs
           node --check scripts/check-release-version.mjs
           node --check scripts/prepare-release.mjs
           node --check scripts/release-intent.mjs

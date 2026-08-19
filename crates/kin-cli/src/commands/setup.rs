@@ -12593,6 +12593,7 @@ fn status_label(status: &crate::commands::health::HealthStatus) -> &'static str 
         HealthStatus::Stale => "STALE",
         HealthStatus::Misconfigured => "MISCONFIGURED",
         HealthStatus::Pending => "PENDING",
+        HealthStatus::Degraded => "DEGRADED",
         HealthStatus::Unsupported => "n/a",
     }
 }
@@ -12606,7 +12607,9 @@ fn print_human_report(report: &crate::commands::health::HealthReport) {
     for check in &report.checks {
         let mark = match check.status {
             HealthStatus::Healthy => style("✓").green(),
-            HealthStatus::Missing | HealthStatus::Misconfigured => style("✗").red(),
+            HealthStatus::Missing | HealthStatus::Misconfigured | HealthStatus::Degraded => {
+                style("✗").red()
+            }
             HealthStatus::Stale => style("!").yellow(),
             HealthStatus::Pending => style("…").yellow(),
             HealthStatus::Unsupported => style("→").cyan(),
