@@ -3279,10 +3279,6 @@ impl std::fmt::Display for PortWaitError {
 
 impl std::error::Error for PortWaitError {}
 
-/// File under a kin root recording how long this store's daemon last took to
-/// publish a port.
-pub const DAEMON_BOOT_COST_FILE: &str = "daemon-boot-cost";
-
 /// Patience for a live daemon that has not reported a port yet, when nothing is
 /// recorded about this store.
 ///
@@ -3298,8 +3294,11 @@ pub const DAEMON_STARTUP_PATIENCE_DEFAULT_SECS: u64 = 300;
 /// Boot cost varies by more than a factor of two run to run on one store under
 /// ordinary host load. Five separate boots of psf/requests measured 48.9 s,
 /// 50.8 s, 57.7 s, 68.4 s and 71.1 s, and the same host was carrying a build.
-/// A multiple, not a margin, is what survives that spread.
-pub const DAEMON_STARTUP_PATIENCE_MULTIPLE: u32 = 4;
+/// A multiple, not a margin, is what survives that spread. It is smaller than
+/// [`CLI_IDLE_BOOT_MULTIPLE`] because the two answer different questions: the
+/// idle window decides how long a warm daemon is worth keeping, and this only
+/// decides how long to wait for one that is provably alive.
+pub const DAEMON_STARTUP_PATIENCE_MULTIPLE: u64 = 4;
 
 /// Ceiling on the scaled wait. A repository slow enough to need longer than this
 /// has a problem a longer wait does not fix.
@@ -3312,20 +3311,21 @@ pub const DAEMON_STARTUP_PATIENCE_ENV: &str = "KIN_DAEMON_READY_TIMEOUT_SECS";
 /// How long to wait for a live daemon to report its port, given what this store
 /// cost to boot last time.
 ///
-/// Pure over both inputs so the policy is testable without a daemon or a
-/// process environment. An operator override wins outright, including a
-/// deliberately short one. Otherwise the floor is the default and a store whose
-/// recorded boot already exceeds a quarter of it raises the wait to a multiple
-/// of what it actually costs.
-pub fn daemon_startup_patience(recorded: Option<Duration>, override_secs: Option<u64>) -> Duration {
+/// Reads the same record [`record_boot_cost`] writes and [`cli_idle_window`]
+/// sizes the idle window from, so the MCP revival path and the CLI spawn path
+/// price their waits off one measured fact rather than two.
+///
+/// Pure over both inputs so the policy is testable without a daemon or a process
+/// environment. An operator override wins outright, including a deliberately
+/// short one. Otherwise the floor is the default, and a store whose recorded boot
+/// already exceeds a quarter of it raises the wait to a multiple of what it
+/// actually costs.
+pub fn daemon_startup_patience(recorded_ms: Option<u64>, override_secs: Option<u64>) -> Duration {
     if let Some(secs) = override_secs {
         return Duration::from_secs(secs);
     }
-    let scaled = recorded
-        .map(|cost| {
-            cost.as_secs()
-                .saturating_mul(u64::from(DAEMON_STARTUP_PATIENCE_MULTIPLE))
-        })
+    let scaled = recorded_ms
+        .map(|ms| (ms / 1_000).saturating_mul(DAEMON_STARTUP_PATIENCE_MULTIPLE))
         .unwrap_or(0);
     Duration::from_secs(scaled.clamp(
         DAEMON_STARTUP_PATIENCE_DEFAULT_SECS,
@@ -3340,46 +3340,16 @@ pub fn daemon_startup_patience_override() -> Option<u64> {
         .and_then(|value| value.trim().parse::<u64>().ok())
 }
 
-/// What this store's daemon last cost to boot, if anything was recorded.
-///
-/// An unreadable, missing or malformed record yields `None`, which the policy
-/// reads as "unmeasured" and answers with the default. A boot cost is an
-/// optimisation on patience, never a precondition for waiting.
-pub fn recorded_daemon_boot_cost(kin_root: &Path) -> Option<Duration> {
-    let raw = std::fs::read_to_string(kin_root.join(DAEMON_BOOT_COST_FILE)).ok()?;
-    let millis: u64 = raw.trim().parse().ok()?;
-    Some(Duration::from_millis(millis))
-}
-
-/// Record what this store's daemon cost to boot, for the next caller's deadline.
-///
-/// Best effort by construction: a store on a read-only mount, or one racing
-/// another spawn, must not fail a successful startup over a hint. The value
-/// written is the time from this call's start to the port appearing, which is
-/// exactly what the next caller's deadline has to cover.
-pub fn record_daemon_boot_cost(kin_root: &Path, cost: Duration) {
-    let _ = std::fs::write(
-        kin_root.join(DAEMON_BOOT_COST_FILE),
-        (cost.as_millis() as u64).to_string(),
-    );
-}
-
 /// Poll the port file until the daemon publishes its bound port.
 ///
 /// Returns the port only when the daemon itself reported one. Reaching the
 /// deadline yields [`PortWaitError::StillStarting`] and leaves the child alive:
 /// see [`StartupDisposition`] for why a deadline is not evidence of death.
-///
-/// A successful wait records its own duration under the kin root, so the next
-/// caller can size its deadline on what this store actually costs instead of a
-/// constant. Callers enter this immediately after spawning, so the measurement
-/// is the child's startup rather than the caller's delay before waiting.
 pub async fn await_reported_port(
     kin_root: &Path,
     child: &mut std::process::Child,
     deadline: tokio::time::Instant,
 ) -> Result<u16, PortWaitError> {
-    let waiting_since = std::time::Instant::now();
     loop {
         match startup_disposition(child) {
             Ok(StartupDisposition::Exited(status)) => {
@@ -3390,7 +3360,6 @@ pub async fn await_reported_port(
         }
 
         if let Some(port) = read_reported_port(kin_root) {
-            record_daemon_boot_cost(kin_root, waiting_since.elapsed());
             return Ok(port);
         }
 
@@ -6505,23 +6474,23 @@ mod tests {
         // its exit, not by this deadline, so shortening it only breaks slow
         // boots.
         assert_eq!(
-            daemon_startup_patience(Some(Duration::from_secs(3)), None),
+            daemon_startup_patience(Some(3_000), None),
             Duration::from_secs(DAEMON_STARTUP_PATIENCE_DEFAULT_SECS)
         );
     }
 
     #[test]
     fn startup_patience_scales_with_a_slow_stores_recorded_cost() {
-        // Four times a 200 s boot is 800 s, which is above the floor and below
-        // the ceiling, so the recorded cost is what decides.
+        // Four times a 200 s boot is 800 s, above the floor and below the
+        // ceiling, so the recorded cost is what decides.
         assert_eq!(
-            daemon_startup_patience(Some(Duration::from_secs(200)), None),
+            daemon_startup_patience(Some(200_000), None),
             Duration::from_secs(800)
         );
         // And it is capped, because a store slower than this has a problem a
         // longer wait does not fix.
         assert_eq!(
-            daemon_startup_patience(Some(Duration::from_secs(9_000)), None),
+            daemon_startup_patience(Some(9_000_000), None),
             Duration::from_secs(DAEMON_STARTUP_PATIENCE_MAX_SECS)
         );
     }
@@ -6529,28 +6498,31 @@ mod tests {
     #[test]
     fn an_operator_override_wins_outright() {
         assert_eq!(
-            daemon_startup_patience(Some(Duration::from_secs(200)), Some(30)),
+            daemon_startup_patience(Some(200_000), Some(30)),
             Duration::from_secs(30)
         );
     }
 
+    /// The revival wait and the CLI idle window read ONE record, the one the
+    /// daemon writes when it finishes opening a store. Two lanes measured the
+    /// same fact the same night; this asserts the second one reuses the first
+    /// rather than adding a parallel file that can disagree with it.
     #[test]
-    fn a_boot_cost_round_trips_and_an_unmeasured_store_reads_none() {
+    fn the_revival_wait_prices_off_the_recorded_open_the_cli_also_reads() {
         let dir = tempfile::tempdir().expect("temp kin root");
-        assert_eq!(recorded_daemon_boot_cost(dir.path()), None);
-        record_daemon_boot_cost(dir.path(), Duration::from_millis(68_378));
+        assert_eq!(read_boot_cost(dir.path()), None);
         assert_eq!(
-            recorded_daemon_boot_cost(dir.path()),
-            Some(Duration::from_millis(68_378))
+            daemon_startup_patience(read_boot_cost(dir.path()).map(|c| c.total_ms), None),
+            Duration::from_secs(DAEMON_STARTUP_PATIENCE_DEFAULT_SECS),
+            "an unmeasured store answers with the default, never a shorter wait"
         );
-        // A corrupt record is unmeasured, never zero: reading it as zero would
-        // hand the next caller the shortest possible wait on the one store that
-        // just proved it needs a long one.
-        std::fs::write(dir.path().join(DAEMON_BOOT_COST_FILE), "not-a-number").unwrap();
-        assert_eq!(recorded_daemon_boot_cost(dir.path()), None);
+
+        record_boot_cost(dir.path(), 200_000);
         assert_eq!(
-            daemon_startup_patience(recorded_daemon_boot_cost(dir.path()), None),
-            Duration::from_secs(DAEMON_STARTUP_PATIENCE_DEFAULT_SECS)
+            daemon_startup_patience(read_boot_cost(dir.path()).map(|c| c.total_ms), None),
+            Duration::from_secs(800),
+            "a measured store raises the wait to a multiple of its own open"
         );
     }
+
 }

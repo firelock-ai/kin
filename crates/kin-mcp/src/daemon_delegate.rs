@@ -1233,9 +1233,11 @@ async fn await_revived_daemon(
     // wait on the same daemon resolved to 300 and said in its doc comment why.
     // The observed cost of the store this fired on was 48.9 s to 71.1 s, so the
     // MCP path gave up four times too early on every single boot and then told
-    // the caller to restart.
+    // the caller to restart. It prices off the same record the CLI's idle window
+    // reads, the one the daemon writes when it finishes opening a store, so the
+    // two paths cannot disagree about what this store costs.
     let patience = kin_daemon_spawn::daemon_startup_patience(
-        kin_daemon_spawn::recorded_daemon_boot_cost(kin_dir),
+        kin_daemon_spawn::read_boot_cost(kin_dir).map(|cost| cost.total_ms),
         kin_daemon_spawn::daemon_startup_patience_override(),
     );
     let port_deadline = tokio::time::Instant::now() + patience;
@@ -1243,7 +1245,7 @@ async fn await_revived_daemon(
         .await
         .map_err(|e| format!("MCP revival: {e}"))?;
 
-    // Poll /health until the daemon is ready (bounded at 15 s).
+    // Poll /health until the daemon is ready, under the same patience.
     let new_base = format!("http://127.0.0.1:{port}");
     let probe = reqwest::Client::builder()
         .connect_timeout(Duration::from_millis(300))
