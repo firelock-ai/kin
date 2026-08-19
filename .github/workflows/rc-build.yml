@@ -25,11 +25,19 @@ name: RC Build
 #
 # SOURCE OF TRUTH: .github/workflows/release.yml, job `build`. Every step below
 # is a byte-identical copy of that job's step of the same name, except where a
-# comment starting DELTA( names the difference and why. Two step groups are
-# omitted on purpose: the six macOS signing and notarization steps, which need
-# the credentials this workflow deliberately cannot reach, and nothing else.
+# comment starting DELTA( names the difference and why. Seven steps are omitted
+# on purpose: the six macOS signing and notarization steps, which need the
+# credentials this workflow deliberately cannot reach, and the Cargo cache.
 # scripts/check-rc-build-drift.mjs holds that relationship and fails the pull
 # request when release.yml moves and this file does not.
+#
+# The cache is omitted rather than copied. release.yml runs only on a v* tag,
+# and that tag is ruleset-protected, so its cache write is authorized code. This
+# workflow builds whatever ref it is handed, so the same step would let a
+# dispatch write a poisoned entry into a cache that CI and release builds later
+# restore from. It would also mean the bytes under proof were assembled partly
+# from cache contents no one reviewed, which is the opposite of what a candidate
+# build is for. A candidate compiles cold.
 #
 # What a candidate archive is NOT:
 #   - not signed and not notarized, so a macOS candidate archive is Gatekeeper
@@ -233,18 +241,6 @@ jobs:
           }
           console.log(`Verified Kin/kin-vfs release compatibility at kin-vfs-core ${kinVfsCore[0].version}`);
           NODE
-
-      - name: Cache Cargo registry and build artifacts
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.0.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-            kin-vfs/target
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-cargo-
 
       - name: Assert clean release source
         shell: bash

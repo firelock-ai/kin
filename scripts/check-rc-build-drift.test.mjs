@@ -154,3 +154,39 @@ test("an rc-build target release.yml does not publish is reported", () => {
     problems.join("\n")
   );
 });
+
+// The properties that make rc-build.yml safe to dispatch on an arbitrary ref.
+// Each is one line to break and none of them is visible in a diff of the build
+// steps, which is what the mirror check covers.
+
+test("rc-build.yml reads no secret and declares no environment", () => {
+  assert.equal(rc.match(/secrets\./g), null);
+  assert.equal(rc.match(/^\s*environment:/m), null);
+});
+
+test("rc-build.yml grants no permission beyond contents: read", () => {
+  const block = /\npermissions:\n((?: {2}\S.*\n)+)/.exec(rc);
+  assert.ok(block, "rc-build.yml declares no permissions block");
+  assert.deepEqual(block[1].trimEnd().split("\n"), ["  contents: read"]);
+});
+
+test("rc-build.yml writes to no Actions cache", () => {
+  // A dispatch builds whatever ref it is handed, so a cache write here would
+  // poison what CI and release builds restore from, and would put unreviewed
+  // cache contents into the bytes under proof.
+  assert.equal(rc.match(/actions\/cache/g), null);
+  assert.equal(rc.match(/rust-cache/g), null);
+});
+
+test("rc-build.yml publishes nothing", () => {
+  for (const forbidden of ["npm publish", "gh release", "cargo publish", "docker push", "softprops/action-gh-release"]) {
+    assert.equal(rc.includes(forbidden), false, `rc-build.yml contains ${forbidden}`);
+  }
+});
+
+test("rc-build.yml is dispatch-only", () => {
+  const triggers = /\non:\n((?:(?: {2}\S.*| {4}.*|)\n)+?)(?=\npermissions:)/.exec(rc);
+  assert.ok(triggers, "could not read rc-build.yml triggers");
+  const topLevel = triggers[1].split("\n").filter((line) => /^ {2}\S/.test(line));
+  assert.deepEqual(topLevel, ["  workflow_dispatch:"]);
+});

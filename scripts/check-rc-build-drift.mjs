@@ -29,7 +29,15 @@ export const RC_WORKFLOW = ".github/workflows/rc-build.yml";
 // branch-controlled workflow code, which must never reach the Apple or
 // package-publish credentials. Without those credentials these steps have
 // nothing to do, so they are absent rather than inert.
+//
+// The Cargo cache, for a different reason. release.yml runs only on a
+// ruleset-protected v* tag, so its cache write is authorized code. rc-build.yml
+// builds whatever ref it is handed, so the same step would let a dispatch write
+// a poisoned entry into a cache that CI and release builds later restore from,
+// and would mean the bytes under proof were assembled partly from cache
+// contents no one reviewed. A candidate compiles cold.
 export const OMITTED_STEPS = [
+  "Cache Cargo registry and build artifacts",
   "Resolve macOS signing credential availability",
   "Import code signing certificate (macOS)",
   "Sign macOS binaries",
