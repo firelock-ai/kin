@@ -485,11 +485,15 @@ fn receiver_call_does_not_reach_an_unimportable_owner() {
     );
 }
 
-/// A caller whose imports account for none of the candidates has no type
-/// evidence at all, and must keep the whole fan-out rather than lose every
-/// candidate to a rule that could not see any of them.
+/// FIR-1552 reverses this one. A caller whose imports account for none of the
+/// candidates used to keep the whole fan-out, on the reasoning that a rule which
+/// cannot see any candidate should not drop them all. That is the clause that
+/// minted ten of the 33 rows `find_references(HTTPAdapter.send)` returned on
+/// psf/requests: `sock.send(...)` in a test file importing nothing that defines
+/// `send` reached the HTTP adapter and every other `send` in the tree. Not
+/// seeing the receiver's type is not knowing the answer is all of them.
 #[test]
-fn receiver_call_with_no_import_evidence_still_fans_out() {
+fn receiver_call_with_no_import_evidence_binds_nothing() {
     let files = python_call_fixture(&[
         (
             "app/a.py",
@@ -507,15 +511,17 @@ fn receiver_call_with_no_import_evidence_still_fans_out() {
 
     let rels = link_cross_file(&files);
     assert!(
-        has_call(&rels, go, a_run) && has_call(&rels, go, b_run),
-        "a file naming no candidate owner keeps every dispatch target"
+        !has_call(&rels, go, a_run) && !has_call(&rels, go, b_run),
+        "a file naming no candidate owner reaches no dispatch target"
     );
 }
 
-/// A caller that CAN name both candidate owners is genuinely ambiguous, and the
-/// fan-out must stay ambiguous rather than pick one.
+/// The other half FIR-1552 reverses. A caller that can name both candidate
+/// owners is genuinely ambiguous, and used to emit both. Two guesses are not one
+/// answer, and every consumer that counted them counted twice, so the call stays
+/// unresolved and the gap shows up as a call site with no edge.
 #[test]
-fn receiver_call_naming_both_owners_keeps_both() {
+fn receiver_call_naming_both_owners_binds_neither() {
     let files = python_call_fixture(&[
         (
             "app/a.py",
@@ -536,7 +542,7 @@ fn receiver_call_naming_both_owners_keeps_both() {
 
     let rels = link_cross_file(&files);
     assert!(
-        has_call(&rels, go, a_run) && has_call(&rels, go, b_run),
-        "both owners are nameable here, so both stay dispatch candidates"
+        !has_call(&rels, go, a_run) && !has_call(&rels, go, b_run),
+        "two nameable owners settle nothing, so neither is bound"
     );
 }

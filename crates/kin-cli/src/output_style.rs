@@ -318,8 +318,16 @@ mod tests {
             graph.upsert_entity(record).unwrap();
         }
         // Two confidences, so the rows carry two different resolution markers
-        // and a painter that assumed one value would be caught.
-        for (caller, confidence) in [(&spanned, 1.0), (&spanless, 0.5)] {
+        // and a painter that assumed one value would be caught. The weaker one
+        // is the receiver-method fan-out tier, which is what puts its row under
+        // the candidate heading.
+        for (caller, confidence) in [
+            (&spanned, 1.0f32),
+            (
+                &spanless,
+                kin_index::resolution::RECEIVER_NAME_FANOUT_CONFIDENCE,
+            ),
+        ] {
             graph
                 .upsert_relation(&Relation {
                     id: kin_model::ids::RelationId::new(),
@@ -360,11 +368,20 @@ mod tests {
         );
         assert!(painted.contains(&format!("{DIM}(Function)")));
 
+        // One real caller and one receiver-name candidate, so the headline counts
+        // one and the candidate keeps its own heading (FIR-1552). Both rows are
+        // still rendered, which is what this test is about.
         let count = lines
             .iter()
             .find(|line| line.starts_with("referenced by "))
             .unwrap_or_else(|| panic!("no count line in {lines:?}"));
-        assert_painted(&paint_refs(count), count, &format!("{ACCENT_BOLD}2"));
+        assert_painted(&paint_refs(count), count, &format!("{ACCENT_BOLD}1"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("1 receiver-name candidate ")),
+            "the withheld candidate must be named under its own heading: {lines:?}"
+        );
 
         let rows: Vec<&str> = lines
             .iter()

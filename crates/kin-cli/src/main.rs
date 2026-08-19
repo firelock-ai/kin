@@ -445,7 +445,7 @@ enum Command {
         /// Comma-separated entity UUIDs for --bulk-json. Required when --bulk-json is set.
         #[arg(long)]
         entities: Option<String>,
-        /// If true (default) emit compact bulk-mode rows ({entity_id, has_references, reference_count}).
+        /// If true (default) emit compact bulk-mode rows ({entity_id, has_references, reference_count, receiver_name_candidate_count}).
         /// Set --no-compact for verbose rows with name/kind/file_path/matched_kinds.
         #[arg(long, default_value_t = true)]
         compact: bool,
