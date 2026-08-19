@@ -29,6 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Size the daemon idle window against a store's measured boot, and let locate return test-role entities on request (#936)
 - End a trace walk at an external reference target and at a type-annotation edge (#937)
 - Resolve JavaScript module specifiers and count the edges they produce (#938)
+- chore(ci): pin kin-actions v0.1.31 (#944)
+- Pin kin-vfs-core 0.4.5 and the kin-vfs release checkout to the composed mount landing (#942)
 
 
 ## [0.5.40] - 2026-08-18
