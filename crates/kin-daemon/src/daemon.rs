@@ -4398,3 +4398,109 @@ mod tests {
         assert!(pending.is_none());
     }
 }
+
+#[cfg(test)]
+mod enrichment_marker_tests {
+    use super::{file_already_enriched, load_lsp_enriched_marker, lsp_enriched_marker_path};
+    use crate::state::DaemonState;
+    use kin_model::EntityStore;
+
+    fn entity(name: &str) -> kin_model::Entity {
+        kin_model::Entity {
+            id: kin_model::EntityId::new(),
+            kind: kin_model::EntityKind::Function,
+            name: name.to_string(),
+            language: kin_model::LanguageId::Python,
+            fingerprint: kin_model::SemanticFingerprint {
+                algorithm: kin_model::FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: kin_model::Hash256::from_bytes([1; 32]),
+                signature_hash: kin_model::Hash256::from_bytes([2; 32]),
+                behavior_hash: kin_model::Hash256::from_bytes([3; 32]),
+                equivalence_hash: kin_model::Hash256::from_bytes([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(kin_model::FilePathId::new("src/sessions.py")),
+            span: None,
+            signature: format!("def {name}()"),
+            visibility: kin_model::Visibility::Public,
+            role: kin_model::EntityRole::Source,
+            doc_summary: None,
+            metadata: kin_model::EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    fn install_language_server_relation(state: &DaemonState) {
+        let src = entity("send");
+        let dst = entity("adapter_send");
+        state.graph.upsert_entity(&src).unwrap();
+        state.graph.upsert_entity(&dst).unwrap();
+        state
+            .graph
+            .upsert_relation(&kin_model::Relation {
+                id: kin_model::RelationId::new(),
+                kind: kin_model::RelationKind::Calls,
+                src: kin_model::GraphNodeId::Entity(src.id),
+                dst: kin_model::GraphNodeId::Entity(dst.id),
+                confidence: 1.0,
+                origin: kin_model::RelationOrigin::Lsp,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+    }
+
+    fn write_marker(state: &DaemonState, files: &[&str]) {
+        std::fs::write(
+            lsp_enriched_marker_path(state),
+            serde_json::to_vec(&files.iter().map(|f| f.to_string()).collect::<Vec<_>>()).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// A marker whose relations are gone must not keep the loss permanent.
+    ///
+    /// This is what made the persistence defect unrecoverable rather than
+    /// merely wasteful: the sweep recorded every file it finished, the
+    /// relations did not survive the process, and each later daemon skipped the
+    /// same files and re-derived nothing.
+    #[test]
+    fn a_marker_without_its_relations_is_discarded() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = DaemonState::open(init.layout).unwrap();
+        write_marker(&state, &["src/sessions.py"]);
+
+        load_lsp_enriched_marker(&state);
+
+        assert!(
+            !file_already_enriched(&state, "src/sessions.py"),
+            "a marker the graph cannot corroborate must not skip the file it names"
+        );
+        assert!(
+            !lsp_enriched_marker_path(&state).exists(),
+            "and the marker itself is removed, so the repair is not re-decided on every open"
+        );
+    }
+
+    /// The other direction, so the reset is not simply "always re-sweep".
+    #[test]
+    fn a_marker_backed_by_relations_is_honored() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = DaemonState::open(init.layout).unwrap();
+        install_language_server_relation(&state);
+        write_marker(&state, &["src/sessions.py"]);
+
+        load_lsp_enriched_marker(&state);
+
+        assert!(
+            file_already_enriched(&state, "src/sessions.py"),
+            "a graph that still holds language-server relations resumes rather than re-sweeping"
+        );
+        assert!(lsp_enriched_marker_path(&state).exists());
+    }
+}
