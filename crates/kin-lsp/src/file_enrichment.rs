@@ -175,7 +175,29 @@ pub async fn enrich_file_definitions(
                         origin: RelationOrigin::Lsp,
                         created_in: None,
                         import_source: None,
-                        evidence: Vec::new(),
+                        // The identifier position this pass ASKED about, which
+                        // is the reference site in the source file: for
+                        // `adapter.send(...)` inside `Session.send` that is the
+                        // call line itself. Enrichment relations carried no
+                        // evidence at all, so every edge a language server
+                        // proved arrived with no reference site and consuming
+                        // surfaces reported `no_evidence_span` for it. The
+                        // position is already in hand, so this costs no extra
+                        // round trip.
+                        evidence: crate::enrichment::query_position_evidence(
+                            "lsp_definition",
+                            &rel_path,
+                            &protocol::Range {
+                                start: protocol::Position {
+                                    line,
+                                    character: col,
+                                },
+                                end: protocol::Position {
+                                    line,
+                                    character: col,
+                                },
+                            },
+                        ),
                     });
                 }
             }

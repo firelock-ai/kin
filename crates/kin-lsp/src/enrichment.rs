@@ -22,7 +22,10 @@ use crate::protocol::{
     self, CallHierarchyItem, Position, TextDocumentIdentifier, TypeHierarchyItem,
     TypeHierarchyPrepareParams, TypeHierarchySupertypesParams,
 };
-use kin_model::{EntityId, GraphNodeId, Relation, RelationId, RelationKind, RelationOrigin};
+use kin_model::{
+    EntityId, FilePathId, GraphNodeId, Relation, RelationEvidence, RelationId, RelationKind,
+    RelationOrigin, SourceSpan,
+};
 
 /// Result of enriching a single file via LSP.
 #[derive(Debug, Default)]
@@ -83,16 +86,45 @@ impl EntityIndex {
     }
 
     /// Find the entity at the given file URI and position.
-    /// Matches the entity whose span contains the position.
+    ///
+    /// Returns the INNERMOST entity whose span contains the line: the method
+    /// rather than the class that holds it, and the class rather than the module
+    /// that holds them both.
+    ///
+    /// This returned the FIRST containing span, and a module entity carries a
+    /// whole-file span and sorts first, so every position in a file resolved to
+    /// its module. The consequences were total rather than partial. Same-file
+    /// targets resolved to the same module as their source, making `source ==
+    /// dst`, and 954 edges were silently dropped that way in one file of the
+    /// requests corpus. Cross-file targets resolved to the target file's module,
+    /// so the whole file-level definitions pass emitted only module-to-module
+    /// edges and produced no entity-level edge at all. The pass answered
+    /// correctly and the mapping threw the answer away.
+    ///
+    /// Line bases: LSP positions are 0-based, and kin graph spans are 0-based
+    /// too (`kin_mcp`'s `presentation_line` adds one for display, which is what
+    /// makes the graph's own base visible). They agree, so no conversion happens
+    /// here. That agreement is asserted in the tests rather than assumed,
+    /// because it currently holds by convention on both sides and a one-line
+    /// change to either would silently shift every lookup by a line, which on
+    /// `def` lines means resolving the enclosing scope instead of the method.
     pub fn find_at(&self, uri: &str, line: u32) -> Option<&EntityRef> {
         let path = protocol::uri_to_path(uri)?;
         let path_str = path.to_string_lossy();
         let entries = self.entries_for_path(path_str.as_ref())?;
 
-        // Find the entity whose span contains this line.
         entries
             .iter()
-            .find(|e| line >= e.start_line && line <= e.end_line)
+            .filter(|e| line >= e.start_line && line <= e.end_line)
+            // Smallest span wins. Ties break on the later start, which is the
+            // more deeply nested of two spans that begin together, so a method
+            // whose body is its whole parent still beats the parent.
+            .min_by_key(|e| {
+                (
+                    e.end_line.saturating_sub(e.start_line),
+                    u32::MAX - e.start_line,
+                )
+            })
     }
 
     /// Return every entity known to live in a file path.
@@ -109,6 +141,41 @@ impl EntityIndex {
             .flat_map(|entries| entries.iter())
             .find(|e| e.name == name || e.name.ends_with(&format!(".{}", name)))
     }
+}
+
+/// Evidence naming the position the server was asked about.
+///
+/// The call site, not the definition. Enrichment relations carried
+/// `evidence: Vec::new()`, so an edge a language server proved arrived with no
+/// reference site and every consuming surface reported `no_evidence_span` for
+/// it. The position is already in hand at every call below, so this costs no
+/// extra round trip: it is the range the server itself reported the reference
+/// at.
+///
+/// Lines are 0-based on both sides, matching LSP and kin graph spans, and the
+/// display surfaces add one.
+pub(crate) fn query_position_evidence(
+    rule: &'static str,
+    file: &str,
+    range: &protocol::Range,
+) -> Vec<RelationEvidence> {
+    vec![RelationEvidence {
+        source_span: Some(SourceSpan {
+            file: FilePathId::new(file),
+            start_byte: 0,
+            end_byte: 0,
+            start_line: range.start.line,
+            start_col: range.start.character,
+            end_line: range.end.line,
+            end_col: range.end.character,
+        }),
+        parser_rule: Some(rule.to_string()),
+        token: None,
+        source_path: None,
+        resolved_path: None,
+        occurrence_count: 1,
+        call_shape: None,
+    }]
 }
 
 pub(crate) fn deterministic_relation_id(
@@ -199,10 +266,15 @@ pub async fn enrich_entity_calls(
         let target_line = call.to.selection_range.start.line;
         let target_uri = &call.to.uri;
 
-        // Try position-based match first, then name-based fallback.
-        let target = index
-            .find_at(target_uri, target_line)
-            .or_else(|| index.find_by_name(&call.to.name));
+        // Position only. The name fallback matched the FIRST entity whose name
+        // ended with the target's, which for `send` was the caller itself, so
+        // the edge became a self-loop and was dropped: a proven answer thrown
+        // away and reported as nothing found. Worse, when it did not self-loop
+        // it stamped an arbitrary same-named entity with `RelationOrigin::Lsp`,
+        // which reads `type_resolved`, a fabricated edge wearing the strongest
+        // resolution there is. A position that maps to nothing now produces no
+        // edge, which is the honest answer and a reportable gap.
+        let target = index.find_at(target_uri, target_line);
 
         match target {
             Some(target_ref) => {
@@ -215,7 +287,15 @@ pub async fn enrich_entity_calls(
                     origin: RelationOrigin::Lsp,
                     created_in: None,
                     import_source: None,
-                    evidence: Vec::new(),
+                    // The call SITE inside the caller, which is what a reader
+                    // needs and what `reference_lines` publishes.
+                    evidence: call
+                        .from_ranges
+                        .first()
+                        .map(|range| {
+                            query_position_evidence("lsp_call_hierarchy", &caller.file_path, range)
+                        })
+                        .unwrap_or_default(),
                 });
             }
             None => {
@@ -303,9 +383,11 @@ pub async fn enrich_entity_overrides(
     for supertype in &supertypes {
         // Look for "SupertypeName.method_name" in the graph index.
         let candidate_name = format!("{}.{}", supertype.name, method_short_name);
-        let target = index
-            .find_at(&supertype.uri, supertype.selection_range.start.line)
-            .or_else(|| index.find_by_name(&candidate_name));
+        // Position only, for the same reason as the call mapping: a name match
+        // here would pick some other class's method of the same name and stamp
+        // it as a proven override.
+        let _ = &candidate_name;
+        let target = index.find_at(&supertype.uri, supertype.selection_range.start.line);
 
         if let Some(target_ref) = target {
             relations.push(Relation {
@@ -397,12 +479,11 @@ pub async fn enrich_entity_uses_type(
 
             for loc in &locations {
                 let target_line = loc.range.start.line;
-                let target = index.find_at(&loc.uri, target_line).or_else(|| {
-                    // Try name extraction from the URI as a fallback.
-                    protocol::uri_to_path(&loc.uri)
-                        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
-                        .and_then(|name| index.find_by_name(&name))
-                });
+                // Position only. The old fallback took the FILE STEM and looked
+                // that up by name, so a reference in `sessions.py` could be
+                // attributed to whatever entity happened to be called
+                // `sessions`, which is a guess wearing a proven label.
+                let target = index.find_at(&loc.uri, target_line);
 
                 if let Some(target_ref) = target {
                     // Skip self-references and duplicates.
@@ -423,7 +504,14 @@ pub async fn enrich_entity_uses_type(
                         origin: RelationOrigin::Lsp,
                         created_in: None,
                         import_source: None,
-                        evidence: Vec::new(),
+                        // The reference SITE the server reported, which is the
+                        // line a reader needs and what `reference_lines`
+                        // publishes.
+                        evidence: query_position_evidence(
+                            "lsp_references",
+                            &entity.file_path,
+                            &loc.range,
+                        ),
                     });
                     debug!(
                         entity = %entity.name,
@@ -580,5 +668,124 @@ mod tests {
 
         assert_eq!(first, second);
         assert_ne!(first, different);
+    }
+}
+
+#[cfg(test)]
+mod innermost_span_tests {
+    use super::*;
+
+    fn at(name: &str, start: u32, end: u32) -> EntityRef {
+        EntityRef {
+            id: EntityId::new(),
+            name: name.to_string(),
+            file_path: "src/requests/adapters.py".to_string(),
+            start_line: start,
+            start_col: 0,
+            end_line: end,
+            name_line: start,
+            name_col: 4,
+        }
+    }
+
+    /// The requests shape, in the order the index actually holds it: the module
+    /// spans the whole file and sorts first, the class sits inside it, and the
+    /// method inside that.
+    fn adapters_file() -> EntityIndex {
+        EntityIndex::new(vec![
+            at("adapters", 0, 400),
+            at("BaseAdapter", 121, 155),
+            at("BaseAdapter.send", 127, 140),
+            at("HTTPAdapter", 157, 399),
+            at("HTTPAdapter.send", 633, 700),
+        ])
+    }
+
+    /// The defect, as a test. A position inside a method must resolve to the
+    /// METHOD, not to the class or the module that contain it.
+    ///
+    /// Returning the first containing span returned the module for every
+    /// position in the file, which made same-file targets equal their own source
+    /// and be dropped as self-loops (954 of them in one file of the requests
+    /// corpus) and made cross-file targets resolve to the target file's module,
+    /// so the whole definitions pass emitted only module-to-module edges.
+    #[test]
+    fn a_position_inside_a_method_resolves_to_the_method() {
+        let index = adapters_file();
+        let found = index
+            .find_at("file:///repo/src/requests/adapters.py", 127)
+            .expect("line 127 is inside BaseAdapter.send");
+        assert_eq!(
+            found.name, "BaseAdapter.send",
+            "the innermost containing span wins; got the enclosing scope instead"
+        );
+    }
+
+    /// The other rungs, so this is a rule about nesting rather than one lucky
+    /// case: inside the class but outside any method resolves to the class, and
+    /// outside every class resolves to the module.
+    #[test]
+    fn nesting_resolves_rung_by_rung() {
+        let index = adapters_file();
+        let uri = "file:///repo/src/requests/adapters.py";
+        assert_eq!(
+            index.find_at(uri, 150).map(|e| e.name.as_str()),
+            Some("BaseAdapter"),
+            "inside the class, outside its methods"
+        );
+        assert_eq!(
+            index.find_at(uri, 10).map(|e| e.name.as_str()),
+            Some("adapters"),
+            "outside every class, the module is the innermost thing there is"
+        );
+        assert_eq!(
+            index.find_at(uri, 500).map(|e| e.name.as_str()),
+            None,
+            "past the end of the file nothing contains the line"
+        );
+    }
+
+    /// Line bases: LSP positions are 0-based and kin graph spans are 0-based, so
+    /// `find_at` converts nothing. Asserted rather than assumed, because it
+    /// holds by convention on both sides and a one-line change to either would
+    /// shift every lookup silently.
+    ///
+    /// Stated in both directions: the first line of a method's span is INSIDE
+    /// it, and the line before is not. Under a base mismatch a `def` line lands
+    /// one short and resolves to the enclosing scope, which is exactly the
+    /// failure this file is fixing, so an off-by-one here is indistinguishable
+    /// from the bug.
+    #[test]
+    fn the_zero_based_line_convention_holds_in_both_directions() {
+        let index = adapters_file();
+        let uri = "file:///repo/src/requests/adapters.py";
+        assert_eq!(
+            index.find_at(uri, 127).map(|e| e.name.as_str()),
+            Some("BaseAdapter.send"),
+            "a span's own first line is inside it"
+        );
+        assert_eq!(
+            index.find_at(uri, 126).map(|e| e.name.as_str()),
+            Some("BaseAdapter"),
+            "the line before it is not, and falls to the enclosing scope"
+        );
+        assert_eq!(
+            index.find_at(uri, 140).map(|e| e.name.as_str()),
+            Some("BaseAdapter.send"),
+            "a span's own last line is inside it"
+        );
+    }
+
+    /// Two spans that begin on the same line: the smaller one wins, so a class
+    /// whose only member starts with it does not swallow that member.
+    #[test]
+    fn a_tie_on_the_start_line_prefers_the_smaller_span() {
+        let index = EntityIndex::new(vec![at("Outer", 5, 40), at("Outer.only", 5, 12)]);
+        assert_eq!(
+            index
+                .find_at("file:///repo/src/requests/adapters.py", 6)
+                .map(|e| e.name.as_str()),
+            Some("Outer.only")
+        );
     }
 }
