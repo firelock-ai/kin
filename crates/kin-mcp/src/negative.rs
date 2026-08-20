@@ -118,6 +118,21 @@ fn spec_for(tool: &str) -> Option<RetrievalSpec> {
             always: false,
             class: NegativeClass::Structural,
         },
+        // A pack's `dependents` group is the reference surface's answer,
+        // assembled by the same collector on the same store (FIR-2474), so the
+        // absence it can claim is the same absence and it is qualified by the
+        // same gates. `dependencies` is not the field here: an empty one says
+        // the focal calls nothing, which is an ordinary fact about a leaf and
+        // not a claim any agent acts on. The claim that decides whether a
+        // contract is safe to change is "nothing depends on this", and that is
+        // the one a pack used to publish as a bare `[]`.
+        "get_context_pack" => RetrievalSpec {
+            field: "dependents",
+            kind: "no_dependents",
+            subject: "nothing was found depending on the focal entity",
+            always: false,
+            class: NegativeClass::Structural,
+        },
         // The neighborhood always returns the focal itself, so an empty
         // `entities` says the focal is not in the graph rather than that it has
         // no neighbors, and for an indexed entity the list is never empty at
@@ -247,7 +262,7 @@ pub(crate) fn absence_cross_file_classes(tool: &str, payload: &Value) -> Vec<Str
                     .collect()
             })
             .unwrap_or_else(reference_classes),
-        "trace_data_flow" | "impact_analysis" => reference_classes(),
+        "trace_data_flow" | "impact_analysis" | "get_context_pack" => reference_classes(),
         _ => Vec::new(),
     }
 }
@@ -287,6 +302,7 @@ fn absence_is_language_scoped(tool: &str) -> bool {
             | "semantic_search"
             | "find_dead_code_seeded"
             | "graph_neighborhood"
+            | "get_context_pack"
     )
 }
 
@@ -609,7 +625,7 @@ pub(crate) fn absence_coverage_gap(tool: &str, payload: &Value) -> Option<String
 ///
 /// | tool | qualifies a populated answer | why |
 /// |---|---|---|
-/// | `find_references`, `bulk_check_references`, `trace_data_flow`, `graph_neighborhood`, `semantic_search`, `find_dead_code_seeded` | yes | each answers from the graph, and whether its rows are the whole set is exactly the question a caller acts on |
+/// | `find_references`, `bulk_check_references`, `trace_data_flow`, `graph_neighborhood`, `semantic_search`, `find_dead_code_seeded`, `get_context_pack` | yes | each answers from the graph, and whether its rows are the whole set is exactly the question a caller acts on |
 /// | `semantic_locate` | NO | its page is a bounded ranking rather than an enumeration, so its verdict can never be authoritative at any coverage, and the module already refuses to certify one. Attaching a verdict to every page is the defect FIR-2430 found wearing the opposite costume: a real symbol and a fabricated one came back under the IDENTICAL envelope, so a qualifier there teaches a reader to read a page as a graph claim when it is not one |
 /// | `entity_history` | NO | reads recorded change history, where a populated answer is the history and there is no whole-set question about the graph to answer |
 /// | `dead_code` | NO | its result is the INVERSE claim, and rows are candidates to check rather than an answer whose completeness licenses an action |
@@ -739,6 +755,23 @@ fn push_gap(trustworthy: &mut bool, trust_reason: &mut String, gap: String) {
 /// Number of items in the tool's result collection within `payload`, or `None`
 /// when the expected collection is absent or not an array (in which case no
 /// negative is synthesized — we never guess emptiness).
+/// Whether `payload` is a real answer from `tool` that simply left its answer
+/// group out, as opposed to a payload this module has no business qualifying.
+///
+/// Absence of the key is not enough on its own: an error object is also missing
+/// it, and qualifying one would report a verdict about a graph nobody queried.
+/// The gate is the marker that the tool did produce an answer. For a context
+/// pack that is `focal_entity`, which is the pack's whole reason to exist and is
+/// present in every mode.
+fn omits_its_answer_group(tool: &str, payload: &Value) -> bool {
+    match tool {
+        "get_context_pack" => payload
+            .get("focal_entity")
+            .is_some_and(|focal| !focal.is_null()),
+        _ => false,
+    }
+}
+
 fn collection_len(payload: &Value, field: &str) -> Option<usize> {
     if field.is_empty() {
         payload.as_array().map(Vec::len)
@@ -1482,7 +1515,19 @@ pub fn negative_for(
     let count = if tool == "semantic_locate" {
         locate_result_count(payload)?
     } else {
-        collection_len(payload, spec.field)?
+        match collection_len(payload, spec.field) {
+            Some(count) => count,
+            // An omitted group makes the same claim as an empty one, and it is
+            // the more dangerous of the two: `[]` at least names the question,
+            // while a missing key reads as a question the tool does not answer.
+            // Bailing out here would leave the shape with no verdict at all,
+            // which is the defect this module exists to prevent wearing its
+            // sharpest costume. `get_context_pack` shipped exactly that in
+            // 0.5.42, where the pack carried no `dependents` key, and nothing
+            // qualified it.
+            None if omits_its_answer_group(tool, payload) => 0,
+            None => return None,
+        }
     };
     // A locate page has a second way of being a negative: it came back full, and
     // not one hit is the symbol the query named. Qualifying that page is the
@@ -1529,7 +1574,14 @@ pub fn negative_for(
     // verdict — the calls may simply never have been linked. Never let an agent
     // read "safe to delete" off an incomplete call graph: downgrade to
     // inconclusive so the absence is flagged as possibly-unresolved, not certain.
-    if tool == "find_references" && focal_is_method(payload) {
+    //
+    // A pack's `dependents` group is built by the same collector over the same
+    // edges (FIR-2474), so the gap it inherits is the same one and it has to be
+    // reported the same way. Gating this on the tool name alone was how the two
+    // surfaces were able to disagree about one entity in one store: the tool
+    // that refused to certify and the tool that published `[]` were reading the
+    // identical incomplete call graph.
+    if matches!(tool, "find_references" | "get_context_pack") && focal_is_method(payload) {
         push_gap(
             &mut trustworthy,
             &mut trust_reason,
@@ -2868,6 +2920,171 @@ mod tests {
         assert!(
             !advice.contains("after embedding is complete"),
             "embedding completeness is not the remedy for a missing edge class: {advice}"
+        );
+    }
+
+    /// A context pack with an empty `dependents` group, over `coverage`.
+    ///
+    /// The group is the reference surface's answer (FIR-2474), so the payload
+    /// carries the same observation `find_references` publishes beside its own
+    /// empty list. A pack that shipped the group without it would be claiming an
+    /// absence with no evidence the query could have found anything, which is
+    /// the FIR-2353 failure arriving through a second tool.
+    fn empty_pack_dependents(kind: &str, coverage: Value) -> Value {
+        json!({
+            "focal_entity": {
+                "id": "00000000-0000-0000-0000-000000000001",
+                "kind": kind,
+                "name": "sendFile",
+            },
+            "dependencies": [{ "id": "00000000-0000-0000-0000-000000000002" }],
+            "dependents": [],
+            "dependency_selection": {
+                "source": "dependency_edges",
+                "returned": 1,
+                "dependents_returned": 0,
+                "certified_dependents": 0,
+                "dependents_withheld": 0,
+                "same_file_candidates": 0,
+                "same_file_dropped": 0,
+            },
+            "edge_coverage": coverage,
+        })
+    }
+
+    /// FIR-2474, the half an agent acts on. `get_context_pack` published
+    /// `dependents: []` with no verdict of any kind, so "nothing depends on
+    /// this" and "this graph links none of this language's edges across files"
+    /// serialized identically, and the empty list was the readable one.
+    ///
+    /// The express shape is the case: JavaScript, no cross-file class produced.
+    #[test]
+    fn a_pack_with_no_dependents_is_inconclusive_when_the_language_links_no_edges() {
+        let payload = empty_pack_dependents(
+            "function",
+            json!({
+                "scope": "language",
+                "language": "JavaScript",
+                "requested_classes": ["calls", "imports", "references"],
+                "classes": { "calls": "absent", "imports": "absent", "references": "absent" },
+                "cross_file_classes": [],
+                "budget_exhausted": false,
+                "entities_examined": 66,
+            }),
+        );
+        let negative = negative_for("get_context_pack", &payload, &structural_ready_envelope())
+            .expect("an empty dependents group yields a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert_eq!(negative["trust"], json!("inconclusive"));
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            reason.starts_with("cross_file_edges_absent"),
+            "the limiting factor must lead the reason: {reason}"
+        );
+        assert!(
+            reason.contains("JavaScript"),
+            "the reason names the language whose edges are missing: {reason}"
+        );
+    }
+
+    /// The control that makes the case above mean something. A gate that
+    /// answered "inconclusive" for every pack would pass it and would be just as
+    /// useless: an empty group on a graph that demonstrably links this
+    /// language's calls across files IS an answer, and it has to read as one.
+    #[test]
+    fn a_pack_with_no_dependents_is_authoritative_when_the_graph_links_them() {
+        let payload = empty_pack_dependents("function", cross_file_edges_observed());
+        let negative = negative_for("get_context_pack", &payload, &structural_ready_envelope())
+            .expect("an empty dependents group yields a negative");
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(true),
+            "a graph that links this language's calls across files can answer: {negative}"
+        );
+        assert_eq!(negative["trust"], json!("authoritative"));
+    }
+
+    /// The pack inherits the reference surface's gap along with its authority.
+    /// A receiver-method call is linked by bare name, so a method's incoming
+    /// edges are routinely unresolved, and `find_references` has always refused
+    /// to certify an empty answer for one. A pack reading the same edges must
+    /// refuse identically, or the two tools disagree about one entity in one
+    /// store, which is the defect this ticket is.
+    #[test]
+    fn a_pack_with_no_dependents_is_inconclusive_for_a_method_focal() {
+        let payload = empty_pack_dependents("method", cross_file_edges_observed());
+        let negative = negative_for("get_context_pack", &payload, &structural_ready_envelope())
+            .expect("an empty dependents group yields a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert!(
+            negative["trust_reason"]
+                .as_str()
+                .unwrap()
+                .contains("method_call_resolution_incomplete"),
+            "the method gap must be named: {negative}"
+        );
+    }
+
+    /// The shipped 0.5.42 pack carried NO `dependents` key at all, not an empty
+    /// one, and the agentadopt lane hit that shape on flask. A missing key is the
+    /// worse of the two: `[]` at least names the question and can be qualified,
+    /// while an absent key reads as a question this tool does not answer, and the
+    /// gate that would have refused to certify it never ran.
+    ///
+    /// The two-group split has since made the key unconditional, so this is a
+    /// regression guard rather than a live bug. It is worth its cost because the
+    /// regression is invisible: dropping the key silently disables the verdict
+    /// instead of failing anything.
+    #[test]
+    fn a_pack_that_omits_its_dependents_group_is_qualified_like_an_empty_one() {
+        let mut payload = empty_pack_dependents("function", cross_file_edges_observed());
+        payload
+            .as_object_mut()
+            .unwrap()
+            .remove("dependents")
+            .expect("the fixture carries the group to remove");
+        let negative = negative_for("get_context_pack", &payload, &structural_ready_envelope())
+            .expect("an omitted dependents group is still an absence claim");
+        assert_eq!(negative["kind"], json!("no_dependents"));
+        assert_eq!(negative["result_count"], json!(0));
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(true),
+            "the omitted shape must be qualified exactly as the empty one is: {negative}"
+        );
+    }
+
+    /// The control that keeps the case above from swallowing payloads it has no
+    /// business judging. A pack that failed before producing a focal has no
+    /// answer to qualify, and inventing a verdict for it would report on a graph
+    /// nobody queried.
+    #[test]
+    fn a_pack_payload_with_no_focal_gets_no_verdict() {
+        let mut payload = empty_pack_dependents("function", cross_file_edges_observed());
+        let map = payload.as_object_mut().unwrap();
+        map.remove("dependents");
+        map.remove("focal_entity");
+        assert!(
+            negative_for("get_context_pack", &payload, &structural_ready_envelope()).is_none(),
+            "a payload carrying no answer must not be handed a verdict about one"
+        );
+    }
+
+    /// A pack that returned dependents is qualified too, because FIR-2463 asks
+    /// every retrieval answer for one verdict rather than only the empty ones.
+    /// What it must never do is claim an absence it is not making.
+    #[test]
+    fn a_populated_pack_is_qualified_without_claiming_an_absence() {
+        let mut payload = empty_pack_dependents("function", cross_file_edges_observed());
+        payload["dependents"] = json!([{ "id": "00000000-0000-0000-0000-000000000003" }]);
+        payload["dependency_selection"]["dependents_returned"] = json!(1);
+        payload["dependency_selection"]["certified_dependents"] = json!(1);
+        let negative = negative_for("get_context_pack", &payload, &structural_ready_envelope())
+            .expect("a populated pack still carries the response's one verdict");
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(false),
+            "an answer with rows claims no absence: {negative}"
         );
     }
 
