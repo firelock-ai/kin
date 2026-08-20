@@ -34,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Ask the language server about the member, not the receiver (#980)
 - Count what a find_references query could have meant, and let the verdict read it (#979)
 - Pin that a repeated receiver does not pull the query column back (#982)
+- Decide every risk finding on the changed entity's own evidence (#981)
 
 
 ## [0.5.42] - 2026-08-19
