@@ -1383,6 +1383,56 @@ fn mark_files_enriched(state: &DaemonState, files: &[String]) {
     }
 }
 
+/// How many consecutive fruitless interrupted sweeps disable the next one.
+///
+/// Three, not one. A single interrupted sweep is ordinary: a plain SIGTERM
+/// during shutdown ends a sweep early, and reading that as a failing store
+/// would trip the breaker on every clean stop.
+const SWEEP_INTERRUPTION_LIMIT: u32 = 3;
+
+/// The count after a sweep that ended the way this tally describes.
+///
+/// A clean finish resets, because the loop this guards is defined by never
+/// finishing. An interruption that still enriched files made progress and is
+/// left alone; the pathological case is the sweep that dies before enriching
+/// anything, over and over, which is what a store too small for its own sweep
+/// produces.
+fn next_interruption_count(previous: u32, ended_early: bool, enriched: usize) -> u32 {
+    if !ended_early {
+        0
+    } else if enriched == 0 {
+        previous.saturating_add(1)
+    } else {
+        previous
+    }
+}
+
+/// Whether the sweep circuit is open, so the next sweep must not be queued.
+fn sweep_circuit_open(consecutive_fruitless_interruptions: u32) -> bool {
+    consecutive_fruitless_interruptions >= SWEEP_INTERRUPTION_LIMIT
+}
+
+fn sweep_interruption_path(state: &DaemonState) -> std::path::PathBuf {
+    state.layout.root().join("lsp-sweep-interruptions")
+}
+
+/// Read the consecutive-interruption count this store carries.
+///
+/// Persisted rather than held in memory because the loop it guards spans daemon
+/// RESTARTS: a sweep dies, the daemon comes back, queues another sweep at
+/// startup, and dies again. One stranger session did that 24 times. An
+/// in-memory counter resets on every start and can never see the pattern.
+fn read_sweep_interruptions(state: &DaemonState) -> u32 {
+    std::fs::read_to_string(sweep_interruption_path(state))
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+fn write_sweep_interruptions(state: &DaemonState, count: u32) {
+    let _ = std::fs::write(sweep_interruption_path(state), count.to_string());
+}
+
 /// Whether a finished sweep may record its files as enriched.
 ///
 /// Marking is safe when the sweep published, and also when it produced nothing
@@ -1856,8 +1906,23 @@ pub async fn run_with_authority_on(
     // cheap on a converged repository, resumable after a kill, and safe to queue
     // on every start.
     if enrichment_enabled && state.lsp_enrichment_tx.is_some() {
-        info!("queueing an LSP sweep so a graph with unenriched files converges");
-        state.queue_lsp_sweep();
+        // A store whose sweeps keep dying before enriching anything gets one
+        // fewer, not another. Queued on EVERY daemon start, this is the point
+        // the marker-discard loop turns at: a sweep dies, the daemon restarts,
+        // queues another, dies again. One stranger session logged 24 of them.
+        let interruptions = read_sweep_interruptions(&state);
+        if sweep_circuit_open(interruptions) {
+            warn!(
+                consecutive_fruitless_interruptions = interruptions,
+                limit = SWEEP_INTERRUPTION_LIMIT,
+                "not queueing an LSP sweep: this store's last sweeps all ended early without \
+                 enriching anything, so another would repeat what has been failing. Enrichment \
+                 stays at what is already durable; one sweep that completes clears this."
+            );
+        } else {
+            info!("queueing an LSP sweep so a graph with unenriched files converges");
+            state.queue_lsp_sweep();
+        }
     }
 
     // Bind the API listener so the daemon owns port selection. With
@@ -3424,6 +3489,16 @@ pub async fn run_with_authority_on(
                             false
                         };
 
+                        // The breaker's count moves on the sweep's own outcome,
+                        // and is persisted because the loop it guards spans
+                        // daemon restarts rather than living inside one.
+                        let interruptions = next_interruption_count(
+                            read_sweep_interruptions(&lsp_state),
+                            tally.ended_early,
+                            tally.enriched,
+                        );
+                        write_sweep_interruptions(&lsp_state, interruptions);
+
                         // The marker records durability, so it is written here
                         // and only here, after the publication above settled it.
                         // The set and the count come from the same arm, so a
@@ -3480,6 +3555,7 @@ pub async fn run_with_authority_on(
                             not_visited,
                             ended_early = tally.ended_early,
                             published,
+                            consecutive_fruitless_interruptions = interruptions,
                             unaccounted,
                             "LSP cold sweep complete"
                         );
@@ -5169,7 +5245,10 @@ mod lsp_query_column_tests {
 
 #[cfg(test)]
 mod sweep_tally_tests {
-    use super::{file_definitions_within_budget, sweep_marker_is_durable, SweepTally};
+    use super::{
+        file_definitions_within_budget, next_interruption_count, sweep_circuit_open,
+        sweep_marker_is_durable, SweepTally, SWEEP_INTERRUPTION_LIMIT,
+    };
     use std::time::Duration;
 
     /// The number the sweep reports as `files`, and the one `/lsp/sweep/status`
@@ -5266,6 +5345,67 @@ mod sweep_tally_tests {
             leaking.unaccounted(66),
             36,
             "36 files left the sweep without reaching any counter and must be visible"
+        );
+    }
+
+    /// One interrupted sweep must NOT open the circuit.
+    ///
+    /// A plain SIGTERM during shutdown ends a sweep early, so a breaker that
+    /// tripped on a single interruption would fire on every clean stop and stop
+    /// enriching a perfectly healthy store. This is the arm that keeps the
+    /// breaker from being worse than the loop it guards.
+    #[test]
+    fn a_single_interrupted_sweep_does_not_open_the_circuit() {
+        let after_one = next_interruption_count(0, true, 0);
+        assert_eq!(after_one, 1);
+        assert!(
+            !sweep_circuit_open(after_one),
+            "one interrupted sweep is ordinary, not a failing store"
+        );
+        assert!(
+            !sweep_circuit_open(SWEEP_INTERRUPTION_LIMIT - 1),
+            "the breaker opens at the limit, not before it"
+        );
+    }
+
+    /// A store that keeps killing fruitless sweeps must back off.
+    ///
+    /// This is the marker-discard loop's own shape: a sweep dies before
+    /// enriching anything, the daemon restarts, queues another, dies again. One
+    /// stranger session logged 24 such sweeps.
+    #[test]
+    fn repeated_fruitless_interruptions_open_the_circuit() {
+        let mut count = 0;
+        for _ in 0..SWEEP_INTERRUPTION_LIMIT {
+            count = next_interruption_count(count, true, 0);
+        }
+        assert!(
+            sweep_circuit_open(count),
+            "after {SWEEP_INTERRUPTION_LIMIT} consecutive fruitless interruptions the next \
+             sweep must not be queued"
+        );
+    }
+
+    /// One clean completion clears it, and progress is not punished.
+    ///
+    /// Two distinct cases. A sweep that FINISHED resets the count outright, so a
+    /// store that recovers is not left permanently unswept. And a sweep that was
+    /// interrupted but still enriched files made progress, so it neither trips
+    /// the breaker nor resets it: the loop being guarded is the one that never
+    /// achieves anything.
+    #[test]
+    fn a_clean_completion_resets_and_progress_is_not_punished() {
+        assert_eq!(
+            next_interruption_count(SWEEP_INTERRUPTION_LIMIT, false, 0),
+            0,
+            "a sweep that ran to completion clears the breaker"
+        );
+        assert!(!sweep_circuit_open(0));
+        assert_eq!(
+            next_interruption_count(2, true, 19),
+            2,
+            "an interrupted sweep that still enriched 19 files made progress: neither a trip \
+             nor a reset"
         );
     }
 
