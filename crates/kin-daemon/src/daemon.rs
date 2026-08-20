@@ -1268,6 +1268,18 @@ fn lsp_enriched_marker_path(state: &DaemonState) -> std::path::PathBuf {
 /// costs a re-sweep and never skips a file wrongly. That asymmetry is deliberate:
 /// a wrong skip is silent and loses the answers, a wrong re-sweep only costs
 /// time.
+///
+/// A marker is honored only while the graph it describes still holds
+/// language-server relations. A store swept before enrichment became durable
+/// carries a complete marker and none of the edges it recorded, and the marker
+/// is exactly what makes that loss permanent: every later daemon skips the same
+/// files and re-derives nothing, so the store can never repair itself. Dropping
+/// such a marker costs one re-sweep and fixes it. A sweep that legitimately
+/// produced no relation at all is re-swept too, which is the same asymmetry
+/// again and the cheap direction to be wrong in.
+///
+/// The scan runs only when a marker exists, and costs one snapshot at startup
+/// beside a read-index build that already walks the whole graph.
 fn load_lsp_enriched_marker(state: &DaemonState) {
     let Ok(bytes) = std::fs::read(lsp_enriched_marker_path(state)) else {
         return;
@@ -1275,9 +1287,30 @@ fn load_lsp_enriched_marker(state: &DaemonState) {
     let Ok(files) = serde_json::from_slice::<Vec<String>>(&bytes) else {
         return;
     };
+    if files.is_empty() {
+        return;
+    }
+    if !graph_holds_language_server_relations(state) {
+        warn!(
+            marked = files.len(),
+            "discarding the language-server enrichment marker: this graph holds none of the relations it records, so the files it marks are swept again"
+        );
+        let _ = std::fs::remove_file(lsp_enriched_marker_path(state));
+        return;
+    }
     if let Ok(mut marked) = state.lsp_enriched_files.lock() {
         marked.extend(files);
     }
+}
+
+/// Whether this graph still holds any relation a language server produced.
+fn graph_holds_language_server_relations(state: &DaemonState) -> bool {
+    state
+        .graph
+        .to_snapshot()
+        .relations
+        .values()
+        .any(|relation| relation.origin == kin_model::RelationOrigin::Lsp)
 }
 
 /// Record that the sweep finished this file, and persist the set.
