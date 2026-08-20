@@ -16,7 +16,7 @@ pub struct DiscoveredServer {
 }
 
 /// Known LSP server configurations per language.
-const KNOWN_SERVERS: &[(LanguageId, &[&str], &[&str])] = &[
+pub(crate) const KNOWN_SERVERS: &[(LanguageId, &[&str], &[&str])] = &[
     // (language, [binary_names_to_search], [default_args])
     (LanguageId::Rust, &["rust-analyzer"], &[]),
     (

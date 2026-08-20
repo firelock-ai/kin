@@ -28,6 +28,16 @@ pub enum LspError {
     #[error("server shutdown unexpectedly")]
     ServerDied,
 
+    /// A start or handshake failure, carrying whatever the server wrote to its
+    /// own stderr before it went.
+    ///
+    /// The reason is the original failure's message; the tail is bounded and
+    /// may be truncated to its last bytes. This variant exists because a server
+    /// that dies before it can frame a JSON-RPC reply has nowhere else to say
+    /// why, and discarding stderr made those failures unattributable.
+    #[error("{reason} (server stderr: {stderr})")]
+    ServerFailedWithStderr { reason: String, stderr: String },
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

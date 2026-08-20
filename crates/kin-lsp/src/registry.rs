@@ -241,6 +241,14 @@ pub enum ProviderGapReason {
     NoBinaryOnPath,
     /// A repo config named a provider id the registry does not know.
     UnknownConfiguredProvider(ProviderId),
+    /// A server binary was found and the server refused to start or to
+    /// initialize.
+    ///
+    /// Distinct from [`ProviderGapReason::NoBinaryOnPath`] on purpose. A
+    /// missing binary and an unusable one need different repairs, and a
+    /// surface that collapses them to "not available" throws away the only
+    /// thing an operator can act on. The string is the server's own message.
+    ServerUnusable { message: String },
 }
 
 impl fmt::Display for ProviderGapReason {
@@ -254,6 +262,12 @@ impl fmt::Display for ProviderGapReason {
             }
             ProviderGapReason::UnknownConfiguredProvider(id) => {
                 write!(f, "configured provider '{id}' is not known to the registry")
+            }
+            ProviderGapReason::ServerUnusable { message } => {
+                write!(
+                    f,
+                    "server binary found but it did not initialize: {message}"
+                )
             }
         }
     }
@@ -612,6 +626,31 @@ impl ProviderRegistry {
     /// Languages the repo config marked as required for citable enrichment.
     pub fn required_languages(&self) -> &[LanguageId] {
         &self.required
+    }
+
+    /// The binary names this build looks for, per language, in preference
+    /// order.
+    ///
+    /// Exported because these names are restated outside this crate: kin's
+    /// installer advice and its coverage reporting each keep a copy, and a copy
+    /// that drifts advertises a fix for a binary the runtime never starts, or
+    /// reports a language served that nothing can serve. A consumer should
+    /// assert against this rather than hardcode the names again.
+    pub fn known_binaries(&self) -> Vec<(LanguageId, Vec<String>)> {
+        self.entries
+            .iter()
+            .map(|(language, specs)| {
+                let mut binaries: Vec<String> = Vec::new();
+                for spec in specs {
+                    for binary in &spec.binaries {
+                        if !binaries.contains(binary) {
+                            binaries.push(binary.clone());
+                        }
+                    }
+                }
+                (*language, binaries)
+            })
+            .collect()
     }
 
     /// Resolve the first candidate whose binary is on PATH, using the system
@@ -1028,5 +1067,59 @@ mod tests {
             assert_eq!(LspCapability::from_slug(cap.as_slug()), Some(cap));
         }
         assert_eq!(LspCapability::from_slug("bogus"), None);
+    }
+}
+
+#[cfg(test)]
+mod table_reconciliation_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// This crate states the server binary names twice, and the two must agree.
+    ///
+    /// `discovery::KNOWN_SERVERS` is what the daemon consults to decide a
+    /// language is enrichable; the registry table is what actually resolves and
+    /// launches one. A name in one and not the other is a build that reports a
+    /// language served and then cannot start anything for it, which is the
+    /// failure class this whole area exists to close. Two tables stating one
+    /// fact is how the runtime and the advice come apart.
+    #[test]
+    fn discovery_and_the_registry_name_the_same_binaries_for_every_language() {
+        let registry: HashMap<LanguageId, Vec<String>> = ProviderRegistry::with_defaults()
+            .known_binaries()
+            .into_iter()
+            .collect();
+
+        let discovered: HashMap<LanguageId, Vec<String>> = crate::discovery::KNOWN_SERVERS
+            .iter()
+            .map(|(language, binaries, _)| {
+                (
+                    *language,
+                    binaries
+                        .iter()
+                        .map(|b| (*b).to_string())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+
+        let mut registry_languages: Vec<String> = registry.keys().map(|l| l.to_string()).collect();
+        let mut discovered_languages: Vec<String> =
+            discovered.keys().map(|l| l.to_string()).collect();
+        registry_languages.sort();
+        discovered_languages.sort();
+        assert_eq!(
+            registry_languages, discovered_languages,
+            "discovery and the registry disagree about which languages have a server"
+        );
+
+        for (language, expected) in &discovered {
+            assert_eq!(
+                registry.get(language),
+                Some(expected),
+                "{language}: discovery and the registry name different binaries, so one of \
+                 them is describing a server this build will never start"
+            );
+        }
     }
 }
