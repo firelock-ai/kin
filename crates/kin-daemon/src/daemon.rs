@@ -1403,6 +1403,16 @@ struct SweepTally {
     server_unavailable: usize,
     /// Files whose source could not be loaded from graph authority.
     source_unreadable: usize,
+    /// Whether the loop stopped before walking every file, on shutdown or on
+    /// the background-work supervisor's verdict.
+    ///
+    /// Without this the two reasons a file can be missing from the counts are
+    /// indistinguishable, and they are opposites: one is a bug in this loop,
+    /// the other is this loop being told to stop. The guard below reported the
+    /// second as the first, so a SIGTERM at 31 of 37 files logged "an exit from
+    /// the sweep loop is not being counted" about six files nothing had failed
+    /// to count, and sent its reader hunting a counting bug that did not exist.
+    ended_early: bool,
 }
 
 impl SweepTally {
@@ -1417,12 +1427,39 @@ impl SweepTally {
         self.unsupported_language + self.server_unavailable + self.source_unreadable
     }
 
-    /// Files in the sweep's own total that reached none of the fields above.
+    /// Files the sweep's total holds that no field above accounts for.
     ///
-    /// This is the guard, not a statistic. A new `continue` added to the loop
-    /// without a counter shows up here rather than silently deflating `files`.
-    fn unaccounted(&self, total_files: usize) -> usize {
+    /// Shared arithmetic for the two questions below; on its own it cannot say
+    /// which of them applies, which is exactly the confusion this split fixes.
+    fn unreached(&self, total_files: usize) -> usize {
         total_files.saturating_sub(self.files_processed() + self.blocked())
+    }
+
+    /// Files the loop never walked because it was told to stop.
+    ///
+    /// Zero for a sweep that ran to completion. This is a normal outcome, not a
+    /// finding: shutdown and the supervisor's halt both stop the loop between
+    /// files on purpose, and what was enriched stays durable.
+    fn not_visited(&self, total_files: usize) -> usize {
+        if self.ended_early {
+            self.unreached(total_files)
+        } else {
+            0
+        }
+    }
+
+    /// Files that went missing while the loop was still walking.
+    ///
+    /// This is the guard, not a statistic. A new `continue` added without a
+    /// counter shows up here rather than silently deflating `files`. It is zero
+    /// for an interrupted sweep by construction, because an interrupted sweep
+    /// has not finished walking and its remaining files are `not_visited`.
+    fn unaccounted(&self, total_files: usize) -> usize {
+        if self.ended_early {
+            0
+        } else {
+            self.unreached(total_files)
+        }
     }
 
     /// Why a sweep enriched nothing, when nothing is what it enriched.
@@ -1431,7 +1468,10 @@ impl SweepTally {
     /// that converged from one that could not run. The distinction is the whole
     /// point: both used to print the same sentence.
     fn blocked_reason(&self, total_files: usize) -> Option<&'static str> {
-        if total_files == 0 || self.files_processed() > 0 {
+        // A sweep that was stopped before it could do anything is not a
+        // blocked one, and saying so would send a reader after a language
+        // server that was never the problem.
+        if total_files == 0 || self.files_processed() > 0 || self.ended_early {
             return None;
         }
         if self.server_unavailable > 0 {
@@ -3177,6 +3217,7 @@ pub async fn run_with_authority_on(
 
                             // Check for shutdown between files.
                             if *lsp_cancel.borrow() {
+                                tally.ended_early = true;
                                 break;
                             }
                             // Same checkpoint, for the supervisor's verdict. A
@@ -3184,6 +3225,7 @@ pub async fn run_with_authority_on(
                             // anything stops here, between files, rather than
                             // mid-request to a language server.
                             if lsp_pass.halted() {
+                                tally.ended_early = true;
                                 info!("LSP cold sweep stopped by the background-work supervisor");
                                 break;
                             }
@@ -3209,6 +3251,7 @@ pub async fn run_with_authority_on(
                             .lsp_sweep_files_blocked
                             .store(tally.blocked() as u64, std::sync::atomic::Ordering::SeqCst);
                         let unaccounted = tally.unaccounted(total_files);
+                        let not_visited = tally.not_visited(total_files);
                         info!(
                             files = tally.files_processed(),
                             total_files,
@@ -3218,6 +3261,8 @@ pub async fn run_with_authority_on(
                             unsupported_language = tally.unsupported_language,
                             server_unavailable = tally.server_unavailable,
                             source_unreadable = tally.source_unreadable,
+                            not_visited,
+                            ended_early = tally.ended_early,
                             unaccounted,
                             "LSP cold sweep complete"
                         );
@@ -4781,6 +4826,7 @@ mod sweep_tally_tests {
             unsupported_language: 5,
             server_unavailable: 6,
             source_unreadable: 7,
+            ended_early: false,
         };
         assert_eq!(tally.files_processed(), 7);
         assert_eq!(tally.blocked(), 18);
@@ -4862,6 +4908,91 @@ mod sweep_tally_tests {
             leaking.unaccounted(66),
             36,
             "36 files left the sweep without reaching any counter and must be visible"
+        );
+    }
+
+    /// An interrupted sweep is not a miscounted one, and the guard must not
+    /// confuse them.
+    ///
+    /// This is the real case, from a run whose daemon took SIGTERM at 31 of 37
+    /// files: it logged `unaccounted=6` and warned that "an exit from the sweep
+    /// loop is not being counted" about six files nothing had failed to count.
+    /// The loop had simply been told to stop. A guard that reports a normal
+    /// shutdown as a counting bug is worse than no guard, because it sends its
+    /// reader after something that is not there.
+    #[test]
+    fn a_sweep_stopped_before_it_finished_reports_not_visited_and_never_warns() {
+        let interrupted = SweepTally {
+            enriched: 31,
+            ended_early: true,
+            ..SweepTally::default()
+        };
+        assert_eq!(
+            interrupted.unaccounted(37),
+            0,
+            "a sweep that was told to stop has not miscounted anything"
+        );
+        assert_eq!(
+            interrupted.not_visited(37),
+            6,
+            "the six files it never walked are still reported, as not_visited"
+        );
+        assert_eq!(
+            interrupted.blocked_reason(37),
+            None,
+            "a stopped sweep is not a blocked one"
+        );
+
+        // The second sweep of that same run, which broke after one file.
+        let barely_started = SweepTally {
+            enriched: 1,
+            ended_early: true,
+            ..SweepTally::default()
+        };
+        assert_eq!(barely_started.unaccounted(37), 0);
+        assert_eq!(barely_started.not_visited(37), 36);
+    }
+
+    /// The other direction, which is what the guard exists for: a sweep that
+    /// ran to completion and still cannot account for every file HAS a counting
+    /// bug, and must say so.
+    #[test]
+    fn a_completed_sweep_that_cannot_account_for_its_files_still_warns() {
+        let leaking = SweepTally {
+            enriched: 30,
+            ended_early: false,
+            ..SweepTally::default()
+        };
+        assert_eq!(
+            leaking.unaccounted(66),
+            36,
+            "a completed sweep missing 36 files is the defect this guard is for"
+        );
+        assert_eq!(
+            leaking.not_visited(66),
+            0,
+            "a completed sweep visited everything, so nothing is not_visited"
+        );
+    }
+
+    /// A stopped sweep that enriched nothing must not be reported as blocked on
+    /// its language server, which would send a reader after a server that was
+    /// never the problem.
+    #[test]
+    fn a_sweep_stopped_before_enriching_anything_is_not_called_blocked() {
+        let stopped_cold = SweepTally {
+            ended_early: true,
+            ..SweepTally::default()
+        };
+        assert_eq!(stopped_cold.blocked_reason(37), None);
+        let really_blocked = SweepTally {
+            server_unavailable: 37,
+            ended_early: false,
+            ..SweepTally::default()
+        };
+        assert_eq!(
+            really_blocked.blocked_reason(37),
+            Some("no language server could be started for these files")
         );
     }
 
