@@ -1306,6 +1306,23 @@ pub struct DaemonState {
     /// Served beside `files_done` so a caller can tell a converged sweep from
     /// one that could not run. `files_done` alone cannot: both report zero.
     pub lsp_sweep_files_blocked: AtomicU64,
+    /// Whether anything OTHER than re-derivable enrichment is waiting to be
+    /// persisted.
+    ///
+    /// The flush guard suppresses background flushes while an LSP sweep runs,
+    /// which is right for the sweep's own edges and wrong for everything else:
+    /// a user's write landing mid-sweep would ride the sweep's whole duration
+    /// with no durability cadence. The dirty flag alone cannot tell the two
+    /// apart, because it records THAT the graph changed and never what changed
+    /// it, and nineteen call sites share it.
+    ///
+    /// So the default is inverted rather than a taxonomy built: `mark_dirty`
+    /// sets this and `mark_dirty_enrichment` does not, and only two of those
+    /// nineteen sites are enrichment. A call site added later calls
+    /// `mark_dirty`, so it is treated as primary and flushed; forgetting to
+    /// classify something costs a redundant flush and never a silent
+    /// suppression, which is the direction this mistake has to fail in.
+    pub primary_dirty: AtomicBool,
     /// Incremented when a sweep finishes, so a waiter can tell "the sweep I
     /// asked for has completed" from "a sweep is not running yet". A bare
     /// running/idle flag cannot: a waiter that polls before the worker picks the
@@ -2401,6 +2418,7 @@ impl DaemonState {
             lsp_sweep_files_done: AtomicU64::new(0),
             lsp_sweep_files_total: AtomicU64::new(0),
             lsp_sweep_files_blocked: AtomicU64::new(0),
+            primary_dirty: AtomicBool::new(false),
             lsp_sweeps_completed: AtomicU64::new(0),
             lsp_sweep_running: AtomicBool::new(false),
             lsp_enriched_files: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -2630,6 +2648,7 @@ impl DaemonState {
             lsp_sweep_files_done: AtomicU64::new(0),
             lsp_sweep_files_total: AtomicU64::new(0),
             lsp_sweep_files_blocked: AtomicU64::new(0),
+            primary_dirty: AtomicBool::new(false),
             lsp_sweeps_completed: AtomicU64::new(0),
             lsp_sweep_running: AtomicBool::new(false),
             lsp_enriched_files: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -5393,11 +5412,33 @@ impl DaemonState {
     /// Called after any graph mutation. The background persistence task
     /// will flush to disk when it sees this flag.
     pub fn mark_dirty(&self) {
+        // Primary by default. Every call site that is not enrichment reaches
+        // this one, including any written after today, which is what makes the
+        // classification fail safe.
+        self.primary_dirty.store(true, Ordering::SeqCst);
+        self.mark_dirty_inner();
+    }
+
+    /// Mark the graph dirty with work the next sweep could re-derive.
+    ///
+    /// Identical to `mark_dirty` except that it leaves `primary_dirty` alone, so
+    /// a sweep's own edges stay suppressible while a user's write does not. Used
+    /// at the two language-server enrichment sites and nowhere else.
+    pub fn mark_dirty_enrichment(&self) {
+        self.mark_dirty_inner();
+    }
+
+    fn mark_dirty_inner(&self) {
         self.mutation_epoch.fetch_add(1, Ordering::SeqCst);
         self.dirty.store(true, Ordering::SeqCst);
         if let Ok(mut last) = self.last_mutation.lock() {
             *last = Instant::now();
         }
+    }
+
+    /// Whether work other than re-derivable enrichment is waiting to persist.
+    pub fn has_primary_dirt(&self) -> bool {
+        self.primary_dirty.load(Ordering::SeqCst)
     }
 
     /// Mark the graph as clean (just saved). Records the save timestamp.
@@ -5408,11 +5449,16 @@ impl DaemonState {
         // that changed across the clear all mean this save did not acknowledge
         // the latest graph truth. Re-arm the persistence wakeup instead of
         // losing the concurrent mutation.
+        // Cleared with the dirty flag and re-armed with it. A save that did not
+        // acknowledge the latest truth leaves BOTH set, or the next flush would
+        // be suppressible while primary work is still outstanding.
+        self.primary_dirty.store(false, Ordering::SeqCst);
         if self.mutation_epoch.load(Ordering::SeqCst) != observed_epoch
             || self.graph.has_unpersisted_changes()
             || self.post_commit_finalization_pending.load(Ordering::SeqCst)
         {
             self.dirty.store(true, Ordering::SeqCst);
+            self.primary_dirty.store(true, Ordering::SeqCst);
             return;
         }
         if let Ok(mut last) = self.last_save.lock() {

@@ -660,6 +660,30 @@ enum FlushSuppression {
     LspSweep,
 }
 
+/// Which pass, if any, may hold the flush clocks down right now.
+///
+/// Primary dirt overrides every suppression. A sweep's own edges are
+/// re-derivable and worth deferring; a user's write landing mid-sweep is not,
+/// and it would otherwise ride the sweep's whole duration with no durability
+/// cadence. The dirty flag cannot tell them apart on its own, so the two
+/// enrichment sites mark themselves and everything else is primary by default.
+fn flush_suppression_for(
+    embed_pass_active: bool,
+    lsp_sweep_running: bool,
+    primary_dirt_pending: bool,
+) -> FlushSuppression {
+    if primary_dirt_pending {
+        return FlushSuppression::None;
+    }
+    if embed_pass_active {
+        FlushSuppression::EmbedPass
+    } else if lsp_sweep_running {
+        FlushSuppression::LspSweep
+    } else {
+        FlushSuppression::None
+    }
+}
+
 fn should_flush_now(
     since_save: Duration,
     since_mutation: Duration,
@@ -2328,16 +2352,13 @@ pub async fn run_with_authority_on(
                 continue;
             }
 
-            let suppression = if persist_state.embed_pass_active() {
-                FlushSuppression::EmbedPass
-            } else if persist_state
-                .lsp_sweep_running
-                .load(std::sync::atomic::Ordering::SeqCst)
-            {
-                FlushSuppression::LspSweep
-            } else {
-                FlushSuppression::None
-            };
+            let suppression = flush_suppression_for(
+                persist_state.embed_pass_active(),
+                persist_state
+                    .lsp_sweep_running
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                persist_state.has_primary_dirt(),
+            );
             let should_flush = should_flush_now(
                 persist_state.time_since_save(),
                 persist_state.time_since_mutation(),
@@ -3083,7 +3104,7 @@ pub async fn run_with_authority_on(
                                 relations = total_relations,
                                 "LSP enrichment added relations"
                             );
-                            lsp_state.mark_dirty();
+                            lsp_state.mark_dirty_enrichment();
                             // Relations reaching the graph is this pass's unit of
                             // durable work, so it is what the supervisor is told
                             // about. Querying an LSP server and finding nothing is
@@ -3432,7 +3453,7 @@ pub async fn run_with_authority_on(
                         }
 
                         if total_relations > 0 {
-                            lsp_state.mark_dirty();
+                            lsp_state.mark_dirty_enrichment();
                         }
 
                         // Publish this sweep's enrichment ONCE, here, and wait
@@ -3871,7 +3892,7 @@ async fn select_with_signals(
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        coverage_drain_verdict, drain_pending_flush, embed_work_outstanding,
+        coverage_drain_verdict, drain_pending_flush, embed_work_outstanding, flush_suppression_for,
         format_singleton_contention, next_embed_error_backoff, parse_duration_secs,
         parse_owner_watch_pid, should_enable_lsp_enrichment, should_flush_now, shutdown_signalled,
         watched_process_is_alive, ControlPlane, CoverageDrainVerdict, DaemonConfig, DaemonState,
@@ -4585,6 +4606,131 @@ mod tests {
             !super::file_already_enriched(&state, never_reached),
             "a file the sweep never reached must NOT be recorded, or the next sweep skips a \
              file that was never enriched"
+        );
+    }
+
+    /// A user's write landing mid-sweep is flushed; the sweep's own edges are not.
+    ///
+    /// Arms 1 and 2 of this change, and they discriminate: breaking the override
+    /// fails the first, breaking suppression fails the second.
+    #[test]
+    fn primary_dirt_overrides_sweep_suppression_and_enrichment_does_not() {
+        assert_eq!(
+            flush_suppression_for(false, true, true),
+            FlushSuppression::None,
+            "a user write landing mid-sweep must be flushed on the normal cadence rather \
+             than riding the sweep's whole duration with no durability"
+        );
+        assert_eq!(
+            flush_suppression_for(false, true, false),
+            FlushSuppression::LspSweep,
+            "the sweep's own re-derivable edges must still not trigger a mid-sweep \
+             full-graph flush"
+        );
+    }
+
+    /// The yield, proven as one sequence rather than two unrelated states.
+    ///
+    /// Same sweep, same embed state; the only thing that changes is that primary
+    /// dirt arrives. Two separate assertions could both pass while the predicate
+    /// ignored the transition, so the point is that ONE varying input flips it.
+    #[test]
+    fn suppression_yields_the_moment_primary_dirt_arrives() {
+        let sweep_running = true;
+        let embed_active = false;
+        let before = flush_suppression_for(embed_active, sweep_running, false);
+        let after = flush_suppression_for(embed_active, sweep_running, true);
+        assert_eq!(before, FlushSuppression::LspSweep);
+        assert_eq!(after, FlushSuppression::None);
+        assert_ne!(
+            before, after,
+            "the arrival of primary dirt alone must change the verdict, or suppression is \
+             not yielding to it at all"
+        );
+        // And it overrides the embed pass on the same terms, so this is a rule
+        // about primary work rather than a special case for sweeps.
+        assert_eq!(
+            flush_suppression_for(true, false, true),
+            FlushSuppression::None
+        );
+        assert_eq!(
+            flush_suppression_for(true, false, false),
+            FlushSuppression::EmbedPass
+        );
+    }
+
+    /// The fail-safe, as a test rather than a convention.
+    ///
+    /// Seventeen of nineteen `mark_dirty` call sites are primary, and any site
+    /// written after today will call it too. This asserts that reaching the
+    /// default marks primary dirt, so forgetting to classify a new mutation
+    /// costs a redundant flush and never a silent suppression.
+    #[test]
+    fn the_default_mark_dirty_records_primary_dirt() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = DaemonState::open(initialized.layout).unwrap();
+        assert!(
+            !state.has_primary_dirt(),
+            "a fresh state has no primary dirt"
+        );
+
+        state.mark_dirty_enrichment();
+        assert!(
+            state.is_dirty(),
+            "enrichment still dirties the graph; it is only the classification that differs"
+        );
+        assert!(
+            !state.has_primary_dirt(),
+            "enrichment must stay suppressible, or the guard this rides on does nothing"
+        );
+
+        state.mark_dirty();
+        assert!(
+            state.has_primary_dirt(),
+            "the default path must record primary dirt, so an unclassified new call site is \
+             flushed rather than silently suppressed"
+        );
+    }
+
+    /// Clearing, so this does not become permanent no-suppression.
+    ///
+    /// Without it the first user write of a daemon's life would disable sweep
+    /// suppression forever and this change would quietly undo its parent.
+    ///
+    /// Both directions, because `mark_clean` does not clear unconditionally and
+    /// should not. A save that did NOT acknowledge the latest truth re-arms the
+    /// dirty flag, and primary dirt has to re-arm with it or the next flush
+    /// would be suppressible while primary work is still outstanding. Writing
+    /// this test the naive way asserted the clear against a freshly initialized
+    /// graph, whose own unpersisted changes make `mark_clean` re-arm, and it
+    /// failed; the failure was the code being right and the test being wrong.
+    #[test]
+    fn a_clean_save_clears_primary_dirt_and_an_unacknowledged_one_does_not() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = DaemonState::open(initialized.layout).unwrap();
+
+        // An unacknowledged save: the graph still carries unpersisted changes,
+        // so both flags re-arm together.
+        state.mark_dirty();
+        state.mark_clean();
+        assert!(
+            state.has_primary_dirt(),
+            "a save that did not acknowledge the latest truth must keep primary dirt set, or \
+             the next flush is suppressible while primary work is outstanding"
+        );
+        assert!(state.is_dirty(), "and the dirty flag re-arms with it");
+
+        // A real save, then a primary mutation, then a clean acknowledgement.
+        state.save_snapshot().expect("snapshot persists");
+        state.mark_dirty();
+        assert!(state.has_primary_dirt());
+        state.mark_clean();
+        assert!(
+            !state.has_primary_dirt(),
+            "a save that acknowledged the latest truth clears primary dirt, so the next \
+             enrichment-only stretch is suppressible again"
         );
     }
 
