@@ -2391,6 +2391,37 @@ impl InMemoryGraph {
         Self::from_snapshot_inner(snapshot, None, false, true)
     }
 
+    /// Restore a graph from a snapshot whose change map was cloned from an
+    /// already-admitted one.
+    ///
+    /// Identical to [`from_snapshot_without_text_index`] except that the
+    /// change-map pass is carried rather than repeated. Every other admission
+    /// check runs exactly as it does there.
+    ///
+    /// CARRY SITE. `snapshot.changes` must be a clone of the map `admitted`
+    /// witnesses. That cannot be checked here without re-deriving the digests
+    /// this exists to avoid, so it is the caller's obligation, the call sites
+    /// are enumerated, and `carry_sites_stay_enumerated` fails if a new one
+    /// appears.
+    ///
+    /// [`from_snapshot_without_text_index`]: Self::from_snapshot_without_text_index
+    pub(crate) fn from_admitted_snapshot_without_text_index(
+        snapshot: GraphSnapshot,
+        admitted: &crate::storage::change_validation::AdmittedChangeMap<'_>,
+    ) -> Result<Self, KinDbError> {
+        {
+            let carried = crate::storage::change_validation::AdmittedChangeMap::carried_from_clone(
+                &snapshot.changes,
+                admitted,
+            );
+            snapshot.validate_storage_admission_carrying(
+                crate::storage::repository::GitProjectionTreeReplay::Required,
+                &carried,
+            )?;
+        }
+        Self::from_snapshot_inner_admitted(snapshot, None, false, true)
+    }
+
     /// Restore a graph from a snapshot without constructing any text index.
     ///
     /// The graph root hash argument is accepted and ignored: text index
@@ -2480,6 +2511,18 @@ impl InMemoryGraph {
         skip_text_index: bool,
     ) -> Result<Self, KinDbError> {
         snapshot.validate_storage_admission()?;
+        Self::from_snapshot_inner_admitted(snapshot, text_index_path, read_only, skip_text_index)
+    }
+
+    /// The graph build itself, for a snapshot whose storage admission the
+    /// caller has already completed. Private: the two callers above are the
+    /// only entry points, and each validates before reaching here.
+    fn from_snapshot_inner_admitted(
+        snapshot: GraphSnapshot,
+        text_index_path: Option<PathBuf>,
+        read_only: bool,
+        skip_text_index: bool,
+    ) -> Result<Self, KinDbError> {
         let retrieval_authority_hash = compute_retrieval_authority_hash(&snapshot);
         let GraphSnapshot {
             version: _,
