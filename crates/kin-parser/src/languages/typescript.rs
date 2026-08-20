@@ -17,8 +17,9 @@ use crate::extract::{
 // nodes in both grammars. Sharing them keeps the two adapters from drifting into
 // different answers for the same source.
 use super::javascript::{
-    collect_js_require_imports, extract_calls_from_context, extract_js_assignment_function,
-    extract_js_object_methods, js_heritage_name, js_require_target, JsOwners,
+    collect_js_property_definers, collect_js_require_imports, extract_calls_from_context,
+    extract_js_assignment_function, extract_js_object_methods, extract_js_property_definition,
+    js_heritage_name, js_require_target, JsOwners, JsPropertyDefiner,
 };
 
 pub struct TypeScriptAdapter;
@@ -75,6 +76,10 @@ impl LanguageAdapter for TypeScriptAdapter {
             }
         }
 
+        // Read the file's property-defining helpers before walking it; a
+        // helper is not bound to its uses by declaration order.
+        let definers = collect_js_property_definers(&root, source);
+
         for child in root.children(&mut cursor) {
             extract_ts_node(
                 &child,
@@ -83,6 +88,7 @@ impl LanguageAdapter for TypeScriptAdapter {
                 &mut entities,
                 &mut relations,
                 &mut owners,
+                &definers,
             );
             if let Some(import_like) = extract_ts_import_like(&child, source) {
                 imports.push(import_like);
@@ -127,6 +133,7 @@ impl LanguageAdapter for TypeScriptAdapter {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn extract_ts_node(
     node: &tree_sitter::Node,
     source: &[u8],
@@ -134,6 +141,7 @@ fn extract_ts_node(
     entities: &mut Vec<ExtractedEntity>,
     relations: &mut Vec<ExtractedRelation>,
     owners: &mut JsOwners,
+    definers: &std::collections::HashMap<String, JsPropertyDefiner>,
 ) {
     match node.kind() {
         "function_declaration" | "function" => {
@@ -241,6 +249,14 @@ fn extract_ts_node(
             }
         }
         "expression_statement" => {
+            // `Object.defineProperty(obj, 'name', {...})` and the local helpers
+            // that forward to it, which a Node-shaped TypeScript file carries
+            // for the same reasons a JavaScript one does.
+            if extract_js_property_definition(
+                node, source, file_id, entities, relations, owners, definers,
+            ) {
+                return;
+            }
             // Prototype and receiver method assignments (`Foo.prototype.bar =
             // function () {}`) plus `module.exports = ...`. TypeScript files in
             // Node packages still carry these CommonJS shapes.
@@ -338,7 +354,9 @@ fn extract_ts_node(
                 if child.kind() == "default" || child.utf8_text(source).unwrap_or("") == "default" {
                     has_default = true;
                 }
-                extract_ts_node(&child, source, file_id, entities, relations, owners);
+                extract_ts_node(
+                    &child, source, file_id, entities, relations, owners, definers,
+                );
             }
             // If this is a default export and recursion didn't create any entities,
             // create a synthetic "default" entity so the linker can resolve
@@ -1521,5 +1539,64 @@ const tmp = 2;
                 "incidental local `{dropped}` should be dropped, got: {names:?}"
             );
         }
+    }
+
+    /// A Node-shaped TypeScript file carries the same `defineProperty` forms a
+    /// JavaScript one does, and it reaches them through the shared extractor.
+    /// Without this the two adapters would disagree about what a property is,
+    /// which is worse than either answer on its own.
+    #[test]
+    fn parse_ts_define_property_helper_defines_the_member() {
+        let adapter = TypeScriptAdapter;
+        let source = br#"defineGetter(req, 'ip', function ip(): string {
+  return proxyaddr(this, trust);
+});
+
+function defineGetter(obj: object, name: string, getter: () => unknown): void {
+  Object.defineProperty(obj, name, { get: getter });
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib/request.ts");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let methods: Vec<&str> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Method)
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(methods, vec!["req.ip"]);
+        let contains: Vec<(&str, &str)> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Contains)
+            .map(|r| (r.src_name.as_str(), r.dst_name.as_str()))
+            .collect();
+        assert!(contains.contains(&("req", "req.ip")));
+    }
+
+    /// FALSIFICATION, TypeScript half: the shared rule reads the helper here
+    /// too, so a handler registration must mint nothing.
+    #[test]
+    fn parse_ts_a_three_argument_call_that_defines_nothing_produces_no_property() {
+        let adapter = TypeScriptAdapter;
+        let source = br#"registerHandler(emitter, 'click', function onClick(): void {
+  handle();
+});
+
+function registerHandler(target: EventTarget, event: string, handler: () => void): void {
+  target.addEventListener(event, handler);
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib/events.ts");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let invented: Vec<&str> = output
+            .entities
+            .iter()
+            .filter(|e| e.name.starts_with("emitter."))
+            .map(|e| e.name.as_str())
+            .collect();
+        assert!(invented.is_empty(), "got {invented:?}");
     }
 }
