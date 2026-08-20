@@ -480,6 +480,45 @@ pub(crate) fn absence_coverage_gap(tool: &str, payload: &Value) -> Option<String
                  no edges to answer from rather than that the target is unused"
             ));
         }
+
+        // `references` absent is ordinary wherever a language server has not
+        // run, which is why [`load_bearing_classes`] leaves it out of the set a
+        // certification rests on. It stops being ordinary the moment this build
+        // wires an adapter for the language AND the host carries the server: the
+        // class was producible here, a scan that ran to completion found none of
+        // it, and an absence read off the classes that survived is read off a
+        // gap rather than off evidence.
+        //
+        // That is the exact shape shipped v0.5.43 certified on expressjs/express,
+        // where all ten exports of `lib/express.js` came back `consumer_count: 0`
+        // and `safe_to_conclude_absent: true` with `decided_by: ["calls"]` beside
+        // `references: absent` and `reference_enrichment: available`
+        // (FIR-2505, FIR-2492). A use that reaches an export through a `require`
+        // and a property read is carried by exactly the class that went missing,
+        // so the question the caller asked lived entirely outside the evidence
+        // the verdict rested on.
+        //
+        // Scoped to `references` because that is the class enrichment produces.
+        // `calls` comes from the linker and is already gated above. `imports` is
+        // never minted as an entity-level relation on any language, healthy or
+        // not, so gating on its absence would report every answer on every real
+        // graph as inconclusive, which is the failure mode opposite to this one
+        // and no more useful. And `absent` is only ever written by a scan that
+        // ran to completion: a skipped or budget-exhausted scan leaves `unknown`,
+        // which the branch above already answers.
+        if requested.iter().any(|class| class == "references")
+            && class_state(states, "references") == "absent"
+            && coverage.get("reference_enrichment").and_then(Value::as_str) == Some("available")
+        {
+            gaps.push(format!(
+                "reference_enrichment_unproduced: this build wires a language-server adapter for \
+                 {language} and one is installed on this host, so cross-file reference edges were \
+                 producible for it, and a completed scan of this graph found none; the class that \
+                 carries a use reaching the target from another file is missing rather than empty, \
+                 so an empty result cannot be read as the target being unused and must not be \
+                 acted on as a deletion"
+            ));
+        }
     }
 
     // A filter that selected a region the graph does not populate answers every
@@ -1245,6 +1284,41 @@ fn structural_coverage_clause(payload: &Value, envelope: &Envelope) -> String {
     }
 }
 
+/// Finish a clean substrate reason by naming the degraded signals this response
+/// actually publishes.
+///
+/// [`crate::envelope::Envelope::negative_trust`] can only see the daemon's own
+/// flags, so it states the substrate verdict and stops. [`degraded_signals`]
+/// publishes a wider set beside it: those flags, plus the payload's own
+/// `degradations[]`, plus the coverage shortfalls the answer's `edge_coverage`
+/// names. Letting the reason claim the wider silence shipped in v0.5.43 as
+/// `trust_reason: "structural_authoritative: daemon graph initialized and loaded
+/// with no degraded signals"` sitting one field away from
+/// `degraded_signals: ["edge_coverage:imports_absent", "edge_coverage:references_absent"]`
+/// on the same object (FIR-2505). That string was not a summary of the field
+/// beside it, it contradicted it.
+///
+/// So the clause is computed from the published array rather than asserted
+/// independently of it, which is the treatment [`build_advice`] already gives
+/// the same fact in its own sentence. A verdict that recites its own disclosures
+/// cannot be read as claiming there were none, and a reader who sees a
+/// non-empty array is told in words why it did not move the verdict.
+///
+/// Applied only to a reason that survived every gate. Once a gap has fired,
+/// [`push_gap`] has replaced the reason with the gap, and appending a silence
+/// clause to a gap would qualify the wrong sentence.
+fn qualify_clean_trust_reason(trust_reason: String, degraded_signals: &[String]) -> String {
+    if degraded_signals.is_empty() {
+        format!("{trust_reason}, with no degraded signals")
+    } else {
+        format!(
+            "{trust_reason}; the disclosed signals [{}] were considered and are not load-bearing \
+             for this claim",
+            degraded_signals.join(", ")
+        )
+    }
+}
+
 /// A human sentence spelling out "absent as-of X, coverage Y%, degraded Z" and
 /// the actionable consequence, so the negative is legible without cross-reading
 /// the envelope. `subject` and `consequence` are passed rather than read off a
@@ -1845,6 +1919,11 @@ pub fn negative_for(
 
     let degraded_signals = degraded_signals(tool, payload, envelope);
     let coverage_clause = coverage_clause(spec.class, payload, envelope);
+    let trust_reason = if trustworthy {
+        qualify_clean_trust_reason(trust_reason, &degraded_signals)
+    } else {
+        trust_reason
+    };
 
     let mut negative = Map::new();
     negative.insert("kind".to_string(), json!(kind));
@@ -1996,6 +2075,17 @@ pub fn resolution_miss_for(tool: &str, message: &str, envelope: &Envelope) -> Op
         .map(str::to_string)
         .collect();
 
+    // Same treatment as the retrieval builder, so one surface cannot word this
+    // fact differently from the other. On this path the two sets coincide (a
+    // miss carries no payload, and `negative_trust` is already untrustworthy
+    // whenever a daemon flag is up), so a trustworthy miss reads exactly as it
+    // always did and only the retrieval path's contradiction is repaired.
+    let trust_reason = if trustworthy {
+        qualify_clean_trust_reason(trust_reason, &degraded_signals)
+    } else {
+        trust_reason
+    };
+
     let mut negative = Map::new();
     negative.insert("kind".to_string(), json!(kind));
     negative.insert("subject".to_string(), json!(subject));
@@ -2092,13 +2182,30 @@ mod tests {
     /// artifact-level edge, and mints no entity-level `Imports` edge for any
     /// language. A converted Python repository whose imports resolve cleanly
     /// reports exactly this shape.
+    /// A graph whose enrichment actually delivered, which is the only shape in
+    /// which Kin certifies a deletion.
+    ///
+    /// This fixture read `references: absent` beside `reference_enrichment:
+    /// available` until FIR-2505, and that combination is not a healthy graph.
+    /// It is the express failure shape exactly: a host that could produce
+    /// reference edges, and a graph holding none. The suite's own idea of
+    /// "healthy" was the defect, which is why every gate here passed while
+    /// shipped v0.5.43 certified the deletion of ten live exports.
+    ///
+    /// The numbers come from the enriched arm of the same stranger run that
+    /// caught it. psf/requests, sweep converged: `Entity-to-entity relation
+    /// kinds: Calls: 945, Contains: 483, References: 438, ...` with
+    /// `Cross-file entity relations: 699 of 1943`. The broken express arm on the
+    /// same binary read `Calls: 254, Contains: 75` and no References at all.
+    /// `imports` stays absent because Kin's linker mints no entity-level
+    /// `Imports` relation on any language, healthy or not.
     fn cross_file_edges_observed() -> Value {
         json!({
             "scope": "language",
             "language": "Rust",
             "requested_classes": ["calls", "imports", "references"],
-            "classes": { "calls": "present", "imports": "absent", "references": "absent" },
-            "cross_file_classes": ["calls"],
+            "classes": { "calls": "present", "imports": "absent", "references": "present" },
+            "cross_file_classes": ["calls", "references"],
             "reference_enrichment": "available",
             "budget_exhausted": false,
             "entities_examined": 2,
@@ -3406,6 +3513,14 @@ mod tests {
     /// resolved them, and on Python that something is pyright. The same fixture
     /// with no server installed is the express case wearing a different
     /// language, and it must not certify.
+    ///
+    /// It also carries `references: present`, because the sentence above is not
+    /// true without it. A pyright that resolved this repository's cross-file
+    /// uses left reference edges behind: the enriched arm of stranger run
+    /// npm0543 read `References: 438` on psf/requests with 699 of 1943 relations
+    /// cross-file. This fixture claimed the resolution and denied the edges
+    /// until FIR-2505, which is the same contradiction the express payload
+    /// shipped, and it is why nothing here failed while a deletion was certified.
     #[test]
     fn a_python_graph_that_resolves_its_imports_still_certifies_an_unused_symbol() {
         let mut payload = authoritative_empty_references("function");
@@ -3415,8 +3530,8 @@ mod tests {
             "scope": "language",
             "language": "Python",
             "requested_classes": ["calls", "imports", "references"],
-            "classes": { "calls": "present", "imports": "absent", "references": "absent" },
-            "cross_file_classes": ["calls"],
+            "classes": { "calls": "present", "imports": "absent", "references": "present" },
+            "cross_file_classes": ["calls", "references"],
             "reference_enrichment": "available",
             "budget_exhausted": false,
             "entities_examined": 12,
@@ -3436,15 +3551,25 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Absence is authoritative"));
-        // Certified, and still honest about the classes it did not observe. The
-        // verdict rests on the resolved calls; saying which classes were empty is
-        // what keeps the next reader from mistaking it for full coverage.
+        // Certified, and still honest about the class it did not observe. The
+        // verdict rests on the resolved calls and references; saying that no
+        // entity-level import edge was seen is what keeps the next reader from
+        // mistaking it for full coverage.
         assert_eq!(
             negative["degraded_signals"],
-            json!([
-                "edge_coverage:imports_absent",
-                "edge_coverage:references_absent"
-            ])
+            json!(["edge_coverage:imports_absent"])
+        );
+        // And FIR-2505's second half on the shape where it bites: an
+        // authoritative verdict that publishes a signal must recite it rather
+        // than claim the response carried none.
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            !reason.contains("no degraded signals"),
+            "a verdict disclosing imports_absent must not claim there were none: {reason}"
+        );
+        assert!(
+            reason.contains("edge_coverage:imports_absent"),
+            "the reason recites what it disclosed: {reason}"
         );
     }
 
@@ -3485,6 +3610,165 @@ mod tests {
         // And an unknown tool inherits nothing: it declares no dependency, so it
         // is neither gated nor granted authority by this map.
         assert!(absence_coverage_gap("some_future_tool", &json!({})).is_none());
+    }
+
+    /// The `edge_coverage` object shipped v0.5.43 certified a deletion on, copied
+    /// verbatim from the isolated stranger run npm0543 against expressjs/express
+    /// at `a3714473feb3`: `impact_analysis` tool_use_id
+    /// `toolu_01VAw8NSCfq74ABm42DAFABu` and `get_context_pack` tool_use_id
+    /// `toolu_011vdWNY8ogtbHfPpec732AR` carry byte-identical `edge_coverage` and
+    /// `_kin.completeness` blocks, which is the evidence that one decision served
+    /// both surfaces (FIR-2505, FIR-2492).
+    fn express_deletion_coverage(references: &str, enrichment: &str) -> Value {
+        json!({
+            "budget_exhausted": false,
+            "classes": { "calls": "present", "imports": "absent", "references": references },
+            "cross_file_classes": ["calls"],
+            "entities_examined": 371,
+            "language": "JavaScript",
+            "reference_enrichment": enrichment,
+            "requested_classes": ["calls", "imports", "references"],
+            "scan": "ran",
+            "scope": "language",
+            "witnessed_by_answer": []
+        })
+    }
+
+    /// FIR-2505 and FIR-2492, the reported direction. All ten exports of
+    /// `lib/express.js` came back `consumer_count: 0`, `safe_to_conclude_absent:
+    /// true` and "safe to treat that entity as unreferenced", on a payload whose
+    /// own `edge_coverage` read `references: absent` beside a language server
+    /// that was available. `express.Router` is referenced 32 times in that
+    /// repository and `express.static` 26 times.
+    #[test]
+    fn a_producible_reference_class_that_produced_nothing_blocks_the_deletion_verdict() {
+        let payload = json!({
+            "entity_impacts": [],
+            "dependents": [],
+            "edge_coverage": express_deletion_coverage("absent", "available")
+        });
+        for tool in ["impact_analysis", "get_context_pack"] {
+            let gap = absence_coverage_gap(tool, &payload)
+                .unwrap_or_else(|| panic!("{tool} must not certify the express deletion shape"));
+            assert!(
+                gap.contains("reference_enrichment_unproduced"),
+                "{tool} names the produced-nothing gap: {gap}"
+            );
+            assert!(
+                gap.contains("JavaScript"),
+                "{tool} names the language the gap is about: {gap}"
+            );
+        }
+    }
+
+    /// The control FIR-2404's descendants exist to protect: the gate must not
+    /// answer "uncertain" to everything. The identical question on a graph whose
+    /// enrichment actually delivered still certifies, so a genuinely dead entity
+    /// stays deletable and the verdict keeps its ability to say yes.
+    #[test]
+    fn an_enriched_graph_still_certifies_the_same_deletion_question() {
+        let payload = json!({
+            "entity_impacts": [],
+            "dependents": [],
+            "edge_coverage": express_deletion_coverage("present", "available")
+        });
+        for tool in ["impact_analysis", "get_context_pack"] {
+            assert_eq!(
+                absence_coverage_gap(tool, &payload),
+                None,
+                "{tool} must still certify when the reference class is present"
+            );
+        }
+    }
+
+    /// The boundary that keeps the gate narrow. Kin's linker mints no
+    /// entity-level `Imports` relation on any language, so `imports: absent` is
+    /// the reading on every real graph including the healthy ones, and gating on
+    /// it would report every answer everywhere as inconclusive. The express
+    /// payload named it as a limit and it is disclosed, not load-bearing.
+    #[test]
+    fn imports_absent_alone_is_never_what_blocks_a_verdict() {
+        let payload = json!({
+            "entity_impacts": [],
+            "edge_coverage": express_deletion_coverage("present", "available")
+        });
+        assert_eq!(payload["edge_coverage"]["classes"]["imports"], json!("absent"));
+        assert_eq!(absence_coverage_gap("impact_analysis", &payload), None);
+    }
+
+    /// A host that could never have produced the class keeps its own reason. The
+    /// new gate is about a class that WAS producible here and was not produced,
+    /// so it must not displace the build-limit and host-limit findings that
+    /// already name a cause an operator can act on.
+    #[test]
+    fn an_unproducible_reference_class_keeps_its_existing_reason() {
+        for (enrichment, expected) in [
+            ("unsupported", "reference_enrichment_unsupported"),
+            ("no_language_server", "reference_enrichment_unsupported"),
+        ] {
+            let payload = json!({
+                "entity_impacts": [],
+                "edge_coverage": express_deletion_coverage("absent", enrichment)
+            });
+            let gap = absence_coverage_gap("impact_analysis", &payload)
+                .unwrap_or_else(|| panic!("{enrichment} must still be gated"));
+            assert!(gap.contains(expected), "{enrichment}: {gap}");
+            assert!(
+                !gap.contains("reference_enrichment_unproduced"),
+                "{enrichment} was never producible here, so the produced-nothing gap must not \
+                 claim it was: {gap}"
+            );
+        }
+    }
+
+    /// FIR-2505's second half. `trust_reason` ended "with no degraded signals" in
+    /// the same object whose `degraded_signals` array held two entries. The
+    /// string was not a summary of the field beside it, it contradicted it.
+    ///
+    /// Asserted on the shape that still certifies, because that is the one where
+    /// the contradiction survives: once a gap fires the reason is the gap and
+    /// makes no claim about silence.
+    #[test]
+    fn a_certified_verdict_recites_its_disclosed_signals_instead_of_denying_them() {
+        let payload = json!({
+            "entity_impacts": [],
+            "edge_coverage": express_deletion_coverage("present", "available")
+        });
+        let negative = negative_for("impact_analysis", &payload, &structural_ready_envelope())
+            .expect("impact_analysis always qualifies");
+        assert_eq!(negative["trust"], json!("authoritative"));
+        let signals = negative["degraded_signals"].as_array().unwrap().clone();
+        assert!(
+            !signals.is_empty(),
+            "this shape discloses imports_absent, or the test is asserting nothing"
+        );
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            !reason.contains("no degraded signals"),
+            "a verdict publishing {signals:?} must not claim there were none: {reason}"
+        );
+        assert!(
+            reason.contains("edge_coverage:imports_absent"),
+            "the reason recites what it disclosed: {reason}"
+        );
+        assert!(
+            reason.contains("structural_authoritative"),
+            "the substrate verdict is kept, not replaced: {reason}"
+        );
+    }
+
+    /// And the other direction: a response with nothing to disclose still says
+    /// so, so the repair adds a fact rather than removing one.
+    #[test]
+    fn a_verdict_with_no_signals_still_says_it_has_none() {
+        let payload = empty_search_page(resolvable_language_scope(Some(12)));
+        let negative = negative_for("semantic_search", &payload, &structural_ready_envelope())
+            .expect("empty results yields a negative");
+        assert_eq!(negative["degraded_signals"], json!([]));
+        assert!(negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .contains("no degraded signals"));
     }
 
     /// The language-scope map is the contract, asserted directly rather than
@@ -3651,11 +3935,7 @@ mod tests {
             .contains("degraded"));
         assert_eq!(
             negative["degraded_signals"],
-            json!([
-                "embed_worker_failed",
-                "edge_coverage:imports_absent",
-                "edge_coverage:references_absent"
-            ]),
+            json!(["embed_worker_failed", "edge_coverage:imports_absent"]),
             "the daemon's flag leads, and the answer's own coverage shortfalls follow \
              it rather than being dropped"
         );

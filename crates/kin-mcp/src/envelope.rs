@@ -1120,6 +1120,14 @@ impl Envelope {
     ///
     /// The reason is honest about which gate held and never claims authority the
     /// envelope did not actually observe.
+    /// The reason names only what THIS function checked: the daemon's own
+    /// flags, which are the sole degraded set an envelope can see. It
+    /// deliberately makes no claim about degraded signals in general, because
+    /// [`crate::negative`] publishes a wider set beside it (the payload's own
+    /// `degradations[]` and the coverage shortfalls its `edge_coverage` names)
+    /// and finishes the sentence there. Claiming the wider silence from here
+    /// shipped in v0.5.43 as `trust_reason` ending "with no degraded signals"
+    /// one field away from a two-element `degraded_signals` array (FIR-2505).
     pub fn negative_trust(&self, class: NegativeClass) -> (bool, &'static str) {
         if self.runtime != Runtime::RepoDaemon {
             return (
@@ -1159,7 +1167,7 @@ impl Envelope {
                 ),
                 Some(_) => (
                     true,
-                    "semantic_authoritative: daemon-owned truth with complete embedding coverage and no degraded signals",
+                    "semantic_authoritative: daemon-owned truth with complete embedding coverage",
                 ),
             },
             NegativeClass::Structural => {
@@ -1176,7 +1184,7 @@ impl Envelope {
                 } else {
                     (
                         true,
-                        "structural_authoritative: daemon graph initialized and loaded with no degraded signals",
+                        "structural_authoritative: daemon graph initialized and loaded",
                     )
                 }
             }
