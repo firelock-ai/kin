@@ -2436,10 +2436,12 @@ async fn check_reference_edge_coverage() -> HealthCheck {
     // read the graph still reports this half, so a repository whose daemon is
     // down does not silently lose the language-server signal that used to have
     // its own row.
-    let missing_servers =
-        missing_language_servers(&crate::commands::graph::installed_language_servers());
-
     let cwd = env::current_dir().unwrap_or_default();
+    // Probed, not looked up on PATH. A binary that resolves and cannot start
+    // serves no language, and a row that reports it as served sends an operator
+    // looking for a problem somewhere else entirely.
+    let readiness = crate::commands::language_servers::probe_language_server_readiness(&cwd).await;
+    let missing_servers = missing_language_servers(&readiness);
     let Some(layout) = kin_core::KinLayout::discover(&cwd) else {
         return HealthCheck::new(
             ID,
@@ -2820,12 +2822,24 @@ async fn check_semantic_query_readiness() -> HealthCheck {
 /// instead: warning about rust-analyzer on a Python-only repository is a row a
 /// reader learns to skip.
 fn missing_language_servers(
-    installed: &std::collections::HashSet<kin_model::LanguageId>,
+    readiness: &kin_core::reference_coverage::LanguageServerReadinessMap,
 ) -> Vec<String> {
+    use kin_core::reference_coverage::LanguageServerReadiness;
     crate::commands::language_servers::language_server_binaries()
         .into_iter()
-        .filter(|(language, _)| !installed.contains(language))
-        .map(|(language, binaries)| format!("{language} ({})", binaries.join(" or ")))
+        .filter_map(|(language, binaries)| match readiness.get(&language) {
+            Some(LanguageServerReadiness::Usable) => None,
+            // A server that is installed and cannot start is NOT reported here.
+            // Telling an operator to install what they already have sends them
+            // to the wrong repair, which is the whole reason the two states are
+            // kept apart.
+            Some(LanguageServerReadiness::Unusable { reason }) => Some(format!(
+                "{language} (installed but it did not start: {reason})"
+            )),
+            Some(LanguageServerReadiness::Absent) | None => {
+                Some(format!("{language} ({})", binaries.join(" or ")))
+            }
+        })
         .collect()
 }
 
@@ -3575,7 +3589,9 @@ mod tests {
     /// carry its own row; folding the two rows must not lose the probe.
     #[test]
     fn doctor_names_the_language_whose_missing_server_costs_cross_file_edges() {
-        let missing = missing_language_servers(&std::collections::HashSet::new());
+        let missing = missing_language_servers(
+            &kin_core::reference_coverage::LanguageServerReadinessMap::new(),
+        );
         let check = coverage_unreadable(
             HealthStatus::Unsupported,
             "no daemon running for this repository",
@@ -3614,10 +3630,15 @@ mod tests {
     /// with every wired language's server installed there is no gap to report.
     #[test]
     fn doctor_reports_no_gap_once_every_wired_language_server_is_installed() {
-        let installed: std::collections::HashSet<kin_model::LanguageId> =
+        let installed: kin_core::reference_coverage::LanguageServerReadinessMap =
             crate::commands::language_servers::language_server_binaries()
                 .into_iter()
-                .map(|(language, _)| language)
+                .map(|(language, _)| {
+                    (
+                        language,
+                        kin_core::reference_coverage::LanguageServerReadiness::Usable,
+                    )
+                })
                 .collect();
         let missing = missing_language_servers(&installed);
         assert!(missing.is_empty(), "{missing:?}");
@@ -3632,12 +3653,58 @@ mod tests {
         assert!(!check.detail.contains("unavailable"), "{}", check.detail);
     }
 
+    /// An installed server that cannot start must not be reported as a missing
+    /// install, and must not be reported as fine either.
+    ///
+    /// This is the state a PATH lookup could not see and the reason the doctor
+    /// row now probes. The dev host produced it on 2026-08-20: a
+    /// typescript-language-server installed beside TypeScript 7, resolving
+    /// perfectly and failing every start. Telling that operator to install what
+    /// they already have sends them to the wrong repair.
+    #[test]
+    fn doctor_separates_a_broken_install_from_a_missing_one() {
+        use kin_core::reference_coverage::{LanguageServerReadiness, LanguageServerReadinessMap};
+        let mut readiness = LanguageServerReadinessMap::new();
+        for (language, _) in crate::commands::language_servers::language_server_binaries() {
+            readiness.insert(language, LanguageServerReadiness::Usable);
+        }
+        readiness.insert(
+            kin_model::LanguageId::JavaScript,
+            LanguageServerReadiness::Unusable {
+                reason: "Could not find a valid TypeScript installation".to_string(),
+            },
+        );
+
+        let missing = missing_language_servers(&readiness);
+        let javascript: Vec<&String> = missing
+            .iter()
+            .filter(|row| row.starts_with("javascript"))
+            .collect();
+        assert_eq!(
+            missing.len(),
+            1,
+            "only the broken language is reported: {missing:?}"
+        );
+        assert!(
+            javascript[0].contains("installed but it did not start"),
+            "the row must say the install is broken rather than absent: {}",
+            javascript[0]
+        );
+        assert!(
+            javascript[0].contains("Could not find a valid TypeScript installation"),
+            "the row must carry the server's own reason, which names the repair: {}",
+            javascript[0]
+        );
+    }
+
     /// A `Stale` row needs attention without failing readiness. A missing
     /// language server degrades a working install; calling it a failure would
     /// turn `kin doctor` red on every host that never installed one.
     #[test]
     fn a_missing_language_server_needs_attention_without_blocking_readiness() {
-        let missing = missing_language_servers(&std::collections::HashSet::new());
+        let missing = missing_language_servers(
+            &kin_core::reference_coverage::LanguageServerReadinessMap::new(),
+        );
         let check = coverage_unreadable(
             HealthStatus::Unsupported,
             "no daemon running for this repository",

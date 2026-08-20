@@ -277,18 +277,6 @@ fn embedding_coverage_is_measured(_graph: &kin_db::InMemoryGraph) -> bool {
     true
 }
 
-/// Languages whose enrichment server is installed on this host.
-///
-/// The table this probes lives in `crate::commands::language_servers`, beside
-/// the command that installs each one, because a name that drifts between the
-/// probe and the advice produces a doctor row that reports a gap and a fix that
-/// does not close it. Probing here rather than through
-/// `kin_lsp::discovery::discover_servers` keeps the status path off a
-/// subprocess, since discovery runs `--version` on every server it finds.
-pub(crate) fn installed_language_servers() -> HashSet<kin_model::LanguageId> {
-    crate::commands::language_servers::installed_language_servers()
-}
-
 /// The whole-graph relation totals the completeness section reports beside its
 /// per-language reference rows.
 ///
@@ -438,14 +426,23 @@ fn build_graph_status_response(
     // inside the collector, so every edge is counted once, and the
     // language-server probe is attached here rather than in kin-core, which
     // measures graph truth and never probes the host.
-    health.reference_edge_coverage = std::mem::take(&mut health.reference_edge_coverage)
-        .with_totals(graph_relation_totals(
+    let coverage =
+        std::mem::take(&mut health.reference_edge_coverage).with_totals(graph_relation_totals(
             graph,
             &relation_counts,
             total_relations,
             cross_file_relations,
-        ))
-        .with_language_servers(&installed_language_servers());
+        ));
+    // Read the readiness a process with the right to spawn already established,
+    // rather than probing the host from a query path. When nobody has published,
+    // the rows are left at their default, which is unknown: an empty map would
+    // read as every server missing, and reporting a gap nothing looked for is
+    // the mistake this whole area exists to stop.
+    health.reference_edge_coverage =
+        match kin_mcp::edge_coverage::published_language_server_readiness() {
+            Some(readiness) => coverage.with_language_servers(&readiness),
+            None => coverage,
+        };
 
     // File count
     let unique_files: HashSet<_> = entities
