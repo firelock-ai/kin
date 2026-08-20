@@ -6104,7 +6104,8 @@ mod tests {
             "an eighth of twelve seconds is more than the interval bound allows"
         );
         assert!(
-            commit_yield_grace(&state, Duration::from_secs(60), false) <= COMMIT_YIELD_GRACE_CEILING,
+            commit_yield_grace(&state, Duration::from_secs(60), false)
+                <= COMMIT_YIELD_GRACE_CEILING,
             "no poll cadence may turn the grace into a stall"
         );
     }
