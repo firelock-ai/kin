@@ -629,14 +629,45 @@ fn duration_from_env_secs(name: &str, default: Duration) -> Duration {
 /// The post-pass snapshot persists the final state once the pass completes, and
 /// a mid-pass crash only loses re-derivable enrichment, never primary truth.
 /// O(gaps × graph size) writes on large repos are the failure mode being closed.
+///
+/// An LSP cold sweep is suppressed for the SAME reason, and the paragraph above
+/// described it before it was covered: a sweep's only graph mutations are
+/// re-derivable enrichment, and a background flush mid-sweep re-serializes the
+/// whole graph to persist edges the next sweep would recompute. Measured on a
+/// converted psf/requests store (6491 commits): one 188-second sweep triggered a
+/// single flush costing 96.6 seconds, which carried a 56.2-second repository
+/// authority successor preparation whose own `change_bodies_ms` was 0. That is
+/// a whole-workspace rebuild and a whole-store re-admission performed for zero
+/// changed content bodies.
+///
+/// Suppression is bounded by the sweep, not open-ended: the sweep marks the
+/// graph dirty when it finishes, so the flush fires immediately after rather
+/// than never, and the sweep's own duration is bounded by the per-file
+/// definitions budget and the per-query caps. A live-only write landing
+/// mid-sweep therefore waits at most one sweep before it is persisted.
+/// Which background pass, if any, is holding the flush clocks down.
+///
+/// Named rather than passed as a second bool beside the first: two adjacent
+/// booleans at a call site say nothing about which is which, and the reason a
+/// flush was suppressed is exactly what a reader of this decision wants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlushSuppression {
+    /// Nothing is holding the clocks; the durability bounds apply as written.
+    None,
+    /// A daemon-side embed pass is in flight.
+    EmbedPass,
+    /// An LSP cold sweep is in flight.
+    LspSweep,
+}
+
 fn should_flush_now(
     since_save: Duration,
     since_mutation: Duration,
-    embed_pass_active: bool,
+    suppression: FlushSuppression,
     idle_flush: Duration,
     periodic_flush: Duration,
 ) -> bool {
-    if embed_pass_active {
+    if suppression != FlushSuppression::None {
         return false;
     }
     since_save >= periodic_flush || since_mutation >= idle_flush
@@ -1316,23 +1347,100 @@ fn graph_holds_language_server_relations(state: &DaemonState) -> bool {
         .any(|relation| relation.origin == kin_model::RelationOrigin::Lsp)
 }
 
-/// Record that the sweep finished this file, and persist the set.
+/// Record that a sweep's files are DURABLE, and persist the set once.
 ///
-/// Written per file rather than once at the end so a killed pass leaves the
-/// files it completed marked, which is what makes the next pass resume rather
-/// than restart. The write is a small JSON array over the files of one
-/// repository; a failure to persist is not fatal, it only costs a re-sweep.
-fn mark_file_enriched(state: &DaemonState, file: &str) {
+/// This was written per FILE, as the sweep finished each one, so that a killed
+/// pass resumed rather than restarted. That ordering records the wrong fact.
+/// The marker's only reader skips a file it names, so what it must mean is "the
+/// enrichment for this file is durable", and per-file it meant "this file was
+/// visited". A sweep whose publication then failed left every file marked and
+/// the next sweep skipped them, permanently, behind a clean log.
+///
+/// The pre-existing mitigation does not close that: `load_lsp_enriched_marker`
+/// discards the marker only when `graph_holds_language_server_relations` is
+/// false, and that helper is an `.any()` over the snapshot. Any single surviving
+/// Lsp relation, from an earlier sweep or from the incremental path, keeps the
+/// marker and with it the skip.
+///
+/// So the set is written once, after publication succeeds. Resume-after-kill
+/// degrades in the correct direction: a hard kill now re-sweeps, which is right,
+/// because a hard kill did not publish either.
+fn mark_files_enriched(state: &DaemonState, files: &[String]) {
+    if files.is_empty() {
+        return;
+    }
     let snapshot = {
         let Ok(mut marked) = state.lsp_enriched_files.lock() else {
             return;
         };
-        marked.insert(file.to_string());
+        for file in files {
+            marked.insert(file.clone());
+        }
         marked.iter().cloned().collect::<Vec<_>>()
     };
     if let Ok(bytes) = serde_json::to_vec(&snapshot) {
         let _ = std::fs::write(lsp_enriched_marker_path(state), bytes);
     }
+}
+
+/// How many consecutive fruitless interrupted sweeps disable the next one.
+///
+/// Three, not one. A single interrupted sweep is ordinary: a plain SIGTERM
+/// during shutdown ends a sweep early, and reading that as a failing store
+/// would trip the breaker on every clean stop.
+const SWEEP_INTERRUPTION_LIMIT: u32 = 3;
+
+/// The count after a sweep that ended the way this tally describes.
+///
+/// A clean finish resets, because the loop this guards is defined by never
+/// finishing. An interruption that still enriched files made progress and is
+/// left alone; the pathological case is the sweep that dies before enriching
+/// anything, over and over, which is what a store too small for its own sweep
+/// produces.
+fn next_interruption_count(previous: u32, ended_early: bool, enriched: usize) -> u32 {
+    if !ended_early {
+        0
+    } else if enriched == 0 {
+        previous.saturating_add(1)
+    } else {
+        previous
+    }
+}
+
+/// Whether the sweep circuit is open, so the next sweep must not be queued.
+fn sweep_circuit_open(consecutive_fruitless_interruptions: u32) -> bool {
+    consecutive_fruitless_interruptions >= SWEEP_INTERRUPTION_LIMIT
+}
+
+fn sweep_interruption_path(state: &DaemonState) -> std::path::PathBuf {
+    state.layout.root().join("lsp-sweep-interruptions")
+}
+
+/// Read the consecutive-interruption count this store carries.
+///
+/// Persisted rather than held in memory because the loop it guards spans daemon
+/// RESTARTS: a sweep dies, the daemon comes back, queues another sweep at
+/// startup, and dies again. One stranger session did that 24 times. An
+/// in-memory counter resets on every start and can never see the pattern.
+fn read_sweep_interruptions(state: &DaemonState) -> u32 {
+    std::fs::read_to_string(sweep_interruption_path(state))
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+fn write_sweep_interruptions(state: &DaemonState, count: u32) {
+    let _ = std::fs::write(sweep_interruption_path(state), count.to_string());
+}
+
+/// Whether a finished sweep may record its files as enriched.
+///
+/// Marking is safe when the sweep published, and also when it produced nothing
+/// to publish: a file that yielded no relations has nothing that can be lost, so
+/// re-sweeping it forever would be waste rather than safety. Everything else
+/// stays unmarked and is swept again.
+fn sweep_marker_is_durable(total_relations: usize, published: bool) -> bool {
+    total_relations == 0 || published
 }
 
 /// Whether the sweep has already finished this file.
@@ -1798,8 +1906,23 @@ pub async fn run_with_authority_on(
     // cheap on a converged repository, resumable after a kill, and safe to queue
     // on every start.
     if enrichment_enabled && state.lsp_enrichment_tx.is_some() {
-        info!("queueing an LSP sweep so a graph with unenriched files converges");
-        state.queue_lsp_sweep();
+        // A store whose sweeps keep dying before enriching anything gets one
+        // fewer, not another. Queued on EVERY daemon start, this is the point
+        // the marker-discard loop turns at: a sweep dies, the daemon restarts,
+        // queues another, dies again. One stranger session logged 24 of them.
+        let interruptions = read_sweep_interruptions(&state);
+        if sweep_circuit_open(interruptions) {
+            warn!(
+                consecutive_fruitless_interruptions = interruptions,
+                limit = SWEEP_INTERRUPTION_LIMIT,
+                "not queueing an LSP sweep: this store's last sweeps all ended early without \
+                 enriching anything, so another would repeat what has been failing. Enrichment \
+                 stays at what is already durable; one sweep that completes clears this."
+            );
+        } else {
+            info!("queueing an LSP sweep so a graph with unenriched files converges");
+            state.queue_lsp_sweep();
+        }
     }
 
     // Bind the API listener so the daemon owns port selection. With
@@ -2205,10 +2328,20 @@ pub async fn run_with_authority_on(
                 continue;
             }
 
+            let suppression = if persist_state.embed_pass_active() {
+                FlushSuppression::EmbedPass
+            } else if persist_state
+                .lsp_sweep_running
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                FlushSuppression::LspSweep
+            } else {
+                FlushSuppression::None
+            };
             let should_flush = should_flush_now(
                 persist_state.time_since_save(),
                 persist_state.time_since_mutation(),
-                persist_state.embed_pass_active(),
+                suppression,
                 idle_flush,
                 periodic_flush,
             );
@@ -2998,6 +3131,7 @@ pub async fn run_with_authority_on(
                             .lsp_sweep_files_total
                             .store(total_files as u64, std::sync::atomic::Ordering::SeqCst);
                         let mut tally = SweepTally::default();
+                        let mut enriched_this_sweep: Vec<String> = Vec::new();
                         let file_definitions_budget = lsp_file_definitions_budget();
                         let mut total_relations = 0usize;
                         // Languages whose server refused to start, remembered for
@@ -3241,7 +3375,7 @@ pub async fn run_with_authority_on(
                                 .await;
 
                             tally.enriched += 1;
-                            mark_file_enriched(&lsp_state, &file_id.0);
+                            enriched_this_sweep.push(file_id.0.clone());
                             lsp_state.lsp_sweep_files_done.store(
                                 tally.files_processed() as u64,
                                 std::sync::atomic::Ordering::SeqCst,
@@ -3300,6 +3434,96 @@ pub async fn run_with_authority_on(
                         if total_relations > 0 {
                             lsp_state.mark_dirty();
                         }
+
+                        // Publish this sweep's enrichment ONCE, here, and wait
+                        // for it.
+                        //
+                        // Publication is not a separate path: it happens inside
+                        // save_snapshot_impl, so the background flush IS the
+                        // publication. Leaving it to that flush is what made
+                        // suppressing the flush lose the work entirely. Measured
+                        // on a converted psf/requests store: a sweep enriched 37
+                        // files and 4231 relations, the daemon began idle
+                        // shutdown 65 ms after the sweep ended, logged its final
+                        // shutdown flush, and then reported that tasks had not
+                        // stopped within 10 s. That flush takes about 96 s on
+                        // this store. Nothing was published, and the whole sweep
+                        // was lost on a path `kin init` takes every time.
+                        //
+                        // Ordering carries the guarantee. This runs BEFORE the
+                        // running flag clears and before the completion counter
+                        // advances, so the sweep is still in flight while it
+                        // happens: nothing reads the daemon as idle, and a
+                        // caller waiting for the sweep (`kin init` does) waits
+                        // for durability rather than for a promise of it.
+                        //
+                        // Both exits, deliberately. The loop reaches here after
+                        // a clean finish AND after breaking early on shutdown or
+                        // a supervisor halt, so an interrupted sweep still makes
+                        // durable what it actually completed, and the crash
+                        // window narrows to a hard kill, which the resume marker
+                        // already recovers by re-sweeping.
+                        let published = if total_relations > 0 {
+                            match save_snapshot_blocking(Arc::clone(&lsp_state)).await {
+                                Ok(()) => {
+                                    lsp_state.mark_clean();
+                                    true
+                                }
+                                Err(error) => {
+                                    // Loud, and not fatal. The relations stay in
+                                    // the live graph and the resume marker still
+                                    // records what was enriched, so the next
+                                    // sweep re-derives them; what must not happen
+                                    // is losing this silently, which is the
+                                    // defect being closed.
+                                    warn!(
+                                        %error,
+                                        relations = total_relations,
+                                        "could not publish this sweep's enrichment; the \
+                                         relations stay live and the next sweep re-derives them"
+                                    );
+                                    false
+                                }
+                            }
+                        } else {
+                            false
+                        };
+
+                        // The breaker's count moves on the sweep's own outcome,
+                        // and is persisted because the loop it guards spans
+                        // daemon restarts rather than living inside one.
+                        let interruptions = next_interruption_count(
+                            read_sweep_interruptions(&lsp_state),
+                            tally.ended_early,
+                            tally.enriched,
+                        );
+                        write_sweep_interruptions(&lsp_state, interruptions);
+
+                        // The marker records durability, so it is written here
+                        // and only here, after the publication above settled it.
+                        // The set and the count come from the same arm, so a
+                        // divergence means a file was counted enriched without
+                        // being recorded, or recorded without being counted.
+                        // Either way the marker would stop describing the sweep.
+                        if enriched_this_sweep.len() != tally.enriched {
+                            warn!(
+                                recorded = enriched_this_sweep.len(),
+                                counted = tally.enriched,
+                                "the enriched-file set and the enriched count disagree; the \
+                                 marker no longer describes this sweep"
+                            );
+                        }
+                        if sweep_marker_is_durable(total_relations, published) {
+                            mark_files_enriched(&lsp_state, &enriched_this_sweep);
+                        } else {
+                            warn!(
+                                files = enriched_this_sweep.len(),
+                                relations = total_relations,
+                                "not recording these files as enriched: their relations were \
+                                 not published, so the next sweep must redo them"
+                            );
+                        }
+
                         // Marked complete even when the loop broke early on
                         // shutdown or a supervisor halt. A waiter blocked on a
                         // counter that only advances on a clean finish would
@@ -3330,6 +3554,8 @@ pub async fn run_with_authority_on(
                             definitions_over_budget = tally.definitions_over_budget,
                             not_visited,
                             ended_early = tally.ended_early,
+                            published,
+                            consecutive_fruitless_interruptions = interruptions,
                             unaccounted,
                             "LSP cold sweep complete"
                         );
@@ -3649,7 +3875,8 @@ mod tests {
         format_singleton_contention, next_embed_error_backoff, parse_duration_secs,
         parse_owner_watch_pid, should_enable_lsp_enrichment, should_flush_now, shutdown_signalled,
         watched_process_is_alive, ControlPlane, CoverageDrainVerdict, DaemonConfig, DaemonState,
-        DEFAULT_RUNTIME_SHUTDOWN_GRACE, DEFAULT_SHUTDOWN_ESCALATION_GRACE, RECON_IDLE,
+        FlushSuppression, DEFAULT_RUNTIME_SHUTDOWN_GRACE, DEFAULT_SHUTDOWN_ESCALATION_GRACE,
+        RECON_IDLE,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -4175,7 +4402,7 @@ mod tests {
         assert!(!should_flush_now(
             Duration::from_secs(10),
             Duration::from_secs(1),
-            false,
+            FlushSuppression::None,
             idle,
             periodic,
         ));
@@ -4183,7 +4410,7 @@ mod tests {
         assert!(should_flush_now(
             Duration::from_secs(10),
             Duration::from_secs(3),
-            false,
+            FlushSuppression::None,
             idle,
             periodic,
         ));
@@ -4198,7 +4425,7 @@ mod tests {
         assert!(!should_flush_now(
             Duration::from_secs(10),
             Duration::from_secs(5),
-            true,
+            FlushSuppression::EmbedPass,
             idle,
             periodic,
         ));
@@ -4209,7 +4436,7 @@ mod tests {
         assert!(!should_flush_now(
             Duration::from_secs(31),
             Duration::from_secs(5),
-            true,
+            FlushSuppression::EmbedPass,
             idle,
             periodic,
         ));
@@ -4217,10 +4444,148 @@ mod tests {
         assert!(should_flush_now(
             Duration::from_secs(31),
             Duration::from_secs(5),
-            false,
+            FlushSuppression::None,
             idle,
             periodic,
         ));
+    }
+
+    /// A cold sweep suppresses both clocks, for the reason the embed-pass arm
+    /// above already documents.
+    ///
+    /// Measured on a converted psf/requests store: one 188-second sweep
+    /// triggered a single background flush costing 96.6 seconds, carrying a
+    /// 56.2-second successor preparation whose `change_bodies_ms` was 0. A
+    /// whole-workspace rebuild and whole-store re-admission, for zero changed
+    /// content bodies, to persist edges the next sweep recomputes.
+    #[test]
+    fn an_lsp_sweep_suppresses_both_flush_clocks() {
+        let idle = Duration::from_secs(2);
+        let periodic = Duration::from_secs(30);
+        // A gap between files mid-sweep looks mutation-quiet; the idle clock
+        // must not read that as a moment to serialize the whole graph.
+        assert!(!should_flush_now(
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+            FlushSuppression::LspSweep,
+            idle,
+            periodic,
+        ));
+        // The periodic clock is suppressed too. A sweep runs for minutes, so a
+        // 30-second bound fires inside it by construction.
+        assert!(!should_flush_now(
+            Duration::from_secs(31),
+            Duration::from_secs(5),
+            FlushSuppression::LspSweep,
+            idle,
+            periodic,
+        ));
+    }
+
+    /// Suppression that became never-flushing would be a worse defect than the
+    /// flush it removed, so this is the arm that says it ends.
+    ///
+    /// The sweep marks the graph dirty when it finishes, so the very next pass
+    /// of the persistence loop sees a mutation-quiet dirty graph with no
+    /// suppression and flushes. Both clocks are checked, because a fix that
+    /// only restored the periodic bound would leave a sweep's own output
+    /// unpersisted for up to thirty seconds after it converged.
+    #[test]
+    fn the_flush_fires_as_soon_as_the_sweep_ends() {
+        let idle = Duration::from_secs(2);
+        let periodic = Duration::from_secs(30);
+        // Mutation-quiet past the idle threshold, sweep over: flush now.
+        assert!(should_flush_now(
+            Duration::from_secs(10),
+            Duration::from_secs(3),
+            FlushSuppression::None,
+            idle,
+            periodic,
+        ));
+        // And the periodic durability bound is intact the moment it lifts.
+        assert!(should_flush_now(
+            Duration::from_secs(31),
+            Duration::from_secs(1),
+            FlushSuppression::None,
+            idle,
+            periodic,
+        ));
+    }
+
+    /// A mutation that is NOT the sweep's own is still persisted, just later.
+    ///
+    /// This is the consequence worth stating rather than discovering: a live
+    /// write landing mid-sweep waits for the sweep to end before it is
+    /// flushed. The staleness is bounded by the sweep's own duration, and the
+    /// predicate cannot tell whose mutation it was, so the guarantee is
+    /// "flushed at sweep end", not "flushed immediately". Both rows below are
+    /// the same dirty state; only the suppression differs.
+    #[test]
+    fn a_non_sweep_mutation_mid_sweep_is_flushed_when_the_sweep_ends() {
+        let idle = Duration::from_secs(2);
+        let periodic = Duration::from_secs(30);
+        let since_save = Duration::from_secs(45);
+        let since_mutation = Duration::from_secs(10);
+        assert!(
+            !should_flush_now(
+                since_save,
+                since_mutation,
+                FlushSuppression::LspSweep,
+                idle,
+                periodic
+            ),
+            "a live write mid-sweep waits: this is the bounded staleness the change accepts"
+        );
+        assert!(
+            should_flush_now(
+                since_save,
+                since_mutation,
+                FlushSuppression::None,
+                idle,
+                periodic
+            ),
+            "and it is flushed as soon as the sweep ends, from the same dirty state"
+        );
+    }
+
+    /// An interrupted sweep records exactly the files it completed, and no more.
+    ///
+    /// The accumulator is pushed only on the arm that increments
+    /// `tally.enriched`, so today the property holds by code shape and a runtime
+    /// warning reports any divergence. Neither is enough on its own: a shape
+    /// invariant is one refactor from silently gone, and the warning only speaks
+    /// in production, after the damage. This pins the property where CI sees it.
+    ///
+    /// The case is a sweep that broke early having finished three files of four.
+    /// The marker must name those three and must NOT name the file the sweep
+    /// never reached, because naming it would make the next sweep skip a file
+    /// that was never enriched at all.
+    #[test]
+    fn an_interrupted_sweep_records_exactly_what_it_completed() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = DaemonState::open(initialized.layout).unwrap();
+
+        let completed = vec![
+            "src/requests/sessions.py".to_string(),
+            "src/requests/adapters.py".to_string(),
+            "src/requests/auth.py".to_string(),
+        ];
+        let never_reached = "src/requests/models.py";
+
+        super::mark_files_enriched(&state, &completed);
+
+        for file in &completed {
+            assert!(
+                super::file_already_enriched(&state, file),
+                "a file the interrupted sweep completed and published must be recorded: {file}"
+            );
+        }
+        assert!(
+            !super::file_already_enriched(&state, never_reached),
+            "a file the sweep never reached must NOT be recorded, or the next sweep skips a \
+             file that was never enriched"
+        );
     }
 
     #[test]
@@ -4880,7 +5245,10 @@ mod lsp_query_column_tests {
 
 #[cfg(test)]
 mod sweep_tally_tests {
-    use super::{file_definitions_within_budget, SweepTally};
+    use super::{
+        file_definitions_within_budget, next_interruption_count, sweep_circuit_open,
+        sweep_marker_is_durable, SweepTally, SWEEP_INTERRUPTION_LIMIT,
+    };
     use std::time::Duration;
 
     /// The number the sweep reports as `files`, and the one `/lsp/sweep/status`
@@ -4977,6 +5345,104 @@ mod sweep_tally_tests {
             leaking.unaccounted(66),
             36,
             "36 files left the sweep without reaching any counter and must be visible"
+        );
+    }
+
+    /// One interrupted sweep must NOT open the circuit.
+    ///
+    /// A plain SIGTERM during shutdown ends a sweep early, so a breaker that
+    /// tripped on a single interruption would fire on every clean stop and stop
+    /// enriching a perfectly healthy store. This is the arm that keeps the
+    /// breaker from being worse than the loop it guards.
+    #[test]
+    fn a_single_interrupted_sweep_does_not_open_the_circuit() {
+        let after_one = next_interruption_count(0, true, 0);
+        assert_eq!(after_one, 1);
+        assert!(
+            !sweep_circuit_open(after_one),
+            "one interrupted sweep is ordinary, not a failing store"
+        );
+        assert!(
+            !sweep_circuit_open(SWEEP_INTERRUPTION_LIMIT - 1),
+            "the breaker opens at the limit, not before it"
+        );
+    }
+
+    /// A store that keeps killing fruitless sweeps must back off.
+    ///
+    /// This is the marker-discard loop's own shape: a sweep dies before
+    /// enriching anything, the daemon restarts, queues another, dies again. One
+    /// stranger session logged 24 such sweeps.
+    #[test]
+    fn repeated_fruitless_interruptions_open_the_circuit() {
+        let mut count = 0;
+        for _ in 0..SWEEP_INTERRUPTION_LIMIT {
+            count = next_interruption_count(count, true, 0);
+        }
+        assert!(
+            sweep_circuit_open(count),
+            "after {SWEEP_INTERRUPTION_LIMIT} consecutive fruitless interruptions the next \
+             sweep must not be queued"
+        );
+    }
+
+    /// One clean completion clears it, and progress is not punished.
+    ///
+    /// Two distinct cases. A sweep that FINISHED resets the count outright, so a
+    /// store that recovers is not left permanently unswept. And a sweep that was
+    /// interrupted but still enriched files made progress, so it neither trips
+    /// the breaker nor resets it: the loop being guarded is the one that never
+    /// achieves anything.
+    #[test]
+    fn a_clean_completion_resets_and_progress_is_not_punished() {
+        assert_eq!(
+            next_interruption_count(SWEEP_INTERRUPTION_LIMIT, false, 0),
+            0,
+            "a sweep that ran to completion clears the breaker"
+        );
+        assert!(!sweep_circuit_open(0));
+        assert_eq!(
+            next_interruption_count(2, true, 19),
+            2,
+            "an interrupted sweep that still enriched 19 files made progress: neither a trip \
+             nor a reset"
+        );
+    }
+
+    /// A sweep whose publication failed must NOT record its files as enriched.
+    ///
+    /// This is the arm that keeps a failure recoverable. The marker's only
+    /// reader skips what it names, so marking unpublished files converts a
+    /// transient publication failure into a permanent skip: the relations are
+    /// gone, the marker says the files are done, and the next sweep passes over
+    /// them reporting `already_enriched`.
+    ///
+    /// The pre-existing recovery check cannot catch that, because
+    /// `graph_holds_language_server_relations` is an `.any()` over the graph and
+    /// a single surviving Lsp relation from any earlier pass keeps the marker.
+    #[test]
+    fn a_sweep_that_did_not_publish_records_nothing() {
+        assert!(
+            !sweep_marker_is_durable(4231, false),
+            "a sweep with relations that failed to publish must leave its files unmarked, \
+             so the next sweep redoes them instead of skipping them forever"
+        );
+        assert!(
+            sweep_marker_is_durable(4231, true),
+            "a sweep that published records what it enriched"
+        );
+    }
+
+    /// A sweep that produced nothing to publish still records its files.
+    ///
+    /// Without this arm the fix would trade a permanent skip for a permanent
+    /// re-sweep: a file that yields no relations has nothing that can be lost,
+    /// and sweeping it again on every daemon start forever is waste, not safety.
+    #[test]
+    fn a_sweep_with_nothing_to_publish_still_records_its_files() {
+        assert!(
+            sweep_marker_is_durable(0, false),
+            "no relations means nothing could be lost, so the visit is worth recording"
         );
     }
 
