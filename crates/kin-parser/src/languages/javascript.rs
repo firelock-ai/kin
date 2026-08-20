@@ -2855,4 +2855,316 @@ const tmp = 2;
             );
         }
     }
+
+    // ── defineProperty-shaped property definitions (FIR-2473) ───────────────
+    //
+    // express `lib/request.js` defines twelve of its most-used properties
+    // through `defineGetter(req, 'name', fn)` and none was an entity, so
+    // `req.ip` could not be located, packed, or traced while its
+    // assignment-form sibling `req.get` could. The fixtures below are that
+    // file's real shapes, plus the shapes a name-based rule would have
+    // wrongly admitted.
+
+    /// The express shape, verbatim in structure: the helper is declared BELOW
+    /// every call to it, so a single forward walk meets the calls first.
+    #[test]
+    fn parse_js_define_getter_helper_declared_after_its_uses() {
+        let adapter = JavaScriptAdapter;
+        let source = br#"
+var req = Object.create(http.IncomingMessage.prototype);
+
+defineGetter(req, 'ip', function ip(){
+  var trust = this.app.get('trust proxy fn');
+  return proxyaddr(this, trust);
+});
+
+defineGetter(req, 'protocol', function protocol(){
+  return this.connection.encrypted ? 'https' : 'http';
+});
+
+function defineGetter(obj, name, getter) {
+  Object.defineProperty(obj, name, {
+    configurable: true,
+    enumerable: true,
+    get: getter
+  });
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib/request.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let methods: Vec<&str> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Method)
+            .map(|e| e.name.as_str())
+            .collect();
+        assert!(
+            methods.contains(&"req.ip"),
+            "req.ip must be an entity, got {methods:?}"
+        );
+        assert!(
+            methods.contains(&"req.protocol"),
+            "req.protocol must be an entity, got {methods:?}"
+        );
+        let contains: Vec<(&str, &str)> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Contains)
+            .map(|r| (r.src_name.as_str(), r.dst_name.as_str()))
+            .collect();
+        assert!(contains.contains(&("req", "req.ip")));
+        assert!(contains.contains(&("req", "req.protocol")));
+    }
+
+    /// The span has to cover the getter BODY, because that is where the code a
+    /// reader is looking for lives. express's `req.ip` bug is on the line
+    /// inside the getter, not on the `defineGetter(` line, and a span stopping
+    /// at the call head would leave that line owned by nothing.
+    #[test]
+    fn parse_js_define_getter_span_covers_the_getter_body() {
+        let adapter = JavaScriptAdapter;
+        let source = br#"defineGetter(req, 'ip', function ip(){
+  var trust = this.app.get('trust proxy fn');
+  return proxyaddr(this, trust);
+});
+
+function defineGetter(obj, name, getter) {
+  Object.defineProperty(obj, name, { get: getter });
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib/request.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let ip = output
+            .entities
+            .iter()
+            .find(|e| e.name == "req.ip")
+            .expect("req.ip is an entity");
+        // Parser spans carry tree-sitter rows, which are 0-based: source line
+        // 1 is `start_line` 0. Asserted explicitly because a span read against
+        // the wrong base still looks like a span.
+        let span = &ip.span;
+        assert_eq!(span.start_line, 0, "starts at the defining statement");
+        // Source line 3, `return proxyaddr(this, trust);`, is the line a reader
+        // chasing the express bug lands on. It has to be inside this entity.
+        let body_line = 2;
+        assert!(
+            span.start_line <= body_line && body_line <= span.end_line,
+            "the getter body line {body_line} must fall inside [{}, {}]",
+            span.start_line,
+            span.end_line
+        );
+    }
+
+    /// Calls inside the getter belong to the property, not to the file. The
+    /// measured task was tracing `req.ip` to `proxyaddr`, which needs the edge.
+    #[test]
+    fn parse_js_define_getter_body_calls_belong_to_the_property() {
+        let adapter = JavaScriptAdapter;
+        let source = br#"defineGetter(req, 'ip', function ip(){
+  return proxyaddr(this, this.app.get('trust proxy fn'));
+});
+
+function defineGetter(obj, name, getter) {
+  Object.defineProperty(obj, name, { get: getter });
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib/request.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let from_ip: Vec<&str> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Calls && r.src_name == "req.ip")
+            .map(|r| r.dst_name.as_str())
+            .collect();
+        assert!(
+            from_ip.contains(&"proxyaddr"),
+            "req.ip must call proxyaddr, got {from_ip:?}"
+        );
+    }
+
+    /// `fresh` is the one of the twelve whose implementation is anonymous, so
+    /// the name can only come from the string argument.
+    #[test]
+    fn parse_js_define_getter_names_the_property_from_the_string_argument() {
+        let adapter = JavaScriptAdapter;
+        let source = br#"defineGetter(req, 'fresh', function(){
+  return true;
+});
+
+function defineGetter(obj, name, getter) {
+  Object.defineProperty(obj, name, { get: getter });
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib/request.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let methods: Vec<&str> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Method)
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(methods, vec!["req.fresh"]);
+    }
+
+    /// `Object.defineProperty` used directly needs no helper at all.
+    #[test]
+    fn parse_js_object_define_property_direct_call_defines_the_member() {
+        let adapter = JavaScriptAdapter;
+        let source = br#"Object.defineProperty(res, 'charset', {
+  get: function charset(){ return this._charset; }
+});
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib/response.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let methods: Vec<&str> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Method)
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(methods, vec!["res.charset"]);
+    }
+
+    /// FALSIFICATION. The rule reads what a helper DOES. A three-argument call
+    /// taking an object, a string and a function is also how every event
+    /// registration in JavaScript is written, and admitting it on shape alone
+    /// would invent `emitter.click`, a property no code defines.
+    #[test]
+    fn parse_js_a_three_argument_call_that_defines_nothing_produces_no_property() {
+        let adapter = JavaScriptAdapter;
+        let source = br#"registerHandler(emitter, 'click', function onClick(){
+  return handle();
+});
+
+function registerHandler(target, event, handler) {
+  target.addEventListener(event, handler);
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib/events.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let invented: Vec<&str> = output
+            .entities
+            .iter()
+            .filter(|e| e.name.starts_with("emitter."))
+            .map(|e| e.name.as_str())
+            .collect();
+        assert!(
+            invented.is_empty(),
+            "a handler registration defines no property, got {invented:?}"
+        );
+    }
+
+    /// FALSIFICATION. A helper that hands `Object.defineProperty` a name of its
+    /// own choosing rather than one of its parameters says nothing about what
+    /// its call sites define, so its call sites must mint nothing.
+    #[test]
+    fn parse_js_a_helper_that_does_not_forward_its_own_arguments_is_not_a_definer() {
+        let adapter = JavaScriptAdapter;
+        let source = br#"lockDown(req, 'ip', function ip(){ return 1; });
+
+function lockDown(obj, name, getter) {
+  Object.defineProperty(obj, 'frozen', { value: true });
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib/request.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let invented: Vec<&str> = output
+            .entities
+            .iter()
+            .filter(|e| e.name.starts_with("req."))
+            .map(|e| e.name.as_str())
+            .collect();
+        assert!(
+            invented.is_empty(),
+            "a helper that names its own property defines nothing for its callers, got {invented:?}"
+        );
+    }
+
+    /// FALSIFICATION. A computed property name is not a name. Recording the
+    /// expression's source text would put an entity called `req.[key]` in the
+    /// graph that nothing can ever be resolved against.
+    #[test]
+    fn parse_js_a_computed_property_name_produces_no_property() {
+        let adapter = JavaScriptAdapter;
+        let source = br#"defineGetter(req, key, function(){ return 1; });
+
+function defineGetter(obj, name, getter) {
+  Object.defineProperty(obj, name, { get: getter });
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib/request.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let invented: Vec<&str> = output
+            .entities
+            .iter()
+            .filter(|e| e.name.starts_with("req."))
+            .map(|e| e.name.as_str())
+            .collect();
+        assert!(invented.is_empty(), "got {invented:?}");
+    }
+
+    /// FALSIFICATION. A data property carries no implementation, so recording
+    /// it as a method would claim a function that does not exist.
+    #[test]
+    fn parse_js_a_data_property_is_not_recorded_as_a_method() {
+        let adapter = JavaScriptAdapter;
+        let source = br#"Object.defineProperty(res, 'version', { value: 3, enumerable: true });
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib/response.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let invented: Vec<&str> = output
+            .entities
+            .iter()
+            .filter(|e| e.name.starts_with("res."))
+            .map(|e| e.name.as_str())
+            .collect();
+        assert!(invented.is_empty(), "got {invented:?}");
+    }
+
+    /// The assignment path must keep working exactly as before. Both forms
+    /// appear in the same express file and both have to land.
+    #[test]
+    fn parse_js_assignment_and_define_getter_forms_coexist() {
+        let adapter = JavaScriptAdapter;
+        let source = br#"req.get =
+req.header = function header(name) {
+  return this.headers[name];
+};
+
+defineGetter(req, 'ip', function ip(){
+  return proxyaddr(this, trust);
+});
+
+function defineGetter(obj, name, getter) {
+  Object.defineProperty(obj, name, { get: getter });
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib/request.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let mut methods: Vec<&str> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Method)
+            .map(|e| e.name.as_str())
+            .collect();
+        methods.sort_unstable();
+        assert_eq!(methods, vec!["req.get", "req.header", "req.ip"]);
+        let owners: Vec<&str> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Class)
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(owners, vec!["req"], "one owner, not one per form");
+    }
 }
