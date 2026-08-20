@@ -691,6 +691,18 @@ pub fn handle_get_entity_sources<G: GraphStore>(
     Ok(assemble_entity_sources_response(resolved, &opts))
 }
 
+/// Certified dependents a pack will recover into its `dependents` group beyond
+/// the rows its own section already carried.
+///
+/// The group's membership must not depend on how much token budget was left,
+/// which is the whole point of recovering them, but a focal with hundreds of
+/// callers must not turn a budgeted pack into an unbudgeted one either. Past
+/// this the count is still exact: `certified_dependents` reports what the
+/// reference authority proved and `dependents_withheld` reports what did not
+/// fit, so a caller reading a short group knows to ask `find_references` for
+/// the rest rather than reading the group as the whole set.
+const CERTIFIED_DEPENDENTS_MAX: usize = 24;
+
 pub const GET_CONTEXT_PACK_DESC: &str = "\
 Assemble a focused, ready-to-read context bundle around one entity, fitted to a token \
 budget. Starting from a focal entity ID, Kin walks the relation graph to gather the \
@@ -714,9 +726,19 @@ edge leaving the focal, `relation: \"dependent_edge\"` is an edge arriving at it
 `relation: \"same_file_neighbor\"` means the focal had no dependency edge in either \
 direction, so the row is a neighbour sharing the focal's file rather than anything the \
 focal depends on. That last one is the usual shape for a class whose only edges are \
-containment, and those rows sort after the real edges. `dependency_selection` names \
-which of the two filled the list, how many rows each group returned, and, for the \
-fallback, how many same-file candidates there were and how many were dropped to fit. \
+containment, and those rows sort after the real edges. A row carrying \
+`bidirectional: true` is joined to the focal BOTH ways; it is grouped by the arriving \
+edge because that is the one that decides whether changing the focal breaks it. \
+`dependents` is assembled by the same collector `find_references` uses, on the same \
+graph, so the two tools cannot answer differently about one entity: a caller that tool \
+returns is in this group, and a bare-name receiver guess it declines to certify is in \
+neither. `dependency_selection` names which selection filled the dependency list, how \
+many rows each group returned, how many dependents the reference authority certified, \
+how many were withheld to stay inside the pack's budget, and, for the fallback, how many \
+same-file candidates there were and how many were dropped to fit. Read `edge_coverage` \
+and the response's `negative` verdict before acting on an EMPTY `dependents`: a graph \
+that does not link this language's calls across files returns the same `[]` for a symbol \
+with twenty callers as for one with none. \
 If get_entity_source is available to you it is cheaper for a raw \
 body alone; if you need to follow an actual call chain step by step, use trace_data_flow.";
 
@@ -861,6 +883,65 @@ pub fn handle_get_context_pack<G: GraphStore>(
         }
     };
 
+    // Membership of the `dependents` group is decided by the edge authority
+    // `find_references` reads, on the same store, in the same request. The two
+    // surfaces answer the same question about the same entity, so a pack that
+    // decided it independently could disagree with the tool beside it, and it
+    // did: on expressjs/express `res.sendFile` packed `dependents: []` while
+    // `find_references` on that id returned `res.download`, which calls it.
+    //
+    // This is the same call `handle_find_references` makes, not a second
+    // implementation of it. Everything that decides what counts as a reference
+    // -- the allowed edge classes, the self-edge exclusion, composition over
+    // proven overrides, and dropping a caller the workspace no longer contains
+    // -- is that function's, so the two cannot drift apart by being edited
+    // separately.
+    let reference_kinds = default_reference_kinds();
+    let reference_rows =
+        collect_graph_reference_rows(store, &entity_id, &reference_kinds, repository_authority)?;
+    // Observed before the partition, because a candidate row still witnesses the
+    // edge class it arrived on. Same rule as the reference tool's, so the
+    // coverage the pack publishes is the coverage that tool would publish.
+    let witnessed = match &focal_entity {
+        Some(entity) => answer_witnessed_classes(store, entity, &reference_rows),
+        None => Vec::new(),
+    };
+    // FIR-1552 again, in the direction that matters here: a row matched on a
+    // bare receiver name with nothing at the site proving the destination is a
+    // candidate, not a caller. `find_references` withholds it from its count,
+    // so a pack that promoted it to a dependent would be certifying what the
+    // reference surface declined to.
+    let mut certified_rows: Vec<ReferenceRow> = reference_rows
+        .into_iter()
+        .filter(|row| !row.receiver_name_guess)
+        .collect();
+    certified_rows.sort_by(|left, right| {
+        left.file_path
+            .cmp(&right.file_path)
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.entity_id.cmp(&right.entity_id))
+    });
+    let certified_ids: Vec<kin_model::ids::EntityId> = certified_rows
+        .iter()
+        .filter_map(|row| row.entity_id.as_deref())
+        .filter_map(|id| parse_entity_id(id).ok())
+        .collect();
+    let certified: std::collections::HashSet<kin_model::ids::EntityId> =
+        certified_ids.iter().copied().collect();
+    // What the graph can structurally answer over the classes the group was
+    // built from. An empty `dependents` is only evidence about the code when
+    // this says the focal's language links those classes across files, and
+    // nothing else in a pack reports it.
+    let edge_coverage = match &focal_entity {
+        Some(entity) => crate::edge_coverage::observe_cross_file_reference_coverage_witnessed(
+            store,
+            entity,
+            &reference_kinds,
+            &witnessed,
+        ),
+        None => serde_json::Value::Null,
+    };
+
     // The dependency section carries both directions, so it is served as two
     // groups named for what they are. Serving it as one list called
     // `dependencies` reported a focal's callers as things the focal depends on,
@@ -870,15 +951,66 @@ pub fn handle_get_context_pack<G: GraphStore>(
     // order survives the partition.
     let mut dependencies: Vec<serde_json::Value> = Vec::new();
     let mut dependents: Vec<serde_json::Value> = Vec::new();
+    let mut packed: std::collections::HashSet<kin_model::ids::EntityId> =
+        std::collections::HashSet::new();
     for entry in &pack.dependency_signatures {
-        let relation = selection.relation_for(&entry.entity_id);
-        let row = project_dep(entry, Some(relation))?;
+        let packed_relation = selection.relation_for(&entry.entity_id);
+        // The union, never the intersection. A certified caller is a dependent
+        // whatever the pack's own section made of it, and an arriving edge of a
+        // class the reference surface does not read -- `UsesType`, `Implements`,
+        // `Extends` -- is still a dependent the pack can see and that surface
+        // cannot. Taking either one alone would drop real blast radius.
+        let relation = if certified.contains(&entry.entity_id) {
+            DependencyRelation::DependentEdge
+        } else {
+            packed_relation
+        };
+        let mut row = project_dep(entry, Some(relation))?;
         match relation {
-            DependencyRelation::DependentEdge => dependents.push(row),
+            DependencyRelation::DependentEdge => {
+                // Nothing is lost when a pair is joined both ways. The pack used
+                // to resolve that by calling the neighbour a dependency, which
+                // on a JavaScript object literal spends a weak leaving
+                // `References` edge to erase a real arriving `Calls` -- and
+                // every sibling method has that shape, so a focal lost its whole
+                // caller set at once. The group is decided by the arriving edge
+                // and the other direction is stated on the row.
+                if packed_relation == DependencyRelation::DependencyEdge {
+                    row["bidirectional"] = serde_json::json!(true);
+                }
+                packed.insert(entry.entity_id);
+                dependents.push(row);
+            }
             DependencyRelation::DependencyEdge | DependencyRelation::SameFileNeighbor => {
                 dependencies.push(row)
             }
         }
+    }
+    // A certified caller the pack's own section never reached -- shed by the
+    // builder's token budget, or missed by its subgraph walk -- is exactly the
+    // shape this defect had. Recovering it here is what makes the group's
+    // membership a property of the answer rather than of how much budget was
+    // left, and the recovered rows carry the same shape as the projected ones so
+    // a reader cannot tell which path produced them.
+    let mut dependents_withheld = 0usize;
+    for id in &certified_ids {
+        if packed.contains(id) {
+            continue;
+        }
+        if dependents.len() >= CERTIFIED_DEPENDENTS_MAX {
+            dependents_withheld += 1;
+            continue;
+        }
+        let entry = kin_model::context::ContextEntry {
+            entity_id: *id,
+            projection_level: kin_model::context::ProjectionLevel::SignatureOnly,
+            content: String::new(),
+        };
+        dependents.push(project_dep(
+            &entry,
+            Some(DependencyRelation::DependentEdge),
+        )?);
+        packed.insert(*id);
     }
     let transitive: Vec<_> = pack
         .transitive_deps
@@ -898,15 +1030,30 @@ pub fn handle_get_context_pack<G: GraphStore>(
         "dependencies": dependencies,
         // Always present, empty included. "no dependents" and "this build does
         // not report dependents" are different answers, and a group that
-        // appears only when populated cannot tell them apart.
+        // appears only when populated cannot tell them apart. What separates
+        // them now is `edge_coverage` and the response's `negative` verdict:
+        // an empty group on a graph that demonstrably links this language's
+        // edges across files is an answer, and an empty group on one that does
+        // not is a gap, and both used to serialize as `[]`.
         "dependents": dependents,
         "dependency_selection": {
             "source": selection.source().as_str(),
             "returned": returned,
             "dependents_returned": dependents_returned,
+            // What the reference authority certified, stated beside what the
+            // group returned so the two can be compared. They differ when the
+            // pack sees an arriving edge of a class that authority does not
+            // read, and when the cap below withholds one.
+            "certified_dependents": certified_ids.len(),
+            "dependents_withheld": dependents_withheld,
             "same_file_candidates": selection.same_file_candidates(),
             "same_file_dropped": selection.same_file_dropped(),
         },
+        // The substrate behind the `dependents` group, so an empty group is
+        // read against what this graph can structurally answer for the focal's
+        // language rather than as a bare fact. Computed by the same observer
+        // `find_references` uses, from the same witnesses.
+        crate::edge_coverage::EDGE_COVERAGE_KEY: edge_coverage,
         "token_budget": budget.max_tokens(),
         "tokens_used": pack.actual_tokens,
     });
