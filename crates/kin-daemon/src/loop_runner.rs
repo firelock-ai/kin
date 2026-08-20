@@ -1670,6 +1670,60 @@ const COMMIT_YIELD_GRACE_INTERVALS: u32 = 5;
 /// The upper bound on holding off, whatever the other two say.
 const COMMIT_YIELD_GRACE_CEILING: Duration = Duration::from_secs(1);
 
+/// The largest number of poll intervals the first admitting round of a daemon's
+/// life will hold off for.
+///
+/// Eighty rather than five, and the difference is the whole cold-start fix.
+/// The three settled bounds all price the wait against a publication that has
+/// already happened. None of them price the only quantity the wait has to
+/// cover, which is how long a `kin commit` takes to reach this daemon, and on
+/// the first round that quantity is at its largest: `kin init` stops the daemon
+/// it converted with, so the commit after a store build either starts a daemon
+/// itself or meets one whose first tick is still publishing the build's
+/// leftovers, and either way its process is starting from cold.
+///
+/// Expressed in poll intervals rather than seconds so the promise the settled
+/// bound makes still holds here: a loop configured to react faster holds off
+/// proportionally less.
+const COLD_START_COMMIT_YIELD_GRACE_INTERVALS: u32 = 80;
+
+/// The upper bound on the first round's hold-off, whatever the cadence says.
+///
+/// Eight seconds because the window it has to cover was measured at 5,174 ms on
+/// shipped v0.5.43: the tick committed to publishing at 16:04:06.883 and the
+/// commit announced itself at 16:04:12.057, read from
+/// `publish_workspace_admission` and `coordination_gate_wait` in that run's
+/// daemon log. The settled grace cannot exceed 500 ms at the default cadence,
+/// which is ten times short of it.
+///
+/// Safe because it is spent at most once per daemon process and released the
+/// instant a commit announces itself. What it costs when no commit comes is one
+/// ambient admission arriving later than it used to, and nothing waits on that
+/// admission: `/commands/commit` forces its own complete admission of the
+/// working copy and never consults this loop.
+const COLD_START_COMMIT_YIELD_GRACE_CEILING: Duration = Duration::from_secs(8);
+
+/// The one cold-start grace a daemon process gets.
+///
+/// Held by the reconcile loop rather than derived from the publication record,
+/// because a commit that takes the first round leaves that record untouched:
+/// `/commands/commit` publishes its own successor through its own transaction
+/// and never reports one here, so a daemon whose first round yielded would look
+/// exactly as cold on the next round, and the next, forever.
+#[derive(Debug)]
+struct ColdStartGrace(bool);
+
+impl ColdStartGrace {
+    fn new() -> Self {
+        Self(true)
+    }
+
+    /// Take the cold-start grace if this process has not spent it yet.
+    fn claim(&mut self) -> bool {
+        std::mem::replace(&mut self.0, false)
+    }
+}
+
 /// How long a tick holds off before publishing, waiting to see whether a commit
 /// is about to make its publication redundant.
 ///
@@ -1689,16 +1743,35 @@ const COMMIT_YIELD_GRACE_CEILING: Duration = Duration::from_secs(1);
 /// less. And never more than a second.
 ///
 /// A daemon that has not published yet has no measurement to scale by, so it
-/// uses the interval bound alone. That is the protective direction on purpose:
-/// the first publication of a process is exactly the one whose cost is unknown.
-fn commit_yield_grace(state: &DaemonState, interval: Duration) -> Duration {
+/// uses the interval bound alone.
+///
+/// Those three bounds together are why the first commit after a store build
+/// still lost. At the default hundred-millisecond cadence the interval bound is
+/// 500ms and dominates every other term, so no publication cost, however large,
+/// buys a longer wait: an eighth of the 13,358ms publication measured on
+/// shipped v0.5.43 is 1,669ms and the ceiling clipped it to 500. The window it
+/// had to cover on that run was 5,174ms. `cold_start` is the correction, and it
+/// applies to the first admitting round of a process rather than to a cost,
+/// because the quantity that is large on that round is the commit's own
+/// startup, which no publication measurement describes.
+fn commit_yield_grace(state: &DaemonState, interval: Duration, cold_start: bool) -> Duration {
     let ceiling = interval
         .saturating_mul(COMMIT_YIELD_GRACE_INTERVALS)
         .min(COMMIT_YIELD_GRACE_CEILING);
-    match state.last_authority_publication() {
+    let settled = match state.last_authority_publication() {
         Some(last) => (last / COMMIT_YIELD_GRACE_SHARE).min(ceiling),
         None => ceiling,
+    };
+    if !cold_start {
+        return settled;
     }
+    // Never shorter than a settled round would have waited. The cold round is
+    // the one with the most to gain from waiting and the least to lose by it.
+    settled.max(
+        interval
+            .saturating_mul(COLD_START_COMMIT_YIELD_GRACE_INTERVALS)
+            .min(COLD_START_COMMIT_YIELD_GRACE_CEILING),
+    )
 }
 
 /// Report whether this reconcile round should stand down for a commit.
@@ -1711,11 +1784,14 @@ fn commit_yield_grace(state: &DaemonState, interval: Duration) -> Duration {
 /// itself.
 ///
 /// The wait holds no lock. It happens before the round takes the coordination
-/// gate, so the commit it is waiting for is never waiting on it.
+/// gate, so the commit it is waiting for is never waiting on it. That is what
+/// makes `cold_start` affordable: the round that claims it can wait seconds
+/// without any other path in the daemon noticing.
 async fn wait_out_imminent_commit(
     state: &DaemonState,
     interval: Duration,
     consecutive_yields: u32,
+    cold_start: bool,
 ) -> bool {
     if consecutive_yields >= MAX_CONSECUTIVE_COMMIT_YIELDS {
         return false;
@@ -1728,7 +1804,7 @@ async fn wait_out_imminent_commit(
     if state.pending_commits.any() {
         return true;
     }
-    let grace = commit_yield_grace(state, interval);
+    let grace = commit_yield_grace(state, interval, cold_start);
     if grace.is_zero() {
         return false;
     }
@@ -1872,6 +1948,11 @@ pub async fn run_loop(
     // Bounded by MAX_CONSECUTIVE_COMMIT_YIELDS so a commit that never leaves the
     // daemon cannot hold ambient admission off forever.
     let mut commit_yields: u32 = 0;
+    // The one long hold-off this process gets, claimed by the first round that
+    // has anything to admit. That round is the one whose commit is starting a
+    // `kin` process from cold, and the settled bounds are sized for a commit
+    // that is already warm.
+    let mut cold_start_grace = ColdStartGrace::new();
 
     // Register with the self-limit supervisor. Registered here rather than at
     // daemon start so a repository that never runs this loop — filesystem
@@ -2071,11 +2152,17 @@ pub async fn run_loop(
         // the retry ladder. The working stretch is deliberately not ended here
         // either. This path is bounded, and a stretch cleared on a path the loop
         // keeps reaching is a stretch the supervisor can no longer measure.
-        if wait_out_imminent_commit(&state, interval, commit_yields).await {
+        // Claimed here rather than inside the wait, because the claim is about
+        // this round having reached the wait at all: the first round with
+        // events to admit is the cold one whether it ends up standing down or
+        // admitting.
+        let cold_start = cold_start_grace.claim();
+        if wait_out_imminent_commit(&state, interval, commit_yields, cold_start).await {
             commit_yields += 1;
             debug!(
                 consecutive = commit_yields,
                 pending = pending_events.len(),
+                cold_start,
                 "holding this reconcile round for a commit inside the daemon"
             );
             tokio::select! {
@@ -5907,7 +5994,7 @@ mod tests {
         let _commit = state.pending_commits.announce();
 
         assert!(
-            wait_out_imminent_commit(&state, Duration::from_secs(3600), 0).await,
+            wait_out_imminent_commit(&state, Duration::from_secs(3600), 0, false).await,
             "a commit inside the daemon is read directly, not waited for"
         );
     }
@@ -5924,7 +6011,7 @@ mod tests {
 
         let started = std::time::Instant::now();
         assert!(
-            !wait_out_imminent_commit(&state, Duration::from_millis(2), 0).await,
+            !wait_out_imminent_commit(&state, Duration::from_millis(2), 0, false).await,
             "no commit arrived, so the round admits"
         );
         assert!(
@@ -5951,7 +6038,7 @@ mod tests {
         // A 200ms poll interval puts the grace at its one-second ceiling, which
         // is fifty times the arrival above.
         assert!(
-            wait_out_imminent_commit(&state, Duration::from_millis(200), 0).await,
+            wait_out_imminent_commit(&state, Duration::from_millis(200), 0, false).await,
             "a commit that arrives inside the grace takes the round"
         );
         arriving.abort();
@@ -5970,7 +6057,7 @@ mod tests {
 
         for round in 0..MAX_CONSECUTIVE_COMMIT_YIELDS {
             assert!(
-                wait_out_imminent_commit(&state, Duration::from_millis(2), round).await,
+                wait_out_imminent_commit(&state, Duration::from_millis(2), round, false).await,
                 "round {round} is within the bound and stands down"
             );
         }
@@ -5978,7 +6065,8 @@ mod tests {
             !wait_out_imminent_commit(
                 &state,
                 Duration::from_millis(2),
-                MAX_CONSECUTIVE_COMMIT_YIELDS
+                MAX_CONSECUTIVE_COMMIT_YIELDS,
+                false
             )
             .await,
             "past the bound the round admits, however loudly a commit is still announcing itself"
@@ -5995,7 +6083,7 @@ mod tests {
         let interval = Duration::from_millis(100);
 
         assert_eq!(
-            commit_yield_grace(&state, interval),
+            commit_yield_grace(&state, interval, false),
             interval * COMMIT_YIELD_GRACE_INTERVALS,
             "a daemon that has never published has no measurement to scale by and uses the \
              interval bound"
@@ -6003,7 +6091,7 @@ mod tests {
 
         state.record_authority_publication(Duration::from_micros(400));
         assert_eq!(
-            commit_yield_grace(&state, interval),
+            commit_yield_grace(&state, interval, false),
             Duration::from_micros(50),
             "a publication measured in microseconds is not worth a wait measured in \
              milliseconds"
@@ -6011,14 +6099,134 @@ mod tests {
 
         state.record_authority_publication(Duration::from_secs(12));
         assert_eq!(
-            commit_yield_grace(&state, interval),
+            commit_yield_grace(&state, interval, false),
             interval * COMMIT_YIELD_GRACE_INTERVALS,
             "an eighth of twelve seconds is more than the interval bound allows"
         );
         assert!(
-            commit_yield_grace(&state, Duration::from_secs(60)) <= COMMIT_YIELD_GRACE_CEILING,
+            commit_yield_grace(&state, Duration::from_secs(60), false) <= COMMIT_YIELD_GRACE_CEILING,
             "no poll cadence may turn the grace into a stall"
         );
+    }
+
+    /// The window the first round has to cover, measured on shipped v0.5.43.
+    ///
+    /// The tick committed to publishing at 16:04:06.883 and the commit
+    /// announced itself at 16:04:12.057, read from `publish_workspace_admission`
+    /// and `coordination_gate_wait` in that run's daemon log. Every settled
+    /// bound is an order of magnitude under it.
+    const MEASURED_COLD_COMMIT_ARRIVAL: Duration = Duration::from_millis(5174);
+
+    /// The first round of a daemon's life outwaits a cold commit's arrival, and
+    /// no settled round can, however expensive the publication it is protecting.
+    #[test]
+    fn the_first_round_of_a_daemons_life_outwaits_a_cold_commits_arrival() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let interval = Duration::from_millis(100);
+
+        assert!(
+            commit_yield_grace(&state, interval, true) >= MEASURED_COLD_COMMIT_ARRIVAL,
+            "the first round must outwait the arrival that was measured losing this race"
+        );
+
+        // The publication that lost it. An eighth of this is 1,669ms, and the
+        // interval bound clips even that to 500, which is the arithmetic the
+        // cold round exists to escape.
+        state.record_authority_publication(Duration::from_millis(13_358));
+        assert!(
+            commit_yield_grace(&state, interval, false) < MEASURED_COLD_COMMIT_ARRIVAL,
+            "a settled round cannot reach that arrival at any publication cost, which is why \
+             re-tuning the share would not have fixed this"
+        );
+        assert!(
+            commit_yield_grace(&state, interval, true) >= MEASURED_COLD_COMMIT_ARRIVAL,
+            "recording an expensive publication must not shorten the cold round"
+        );
+    }
+
+    /// The cold round keeps the promise the settled bound makes: a loop
+    /// configured to react faster holds off proportionally less.
+    #[test]
+    fn a_faster_configured_loop_holds_off_less_even_on_its_cold_round() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+
+        let fast = commit_yield_grace(&state, Duration::from_millis(10), true);
+        let default = commit_yield_grace(&state, Duration::from_millis(100), true);
+        assert!(
+            fast < default,
+            "a ten-millisecond cadence must not buy the same hold-off as a hundred"
+        );
+        assert!(
+            commit_yield_grace(&state, Duration::from_secs(60), true)
+                <= COLD_START_COMMIT_YIELD_GRACE_CEILING,
+            "no poll cadence may turn the cold round into a stall either"
+        );
+    }
+
+    /// The whole point, stated as behavior rather than arithmetic: a commit that
+    /// arrives after the settled grace has expired still takes the cold round.
+    ///
+    /// Both directions run in one test. An assertion that only the cold round
+    /// stands down would also pass with the wait deleted, if the commit happened
+    /// to be announced by the time `any()` was read; the settled arm is what
+    /// makes that impossible, because it proves the same arrival is missed when
+    /// the round is not cold.
+    ///
+    /// Real timers rather than a paused clock, so the wait exercised here is the
+    /// one production runs. The arrival is five times the 500ms a settled round
+    /// waits at this cadence, which is the margin that keeps a loaded machine
+    /// from deciding the result.
+    #[tokio::test]
+    async fn a_cold_round_stands_down_for_a_commit_a_settled_round_would_have_missed() {
+        const ARRIVES_AFTER: Duration = Duration::from_millis(2500);
+        let interval = Duration::from_millis(100);
+
+        for (cold_start, expected) in [(false, false), (true, true)] {
+            let repo = tempfile::tempdir().unwrap();
+            let state = open_test_state(&repo);
+            let announcing = Arc::clone(&state);
+            let arriving = tokio::spawn(async move {
+                tokio::time::sleep(ARRIVES_AFTER).await;
+                let _commit = announcing.pending_commits.announce();
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            });
+
+            let started = std::time::Instant::now();
+            let stood_down = wait_out_imminent_commit(&state, interval, 0, cold_start).await;
+            let waited = started.elapsed();
+            arriving.abort();
+
+            assert_eq!(
+                stood_down,
+                expected,
+                "a commit arriving {}ms in must {} the round when cold_start is {cold_start}",
+                ARRIVES_AFTER.as_millis(),
+                if expected { "take" } else { "miss" },
+            );
+            if !cold_start {
+                assert!(
+                    waited < ARRIVES_AFTER,
+                    "the settled round must give up before the commit arrives, or this test \
+                     proves nothing about the cold round; it waited {waited:?} on a machine \
+                     that may simply be too loaded to schedule a 500ms timer"
+                );
+            }
+        }
+    }
+
+    /// One cold round per process, not one per round.
+    #[test]
+    fn the_cold_start_grace_is_spent_once() {
+        let mut grace = ColdStartGrace::new();
+        assert!(grace.claim(), "the first round claims it");
+        assert!(
+            !grace.claim(),
+            "a second claim would let every round hold off for seconds, because a commit that \
+             takes the first round leaves no publication record to mark the process warm"
+        );
+        assert!(!grace.claim(), "and it stays spent");
     }
 }
 
