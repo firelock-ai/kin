@@ -152,3 +152,58 @@ fn init_finishes_its_store_when_the_reader_closes_the_pipe() {
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
+
+/// The conversion phase must leave no daemon behind, including when it exits
+/// early.
+///
+/// `kin init` starts a daemon to run the language-server sweep. The cleanup that
+/// stops it sat after the happy-path wait, so every early return skipped it. On
+/// a CI runner the sweep POST was refused 401 and the phase returned before the
+/// stop, and two minutes later an independent daemon could not start against the
+/// same repository: "another kin daemon (pid 10195) already owns ... and is
+/// still running".
+///
+/// This drives the early-exit path by construction rather than by hoping: with
+/// no language server on PATH the daemon reports `enrichment_available: false`
+/// and the phase returns immediately, which is the same shape as the 401 and
+/// reaches the same cleanup. A leaked daemon fails the assertion below by
+/// leaving a live pid recorded for the repository.
+#[test]
+fn the_conversion_phase_leaves_no_daemon_behind_when_it_exits_early() {
+    let root = tempdir().expect("temp root");
+    let repo = root.path().join("no-leak");
+    seed_linkable_git_repo(&repo);
+
+    let runtime = IsolatedDaemonRuntime::new(&repo);
+    let output = runtime
+        .process_command_for_test(env!("CARGO_BIN_EXE_kin"))
+        .arg("init")
+        .arg(&repo)
+        // No language server can be found on this PATH, so the phase takes its
+        // early exit. `sh` and the core utilities the CLI shells out to live in
+        // the standard directories, which carry no language server.
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .expect("run kin init");
+    assert!(
+        output.status.success(),
+        "init must succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The daemon record is the evidence. A phase that stopped what it started
+    // leaves either no pid file or a pid that is gone; a leaked daemon leaves a
+    // live one, which is exactly what blocked the next daemon on the runner.
+    let pid_file = repo.join(".kin").join("daemon.pid");
+    if let Ok(recorded) = fs::read_to_string(&pid_file) {
+        if let Ok(pid) = recorded.trim().parse::<i32>() {
+            let alive = unsafe { libc::kill(pid, 0) } == 0;
+            assert!(
+                !alive,
+                "kin init left daemon pid {pid} running; the conversion phase must stop the \
+                 daemon it started on every exit, including its early ones"
+            );
+        }
+    }
+}

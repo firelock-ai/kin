@@ -835,7 +835,7 @@ pub async fn stop(all: bool, machine: bool, json: bool) -> Result<()> {
         };
         stop_all(scope, json, false).await
     } else {
-        stop_current_repo(json).await
+        stop_current_repo(json, false, None).await
     }
 }
 
@@ -1040,9 +1040,27 @@ fn retire_worker_endpoint(
     }
 }
 
-async fn stop_current_repo(json: bool) -> Result<()> {
-    let cwd = std::env::current_dir()?;
-    let Some(layout) = kin_core::KinLayout::discover(&cwd) else {
+/// Stop this repository's worker daemon, and only this repository's.
+///
+/// `quiet` suppresses the report. `kin init`'s conversion phase uses it: that
+/// phase ends by stopping the daemon it started, and a second command's report
+/// on stdout there is not chatty output, it corrupts `kin init --json`. Never
+/// widened to a machine-wide stop for that caller, which would take down other
+/// lanes' daemons to tidy up after one conversion.
+async fn stop_current_repo(json: bool, quiet: bool, kin_root: Option<&Path>) -> Result<()> {
+    // The repository this stop is about, named by the caller when it has one.
+    //
+    // Discovering it from the process working directory is right for
+    // `kin daemon stop`, typed inside a repo, and WRONG for a caller that was
+    // handed a path: `kin init /elsewhere` runs with a working directory that is
+    // not the new repository, so the discovery failed, the stop bailed, and the
+    // daemon the conversion phase had started was left running. The next daemon
+    // on that repository then refused to start because one already owned it.
+    let layout = match kin_root {
+        Some(root) => kin_core::KinLayout::discover(root),
+        None => kin_core::KinLayout::discover(&std::env::current_dir()?),
+    };
+    let Some(layout) = layout else {
         bail!(
             "not inside a Kin repository — run `kin daemon stop` from a repo, or \
              `kin daemon stop --all` to stop every daemon"
@@ -1066,9 +1084,13 @@ async fn stop_current_repo(json: bool) -> Result<()> {
                 "stopped": [],
                 "all_stopped": true,
             });
-            println!("{}", serde_json::to_string_pretty(&payload)?);
+            if !quiet {
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+            }
         } else {
-            println!("No worker daemon running for repo '{label}' (nothing to stop).");
+            if !quiet {
+                println!("No worker daemon running for repo '{label}' (nothing to stop).");
+            }
         }
         return Ok(());
     };
@@ -1082,7 +1104,15 @@ async fn stop_current_repo(json: bool) -> Result<()> {
         outcome,
         preserved_endpoint,
     }];
+    if quiet {
+        return Ok(());
+    }
     finish_stop("current-repo", &report, json)
+}
+
+/// Stop this repository's worker daemon without writing a report to stdout.
+pub(crate) async fn stop_current_repo_quiet(kin_root: &Path) -> Result<()> {
+    stop_current_repo(false, true, Some(kin_root)).await
 }
 
 /// Resolve the pid of the current repo's worker daemon, the way the daemon

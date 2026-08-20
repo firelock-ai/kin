@@ -688,7 +688,6 @@ pub enum LspEnrichmentMessage {
     /// Incremental: enrich only these specific changed entities.
     Incremental(LspEnrichmentRequest),
     /// Cold sweep: enrich ALL entities in the graph, file by file.
-    /// Triggered after init/migrate/reconcile.
     Sweep,
 }
 
@@ -1283,6 +1282,34 @@ pub struct DaemonState {
     /// Channel for LSP enrichment messages (incremental or sweep).
     /// None if LSP enrichment is disabled (no servers found).
     pub lsp_enrichment_tx: Option<tokio::sync::mpsc::Sender<LspEnrichmentMessage>>,
+    /// How far the running cold sweep has got, and how many have finished.
+    ///
+    /// A sweep is asynchronous and takes minutes on a real repository, and until
+    /// this existed nothing could tell a converged graph from one still being
+    /// enriched: `POST /lsp/sweep` answered `sweep_queued` and never spoke
+    /// again. A caller that must not query a half-enriched graph, which is every
+    /// conversion, had no signal to wait on. These are the signal.
+    pub lsp_sweep_files_done: AtomicU64,
+    pub lsp_sweep_files_total: AtomicU64,
+    /// Incremented when a sweep finishes, so a waiter can tell "the sweep I
+    /// asked for has completed" from "a sweep is not running yet". A bare
+    /// running/idle flag cannot: a waiter that polls before the worker picks the
+    /// message up reads idle and concludes it is done.
+    pub lsp_sweeps_completed: AtomicU64,
+    /// Set while a sweep is in flight.
+    pub lsp_sweep_running: AtomicBool,
+    /// Files a sweep has finished enriching, so a later pass can skip them.
+    ///
+    /// An explicit marker rather than an inference from the graph. Two attempts
+    /// to infer it from relation origin failed, both silently and both on the
+    /// files that matter: asking whether a file's entities carry an Lsp-origin
+    /// relation counts edges pointing INTO them, and narrowing to edges they are
+    /// the SOURCE of still skipped `sessions.py`, `auth.py` and `adapters.py`,
+    /// because enrichment writes source-side edges from more than one direction.
+    /// A marker the sweep writes when it finishes a file cannot be confused by
+    /// any of that: it records what the sweep DID, which is the only thing a
+    /// skip is entitled to act on.
+    pub lsp_enriched_files: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Repo ID resolved once at construction. Cached to avoid re-reading
     /// `.kin/manifest.json` on every snapshot save — under high host
     /// concurrency those reads contend and surface as opaque "Core error"
@@ -2356,6 +2383,11 @@ impl DaemonState {
             idle_timeout_ms: AtomicU64::new(0),
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
+            lsp_sweep_files_done: AtomicU64::new(0),
+            lsp_sweep_files_total: AtomicU64::new(0),
+            lsp_sweeps_completed: AtomicU64::new(0),
+            lsp_sweep_running: AtomicBool::new(false),
+            lsp_enriched_files: std::sync::Mutex::new(std::collections::HashSet::new()),
             cached_repo_id,
             cached_workspace_id: Some(workspace_id),
             is_shutdown: AtomicBool::new(false),
@@ -2579,6 +2611,11 @@ impl DaemonState {
             idle_timeout_ms: AtomicU64::new(0),
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
+            lsp_sweep_files_done: AtomicU64::new(0),
+            lsp_sweep_files_total: AtomicU64::new(0),
+            lsp_sweeps_completed: AtomicU64::new(0),
+            lsp_sweep_running: AtomicBool::new(false),
+            lsp_enriched_files: std::sync::Mutex::new(std::collections::HashSet::new()),
             cached_repo_id: repo_id.to_string(),
             cached_workspace_id: None,
             is_shutdown: AtomicBool::new(false),
@@ -5386,18 +5423,40 @@ impl DaemonState {
     }
 
     /// Queue a cold sweep that enriches ALL entities in the graph via LSP.
-    /// Triggered after init/migrate/reconcile. No-op if LSP enrichment is not available.
-    pub fn queue_lsp_sweep(&self) {
+    ///
+    /// No-op if LSP enrichment is not available. This used to claim it was
+    /// "triggered after init/migrate/reconcile" and none of those triggered it:
+    /// the only caller was `POST /lsp/sweep`, so on a freshly converted
+    /// repository the enrichment worker sat blocked on a channel nothing fed and
+    /// no cross-file reference edge was ever produced. The daemon now queues one
+    /// at startup when servers are present and the graph holds files with no
+    /// language-server evidence yet.
+    pub fn queue_lsp_sweep(&self) -> bool {
         if self.filesystem_reconcile_disabled() {
-            return;
+            return false;
+        }
+        // One sweep at a time. The daemon queues one at startup and a caller may
+        // queue another, and two sweeps over one graph is not merely wasteful:
+        // a waiter that captured its baseline before the second was queued sees
+        // the FIRST one finish, returns, and hands back a graph the second is
+        // still mutating. That is what left `kin init` reporting a converged
+        // repository while a sweep ran on underneath it.
+        if self
+            .lsp_sweep_running
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return false;
         }
         if let Some(ref tx) = self.lsp_enrichment_tx {
             if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
                 tx.try_send(LspEnrichmentMessage::Sweep)
             {
                 warn!("LSP enrichment channel full, sweep request dropped");
+                return false;
             }
+            return true;
         }
+        false
     }
 
     /// Return the current reconciliation status as a human-readable string.

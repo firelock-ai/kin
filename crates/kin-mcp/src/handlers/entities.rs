@@ -1208,6 +1208,9 @@ fn spine_reference_rows(
             // payload could show that it was.
             resolution: None,
             receiver_name_guess: false,
+            // A federated xref reaches the focal directly in the other
+            // repository's graph; nothing here is composed over an override.
+            via_override_of: None,
         });
     }
 
@@ -1394,12 +1397,25 @@ fn reference_row_json(row: ReferenceRow, include_snippets: bool) -> serde_json::
             .into_iter()
             .map(relation_kind_name)
             .collect::<Vec<_>>(),
-        // How strongly this reference was resolved: `type_resolved`,
-        // `import_scoped`, or `name_only`. `name_only` is a same-name match
-        // with nothing at the call site proving the destination, so it is a
-        // candidate rather than a fact. Absent only for a federated row, whose
-        // edge lives in another repository's graph.
-        "resolution": row.resolution.map(RelationResolution::as_str),
+        // How strongly this reference was resolved. Normally `type_resolved`,
+        // `import_scoped`, or `name_only`; `name_only` is a same-name match with
+        // nothing at the call site proving the destination, so it is a candidate
+        // rather than a fact. Absent only for a federated row, whose edge lives
+        // in another repository's graph.
+        //
+        // A row composed over a proven override reports
+        // `via_override_of=<base>` instead. It is a reference and it counts, but
+        // it is not the same fact as a direct call: the caller provably calls
+        // the BASE, and the focal provably overrides that base. A reader
+        // separating direct callers from dispatch-reachable ones needs to see
+        // which, and one undifferentiated `type_resolved` would hide it.
+        "resolution": match (&row.via_override_of, row.resolution) {
+            (Some(base), _) => Some(format!("via_override_of={base}")),
+            (None, resolution) => resolution.map(|r| r.as_str().to_string()),
+        },
+        // The base named on its own, so a consumer filters on it without
+        // parsing the label.
+        "via_override_of": row.via_override_of,
     });
     if include_snippets {
         value["signature"] = serde_json::json!(row.signature);
