@@ -354,7 +354,9 @@ fn extract_ts_node(
                 if child.kind() == "default" || child.utf8_text(source).unwrap_or("") == "default" {
                     has_default = true;
                 }
-                extract_ts_node(&child, source, file_id, entities, relations, owners, definers);
+                extract_ts_node(
+                    &child, source, file_id, entities, relations, owners, definers,
+                );
             }
             // If this is a default export and recursion didn't create any entities,
             // create a synthetic "default" entity so the linker can resolve
