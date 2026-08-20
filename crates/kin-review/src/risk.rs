@@ -1056,6 +1056,68 @@ mod tests {
         );
     }
 
+    /// A removal whose only consumers are tests, pinned deliberately because
+    /// FIR-2485 asked for it to be and because an unpinned choice here is the
+    /// same class of defect as the one this change fixes.
+    ///
+    /// It fires. `shadow.rs`'s BLOCKING gate keys on non-test consumers, and
+    /// that is right for a gate: a test is not what decides whether a deletion
+    /// is safe to merge. This is not that gate. It is a risk finding, and
+    /// deleting a function a test calls does break the test, so the blast radius
+    /// is real and a reviewer should see it. kin#978 made the same call in the
+    /// message, where a test consumer is listed but sorts after production ones
+    /// and yields the capped slots to them.
+    ///
+    /// The two therefore disagree ON PURPOSE, and the disagreement is legible:
+    /// the finding names the test, the gate does not block on it.
+    #[test]
+    fn a_removal_consumed_only_by_a_test_still_reports_it() {
+        use crate::diff::{RelationChange, RelationChangeKind};
+
+        let removed = placed_entity("helper_under_test", "src/helper.rs", 10);
+        let mut only_test = placed_entity("tests_helper", "tests/helper.rs", 5);
+        only_test.role = EntityRole::Test;
+
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: removed.id,
+                kind: EntityChangeKind::Removed {
+                    old: Some(removed.clone()),
+                },
+            }],
+            relation_changes: vec![RelationChange {
+                kind: RelationChangeKind::Removed {
+                    old: calls_relation(&only_test, &removed),
+                },
+            }],
+            ..Default::default()
+        };
+        // `consumer_count` is non-test by definition, so the recorded count is
+        // zero here and the relation walk is the only source that sees this.
+        let impact = ImpactReport {
+            affected_tests: vec![only_test.clone()],
+            entity_impacts: vec![entity_impact_counts(removed.id, 0, 0, 1)],
+            ..Default::default()
+        };
+
+        let summary = assess_risk(&diff, &impact);
+        let finding = summary
+            .breaking_changes
+            .iter()
+            .find(|f| f.contains("helper_under_test"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "deleting a function a test calls breaks that test, and a reviewer \
+                     should see it: {:?}",
+                    summary.breaking_changes
+                )
+            });
+        assert!(
+            finding.contains("tests_helper"),
+            "and the finding names the test, so the reader can judge it: {finding}"
+        );
+    }
+
     #[test]
     fn low_risk_for_empty_diff() {
         let diff = SemanticDiff::default();
