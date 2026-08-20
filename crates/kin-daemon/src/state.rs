@@ -1301,6 +1301,11 @@ pub struct DaemonState {
     /// conversion, had no signal to wait on. These are the signal.
     pub lsp_sweep_files_done: AtomicU64,
     pub lsp_sweep_files_total: AtomicU64,
+    /// Files the last cold sweep walked past without being able to enrich.
+    ///
+    /// Served beside `files_done` so a caller can tell a converged sweep from
+    /// one that could not run. `files_done` alone cannot: both report zero.
+    pub lsp_sweep_files_blocked: AtomicU64,
     /// Incremented when a sweep finishes, so a waiter can tell "the sweep I
     /// asked for has completed" from "a sweep is not running yet". A bare
     /// running/idle flag cannot: a waiter that polls before the worker picks the
@@ -2395,6 +2400,7 @@ impl DaemonState {
             lsp_enrichment_tx: None,
             lsp_sweep_files_done: AtomicU64::new(0),
             lsp_sweep_files_total: AtomicU64::new(0),
+            lsp_sweep_files_blocked: AtomicU64::new(0),
             lsp_sweeps_completed: AtomicU64::new(0),
             lsp_sweep_running: AtomicBool::new(false),
             lsp_enriched_files: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -2623,6 +2629,7 @@ impl DaemonState {
             lsp_enrichment_tx: None,
             lsp_sweep_files_done: AtomicU64::new(0),
             lsp_sweep_files_total: AtomicU64::new(0),
+            lsp_sweep_files_blocked: AtomicU64::new(0),
             lsp_sweeps_completed: AtomicU64::new(0),
             lsp_sweep_running: AtomicBool::new(false),
             lsp_enriched_files: std::sync::Mutex::new(std::collections::HashSet::new()),

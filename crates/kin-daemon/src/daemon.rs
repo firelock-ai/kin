@@ -1379,6 +1379,114 @@ fn lsp_query_column(signature: &str, name: &str, start_col: u32) -> u32 {
     start_col
 }
 
+/// What a cold sweep did with every file it walked.
+///
+/// The sweep used to report only the files it counted, and it counted a file in
+/// exactly two places: one it enriched, and one it skipped as already enriched.
+/// Every other way out of the loop was a bare `continue`, so a sweep that could
+/// not do anything at all reported `files=0 total_files=66` and called itself
+/// complete. On a JavaScript repository with a working language server on PATH
+/// that is what a stranger saw at the end of their first conversion, and the
+/// zero read as convergence rather than as a sweep that never ran.
+///
+/// Every exit now lands in one of these fields, and `unaccounted` is what
+/// catches the next one that does not.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SweepTally {
+    /// Files the sweep queried a language server about.
+    enriched: usize,
+    /// Files skipped because this graph already holds server evidence for them.
+    already_enriched: usize,
+    /// Files whose extension maps to no language this build enriches.
+    unsupported_language: usize,
+    /// Files whose language server could not be started.
+    server_unavailable: usize,
+    /// Files whose source could not be loaded from graph authority.
+    source_unreadable: usize,
+    /// Whether the loop stopped before walking every file, on shutdown or on
+    /// the background-work supervisor's verdict.
+    ///
+    /// Without this the two reasons a file can be missing from the counts are
+    /// indistinguishable, and they are opposites: one is a bug in this loop,
+    /// the other is this loop being told to stop. The guard below reported the
+    /// second as the first, so a SIGTERM at 31 of 37 files logged "an exit from
+    /// the sweep loop is not being counted" about six files nothing had failed
+    /// to count, and sent its reader hunting a counting bug that did not exist.
+    ended_early: bool,
+}
+
+impl SweepTally {
+    /// What the sweep reports as `files`, and what `/lsp/sweep/status` serves
+    /// as `files_done`. Unchanged in meaning: a file the sweep is done with.
+    fn files_processed(&self) -> usize {
+        self.enriched + self.already_enriched
+    }
+
+    /// Files the sweep walked past without being able to do anything.
+    fn blocked(&self) -> usize {
+        self.unsupported_language + self.server_unavailable + self.source_unreadable
+    }
+
+    /// Files the sweep's total holds that no field above accounts for.
+    ///
+    /// Shared arithmetic for the two questions below; on its own it cannot say
+    /// which of them applies, which is exactly the confusion this split fixes.
+    fn unreached(&self, total_files: usize) -> usize {
+        total_files.saturating_sub(self.files_processed() + self.blocked())
+    }
+
+    /// Files the loop never walked because it was told to stop.
+    ///
+    /// Zero for a sweep that ran to completion. This is a normal outcome, not a
+    /// finding: shutdown and the supervisor's halt both stop the loop between
+    /// files on purpose, and what was enriched stays durable.
+    fn not_visited(&self, total_files: usize) -> usize {
+        if self.ended_early {
+            self.unreached(total_files)
+        } else {
+            0
+        }
+    }
+
+    /// Files that went missing while the loop was still walking.
+    ///
+    /// This is the guard, not a statistic. A new `continue` added without a
+    /// counter shows up here rather than silently deflating `files`. It is zero
+    /// for an interrupted sweep by construction, because an interrupted sweep
+    /// has not finished walking and its remaining files are `not_visited`.
+    fn unaccounted(&self, total_files: usize) -> usize {
+        if self.ended_early {
+            0
+        } else {
+            self.unreached(total_files)
+        }
+    }
+
+    /// Why a sweep enriched nothing, when nothing is what it enriched.
+    ///
+    /// `None` when the sweep did process files, so a caller can tell a sweep
+    /// that converged from one that could not run. The distinction is the whole
+    /// point: both used to print the same sentence.
+    fn blocked_reason(&self, total_files: usize) -> Option<&'static str> {
+        // A sweep that was stopped before it could do anything is not a
+        // blocked one, and saying so would send a reader after a language
+        // server that was never the problem.
+        if total_files == 0 || self.files_processed() > 0 || self.ended_early {
+            return None;
+        }
+        if self.server_unavailable > 0 {
+            return Some("no language server could be started for these files");
+        }
+        if self.source_unreadable > 0 {
+            return Some("their source could not be read from graph authority");
+        }
+        if self.unsupported_language > 0 {
+            return Some("this build enriches no language they are written in");
+        }
+        Some("the sweep reached none of them")
+    }
+}
+
 fn install_lsp_relations(state: &DaemonState, relations: &[kin_model::Relation]) -> usize {
     if relations.is_empty() {
         return 0;
@@ -2828,8 +2936,18 @@ pub async fn run_with_authority_on(
                         lsp_state
                             .lsp_sweep_files_total
                             .store(total_files as u64, std::sync::atomic::Ordering::SeqCst);
-                        let mut files_processed = 0usize;
+                        let mut tally = SweepTally::default();
                         let mut total_relations = 0usize;
+                        // Languages whose server refused to start, remembered for
+                        // the rest of this sweep. Without it the loop retries the
+                        // start once per FILE: express logged 66 spawn attempts
+                        // per sweep and 462 across one session, every one of them
+                        // a process spawn plus a 30-second-capped initialize
+                        // handshake, and none of them could succeed for a reason
+                        // that had nothing to do with the file being visited.
+                        let mut server_start_failed: std::collections::HashSet<
+                            kin_model::LanguageId,
+                        > = std::collections::HashSet::new();
 
                         // Build entity index for the whole graph (used for target matching).
                         let entity_refs: Vec<kin_lsp::EntityRef> = entities
@@ -2870,7 +2988,10 @@ pub async fn run_with_authority_on(
                                 }
                                 _ => None,
                             };
-                            let Some(lang) = language else { continue };
+                            let Some(lang) = language else {
+                                tally.unsupported_language += 1;
+                                continue;
+                            };
 
                             // Skip a file this graph already holds language-server
                             // evidence for. This is what makes the sweep idempotent
@@ -2883,7 +3004,7 @@ pub async fn run_with_authority_on(
                             // is not a cost anyone would accept, and a sweep nobody
                             // dares run is a sweep that never runs.
                             if file_already_enriched(&lsp_state, &file_id.0) {
-                                files_processed += 1;
+                                tally.already_enriched += 1;
                                 // Info, not debug. A skip and a zero are different
                                 // facts and both are findings, and a skip nobody can
                                 // see is how a predicate that dropped the three files
@@ -2891,9 +3012,19 @@ pub async fn run_with_authority_on(
                                 // 37 of 37 complete.
                                 info!(
                                     file = %file_id.0,
-                                    progress = %format!("{files_processed}/{total_files}"),
+                                    progress = %format!(
+                                        "{}/{total_files}",
+                                        tally.files_processed()
+                                    ),
                                     "sweep skipped an already-enriched file"
                                 );
+                                continue;
+                            }
+
+                            // A language whose server already refused to start is
+                            // not retried for every remaining file.
+                            if server_start_failed.contains(&lang) {
+                                tally.server_unavailable += 1;
                                 continue;
                             }
 
@@ -2917,7 +3048,22 @@ pub async fn run_with_authority_on(
                                             servers.insert(lang, server);
                                         }
                                         Err(e) => {
-                                            debug!(language = %lang, error = %e, "failed to start LSP server for sweep");
+                                            // Warn, and once per language rather
+                                            // than once per file. At debug this
+                                            // was invisible on a default daemon,
+                                            // so the only trace a whole language
+                                            // failed to enrich was a sweep that
+                                            // reported zero files and called
+                                            // itself complete.
+                                            warn!(
+                                                language = %lang,
+                                                command = %cmd,
+                                                error = %e,
+                                                "could not start the language server for this sweep; \
+                                                 files in this language are left unenriched"
+                                            );
+                                            server_start_failed.insert(lang);
+                                            tally.server_unavailable += 1;
                                             continue;
                                         }
                                     }
@@ -2925,6 +3071,12 @@ pub async fn run_with_authority_on(
                             }
 
                             let Some(server) = servers.get(&lang) else {
+                                // No adapter is wired for this language, so no
+                                // start was even attempted. Counted, because an
+                                // uncounted file is how `files=0 total_files=66`
+                                // came to read as a completed sweep.
+                                server_start_failed.insert(lang);
+                                tally.server_unavailable += 1;
                                 continue;
                             };
 
@@ -2939,6 +3091,7 @@ pub async fn run_with_authority_on(
                                         error = %error,
                                         "LSP sweep skipped graph source that could not be loaded from authority"
                                     );
+                                    tally.source_unreadable += 1;
                                     continue;
                                 }
                             };
@@ -3021,11 +3174,12 @@ pub async fn run_with_authority_on(
                                 )
                                 .await;
 
-                            files_processed += 1;
+                            tally.enriched += 1;
                             mark_file_enriched(&lsp_state, &file_id.0);
-                            lsp_state
-                                .lsp_sweep_files_done
-                                .store(files_processed as u64, std::sync::atomic::Ordering::SeqCst);
+                            lsp_state.lsp_sweep_files_done.store(
+                                tally.files_processed() as u64,
+                                std::sync::atomic::Ordering::SeqCst,
+                            );
                             total_relations += file_relations;
                             // Credited per file rather than once at the end. A
                             // cold sweep walks the whole graph, and a pass that
@@ -3040,7 +3194,7 @@ pub async fn run_with_authority_on(
                                 info!(
                                     file = %file_id,
                                     relations = file_relations,
-                                    progress = format!("{}/{}", files_processed, total_files),
+                                    progress = format!("{}/{}", tally.files_processed(), total_files),
                                     "sweep enriched file"
                                 );
                             } else {
@@ -3056,13 +3210,14 @@ pub async fn run_with_authority_on(
                                 info!(
                                     file = %file_id,
                                     entities = file_entity_refs.len(),
-                                    progress = format!("{}/{}", files_processed, total_files),
+                                    progress = format!("{}/{}", tally.files_processed(), total_files),
                                     "sweep enriched NOTHING for this file"
                                 );
                             }
 
                             // Check for shutdown between files.
                             if *lsp_cancel.borrow() {
+                                tally.ended_early = true;
                                 break;
                             }
                             // Same checkpoint, for the supervisor's verdict. A
@@ -3070,6 +3225,7 @@ pub async fn run_with_authority_on(
                             // anything stops here, between files, rather than
                             // mid-request to a language server.
                             if lsp_pass.halted() {
+                                tally.ended_early = true;
                                 info!("LSP cold sweep stopped by the background-work supervisor");
                                 break;
                             }
@@ -3091,12 +3247,45 @@ pub async fn run_with_authority_on(
                         lsp_state
                             .lsp_sweeps_completed
                             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        lsp_state
+                            .lsp_sweep_files_blocked
+                            .store(tally.blocked() as u64, std::sync::atomic::Ordering::SeqCst);
+                        let unaccounted = tally.unaccounted(total_files);
+                        let not_visited = tally.not_visited(total_files);
                         info!(
-                            files = files_processed,
+                            files = tally.files_processed(),
                             total_files,
                             relations = total_relations,
+                            enriched = tally.enriched,
+                            already_enriched = tally.already_enriched,
+                            unsupported_language = tally.unsupported_language,
+                            server_unavailable = tally.server_unavailable,
+                            source_unreadable = tally.source_unreadable,
+                            not_visited,
+                            ended_early = tally.ended_early,
+                            unaccounted,
                             "LSP cold sweep complete"
                         );
+                        // A sweep that finished having done nothing is a
+                        // finding, and it used to be indistinguishable from a
+                        // converged one. Both printed `files=0`.
+                        if let Some(reason) = tally.blocked_reason(total_files) {
+                            warn!(
+                                total_files,
+                                server_unavailable = tally.server_unavailable,
+                                source_unreadable = tally.source_unreadable,
+                                unsupported_language = tally.unsupported_language,
+                                "LSP cold sweep enriched no files: {reason}"
+                            );
+                        }
+                        if unaccounted > 0 {
+                            warn!(
+                                unaccounted,
+                                total_files,
+                                "LSP cold sweep left files unaccounted for; an exit from the \
+                                 sweep loop is not being counted"
+                            );
+                        }
                     } // end Sweep
                 } // end match
             }
@@ -4619,5 +4808,199 @@ mod lsp_query_column_tests {
     #[test]
     fn a_name_absent_from_the_signature_keeps_the_declaration_column() {
         assert_eq!(lsp_query_column("const x = 1", "handle", 3), 3);
+    }
+}
+
+#[cfg(test)]
+mod sweep_tally_tests {
+    use super::SweepTally;
+
+    /// The number the sweep reports as `files`, and the one `/lsp/sweep/status`
+    /// serves as `files_done`, is unchanged in meaning by the tally: a file the
+    /// sweep finished with, whether it enriched it or found it already done.
+    #[test]
+    fn files_processed_counts_enriched_and_already_enriched_only() {
+        let tally = SweepTally {
+            enriched: 3,
+            already_enriched: 4,
+            unsupported_language: 5,
+            server_unavailable: 6,
+            source_unreadable: 7,
+            ended_early: false,
+        };
+        assert_eq!(tally.files_processed(), 7);
+        assert_eq!(tally.blocked(), 18);
+    }
+
+    /// A sweep that did work is not asked to explain itself. This is the arm
+    /// that keeps the new warning off a healthy conversion.
+    #[test]
+    fn a_sweep_that_processed_files_reports_no_blocked_reason() {
+        let tally = SweepTally {
+            enriched: 37,
+            ..SweepTally::default()
+        };
+        assert_eq!(tally.blocked_reason(37), None);
+    }
+
+    /// The express case, exactly: 66 files in the graph, a language server that
+    /// would not start, and every file walked past. This used to report
+    /// `files=0 total_files=66` and call itself complete, which is what a
+    /// stranger read as a finished conversion.
+    #[test]
+    fn a_sweep_blocked_on_its_language_server_says_so() {
+        let tally = SweepTally {
+            server_unavailable: 66,
+            ..SweepTally::default()
+        };
+        assert_eq!(
+            tally.blocked_reason(66),
+            Some("no language server could be started for these files"),
+            "a sweep that enriched nothing because no server started must not be \
+             indistinguishable from a converged one"
+        );
+    }
+
+    /// Unreadable source and an unenrichable language are different findings
+    /// and get different sentences, so a reader is not told to install a
+    /// language server for a repository that has no supported language in it.
+    #[test]
+    fn the_blocked_reason_names_the_cause_it_actually_hit() {
+        let unreadable = SweepTally {
+            source_unreadable: 2,
+            ..SweepTally::default()
+        };
+        assert_eq!(
+            unreadable.blocked_reason(2),
+            Some("their source could not be read from graph authority")
+        );
+        let unsupported = SweepTally {
+            unsupported_language: 2,
+            ..SweepTally::default()
+        };
+        assert_eq!(
+            unsupported.blocked_reason(2),
+            Some("this build enriches no language they are written in")
+        );
+    }
+
+    /// The guard, and the reason the tally exists rather than a second counter.
+    ///
+    /// Every exit from the sweep loop lands in one of the tally's fields. A new
+    /// `continue` added without a counter shows up here as an unaccounted file
+    /// instead of silently deflating the `files` the sweep reports, which is the
+    /// shape of the defect this whole change is about.
+    #[test]
+    fn a_file_that_reached_no_counter_is_reported_as_unaccounted() {
+        let complete = SweepTally {
+            enriched: 30,
+            already_enriched: 6,
+            server_unavailable: 30,
+            ..SweepTally::default()
+        };
+        assert_eq!(complete.unaccounted(66), 0);
+
+        let leaking = SweepTally {
+            enriched: 30,
+            ..SweepTally::default()
+        };
+        assert_eq!(
+            leaking.unaccounted(66),
+            36,
+            "36 files left the sweep without reaching any counter and must be visible"
+        );
+    }
+
+    /// An interrupted sweep is not a miscounted one, and the guard must not
+    /// confuse them.
+    ///
+    /// This is the real case, from a run whose daemon took SIGTERM at 31 of 37
+    /// files: it logged `unaccounted=6` and warned that "an exit from the sweep
+    /// loop is not being counted" about six files nothing had failed to count.
+    /// The loop had simply been told to stop. A guard that reports a normal
+    /// shutdown as a counting bug is worse than no guard, because it sends its
+    /// reader after something that is not there.
+    #[test]
+    fn a_sweep_stopped_before_it_finished_reports_not_visited_and_never_warns() {
+        let interrupted = SweepTally {
+            enriched: 31,
+            ended_early: true,
+            ..SweepTally::default()
+        };
+        assert_eq!(
+            interrupted.unaccounted(37),
+            0,
+            "a sweep that was told to stop has not miscounted anything"
+        );
+        assert_eq!(
+            interrupted.not_visited(37),
+            6,
+            "the six files it never walked are still reported, as not_visited"
+        );
+        assert_eq!(
+            interrupted.blocked_reason(37),
+            None,
+            "a stopped sweep is not a blocked one"
+        );
+
+        // The second sweep of that same run, which broke after one file.
+        let barely_started = SweepTally {
+            enriched: 1,
+            ended_early: true,
+            ..SweepTally::default()
+        };
+        assert_eq!(barely_started.unaccounted(37), 0);
+        assert_eq!(barely_started.not_visited(37), 36);
+    }
+
+    /// The other direction, which is what the guard exists for: a sweep that
+    /// ran to completion and still cannot account for every file HAS a counting
+    /// bug, and must say so.
+    #[test]
+    fn a_completed_sweep_that_cannot_account_for_its_files_still_warns() {
+        let leaking = SweepTally {
+            enriched: 30,
+            ended_early: false,
+            ..SweepTally::default()
+        };
+        assert_eq!(
+            leaking.unaccounted(66),
+            36,
+            "a completed sweep missing 36 files is the defect this guard is for"
+        );
+        assert_eq!(
+            leaking.not_visited(66),
+            0,
+            "a completed sweep visited everything, so nothing is not_visited"
+        );
+    }
+
+    /// A stopped sweep that enriched nothing must not be reported as blocked on
+    /// its language server, which would send a reader after a server that was
+    /// never the problem.
+    #[test]
+    fn a_sweep_stopped_before_enriching_anything_is_not_called_blocked() {
+        let stopped_cold = SweepTally {
+            ended_early: true,
+            ..SweepTally::default()
+        };
+        assert_eq!(stopped_cold.blocked_reason(37), None);
+        let really_blocked = SweepTally {
+            server_unavailable: 37,
+            ended_early: false,
+            ..SweepTally::default()
+        };
+        assert_eq!(
+            really_blocked.blocked_reason(37),
+            Some("no language server could be started for these files")
+        );
+    }
+
+    /// An empty graph is not a blocked sweep. Without this arm the new warning
+    /// fires on every repository with nothing to enrich.
+    #[test]
+    fn a_sweep_over_no_files_is_not_blocked() {
+        assert_eq!(SweepTally::default().blocked_reason(0), None);
+        assert_eq!(SweepTally::default().unaccounted(0), 0);
     }
 }
