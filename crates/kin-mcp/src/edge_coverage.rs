@@ -231,11 +231,28 @@ pub fn observe_cross_file_reference_coverage_for_languages_witnessed<S: EntitySt
         observed_languages.push(*language);
     }
 
+    // Computed before the skip decision, because it is one of the two facts that
+    // decides which classes the verdict rests on. It is reused verbatim below,
+    // so the state the skip reasoned about and the state the payload publishes
+    // can never be two different readings.
+    let enrichment = reference_enrichment(&observed_languages);
+    let references_producible = enrichment.as_str() == Some("available");
+
     // The scan exists to decide the classes the verdict rests on. When the
     // answer already carried a witness for every one of them, running it buys a
     // disclosure about classes nothing decides and costs a language-wide relation
     // walk on the populated path, where there was no scan at all before.
-    let scan_needed = !deciding_classes_all_present(&merged);
+    //
+    // `references` joins that deciding set exactly when this host could have
+    // produced it, which is the same condition
+    // [`crate::negative::absence_coverage_gap`] now gates a certification on.
+    // Leaving it out here would have left that gate a bypass on one of the two
+    // surfaces it was written for: `get_context_pack` passes the witnesses its
+    // own rows carry, so a pack whose dependents group witnessed one cross-file
+    // `Calls` edge skipped the scan, published `references: unknown` instead of
+    // `absent`, and certified on a class nothing had measured. A gate that only
+    // fires when a scan happened to run is not a gate.
+    let scan_needed = !deciding_classes_all_present(&merged, references_producible);
     if scan_needed {
         for (index, language) in observed_languages.iter().enumerate() {
             let (states, examined, budget_exhausted) =
@@ -294,7 +311,7 @@ pub fn observe_cross_file_reference_coverage_for_languages_witnessed<S: EntitySt
             .collect::<Vec<_>>(),
         "classes": Value::Object(classes),
         "cross_file_classes": cross_file,
-        "reference_enrichment": reference_enrichment(&observed_languages),
+        "reference_enrichment": enrichment,
         "budget_exhausted": any_budget_exhausted,
         "entities_examined": examined_total,
         // How each verdict was reached, because "present" from a witness the
@@ -415,12 +432,15 @@ pub fn languages_of(entities: &[Entity]) -> Vec<LanguageId> {
 /// of its own: Kin mints no entity-level `Imports` edge, so a rule that waited
 /// for every requested class would never skip a scan and would report every
 /// answer on every healthy graph as short of coverage.
-fn deciding_classes_all_present(merged: &[(RelationKind, ClassState)]) -> bool {
+fn deciding_classes_all_present(
+    merged: &[(RelationKind, ClassState)],
+    references_producible: bool,
+) -> bool {
     let requested: Vec<String> = merged
         .iter()
         .map(|(kind, _)| class_name(*kind).to_string())
         .collect();
-    let deciding = crate::negative::load_bearing_classes(&requested);
+    let deciding = crate::negative::deciding_classes(&requested, references_producible);
     if deciding.is_empty() {
         return false;
     }
@@ -1047,6 +1067,76 @@ mod tests {
             ReferenceEnrichment::Unknown,
             "no language observed establishes nothing"
         );
+    }
+
+    /// FIR-2505 / FIR-2492. The scan may not skip the one class the certification
+    /// gate now rests on.
+    ///
+    /// `get_context_pack` passes the witnesses its own rows carry, so a pack
+    /// whose dependents group held a cross-file `Calls` edge used to satisfy the
+    /// deciding set on the spot, skip the language scan, and publish
+    /// `references: unknown`. An `unknown` is not a finding, so
+    /// [`crate::negative::absence_coverage_gap`] had nothing to gate on and
+    /// certified anyway. That is the same false clean the gate was written to
+    /// stop, reached by never measuring instead of by measuring and ignoring.
+    #[test]
+    fn a_producible_reference_class_is_measured_even_when_the_answer_witnessed_calls() {
+        let store = InMemoryGraph::new();
+        let caller = entity("consumer", "lib/consumer.js", LanguageId::JavaScript);
+        let target = entity("Router", "lib/express.js", LanguageId::JavaScript);
+        store.upsert_entity(&caller).unwrap();
+        store.upsert_entity(&target).unwrap();
+        store
+            .upsert_relation(&relation(caller.id, target.id, RelationKind::Calls))
+            .unwrap();
+        let kinds = [
+            RelationKind::Calls,
+            RelationKind::Imports,
+            RelationKind::References,
+        ];
+
+        // A host that can produce reference edges: the class is load-bearing, so
+        // it gets measured and the graph's silence is recorded as a finding.
+        test_support::with_language_servers(&[LanguageId::JavaScript], || {
+            let coverage = observe_cross_file_reference_coverage_witnessed(
+                &store,
+                &target,
+                &kinds,
+                &[RelationKind::Calls],
+            );
+            assert_eq!(coverage["reference_enrichment"], json!("available"));
+            assert_eq!(
+                coverage["scan"], "ran",
+                "the class the verdict rests on must be measured: {coverage}"
+            );
+            assert_eq!(
+                coverage["classes"]["references"],
+                json!("absent"),
+                "a completed scan over a graph holding no cross-file references reports a \
+                 finding, not an unknown: {coverage}"
+            );
+        });
+
+        // The control that keeps this narrow, and the one that proves the host
+        // fact is what moved the decision rather than the change simply forcing
+        // a scan on everything: with no server installed the class was never
+        // producible, it is not load-bearing, and the witnessed skip stands.
+        test_support::with_language_servers(&[], || {
+            let coverage = observe_cross_file_reference_coverage_witnessed(
+                &store,
+                &target,
+                &kinds,
+                &[RelationKind::Calls],
+            );
+            assert_eq!(
+                coverage["reference_enrichment"],
+                json!("no_language_server")
+            );
+            assert_eq!(
+                coverage["scan"], "skipped_answer_witnessed",
+                "an unproducible class must not cost a language-wide walk: {coverage}"
+            );
+        });
     }
 
     /// JavaScript is wired now, so an express-shaped repository must no longer
