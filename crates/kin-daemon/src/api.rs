@@ -5949,9 +5949,15 @@ async fn search(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let mut result =
-        kin_cli::commands::search::collect_daemon_search_response(graph.as_ref(), &req)
-            .map_err(internal_error)?;
+    let mut result = kin_cli::commands::search::collect_daemon_search_response(
+        graph.as_ref(),
+        &req,
+        // Same substrate reading the impact and trace routes supply, from the
+        // same helper, so no CLI surface can be more confident than its MCP
+        // counterpart about one daemon at one instant (FIR-2524).
+        &kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state)),
+    )
+    .map_err(internal_error)?;
     if req.show_body {
         attach_search_bodies(&state, &mut result, req.body_limit.unwrap_or(10));
     }

@@ -548,7 +548,14 @@ pub fn build_dead_code_seeded_response(
         show_body: false,
         body_limit: None,
     };
-    let search_response = collect_daemon_search_response(graph, &search_request)?;
+    // `dead_code` consumes this response programmatically rather than printing
+    // it, so it wants no absence qualifier and asserts no substrate reading. An
+    // envelope with no health is exactly that claim: `negative_for` refuses to
+    // certify on it, the qualifier stays unrendered here, and nothing about
+    // dead-code's own output changes. Rung three gives this command its own
+    // verdict on its own terms (FIR-2524 rollout).
+    let search_response =
+        collect_daemon_search_response(graph, &search_request, &kin_mcp::Envelope::daemon())?;
 
     let reference_kinds = [
         RelationKind::Calls,
