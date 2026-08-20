@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.44] - 2026-08-20
+
+### Changed
+
+- Account for every file the LSP cold sweep walks (#985)
+
+
 ## [0.5.43] - 2026-08-20
 
 ### Changed
