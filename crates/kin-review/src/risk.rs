@@ -418,6 +418,31 @@ mod tests {
         entity
     }
 
+    /// A per-entity impact record with the three counts these cases turn on.
+    ///
+    /// Written out rather than reached through `Default`, which `EntityImpact`
+    /// deliberately does not derive: every field is a measured count, and a
+    /// field added later should force a decision here rather than silently
+    /// arriving as zero in tests that are about which entity a count belongs to.
+    fn entity_impact_counts(
+        entity_id: EntityId,
+        consumer_count: usize,
+        contract_consumer_count: usize,
+        covering_tests: usize,
+    ) -> crate::impact::EntityImpact {
+        crate::impact::EntityImpact {
+            entity_id,
+            consumer_count,
+            strong_consumer_count: consumer_count,
+            proven_consumer_count: consumer_count,
+            contract_consumer_count,
+            consumer_files: Vec::new(),
+            covering_tests,
+            consumers_migrated_in_diff: 0,
+            call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
+        }
+    }
+
     fn calls_relation(src: &Entity, dst: &Entity) -> kin_model::relation::Relation {
         kin_model::relation::Relation {
             id: kin_model::ids::RelationId::new(),
@@ -636,6 +661,339 @@ mod tests {
         assert!(!contains_uuid(
             "Removed entity `super_len` (Function) at src/requests/utils.py:160"
         ));
+    }
+
+    /// FIR-2485. Every condition in `assess_risk`'s per-change loop reads a
+    /// DIFF-GLOBAL bucket off the impact report and attributes it to whichever
+    /// change is in hand, so a finding about entity A fires on entity B's
+    /// evidence.
+    ///
+    /// The reported direction: a removal finding on an entity nothing depends
+    /// on, because a DIFFERENT entity in the same diff has dependents.
+    ///
+    /// Every case in this set is a TWO-entity diff on purpose. A one-entity
+    /// diff cannot tell diff-global attribution from per-entity attribution,
+    /// which is exactly why the older tests here pass under both readings.
+    #[test]
+    fn a_removal_does_not_inherit_another_entitys_dependents() {
+        let removed = placed_entity("orphan_helper", "src/orphan.rs", 10);
+        let modified_old = placed_entity("busy_function", "src/busy.rs", 20);
+        let mut modified_new = modified_old.clone();
+        modified_new.signature = "fn busy_function(x: i32)".to_string();
+        let caller = placed_entity("caller_of_busy", "src/callers.rs", 30);
+
+        let diff = SemanticDiff {
+            entity_changes: vec![
+                EntityChange {
+                    entity_id: removed.id,
+                    kind: EntityChangeKind::Removed {
+                        old: Some(removed.clone()),
+                    },
+                },
+                EntityChange {
+                    entity_id: modified_new.id,
+                    kind: EntityChangeKind::Modified {
+                        old: modified_old.clone(),
+                        new: modified_new.clone(),
+                    },
+                },
+            ],
+            ..Default::default()
+        };
+        // The caller belongs to `busy_function`. No relation reaching the
+        // removed entity was removed, because nothing reached it.
+        let impact = ImpactReport {
+            affected_callers: vec![caller.clone()],
+            ..Default::default()
+        };
+
+        let summary = assess_risk(&diff, &impact);
+        assert!(
+            !summary
+                .breaking_changes
+                .iter()
+                .any(|f| f.contains("orphan_helper")),
+            "nothing depends on the removed entity, so no removal finding may name it: {:?}",
+            summary.breaking_changes
+        );
+    }
+
+    /// The control that keeps the case above from being satisfied by a finding
+    /// that never fires. A removal whose OWN dependents are in the diff must
+    /// still be reported, or "no more false positives" and "the check is dead"
+    /// are the same patch.
+    #[test]
+    fn a_removal_with_its_own_dependents_still_reports() {
+        use crate::diff::{RelationChange, RelationChangeKind};
+
+        let removed = placed_entity("consumed_helper", "src/helper.rs", 10);
+        let caller = placed_entity("real_caller", "src/callers.rs", 30);
+        let unrelated_old = placed_entity("unrelated", "src/other.rs", 40);
+
+        let diff = SemanticDiff {
+            entity_changes: vec![
+                EntityChange {
+                    entity_id: removed.id,
+                    kind: EntityChangeKind::Removed {
+                        old: Some(removed.clone()),
+                    },
+                },
+                EntityChange {
+                    entity_id: unrelated_old.id,
+                    kind: EntityChangeKind::Modified {
+                        old: unrelated_old.clone(),
+                        new: unrelated_old.clone(),
+                    },
+                },
+            ],
+            relation_changes: vec![RelationChange {
+                kind: RelationChangeKind::Removed {
+                    old: calls_relation(&caller, &removed),
+                },
+            }],
+            ..Default::default()
+        };
+        let impact = ImpactReport {
+            affected_callers: vec![caller.clone()],
+            ..Default::default()
+        };
+
+        let summary = assess_risk(&diff, &impact);
+        let finding = summary
+            .breaking_changes
+            .iter()
+            .find(|f| f.contains("consumed_helper"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "a removal with its own dependents is still a breaking change: {:?}",
+                    summary.breaking_changes
+                )
+            });
+        assert!(
+            finding.contains("real_caller"),
+            "and it names the dependent that makes it one: {finding}"
+        );
+    }
+
+    /// The other direction, which the ticket does not name and which is the
+    /// more dangerous half: the empty-bucket conditions SUPPRESS a finding.
+    ///
+    /// A modified entity with no tests of its own is reported as covered
+    /// because a DIFFERENT entity in the same diff has a test. Risk is hidden
+    /// rather than invented, so nothing in the output says anything is wrong.
+    #[test]
+    fn a_coverage_gap_is_not_hidden_by_another_entitys_tests() {
+        let untested_old = placed_entity("untested", "src/untested.rs", 10);
+        let mut untested_new = untested_old.clone();
+        untested_new.signature = "fn untested(x: i32)".to_string();
+
+        let tested_old = placed_entity("tested", "src/tested.rs", 20);
+        let mut tested_new = tested_old.clone();
+        tested_new.signature = "fn tested(y: i32)".to_string();
+
+        let mut covering_test = placed_entity("tests_tested", "tests/tested.rs", 5);
+        covering_test.role = EntityRole::Test;
+
+        let diff = SemanticDiff {
+            entity_changes: vec![
+                EntityChange {
+                    entity_id: untested_new.id,
+                    kind: EntityChangeKind::Modified {
+                        old: untested_old.clone(),
+                        new: untested_new.clone(),
+                    },
+                },
+                EntityChange {
+                    entity_id: tested_new.id,
+                    kind: EntityChangeKind::Modified {
+                        old: tested_old.clone(),
+                        new: tested_new.clone(),
+                    },
+                },
+            ],
+            ..Default::default()
+        };
+        // The test covers `tested`, and only `tested`.
+        let impact = ImpactReport {
+            affected_tests: vec![covering_test.clone()],
+            entity_impacts: vec![entity_impact_counts(tested_new.id, 0, 0, 1)],
+            ..Default::default()
+        };
+
+        let summary = assess_risk(&diff, &impact);
+        assert!(
+            summary
+                .test_coverage_gaps
+                .iter()
+                .any(|gap| gap.contains("untested")),
+            "an entity with no tests of its own has a coverage gap whatever its \
+             neighbours have: {:?}",
+            summary.test_coverage_gaps
+        );
+    }
+
+    /// The control for the case above. An entity with its own covering tests
+    /// must stay silent, or the fix reports a gap for everything and says
+    /// nothing.
+    #[test]
+    fn a_covered_entity_reports_no_coverage_gap() {
+        let tested_old = placed_entity("tested", "src/tested.rs", 20);
+        let mut tested_new = tested_old.clone();
+        tested_new.signature = "fn tested(y: i32)".to_string();
+        let mut covering_test = placed_entity("tests_tested", "tests/tested.rs", 5);
+        covering_test.role = EntityRole::Test;
+
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: tested_new.id,
+                kind: EntityChangeKind::Modified {
+                    old: tested_old.clone(),
+                    new: tested_new.clone(),
+                },
+            }],
+            ..Default::default()
+        };
+        let impact = ImpactReport {
+            affected_tests: vec![covering_test.clone()],
+            entity_impacts: vec![entity_impact_counts(tested_new.id, 0, 0, 1)],
+            ..Default::default()
+        };
+
+        let summary = assess_risk(&diff, &impact);
+        assert!(
+            summary.test_coverage_gaps.is_empty(),
+            "an entity its own tests cover has no gap: {:?}",
+            summary.test_coverage_gaps
+        );
+    }
+
+    /// Conditions 1 and 2: a signature change becomes a breaking change when
+    /// THAT entity has consumers. Another entity's callers are not this
+    /// entity's blast radius.
+    #[test]
+    fn a_signature_change_does_not_inherit_another_entitys_callers() {
+        let quiet_old = placed_entity("quiet", "src/quiet.rs", 10);
+        let mut quiet_new = quiet_old.clone();
+        quiet_new.signature = "fn quiet(x: i32)".to_string();
+
+        let busy_old = placed_entity("busy", "src/busy.rs", 20);
+        let mut busy_new = busy_old.clone();
+        busy_new.signature = "fn busy(y: i32)".to_string();
+
+        let caller = placed_entity("caller_of_busy", "src/callers.rs", 30);
+
+        let diff = SemanticDiff {
+            entity_changes: vec![
+                EntityChange {
+                    entity_id: quiet_new.id,
+                    kind: EntityChangeKind::Modified {
+                        old: quiet_old.clone(),
+                        new: quiet_new.clone(),
+                    },
+                },
+                EntityChange {
+                    entity_id: busy_new.id,
+                    kind: EntityChangeKind::Modified {
+                        old: busy_old.clone(),
+                        new: busy_new.clone(),
+                    },
+                },
+            ],
+            ..Default::default()
+        };
+        let impact = ImpactReport {
+            affected_callers: vec![caller.clone()],
+            entity_impacts: vec![entity_impact_counts(busy_new.id, 1, 0, 0)],
+            ..Default::default()
+        };
+
+        let summary = assess_risk(&diff, &impact);
+        assert!(
+            !summary
+                .breaking_changes
+                .iter()
+                .any(|f| f.contains("`quiet`")),
+            "a signature change on a consumer-free entity is not a breaking change: {:?}",
+            summary.breaking_changes
+        );
+        assert!(
+            summary
+                .breaking_changes
+                .iter()
+                .any(|f| f.contains("`busy`")),
+            "control: the entity that DOES have a consumer must still report: {:?}",
+            summary.breaking_changes
+        );
+    }
+
+    /// Condition 3, and condition 6's added-entity coverage, in one two-entity
+    /// diff. A contract entity is violated by ITS OWN consumers, and a new
+    /// public entity's coverage note is about its own tests.
+    #[test]
+    fn a_contract_and_a_new_entity_are_judged_on_their_own_evidence() {
+        let mut contract_old = placed_entity("QuietSchema", "src/schema.rs", 10);
+        contract_old.kind = EntityKind::Schema;
+        let mut contract_new = contract_old.clone();
+        contract_new.signature = "schema QuietSchema { v2 }".to_string();
+
+        let added = placed_entity("brand_new", "src/new.rs", 40);
+
+        let busy_old = placed_entity("busy", "src/busy.rs", 20);
+        let mut busy_new = busy_old.clone();
+        busy_new.signature = "fn busy(y: i32)".to_string();
+        let consumer = placed_entity("consumer_of_busy", "src/consumers.rs", 30);
+        let mut busy_test = placed_entity("tests_busy", "tests/busy.rs", 5);
+        busy_test.role = EntityRole::Test;
+
+        let diff = SemanticDiff {
+            entity_changes: vec![
+                EntityChange {
+                    entity_id: contract_new.id,
+                    kind: EntityChangeKind::Modified {
+                        old: contract_old.clone(),
+                        new: contract_new.clone(),
+                    },
+                },
+                EntityChange {
+                    entity_id: added.id,
+                    kind: EntityChangeKind::Added(added.clone()),
+                },
+                EntityChange {
+                    entity_id: busy_new.id,
+                    kind: EntityChangeKind::Modified {
+                        old: busy_old.clone(),
+                        new: busy_new.clone(),
+                    },
+                },
+            ],
+            ..Default::default()
+        };
+        // Every consumer and test in this report belongs to `busy`.
+        let impact = ImpactReport {
+            affected_contract_consumers: vec![consumer.clone()],
+            affected_tests: vec![busy_test.clone()],
+            entity_impacts: vec![entity_impact_counts(busy_new.id, 1, 1, 1)],
+            ..Default::default()
+        };
+
+        let summary = assess_risk(&diff, &impact);
+        assert!(
+            !summary
+                .contract_violations
+                .iter()
+                .any(|v| v.contains("QuietSchema")),
+            "a contract with no consumers of its own is not violated: {:?}",
+            summary.contract_violations
+        );
+        assert!(
+            summary
+                .notes
+                .iter()
+                .any(|n| n.contains("brand_new") && n.contains("no test coverage")),
+            "a new public entity with no tests of its own is noted whatever its \
+             neighbours have: {:?}",
+            summary.notes
+        );
     }
 
     #[test]
