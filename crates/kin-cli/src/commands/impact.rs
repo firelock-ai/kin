@@ -411,23 +411,24 @@ fn impact_absence_qualifier(
     // `Imports` relation on any language, so that class reads absent on healthy
     // graphs too, and naming it is a small fabrication of the same kind this
     // change exists to stop.
-    let requested: Vec<String> = kin_mcp::handlers::review::IMPACT_REFERENCE_KINDS
-        .iter()
-        .map(|kind| format!("{kind:?}").to_lowercase())
-        .collect();
-    let deciding = kin_mcp::negative::deciding_classes(
-        &requested,
-        kin_mcp::negative::references_producible(&payload),
-    );
+    //
+    // Which classes those are is READ from the record the verdict publishes
+    // rather than recomputed from the function that produced it. FIR-2505 made
+    // the completeness block publish `decided_by` for exactly this reason, so
+    // consuming it here is identical to the decision by construction, and needs
+    // nothing from `kin_mcp::negative` that is not already public. Importing the
+    // deciding-set helper instead would have been reading the pieces, which is
+    // the habit this ticket family exists to break.
+    let deciding = completeness_decided_by(&payload, envelope);
     let missing: Vec<&'static str> = deciding
         .iter()
         .filter(|class| state_of(class) == Some("absent"))
         .map(|class| edge_class_noun(class))
         .collect();
-    let present: Vec<&'static str> = requested
-        .iter()
+    let present: Vec<&'static str> = ["calls", "imports", "references"]
+        .into_iter()
         .filter(|class| state_of(class) == Some("present"))
-        .map(|class| edge_class_noun(class))
+        .map(edge_class_noun)
         .collect();
 
     // Naming a missing class the observation did not report would be the same
@@ -470,6 +471,51 @@ fn impact_absence_qualifier(
         ));
     }
     said
+}
+
+/// The classes the verdict says it rested on, read off the published
+/// completeness block rather than recomputed.
+///
+/// `_kin.completeness.decided_by` is the verdict's own record of what it
+/// weighed (FIR-2505), so a renderer that reads it cannot name a class the
+/// decision did not use. Going through the same `finalize_with_envelope` the MCP
+/// surface goes through is the point: one producer, one record, two readers.
+///
+/// An empty answer here names no class, which is the conservative direction: the
+/// caller then falls back to the disclosed signals rather than inventing an edge
+/// class nobody observed.
+fn completeness_decided_by(
+    payload: &serde_json::Value,
+    envelope: &kin_mcp::Envelope,
+) -> Vec<String> {
+    let annotated = kin_mcp::finalize_with_envelope(
+        kin_mcp::ToolCallResult::text(payload.to_string()),
+        envelope.clone(),
+        "impact_analysis",
+    );
+    annotated
+        .content
+        .iter()
+        .find_map(|block| match block {
+            kin_mcp::ContentBlock::Text { text } => {
+                serde_json::from_str::<serde_json::Value>(text).ok()
+            }
+        })
+        .and_then(|value| {
+            value
+                .get(kin_mcp::ENVELOPE_KEY)
+                .and_then(|envelope| envelope.get("completeness"))
+                .and_then(|completeness| completeness.get("decided_by"))
+                .and_then(serde_json::Value::as_array)
+                .map(|classes| {
+                    classes
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+        })
+        .unwrap_or_default()
 }
 
 /// The edge class in the noun a sentence wants, since the observation keys are

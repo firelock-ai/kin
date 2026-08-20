@@ -12458,9 +12458,8 @@ mod tests {
                 "entities_examined": 3,
             }
         });
-        let negative =
-            kin_mcp::negative::negative_for("impact_analysis", &payload, &envelope, &[])
-                .expect("impact_analysis always qualifies");
+        let negative = kin_mcp::negative::negative_for("impact_analysis", &payload, &envelope, &[])
+            .expect("impact_analysis always qualifies");
         assert_eq!(
             negative["safe_to_conclude_absent"],
             serde_json::json!(false),
@@ -12485,9 +12484,8 @@ mod tests {
             "graph_generation": 7,
             "embed_worker_failed": false,
         }));
-        let negative =
-            kin_mcp::negative::negative_for("impact_analysis", &payload, &healthy, &[])
-                .expect("impact_analysis always qualifies");
+        let negative = kin_mcp::negative::negative_for("impact_analysis", &payload, &healthy, &[])
+            .expect("impact_analysis always qualifies");
         assert_eq!(
             negative["safe_to_conclude_absent"],
             serde_json::json!(true),
