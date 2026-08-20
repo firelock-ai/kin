@@ -26,7 +26,7 @@ use std::path::Path;
 pub async fn run(path: String, reason: String) -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
     let approved_by = crate::commands::require_commit_author_for(&layout)?;
-    let root = layout.root().to_path_buf();
+    let root = repo_root_of(&layout);
 
     if reason.trim().is_empty() {
         bail!("an approval needs a reason: it is what a reviewer reads to judge the exemption");
@@ -70,7 +70,7 @@ pub async fn run(path: String, reason: String) -> Result<()> {
     };
     allowance.validate()?;
 
-    let allowance_file = root.join(SENSITIVE_ALLOWANCE_SOURCE_PATH);
+    let allowance_file = allowance_file_path(&layout);
     let mut existing = match std::fs::read(&allowance_file) {
         Ok(body) => parse_sensitive_allowances(&body).with_context(|| {
             format!("{SENSITIVE_ALLOWANCE_SOURCE_PATH} is present but could not be read")
@@ -143,6 +143,21 @@ fn render(allowances: &[SensitiveArtifactAllowance]) -> Vec<u8> {
     out.into_bytes()
 }
 
+/// The repository working directory.
+///
+/// `working_dir()`, never `root()`: `root()` is the `.kin/` directory itself, so
+/// resolving against it reports every repository path as outside the repository
+/// and writes the approval where no derivation reads it. One accessor for both
+/// callers, so the two cannot disagree.
+fn repo_root_of(layout: &kin_core::KinLayout) -> std::path::PathBuf {
+    layout.working_dir().to_path_buf()
+}
+
+/// Where the approval file lives: beside `.kin/`, not inside it.
+fn allowance_file_path(layout: &kin_core::KinLayout) -> std::path::PathBuf {
+    repo_root_of(layout).join(SENSITIVE_ALLOWANCE_SOURCE_PATH)
+}
+
 fn repo_relative(root: &Path, given: &str) -> Result<RepoPath> {
     let candidate = Path::new(given);
     let absolute = if candidate.is_absolute() {
@@ -213,6 +228,29 @@ mod tests {
             approved_by: AuthorId::new("troy@firelock.ai"),
             reason: "reviewed in the pull request that adds this line".to_string(),
         }
+    }
+
+    /// `root()` is the `.kin/` directory and `working_dir()` is the repository.
+    /// Reaching for the wrong one reports every repository path as outside the
+    /// repository and writes the approval inside `.kin/`, where no derivation
+    /// reads it. A live acceptance run caught exactly that; this pins it.
+    #[test]
+    fn paths_resolve_against_the_repository_not_against_dot_kin() {
+        let layout = kin_core::KinLayout::new(std::path::PathBuf::from("/tmp/repo/.kin"));
+        assert_eq!(
+            repo_root_of(&layout),
+            std::path::PathBuf::from("/tmp/repo"),
+            "paths resolve against the repository, not against .kin/"
+        );
+        let path = allowance_file_path(&layout);
+        assert_eq!(
+            path,
+            std::path::PathBuf::from("/tmp/repo").join(SENSITIVE_ALLOWANCE_SOURCE_PATH)
+        );
+        assert!(
+            !path.starts_with("/tmp/repo/.kin/"),
+            "an approval inside .kin/ is invisible to policy derivation: {path:?}"
+        );
     }
 
     /// The writer and the reader live in different crates, so nothing but a
