@@ -218,11 +218,11 @@ const ENRICH_BUDGET: std::time::Duration = std::time::Duration::from_secs(900);
 /// Called after the sweep has completed or its budget expired, never mid-pass:
 /// a sweep killed halfway is the failure this whole area exists to prevent, and
 /// the marker only makes it resumable, not free.
-async fn stop_conversion_daemon(borrowed_existing: bool) {
+async fn stop_conversion_daemon(borrowed_existing: bool, kin_root: &Path) {
     if borrowed_existing {
         return;
     }
-    if let Err(error) = crate::commands::daemon::stop_current_repo_quiet().await {
+    if let Err(error) = crate::commands::daemon::stop_current_repo_quiet(kin_root).await {
         note!("note: the conversion daemon could not be stopped: {error:#}");
     }
 }
@@ -247,25 +247,42 @@ async fn stop_conversion_daemon(borrowed_existing: bool) {
 /// there and fails with a version error naming a layout nothing wrote, which is
 /// exactly how this read as "no daemon could be started" on a repository whose
 /// store had just been created successfully.
+/// Run the conversion phase and ALWAYS clean up after it.
+///
+/// The cleanup used to sit after the happy-path wait, so every early return
+/// skipped it. On a CI runner the sweep POST was refused 401 and the phase
+/// returned before the stop, leaking the daemon it had started; two minutes
+/// later an independent daemon could not start because "another kin daemon (pid
+/// 10195) already owns" the repository. That is the fourth time this phase
+/// broke a contract it has no business touching, and the first three were all
+/// on the happy path, so the fix is structural rather than another audited exit.
+///
+/// The phase runs on its own task and the cleanup runs after the join, so it is
+/// reached on success, on refusal, on timeout and on panic alike.
 async fn enrich_after_init(kin_root: &Path) {
-    // Whether a daemon was already serving this repository. If not, the one
-    // below is ours and we stop it when the sweep is done.
-    //
-    // A daemon left running from `kin init` pins its repository cursor at the
-    // generation it opened, and the next mutation refuses against it: "daemon
-    // repository cursor is at generation 1, but the authority for switching
-    // branches is at generation 2". Five branch tests failed exactly that way.
-    // Conversion is a phase with an end, so its daemon has one too. A daemon the
-    // caller already had is theirs and is left alone.
-    let borrowed_existing = match kin_core::KinLayout::discover(kin_root) {
-        Some(layout) => crate::daemon_client::resolve_daemon_url_if_running_async(&layout)
-            .await
-            .is_some(),
-        // No layout to ask about means nothing of ours is running, so anything
-        // started below is ours to stop.
-        None => false,
+    let Some(layout) = kin_core::KinLayout::discover(kin_root) else {
+        note!("note: cross-file reference enrichment was skipped: no Kin layout at this path");
+        return;
     };
 
+    // Whether a daemon was already serving this repository. If not, anything
+    // running afterwards is ours, and a daemon left behind by `kin init` pins a
+    // repository cursor that makes the next mutation refuse.
+    let borrowed_existing = crate::daemon_client::resolve_daemon_url_if_running_async(&layout)
+        .await
+        .is_some();
+
+    let root = kin_root.to_path_buf();
+    let phase_layout = layout.clone();
+    let phase = tokio::spawn(async move { enrich_phase(&root, &phase_layout).await });
+    if let Err(error) = phase.await {
+        note!("note: the cross-file enrichment phase did not finish cleanly: {error}");
+    }
+
+    stop_conversion_daemon(borrowed_existing, kin_root).await;
+}
+
+async fn enrich_phase(kin_root: &Path, layout: &kin_core::KinLayout) {
     let url = match crate::daemon_client::ensure_daemon_running(kin_root).await {
         Ok(url) => url,
         Err(error) => {
@@ -276,7 +293,14 @@ async fn enrich_after_init(kin_root: &Path) {
             return;
         }
     };
-    let client = match crate::daemon_client::DaemonClient::from_base_url(url) {
+    // FOR_LAYOUT, not the plain constructor. The plain one resolves the
+    // daemon bearer token from the PROCESS WORKING DIRECTORY, and `kin init`
+    // takes the repository as an argument, so on a runner whose cwd is not the
+    // new repository the token was never found and the sweep POST went out
+    // unauthenticated: "kin lsp sweep refused (HTTP 401)". The layout is the
+    // repository this phase is about, and its `.kin` holds the token the daemon
+    // just minted.
+    let client = match crate::daemon_client::DaemonClient::from_base_url_for_layout(url, layout) {
         Ok(client) => client,
         Err(error) => {
             note!("note: cross-file reference enrichment was skipped: {error:#}");
@@ -316,7 +340,6 @@ async fn enrich_after_init(kin_root: &Path) {
             Ok(status) => status,
             Err(error) => {
                 note!("note: enrichment progress could not be read: {error:#}");
-                stop_conversion_daemon(borrowed_existing).await;
                 return;
             }
         };
@@ -349,7 +372,6 @@ async fn enrich_after_init(kin_root: &Path) {
         // fails to resolve entities it resolves fine before and after.
         if completed > baseline && !running {
             note!("  cross-file enrichment complete ({done}/{total} files)");
-            stop_conversion_daemon(borrowed_existing).await;
             return;
         }
         if std::time::Instant::now() >= deadline {
@@ -358,12 +380,10 @@ async fn enrich_after_init(kin_root: &Path) {
                  resumes from where it stopped on the next daemon start",
                 ENRICH_BUDGET.as_secs()
             );
-            stop_conversion_daemon(borrowed_existing).await;
             return;
         }
     }
 }
-
 fn ensure_directory(dir: &Path) -> Result<()> {
     match std::fs::symlink_metadata(dir) {
         Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
