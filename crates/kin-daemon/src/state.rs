@@ -848,6 +848,16 @@ enum SnapshotSaveMode {
     Full,
 }
 
+fn authority_holds_entity(
+    authority: &kin_db::GraphSnapshot,
+    node: &kin_model::GraphNodeId,
+) -> bool {
+    match node {
+        kin_model::GraphNodeId::Entity(entity_id) => authority.entities.contains_key(entity_id),
+        _ => false,
+    }
+}
+
 fn exact_source_storage_error(message: impl Into<String>) -> DaemonError {
     DaemonError::Graph(kin_db::KinDbError::StorageError(message.into()))
 }
@@ -4626,28 +4636,50 @@ impl DaemonState {
             // Exact tree admission and explicit commit publication move that
             // authority before mutating this derived runtime graph. Detach the
             // current derived batch, prove its exact tree matches the persisted
-            // workspace at this generation, then acknowledge it after flushing
-            // query text. Never recreate graph.kndb as a second local truth.
+            // workspace at this generation, publish the language-server
+            // relations that authority does not hold yet, then acknowledge the
+            // batch after flushing query text. Never recreate graph.kndb as a
+            // second local truth.
+            //
+            // The acknowledgement sits after the publication on purpose. This
+            // arm used to detach a batch, discard it, and complete the epoch
+            // regardless, so every language-server relation the sweep had just
+            // installed was reported as persisted and was gone on the next
+            // open. A failure now returns before `complete`, the RAII attempt
+            // drops into `fail_persistence`, and nothing claims a batch it did
+            // not write.
             let persistence_attempt = self
                 .graph
                 .begin_delta_persistence(expected_gen)
                 .map(|(_, epoch)| GraphPersistenceAttempt::new(self.graph.as_ref(), epoch));
-            let authority_graph = self.load_committed_authority_graph(expected_gen)?;
-            let authority_tree = authority_graph.resolved_tree();
-            let live_tree = self.graph.resolved_tree();
-            if live_tree != authority_tree {
-                return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
-                    format!(
-                        "refusing to acknowledge derived graph state at repository generation {expected_gen}: live exact tree does not match workspace authority"
-                    ),
-                )));
-            }
+            // Publishing moves the authority generation, so it must not land
+            // inside a repository command. That command planned against the
+            // generation it read, and `require_fresh_daemon_workspace` compares
+            // the two, so a publication between its plan and its commit makes it
+            // refuse itself and tell the user to reopen. Taking the gate the
+            // mutation routes take closes that window rather than narrowing it.
+            //
+            // A try, never a wait: this runs on the persist path, which may not
+            // block on an async gate, and a flush is periodic anyway. When a
+            // command holds it, the whole arm defers. Nothing is acknowledged,
+            // the relations stay in the live graph, and the next flush derives
+            // the same write set from there. The tree proof defers with it,
+            // which is the point: an acknowledgement is worth nothing without
+            // the proof beside it.
+            let Ok(_coordinated) = self.coordination_gate.try_lock() else {
+                debug!(
+                    generation = expected_gen,
+                    "deferred enrichment publication while a repository command holds the coordination gate"
+                );
+                return Ok(());
+            };
+            let published_generation = self.publish_local_workspace_enrichment(expected_gen)?;
             self.graph.flush_text_index().map_err(DaemonError::from)?;
             if let Some(attempt) = persistence_attempt {
                 attempt.complete();
             }
             self.graph.clear_full_snapshot_required();
-            expected_gen
+            published_generation
         };
 
         // Backend saves advance their own authority here. Local authority was
@@ -4846,6 +4878,213 @@ impl DaemonState {
             sync_directory_metadata(parent).map_err(DaemonError::Io)?;
         }
         Ok(index_path)
+    }
+
+    /// Prove the derived graph still matches workspace authority at this
+    /// generation, publish the language-server relations authority does not
+    /// hold yet, and report the generation the workspace ends at.
+    ///
+    /// Language-server relations are the one part of this derived graph that
+    /// nothing rebuilds. Parser reconciliation re-derives its own output from
+    /// the exact tree, and authority owns that tree. An enrichment edge exists
+    /// only while a language server was running, and the sweep records the file
+    /// it finished, so a reopen that finds those edges missing does not go
+    /// looking again and the loss is permanent. Writing them into the workspace
+    /// semantic overlay is what makes them survive: `workspace_graph_snapshot`
+    /// replays that overlay on every open, which is the same path a daemon
+    /// loads its graph through at startup.
+    ///
+    /// The write set comes from the live graph rather than from the detached
+    /// persistence batch. A batch is swapped out of the pending buffer before
+    /// anything writes it, so a failed write loses its contents while the
+    /// relations themselves stay live, and no later batch carries them again.
+    /// Diffing live against authority is idempotent instead: it republishes
+    /// whatever an earlier attempt failed to land, and it does not care which
+    /// batch an edge arrived in.
+    ///
+    /// One authority open serves the whole pass. An open is O(store) rather
+    /// than a cheap handle, because kin-db decodes the complete persisted
+    /// authority and then re-verifies every body in repository CAS against its
+    /// content address, so the tree proof, the diff, and the commit all run
+    /// against this one lease.
+    fn publish_local_workspace_enrichment(&self, expected_generation: u64) -> Result<u64> {
+        let binding = self.local_repository_authority_binding()?;
+        let authority = binding.open_manager().map_err(DaemonError::from)?;
+        let workspace_id = binding.workspace_id();
+        let lease = authority.read_authority();
+        let observed_generation = lease.roots().generation;
+        if observed_generation != expected_generation {
+            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                format!(
+                    "post-commit authority moved for repo {}: expected generation {expected_generation}, recovered {observed_generation}; reopen before finalizing derived indexes",
+                    self.cached_repo_id
+                ),
+            )));
+        }
+        // One expression on one line, because the zero-file-search guard pins
+        // this authority accessor by its exact source text: it shares a name
+        // with the filesystem metadata probe in the shared deny set and is
+        // otherwise indistinguishable from one.
+        let authority_metadata = lease.metadata();
+        let workspace = authority_metadata
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == workspace_id)
+            .cloned()
+            .ok_or_else(|| {
+                DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
+                    "local repository {} authority has no startup-pinned workspace {workspace_id}",
+                    self.cached_repo_id
+                )))
+            })?;
+        let authority_snapshot = lease
+            .workspace_graph_snapshot(&workspace_id)
+            .map_err(DaemonError::from)?
+            .ok_or_else(|| {
+                DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
+                    "local repository {} authority has no graph for workspace {workspace_id}",
+                    self.cached_repo_id
+                )))
+            })?;
+        let roots = lease.roots().clone();
+        // The lease is a read of this authority and the commit below goes
+        // through the authority itself, so the read ends here and the open
+        // does not.
+        drop(lease);
+
+        let live_tree = self.graph.resolved_tree();
+        if live_tree != authority_snapshot.resolved_tree {
+            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                format!(
+                    "refusing to acknowledge derived graph state at repository generation {expected_generation}: live exact tree does not match workspace authority"
+                ),
+            )));
+        }
+
+        let live_snapshot = self.graph.to_snapshot();
+        let (semantic_delta, unpublishable) =
+            Self::language_server_enrichment_delta(&live_snapshot, &authority_snapshot)?;
+        if unpublishable > 0 {
+            debug!(
+                unpublishable,
+                "language-server relations name a node this workspace authority does not hold and were not published"
+            );
+        }
+        if semantic_delta.is_empty() {
+            return Ok(expected_generation);
+        }
+        let published = semantic_delta.relation_deltas().len();
+
+        let new_generation = workspace.generation.checked_add(1).ok_or_else(|| {
+            DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
+                "workspace {workspace_id} is at generation {}, the highest kin can record, so language-server enrichment cannot be published",
+                workspace.generation
+            )))
+        })?;
+        let transaction = kin_model::RepositoryTransaction {
+            schema_version: kin_model::REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: OperationId::new(),
+            repository_id: binding.repository_id().clone(),
+            expected_generation,
+            expected_roots: roots,
+            actor: kin_model::AuthorId::new("kin"),
+            reason: "publish language-server reference enrichment".to_string(),
+            external_objects: Vec::new(),
+            changes: Vec::new(),
+            aliases: Vec::new(),
+            git_authority_delta: None,
+            ref_mutations: Vec::new(),
+            default_ref_mutation: None,
+            workspace_mutation: Some(kin_model::WorkspaceMutation {
+                workspace_id,
+                expected: kin_model::WorkspaceExpectation::MustEqual {
+                    generation: workspace.generation,
+                    head: workspace.head.clone(),
+                    base_target: workspace.base_target.clone(),
+                    base_tree_hash: workspace.base_tree_hash,
+                    tree_hash: workspace.tree_hash,
+                    semantic_overlay_hash: workspace.semantic_overlay_hash,
+                    admission_policy: workspace.admission_policy,
+                },
+                new_generation,
+                new_head: workspace.head.clone(),
+                new_base_target: workspace.base_target.clone(),
+                new_base_tree_hash: workspace.base_tree_hash,
+                // Enrichment changes what kin knows about the tree, never the
+                // tree. Restating the exact tree hash unchanged is what keeps
+                // this a semantic publication rather than a tree admission.
+                tree_deltas: Vec::new(),
+                new_tree_hash: workspace.tree_hash,
+                semantic_delta,
+                new_shared_admission_policy: workspace.shared_admission_policy.clone(),
+                new_admission_policy: workspace.admission_policy,
+            }),
+            local_overlay_delta: None,
+            merge_transaction_delta: None,
+            sealed_observation: None,
+        };
+        let receipt = authority
+            .commit_repository_transaction(transaction)
+            .map_err(DaemonError::from)?;
+        self.record_repository_authority_commit(receipt.generation)?;
+        info!(
+            repo_id = self.cached_repo_id.as_str(),
+            published,
+            generation = receipt.generation,
+            "published language-server enrichment into workspace authority"
+        );
+        Ok(receipt.generation)
+    }
+
+    /// The canonical workspace semantic transition that publishes every
+    /// language-server relation the live graph holds and authority does not,
+    /// paired with the count this workspace cannot carry.
+    ///
+    /// Only `RelationOrigin::Lsp` edges are published. The rest of the derived
+    /// graph is reproducible from the exact tree authority already owns, so
+    /// promoting it here would turn a derived view into authority rather than
+    /// repair a loss.
+    ///
+    /// The desired set starts from what authority already holds, so this can
+    /// only add or refine. Enrichment never retracts an authority relation:
+    /// a language server that is absent this run, or slower than the last one,
+    /// would otherwise delete durable truth by failing to reproduce it.
+    ///
+    /// An edge is skipped unless authority holds both of its endpoints as
+    /// entities. A relation is not a place to introduce an entity, and the
+    /// endpoint an enrichment edge names may be an artifact, a test, or a
+    /// symbol owned outside this repository; publishing one of those here would
+    /// ask authority to accept a relation into a node it cannot resolve.
+    fn language_server_enrichment_delta(
+        live: &kin_db::GraphSnapshot,
+        authority: &kin_db::GraphSnapshot,
+    ) -> Result<(kin_model::WorkspaceSemanticDelta, usize)> {
+        let mut desired = authority.relations.clone();
+        let mut unpublishable = 0usize;
+        for (relation_id, relation) in &live.relations {
+            if relation.origin != kin_model::RelationOrigin::Lsp {
+                continue;
+            }
+            if !authority_holds_entity(authority, &relation.src)
+                || !authority_holds_entity(authority, &relation.dst)
+            {
+                unpublishable += 1;
+                continue;
+            }
+            desired.insert(*relation_id, relation.clone());
+        }
+        let delta = kin_core::diff_workspace_semantics(
+            &authority.entities,
+            &authority.relations,
+            &authority.entities,
+            &desired,
+        )
+        .map_err(|error| {
+            DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
+                "canonicalize language-server enrichment transition: {error}"
+            )))
+        })?;
+        Ok((delta, unpublishable))
     }
 
     fn load_committed_authority_graph(
@@ -9164,5 +9403,373 @@ mod tests {
         state
             .sync_blob_store()
             .expect("a second barrier with nothing pending is a no-op, not an error");
+    }
+
+    // ── Language-server enrichment must outlive the process that found it ──
+    //
+    // The daemon's local arm used to detach the pending batch, discard it, and
+    // acknowledge it anyway, so every enrichment edge was reported persisted
+    // and was absent on the next open. These pin both halves: what may be
+    // published, and that it comes back.
+
+    fn language_server_relation(
+        src: &Entity,
+        dst: &Entity,
+        origin: kin_model::RelationOrigin,
+    ) -> kin_model::Relation {
+        kin_model::Relation {
+            id: kin_model::RelationId::new(),
+            kind: kin_model::RelationKind::Calls,
+            src: kin_model::GraphNodeId::Entity(src.id),
+            dst: kin_model::GraphNodeId::Entity(dst.id),
+            confidence: 1.0,
+            origin,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        }
+    }
+
+    fn snapshot_of(
+        entities: &[Entity],
+        relations: &[kin_model::Relation],
+    ) -> kin_db::GraphSnapshot {
+        let graph = kin_db::InMemoryGraph::new();
+        for entity in entities {
+            graph.upsert_entity(entity).unwrap();
+        }
+        for relation in relations {
+            graph.upsert_relation(relation).unwrap();
+        }
+        graph.to_snapshot()
+    }
+
+    #[test]
+    fn enrichment_publishes_language_server_edges_and_leaves_the_rest_derived() {
+        let caller = test_entity("send", "src/sessions.rs");
+        let callee = test_entity("adapter_send", "src/adapters.rs");
+        let enriched = language_server_relation(&caller, &callee, kin_model::RelationOrigin::Lsp);
+        let parsed = language_server_relation(&caller, &callee, kin_model::RelationOrigin::Parsed);
+        let authority = snapshot_of(&[caller.clone(), callee.clone()], &[]);
+        let live = snapshot_of(
+            &[caller, callee],
+            std::slice::from_ref(&enriched)
+                .iter()
+                .chain(std::slice::from_ref(&parsed))
+                .cloned()
+                .collect::<Vec<_>>()
+                .as_slice(),
+        );
+
+        let (delta, unpublishable) =
+            DaemonState::language_server_enrichment_delta(&live, &authority).unwrap();
+
+        assert_eq!(unpublishable, 0);
+        let published = delta
+            .relation_deltas()
+            .iter()
+            .map(|delta| match delta {
+                kin_model::RelationDelta::Added { new } => new.id,
+                other => panic!("enrichment publishes additions only, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            published,
+            vec![enriched.id],
+            "only the language-server edge is authority's to keep; the parsed one is rebuilt \
+             from the exact tree authority already owns"
+        );
+    }
+
+    #[test]
+    fn enrichment_never_retracts_a_relation_authority_holds() {
+        // A language server that is absent this run, or slower than the last
+        // one, must not delete durable truth by failing to reproduce it.
+        let caller = test_entity("send", "src/sessions.rs");
+        let callee = test_entity("adapter_send", "src/adapters.rs");
+        let already_durable =
+            language_server_relation(&caller, &callee, kin_model::RelationOrigin::Lsp);
+        let authority = snapshot_of(
+            &[caller.clone(), callee.clone()],
+            std::slice::from_ref(&already_durable),
+        );
+        let live = snapshot_of(&[caller, callee], &[]);
+
+        let (delta, _) = DaemonState::language_server_enrichment_delta(&live, &authority).unwrap();
+
+        assert!(
+            delta.is_empty(),
+            "a live graph missing an authority relation must publish nothing, not a removal: {:?}",
+            delta.relation_deltas()
+        );
+    }
+
+    #[test]
+    fn enrichment_skips_an_endpoint_authority_does_not_hold() {
+        // A relation is not a place to introduce an entity. Publishing an edge
+        // into a node authority cannot resolve would ask it to admit one.
+        let caller = test_entity("send", "src/sessions.rs");
+        let stranger = test_entity("not_admitted", "src/vendored.rs");
+        let dangling = language_server_relation(&caller, &stranger, kin_model::RelationOrigin::Lsp);
+        let authority = snapshot_of(std::slice::from_ref(&caller), &[]);
+        let live = snapshot_of(&[caller, stranger], std::slice::from_ref(&dangling));
+
+        let (delta, unpublishable) =
+            DaemonState::language_server_enrichment_delta(&live, &authority).unwrap();
+
+        assert!(delta.is_empty(), "a dangling edge is not published");
+        assert_eq!(
+            unpublishable, 1,
+            "and the skip is counted rather than silent"
+        );
+    }
+
+    /// Admit entities and the files they live in into workspace authority the
+    /// way a commit does, so an enrichment edge between them has endpoints
+    /// authority holds.
+    ///
+    /// The files are not decoration. Authority refuses a transaction that
+    /// leaves an entity on a repository path its staged tree does not carry, so
+    /// an entity-only admission cannot be built at all. The same deltas are
+    /// applied to the live graph, which is what leaves the live tree equal to
+    /// authority's and lets a flush proceed.
+    fn publish_authority_entities(state: &DaemonState, entities: &[Entity]) {
+        let binding = state.local_repository_authority_binding().unwrap();
+        let authority = binding.open_manager().unwrap();
+        let workspace_id = binding.workspace_id();
+        let lease = authority.read_authority();
+        let roots = lease.roots().clone();
+        let expected_generation = roots.generation;
+        let authority_metadata = lease.metadata();
+        let workspace = authority_metadata
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == workspace_id)
+            .cloned()
+            .expect("the fixture workspace exists");
+        drop(lease);
+
+        let mut tree_deltas = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for entity in entities {
+            let Some(file) = entity.file_origin.as_ref() else {
+                continue;
+            };
+            if !seen.insert(file.0.clone()) {
+                continue;
+            }
+            let body = format!("// {}\n", file.0).into_bytes();
+            let hash = Hash256::from_bytes(kin_blobs::digest_bytes(&body));
+            authority.save_source_blob(hash, &body).unwrap();
+            state.blobs.write(&body).unwrap();
+            tree_deltas.push(TreeDelta::Added {
+                artifact_id: ArtifactId::new(),
+                new: LocatedEntry::new(
+                    RepoPath::from_utf8(&file.0).unwrap(),
+                    TreeEntry::blob(hash, false),
+                ),
+            });
+        }
+        let next_tree = workspace.tree.apply(&tree_deltas).unwrap();
+        let next_tree_hash = kin_model::compute_resolved_tree_hash(&next_tree).unwrap();
+
+        let entity_deltas = entities
+            .iter()
+            .map(|entity| kin_model::EntityDelta::Added {
+                new: entity.clone(),
+            })
+            .collect::<Vec<_>>();
+        let semantic_delta =
+            kin_model::WorkspaceSemanticDelta::new(entity_deltas.clone(), Vec::new()).unwrap();
+        let transaction = kin_model::RepositoryTransaction {
+            schema_version: kin_model::REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: OperationId::new(),
+            repository_id: binding.repository_id().clone(),
+            expected_generation,
+            expected_roots: roots,
+            actor: kin_model::AuthorId::new("kin"),
+            reason: "admit fixture entities".to_string(),
+            external_objects: Vec::new(),
+            changes: Vec::new(),
+            aliases: Vec::new(),
+            git_authority_delta: None,
+            ref_mutations: Vec::new(),
+            default_ref_mutation: None,
+            workspace_mutation: Some(kin_model::WorkspaceMutation {
+                workspace_id,
+                expected: kin_model::WorkspaceExpectation::MustEqual {
+                    generation: workspace.generation,
+                    head: workspace.head.clone(),
+                    base_target: workspace.base_target.clone(),
+                    base_tree_hash: workspace.base_tree_hash,
+                    tree_hash: workspace.tree_hash,
+                    semantic_overlay_hash: workspace.semantic_overlay_hash,
+                    admission_policy: workspace.admission_policy,
+                },
+                new_generation: workspace.generation + 1,
+                new_head: workspace.head.clone(),
+                new_base_target: workspace.base_target.clone(),
+                new_base_tree_hash: workspace.base_tree_hash,
+                tree_deltas: tree_deltas.clone(),
+                new_tree_hash: next_tree_hash,
+                semantic_delta,
+                new_shared_admission_policy: workspace.shared_admission_policy.clone(),
+                new_admission_policy: workspace.admission_policy,
+            }),
+            local_overlay_delta: None,
+            merge_transaction_delta: None,
+            sealed_observation: None,
+        };
+        let receipt = authority
+            .commit_repository_transaction(transaction)
+            .expect("the fixture entity admission commits");
+        state
+            .record_repository_authority_commit(receipt.generation)
+            .expect("the daemon cursor follows its own authority commit");
+        state
+            .graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                tree_deltas,
+                entity_deltas,
+                ..Default::default()
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn language_server_relations_survive_a_daemon_restart() {
+        // The whole defect in one assertion. Before the fix this relation was
+        // installed, counted, acknowledged as persisted, and absent here.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let layout = init.layout.clone();
+        let caller = test_entity("send", "src/sessions.rs");
+        let callee = test_entity("adapter_send", "src/adapters.rs");
+        let enriched = language_server_relation(&caller, &callee, kin_model::RelationOrigin::Lsp);
+
+        {
+            let state = test_state(layout.clone(), repo_dir.path());
+            publish_authority_entities(&state, &[caller.clone(), callee.clone()]);
+            state.graph.upsert_entity(&caller).unwrap();
+            state.graph.upsert_entity(&callee).unwrap();
+            state.graph.upsert_relation(&enriched).unwrap();
+            state
+                .save_snapshot()
+                .expect("a flush that publishes enrichment succeeds");
+            assert!(
+                state
+                    .graph
+                    .to_snapshot()
+                    .relations
+                    .contains_key(&enriched.id),
+                "the fixture must actually hold the edge before the restart"
+            );
+        }
+
+        let reopened = test_state(layout, repo_dir.path());
+        assert!(
+            reopened
+                .graph
+                .to_snapshot()
+                .relations
+                .contains_key(&enriched.id),
+            "a language-server relation must be graph-owned durable truth, not runtime state \
+             the next process does not inherit"
+        );
+    }
+
+    #[test]
+    fn a_flush_defers_while_a_repository_command_holds_the_gate() {
+        // Publishing moves the authority generation. A command that already
+        // read that generation and has not committed yet would then refuse
+        // itself, so a flush waits its turn instead of taking it.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = test_state(init.layout, repo_dir.path());
+        let caller = test_entity("send", "src/sessions.rs");
+        let callee = test_entity("adapter_send", "src/adapters.rs");
+        publish_authority_entities(&state, &[caller.clone(), callee.clone()]);
+        state
+            .graph
+            .upsert_relation(&language_server_relation(
+                &caller,
+                &callee,
+                kin_model::RelationOrigin::Lsp,
+            ))
+            .unwrap();
+        let before = state.snapshot_generation.load(Ordering::SeqCst);
+
+        let held = state
+            .coordination_gate
+            .try_lock()
+            .expect("the fixture gate is free until this test takes it");
+        state
+            .save_snapshot()
+            .expect("a deferred flush is a deferral, not a failure");
+        assert_eq!(
+            state.snapshot_generation.load(Ordering::SeqCst),
+            before,
+            "a flush must publish nothing while a repository command holds the gate"
+        );
+
+        drop(held);
+        state.save_snapshot().expect("the deferred flush publishes");
+        assert!(
+            state.snapshot_generation.load(Ordering::SeqCst) > before,
+            "and the deferral must be a delay rather than a loss"
+        );
+    }
+
+    #[test]
+    fn a_flush_that_cannot_publish_does_not_acknowledge_the_batch() {
+        // The non-negotiable: the local arm must never complete a persistence
+        // epoch for a batch nothing wrote. A live tree ahead of authority is
+        // refused before publication, and the RAII attempt must retire the
+        // batch rather than acknowledge it.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = test_state(init.layout, repo_dir.path());
+        let caller = test_entity("send", "src/sessions.rs");
+        let callee = test_entity("adapter_send", "src/adapters.rs");
+        publish_authority_entities(&state, &[caller.clone(), callee.clone()]);
+        state.graph.upsert_entity(&caller).unwrap();
+        state.graph.upsert_entity(&callee).unwrap();
+        state
+            .graph
+            .upsert_relation(&language_server_relation(
+                &caller,
+                &callee,
+                kin_model::RelationOrigin::Lsp,
+            ))
+            .unwrap();
+        let content = b"fn only_live() {}\n".to_vec();
+        let content_hash = Hash256::from_bytes(kin_blobs::digest_bytes(&content));
+        state.blobs.write(&content).unwrap();
+        state
+            .graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id: ArtifactId::new(),
+                    new: LocatedEntry::new(
+                        RepoPath::from_utf8("src/only_live.rs").unwrap(),
+                        TreeEntry::blob(content_hash, false),
+                    ),
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+        state.graph.clear_full_snapshot_required();
+
+        let refused = state.save_snapshot();
+
+        assert!(
+            refused.is_err(),
+            "a live tree authority has not admitted must refuse the flush"
+        );
+        assert!(
+            state.graph.full_snapshot_required(),
+            "a refused flush must retire its batch, which is what makes the next attempt \
+             serialize the live graph instead of trusting an acknowledgement nothing earned"
+        );
     }
 }
