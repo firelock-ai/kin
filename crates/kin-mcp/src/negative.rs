@@ -118,6 +118,21 @@ fn spec_for(tool: &str) -> Option<RetrievalSpec> {
             always: false,
             class: NegativeClass::Structural,
         },
+        // A pack's `dependents` group is the reference surface's answer,
+        // assembled by the same collector on the same store (FIR-2474), so the
+        // absence it can claim is the same absence and it is qualified by the
+        // same gates. `dependencies` is not the field here: an empty one says
+        // the focal calls nothing, which is an ordinary fact about a leaf and
+        // not a claim any agent acts on. The claim that decides whether a
+        // contract is safe to change is "nothing depends on this", and that is
+        // the one a pack used to publish as a bare `[]`.
+        "get_context_pack" => RetrievalSpec {
+            field: "dependents",
+            kind: "no_dependents",
+            subject: "nothing was found depending on the focal entity",
+            always: false,
+            class: NegativeClass::Structural,
+        },
         // The neighborhood always returns the focal itself, so an empty
         // `entities` says the focal is not in the graph rather than that it has
         // no neighbors, and for an indexed entity the list is never empty at
@@ -247,7 +262,7 @@ pub(crate) fn absence_cross_file_classes(tool: &str, payload: &Value) -> Vec<Str
                     .collect()
             })
             .unwrap_or_else(reference_classes),
-        "trace_data_flow" | "impact_analysis" => reference_classes(),
+        "trace_data_flow" | "impact_analysis" | "get_context_pack" => reference_classes(),
         _ => Vec::new(),
     }
 }
@@ -287,6 +302,7 @@ fn absence_is_language_scoped(tool: &str) -> bool {
             | "semantic_search"
             | "find_dead_code_seeded"
             | "graph_neighborhood"
+            | "get_context_pack"
     )
 }
 
@@ -609,7 +625,7 @@ pub(crate) fn absence_coverage_gap(tool: &str, payload: &Value) -> Option<String
 ///
 /// | tool | qualifies a populated answer | why |
 /// |---|---|---|
-/// | `find_references`, `bulk_check_references`, `trace_data_flow`, `graph_neighborhood`, `semantic_search`, `find_dead_code_seeded` | yes | each answers from the graph, and whether its rows are the whole set is exactly the question a caller acts on |
+/// | `find_references`, `bulk_check_references`, `trace_data_flow`, `graph_neighborhood`, `semantic_search`, `find_dead_code_seeded`, `get_context_pack` | yes | each answers from the graph, and whether its rows are the whole set is exactly the question a caller acts on |
 /// | `semantic_locate` | NO | its page is a bounded ranking rather than an enumeration, so its verdict can never be authoritative at any coverage, and the module already refuses to certify one. Attaching a verdict to every page is the defect FIR-2430 found wearing the opposite costume: a real symbol and a fabricated one came back under the IDENTICAL envelope, so a qualifier there teaches a reader to read a page as a graph claim when it is not one |
 /// | `entity_history` | NO | reads recorded change history, where a populated answer is the history and there is no whole-set question about the graph to answer |
 /// | `dead_code` | NO | its result is the INVERSE claim, and rows are candidates to check rather than an answer whose completeness licenses an action |
@@ -1529,7 +1545,14 @@ pub fn negative_for(
     // verdict — the calls may simply never have been linked. Never let an agent
     // read "safe to delete" off an incomplete call graph: downgrade to
     // inconclusive so the absence is flagged as possibly-unresolved, not certain.
-    if tool == "find_references" && focal_is_method(payload) {
+    //
+    // A pack's `dependents` group is built by the same collector over the same
+    // edges (FIR-2474), so the gap it inherits is the same one and it has to be
+    // reported the same way. Gating this on the tool name alone was how the two
+    // surfaces were able to disagree about one entity in one store: the tool
+    // that refused to certify and the tool that published `[]` were reading the
+    // identical incomplete call graph.
+    if matches!(tool, "find_references" | "get_context_pack") && focal_is_method(payload) {
         push_gap(
             &mut trustworthy,
             &mut trust_reason,
