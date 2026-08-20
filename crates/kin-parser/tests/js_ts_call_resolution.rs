@@ -238,3 +238,135 @@ fn ts_dotted_dst_names_only_ever_name_the_enclosing_owner() {
         );
     }
 }
+
+// ---- Receivers ----
+//
+// A member call also records the expression it was written on. Without it the
+// linker has only the bare leaf, and matching that leaf against every
+// same-named symbol in the repository is what bound `JSON.stringify` to
+// express's own `stringify` and `http.createServer` to a test's own
+// `createServer`. The receiver is what separates a call through an imported
+// module from a call through a value nothing here types.
+
+fn receiver_for<'a>(output: &'a ParseOutput, dst: &str) -> Option<&'a str> {
+    calls(output)
+        .into_iter()
+        .find(|r| r.dst_name == dst)
+        .unwrap_or_else(|| panic!("no Calls edge to `{dst}` in {:?}", dst_names(output)))
+        .receiver
+        .as_deref()
+}
+
+fn receivers_for<'a>(output: &'a ParseOutput, dst: &str) -> Vec<Option<&'a str>> {
+    calls(output)
+        .into_iter()
+        .filter(|r| r.dst_name == dst)
+        .map(|r| r.receiver.as_deref())
+        .collect()
+}
+
+#[test]
+fn js_member_call_records_the_receiver_it_was_written_on() {
+    let output = parse_fixture(&JavaScriptAdapter, "javascript", "calls.js");
+    assert_eq!(
+        receiver_for(&output, "log"),
+        Some("console"),
+        "`console.log(...)` must record `console` as its receiver"
+    );
+    assert_eq!(
+        receiver_for(&output, "handle"),
+        Some("this.router"),
+        "`this.router.handle(...)` must record the whole property chain, \
+         which is the only thing that says the destination is not here"
+    );
+    assert_eq!(
+        receiver_for(&output, "b"),
+        Some("a"),
+        "`a.b()` must record `a` as its receiver"
+    );
+    assert_eq!(
+        receiver_for(&output, "maybe"),
+        Some("obj"),
+        "an optional chain is still a member call and still has a receiver"
+    );
+}
+
+#[test]
+fn js_owner_folded_and_bare_calls_record_no_receiver() {
+    // The owner is already in the callee name, so repeating it as a receiver
+    // would make the linker skip the same-file tier that name exists to reach.
+    // This is the same split the Python adapter makes for `self`/`cls`.
+    let output = parse_fixture(&JavaScriptAdapter, "javascript", "calls.js");
+    assert_eq!(
+        receiver_for(&output, "Greeter.sayHi"),
+        None,
+        "`this.sayHi()` is recorded owner-qualified, so it carries no receiver"
+    );
+    assert_eq!(
+        receiver_for(&output, "Application.own"),
+        None,
+        "`this.own()` is recorded owner-qualified, so it carries no receiver"
+    );
+    assert_eq!(
+        receiver_for(&output, "helperCall"),
+        None,
+        "a bare call has no receiver to record"
+    );
+    assert_eq!(
+        receiver_for(&output, "bare"),
+        None,
+        "a bare call has no receiver to record"
+    );
+}
+
+#[test]
+fn js_receiver_that_is_not_a_name_chain_is_declined() {
+    // The field's consumers read it as a name: the linker splits it at the
+    // first `.` and asks the file's imports about that root. A call, a
+    // subscript or a parenthesized expression answers nothing, and recording
+    // its raw text would put source formatting into an identifier position.
+    let output = parse_fixture(&JavaScriptAdapter, "javascript", "calls.js");
+    assert_eq!(
+        receiver_for(&output, "c"),
+        None,
+        "`a.b().c()` is written on a call, which names no binding"
+    );
+    let run_receivers = receivers_for(&output, "run");
+    assert_eq!(
+        run_receivers.len(),
+        2,
+        "the fixture writes `run` on a subscript and on a call, got {run_receivers:?}"
+    );
+    assert!(
+        run_receivers.iter().all(Option::is_none),
+        "neither `deps[0]` nor `make()` names a binding, got {run_receivers:?}"
+    );
+}
+
+#[test]
+fn ts_member_calls_record_receivers_through_the_same_constructor() {
+    // TypeScript has no call extractor of its own: `typescript.rs` imports
+    // `extract_calls_from_context` from the JavaScript adapter. This pins that,
+    // so a change made for JavaScript cannot silently leave TypeScript behind.
+    let output = parse_fixture(&TypeScriptAdapter, "typescript", "calls.ts");
+    assert_eq!(
+        receiver_for(&output, "log"),
+        Some("console"),
+        "`console.log(...)` must record `console` as its receiver"
+    );
+    assert_eq!(
+        receiver_for(&output, "handle"),
+        Some("this.router"),
+        "`this.router.handle(...)` must record the whole property chain"
+    );
+    assert_eq!(
+        receiver_for(&output, "Application.own"),
+        None,
+        "an owner-folded call carries no receiver in TypeScript either"
+    );
+    assert_eq!(
+        receiver_for(&output, "c"),
+        None,
+        "`a.b().c()` is written on a call, which names no binding"
+    );
+}
