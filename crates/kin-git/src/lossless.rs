@@ -59,7 +59,7 @@ std::thread_local! {
     // asks for it repeatedly, so one slot captures every repeat ask while
     // bounding what is held: the flask corpus's closure is 162.5 MiB, and a
     // cache that grew would trade the wall for a memory wall.
-    static CLOSURE_CACHE: std::cell::RefCell<Option<(ClosureKey, Rc<ClosureBodies>)>> =
+    static CLOSURE_CACHE: std::cell::RefCell<Option<(ClosureKey, SharedObjectClosure)>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -88,6 +88,45 @@ struct ClosureKey {
 }
 
 type ClosureBodies = BTreeMap<ExternalObjectId, Vec<u8>>;
+
+/// A decompressed object closure this process built and is still holding.
+///
+/// The skip this enables rests on one claim: these bytes were read from the
+/// CAS and checked against their descriptors BY THIS PROCESS, and have been
+/// held immutable since. A closure that outlived the process, or reached a
+/// thread that did not verify it, would be a different claim needing
+/// re-verification on load, and nothing here would notice the difference.
+///
+/// So the type refuses to become one. The field is private and the only
+/// constructor is [`decompressed_closure`]. The handle is [`Rc`], which is
+/// `!Send`, so it cannot cross a thread boundary. The cache holding it is a
+/// `thread_local`, so it cannot outlive the thread. Neither this type nor the
+/// cache entry carries a serialization impl.
+pub(crate) struct SharedObjectClosure(Rc<ClosureBodies>);
+
+const _: () = {
+    // Holds the handle to `Rc` at compile time. Swapping it for `Arc` would
+    // make the closure `Send`, and a verified-here closure that can be moved
+    // to a thread that did not verify it is no longer evidence of anything.
+    #[allow(dead_code)]
+    fn the_handle_stays_thread_bound(closure: &SharedObjectClosure) -> &Rc<ClosureBodies> {
+        &closure.0
+    }
+};
+
+impl Clone for SharedObjectClosure {
+    fn clone(&self) -> Self {
+        Self(Rc::clone(&self.0))
+    }
+}
+
+impl std::ops::Deref for SharedObjectClosure {
+    type Target = ClosureBodies;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 /// Whether a caller may be handed a closure this thread already decompressed.
 ///
@@ -742,7 +781,7 @@ fn gix_object_id(oid: GitObjectId) -> Result<gix::ObjectId> {
 pub(crate) fn validate_snapshot(
     snapshot: &LosslessGitRepository,
     blob_store: &BlobStore,
-) -> Result<Rc<ClosureBodies>> {
+) -> Result<SharedObjectClosure> {
     validate_snapshot_with(snapshot, blob_store, ClosureSharing::Shared)
 }
 
@@ -752,7 +791,7 @@ fn validate_snapshot_with(
     snapshot: &LosslessGitRepository,
     blob_store: &BlobStore,
     sharing: ClosureSharing,
-) -> Result<Rc<ClosureBodies>> {
+) -> Result<SharedObjectClosure> {
     snapshot.refs.validate()?;
     for repository_ref in &snapshot.refs.refs {
         if repository_ref.repository_id != snapshot.repository_id {
@@ -794,7 +833,7 @@ fn decompressed_closure(
     snapshot: &LosslessGitRepository,
     blob_store: &BlobStore,
     sharing: ClosureSharing,
-) -> Result<Rc<ClosureBodies>> {
+) -> Result<SharedObjectClosure> {
     let key = closure_key(snapshot);
     if sharing == ClosureSharing::Shared {
         if let Some(shared) = CLOSURE_CACHE.with(|cache| {
@@ -802,7 +841,7 @@ fn decompressed_closure(
                 .borrow()
                 .as_ref()
                 .filter(|(cached, _)| *cached == key)
-                .map(|(_, bodies)| Rc::clone(bodies))
+                .map(|(_, bodies)| bodies.clone())
         }) {
             return Ok(shared);
         }
@@ -846,9 +885,9 @@ fn decompressed_closure(
 
     // Published only after every body passed, so a rejected object set leaves
     // nothing behind for the next caller to hit.
-    let shared = Rc::new(bodies);
+    let shared = SharedObjectClosure(Rc::new(bodies));
     CLOSURE_CACHE.with(|cache| {
-        *cache.borrow_mut() = Some((key, Rc::clone(&shared)));
+        *cache.borrow_mut() = Some((key, shared.clone()));
     });
     Ok(shared)
 }
@@ -2323,6 +2362,35 @@ mod tests {
             Err(GitError::Blob(_))
         ));
         assert!(!cas_output.exists());
+    }
+
+    #[test]
+    fn a_shared_closure_is_byte_identical_to_a_rebuild() {
+        let fixture = Fixture::simple();
+        let snapshot = capture_lossless_git_repository(
+            &fixture.repo,
+            RepositoryId::new("byte-identical").unwrap(),
+            &fixture.blob_store,
+        )
+        .unwrap();
+
+        let shared = validate_snapshot(&snapshot, &fixture.blob_store).unwrap();
+
+        let before = closure_reconstruction_count();
+        let fresh =
+            validate_snapshot_with(&snapshot, &fixture.blob_store, ClosureSharing::Fresh).unwrap();
+        // Without this the test could compare a cached closure against itself
+        // and pass no matter how stale the cache had become.
+        assert_eq!(
+            closure_reconstruction_count(),
+            before + 1,
+            "the control arm must actually re-read the CAS, or it controls nothing",
+        );
+
+        assert_eq!(
+            *shared, *fresh,
+            "a shared closure must be byte-identical to one rebuilt from the CAS",
+        );
     }
 
     #[test]
