@@ -3426,9 +3426,9 @@ dependencies = [
 
 [[package]]
 name = "kin-lsp"
-version = "0.6.14"
+version = "0.6.16"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "6d926f6fdf0445ce64ef10fdc01c02f9a9905bafdc16e9417160183130a861b0"
+checksum = "5ef67e9479a739aea7286339c3ed34aaf24bd114c38a5b2ff0352b71f97d2581"
 dependencies = [
  "kin-model",
  "serde",
