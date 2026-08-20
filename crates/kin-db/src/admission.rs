@@ -493,7 +493,11 @@ pub enum SensitiveAdmissionError {
         observed: Hash256,
     },
     #[error(
-        "untracked sensitive content at {path} is blocked before authority publication ({finding:?}); approve this exact path, digest, and entry kind explicitly"
+        "untracked sensitive content at {path} is blocked before authority publication ({finding:?}); \
+         approve it by recording this exact path, its digest {content_hash}, and its entry kind in \
+         .kin-allowances at the repository root, which `kin allow {path} --reason \"<why>\"` writes \
+         for you; the approval is tracked, so it travels with the repository and a later edit to \
+         this file changes the digest and blocks again"
     )]
     Blocked {
         path: RepoPath,
@@ -837,6 +841,30 @@ def build_match_query(term):
         assert!(
             error.to_string().contains("untracked sensitive content"),
             "unexpected error for a hardcoded key literal: {error}"
+        );
+    }
+
+    #[test]
+    fn the_block_names_the_approval_file_the_digest_and_the_command() {
+        let contents = "api_key = \"9f8a7b6c5d4e3f2a1b0c4d5e\"\n";
+        let error = admit("notekeeper/client.py", contents)
+            .expect_err("a hardcoded key literal must block");
+        let text = error.to_string();
+        for expected in [
+            "notekeeper/client.py",
+            ".kin-allowances",
+            "kin allow",
+            "--reason",
+            &sha256(contents.as_bytes()).to_string(),
+        ] {
+            assert!(
+                text.contains(expected),
+                "the refusal must name {expected:?}, got: {text}"
+            );
+        }
+        assert!(
+            !text.contains("approve this exact path, digest, and entry kind explicitly"),
+            "the old promise named no command and nothing performed it: {text}"
         );
     }
 
