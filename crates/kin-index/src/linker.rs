@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use kin_model::{
     ArtifactId, Entity, EntityId, EntityKind, EntityRole, FilePathId, GraphNodeId, LanguageId,
     ParseCompleteness, Relation, RelationEvidence, RelationId, RelationKind, RelationOrigin,
-    Visibility,
+    SourceSpan, Visibility,
 };
 use kin_parser::{
     is_call_extraction_incomplete_marker, is_python_builtin_name, CallArgShape, ExtractedRelation,
@@ -86,6 +86,14 @@ pub const CALL_SHAPE_PARSE_COVERAGE_INCOMPLETE_V1: &str = "call_shape_parse_cove
 /// receiver resolution was not exhaustive.
 pub const CALL_SHAPE_EXTRACTION_COVERAGE_INCOMPLETE_V1: &str =
     "call_shape_extraction_coverage_incomplete_v1";
+
+/// Provenance marker for an `Overrides` edge the linker derived from syntax
+/// alone: the class declares a base, that base name resolved to a class entity
+/// through the same tiers an inherited-method call resolves through, and both
+/// classes define a member of the same leaf name. It records that no language
+/// server was involved, which is what separates this edge from an
+/// `Overrides` a type hierarchy proved.
+pub const OVERRIDE_EVIDENCE_RESOLVED_BASE_V1: &str = "override_resolved_base_v1";
 
 /// Per-file parse completeness supplied by ingestion paths that have parser
 /// state available. Kept separate from [`FileParseData`] so adding the safety
@@ -1292,6 +1300,13 @@ fn resolve_one_file(
             kind = ?rel.kind,
             "linker: cross-file relation unresolved"
         );
+    }
+
+    // Derived after the parser's own relations: an override is a fact about
+    // two declarations plus a resolved base, not about any one extracted
+    // relation, so it has no `ExtractedRelation` to be resolved from.
+    for relation in derive_override_relations(file, ctx) {
+        accumulate_relation(&mut resolved, &mut relation_indices, relation);
     }
 
     resolved
@@ -2514,6 +2529,121 @@ fn resolve_inherited_method(
     None
 }
 
+/// Whether an entity kind can override an ancestor's member.
+///
+/// Methods are the whole of it for the languages kin parses, but a parser that
+/// records a class member as a plain function is admitted on the same footing
+/// so the rule turns on the parser's own `Contains` edge rather than on a
+/// naming convention.
+fn is_overridable_member(kind: Option<&EntityKind>) -> bool {
+    matches!(kind, Some(EntityKind::Method | EntityKind::Function))
+}
+
+/// Build the `Overrides` edge for a resolved (child member, base member) pair.
+///
+/// `Parsed` origin and full confidence, because every input is syntax the
+/// parser read: the base declaration, the two member declarations, and the
+/// resolution tiers that connected them. Evidence carries the overriding
+/// member's own span, so a reader is sent to the declaration that does the
+/// overriding rather than to the base it replaces.
+fn override_relation(child: EntityId, base: EntityId, span: Option<&SourceSpan>) -> Relation {
+    Relation {
+        id: stable_relation_id(&child, &base, &RelationKind::Overrides),
+        kind: RelationKind::Overrides,
+        src: GraphNodeId::Entity(child),
+        dst: GraphNodeId::Entity(base),
+        confidence: 1.0,
+        origin: RelationOrigin::Parsed,
+        created_in: None,
+        import_source: None,
+        evidence: vec![RelationEvidence {
+            source_span: span.cloned(),
+            parser_rule: Some(OVERRIDE_EVIDENCE_RESOLVED_BASE_V1.to_string()),
+            ..RelationEvidence::default()
+        }],
+    }
+}
+
+/// Emit `Overrides(child member -> base member)` for every member a class
+/// redeclares from an ancestor it declares and the linker can resolve.
+///
+/// This is a syntactic fact, not a type-resolved one, and it is deliberately
+/// the same fact the inherited-call path already trusts: the walk is
+/// [`resolve_inherited_method`], so a class overrides exactly what a call
+/// through that class would have reached on its base. Two answers derived from
+/// one walk cannot disagree, which matters because a consumer that counts a
+/// caller of the base as reaching the override would otherwise double count or
+/// miss depending on which of two walks it asked.
+///
+/// A base that resolves to nothing yields nothing. `locate_base_class` returns
+/// `None` for an external, builtin, or ambiguous base name, and the walk ends
+/// that branch rather than guessing, so a name-only base reference never mints
+/// an edge — it is not evidence that anything was overridden.
+///
+/// Class membership comes from the parser's `Contains` edges rather than from
+/// splitting qualified entity names, so a language whose parser names members
+/// bare is covered on the same footing as one that qualifies them. Kept in
+/// exact resolution parity with [`derive_override_relations_incremental`].
+fn derive_override_relations(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation> {
+    let file_path = file.file_path.as_str();
+    // Nothing in this file declares a base, so nothing in it can override.
+    if !file
+        .relations
+        .iter()
+        .any(|rel| rel.kind == RelationKind::Extends)
+    {
+        return Vec::new();
+    }
+
+    let span_by_id: HashMap<EntityId, &SourceSpan> = file
+        .entities
+        .iter()
+        .filter_map(|entity| entity.span.as_ref().map(|span| (entity.id, span)))
+        .collect();
+
+    let mut overrides = Vec::new();
+    for rel in &file.relations {
+        if rel.kind != RelationKind::Contains {
+            continue;
+        }
+        // Only a class this file declares a base for can override anything.
+        if !ctx
+            .class_bases_by_file_class
+            .contains_key(&(file_path, rel.src_name.as_str()))
+        {
+            continue;
+        }
+        let Some(&child_id) = ctx
+            .entity_by_file_name
+            .get(&(file_path, rel.dst_name.as_str()))
+        else {
+            continue;
+        };
+        if !is_overridable_member(ctx.entity_kind_by_id.get(&child_id)) {
+            continue;
+        }
+        let Some(base_id) = resolve_inherited_method(
+            file_path,
+            &rel.src_name,
+            bare_entity_name(&rel.dst_name),
+            ctx,
+        ) else {
+            continue;
+        };
+        // A cycle in the declared hierarchy could walk back to the member it
+        // started from; a member does not override itself.
+        if base_id == child_id {
+            continue;
+        }
+        overrides.push(override_relation(
+            child_id,
+            base_id,
+            span_by_id.get(&child_id).copied(),
+        ));
+    }
+    overrides
+}
+
 /// Incremental-linker counterpart of [`locate_base_class`], kept in exact
 /// resolution parity: same-file class, then the caller file's import bindings,
 /// then a repo-globally unique class name. `import_map` is the step-local
@@ -2634,6 +2764,74 @@ fn resolve_inherited_method_incremental(
         }
     }
     None
+}
+
+/// Incremental-linker counterpart of [`derive_override_relations`], kept in
+/// exact resolution parity: the same `Contains`-driven membership, the same
+/// overridable-kind rule, and the same walk through
+/// [`resolve_inherited_method_incremental`], whose base resolution mirrors
+/// [`locate_base_class`] tier for tier. `class_bases` is the step-local
+/// hierarchy overlay, so a class whose base was declared in this step resolves
+/// exactly as the batch linker would resolve it.
+fn derive_override_relations_incremental(
+    file: &FileParseData,
+    linker: &IncrementalLinker,
+    import_map: &HashMap<&str, HashMap<&str, (&str, &str)>>,
+    class_bases: &HashMap<String, Vec<(String, Vec<String>)>>,
+) -> Vec<Relation> {
+    let file_path = file.file_path.as_str();
+    if !file
+        .relations
+        .iter()
+        .any(|rel| rel.kind == RelationKind::Extends)
+    {
+        return Vec::new();
+    }
+
+    let span_by_id: HashMap<EntityId, &SourceSpan> = file
+        .entities
+        .iter()
+        .filter_map(|entity| entity.span.as_ref().map(|span| (entity.id, span)))
+        .collect();
+
+    let mut overrides = Vec::new();
+    for rel in &file.relations {
+        if rel.kind != RelationKind::Contains {
+            continue;
+        }
+        if class_bases_in(class_bases, file_path, &rel.src_name).is_none() {
+            continue;
+        }
+        let Some(&child_id) = linker
+            .entity_by_file_name
+            .get(file_path)
+            .and_then(|by_name| by_name.get(rel.dst_name.as_str()))
+        else {
+            continue;
+        };
+        if !is_overridable_member(linker.entity_kind_by_id.get(&child_id)) {
+            continue;
+        }
+        let Some(base_id) = resolve_inherited_method_incremental(
+            file_path,
+            &rel.src_name,
+            bare_entity_name(&rel.dst_name),
+            linker,
+            import_map,
+            class_bases,
+        ) else {
+            continue;
+        };
+        if base_id == child_id {
+            continue;
+        }
+        overrides.push(override_relation(
+            child_id,
+            base_id,
+            span_by_id.get(&child_id).copied(),
+        ));
+    }
+    overrides
 }
 
 /// Directory component of a repo-relative path (`""` for top-level files).
@@ -5477,6 +5675,14 @@ fn resolve_one_file_incremental(
             accumulate_relation(&mut resolved, &mut relation_indices, external);
             continue;
         }
+    }
+
+    // See the batch resolver: an override is derived from declarations, not
+    // resolved from an extracted relation.
+    for relation in
+        derive_override_relations_incremental(file, linker, import_map, class_bases)
+    {
+        accumulate_relation(&mut resolved, &mut relation_indices, relation);
     }
 
     resolved
