@@ -974,6 +974,57 @@ fn trace_absence_subject(payload: &Value) -> Option<&'static str> {
 /// `trace_data_flow` used to skip all of them and certify absence on nothing but
 /// the substrate gate, which is how an entity with a live caller came back
 /// authoritative-absent.
+/// The gap a response's own `focal_resolution` names, phrased for the shape of
+/// answer that carries it.
+///
+/// Shared, because two tools resolve a focal the same way and must not qualify
+/// it differently. `trace_data_flow` has always refused to certify a walk whose
+/// focal name the graph holds twice; `find_references` published the identical
+/// resolution block and read nothing from it, so on pallets/flask it stamped an
+/// answer describing one of three same-named methods as complete and exact
+/// (FIR-2475). One resolution, one verdict about it.
+///
+/// `subject` names what the answer is, so the sentence reads about a chain or a
+/// reference list rather than about "the answer" in both.
+fn focal_resolution_gap(payload: &Value, subject: &str) -> Option<String> {
+    // A missing block is the `None` arm, not an exemption. Both tools publish
+    // one on every answer, so its absence means the resolution went unreported
+    // rather than that this response has no focal to resolve, and reading it as
+    // an exemption would let exactly the answers that say least certify most.
+    let resolution = payload.get("focal_resolution").unwrap_or(&Value::Null);
+    match resolution
+        .get("same_name_candidates")
+        .and_then(Value::as_u64)
+    {
+        None => Some(format!(
+            "focal_resolution_unreported: this answer did not report how many entities the \
+             focal could have been resolved from, so {subject} may describe a same-named \
+             sibling rather than the entity that was asked about"
+        )),
+        Some(candidates) if candidates > 1 => {
+            // Which rule produced the count decides what the gap is ABOUT: a
+            // query that matched several entities is an ambiguous question,
+            // while several entities carrying one exact name is an ambiguous
+            // graph. Reporting either as the other sends a reader to fix the
+            // wrong end.
+            let counted = resolution
+                .get("matched")
+                .and_then(Value::as_str)
+                .unwrap_or("exact_focal_name");
+            let clause = if counted == "query_name_pattern" {
+                "match the name that was queried"
+            } else {
+                "share the focal's name"
+            };
+            Some(format!(
+                "focal_resolution_ambiguous: {candidates} entities {clause} and only one was \
+                 answered for, so {subject} is not evidence about the others"
+            ))
+        }
+        Some(_) => None,
+    }
+}
+
 fn trace_flow_gaps(payload: &Value) -> Vec<String> {
     let mut gaps = Vec::new();
 
@@ -997,22 +1048,8 @@ fn trace_flow_gaps(payload: &Value) -> Vec<String> {
     // one of them, and an edge the extractor could not attribute to a single
     // candidate sits on neither. Certifying that as absence answers for every
     // twin a question that was asked of one.
-    match payload
-        .get("focal_resolution")
-        .and_then(|resolution| resolution.get("same_name_candidates"))
-        .and_then(Value::as_u64)
-    {
-        None => gaps.push(
-            "focal_resolution_unreported: the walk did not report how many entities share the \
-             focal's name, so an empty chain may describe a same-named sibling rather than the \
-             entity that was asked about"
-                .to_string(),
-        ),
-        Some(candidates) if candidates > 1 => gaps.push(format!(
-            "focal_resolution_ambiguous: {candidates} entities share the focal's name and only \
-             one was walked, so an empty chain is not evidence about the others"
-        )),
-        Some(_) => {}
+    if let Some(gap) = focal_resolution_gap(payload, "an empty chain") {
+        gaps.push(gap);
     }
 
     // A walk cut short by its own caps or work ceilings stopped before it could
@@ -1581,6 +1618,26 @@ pub fn negative_for(
     // surfaces were able to disagree about one entity in one store: the tool
     // that refused to certify and the tool that published `[]` were reading the
     // identical incomplete call graph.
+    //
+    // The resolution the answer rode in on. `find_references` published a
+    // `focal_resolution` block and never read it back, so an answer describing
+    // one of several same-named entities was certified as the whole set
+    // (FIR-2475).
+    //
+    // Scoped to `find_references` on purpose, and the asymmetry with the method
+    // gate below is the point rather than an oversight: `get_context_pack` is
+    // addressed by `entity_id` and resolves no name, so it publishes no
+    // `focal_resolution` and has no resolution to qualify. Extending this to it
+    // would report `focal_resolution_unreported` on every pack, which is a gap
+    // about a step that tool never takes. The method gate is shared because both
+    // tools read the same edges; this one is not because only one of them
+    // resolves a name.
+    if tool == "find_references" {
+        if let Some(gap) = focal_resolution_gap(payload, "this reference list") {
+            push_gap(&mut trustworthy, &mut trust_reason, gap);
+        }
+    }
+
     if matches!(tool, "find_references" | "get_context_pack") && focal_is_method(payload) {
         push_gap(
             &mut trustworthy,
@@ -2127,7 +2184,84 @@ mod tests {
                 "authority_roots": { "provider": "provider-root" },
             },
             "edge_coverage": cross_file_edges_observed(),
+            // Every real find_references answer carries this block, so a
+            // fixture without one is not a smaller response, it is a shape the
+            // handler cannot produce. Leaving it out exercised the absence
+            // gates against a payload that never says how it resolved its
+            // focal, which is the gap FIR-2475 found unread.
+            "focal_resolution": {
+                "addressed_by": "entity_id",
+                "same_name_candidates": 1,
+                "matched": "exact_focal_name",
+                "other_candidates": [],
+            },
         })
+    }
+
+    /// FIR-2475, the verdict half. `find_references` published a
+    /// `focal_resolution` block on every answer and read nothing back from it,
+    /// so an answer describing one of several same-named entities was stamped
+    /// complete and exact. `trace_data_flow` has refused to certify that shape
+    /// since it was built; one resolution deserves one verdict whichever tool
+    /// carries it.
+    #[test]
+    fn find_references_absence_is_inconclusive_when_the_query_matched_several_entities() {
+        let mut payload = authoritative_empty_references("function");
+        payload["focal_resolution"] = json!({
+            "addressed_by": "name",
+            "same_name_candidates": 3,
+            "matched": "query_name_pattern",
+            "other_candidates": [
+                {"id": "00000000-0000-0000-0000-000000000002", "name": "View.dispatch_request"},
+                {"id": "00000000-0000-0000-0000-000000000003", "name": "MethodView.dispatch_request"},
+            ],
+        });
+        let negative = negative_for("find_references", &payload, &structural_ready_envelope())
+            .expect("an empty reference list yields a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            reason.contains("focal_resolution_ambiguous"),
+            "the ambiguous resolution must be named: {reason}"
+        );
+        assert!(
+            reason.contains("match the name that was queried"),
+            "an ambiguous QUERY and an ambiguous graph send a reader to different \
+             places, so the gap must say which one this is: {reason}"
+        );
+    }
+
+    /// The control. The gate must not fire on an unambiguous resolution, or it
+    /// would mark every answer uncertain and say nothing at all.
+    #[test]
+    fn find_references_absence_stays_authoritative_when_its_resolution_was_exact() {
+        let payload = authoritative_empty_references("function");
+        let negative = negative_for("find_references", &payload, &structural_ready_envelope())
+            .expect("an empty reference list yields a negative");
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(true),
+            "one candidate is not an ambiguity: {negative}"
+        );
+    }
+
+    /// An answer that does not report its resolution at all is the shape that
+    /// let this through: absent said nothing, and nothing read as fine.
+    #[test]
+    fn find_references_absence_is_inconclusive_when_the_resolution_went_unreported() {
+        let mut payload = authoritative_empty_references("function");
+        payload
+            .as_object_mut()
+            .unwrap()
+            .remove("focal_resolution")
+            .expect("the fixture carries the block to remove");
+        let negative = negative_for("find_references", &payload, &structural_ready_envelope())
+            .expect("an empty reference list yields a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert!(negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .contains("focal_resolution_unreported"));
     }
 
     #[test]

@@ -1797,6 +1797,18 @@ mod tests {
                     "reference_enrichment": "unknown",
                     "budget_exhausted": false,
                 },
+                // Unambiguous on purpose, and present on purpose. The handler
+                // publishes this block on every answer, and since FIR-2475 the
+                // verdict reads it: an answer that does not say how its focal
+                // was resolved cannot be certified, because it may describe a
+                // same-named sibling. A fixture omitting it is not a smaller
+                // response, it is one the handler cannot produce.
+                "focal_resolution": {
+                    "addressed_by": "entity_id",
+                    "same_name_candidates": 1,
+                    "matched": "exact_focal_name",
+                    "other_candidates": [],
+                },
             })
             .to_string(),
         )
