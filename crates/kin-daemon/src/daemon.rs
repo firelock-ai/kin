@@ -1260,12 +1260,39 @@ fn install_lsp_relations(state: &DaemonState, relations: &[kin_model::Relation])
 
     use kin_model::EntityStore;
     let graph_mutation = state.begin_graph_authority_mutation();
+    let mut installed = 0usize;
+    let mut refused = 0usize;
     for relation in relations {
-        let _ = state.graph.upsert_relation(relation);
+        match state.graph.upsert_relation(relation) {
+            Ok(_) => installed += 1,
+            Err(error) => {
+                refused += 1;
+                // Was `let _ =`. A write the graph refused was indistinguishable
+                // from one it took, and the count returned was the number of
+                // relations ATTEMPTED, so a pass that installed nothing reported
+                // exactly the same number as one that installed everything. That
+                // is how a language-server answer proved correct in the trace
+                // reached the graph as nothing at all, and every log line about
+                // it said the enrichment had worked.
+                debug!(
+                    kind = ?relation.kind,
+                    src = ?relation.src,
+                    dst = ?relation.dst,
+                    %error,
+                    "graph refused an enrichment relation"
+                );
+            }
+        }
+    }
+    if refused > 0 {
+        warn!(
+            installed,
+            refused, "graph refused enrichment relations; the enriched count reports what it took"
+        );
     }
     state.bump_version();
     drop(graph_mutation);
-    relations.len()
+    installed
 }
 
 /// Enrich a single entity with all available LSP relation types (calls, overrides,
