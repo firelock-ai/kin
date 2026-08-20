@@ -4594,6 +4594,18 @@ mod lsp_query_column_tests {
         );
     }
 
+    /// A signature that repeats the receiver must not pull the cursor back to
+    /// it.
+    ///
+    /// `app.app = function app(` carries the token `app` three times. Anchoring
+    /// on the whole dotted name and then stepping to its last segment lands on
+    /// the member at 4. Searching for the segment on its own would return 0,
+    /// the receiver, which is this same defect wearing a different disguise.
+    #[test]
+    fn a_signature_that_repeats_the_receiver_still_addresses_the_member() {
+        assert_eq!(lsp_query_column("app.app = function app(", "app.app", 0), 4);
+    }
+
     /// And a name the signature does not carry at all keeps the old answer
     /// rather than inventing a position.
     #[test]
