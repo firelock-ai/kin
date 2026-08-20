@@ -4652,6 +4652,27 @@ impl DaemonState {
                 .graph
                 .begin_delta_persistence(expected_gen)
                 .map(|(_, epoch)| GraphPersistenceAttempt::new(self.graph.as_ref(), epoch));
+            // Publishing moves the authority generation, so it must not land
+            // inside a repository command. That command planned against the
+            // generation it read, and `require_fresh_daemon_workspace` compares
+            // the two, so a publication between its plan and its commit makes it
+            // refuse itself and tell the user to reopen. Taking the gate the
+            // mutation routes take closes that window rather than narrowing it.
+            //
+            // A try, never a wait: this runs on the persist path, which may not
+            // block on an async gate, and a flush is periodic anyway. When a
+            // command holds it, the whole arm defers. Nothing is acknowledged,
+            // the relations stay in the live graph, and the next flush derives
+            // the same write set from there. The tree proof defers with it,
+            // which is the point: an acknowledgement is worth nothing without
+            // the proof beside it.
+            let Ok(_coordinated) = self.coordination_gate.try_lock() else {
+                debug!(
+                    generation = expected_gen,
+                    "deferred enrichment publication while a repository command holds the coordination gate"
+                );
+                return Ok(());
+            };
             let published_generation = self.publish_local_workspace_enrichment(expected_gen)?;
             self.graph.flush_text_index().map_err(DaemonError::from)?;
             if let Some(attempt) = persistence_attempt {
@@ -9654,6 +9675,48 @@ mod tests {
                 .contains_key(&enriched.id),
             "a language-server relation must be graph-owned durable truth, not runtime state \
              the next process does not inherit"
+        );
+    }
+
+    #[test]
+    fn a_flush_defers_while_a_repository_command_holds_the_gate() {
+        // Publishing moves the authority generation. A command that already
+        // read that generation and has not committed yet would then refuse
+        // itself, so a flush waits its turn instead of taking it.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = test_state(init.layout, repo_dir.path());
+        let caller = test_entity("send", "src/sessions.rs");
+        let callee = test_entity("adapter_send", "src/adapters.rs");
+        publish_authority_entities(&state, &[caller.clone(), callee.clone()]);
+        state
+            .graph
+            .upsert_relation(&language_server_relation(
+                &caller,
+                &callee,
+                kin_model::RelationOrigin::Lsp,
+            ))
+            .unwrap();
+        let before = state.snapshot_generation.load(Ordering::SeqCst);
+
+        let held = state
+            .coordination_gate
+            .try_lock()
+            .expect("the fixture gate is free until this test takes it");
+        state
+            .save_snapshot()
+            .expect("a deferred flush is a deferral, not a failure");
+        assert_eq!(
+            state.snapshot_generation.load(Ordering::SeqCst),
+            before,
+            "a flush must publish nothing while a repository command holds the gate"
+        );
+
+        drop(held);
+        state.save_snapshot().expect("the deferred flush publishes");
+        assert!(
+            state.snapshot_generation.load(Ordering::SeqCst) > before,
+            "and the deferral must be a delay rather than a loss"
         );
     }
 
