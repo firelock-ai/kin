@@ -1403,6 +1403,12 @@ struct SweepTally {
     server_unavailable: usize,
     /// Files whose source could not be loaded from graph authority.
     source_unreadable: usize,
+    /// Files whose file-level definitions pass exceeded its wall-clock budget.
+    ///
+    /// Counted rather than merely logged so the sweep's own completion record
+    /// carries it. These files are still visited and still get the per-entity
+    /// arm, so they are not blocked; what they lost is the definitions pass.
+    definitions_over_budget: usize,
     /// Whether the loop stopped before walking every file, on shutdown or on
     /// the background-work supervisor's verdict.
     ///
@@ -1484,6 +1490,61 @@ impl SweepTally {
             return Some("this build enriches no language they are written in");
         }
         Some("the sweep reached none of them")
+    }
+}
+
+/// How long the file-level definitions pass may take for one file.
+///
+/// The pass had no bound of any kind. It is called at its sweep site as
+/// `.await.unwrap_or_default()`, and `locations_at` wraps nothing of its own, so
+/// every query inherits only the JSON-RPC client's own 10-second cap and a
+/// timeout yields an empty result that lets the loop continue to the NEXT
+/// identifier. A file whose language server stops answering therefore costs
+/// identifiers times ten seconds rather than failing, which on a large file is
+/// hours. Its sibling `enrich_single_entity` caps every query at 5 seconds, so
+/// the per-entity arm was bounded and the per-file arm was not.
+///
+/// 120 seconds is chosen from measurement, not taste. On a converted
+/// psf/requests store the whole per-file pass, both arms together, ran to a
+/// median of 1.2 s, a p90 of 12.0 s and a maximum of 62.4 s. The budget sits at
+/// nearly twice the slowest healthy file, so it cannot truncate work that is
+/// merely slow; it exists to turn an unbounded hang into a bounded, counted one.
+fn lsp_file_definitions_budget() -> Duration {
+    duration_from_env_secs("KIN_DAEMON_LSP_FILE_BUDGET_SECS", Duration::from_secs(120))
+}
+
+/// Run the file-level definitions pass under a wall-clock budget.
+///
+/// A pass that overruns yields the empty result the call site already used for
+/// a failed pass, and is counted on the tally so the sweep reports it rather
+/// than losing it. Split out from the call site so the budget decision can be
+/// tested against a provider that never answers, which is the case that
+/// motivated it and the one a live language server will not reproduce on demand.
+async fn file_definitions_within_budget<F, E>(
+    pass: F,
+    budget: Duration,
+    file: &str,
+    tally: &mut SweepTally,
+) -> kin_lsp::file_enrichment::FileEnrichmentResult
+where
+    F: std::future::Future<
+        Output = std::result::Result<kin_lsp::file_enrichment::FileEnrichmentResult, E>,
+    >,
+{
+    match tokio::time::timeout(budget, pass).await {
+        Ok(Ok(result)) => result,
+        // A pass that failed keeps the behaviour the call site always had.
+        Ok(Err(_)) => kin_lsp::file_enrichment::FileEnrichmentResult::default(),
+        Err(_) => {
+            tally.definitions_over_budget += 1;
+            warn!(
+                file = %file,
+                budget_s = budget.as_secs(),
+                "the file-level definitions pass exceeded its budget and was abandoned for \
+                 this file; its language server is not answering"
+            );
+            kin_lsp::file_enrichment::FileEnrichmentResult::default()
+        }
     }
 }
 
@@ -2937,6 +2998,7 @@ pub async fn run_with_authority_on(
                             .lsp_sweep_files_total
                             .store(total_files as u64, std::sync::atomic::Ordering::SeqCst);
                         let mut tally = SweepTally::default();
+                        let file_definitions_budget = lsp_file_definitions_budget();
                         let mut total_relations = 0usize;
                         // Languages whose server refused to start, remembered for
                         // the rest of this sweep. Without it the loop retries the
@@ -3140,16 +3202,20 @@ pub async fn run_with_authority_on(
 
                             // File-level enrichment: query definition at every identifier
                             // to capture ALL relationships (40-50x more than per-entity).
-                            let file_result = kin_lsp::file_enrichment::enrich_file_definitions(
-                                server,
-                                &abs_path,
-                                &file_content,
-                                &index,
-                                &lsp_root,
-                                documents,
+                            let file_result = file_definitions_within_budget(
+                                kin_lsp::file_enrichment::enrich_file_definitions(
+                                    server,
+                                    &abs_path,
+                                    &file_content,
+                                    &index,
+                                    &lsp_root,
+                                    documents,
+                                ),
+                                file_definitions_budget,
+                                &file_id.0,
+                                &mut tally,
                             )
-                            .await
-                            .unwrap_or_default();
+                            .await;
 
                             let mut file_relations =
                                 install_lsp_relations(&lsp_state, &file_result.relations);
@@ -3261,6 +3327,7 @@ pub async fn run_with_authority_on(
                             unsupported_language = tally.unsupported_language,
                             server_unavailable = tally.server_unavailable,
                             source_unreadable = tally.source_unreadable,
+                            definitions_over_budget = tally.definitions_over_budget,
                             not_visited,
                             ended_early = tally.ended_early,
                             unaccounted,
@@ -4813,7 +4880,8 @@ mod lsp_query_column_tests {
 
 #[cfg(test)]
 mod sweep_tally_tests {
-    use super::SweepTally;
+    use super::{file_definitions_within_budget, SweepTally};
+    use std::time::Duration;
 
     /// The number the sweep reports as `files`, and the one `/lsp/sweep/status`
     /// serves as `files_done`, is unchanged in meaning by the tally: a file the
@@ -4826,6 +4894,7 @@ mod sweep_tally_tests {
             unsupported_language: 5,
             server_unavailable: 6,
             source_unreadable: 7,
+            definitions_over_budget: 0,
             ended_early: false,
         };
         assert_eq!(tally.files_processed(), 7);
@@ -4909,6 +4978,94 @@ mod sweep_tally_tests {
             36,
             "36 files left the sweep without reaching any counter and must be visible"
         );
+    }
+
+    /// A provider that never answers is abandoned at its budget and counted.
+    ///
+    /// This is the case the budget exists for and the one a live language server
+    /// will not reproduce on demand: the pass had no bound at all, and every
+    /// query inside it inherits only the client's 10-second cap and yields an
+    /// empty result that lets the loop continue to the next identifier, so a
+    /// dead server costs identifiers times ten seconds instead of failing.
+    #[tokio::test]
+    async fn a_definitions_pass_that_never_answers_is_abandoned_and_counted() {
+        let mut tally = SweepTally::default();
+        let stalled = std::future::pending::<
+            std::result::Result<kin_lsp::file_enrichment::FileEnrichmentResult, ()>,
+        >();
+        let result = file_definitions_within_budget(
+            stalled,
+            Duration::from_millis(60),
+            "src/requests/models.py",
+            &mut tally,
+        )
+        .await;
+        assert_eq!(
+            tally.definitions_over_budget, 1,
+            "a pass abandoned at its budget must be counted, not merely logged"
+        );
+        assert!(
+            result.relations.is_empty(),
+            "an abandoned pass yields the same empty result a failed pass always did"
+        );
+    }
+
+    /// The other direction: a pass that answers inside its budget is handed
+    /// back UNCHANGED and costs the tally nothing.
+    ///
+    /// Without this arm the budget could quietly truncate healthy enrichment and
+    /// every test above would still pass, which is the failure mode that matters
+    /// most here: relations silently going missing look exactly like a corpus
+    /// that had none.
+    #[tokio::test]
+    async fn a_pass_inside_its_budget_is_returned_byte_identical() {
+        use kin_model::{GraphNodeId, Relation, RelationId, RelationKind, RelationOrigin};
+        let src = kin_model::EntityId::new();
+        let dst = kin_model::EntityId::new();
+        let build = || kin_lsp::file_enrichment::FileEnrichmentResult {
+            relations: vec![Relation {
+                id: RelationId::from_bytes([9u8; 16]),
+                kind: RelationKind::References,
+                src: GraphNodeId::Entity(src),
+                dst: GraphNodeId::Entity(dst),
+                confidence: 0.85,
+                origin: RelationOrigin::Lsp,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            }],
+            definitions_resolved: 7,
+            positions_queried: 913,
+        };
+        let expected = build();
+        let mut tally = SweepTally::default();
+        // The pass must take REAL time before answering. An instantly-ready
+        // future is polled once and returned before any budget can apply, so a
+        // test written that way passes even with the budget set to a
+        // nanosecond, and proves nothing about truncation. Found by falsifying
+        // this very test: at a 1 ns budget it stayed green.
+        let healthy = async move {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            std::result::Result::<_, ()>::Ok(build())
+        };
+        let result = file_definitions_within_budget(
+            healthy,
+            Duration::from_secs(120),
+            "src/requests/models.py",
+            &mut tally,
+        )
+        .await;
+        assert_eq!(
+            tally.definitions_over_budget, 0,
+            "a pass that answered in time must not be counted against the budget"
+        );
+        assert_eq!(
+            result.relations, expected.relations,
+            "a healthy pass must come back with its relations unchanged; a budget that \
+             quietly truncated them would look exactly like a corpus that had none"
+        );
+        assert_eq!(result.definitions_resolved, expected.definitions_resolved);
+        assert_eq!(result.positions_queried, expected.positions_queried);
     }
 
     /// An interrupted sweep is not a miscounted one, and the guard must not
