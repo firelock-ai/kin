@@ -73,6 +73,19 @@ impl LanguageServerRecipe {
     }
 }
 
+/// The typescript package `typescript-language-server` is installed beside.
+///
+/// Pinned to 5.x, and the pin is load-bearing. `typescript-language-server`
+/// runs `tsserver`, which ships as `lib/tsserver.js` inside the typescript
+/// package. TypeScript 7 dropped that entry point: its package exposes only a
+/// `tsc` binary and carries no `lib/tsserver.js`. Installing typescript
+/// unpinned resolves the `latest` dist-tag, which is 7.x, and the server then
+/// answers Kin's `initialize` with "Could not find a valid TypeScript
+/// installation" and exits. Nothing in npm metadata prevents that pairing,
+/// because `typescript-language-server` declares no peer dependency on
+/// typescript at all.
+const TYPESCRIPT_PACKAGE: &str = "typescript@^5";
+
 /// Every language this build can enrich, with the server that enriches it.
 ///
 /// JavaScript and TypeScript are separate rows resolving to one binary and one
@@ -100,7 +113,12 @@ pub(crate) const LANGUAGE_SERVERS: &[LanguageServerRecipe] = &[
         language: LanguageId::TypeScript,
         binaries: &["typescript-language-server", "vtsls"],
         program: "npm",
-        args: &["install", "-g", "typescript-language-server", "typescript"],
+        args: &[
+            "install",
+            "-g",
+            "typescript-language-server",
+            TYPESCRIPT_PACKAGE,
+        ],
         disclosure: "downloads the typescript-language-server and typescript npm packages into \
                      your global npm prefix",
     },
@@ -108,7 +126,12 @@ pub(crate) const LANGUAGE_SERVERS: &[LanguageServerRecipe] = &[
         language: LanguageId::JavaScript,
         binaries: &["typescript-language-server"],
         program: "npm",
-        args: &["install", "-g", "typescript-language-server", "typescript"],
+        args: &[
+            "install",
+            "-g",
+            "typescript-language-server",
+            TYPESCRIPT_PACKAGE,
+        ],
         disclosure: "downloads the typescript-language-server and typescript npm packages into \
                      your global npm prefix",
     },
@@ -474,12 +497,40 @@ mod tests {
         );
         assert_eq!(
             recipe_for(LanguageId::TypeScript).unwrap().command_line(),
-            "npm install -g typescript-language-server typescript"
+            "npm install -g typescript-language-server typescript@^5"
         );
         assert_eq!(
             recipe_for(LanguageId::Rust).unwrap().command_line(),
             "rustup component add rust-analyzer"
         );
+    }
+
+    /// The typescript package must never be installed unpinned.
+    ///
+    /// TypeScript 7 ships no `lib/tsserver.js`, so a bare `typescript`
+    /// argument resolves the `latest` dist-tag to 7.x and the language server
+    /// refuses to initialize. The failure is invisible from the install side:
+    /// `npm install -g` succeeds, `typescript-language-server` lands on PATH,
+    /// and `installed()` reports the language served. Only a start attempt
+    /// disagrees, which is why the pin is asserted here rather than left to a
+    /// runtime check.
+    #[test]
+    fn the_typescript_package_is_pinned_away_from_the_version_without_tsserver() {
+        for language in [LanguageId::TypeScript, LanguageId::JavaScript] {
+            let recipe = recipe_for(language).expect("language must have a recipe");
+            let typescript_arg = recipe
+                .args
+                .iter()
+                .find(|arg| arg.starts_with("typescript@") || **arg == "typescript")
+                .unwrap_or_else(|| panic!("{language}: recipe installs no typescript package"));
+            assert_eq!(
+                *typescript_arg, "typescript@^5",
+                "{language}: the typescript package must carry the 5.x pin. Unpinned, npm \
+                 resolves latest to TypeScript 7, which ships no lib/tsserver.js, and \
+                 typescript-language-server answers initialize with \"Could not find a valid \
+                 TypeScript installation\" and exits."
+            );
+        }
     }
 
     /// One npm package serves both JavaScript and TypeScript, so the advice is
@@ -489,7 +540,7 @@ mod tests {
         let commands = install_commands_for(&[LanguageId::JavaScript, LanguageId::TypeScript]);
         assert_eq!(
             commands,
-            vec!["npm install -g typescript-language-server typescript".to_string()]
+            vec!["npm install -g typescript-language-server typescript@^5".to_string()]
         );
     }
 
