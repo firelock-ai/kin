@@ -210,11 +210,26 @@ mod tests {
         /// Wire `caller` as calling `callee`, indexed under BOTH endpoints so an
         /// impact walk finds it from either direction.
         pub(super) fn insert_test_calls_relation(&mut self, caller: &Entity, callee: &Entity) {
+            self.insert_test_relation(RelationKind::Calls, caller, callee);
+        }
+
+        /// Wire one `src -> dst` edge of `kind`, indexed under BOTH endpoints.
+        ///
+        /// The kind is a parameter because direction alone does not decide what
+        /// a row answers: a pair joined by an arriving `Calls` and a leaving
+        /// `References` is a caller, and a fixture that can only build `Calls`
+        /// cannot express that pair at all.
+        pub(super) fn insert_test_relation(
+            &mut self,
+            kind: RelationKind,
+            src: &Entity,
+            dst: &Entity,
+        ) {
             let relation = Relation {
                 id: RelationId::new(),
-                kind: RelationKind::Calls,
-                src: kin_model::GraphNodeId::Entity(caller.id),
-                dst: kin_model::GraphNodeId::Entity(callee.id),
+                kind,
+                src: kin_model::GraphNodeId::Entity(src.id),
+                dst: kin_model::GraphNodeId::Entity(dst.id),
                 confidence: 1.0,
                 origin: kin_model::relation::RelationOrigin::Parsed,
                 created_in: None,
@@ -222,11 +237,11 @@ mod tests {
                 evidence: vec![],
             };
             self.relations_by_entity
-                .entry(callee.id)
+                .entry(dst.id)
                 .or_default()
                 .push(relation.clone());
             self.relations_by_entity
-                .entry(caller.id)
+                .entry(src.id)
                 .or_default()
                 .push(relation);
         }
@@ -2984,9 +2999,15 @@ mod tests {
         note_store: Entity,
         reader: Entity,
         renderer: Entity,
+        sender: Entity,
+        downloader: Entity,
     }
 
     const NOTES_SOURCE: &str = "export class NoteStore {\n  open(): void {}\n  close(): void {}\n  stats(): number { return 0; }\n}\n";
+    const SEND_SOURCE: &str =
+        "export function sendFile(path: string): void {\n  void path;\n}\n";
+    const DOWNLOAD_SOURCE: &str =
+        "export function download(path: string): void {\n  sendFile(path);\n}\n";
 
     fn pack_provenance_fixture() -> PackProvenanceFixture {
         let dir = tempdir().unwrap();
@@ -3083,6 +3104,20 @@ mod tests {
             EntityKind::Function,
             0,
         );
+        let sender = file_entity(
+            "send.ts",
+            SEND_SOURCE,
+            "res.sendFile",
+            EntityKind::Method,
+            0,
+        );
+        let downloader = file_entity(
+            "download.ts",
+            DOWNLOAD_SOURCE,
+            "res.download",
+            EntityKind::Method,
+            0,
+        );
 
         // The class's only edges are containment, which is the shape that sends
         // the builder to its same-file fallback: edges exist, none of them is a
@@ -3116,6 +3151,16 @@ mod tests {
         // `reader` is what breaks it.
         store.insert_test_calls_relation(&renderer, &reader);
 
+        // FIR-2474, measured on expressjs/express at a3714473feb3. `res.download`
+        // calls `res.sendFile`, and `res.sendFile` names `res.download` back
+        // because both are methods assigned onto the same object literal, so the
+        // pair carries an arriving `Calls` and a leaving `References`. Every
+        // `res.*` sibling has that shape, which is why the focal's whole caller
+        // set went missing at once rather than one row at a time.
+        store.insert_test_calls_relation(&downloader, &sender);
+        store.insert_test_relation(RelationKind::References, &downloader, &sender);
+        store.insert_test_relation(RelationKind::References, &sender, &downloader);
+
         install_empty_store_exact_tree(&mut store, dir.path());
         let authority = test_repository_authority(dir.path());
 
@@ -3127,6 +3172,8 @@ mod tests {
             note_store,
             reader,
             renderer,
+            sender,
+            downloader,
         }
     }
 
@@ -3288,6 +3335,126 @@ mod tests {
                 value["dependency_selection"]["dependents_returned"],
                 serde_json::json!(1),
                 "the selection must count both groups (compact={compact}): {value}"
+            );
+        }
+    }
+
+    /// FIR-2474. A pack served `dependents: []` for `res.sendFile` while
+    /// `find_references` on the SAME entity in the SAME store answered with
+    /// `res.download`, which calls it at `lib/response.js:483`. Measured on
+    /// expressjs/express at a3714473feb3 against kin 0.5.42.
+    ///
+    /// The cause is not the token budget: raising it to 200k left the group
+    /// empty and put `res.download` under `dependencies` instead. Both methods
+    /// hang off one object literal, so the graph holds an arriving `Calls` AND a
+    /// leaving `References` for the pair, and a rule that reported any
+    /// both-directions neighbour as a dependency spent the weaker leaving edge
+    /// to erase the stronger arriving one. Every `res.*` sibling has that shape,
+    /// so the focal's entire caller set disappeared at once and the answer an
+    /// agent read was the opposite of the truth: nothing depends on me, and the
+    /// thing that does is something I depend on.
+    ///
+    /// The reference surface is the control. A pack that agreed with it by
+    /// returning nothing on a graph holding nothing would prove nothing, so this
+    /// asserts the caller is reachable through `find_references` first.
+    #[tokio::test]
+    async fn a_context_pack_reports_the_caller_that_find_references_finds() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = pack_provenance_fixture();
+        let caller_id = serde_json::json!(fixture.downloader.id.to_string());
+
+        let references = tool_result_json(
+            entities::handle_find_references_with_ambient_binding(
+                &HashMap::from([(
+                    "entity_id".to_string(),
+                    serde_json::json!(fixture.sender.id.to_string()),
+                )]),
+                &fixture.store,
+                entities::AmbientCrossRepoBinding::new(None, None),
+                Some(&fixture.authority),
+            )
+            .await
+            .unwrap(),
+        );
+        let rows = references["references"].as_array().unwrap_or_else(|| {
+            panic!("the control must reach the references surface: {references}")
+        });
+        assert!(
+            rows.iter().any(|row| row["entity_id"] == caller_id),
+            "control: the caller must be reachable through find_references, or this test \
+             cannot fail when the pack is wrong: {references}"
+        );
+
+        for compact in [false, true] {
+            let value = context_pack_json(&fixture, &fixture.sender, compact);
+            let dependents = value["dependents"].as_array().unwrap_or_else(|| {
+                panic!("the pack must name the group holding what depends on the focal: {value}")
+            });
+            assert!(
+                dependents.iter().any(|row| row["id"] == caller_id),
+                "the caller find_references reports must reach the pack's dependents \
+                 (compact={compact}): {value}"
+            );
+            assert_eq!(
+                value["dependency_selection"]["dependents_returned"],
+                serde_json::json!(dependents.len()),
+                "the selection must count the group it describes (compact={compact}): {value}"
+            );
+            let dependencies = value["dependencies"].as_array().unwrap_or_else(|| {
+                panic!("the pack must carry a dependencies group: {value}")
+            });
+            assert!(
+                dependencies.iter().all(|row| row["id"] != caller_id),
+                "a caller must not also be served as something the focal depends on \
+                 (compact={compact}): {value}"
+            );
+        }
+    }
+
+    /// The other half of FIR-2474, and the reason an empty group was readable as
+    /// an answer at all: the two surfaces must not be able to disagree in EITHER
+    /// direction. `find_references` withholds a row whose only edge is a
+    /// bare-name receiver guess, reporting it as a candidate instead. A pack
+    /// that promoted the same edge to a dependent would be handing an agent a
+    /// caller the reference surface declined to certify.
+    #[tokio::test]
+    async fn a_context_pack_withholds_a_dependent_find_references_declines_to_certify() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = pack_provenance_fixture();
+
+        let references = tool_result_json(
+            entities::handle_find_references_with_ambient_binding(
+                &HashMap::from([(
+                    "entity_id".to_string(),
+                    serde_json::json!(fixture.sender.id.to_string()),
+                )]),
+                &fixture.store,
+                entities::AmbientCrossRepoBinding::new(None, None),
+                Some(&fixture.authority),
+            )
+            .await
+            .unwrap(),
+        );
+        let certified: HashSet<String> = references["references"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the control must reach the references surface: {references}"))
+            .iter()
+            .filter_map(|row| row["entity_id"].as_str().map(str::to_string))
+            .collect();
+
+        let value = context_pack_json(&fixture, &fixture.sender, false);
+        for row in value["dependents"].as_array().unwrap() {
+            let id = row["id"].as_str().unwrap().to_string();
+            assert!(
+                certified.contains(&id),
+                "the pack must not certify a dependent the reference surface withheld: \
+                 {row} not in {certified:?}"
             );
         }
     }
