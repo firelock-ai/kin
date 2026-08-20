@@ -356,10 +356,11 @@ fn push(
         &daemon_relations,
     )
     .context("plan the exact sealed workspace semantic transition")?;
-    let (sealed_policy, admission_policy_delta) = SharedAdmissionPolicy::derive_from_tree(
+    let (sealed_policy, admission_policy_delta) = SharedAdmissionPolicy::derive_from_tree_with_allowances(
         parent_policy.as_ref(),
         &sealed.expected_tree,
         |hash| repository_source_length(&authority.manager, hash),
+    |hash| repository_source_body(&authority.manager, hash),
     )
     .context("derive the exact admission policy for the sealed workspace tree")?;
     let sealed_tree = sealed.expected_tree;
@@ -1045,6 +1046,24 @@ fn require_sealed_sources_in_repository_cas(
         }
     }
     Ok(())
+}
+
+fn repository_source_body(
+    manager: &kin_db::RepositoryAuthorityManager<kin_db::LocalFileBackend>,
+    hash: Hash256,
+) -> std::result::Result<Vec<u8>, kin_model::ModelError> {
+    manager
+        .load_source_blob(hash)
+        .map_err(|error| {
+            kin_model::ModelError::InvalidOperation(format!(
+                "read graph-owned admission source {hash}: {error}"
+            ))
+        })?
+        .ok_or_else(|| {
+            kin_model::ModelError::InvalidOperation(format!(
+                "repository source CAS is missing exact admission source {hash}"
+            ))
+        })
 }
 
 fn repository_source_length(
