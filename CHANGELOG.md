@@ -31,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Decide a context pack's dependents with the authority find_references reads (#976)
 - Make a defineProperty-shaped JavaScript property an entity (#977)
 - Carry a removed entity's record into the diff so review names what was deleted (#978)
+- Ask the language server about the member, not the receiver (#980)
 
 
 ## [0.5.42] - 2026-08-19
