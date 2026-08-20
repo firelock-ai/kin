@@ -24636,6 +24636,106 @@ mod tests {
         );
     }
 
+    /// The same spine for `kin search`, whose gate is NOT impact's.
+    ///
+    /// `semantic_search` declares no edge class and is language-scoped, so this
+    /// asserts the degradation reaches a surface gated on scope rather than on
+    /// cross-file coverage. A fix proven only on the reference readers would
+    /// leave this one silent, which is why the rollout falsifies one command per
+    /// gate shape rather than one per rung.
+    #[tokio::test]
+    async fn a_degraded_daemon_reaches_the_search_cli_through_the_route() {
+        let state = test_state();
+        state.graph.upsert_entity(&test_entity("present", "src/a.py")).unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        state
+            .embed_worker_failed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "query": "definitelyNoSuchSymbol" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let result: kin_cli::commands::search::DaemonSearchResponse =
+            serde_json::from_slice(&body).unwrap();
+
+        assert!(result.records.is_empty(), "the query must match nothing");
+        let qualifier = result.absence_qualifier.join(" ");
+        assert!(
+            qualifier.contains("Kin cannot rule out"),
+            "the route's envelope must carry the degradation into the rendered verdict; a \
+             thinner snapshot leaves this empty: {qualifier:?}"
+        );
+        assert!(
+            qualifier.contains("embed_worker_failed"),
+            "the line names the signal the verdict disclosed rather than inventing a cause: \
+             {qualifier:?}"
+        );
+        // And it must not fabricate a missing edge class: semantic_search reads
+        // none, so naming one would be gating on evidence it never gathers.
+        assert!(
+            !qualifier.contains("cross-file"),
+            "a scope-gated surface must not claim an edge class: {qualifier:?}"
+        );
+    }
+
+    /// The control that keeps the search qualifier from becoming noise: a query
+    /// that MATCHES says nothing extra, on the same degraded daemon.
+    ///
+    /// Without this the fix could stamp every search with a caveat and still
+    /// pass the case above, which is the FIR-2404 failure wearing its opposite
+    /// costume.
+    #[tokio::test]
+    async fn a_search_that_matches_stays_unqualified_even_when_degraded() {
+        let state = test_state();
+        state.graph.upsert_entity(&test_entity("findable", "src/a.py")).unwrap();
+        state.graph.flush_text_index().ok();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        state
+            .embed_worker_failed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "query": "findable" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let result: kin_cli::commands::search::DaemonSearchResponse =
+            serde_json::from_slice(&body).unwrap();
+
+        assert!(!result.records.is_empty(), "the query must match: {result:?}");
+        assert!(
+            result.absence_qualifier.is_empty(),
+            "a populated answer asserts no absence and must carry no qualifier: {:?}",
+            result.absence_qualifier
+        );
+    }
+
     /// THE SPINE (FIR-2524, captain's rider). Drives the ROUTE, because that is
     /// the only place the rejected wiring differs.
     ///
