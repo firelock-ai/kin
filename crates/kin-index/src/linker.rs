@@ -11183,4 +11183,510 @@ void f();
             "an object call reaches no module-level function on the live path either"
         );
     }
+
+    // ── Overrides: the parser's syntactic override fact ─────────────────────
+    //
+    // `Overrides` had six consumers and no producer: rename follows it,
+    // context assembly weights it at 4.0, ranked impact ranks it at 105, and
+    // the only code that could emit one asks a language server for a type
+    // hierarchy pyright declines to serve. The fixtures below are the
+    // psf/requests shape the gap was found on, and each states which half of
+    // the rule it guards, so a revert fails exactly one of them.
+
+    fn py_class(name: &str, file_path: &str) -> Entity {
+        py_entity(name, file_path, EntityKind::Class, EntityRole::Source)
+    }
+
+    fn py_extends(class: &str, base: &str) -> ExtractedRelation {
+        ExtractedRelation {
+            site: None,
+            receiver: None,
+            call_shape: None,
+            kind: RelationKind::Extends,
+            src_name: class.to_string(),
+            dst_name: base.to_string(),
+            import_source: None,
+        }
+    }
+
+    fn py_contains(class: &str, member: &str) -> ExtractedRelation {
+        ExtractedRelation {
+            site: None,
+            receiver: None,
+            call_shape: None,
+            kind: RelationKind::Contains,
+            src_name: class.to_string(),
+            dst_name: member.to_string(),
+            import_source: None,
+        }
+    }
+
+    fn override_edges<'a>(result: &'a [Relation], src: &Entity) -> Vec<&'a Relation> {
+        result
+            .iter()
+            .filter(|rel| {
+                rel.kind == RelationKind::Overrides && rel.src == GraphNodeId::Entity(src.id)
+            })
+            .collect()
+    }
+
+    fn all_override_edges(result: &[Relation]) -> Vec<&Relation> {
+        result
+            .iter()
+            .filter(|rel| rel.kind == RelationKind::Overrides)
+            .collect()
+    }
+
+    /// The whole point: `class HTTPAdapter(BaseAdapter)` in one file, both
+    /// classes declaring `send`, and the base reached through the import the
+    /// real `adapters.py` carries. Nothing here needs a language server.
+    #[test]
+    fn a_resolvable_base_with_a_same_named_method_produces_the_override() {
+        let base = py_class("BaseAdapter", "src/requests/adapters.py");
+        let base_send = py_method(
+            "BaseAdapter.send",
+            "src/requests/adapters.py",
+            EntityRole::Source,
+        );
+        let child = py_class("HTTPAdapter", "src/requests/adapters.py");
+        let child_send = py_method(
+            "HTTPAdapter.send",
+            "src/requests/adapters.py",
+            EntityRole::Source,
+        );
+
+        let files = vec![FileParseData {
+            file_path: "src/requests/adapters.py".to_string(),
+            entities: vec![
+                base.clone(),
+                base_send.clone(),
+                child.clone(),
+                child_send.clone(),
+            ],
+            relations: vec![
+                py_contains("BaseAdapter", "BaseAdapter.send"),
+                py_extends("HTTPAdapter", "BaseAdapter"),
+                py_contains("HTTPAdapter", "HTTPAdapter.send"),
+            ],
+            imports: vec![],
+        }];
+
+        let result = link_cross_file(&files);
+        let edges = override_edges(&result, &child_send);
+        assert_eq!(edges.len(), 1, "one override, to the base that declares it");
+        assert_eq!(edges[0].dst, GraphNodeId::Entity(base_send.id));
+        assert_eq!(
+            edges[0].origin,
+            RelationOrigin::Parsed,
+            "syntax the parser read, not a server's answer"
+        );
+        assert_eq!(edges[0].confidence, 1.0);
+        assert_eq!(
+            edges[0].evidence[0].parser_rule.as_deref(),
+            Some(OVERRIDE_EVIDENCE_RESOLVED_BASE_V1),
+            "the edge names the rule that produced it"
+        );
+        assert!(
+            edges[0].evidence[0].source_span.is_some(),
+            "evidence points at the overriding declaration"
+        );
+        assert!(
+            override_edges(&result, &base_send).is_empty(),
+            "the base overrides nothing"
+        );
+    }
+
+    /// The same fact across files, which is the shape the composition needs:
+    /// `sessions.py` never sees `adapters.py`'s source, only its import.
+    #[test]
+    fn an_override_resolves_across_files_through_the_declaring_import() {
+        let base = py_class("BaseAdapter", "src/requests/adapters.py");
+        let base_send = py_method(
+            "BaseAdapter.send",
+            "src/requests/adapters.py",
+            EntityRole::Source,
+        );
+        let child = py_class("LoggingAdapter", "src/requests/logging_adapter.py");
+        let child_send = py_method(
+            "LoggingAdapter.send",
+            "src/requests/logging_adapter.py",
+            EntityRole::Source,
+        );
+
+        let files = vec![
+            FileParseData {
+                file_path: "src/requests/adapters.py".to_string(),
+                entities: vec![base.clone(), base_send.clone()],
+                relations: vec![py_contains("BaseAdapter", "BaseAdapter.send")],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "src/requests/logging_adapter.py".to_string(),
+                entities: vec![child.clone(), child_send.clone()],
+                relations: vec![
+                    py_extends("LoggingAdapter", "BaseAdapter"),
+                    py_contains("LoggingAdapter", "LoggingAdapter.send"),
+                ],
+                imports: vec![import_of(".adapters", "BaseAdapter")],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        let edges = override_edges(&result, &child_send);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].dst, GraphNodeId::Entity(base_send.id));
+    }
+
+    /// FALSIFICATION. A base the repo does not declare is a name and nothing
+    /// more. `requests.Session` subclasses nothing kin can see when the base
+    /// lives in the standard library, and a name-only base reference is not
+    /// evidence that anything was overridden.
+    #[test]
+    fn an_unresolved_base_produces_no_override() {
+        let child = py_class("HTTPAdapter", "src/requests/adapters.py");
+        let child_send = py_method(
+            "HTTPAdapter.send",
+            "src/requests/adapters.py",
+            EntityRole::Source,
+        );
+
+        let files = vec![FileParseData {
+            file_path: "src/requests/adapters.py".to_string(),
+            entities: vec![child.clone(), child_send.clone()],
+            relations: vec![
+                // `BaseAdapter` is declared nowhere in this universe.
+                py_extends("HTTPAdapter", "BaseAdapter"),
+                py_contains("HTTPAdapter", "HTTPAdapter.send"),
+            ],
+            imports: vec![],
+        }];
+
+        let result = link_cross_file(&files);
+        assert!(
+            all_override_edges(&result).is_empty(),
+            "an unresolvable base mints nothing"
+        );
+    }
+
+    /// FALSIFICATION. A base name that two files both declare is ambiguous,
+    /// and the linker refuses to pick. Django alone carries dozens of
+    /// `Command` classes; guessing one would put a false override on every
+    /// method they share.
+    #[test]
+    fn an_ambiguous_base_name_produces_no_override() {
+        let one = py_class("Base", "src/one/base.py");
+        let one_run = py_method("Base.run", "src/one/base.py", EntityRole::Source);
+        let two = py_class("Base", "src/two/base.py");
+        let two_run = py_method("Base.run", "src/two/base.py", EntityRole::Source);
+        let child = py_class("Worker", "src/worker.py");
+        let child_run = py_method("Worker.run", "src/worker.py", EntityRole::Source);
+
+        let files = vec![
+            FileParseData {
+                file_path: "src/one/base.py".to_string(),
+                entities: vec![one.clone(), one_run.clone()],
+                relations: vec![py_contains("Base", "Base.run")],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "src/two/base.py".to_string(),
+                entities: vec![two.clone(), two_run.clone()],
+                relations: vec![py_contains("Base", "Base.run")],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "src/worker.py".to_string(),
+                entities: vec![child.clone(), child_run.clone()],
+                relations: vec![
+                    py_extends("Worker", "Base"),
+                    py_contains("Worker", "Worker.run"),
+                ],
+                // No import binding names which `Base` is meant.
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        assert!(
+            all_override_edges(&result).is_empty(),
+            "two candidate bases means no proven base"
+        );
+    }
+
+    /// FALSIFICATION. Subclassing does not make every method an override.
+    /// `HTTPAdapter.build_response` has no counterpart on `BaseAdapter`, and
+    /// an edge there would tell rename to follow a method that does not exist.
+    #[test]
+    fn a_method_with_no_base_counterpart_produces_no_override() {
+        let base = py_class("BaseAdapter", "src/requests/adapters.py");
+        let base_send = py_method(
+            "BaseAdapter.send",
+            "src/requests/adapters.py",
+            EntityRole::Source,
+        );
+        let child = py_class("HTTPAdapter", "src/requests/adapters.py");
+        let child_build = py_method(
+            "HTTPAdapter.build_response",
+            "src/requests/adapters.py",
+            EntityRole::Source,
+        );
+
+        let files = vec![FileParseData {
+            file_path: "src/requests/adapters.py".to_string(),
+            entities: vec![
+                base.clone(),
+                base_send.clone(),
+                child.clone(),
+                child_build.clone(),
+            ],
+            relations: vec![
+                py_contains("BaseAdapter", "BaseAdapter.send"),
+                py_extends("HTTPAdapter", "BaseAdapter"),
+                py_contains("HTTPAdapter", "HTTPAdapter.build_response"),
+            ],
+            imports: vec![],
+        }];
+
+        let result = link_cross_file(&files);
+        assert!(
+            all_override_edges(&result).is_empty(),
+            "a method the base never declares overrides nothing"
+        );
+    }
+
+    /// FALSIFICATION. A class that declares no base at all is the common case
+    /// in any repository, and it must stay silent even when another class
+    /// somewhere shares its method names.
+    #[test]
+    fn a_class_with_no_declared_base_produces_no_override() {
+        let unrelated = py_class("Poller", "src/poller.py");
+        let unrelated_send = py_method("Poller.send", "src/poller.py", EntityRole::Source);
+        let base = py_class("BaseAdapter", "src/requests/adapters.py");
+        let base_send = py_method(
+            "BaseAdapter.send",
+            "src/requests/adapters.py",
+            EntityRole::Source,
+        );
+
+        let files = vec![
+            FileParseData {
+                file_path: "src/poller.py".to_string(),
+                entities: vec![unrelated.clone(), unrelated_send.clone()],
+                relations: vec![py_contains("Poller", "Poller.send")],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "src/requests/adapters.py".to_string(),
+                entities: vec![base.clone(), base_send.clone()],
+                relations: vec![py_contains("BaseAdapter", "BaseAdapter.send")],
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        assert!(
+            all_override_edges(&result).is_empty(),
+            "a same-named method on an unrelated class is not an override"
+        );
+    }
+
+    /// The nearest ancestor wins, which is what makes the edge usable for
+    /// rename: `C.send` replaces `B.send`, and `B.send` replaces `A.send`.
+    /// A direct `C -> A` edge would claim `C` replaces a method `B` already
+    /// replaced.
+    #[test]
+    fn an_override_binds_to_the_nearest_declaring_ancestor() {
+        let a = py_class("A", "src/a.py");
+        let a_send = py_method("A.send", "src/a.py", EntityRole::Source);
+        let b = py_class("B", "src/b.py");
+        let b_send = py_method("B.send", "src/b.py", EntityRole::Source);
+        let c = py_class("C", "src/c.py");
+        let c_send = py_method("C.send", "src/c.py", EntityRole::Source);
+
+        let files = vec![
+            FileParseData {
+                file_path: "src/a.py".to_string(),
+                entities: vec![a.clone(), a_send.clone()],
+                relations: vec![py_contains("A", "A.send")],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "src/b.py".to_string(),
+                entities: vec![b.clone(), b_send.clone()],
+                relations: vec![py_extends("B", "A"), py_contains("B", "B.send")],
+                imports: vec![import_of(".a", "A")],
+            },
+            FileParseData {
+                file_path: "src/c.py".to_string(),
+                entities: vec![c.clone(), c_send.clone()],
+                relations: vec![py_extends("C", "B"), py_contains("C", "C.send")],
+                imports: vec![import_of(".b", "B")],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        let from_c = override_edges(&result, &c_send);
+        assert_eq!(from_c.len(), 1, "one edge, to the nearest declaring base");
+        assert_eq!(from_c[0].dst, GraphNodeId::Entity(b_send.id));
+
+        let from_b = override_edges(&result, &b_send);
+        assert_eq!(from_b.len(), 1);
+        assert_eq!(from_b[0].dst, GraphNodeId::Entity(a_send.id));
+    }
+
+    /// A grandparent still counts when the parent is silent: `C` declares
+    /// `send`, `B` does not, `A` does. Skipping the walk past a silent parent
+    /// would drop the real override.
+    #[test]
+    fn an_override_walks_past_an_ancestor_that_declares_nothing() {
+        let a = py_class("A", "src/a.py");
+        let a_send = py_method("A.send", "src/a.py", EntityRole::Source);
+        let b = py_class("B", "src/b.py");
+        let c = py_class("C", "src/c.py");
+        let c_send = py_method("C.send", "src/c.py", EntityRole::Source);
+
+        let files = vec![
+            FileParseData {
+                file_path: "src/a.py".to_string(),
+                entities: vec![a.clone(), a_send.clone()],
+                relations: vec![py_contains("A", "A.send")],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "src/b.py".to_string(),
+                entities: vec![b.clone()],
+                relations: vec![py_extends("B", "A")],
+                imports: vec![import_of(".a", "A")],
+            },
+            FileParseData {
+                file_path: "src/c.py".to_string(),
+                entities: vec![c.clone(), c_send.clone()],
+                relations: vec![py_extends("C", "B"), py_contains("C", "C.send")],
+                imports: vec![import_of(".b", "B")],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        let edges = override_edges(&result, &c_send);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].dst, GraphNodeId::Entity(a_send.id));
+    }
+
+    /// JavaScript `class Child extends Parent` carries the same fact under
+    /// different syntax, and the rule reads the parser's own `Contains` edges
+    /// rather than a Python naming convention, so it covers both.
+    #[test]
+    fn a_javascript_extends_clause_produces_the_same_override() {
+        let parent = make_entity("Animal", "src/animal.js");
+        let mut parent = parent;
+        parent.kind = EntityKind::Class;
+        parent.language = LanguageId::JavaScript;
+        let mut parent_speak = make_entity("Animal.speak", "src/animal.js");
+        parent_speak.kind = EntityKind::Method;
+        parent_speak.language = LanguageId::JavaScript;
+        let mut child = make_entity("Dog", "src/dog.js");
+        child.kind = EntityKind::Class;
+        child.language = LanguageId::JavaScript;
+        let mut child_speak = make_entity("Dog.speak", "src/dog.js");
+        child_speak.kind = EntityKind::Method;
+        child_speak.language = LanguageId::JavaScript;
+
+        let files = vec![
+            FileParseData {
+                file_path: "src/animal.js".to_string(),
+                entities: vec![parent.clone(), parent_speak.clone()],
+                relations: vec![py_contains("Animal", "Animal.speak")],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "src/dog.js".to_string(),
+                entities: vec![child.clone(), child_speak.clone()],
+                relations: vec![py_extends("Dog", "Animal"), py_contains("Dog", "Dog.speak")],
+                imports: vec![import_of("./animal", "Animal")],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        let edges = override_edges(&result, &child_speak);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].dst, GraphNodeId::Entity(parent_speak.id));
+    }
+
+    /// The incremental linker must answer identically or a warm reindex
+    /// silently retires an edge the cold ingest produced.
+    #[test]
+    fn the_incremental_linker_derives_the_same_override() {
+        let base = py_class("BaseAdapter", "src/requests/adapters.py");
+        let base_send = py_method(
+            "BaseAdapter.send",
+            "src/requests/adapters.py",
+            EntityRole::Source,
+        );
+        let child = py_class("LoggingAdapter", "src/requests/logging_adapter.py");
+        let child_send = py_method(
+            "LoggingAdapter.send",
+            "src/requests/logging_adapter.py",
+            EntityRole::Source,
+        );
+
+        let mut linker = IncrementalLinker::new();
+        linker.add_file(
+            "src/requests/adapters.py",
+            admitted_artifact_id("src/requests/adapters.py"),
+            &[base.clone(), base_send.clone()],
+        );
+        linker.add_file(
+            "src/requests/logging_adapter.py",
+            admitted_artifact_id("src/requests/logging_adapter.py"),
+            &[child.clone(), child_send.clone()],
+        );
+
+        let files = vec![FileParseData {
+            file_path: "src/requests/logging_adapter.py".to_string(),
+            entities: vec![child.clone(), child_send.clone()],
+            relations: vec![
+                py_extends("LoggingAdapter", "BaseAdapter"),
+                py_contains("LoggingAdapter", "LoggingAdapter.send"),
+            ],
+            imports: vec![import_of(".adapters", "BaseAdapter")],
+        }];
+
+        let result = link_cross_file_incremental(&files, &linker);
+        let edges = override_edges(&result, &child_send);
+        assert_eq!(edges.len(), 1, "the warm path derives it too");
+        assert_eq!(edges[0].dst, GraphNodeId::Entity(base_send.id));
+        assert_eq!(edges[0].origin, RelationOrigin::Parsed);
+    }
+
+    /// FALSIFICATION, incremental half: the warm path must refuse an
+    /// unresolvable base for the same reason the cold path does.
+    #[test]
+    fn the_incremental_linker_refuses_an_unresolved_base() {
+        let child = py_class("LoggingAdapter", "src/requests/logging_adapter.py");
+        let child_send = py_method(
+            "LoggingAdapter.send",
+            "src/requests/logging_adapter.py",
+            EntityRole::Source,
+        );
+
+        let mut linker = IncrementalLinker::new();
+        linker.add_file(
+            "src/requests/logging_adapter.py",
+            admitted_artifact_id("src/requests/logging_adapter.py"),
+            &[child.clone(), child_send.clone()],
+        );
+
+        let files = vec![FileParseData {
+            file_path: "src/requests/logging_adapter.py".to_string(),
+            entities: vec![child.clone(), child_send.clone()],
+            relations: vec![
+                py_extends("LoggingAdapter", "BaseAdapter"),
+                py_contains("LoggingAdapter", "LoggingAdapter.send"),
+            ],
+            imports: vec![],
+        }];
+
+        let result = link_cross_file_incremental(&files, &linker);
+        assert!(all_override_edges(&result).is_empty());
+    }
 }
