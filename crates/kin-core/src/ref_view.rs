@@ -661,6 +661,26 @@ where
 
     parsed_relations.extend(projection_relations);
     for relation in parsed_relations {
+        // A placeholder edge names a destination this repository does not
+        // define, so nothing in the snapshot backs it and admission rejects the
+        // whole view with "unadmitted destination endpoint". Materialize the
+        // target the same way historical delta derivation does, from the
+        // importing entity's language, since a target defined elsewhere has
+        // none of its own.
+        if let Some(destination) = relation.dst.as_entity() {
+            if !snapshot.entities.contains_key(&destination) {
+                let language = relation
+                    .src
+                    .as_entity()
+                    .and_then(|id| snapshot.entities.get(&id))
+                    .map(|entity| entity.language);
+                if let Some(target) = language
+                    .and_then(|language| kin_index::placeholder_target_entity(&relation, language))
+                {
+                    snapshot.entities.insert(destination, target);
+                }
+            }
+        }
         snapshot.relations.insert(relation.id, relation);
     }
 

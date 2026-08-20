@@ -1363,6 +1363,46 @@ fn js_receiver_is_enclosing_owner(
     }
 }
 
+/// The receiver expression a member call is written on, as written.
+///
+/// Only a receiver spelled as one unbroken token is recorded. The field's
+/// consumers read it as a name: the linker splits it at the first `.` and asks
+/// the calling file's imports whether that root is a module or a value, and the
+/// placeholder tier rejects anything holding whitespace. A receiver that is
+/// itself a call, a subscript, a parenthesized expression or a chain broken
+/// across lines answers neither question, and recording its raw text would put
+/// source formatting into an identifier position. Declining leaves such a call
+/// exactly where it was before receivers existed.
+///
+/// `this` is kept rather than dropped. It is not the destination, but it is the
+/// root of the property chain the destination hangs off, and `this.router` is
+/// the receiver the express hand-off is actually written on.
+fn js_call_receiver_text(function: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let object = function.child_by_field_name("object")?;
+    let text = object.utf8_text(source).ok()?.trim();
+    if text.is_empty() || text.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let usable = text
+        .split('.')
+        .all(|segment| segment == "this" || is_path_identifier_segment(segment));
+    usable.then(|| text.to_string())
+}
+
+/// Whether one dot-separated receiver segment reads as a plain name.
+///
+/// Deliberately the same shape the linker applies to a receiver root, so a
+/// receiver this adapter records is one the linker can classify rather than one
+/// it must immediately discard.
+fn is_path_identifier_segment(segment: &str) -> bool {
+    let mut chars = segment.chars();
+    match chars.next() {
+        Some(c) if c == '_' || c == '$' || c.is_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c == '_' || c == '$' || c.is_alphanumeric())
+}
+
 /// Extract all function/method calls within a function/method body.
 ///
 /// For a `call_expression`, the `function` field is the callee. A
@@ -1379,6 +1419,14 @@ fn js_receiver_is_enclosing_owner(
 /// name matches no entity the linker falls back to the bare leaf, so recall
 /// never drops below the unqualified behavior.
 ///
+/// Every other member call carries its receiver expression as written, which is
+/// what separates a call through an imported module from a call through a value
+/// whose type nothing here settles. Without it the bare leaf is all the linker
+/// has, and matching that leaf against every same-named symbol in the repository
+/// is how `res.send()` acquired a caller it never had. An owner-folded call
+/// records no receiver, because the owner is already in the name; that is the
+/// same split Python's adapter makes for `self`/`cls`.
+///
 /// `new X()` is a `new_expression` (not `call_expression`) and is intentionally
 /// skipped here.
 pub(super) fn extract_calls_from_context(
@@ -1392,7 +1440,7 @@ pub(super) fn extract_calls_from_context(
     for child in node.children(&mut cursor) {
         if child.kind() == "call_expression" {
             if let Some(function) = child.child_by_field_name("function") {
-                let callee_name = match function.kind() {
+                let (callee_name, receiver) = match function.kind() {
                     "member_expression" => {
                         let property = function
                             .child_by_field_name("property")
@@ -1403,13 +1451,13 @@ pub(super) fn extract_calls_from_context(
                                 if !property.is_empty()
                                     && js_receiver_is_enclosing_owner(&function, source, owner) =>
                             {
-                                format!("{owner}.{property}")
+                                (format!("{owner}.{property}"), None)
                             }
-                            _ => property,
+                            _ => (property, js_call_receiver_text(&function, source)),
                         }
                     }
-                    "identifier" => function.utf8_text(source).unwrap_or("").to_string(),
-                    _ => String::new(),
+                    "identifier" => (function.utf8_text(source).unwrap_or("").to_string(), None),
+                    _ => (String::new(), None),
                 };
                 if is_valid_callee_name(&callee_name) {
                     relations.push(ExtractedRelation {
@@ -1417,7 +1465,7 @@ pub(super) fn extract_calls_from_context(
                         // the line the call is written on rather than the line the
                         // caller's definition starts on.
                         site: Some(site_from_node(&child)),
-                        receiver: None,
+                        receiver,
                         call_shape: None,
                         kind: kin_model::RelationKind::Calls,
                         src_name: context_name.to_string(),

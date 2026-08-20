@@ -1,6 +1,6 @@
 {
   "comment": "Replay-semantics surface pinned by scripts/verify-hydration-semantics.py. These functions re-author the entity/relation deltas persisted for historical changes during Git admission, so editing one changes what a repository's past is said to contain the next time that repository is admitted. A digest mismatch is not a failure to fix by regenerating: decide first whether replay semantics changed, and if so bump HYDRATION_SEMANTICS_VERSION and hydration_semantics_version together. Bumping the version records the decision; it does not migrate, invalidate, or re-enrich a repository that was already admitted, because nothing persists the version beside a graph or compares it when one is opened.",
-  "hydration_semantics_version": 8,
+  "hydration_semantics_version": 9,
   "guarded": [
     {
       "file": "crates/kin-index/src/history.rs",
@@ -19,7 +19,7 @@
     {
       "file": "crates/kin-index/src/history.rs",
       "function": "external_reference_targets",
-      "digest": "sha256:9542f2e28f43ed31d8f66c229992457570c3fc18f07fe2ed5f3d729d8ccf574a",
+      "digest": "sha256:71a383d53839a3ca68a109671b91508d2c2a7ff640a34a44f6f643880bd068c1",
       "reason": "Decides which cross-repo destinations a tree binds an external target for, and derives every field of that target from the importers it collects. Its output is persisted entity state, so a change here restates what a repository's past says about the symbols it reaches through another repository.",
       "owner": "kin-index"
     },

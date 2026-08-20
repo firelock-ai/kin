@@ -31,7 +31,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.5.42"
+version = "0.5.43"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Troy Fortin <troy@firelock.ai>"]
@@ -149,7 +149,7 @@ kin-daemon-spawn = { path = "crates/kin-daemon-spawn" }
 kin-mcp = { path = "crates/kin-mcp" }
 kin-spine = { path = "crates/kin-spine" }
 kin-registry = { path = "crates/kin-registry" }
-kin-lsp = { version = "=0.6.14", registry = "kin" }
+kin-lsp = { version = "=0.6.16", registry = "kin" }
 # Cross-platform base: NO "metal" here. `[workspace.dependencies]` entries cannot be
 # `[target.'cfg(...)']`-gated, so listing "metal" here forces the macOS-only kin-infer/metal
 # backend on every target (incl. Linux, where it cannot compile). Metal is re-enabled

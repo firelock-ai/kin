@@ -1430,6 +1430,7 @@ async fn enrich_single_entity(
     index: &kin_lsp::EntityIndex,
     root: &std::path::Path,
     state: &DaemonState,
+    documents: Option<kin_lsp::DocumentProvider<'_>>,
 ) -> usize {
     let timeout = std::time::Duration::from_secs(5);
     let mut count = 0;
@@ -1465,7 +1466,7 @@ async fn enrich_single_entity(
     // UsesType
     if let Ok(Ok(relations)) = tokio::time::timeout(
         timeout,
-        kin_lsp::enrichment::enrich_entity_uses_type(server, entity_ref, index, root),
+        kin_lsp::enrichment::enrich_entity_uses_type(server, entity_ref, index, root, documents),
     )
     .await
     {
@@ -2520,6 +2521,12 @@ pub async fn run_with_authority_on(
                     return;
                 }
             };
+            let load_document = |path: &str| -> Option<String> {
+                source_view
+                    .load_text(&kin_model::FilePathId::new(path))
+                    .ok()
+            };
+            let documents: Option<kin_lsp::DocumentProvider<'_>> = Some(&load_document);
 
             // Lazily start LSP servers on first use per language.
             let mut servers: std::collections::HashMap<
@@ -2763,7 +2770,7 @@ pub async fn run_with_authority_on(
                         for entity_ref in &file_entities {
                             info!(entity = %entity_ref.name, "querying LSP for entity");
                             total_relations += enrich_single_entity(
-                                server, entity_ref, &index, &lsp_root, &lsp_state,
+                                server, entity_ref, &index, &lsp_root, &lsp_state, documents,
                             )
                             .await;
                         }
@@ -2986,6 +2993,7 @@ pub async fn run_with_authority_on(
                                 &file_content,
                                 &index,
                                 &lsp_root,
+                                documents,
                             )
                             .await
                             .unwrap_or_default();
@@ -2997,7 +3005,7 @@ pub async fn run_with_authority_on(
                             // (definition approach gives References, call hierarchy gives Calls).
                             for entity_ref in &file_entity_refs {
                                 file_relations += enrich_single_entity(
-                                    server, entity_ref, &index, &lsp_root, &lsp_state,
+                                    server, entity_ref, &index, &lsp_root, &lsp_state, documents,
                                 )
                                 .await;
                             }
