@@ -3426,9 +3426,9 @@ dependencies = [
 
 [[package]]
 name = "kin-lsp"
-version = "0.6.12"
+version = "0.6.14"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "bb2026d10f41f36fad8fad9709195e587611507a885d0956e6e6fea28adb97f4"
+checksum = "6d926f6fdf0445ce64ef10fdc01c02f9a9905bafdc16e9417160183130a861b0"
 dependencies = [
  "kin-model",
  "serde",
@@ -6644,7 +6644,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
