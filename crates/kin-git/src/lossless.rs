@@ -14,7 +14,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::rc::Rc;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use gix::bstr::ByteSlice;
 use gix::objs::tree::EntryKind;
@@ -30,25 +32,76 @@ use crate::error::{GitError, Result};
 #[cfg(unix)]
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// How many times this process has decompressed a snapshot's whole object
-/// closure.
-///
-/// Counted because the cost is invisible from any one call site. Every caller
-/// that wants the closure asks [`validate_snapshot`] for it, and that call
-/// reads and verifies EVERY object body in the repository, so a conversion that
-/// asks eleven times pays eleven whole-repository decompressions for one
-/// import. On a 1,200-commit flask corpus that is 162.5 MiB decompressed
-/// against 13 MB packed, per rebuild, and it was the dominant repeated wall
-/// clock cost of `kin init` before anyone counted it.
-///
-/// This is a measurement rather than a guard, so it is `Relaxed`: nothing
-/// branches on it, and a test that reads it does so after the work it is
-/// measuring has finished on the same thread.
-static CLOSURE_RECONSTRUCTIONS: AtomicUsize = AtomicUsize::new(0);
+// How many times this process has decompressed a snapshot's whole object
+// closure.
+//
+// Counted because the cost is invisible from any one call site. Every caller
+// that wants the closure asks [`validate_snapshot`] for it, and that call
+// reads and verifies EVERY object body in the repository, so a conversion that
+// asked once per caller paid a whole-repository decompression per caller. On a 1,200-commit flask corpus that is 162.5 MiB decompressed
+// against 13 MB packed, per rebuild, and it was the dominant repeated wall
+// clock cost of `kin init` before anyone counted it.
+//
+// Per-thread rather than global, and that is what makes it usable as a test
+// assertion. A conversion is a sequential pipeline on one thread, so a
+// thread-local counts exactly the rebuilds its own caller provoked; a process
+// global would be polluted by any test running beside it, and `cargo test`
+// runs tests as threads in one process. Reading a delta around a call is
+// therefore exact here without serializing the suite or adding a dependency
+// to force it.
+std::thread_local! {
+    static CLOSURE_RECONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 
-/// How many whole-closure decompressions this process has performed.
+    // The most recently decompressed closure, and the exact object set it was
+    // decompressed from.
+    //
+    // Capacity one on purpose. A conversion works one object set at a time and
+    // asks for it repeatedly, so one slot captures every repeat ask while
+    // bounding what is held: the flask corpus's closure is 162.5 MiB, and a
+    // cache that grew would trade the wall for a memory wall.
+    static CLOSURE_CACHE: std::cell::RefCell<Option<(ClosureKey, Rc<ClosureBodies>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// What a decompressed closure is a function of.
+///
+/// The object records themselves, which carry every object's identity, kind and
+/// CAS body hash. That is the entire input to the decompression below, which is
+/// what makes it sound as a cache key: two snapshots with equal records read
+/// the same bodies out of the same CAS and verify the same descriptors against
+/// them, so a hit cannot hand a caller a closure built from different objects.
+///
+/// Compared rather than hashed, so the match is exact rather than
+/// collision-resistant. Kin's import proofs are load-bearing and a closure that
+/// satisfied a proof by hash collision would be exactly the failure this key
+/// exists to make impossible. The comparison walks records without touching
+/// bodies, so it costs a pointer walk against the whole-repository read it
+/// avoids.
+///
+/// Keying on something coarser, the tree root for instance, would not have this
+/// property: two object sets can share a root and differ elsewhere, and a hit
+/// would then satisfy a proof with a closure the proof never covered.
+#[derive(PartialEq)]
+struct ClosureKey {
+    object_format: GitObjectFormat,
+    objects: Vec<ExternalObjectRecord>,
+}
+
+type ClosureBodies = BTreeMap<ExternalObjectId, Vec<u8>>;
+
+fn closure_key(snapshot: &LosslessGitRepository) -> ClosureKey {
+    ClosureKey {
+        object_format: snapshot.object_format,
+        objects: snapshot.objects.clone(),
+    }
+}
+
+/// How many whole-closure decompressions this thread has performed.
+///
+/// Read it either side of a conversion and subtract. The number that matters is
+/// the delta, not the total.
 pub fn closure_reconstruction_count() -> usize {
-    CLOSURE_RECONSTRUCTIONS.load(Ordering::Relaxed)
+    CLOSURE_RECONSTRUCTIONS.with(std::cell::Cell::get)
 }
 
 #[cfg(all(unix, test))]
@@ -651,10 +704,16 @@ fn gix_object_id(oid: GitObjectId) -> Result<gix::ObjectId> {
         .map_err(|error| GitError::InvalidSnapshot(format!("invalid Git object ID: {error}")))
 }
 
+/// Validate a snapshot and hand back its decompressed object closure.
+///
+/// The closure is returned SHARED rather than owned, because a conversion asks
+/// several times over the same objects and a per-caller copy of it is the same
+/// whole-repository cost this sharing exists to remove: on the flask corpus the
+/// map is 162.5 MiB. Callers read it; nobody mutates it.
 pub(crate) fn validate_snapshot(
     snapshot: &LosslessGitRepository,
     blob_store: &BlobStore,
-) -> Result<BTreeMap<ExternalObjectId, Vec<u8>>> {
+) -> Result<Rc<ClosureBodies>> {
     snapshot.refs.validate()?;
     for repository_ref in &snapshot.refs.refs {
         if repository_ref.repository_id != snapshot.repository_id {
@@ -666,10 +725,52 @@ pub(crate) fn validate_snapshot(
     }
     validate_head_and_default(snapshot)?;
 
-    // Counted here rather than at the entry, because everything above this
-    // point is cheap ref arithmetic. The loop below is the whole-repository
-    // decompression this counter exists to make visible.
-    CLOSURE_RECONSTRUCTIONS.fetch_add(1, Ordering::Relaxed);
+    let bodies = decompressed_closure(snapshot, blob_store)?;
+
+    // Outside the shared closure on purpose. Reachability is a function of the
+    // refs and HEAD as well as the objects, and those are NOT part of the cache
+    // key, so two snapshots that share an object set can still disagree about
+    // what is reachable from it. Re-walking is cheap next to decompressing, and
+    // a proof that only ran on a cache miss would be a proof that stopped
+    // running.
+    validate_reachable_closure(snapshot, &bodies)?;
+    Ok(bodies)
+}
+
+/// The snapshot's object bodies, decompressed once per distinct object set.
+///
+/// A conversion asks for the same closure at every step, and each ask used to
+/// re-read and re-verify every object body in the repository. This returns the
+/// previous answer when the object set is byte-for-byte the one it was built
+/// from, and rebuilds otherwise.
+///
+/// What is shared is the DECOMPRESSION, never a verdict. The per-object
+/// descriptor check below runs on every body the first time that object set is
+/// seen, and a hit is only possible when the key covering every object ID, kind
+/// and CAS body hash matches, so a hit re-uses bodies that were verified
+/// against these exact descriptors and no others. Everything a proof actually
+/// asserts, the derived plan and the reachable closure, is recomputed by the
+/// caller either way.
+fn decompressed_closure(
+    snapshot: &LosslessGitRepository,
+    blob_store: &BlobStore,
+) -> Result<Rc<ClosureBodies>> {
+    let key = closure_key(snapshot);
+    if let Some(shared) = CLOSURE_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .filter(|(cached, _)| *cached == key)
+            .map(|(_, bodies)| Rc::clone(bodies))
+    }) {
+        return Ok(shared);
+    }
+
+    // Counted here rather than at the function entry, because a hit above costs
+    // nothing and everything before it is cheap ref arithmetic. The loop below
+    // is the whole-repository decompression this counter exists to make
+    // visible.
+    CLOSURE_RECONSTRUCTIONS.with(|count| count.set(count.get() + 1));
 
     let mut bodies = BTreeMap::new();
     let mut object_ids = BTreeSet::new();
@@ -701,8 +802,13 @@ pub(crate) fn validate_snapshot(
         }
     }
 
-    validate_reachable_closure(snapshot, &bodies)?;
-    Ok(bodies)
+    // Published only after every body passed, so a rejected object set leaves
+    // nothing behind for the next caller to hit.
+    let shared = Rc::new(bodies);
+    CLOSURE_CACHE.with(|cache| {
+        *cache.borrow_mut() = Some((key, Rc::clone(&shared)));
+    });
+    Ok(shared)
 }
 
 fn validate_head_and_default(snapshot: &LosslessGitRepository) -> Result<()> {
