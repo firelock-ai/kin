@@ -2355,8 +2355,20 @@ mod tests {
         )
         .unwrap();
         commit_native_plan(&init.layout, &blobs, winner).unwrap();
+        // The refusal comes from the durable compare-and-swap. A plan carries
+        // the authority it planned against, so publishing a stale plan no
+        // longer re-reads authority first and cannot notice the move before
+        // preparing its successor; kin-db refuses the write itself because the
+        // persisted base generation is not the one the successor was built on.
+        // The refusal is what matters and it is unconditional: the successor
+        // exists only in memory, and nothing durable moved, which the state
+        // assertions below check rather than assume.
         let error = commit_native_plan(&init.layout, &blobs, stale).unwrap_err();
-        assert!(error.to_string().contains("authority moved"));
+        let refusal = error.to_string();
+        assert!(
+            refusal.contains("generation mismatch") && refusal.contains("another writer committed"),
+            "a stale plan must be refused naming the generation conflict, got: {refusal}"
+        );
 
         let authority = reopen(&init);
         let lease = authority.read_authority();
