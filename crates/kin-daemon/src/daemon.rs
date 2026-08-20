@@ -1344,6 +1344,41 @@ fn file_already_enriched(state: &DaemonState, file: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Column an LSP query should be asked at for one entity, given its signature
+/// and the column its declaration starts on.
+///
+/// The cursor has to sit on the name rather than on the declaration's first
+/// byte, and for a dotted name it has to sit on the LAST segment. An entity
+/// named `app.handle` whose signature reads `app.handle = function handle(`
+/// starts at the `app` token, and `signature.find(name)` returns 0 for it, so
+/// the query went to the receiver instead of the member.
+///
+/// That is not a near miss. Asking a language server for references at a
+/// receiver returns everything the object touches, so express minted an
+/// all-pairs whole-file fan, and every edge in it was stamped `Lsp` and
+/// therefore read as `type_resolved` with no evidence behind it. A caller walk
+/// then counted fabricated callees as real ones, which is worse than the
+/// missing edge it was meant to supply: a wrong answer wearing the label of a
+/// resolved one.
+///
+/// A name with no dot is unaffected. Its segment offset is zero and the result
+/// is exactly what it always was.
+fn lsp_query_column(signature: &str, name: &str, start_col: u32) -> u32 {
+    let segment_offset = name.rfind('.').map_or(0, |dot| dot + 1);
+    if let Some(offset) = signature.find(name) {
+        return start_col.saturating_add((offset + segment_offset) as u32);
+    }
+    // The signature does not spell the dotted name out. Ask for the final
+    // segment on its own rather than falling back to the declaration start,
+    // which is the receiver again whenever the receiver is what opens the line.
+    if segment_offset > 0 {
+        if let Some(offset) = signature.find(&name[segment_offset..]) {
+            return start_col.saturating_add(offset as u32);
+        }
+    }
+    start_col
+}
+
 fn install_lsp_relations(state: &DaemonState, relations: &[kin_model::Relation]) -> usize {
     if relations.is_empty() {
         return 0;
@@ -2613,11 +2648,8 @@ pub async fn run_with_authority_on(
                                 let span = e.span.as_ref()?;
                                 // Compute name position by finding name in signature.
                                 // LSP needs cursor on name, not declaration start.
-                                let name_col = e
-                                    .signature
-                                    .find(&e.name)
-                                    .map(|offset| span.start_col as u32 + offset as u32)
-                                    .unwrap_or(span.start_col as u32);
+                                let name_col =
+                                    lsp_query_column(&e.signature, &e.name, span.start_col as u32);
                                 Some(kin_lsp::EntityRef {
                                     id: e.id,
                                     name: e.name.clone(),
@@ -2709,11 +2741,11 @@ pub async fn run_with_authority_on(
                                 let entity = entities.iter().find(|e| e.id == *id)?;
                                 let fo = entity.file_origin.as_ref()?;
                                 let span = entity.span.as_ref()?;
-                                let name_col = entity
-                                    .signature
-                                    .find(&entity.name)
-                                    .map(|offset| span.start_col as u32 + offset as u32)
-                                    .unwrap_or(span.start_col as u32);
+                                let name_col = lsp_query_column(
+                                    &entity.signature,
+                                    &entity.name,
+                                    span.start_col as u32,
+                                );
                                 Some(kin_lsp::EntityRef {
                                     id: entity.id,
                                     name: entity.name.clone(),
@@ -2798,11 +2830,8 @@ pub async fn run_with_authority_on(
                             .filter_map(|e| {
                                 let fo = e.file_origin.as_ref()?;
                                 let span = e.span.as_ref()?;
-                                let name_col = e
-                                    .signature
-                                    .find(&e.name)
-                                    .map(|offset| span.start_col as u32 + offset as u32)
-                                    .unwrap_or(span.start_col as u32);
+                                let name_col =
+                                    lsp_query_column(&e.signature, &e.name, span.start_col as u32);
                                 Some(kin_lsp::EntityRef {
                                     id: e.id,
                                     name: e.name.clone(),
@@ -2931,11 +2960,11 @@ pub async fn run_with_authority_on(
                                 .iter()
                                 .filter_map(|e| {
                                     let span = e.span.as_ref()?;
-                                    let name_col = e
-                                        .signature
-                                        .find(&e.name)
-                                        .map(|offset| span.start_col as u32 + offset as u32)
-                                        .unwrap_or(span.start_col as u32);
+                                    let name_col = lsp_query_column(
+                                        &e.signature,
+                                        &e.name,
+                                        span.start_col as u32,
+                                    );
                                     Some(kin_lsp::EntityRef {
                                         id: e.id,
                                         name: e.name.clone(),
@@ -4507,5 +4536,68 @@ mod enrichment_marker_tests {
             "a graph that still holds language-server relations resumes rather than re-sweeping"
         );
         assert!(lsp_enriched_marker_path(&state).exists());
+    }
+}
+
+#[cfg(test)]
+mod lsp_query_column_tests {
+    use super::lsp_query_column;
+
+    /// The express case, which is what this exists for.
+    ///
+    /// `app.handle` at `lib/application.js` has the signature below, so the old
+    /// `signature.find(name)` returned 0 and the query landed on `app`. The
+    /// language server then answered about the receiver and the walk counted
+    /// `app.set`, `res.send` and `res.redirect` as callees of `app.handle`.
+    #[test]
+    fn a_dotted_name_is_queried_at_its_final_segment() {
+        assert_eq!(
+            lsp_query_column("app.handle = function handle(", "app.handle", 0),
+            4,
+            "the cursor belongs on `handle`, not on the `app` receiver"
+        );
+    }
+
+    /// The declaration's own column still offsets the result.
+    #[test]
+    fn the_declaration_column_is_carried_through() {
+        assert_eq!(
+            lsp_query_column("app.handle = function handle(", "app.handle", 6),
+            10
+        );
+    }
+
+    /// An undotted name keeps exactly the behavior it had.
+    #[test]
+    fn a_plain_name_is_unchanged() {
+        assert_eq!(lsp_query_column("function handle(", "handle", 0), 9);
+        assert_eq!(lsp_query_column("def send(self):", "send", 4), 8);
+    }
+
+    /// A deeper receiver chain still resolves to the last segment.
+    #[test]
+    fn only_the_final_segment_is_addressed() {
+        assert_eq!(
+            lsp_query_column("this.router.handle = fn", "this.router.handle", 0),
+            12
+        );
+    }
+
+    /// When the signature does not spell the dotted name out, the segment is
+    /// still preferred over the declaration start, because the declaration
+    /// start is the receiver again whenever the receiver opens the line.
+    #[test]
+    fn an_unspelled_dotted_name_falls_back_to_its_segment() {
+        assert_eq!(
+            lsp_query_column("exports.handle = function handle(", "app.handle", 0),
+            8
+        );
+    }
+
+    /// And a name the signature does not carry at all keeps the old answer
+    /// rather than inventing a position.
+    #[test]
+    fn a_name_absent_from_the_signature_keeps_the_declaration_column() {
+        assert_eq!(lsp_query_column("const x = 1", "handle", 3), 3);
     }
 }
