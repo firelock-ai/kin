@@ -48,6 +48,8 @@ impl LocalRepositoryAuthorityContext {
     pub(crate) fn open(
         &self,
     ) -> std::result::Result<RepositoryAuthorityManager<LocalFileBackend>, kin_db::KinDbError> {
+        #[cfg(test)]
+        record_authority_open();
         self.binding.open_manager()
     }
 
@@ -56,6 +58,37 @@ impl LocalRepositoryAuthorityContext {
     ) -> std::result::Result<(), kin_core::PinnedNamespaceRefusal> {
         self.binding.revalidate_pinned_namespace()
     }
+}
+
+// How many repository authorities this thread has opened.
+//
+// Opening one is O(store) and not a cheap handle: kin-db decodes the whole
+// persisted authority and then re-verifies every body in repository CAS against
+// its content address, unconditionally, on every open. How many a single
+// operation pays for is therefore a cost invariant worth pinning, and nothing
+// else in this process can observe it. The count is per thread because a test
+// owns its thread and the commit path it drives is synchronous, so a concurrent
+// test can neither inflate nor deflate another's reading.
+#[cfg(test)]
+thread_local! {
+    static AUTHORITY_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_authority_open() {
+    AUTHORITY_OPENS.with(|count| count.set(count.get() + 1));
+}
+
+/// Start counting authority opens on this thread from zero.
+#[cfg(test)]
+pub(crate) fn reset_authority_open_count() {
+    AUTHORITY_OPENS.with(|count| count.set(0));
+}
+
+/// Authority opens on this thread since the last reset.
+#[cfg(test)]
+pub(crate) fn authority_open_count() -> usize {
+    AUTHORITY_OPENS.with(std::cell::Cell::get)
 }
 
 /// Why a command refused to bind this daemon's local repository authority.
