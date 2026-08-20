@@ -26,6 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Make the LSP sweep run, finish and be observable, and count callers that reach an override through a proven base (#971)
 - Carry the planned repository authority into the commit that publishes it (#972)
 - Produce the Overrides edge kin already consumes six ways (#973)
+- Make language-server relations durable repository authority (#974)
+- Pin kin-lsp to =0.6.14 so runtime resolution carries the enrichment fixes (#975)
 
 
 ## [0.5.42] - 2026-08-19
