@@ -17,8 +17,18 @@ use crate::error::ReviewError;
 #[allow(clippy::large_enum_variant)]
 pub enum EntityChangeKind {
     Added(Entity),
-    Modified { old: Entity, new: Entity },
-    Removed(EntityId),
+    Modified {
+        old: Entity,
+        new: Entity,
+    },
+    /// The base-side record of a removed entity. The delta that produced the
+    /// removal already carries this entity, so a review can name what was
+    /// deleted instead of printing an opaque id. `None` only when no version of
+    /// the entity is recoverable from the graph or its history, which a renderer
+    /// must report as an unresolved removal rather than as a bare id.
+    Removed {
+        old: Option<Entity>,
+    },
 }
 
 /// A single entity-level diff entry.
@@ -32,8 +42,15 @@ pub struct EntityChange {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RelationChangeKind {
     Added(Relation),
-    Modified { old: Relation, new: Relation },
-    Removed(RelationId),
+    Modified {
+        old: Relation,
+        new: Relation,
+    },
+    /// The base-side record of a removed relation, which carries both endpoints
+    /// and the edge kind. Every producer holds it, so it is not optional.
+    Removed {
+        old: Relation,
+    },
 }
 
 /// A single relation-level diff entry.
@@ -76,7 +93,21 @@ impl SemanticDiff {
         self.entity_changes
             .iter()
             .filter_map(|c| match &c.kind {
-                EntityChangeKind::Removed(id) => Some(id),
+                EntityChangeKind::Removed { .. } => Some(&c.entity_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Removed entities paired with the id they were recorded under. The entity
+    /// is `None` only for a removal whose base-side record could not be
+    /// recovered; a caller must render that case as unresolved rather than
+    /// falling back to the id alone as if it were a name.
+    pub fn removed_entities(&self) -> Vec<(&EntityId, Option<&Entity>)> {
+        self.entity_changes
+            .iter()
+            .filter_map(|c| match &c.kind {
+                EntityChangeKind::Removed { old } => Some((&c.entity_id, old.as_ref())),
                 _ => None,
             })
             .collect()
@@ -101,7 +132,7 @@ fn relation_change_key(change: &RelationChange) -> String {
     match &change.kind {
         RelationChangeKind::Added(rel) => rel.id.to_string(),
         RelationChangeKind::Modified { new, .. } => new.id.to_string(),
-        RelationChangeKind::Removed(id) => id.to_string(),
+        RelationChangeKind::Removed { old } => old.id.to_string(),
     }
 }
 
@@ -157,7 +188,7 @@ pub fn compute_diff_scoped<G: GraphStore>(
                 EntityDelta::Added { new: entity } => {
                     let id = entity.id;
                     match entity_states.get(&id) {
-                        Some(EntityChangeKind::Removed(_)) => {
+                        Some(EntityChangeKind::Removed { .. }) => {
                             // The model delta carries the removed payload, but
                             // the public review summary remains ID-shaped for
                             // now. Treat a reintroduction as an add rather than
@@ -196,7 +227,12 @@ pub fn compute_diff_scoped<G: GraphStore>(
                             entity_states.remove(&id);
                         }
                         _ => {
-                            entity_states.insert(id, EntityChangeKind::Removed(id));
+                            entity_states.insert(
+                                id,
+                                EntityChangeKind::Removed {
+                                    old: Some(old.clone()),
+                                },
+                            );
                         }
                     }
                 }
@@ -262,9 +298,9 @@ pub fn compute_diff_scoped<G: GraphStore>(
             kind: RelationChangeKind::Modified { old, new },
         });
     }
-    for (id, _) in relation_removed {
+    for (_, old) in relation_removed {
         diff.relation_changes.push(RelationChange {
-            kind: RelationChangeKind::Removed(id),
+            kind: RelationChangeKind::Removed { old },
         });
     }
     diff.relation_changes.sort_by_key(relation_change_key);
@@ -291,7 +327,12 @@ pub fn diff_from_change(change: &SemanticChange) -> SemanticDiff {
                     new: new.clone(),
                 },
             ),
-            EntityDelta::Removed { old } => (old.id, EntityChangeKind::Removed(old.id)),
+            EntityDelta::Removed { old } => (
+                old.id,
+                EntityChangeKind::Removed {
+                    old: Some(old.clone()),
+                },
+            ),
         };
         diff.entity_changes.push(EntityChange { entity_id, kind });
     }
@@ -303,7 +344,7 @@ pub fn diff_from_change(change: &SemanticChange) -> SemanticDiff {
                 old: old.clone(),
                 new: new.clone(),
             },
-            RelationDelta::Removed { old } => RelationChangeKind::Removed(old.id),
+            RelationDelta::Removed { old } => RelationChangeKind::Removed { old: old.clone() },
         };
         diff.relation_changes.push(RelationChange { kind });
     }
@@ -360,7 +401,12 @@ pub fn diff_from_changes(changes: &[SemanticChange]) -> SemanticDiff {
                         entity_states.remove(&old.id);
                     }
                     _ => {
-                        entity_states.insert(old.id, EntityChangeKind::Removed(old.id));
+                        entity_states.insert(
+                            old.id,
+                            EntityChangeKind::Removed {
+                                old: Some(old.clone()),
+                            },
+                        );
                     }
                 },
             }
@@ -423,9 +469,9 @@ pub fn diff_from_changes(changes: &[SemanticChange]) -> SemanticDiff {
             kind: RelationChangeKind::Modified { old, new },
         });
     }
-    for (id, _) in relation_removed {
+    for (_, old) in relation_removed {
         diff.relation_changes.push(RelationChange {
-            kind: RelationChangeKind::Removed(id),
+            kind: RelationChangeKind::Removed { old },
         });
     }
     diff.relation_changes.sort_by_key(relation_change_key);
@@ -479,10 +525,23 @@ pub fn diff_from_entity_ids<G: GraphStore>(
                 });
             }
             None => {
-                // Entity not in graph — treat as removed
+                // Entity not in graph, so treat as removed. The entity is absent
+                // at head by definition here, but its history still holds the
+                // last version that existed, and that record is what lets a
+                // review name what was deleted. Prefer the payload the removal
+                // delta itself carried, then the newest surviving version.
+                let history = store.get_entity_history(&eid).map_err(ReviewError::graph)?;
+                let old = history.iter().rev().find_map(|change| {
+                    change.entity_deltas.iter().find_map(|delta| match delta {
+                        EntityDelta::Removed { old } if old.id == eid => Some(old.clone()),
+                        EntityDelta::Modified { new, .. } if new.id == eid => Some(new.clone()),
+                        EntityDelta::Added { new } if new.id == eid => Some(new.clone()),
+                        _ => None,
+                    })
+                });
                 diff.entity_changes.push(EntityChange {
                     entity_id: eid,
-                    kind: EntityChangeKind::Removed(eid),
+                    kind: EntityChangeKind::Removed { old },
                 });
             }
         }

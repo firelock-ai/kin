@@ -1268,6 +1268,22 @@ fn lsp_enriched_marker_path(state: &DaemonState) -> std::path::PathBuf {
 /// costs a re-sweep and never skips a file wrongly. That asymmetry is deliberate:
 /// a wrong skip is silent and loses the answers, a wrong re-sweep only costs
 /// time.
+///
+/// A marker is honored only while the graph it describes still holds
+/// language-server relations. A store swept before enrichment became durable
+/// carries a complete marker and none of the edges it recorded, and the marker
+/// is exactly what makes that loss permanent: every later daemon skips the same
+/// files and re-derives nothing, so the store can never repair itself. Dropping
+/// such a marker costs one re-sweep and fixes it. A sweep that legitimately
+/// produced no relation at all is re-swept too, which is the same asymmetry
+/// again and the cheap direction to be wrong in.
+///
+/// The file is left alone rather than deleted. The judgment is made again from
+/// the graph on every load, and the sweep that follows rewrites the marker with
+/// what it finished, so removing it would change nothing a later open decides.
+///
+/// The scan runs only when a marker exists, and costs one snapshot at startup
+/// beside a read-index build that already walks the whole graph.
 fn load_lsp_enriched_marker(state: &DaemonState) {
     let Ok(bytes) = std::fs::read(lsp_enriched_marker_path(state)) else {
         return;
@@ -1275,9 +1291,29 @@ fn load_lsp_enriched_marker(state: &DaemonState) {
     let Ok(files) = serde_json::from_slice::<Vec<String>>(&bytes) else {
         return;
     };
+    if files.is_empty() {
+        return;
+    }
+    if !graph_holds_language_server_relations(state) {
+        warn!(
+            marked = files.len(),
+            "ignoring the language-server enrichment marker: this graph holds none of the relations it records, so the files it marks are swept again"
+        );
+        return;
+    }
     if let Ok(mut marked) = state.lsp_enriched_files.lock() {
         marked.extend(files);
     }
+}
+
+/// Whether this graph still holds any relation a language server produced.
+fn graph_holds_language_server_relations(state: &DaemonState) -> bool {
+    state
+        .graph
+        .to_snapshot()
+        .relations
+        .values()
+        .any(|relation| relation.origin == kin_model::RelationOrigin::Lsp)
 }
 
 /// Record that the sweep finished this file, and persist the set.
@@ -1308,6 +1344,41 @@ fn file_already_enriched(state: &DaemonState, file: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Column an LSP query should be asked at for one entity, given its signature
+/// and the column its declaration starts on.
+///
+/// The cursor has to sit on the name rather than on the declaration's first
+/// byte, and for a dotted name it has to sit on the LAST segment. An entity
+/// named `app.handle` whose signature reads `app.handle = function handle(`
+/// starts at the `app` token, and `signature.find(name)` returns 0 for it, so
+/// the query went to the receiver instead of the member.
+///
+/// That is not a near miss. Asking a language server for references at a
+/// receiver returns everything the object touches, so express minted an
+/// all-pairs whole-file fan, and every edge in it was stamped `Lsp` and
+/// therefore read as `type_resolved` with no evidence behind it. A caller walk
+/// then counted fabricated callees as real ones, which is worse than the
+/// missing edge it was meant to supply: a wrong answer wearing the label of a
+/// resolved one.
+///
+/// A name with no dot is unaffected. Its segment offset is zero and the result
+/// is exactly what it always was.
+fn lsp_query_column(signature: &str, name: &str, start_col: u32) -> u32 {
+    let segment_offset = name.rfind('.').map_or(0, |dot| dot + 1);
+    if let Some(offset) = signature.find(name) {
+        return start_col.saturating_add((offset + segment_offset) as u32);
+    }
+    // The signature does not spell the dotted name out. Ask for the final
+    // segment on its own rather than falling back to the declaration start,
+    // which is the receiver again whenever the receiver is what opens the line.
+    if segment_offset > 0 {
+        if let Some(offset) = signature.find(&name[segment_offset..]) {
+            return start_col.saturating_add(offset as u32);
+        }
+    }
+    start_col
+}
+
 fn install_lsp_relations(state: &DaemonState, relations: &[kin_model::Relation]) -> usize {
     if relations.is_empty() {
         return 0;
@@ -1315,12 +1386,39 @@ fn install_lsp_relations(state: &DaemonState, relations: &[kin_model::Relation])
 
     use kin_model::EntityStore;
     let graph_mutation = state.begin_graph_authority_mutation();
+    let mut installed = 0usize;
+    let mut refused = 0usize;
     for relation in relations {
-        let _ = state.graph.upsert_relation(relation);
+        match state.graph.upsert_relation(relation) {
+            Ok(_) => installed += 1,
+            Err(error) => {
+                refused += 1;
+                // Was `let _ =`. A write the graph refused was indistinguishable
+                // from one it took, and the count returned was the number of
+                // relations ATTEMPTED, so a pass that installed nothing reported
+                // exactly the same number as one that installed everything. That
+                // is how a language-server answer proved correct in the trace
+                // reached the graph as nothing at all, and every log line about
+                // it said the enrichment had worked.
+                debug!(
+                    kind = ?relation.kind,
+                    src = ?relation.src,
+                    dst = ?relation.dst,
+                    %error,
+                    "graph refused an enrichment relation"
+                );
+            }
+        }
+    }
+    if refused > 0 {
+        warn!(
+            installed,
+            refused, "graph refused enrichment relations; the enriched count reports what it took"
+        );
     }
     state.bump_version();
     drop(graph_mutation);
-    relations.len()
+    installed
 }
 
 /// Enrich a single entity with all available LSP relation types (calls, overrides,
@@ -2550,11 +2648,8 @@ pub async fn run_with_authority_on(
                                 let span = e.span.as_ref()?;
                                 // Compute name position by finding name in signature.
                                 // LSP needs cursor on name, not declaration start.
-                                let name_col = e
-                                    .signature
-                                    .find(&e.name)
-                                    .map(|offset| span.start_col as u32 + offset as u32)
-                                    .unwrap_or(span.start_col as u32);
+                                let name_col =
+                                    lsp_query_column(&e.signature, &e.name, span.start_col as u32);
                                 Some(kin_lsp::EntityRef {
                                     id: e.id,
                                     name: e.name.clone(),
@@ -2646,11 +2741,11 @@ pub async fn run_with_authority_on(
                                 let entity = entities.iter().find(|e| e.id == *id)?;
                                 let fo = entity.file_origin.as_ref()?;
                                 let span = entity.span.as_ref()?;
-                                let name_col = entity
-                                    .signature
-                                    .find(&entity.name)
-                                    .map(|offset| span.start_col as u32 + offset as u32)
-                                    .unwrap_or(span.start_col as u32);
+                                let name_col = lsp_query_column(
+                                    &entity.signature,
+                                    &entity.name,
+                                    span.start_col as u32,
+                                );
                                 Some(kin_lsp::EntityRef {
                                     id: entity.id,
                                     name: entity.name.clone(),
@@ -2735,11 +2830,8 @@ pub async fn run_with_authority_on(
                             .filter_map(|e| {
                                 let fo = e.file_origin.as_ref()?;
                                 let span = e.span.as_ref()?;
-                                let name_col = e
-                                    .signature
-                                    .find(&e.name)
-                                    .map(|offset| span.start_col as u32 + offset as u32)
-                                    .unwrap_or(span.start_col as u32);
+                                let name_col =
+                                    lsp_query_column(&e.signature, &e.name, span.start_col as u32);
                                 Some(kin_lsp::EntityRef {
                                     id: e.id,
                                     name: e.name.clone(),
@@ -2868,11 +2960,11 @@ pub async fn run_with_authority_on(
                                 .iter()
                                 .filter_map(|e| {
                                     let span = e.span.as_ref()?;
-                                    let name_col = e
-                                        .signature
-                                        .find(&e.name)
-                                        .map(|offset| span.start_col as u32 + offset as u32)
-                                        .unwrap_or(span.start_col as u32);
+                                    let name_col = lsp_query_column(
+                                        &e.signature,
+                                        &e.name,
+                                        span.start_col as u32,
+                                    );
                                     Some(kin_lsp::EntityRef {
                                         id: e.id,
                                         name: e.name.clone(),
@@ -4336,5 +4428,188 @@ mod tests {
 
         drain_pending_flush(&mut pending).await;
         assert!(pending.is_none());
+    }
+}
+
+#[cfg(test)]
+mod enrichment_marker_tests {
+    use super::{file_already_enriched, load_lsp_enriched_marker, lsp_enriched_marker_path};
+    use crate::state::DaemonState;
+    use kin_model::EntityStore;
+
+    fn entity(name: &str) -> kin_model::Entity {
+        kin_model::Entity {
+            id: kin_model::EntityId::new(),
+            kind: kin_model::EntityKind::Function,
+            name: name.to_string(),
+            language: kin_model::LanguageId::Python,
+            fingerprint: kin_model::SemanticFingerprint {
+                algorithm: kin_model::FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: kin_model::Hash256::from_bytes([1; 32]),
+                signature_hash: kin_model::Hash256::from_bytes([2; 32]),
+                behavior_hash: kin_model::Hash256::from_bytes([3; 32]),
+                equivalence_hash: kin_model::Hash256::from_bytes([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(kin_model::FilePathId::new("src/sessions.py")),
+            span: None,
+            signature: format!("def {name}()"),
+            visibility: kin_model::Visibility::Public,
+            role: kin_model::EntityRole::Source,
+            doc_summary: None,
+            metadata: kin_model::EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    fn install_language_server_relation(state: &DaemonState) {
+        let src = entity("send");
+        let dst = entity("adapter_send");
+        state.graph.upsert_entity(&src).unwrap();
+        state.graph.upsert_entity(&dst).unwrap();
+        state
+            .graph
+            .upsert_relation(&kin_model::Relation {
+                id: kin_model::RelationId::new(),
+                kind: kin_model::RelationKind::Calls,
+                src: kin_model::GraphNodeId::Entity(src.id),
+                dst: kin_model::GraphNodeId::Entity(dst.id),
+                confidence: 1.0,
+                origin: kin_model::RelationOrigin::Lsp,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+    }
+
+    fn write_marker(state: &DaemonState, files: &[&str]) {
+        std::fs::write(
+            lsp_enriched_marker_path(state),
+            serde_json::to_vec(&files.iter().map(|f| f.to_string()).collect::<Vec<_>>()).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// A marker whose relations are gone must not keep the loss permanent.
+    ///
+    /// This is what made the persistence defect unrecoverable rather than
+    /// merely wasteful: the sweep recorded every file it finished, the
+    /// relations did not survive the process, and each later daemon skipped the
+    /// same files and re-derived nothing.
+    #[test]
+    fn a_marker_without_its_relations_is_discarded() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = DaemonState::open(init.layout).unwrap();
+        write_marker(&state, &["src/sessions.py"]);
+
+        load_lsp_enriched_marker(&state);
+
+        assert!(
+            !file_already_enriched(&state, "src/sessions.py"),
+            "a marker the graph cannot corroborate must not skip the file it names"
+        );
+        load_lsp_enriched_marker(&state);
+        assert!(
+            !file_already_enriched(&state, "src/sessions.py"),
+            "and it stays unhonored while the graph still cannot corroborate it, so the \
+             judgment does not depend on having deleted the file"
+        );
+    }
+
+    /// The other direction, so the reset is not simply "always re-sweep".
+    #[test]
+    fn a_marker_backed_by_relations_is_honored() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = DaemonState::open(init.layout).unwrap();
+        install_language_server_relation(&state);
+        write_marker(&state, &["src/sessions.py"]);
+
+        load_lsp_enriched_marker(&state);
+
+        assert!(
+            file_already_enriched(&state, "src/sessions.py"),
+            "a graph that still holds language-server relations resumes rather than re-sweeping"
+        );
+        assert!(lsp_enriched_marker_path(&state).exists());
+    }
+}
+
+#[cfg(test)]
+mod lsp_query_column_tests {
+    use super::lsp_query_column;
+
+    /// The express case, which is what this exists for.
+    ///
+    /// `app.handle` at `lib/application.js` has the signature below, so the old
+    /// `signature.find(name)` returned 0 and the query landed on `app`. The
+    /// language server then answered about the receiver and the walk counted
+    /// `app.set`, `res.send` and `res.redirect` as callees of `app.handle`.
+    #[test]
+    fn a_dotted_name_is_queried_at_its_final_segment() {
+        assert_eq!(
+            lsp_query_column("app.handle = function handle(", "app.handle", 0),
+            4,
+            "the cursor belongs on `handle`, not on the `app` receiver"
+        );
+    }
+
+    /// The declaration's own column still offsets the result.
+    #[test]
+    fn the_declaration_column_is_carried_through() {
+        assert_eq!(
+            lsp_query_column("app.handle = function handle(", "app.handle", 6),
+            10
+        );
+    }
+
+    /// An undotted name keeps exactly the behavior it had.
+    #[test]
+    fn a_plain_name_is_unchanged() {
+        assert_eq!(lsp_query_column("function handle(", "handle", 0), 9);
+        assert_eq!(lsp_query_column("def send(self):", "send", 4), 8);
+    }
+
+    /// A deeper receiver chain still resolves to the last segment.
+    #[test]
+    fn only_the_final_segment_is_addressed() {
+        assert_eq!(
+            lsp_query_column("this.router.handle = fn", "this.router.handle", 0),
+            12
+        );
+    }
+
+    /// When the signature does not spell the dotted name out, the segment is
+    /// still preferred over the declaration start, because the declaration
+    /// start is the receiver again whenever the receiver opens the line.
+    #[test]
+    fn an_unspelled_dotted_name_falls_back_to_its_segment() {
+        assert_eq!(
+            lsp_query_column("exports.handle = function handle(", "app.handle", 0),
+            8
+        );
+    }
+
+    /// A signature that repeats the receiver must not pull the cursor back to
+    /// it.
+    ///
+    /// `app.app = function app(` carries the token `app` three times. Anchoring
+    /// on the whole dotted name and then stepping to its last segment lands on
+    /// the member at 4. Searching for the segment on its own would return 0,
+    /// the receiver, which is this same defect wearing a different disguise.
+    #[test]
+    fn a_signature_that_repeats_the_receiver_still_addresses_the_member() {
+        assert_eq!(lsp_query_column("app.app = function app(", "app.app", 0), 4);
+    }
+
+    /// And a name the signature does not carry at all keeps the old answer
+    /// rather than inventing a position.
+    #[test]
+    fn a_name_absent_from_the_signature_keeps_the_declaration_column() {
+        assert_eq!(lsp_query_column("const x = 1", "handle", 3), 3);
     }
 }

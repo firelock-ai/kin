@@ -691,6 +691,18 @@ pub fn handle_get_entity_sources<G: GraphStore>(
     Ok(assemble_entity_sources_response(resolved, &opts))
 }
 
+/// Certified dependents a pack will recover into its `dependents` group beyond
+/// the rows its own section already carried.
+///
+/// The group's membership must not depend on how much token budget was left,
+/// which is the whole point of recovering them, but a focal with hundreds of
+/// callers must not turn a budgeted pack into an unbudgeted one either. Past
+/// this the count is still exact: `certified_dependents` reports what the
+/// reference authority proved and `dependents_withheld` reports what did not
+/// fit, so a caller reading a short group knows to ask `find_references` for
+/// the rest rather than reading the group as the whole set.
+const CERTIFIED_DEPENDENTS_MAX: usize = 24;
+
 pub const GET_CONTEXT_PACK_DESC: &str = "\
 Assemble a focused, ready-to-read context bundle around one entity, fitted to a token \
 budget. Starting from a focal entity ID, Kin walks the relation graph to gather the \
@@ -714,9 +726,19 @@ edge leaving the focal, `relation: \"dependent_edge\"` is an edge arriving at it
 `relation: \"same_file_neighbor\"` means the focal had no dependency edge in either \
 direction, so the row is a neighbour sharing the focal's file rather than anything the \
 focal depends on. That last one is the usual shape for a class whose only edges are \
-containment, and those rows sort after the real edges. `dependency_selection` names \
-which of the two filled the list, how many rows each group returned, and, for the \
-fallback, how many same-file candidates there were and how many were dropped to fit. \
+containment, and those rows sort after the real edges. A row carrying \
+`bidirectional: true` is joined to the focal BOTH ways; it is grouped by the arriving \
+edge because that is the one that decides whether changing the focal breaks it. \
+`dependents` is assembled by the same collector `find_references` uses, on the same \
+graph, so the two tools cannot answer differently about one entity: a caller that tool \
+returns is in this group, and a bare-name receiver guess it declines to certify is in \
+neither. `dependency_selection` names which selection filled the dependency list, how \
+many rows each group returned, how many dependents the reference authority certified, \
+how many were withheld to stay inside the pack's budget, and, for the fallback, how many \
+same-file candidates there were and how many were dropped to fit. Read `edge_coverage` \
+and the response's `negative` verdict before acting on an EMPTY `dependents`: a graph \
+that does not link this language's calls across files returns the same `[]` for a symbol \
+with twenty callers as for one with none. \
 If get_entity_source is available to you it is cheaper for a raw \
 body alone; if you need to follow an actual call chain step by step, use trace_data_flow.";
 
@@ -861,6 +883,65 @@ pub fn handle_get_context_pack<G: GraphStore>(
         }
     };
 
+    // Membership of the `dependents` group is decided by the edge authority
+    // `find_references` reads, on the same store, in the same request. The two
+    // surfaces answer the same question about the same entity, so a pack that
+    // decided it independently could disagree with the tool beside it, and it
+    // did: on expressjs/express `res.sendFile` packed `dependents: []` while
+    // `find_references` on that id returned `res.download`, which calls it.
+    //
+    // This is the same call `handle_find_references` makes, not a second
+    // implementation of it. Everything that decides what counts as a reference
+    // -- the allowed edge classes, the self-edge exclusion, composition over
+    // proven overrides, and dropping a caller the workspace no longer contains
+    // -- is that function's, so the two cannot drift apart by being edited
+    // separately.
+    let reference_kinds = default_reference_kinds();
+    let reference_rows =
+        collect_graph_reference_rows(store, &entity_id, &reference_kinds, repository_authority)?;
+    // Observed before the partition, because a candidate row still witnesses the
+    // edge class it arrived on. Same rule as the reference tool's, so the
+    // coverage the pack publishes is the coverage that tool would publish.
+    let witnessed = match &focal_entity {
+        Some(entity) => answer_witnessed_classes(store, entity, &reference_rows),
+        None => Vec::new(),
+    };
+    // FIR-1552 again, in the direction that matters here: a row matched on a
+    // bare receiver name with nothing at the site proving the destination is a
+    // candidate, not a caller. `find_references` withholds it from its count,
+    // so a pack that promoted it to a dependent would be certifying what the
+    // reference surface declined to.
+    let mut certified_rows: Vec<ReferenceRow> = reference_rows
+        .into_iter()
+        .filter(|row| !row.receiver_name_guess)
+        .collect();
+    certified_rows.sort_by(|left, right| {
+        left.file_path
+            .cmp(&right.file_path)
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.entity_id.cmp(&right.entity_id))
+    });
+    let certified_ids: Vec<kin_model::ids::EntityId> = certified_rows
+        .iter()
+        .filter_map(|row| row.entity_id.as_deref())
+        .filter_map(|id| parse_entity_id(id).ok())
+        .collect();
+    let certified: std::collections::HashSet<kin_model::ids::EntityId> =
+        certified_ids.iter().copied().collect();
+    // What the graph can structurally answer over the classes the group was
+    // built from. An empty `dependents` is only evidence about the code when
+    // this says the focal's language links those classes across files, and
+    // nothing else in a pack reports it.
+    let edge_coverage = match &focal_entity {
+        Some(entity) => crate::edge_coverage::observe_cross_file_reference_coverage_witnessed(
+            store,
+            entity,
+            &reference_kinds,
+            &witnessed,
+        ),
+        None => serde_json::Value::Null,
+    };
+
     // The dependency section carries both directions, so it is served as two
     // groups named for what they are. Serving it as one list called
     // `dependencies` reported a focal's callers as things the focal depends on,
@@ -870,15 +951,66 @@ pub fn handle_get_context_pack<G: GraphStore>(
     // order survives the partition.
     let mut dependencies: Vec<serde_json::Value> = Vec::new();
     let mut dependents: Vec<serde_json::Value> = Vec::new();
+    let mut packed: std::collections::HashSet<kin_model::ids::EntityId> =
+        std::collections::HashSet::new();
     for entry in &pack.dependency_signatures {
-        let relation = selection.relation_for(&entry.entity_id);
-        let row = project_dep(entry, Some(relation))?;
+        let packed_relation = selection.relation_for(&entry.entity_id);
+        // The union, never the intersection. A certified caller is a dependent
+        // whatever the pack's own section made of it, and an arriving edge of a
+        // class the reference surface does not read -- `UsesType`, `Implements`,
+        // `Extends` -- is still a dependent the pack can see and that surface
+        // cannot. Taking either one alone would drop real blast radius.
+        let relation = if certified.contains(&entry.entity_id) {
+            DependencyRelation::DependentEdge
+        } else {
+            packed_relation
+        };
+        let mut row = project_dep(entry, Some(relation))?;
         match relation {
-            DependencyRelation::DependentEdge => dependents.push(row),
+            DependencyRelation::DependentEdge => {
+                // Nothing is lost when a pair is joined both ways. The pack used
+                // to resolve that by calling the neighbour a dependency, which
+                // on a JavaScript object literal spends a weak leaving
+                // `References` edge to erase a real arriving `Calls` -- and
+                // every sibling method has that shape, so a focal lost its whole
+                // caller set at once. The group is decided by the arriving edge
+                // and the other direction is stated on the row.
+                if packed_relation == DependencyRelation::DependencyEdge {
+                    row["bidirectional"] = serde_json::json!(true);
+                }
+                packed.insert(entry.entity_id);
+                dependents.push(row);
+            }
             DependencyRelation::DependencyEdge | DependencyRelation::SameFileNeighbor => {
                 dependencies.push(row)
             }
         }
+    }
+    // A certified caller the pack's own section never reached -- shed by the
+    // builder's token budget, or missed by its subgraph walk -- is exactly the
+    // shape this defect had. Recovering it here is what makes the group's
+    // membership a property of the answer rather than of how much budget was
+    // left, and the recovered rows carry the same shape as the projected ones so
+    // a reader cannot tell which path produced them.
+    let mut dependents_withheld = 0usize;
+    for id in &certified_ids {
+        if packed.contains(id) {
+            continue;
+        }
+        if dependents.len() >= CERTIFIED_DEPENDENTS_MAX {
+            dependents_withheld += 1;
+            continue;
+        }
+        let entry = kin_model::context::ContextEntry {
+            entity_id: *id,
+            projection_level: kin_model::context::ProjectionLevel::SignatureOnly,
+            content: String::new(),
+        };
+        dependents.push(project_dep(
+            &entry,
+            Some(DependencyRelation::DependentEdge),
+        )?);
+        packed.insert(*id);
     }
     let transitive: Vec<_> = pack
         .transitive_deps
@@ -898,15 +1030,30 @@ pub fn handle_get_context_pack<G: GraphStore>(
         "dependencies": dependencies,
         // Always present, empty included. "no dependents" and "this build does
         // not report dependents" are different answers, and a group that
-        // appears only when populated cannot tell them apart.
+        // appears only when populated cannot tell them apart. What separates
+        // them now is `edge_coverage` and the response's `negative` verdict:
+        // an empty group on a graph that demonstrably links this language's
+        // edges across files is an answer, and an empty group on one that does
+        // not is a gap, and both used to serialize as `[]`.
         "dependents": dependents,
         "dependency_selection": {
             "source": selection.source().as_str(),
             "returned": returned,
             "dependents_returned": dependents_returned,
+            // What the reference authority certified, stated beside what the
+            // group returned so the two can be compared. They differ when the
+            // pack sees an arriving edge of a class that authority does not
+            // read, and when the cap below withholds one.
+            "certified_dependents": certified_ids.len(),
+            "dependents_withheld": dependents_withheld,
             "same_file_candidates": selection.same_file_candidates(),
             "same_file_dropped": selection.same_file_dropped(),
         },
+        // The substrate behind the `dependents` group, so an empty group is
+        // read against what this graph can structurally answer for the focal's
+        // language rather than as a bare fact. Computed by the same observer
+        // `find_references` uses, from the same witnesses.
+        crate::edge_coverage::EDGE_COVERAGE_KEY: edge_coverage,
         "token_budget": budget.max_tokens(),
         "tokens_used": pack.actual_tokens,
     });
@@ -1605,6 +1752,10 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     };
 
     let addressed_by_name = get_optional_string_param(args, "entity_id").is_none();
+    // Kept for the resolution accounting below. The count that answers "how
+    // ambiguous was what I typed" can only be taken against the caller's own
+    // string, and the resolver consumes it and hands back a winner.
+    let resolution_query = get_optional_string_param(args, "query");
     let target = if let Some(entity_id_str) = get_optional_string_param(args, "entity_id") {
         let entity_id = parse_entity_id(&entity_id_str)?;
         store.get_entity(&entity_id).map_err(McpError::graph)?
@@ -1803,19 +1954,50 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     // rename driven by an unannounced guess. `trace_data_flow` already reports
     // this as `focal_resolution`; the shape is copied deliberately so the two
     // tools answer the same question with the same key.
-    let same_name_candidates = same_name_entity_count(store, &target.name)?;
+    //
+    // The count has to be taken against what the CALLER addressed, not against
+    // what the resolver returned. Taking it against the winner's own name made
+    // it structurally unable to count on any language that qualifies a method:
+    // `find_references(query: "dispatch_request")` on pallets/flask resolved
+    // `Flask.dispatch_request` and reported one candidate, while the graph held
+    // `View.dispatch_request` and `MethodView.dispatch_request` beside it and
+    // `semantic_search` for the same string returned six. An ambiguity counter
+    // pinned at one is worse than no counter: a reader who checks it is handed
+    // an explicit assurance that there was nothing to disambiguate (FIR-2475).
+    let (same_name_candidates, other_candidates, matched_by) = match resolution_query.as_deref() {
+        Some(query) if addressed_by_name => {
+            let (count, others) = query_resolution_candidates(store, query, &target.id)?;
+            (count, others, "query_name_pattern")
+        }
+        // A pinned entity_id resolved nothing by name, so there is no query
+        // ambiguity to report. What still applies is the twin question: a name
+        // the graph holds twice (two cfg arms admitted as distinct entities)
+        // means an edge the extractor could not attribute sits on neither.
+        _ => {
+            let count = same_name_entity_count(store, &target.name)?;
+            (count, Vec::new(), "exact_focal_name")
+        }
+    };
     result["focal_resolution"] = serde_json::json!({
         "addressed_by": if addressed_by_name { "name" } else { "entity_id" },
         "same_name_candidates": same_name_candidates,
+        // Which rule produced the number. Without it the same field means two
+        // different things depending on how the call was addressed, and a
+        // reader cannot tell which answer they are holding.
+        "matched": matched_by,
+        // A count alone says the tool guessed and leaves no way to ask again.
+        // These are addressable by id, bounded, and never include the winner.
+        "other_candidates": other_candidates,
     });
     if addressed_by_name && same_name_candidates > 1 {
         let entry = serde_json::json!({
             "component": "focal_resolution",
             "reason": "ambiguous_name",
             "detail": format!(
-                "{same_name_candidates} entities are named '{}', and this answer describes the \
-                 one reported as focal_entity. Address it by entity_id to pin the choice.",
-                target.name
+                "{same_name_candidates} entities match the name '{}' that was queried, and this \
+                 answer describes the one reported as focal_entity. Address it by entity_id, \
+                 from focal_resolution.other_candidates, to pin the choice.",
+                resolution_query.as_deref().unwrap_or(target.name.as_str())
             ),
         });
         match result
@@ -3694,6 +3876,72 @@ pub fn handle_trace_data_flow<G: GraphStore>(
 ///
 /// Never reports zero: the focal was resolved from this store, so it is its own
 /// first candidate whatever the pattern query matched.
+/// Rejected candidates a resolution will name before it stops listing them.
+///
+/// The count beside them is exact whatever this is, so a caller reading a short
+/// list still knows how many it is choosing between. The cap exists because a
+/// short query is a substring: `find_references(query: "get")` matches every
+/// getter in the repository, and a resolution note is not the place to
+/// enumerate them.
+const RESOLUTION_CANDIDATES_LISTED_MAX: usize = 10;
+
+/// How many entities the caller's QUERY could have meant, and which ones the
+/// resolver did not pick.
+///
+/// This mirrors what `kin_ranking::select_best_entity` filters on, because the
+/// number is only honest if it counts the set that resolver actually chose
+/// among: the same `name_pattern` match, which is a case-insensitive substring
+/// unless the caller wrote a wildcard, and the same exclusion of external
+/// reference targets the repository does not define. A count taken with a
+/// different rule than the choice it describes is a different question wearing
+/// the same field name, which is the whole of FIR-2475.
+fn query_resolution_candidates<G: GraphStore>(
+    store: &G,
+    query: &str,
+    chosen: &kin_model::ids::EntityId,
+) -> Result<(usize, Vec<serde_json::Value>)> {
+    let filter = EntityFilter {
+        name_pattern: Some(query.to_string()),
+        ..Default::default()
+    };
+    let mut matched: Vec<_> = store
+        .query_entities(&filter)
+        .map_err(McpError::graph)?
+        .into_iter()
+        .filter(|entity| {
+            entity.file_origin.is_some() || entity.role != kin_model::entity::EntityRole::External
+        })
+        .collect();
+    // A total order, so two runs of one store list the same candidates. The rows
+    // come off a query whose order is the store's, and several entities can
+    // share a file and a name.
+    matched.sort_by(|left, right| {
+        left.file_origin
+            .as_ref()
+            .map(|path| path.0.as_str())
+            .cmp(&right.file_origin.as_ref().map(|path| path.0.as_str()))
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    // A resolved focal proves at least one match, so a zero here would be the
+    // count disagreeing with the answer it travels with rather than a fact.
+    let count = matched.len().max(1);
+    let others = matched
+        .into_iter()
+        .filter(|entity| entity.id != *chosen)
+        .take(RESOLUTION_CANDIDATES_LISTED_MAX)
+        .map(|entity| {
+            serde_json::json!({
+                "id": entity.id,
+                "name": entity.name,
+                "kind": entity.kind,
+                "file_path": entity.file_origin.as_ref().map(|path| path.to_string()),
+            })
+        })
+        .collect();
+    Ok((count, others))
+}
+
 fn same_name_entity_count<G: GraphStore>(store: &G, name: &str) -> Result<usize> {
     let filter = EntityFilter {
         name_pattern: Some(name.to_string()),
@@ -5250,6 +5498,160 @@ mod tests {
         // blob-backed body to project).
         assert!(verbose_refs[0].as_object().unwrap().contains_key("snippet"));
         assert_eq!(verbose_refs[0]["signature"], "fn caller()");
+    }
+
+    /// FIR-2475. The ambiguity counter above cannot count ambiguity on any
+    /// language that qualifies a method name, which is most of them.
+    ///
+    /// Measured on pallets/flask at d318b683 with npm `@kinlab/kin@0.5.42`:
+    /// `find_references(query: "dispatch_request")` resolved
+    /// `Flask.dispatch_request` and reported `same_name_candidates: 1`, while
+    /// `semantic_search` for the same string in the same session returned
+    /// `total_matches: 6`. Three of those are source-role methods whose
+    /// unqualified name is exactly `dispatch_request`, in two files.
+    ///
+    /// Two bugs stack. The count is taken against the RESOLVED focal's qualified
+    /// name rather than against the query the caller typed, and it is taken with
+    /// exact string equality rather than the substring rule the resolver ranked
+    /// with. So for a qualified-name language the answer is pinned at one
+    /// whatever the caller asked, the `ambiguous_name` degradation can never
+    /// fire, and a reader following FIR-2439's own advice gets an explicit
+    /// assurance that there was nothing to disambiguate. The fixture above
+    /// passes only because its two entities carry bare identical names.
+    #[tokio::test]
+    async fn find_references_counts_what_the_query_could_have_meant() {
+        let store = InMemoryGraph::new();
+        let app = make_entity_in(
+            LanguageId::Python,
+            "Flask.dispatch_request",
+            "src/flask/app.py",
+        );
+        let base = make_entity_in(
+            LanguageId::Python,
+            "View.dispatch_request",
+            "src/flask/views.py",
+        );
+        let derived = make_entity_in(
+            LanguageId::Python,
+            "MethodView.dispatch_request",
+            "src/flask/views.py",
+        );
+        for entity in [&app, &base, &derived] {
+            store.upsert_entity(entity).unwrap();
+        }
+
+        // The control. Three distinct entities really do answer to this query in
+        // this store, so a response reporting one candidate is reporting a fact
+        // the store contradicts rather than a small repository.
+        let matched = store
+            .query_entities(&kin_model::graph::EntityFilter {
+                name_pattern: Some("dispatch_request".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            matched.len(),
+            3,
+            "control: the query must be genuinely ambiguous in this store, or this test \
+             cannot fail"
+        );
+
+        let mut args = HashMap::new();
+        args.insert("query".to_string(), serde_json::json!("dispatch_request"));
+        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+
+        assert_eq!(body["focal_resolution"]["addressed_by"], "name");
+        assert_eq!(
+            body["focal_resolution"]["same_name_candidates"], 3,
+            "the count must answer what the QUERY could have meant, not how many \
+             entities carry the winner's qualified name: {body}"
+        );
+        assert_eq!(
+            body["focal_resolution"]["matched"], "query_name_pattern",
+            "the response must name the rule it counted by, or the number is unreadable: {body}"
+        );
+
+        // A count alone tells an agent it guessed and leaves it no way to ask
+        // again. The rejected candidates travel with it, addressable by id.
+        let others = body["focal_resolution"]["other_candidates"]
+            .as_array()
+            .unwrap_or_else(|| {
+                panic!("an ambiguous resolution must name what it did not pick: {body}")
+            });
+        assert_eq!(others.len(), 2, "two candidates were not chosen: {body}");
+        let focal_id = body["focal_entity"]["id"].as_str().unwrap().to_string();
+        for other in others {
+            assert_ne!(
+                other["id"].as_str().unwrap(),
+                focal_id,
+                "the chosen entity is not one of the rejected ones: {body}"
+            );
+            assert!(
+                other["name"].is_string() && other["file_path"].is_string(),
+                "a rejected candidate must be re-askable: {other}"
+            );
+        }
+
+        let degradations = body["degradations"]
+            .as_array()
+            .unwrap_or_else(|| panic!("an ambiguous resolution must degrade: {body}"));
+        assert!(
+            degradations
+                .iter()
+                .any(|entry| entry["reason"] == "ambiguous_name"),
+            "the ambiguity must be named: {body}"
+        );
+
+        // The verdict half of this is asserted where `negative_for` is callable
+        // directly, in `negative::tests`. This handler returns its payload
+        // before the envelope layer attaches one, so asserting it here would be
+        // asserting on a key this call never produces.
+    }
+
+    /// The control for the case above, and the reason the field cannot simply be
+    /// redefined as "everything the pattern matched". Addressing by entity_id
+    /// resolves nothing by name, so there is no query ambiguity to report, and
+    /// the count must stay the exact-name twin count that protects the cfg-twin
+    /// shape rather than inheriting a substring's fan-out.
+    #[tokio::test]
+    async fn find_references_addressed_by_id_counts_exact_name_twins() {
+        let store = InMemoryGraph::new();
+        let app = make_entity_in(
+            LanguageId::Python,
+            "Flask.dispatch_request",
+            "src/flask/app.py",
+        );
+        let base = make_entity_in(
+            LanguageId::Python,
+            "View.dispatch_request",
+            "src/flask/views.py",
+        );
+        for entity in [&app, &base] {
+            store.upsert_entity(entity).unwrap();
+        }
+
+        let mut args = HashMap::new();
+        args.insert(
+            "entity_id".to_string(),
+            serde_json::json!(app.id.to_string()),
+        );
+        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+
+        assert_eq!(body["focal_resolution"]["addressed_by"], "entity_id");
+        assert_eq!(
+            body["focal_resolution"]["same_name_candidates"], 1,
+            "one entity carries this exact name, and the caller pinned it: {body}"
+        );
+        assert_eq!(
+            body["focal_resolution"]["matched"], "exact_focal_name",
+            "a pinned address must say it counted twins, not query matches: {body}"
+        );
+        assert!(
+            body["degradations"]
+                .as_array()
+                .is_none_or(|entries| entries.iter().all(|e| e["reason"] != "ambiguous_name")),
+            "a pinned address is not an ambiguous one: {body}"
+        );
     }
 
     /// A bare name that matches several entities is resolved to one of them and

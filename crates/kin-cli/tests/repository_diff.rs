@@ -54,6 +54,14 @@ fn run_kin(repo: &Path, home: &Path, args: &[&str]) -> std::process::Output {
         .args(args)
         .env("HOME", home)
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        // This test asserts an exact authority generation, which means "this
+        // repository was written once, by init". Language-server enrichment is
+        // durable authority now, so a host that has a server for the polyglot
+        // fixture writes a second time and the number moves. Nothing here is
+        // about enrichment, so the writer is switched off rather than the
+        // assertion loosened, which also stops the result depending on which
+        // servers the host happens to have installed.
+        .env("KIN_DAEMON_DISABLE_LSP", "1")
         .env_remove("KIN_DAEMON_URL")
         .env_remove("KIN_VFS_WORKSPACE")
         .current_dir(repo)
