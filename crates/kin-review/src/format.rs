@@ -42,6 +42,29 @@ pub fn format_review(review: &Review) -> String {
     out
 }
 
+/// Convert a graph-owned 0-based line index to the 1-based line number every
+/// editor, `file:line` reference, and diff hunk uses.
+///
+/// A review renders locations a reader clicks or greps, so emitting the raw
+/// graph row sends them one line above the declaration. The agent-facing
+/// surfaces convert at one seam per surface for this reason; this is that seam
+/// for the review renderers.
+pub(crate) fn presentation_line(graph_line: u32) -> u32 {
+    graph_line.saturating_add(1)
+}
+
+/// `file:line` for an entity, or just the file when no span was captured.
+fn entity_location(entity: &kin_model::entity::Entity) -> Option<String> {
+    if let Some(span) = entity.span.as_ref() {
+        return Some(format!(
+            "{}:{}",
+            span.file,
+            presentation_line(span.start_line)
+        ));
+    }
+    entity.file_origin.as_ref().map(|origin| origin.to_string())
+}
+
 /// Format entity-level diff.
 pub fn format_diff(diff: &SemanticDiff) -> String {
     let mut out = String::new();
@@ -55,7 +78,7 @@ pub fn format_diff(diff: &SemanticDiff) -> String {
 
     let added = diff.added_entities();
     let modified = diff.modified_entities();
-    let removed = diff.removed_entity_ids();
+    let removed = diff.removed_entities();
 
     if !added.is_empty() {
         writeln!(out, "\nAdded ({}):", added.len()).unwrap();
@@ -95,8 +118,31 @@ pub fn format_diff(diff: &SemanticDiff) -> String {
 
     if !removed.is_empty() {
         writeln!(out, "\nRemoved ({}):", removed.len()).unwrap();
-        for id in &removed {
-            writeln!(out, "  - {}", id).unwrap();
+        for (id, entity) in &removed {
+            match entity {
+                Some(entity) => {
+                    writeln!(
+                        out,
+                        "  - {} ({:?}) — {}",
+                        entity.name, entity.kind, entity.signature,
+                    )
+                    .unwrap();
+                    if let Some(location) = entity_location(entity) {
+                        writeln!(out, "    file: {}", location).unwrap();
+                    }
+                }
+                // An unresolved removal is reported as one. Printing the id
+                // alone would read as a name and hide that the base-side record
+                // was unrecoverable.
+                None => {
+                    writeln!(out, "  - <unresolved removal> id {}", id).unwrap();
+                    writeln!(
+                        out,
+                        "    no base-side record for this entity; its name, kind and location are unknown"
+                    )
+                    .unwrap();
+                }
+            }
         }
     }
 
@@ -116,8 +162,8 @@ pub fn format_diff(diff: &SemanticDiff) -> String {
                     )
                     .unwrap();
                 }
-                RelationChangeKind::Removed(id) => {
-                    writeln!(out, "  - relation {}", id).unwrap();
+                RelationChangeKind::Removed { old } => {
+                    writeln!(out, "  - {:?}: {} -> {}", old.kind, old.src, old.dst).unwrap();
                 }
             }
         }

@@ -1,10 +1,147 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use crate::diff::{EntityChangeKind, SemanticDiff};
+use std::collections::BTreeMap;
+
+use crate::diff::{EntityChangeKind, RelationChangeKind, SemanticDiff};
 use crate::impact::ImpactReport;
-use kin_model::entity::{EntityKind, EntityRole, Visibility};
+use kin_model::entity::{Entity, EntityKind, EntityRole, Visibility};
+use kin_model::ids::EntityId;
+use kin_model::relation::GraphNodeId;
 use kin_model::review::{RiskLevel, RiskSummary};
+
+/// `name (Kind) at file:line` for a removed entity, so a finding reads as code.
+fn describe_entity(entity: &Entity) -> String {
+    let kind = format!("{:?}", entity.kind);
+    match entity.span.as_ref() {
+        Some(span) => format!(
+            "`{}` ({}) at {}:{}",
+            entity.name,
+            kind,
+            span.file,
+            crate::format::presentation_line(span.start_line)
+        ),
+        None => match entity.file_origin.as_ref() {
+            Some(origin) => format!("`{}` ({}) in {}", entity.name, kind, origin),
+            None => format!("`{}` ({})", entity.name, kind),
+        },
+    }
+}
+
+/// Names for every entity this diff and impact report can see, keyed by id.
+///
+/// A relation note carries two node ids. Both are usually entities the same
+/// review already describes, so this index turns them back into names. An id
+/// with no entry stays an id: a note must not invent a name it cannot support.
+fn known_entity_names(diff: &SemanticDiff, impact: &ImpactReport) -> BTreeMap<EntityId, String> {
+    let mut names = BTreeMap::new();
+    for entity in impact
+        .affected_callers
+        .iter()
+        .chain(impact.affected_dependents.iter())
+        .chain(impact.affected_contract_consumers.iter())
+        .chain(impact.affected_tests.iter())
+    {
+        names
+            .entry(entity.id)
+            .or_insert_with(|| entity.name.clone());
+    }
+    for change in &diff.entity_changes {
+        let named = match &change.kind {
+            EntityChangeKind::Added(entity) => Some(entity),
+            EntityChangeKind::Modified { new, .. } => Some(new),
+            EntityChangeKind::Removed { old } => old.as_ref(),
+        };
+        if let Some(entity) = named {
+            names
+                .entry(change.entity_id)
+                .or_insert_with(|| entity.name.clone());
+        }
+    }
+    names
+}
+
+/// One endpoint of a relation, named where the review can name it.
+fn describe_node(node: &GraphNodeId, names: &BTreeMap<EntityId, String>) -> String {
+    match node.as_entity().and_then(|id| names.get(&id)) {
+        Some(name) => format!("`{name}`"),
+        None => node.to_string(),
+    }
+}
+
+/// How many dependents a removal finding names before summarising the rest. A
+/// deleted helper can have dozens of callers; naming the first few and counting
+/// the remainder keeps the finding readable without hiding the size.
+const MAX_LISTED_DEPENDENTS: usize = 5;
+
+/// Dependents of a removed entity, named and carrying the edge kind that joined
+/// them to it.
+///
+/// The edge kinds come from the relations this diff removed alongside the
+/// entity: a relation whose `dst` was the removed entity names its consumer in
+/// `src`. Names come from the impact report's entity lists, which hold whole
+/// entities. Both inputs are already in hand, so no graph lookup is needed and
+/// this is safe to call from a pure formatting path.
+///
+/// Returns the rendered dependents and the total found, which may exceed the
+/// rendered count. Production consumers sort ahead of tests so a cap never
+/// drops the callers that decide whether the deletion is safe.
+fn removed_entity_dependents(
+    diff: &SemanticDiff,
+    impact: &ImpactReport,
+    removed_id: &EntityId,
+) -> (Vec<String>, usize) {
+    let mut edge_kinds: BTreeMap<EntityId, String> = BTreeMap::new();
+    for relation_change in &diff.relation_changes {
+        let RelationChangeKind::Removed { old } = &relation_change.kind else {
+            continue;
+        };
+        if old.dst != GraphNodeId::Entity(*removed_id) {
+            continue;
+        }
+        if let Some(src) = old.src.as_entity() {
+            // A pair can carry more than one edge kind; keep the first in the
+            // relation set's stable order rather than picking arbitrarily.
+            edge_kinds
+                .entry(src)
+                .or_insert_with(|| format!("{:?}", old.kind));
+        }
+    }
+    if edge_kinds.is_empty() {
+        return (Vec::new(), 0);
+    }
+
+    // A test consumer is real blast radius but it is not what decides whether a
+    // deletion is safe, so it sorts after production consumers and yields the
+    // listed slots to them.
+    let mut described: BTreeMap<EntityId, (bool, String)> = BTreeMap::new();
+    let candidates = impact
+        .affected_callers
+        .iter()
+        .chain(impact.affected_dependents.iter())
+        .chain(impact.affected_contract_consumers.iter())
+        .chain(impact.affected_tests.iter());
+    for entity in candidates {
+        if let Some(edge_kind) = edge_kinds.get(&entity.id) {
+            described.entry(entity.id).or_insert_with(|| {
+                (
+                    entity.role == EntityRole::Test,
+                    format!("{} via {}", describe_entity(entity), edge_kind),
+                )
+            });
+        }
+    }
+
+    let mut ordered: Vec<(bool, String)> = described.into_values().collect();
+    ordered.sort();
+    let total = ordered.len();
+    let listed = ordered
+        .into_iter()
+        .take(MAX_LISTED_DEPENDENTS)
+        .map(|(_, description)| description)
+        .collect();
+    (listed, total)
+}
 
 /// Assess risk given a diff and its impact report.
 ///
@@ -68,11 +205,37 @@ pub fn assess_risk(diff: &SemanticDiff, impact: &ImpactReport) -> RiskSummary {
                     }
                 }
             }
-            EntityChangeKind::Removed(id) => {
+            EntityChangeKind::Removed { old } => {
                 let has_dependents =
                     !impact.affected_dependents.is_empty() || !impact.affected_callers.is_empty();
                 if has_dependents {
-                    breaking_changes.push(format!("Removed entity `{}` still has dependents", id,));
+                    let subject = match old {
+                        Some(entity) => describe_entity(entity),
+                        // An unrecoverable base-side record is reported as one.
+                        // An id rendered bare would read as a name.
+                        None => format!(
+                            "<unresolved removal> id {} (no base-side record)",
+                            change.entity_id
+                        ),
+                    };
+                    let (dependents, total) =
+                        removed_entity_dependents(diff, impact, &change.entity_id);
+                    if dependents.is_empty() {
+                        breaking_changes
+                            .push(format!("Removed entity {subject} still has dependents"));
+                    } else {
+                        // The overflow is counted rather than dropped: a reader
+                        // must be able to tell five of five from five of forty.
+                        let more = total
+                            .checked_sub(dependents.len())
+                            .filter(|remaining| *remaining > 0)
+                            .map(|remaining| format!(", and {remaining} more"))
+                            .unwrap_or_default();
+                        breaking_changes.push(format!(
+                            "Removed entity {subject} still has {total} dependent(s): {}{more}",
+                            dependents.join(", ")
+                        ));
+                    }
                 }
             }
             EntityChangeKind::Added(entity) => {
@@ -91,9 +254,15 @@ pub fn assess_risk(diff: &SemanticDiff, impact: &ImpactReport) -> RiskSummary {
     }
 
     // Removed relations that break contracts
+    let relation_note_names = known_entity_names(diff, impact);
     for rel_change in &diff.relation_changes {
-        if let crate::diff::RelationChangeKind::Removed(id) = &rel_change.kind {
-            notes.push(format!("Relation {} removed", id));
+        if let RelationChangeKind::Removed { old } = &rel_change.kind {
+            notes.push(format!(
+                "Relation removed: {:?} {} -> {}",
+                old.kind,
+                describe_node(&old.src, &relation_note_names),
+                describe_node(&old.dst, &relation_note_names)
+            ));
         }
     }
 
@@ -229,6 +398,244 @@ mod tests {
             created_in: None,
             superseded_by: None,
         }
+    }
+
+    /// `test_entity` with a real span, so a rendered finding can be checked for
+    /// the file and line a reviewer needs.
+    fn placed_entity(name: &str, file: &str, start_line: u32) -> Entity {
+        let mut entity = test_entity(name);
+        entity.span = Some(kin_model::entity::SourceSpan {
+            file: kin_model::ids::FilePathId::new(file),
+            start_byte: 0,
+            end_byte: 1,
+            // `placed_entity` takes the 1-based line a reader would see, so the
+            // graph row stored here is one less.
+            start_line: start_line.saturating_sub(1),
+            start_col: 0,
+            end_line: start_line,
+            end_col: 0,
+        });
+        entity
+    }
+
+    fn calls_relation(src: &Entity, dst: &Entity) -> kin_model::relation::Relation {
+        kin_model::relation::Relation {
+            id: kin_model::ids::RelationId::new(),
+            kind: kin_model::relation::RelationKind::Calls,
+            src: GraphNodeId::Entity(src.id),
+            dst: GraphNodeId::Entity(dst.id),
+            confidence: 1.0,
+            origin: kin_model::relation::RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: vec![],
+        }
+    }
+
+    /// Deleting a consumed helper is the canonical review catch. The finding has
+    /// to say what was deleted and who still calls it, in words a reviewer can
+    /// act on. This mirrors the `utils.super_len` case from the reviewprobe
+    /// assessment, where the finding named a bare id and nothing else.
+    #[test]
+    fn removed_entity_finding_names_the_entity_and_its_dependents() {
+        use crate::diff::{RelationChange, RelationChangeKind};
+
+        let removed = placed_entity("super_len", "src/requests/utils.py", 160);
+        let caller_a = placed_entity(
+            "PreparedRequest.prepare_body",
+            "src/requests/models.py",
+            576,
+        );
+        let caller_b = placed_entity(
+            "PreparedRequest.prepare_content_length",
+            "src/requests/models.py",
+            654,
+        );
+
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: removed.id,
+                kind: EntityChangeKind::Removed {
+                    old: Some(removed.clone()),
+                },
+            }],
+            relation_changes: vec![
+                RelationChange {
+                    kind: RelationChangeKind::Removed {
+                        old: calls_relation(&caller_a, &removed),
+                    },
+                },
+                RelationChange {
+                    kind: RelationChangeKind::Removed {
+                        old: calls_relation(&caller_b, &removed),
+                    },
+                },
+            ],
+            ..Default::default()
+        };
+        let impact = ImpactReport {
+            affected_callers: vec![caller_a.clone(), caller_b.clone()],
+            ..Default::default()
+        };
+
+        let summary = assess_risk(&diff, &impact);
+        let finding = summary
+            .breaking_changes
+            .iter()
+            .find(|f| f.contains("still has") && f.contains("dependent"))
+            .expect("a removal with dependents is a breaking change");
+
+        assert!(
+            finding.contains("super_len"),
+            "names the deleted entity: {finding}"
+        );
+        assert!(
+            finding.contains("src/requests/utils.py:160"),
+            "names where it lived: {finding}"
+        );
+        assert!(
+            finding.contains("PreparedRequest.prepare_body")
+                && finding.contains("src/requests/models.py:576"),
+            "names the first dependent and its location: {finding}"
+        );
+        assert!(
+            finding.contains("PreparedRequest.prepare_content_length")
+                && finding.contains("src/requests/models.py:654"),
+            "names the second dependent and its location: {finding}"
+        );
+        assert!(finding.contains("Calls"), "names the edge kind: {finding}");
+        assert!(
+            !contains_uuid(finding),
+            "a reviewer cannot act on an opaque id: {finding}"
+        );
+    }
+
+    /// A widely-called helper has more dependents than a finding should print.
+    /// The cap must count what it omits, and must spend its slots on production
+    /// callers rather than tests.
+    #[test]
+    fn dependent_list_is_capped_but_counts_the_remainder_and_prefers_production() {
+        use crate::diff::{RelationChange, RelationChangeKind};
+
+        let removed = placed_entity("super_len", "src/requests/utils.py", 160);
+        let production = placed_entity(
+            "PreparedRequest.prepare_body",
+            "src/requests/models.py",
+            576,
+        );
+        let mut tests: Vec<Entity> = (0..12)
+            .map(|i| {
+                let mut test = placed_entity(
+                    &format!("TestSuperLen.test_case_{i:02}"),
+                    "tests/test_utils.py",
+                    60 + i,
+                );
+                test.role = EntityRole::Test;
+                test
+            })
+            .collect();
+        let mut consumers = vec![production.clone()];
+        consumers.append(&mut tests);
+
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: removed.id,
+                kind: EntityChangeKind::Removed {
+                    old: Some(removed.clone()),
+                },
+            }],
+            relation_changes: consumers
+                .iter()
+                .map(|consumer| RelationChange {
+                    kind: RelationChangeKind::Removed {
+                        old: calls_relation(consumer, &removed),
+                    },
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let impact = ImpactReport {
+            affected_callers: consumers.clone(),
+            ..Default::default()
+        };
+
+        let summary = assess_risk(&diff, &impact);
+        let finding = summary
+            .breaking_changes
+            .iter()
+            .find(|f| f.contains("still has") && f.contains("dependent"))
+            .expect("a removal with dependents is a breaking change");
+
+        assert!(
+            finding.contains("still has 13 dependent(s)"),
+            "the total is stated, not just the listed few: {finding}"
+        );
+        assert!(
+            finding.contains("and 8 more"),
+            "the omitted remainder is counted, never silently dropped: {finding}"
+        );
+        assert!(
+            finding.contains("PreparedRequest.prepare_body"),
+            "a production caller must not be crowded out by tests: {finding}"
+        );
+        assert!(
+            !contains_uuid(finding),
+            "a reviewer cannot act on an opaque id: {finding}"
+        );
+    }
+
+    /// A removal whose base-side record is unrecoverable must say so. Printing
+    /// the id alone would read as a name and hide the gap.
+    #[test]
+    fn unresolvable_removal_is_reported_as_unresolved_not_as_a_name() {
+        let dependent = placed_entity("caller", "src/lib.rs", 10);
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: EntityId::new(),
+                kind: EntityChangeKind::Removed { old: None },
+            }],
+            ..Default::default()
+        };
+        let impact = ImpactReport {
+            affected_callers: vec![dependent],
+            ..Default::default()
+        };
+
+        let summary = assess_risk(&diff, &impact);
+        let finding = summary
+            .breaking_changes
+            .iter()
+            .find(|f| f.contains("still has") && f.contains("dependent"))
+            .expect("a removal with dependents is a breaking change");
+        assert!(
+            finding.contains("unresolved removal"),
+            "an unrecoverable record is named as one: {finding}"
+        );
+    }
+
+    /// A 36-character hyphenated hex id. Used to assert a rendered finding does
+    /// not fall back to one where a name is required.
+    fn contains_uuid(text: &str) -> bool {
+        text.split(|c: char| !(c.is_ascii_hexdigit() || c == '-'))
+            .any(|token| {
+                let parts: Vec<&str> = token.split('-').collect();
+                parts.len() == 5
+                    && [8, 4, 4, 4, 12]
+                        .iter()
+                        .zip(&parts)
+                        .all(|(want, part)| part.len() == *want)
+            })
+    }
+
+    #[test]
+    fn uuid_detector_catches_the_shape_it_is_guarding_against() {
+        // The guard above is only evidence if it can fail, so pin both ways.
+        assert!(contains_uuid(
+            "Removed entity `1c5c4764-ef10-4cb7-b2b3-e1512d0b578d` still has dependents"
+        ));
+        assert!(!contains_uuid(
+            "Removed entity `super_len` (Function) at src/requests/utils.py:160"
+        ));
     }
 
     #[test]
@@ -400,7 +807,7 @@ mod tests {
         let diff = SemanticDiff {
             entity_changes: vec![EntityChange {
                 entity_id,
-                kind: EntityChangeKind::Removed(entity_id),
+                kind: EntityChangeKind::Removed { old: None },
             }],
             ..Default::default()
         };
@@ -423,7 +830,7 @@ mod tests {
         let diff = SemanticDiff {
             entity_changes: vec![EntityChange {
                 entity_id,
-                kind: EntityChangeKind::Removed(entity_id),
+                kind: EntityChangeKind::Removed { old: None },
             }],
             ..Default::default()
         };
@@ -629,19 +1036,71 @@ mod tests {
     #[test]
     fn removed_relation_generates_note() {
         use crate::diff::{RelationChange, RelationChangeKind};
-        use kin_model::ids::RelationId;
 
-        let rel_id = RelationId::new();
+        let src = test_entity("caller");
+        let dst = test_entity("callee");
         let diff = SemanticDiff {
             relation_changes: vec![RelationChange {
-                kind: RelationChangeKind::Removed(rel_id),
+                kind: RelationChangeKind::Removed {
+                    old: calls_relation(&src, &dst),
+                },
             }],
             ..Default::default()
         };
 
-        let impact = ImpactReport::default();
+        // The endpoints are entities the review can see, so the note must name
+        // them rather than printing node ids.
+        let impact = ImpactReport {
+            affected_callers: vec![src.clone()],
+            affected_dependents: vec![dst.clone()],
+            ..Default::default()
+        };
         let summary = assess_risk(&diff, &impact);
-        assert!(summary.notes.iter().any(|n| n.contains("Relation")));
+        let note = summary
+            .notes
+            .iter()
+            .find(|n| n.contains("Relation removed"))
+            .expect("removed relation emits a note");
+        assert!(
+            note.contains("Calls"),
+            "note should name the edge kind: {note}"
+        );
+        assert!(
+            note.contains("`caller`") && note.contains("`callee`"),
+            "note should name both endpoints: {note}"
+        );
+        assert!(
+            !contains_uuid(note),
+            "a named endpoint must not fall back to a node id: {note}"
+        );
+    }
+
+    /// An endpoint the review cannot name keeps its id. Inventing a name would
+    /// be worse than showing the id, so the fallback is pinned.
+    #[test]
+    fn unknown_relation_endpoint_keeps_its_id() {
+        use crate::diff::{RelationChange, RelationChangeKind};
+
+        let src = test_entity("stranger");
+        let dst = test_entity("also_stranger");
+        let diff = SemanticDiff {
+            relation_changes: vec![RelationChange {
+                kind: RelationChangeKind::Removed {
+                    old: calls_relation(&src, &dst),
+                },
+            }],
+            ..Default::default()
+        };
+        let summary = assess_risk(&diff, &ImpactReport::default());
+        let note = summary
+            .notes
+            .iter()
+            .find(|n| n.contains("Relation removed"))
+            .expect("removed relation emits a note");
+        assert!(
+            contains_uuid(note),
+            "an unnameable endpoint shows its id rather than a guess: {note}"
+        );
     }
 
     // ── API endpoint contract tests ─────────────────────────────────────
