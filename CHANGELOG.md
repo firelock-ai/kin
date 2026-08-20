@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.43] - 2026-08-20
+
+### Changed
+
+- chore(ci): pin kin-actions v0.1.32 (#963)
+- Report commit-memory parity as a warning and state the cost in INSTALL.md (#959)
+- Name the context pack's two directions and disclose small-corpus ranking (#960)
+- Cut CI wall clock: build Windows legs once, shard the macOS gate, route release-policy failures (#964)
+- Cut the release build's dead cache and its 40-minute Intel leg, and probe a candidate's first install (#961)
+- chore(ci): pin kin-actions v0.1.33 (#968)
+- Collapse a retrieval response's three verdict blocks into one (#966)
+- Wait on the daemon's own record instead of a 60s ambient-admission bound (#969)
+- Wire JavaScript and TypeScript reference enrichment, provision the servers, and stop certifying an absence over a language nothing resolved (#967)
+- Key the release mint off the merge-group-proven sha (#962)
+- Never certify absence of a thing from absence of a match (#957)
+- Put the one verdict on every retrieval answer and stop certifying an unprobed scan (#970)
+- Make the LSP sweep run, finish and be observable, and count callers that reach an override through a proven base (#971)
+- Carry the planned repository authority into the commit that publishes it (#972)
+- Produce the Overrides edge kin already consumes six ways (#973)
+- Make language-server relations durable repository authority (#974)
+- Pin kin-lsp to =0.6.14 so runtime resolution carries the enrichment fixes (#975)
+- Decide a context pack's dependents with the authority find_references reads (#976)
+- Make a defineProperty-shaped JavaScript property an entity (#977)
+- Carry a removed entity's record into the diff so review names what was deleted (#978)
+- Ask the language server about the member, not the receiver (#980)
+- Count what a find_references query could have meant, and let the verdict read it (#979)
+- Pin that a repeated receiver does not pull the query column back (#982)
+- Decide every risk finding on the changed entity's own evidence (#981)
+- Hand the enrichment joins graph-owned documents, and pin kin-lsp to =0.6.16 (#984)
+- Record the receiver a JavaScript member call was written on (#983)
+
+
 ## [0.5.42] - 2026-08-19
 
 ### Changed
