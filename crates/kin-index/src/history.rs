@@ -548,6 +548,45 @@ pub fn is_external_reference_target(entity: &Entity) -> bool {
     entity.role == EntityRole::External && entity.file_origin.is_none()
 }
 
+/// The placeholder entity one placeholder relation's destination stands for,
+/// or `None` when the relation is not a placeholder.
+///
+/// Both placeholder classes are handled here so a caller cannot learn one and
+/// miss the other. That is not hypothetical: the historical ref view re-links
+/// source and inserts the result straight into a snapshot, and admission fails
+/// closed on an endpoint no entity backs, so a synthesis that knew only the
+/// cross-repo class turned a new class of edge into a hard error the moment one
+/// appeared.
+///
+/// The language comes from the caller because a target defined elsewhere has
+/// none of its own; the importing side is the only thing that observed it.
+pub fn placeholder_target_entity(relation: &Relation, language: LanguageId) -> Option<Entity> {
+    let destination = relation.dst.as_entity()?;
+    let token = relation.evidence.first()?.token.as_deref()?;
+    if is_external_import_placeholder(relation) {
+        let import_source = relation.import_source.as_deref()?;
+        let fingerprint = external_reference_fingerprint(import_source, token);
+        return Some(external_reference_entity(
+            destination,
+            token,
+            language,
+            fingerprint,
+        ));
+    }
+    if is_unresolved_receiver_placeholder(relation) {
+        let (receiver, symbol) = split_unresolved_receiver_token(token)?;
+        let name = unresolved_receiver_display_name(receiver, symbol);
+        let fingerprint = external_reference_fingerprint("", &name);
+        return Some(external_reference_entity(
+            destination,
+            &name,
+            language,
+            fingerprint,
+        ));
+    }
+    None
+}
+
 /// Build the external target a cross-repo reference resolves against.
 fn external_reference_entity(
     id: EntityId,
