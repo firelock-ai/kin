@@ -68,6 +68,11 @@ impl LanguageAdapter for JavaScriptAdapter {
             }
         }
 
+        // Read the file's property-defining helpers before walking it.
+        // Declaration order does not bind a helper to its uses: express
+        // declares `defineGetter` below all twelve calls to it.
+        let definers = collect_js_property_definers(&root, source);
+
         for child in root.children(&mut cursor) {
             extract_js_node(
                 &child,
@@ -76,6 +81,7 @@ impl LanguageAdapter for JavaScriptAdapter {
                 &mut entities,
                 &mut relations,
                 &mut owners,
+                &definers,
             );
             if let Some(import_like) = extract_js_import_like(&child, source) {
                 imports.push(import_like);
@@ -183,6 +189,366 @@ impl JsOwners {
     }
 }
 
+/// Where a property-defining helper carries each part of the definition.
+///
+/// `Object.defineProperty(obj, name, descriptor)` is the shape every such
+/// helper forwards to, so a wrapper is described by which of ITS parameters
+/// reach those three positions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct JsPropertyDefiner {
+    /// Argument index naming the object the property lands on.
+    target: usize,
+    /// Argument index carrying the property name.
+    name: usize,
+    /// Argument index carrying the implementation function.
+    value: usize,
+}
+
+/// The canonical definer: `Object.defineProperty` itself takes the object, the
+/// key, and a descriptor, in that order.
+const OBJECT_DEFINE_PROPERTY: &str = "Object.defineProperty";
+
+/// Descriptor keys whose value is the property's implementation.
+const JS_DESCRIPTOR_FUNCTION_KEYS: &[&str] = &["get", "set", "value"];
+
+/// Local helpers that define a property by forwarding to
+/// `Object.defineProperty`, keyed by the helper's own name.
+///
+/// This is recognized by what a function DOES, never by what it is called.
+/// express writes `defineGetter(req, 'ip', fn)`, but a positional rule that
+/// admitted any `ident(ident, 'string', function)` call would also admit
+/// `registerHandler(emitter, 'click', fn)` and invent an `emitter.click`
+/// property that no code defines. So the helper has to be read: its body must
+/// pass its own parameters through to `Object.defineProperty`, and the
+/// parameter positions it uses are what the call sites are then read with.
+///
+/// Collected in a pass of its own because declaration order does not bind a
+/// helper to its uses. express declares `defineGetter` at the foot of
+/// `lib/request.js`, below all twelve calls to it, so a single forward walk
+/// reaches every call site before it has ever seen the helper.
+pub(super) fn collect_js_property_definers(
+    root: &tree_sitter::Node,
+    source: &[u8],
+) -> std::collections::HashMap<String, JsPropertyDefiner> {
+    let mut definers = std::collections::HashMap::new();
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        if child.kind() != "function_declaration" && child.kind() != "function" {
+            continue;
+        }
+        let Some(name_node) = child.child_by_field_name("name") else {
+            continue;
+        };
+        let Ok(name) = name_node.utf8_text(source) else {
+            continue;
+        };
+        let params = js_parameter_names(&child, source);
+        if params.is_empty() {
+            continue;
+        }
+        let Some(body) = child.child_by_field_name("body") else {
+            continue;
+        };
+        if let Some(shape) = js_forwarded_define_property(&body, source, &params) {
+            definers.insert(name.to_string(), shape);
+        }
+    }
+    definers
+}
+
+/// A function's parameter names in declaration order. A destructured or
+/// defaulted parameter yields an empty slot rather than being skipped, so the
+/// positions of the parameters around it stay truthful.
+///
+/// TypeScript wraps each parameter in a `required_parameter` or
+/// `optional_parameter` carrying the binding under a `pattern` field, so the
+/// name is read through that wrapper as well as bare. Without it the shared
+/// rule silently reads every TypeScript parameter as unnamed and no helper is
+/// ever recognized in a `.ts` file, which is a difference between the two
+/// adapters that nothing in either one would report.
+fn js_parameter_names(function: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    let Some(params) = function.child_by_field_name("parameters") else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    let mut cursor = params.walk();
+    for param in params.children(&mut cursor) {
+        if !param.is_named() || param.kind() == "comment" {
+            continue;
+        }
+        let binding = if param.kind() == "identifier" {
+            Some(param)
+        } else {
+            param
+                .child_by_field_name("pattern")
+                .filter(|pattern| pattern.kind() == "identifier")
+        };
+        names.push(
+            binding
+                .and_then(|node| node.utf8_text(source).ok())
+                .unwrap_or("")
+                .to_string(),
+        );
+    }
+    names
+}
+
+/// The parameter positions a body forwards to `Object.defineProperty`, when it
+/// forwards all three from its own parameter list.
+///
+/// A body that hands `Object.defineProperty` anything else, a captured local, a
+/// literal, a computed expression, is not a general property definer and its
+/// call sites say nothing about what property gets defined, so it is refused.
+fn js_forwarded_define_property(
+    body: &tree_sitter::Node,
+    source: &[u8],
+    params: &[String],
+) -> Option<JsPropertyDefiner> {
+    let call = js_find_define_property_call(body, source)?;
+    let args = js_call_arguments(&call);
+    let target = js_parameter_index(args.first(), source, params)?;
+    let name = js_parameter_index(args.get(1), source, params)?;
+    let descriptor = args.get(2)?;
+    let value = js_descriptor_parameter_index(descriptor, source, params)?;
+    Some(JsPropertyDefiner {
+        target,
+        name,
+        value,
+    })
+}
+
+/// The first `Object.defineProperty(...)` call anywhere inside `node`.
+fn js_find_define_property_call<'t>(
+    node: &tree_sitter::Node<'t>,
+    source: &[u8],
+) -> Option<tree_sitter::Node<'t>> {
+    if node.kind() == "call_expression" {
+        if let Some(function) = node.child_by_field_name("function") {
+            if function.utf8_text(source).unwrap_or("") == OBJECT_DEFINE_PROPERTY {
+                return Some(*node);
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if let Some(found) = js_find_define_property_call(&child, source) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// The named argument nodes of a call, in order.
+fn js_call_arguments<'t>(call: &tree_sitter::Node<'t>) -> Vec<tree_sitter::Node<'t>> {
+    let Some(args) = call.child_by_field_name("arguments") else {
+        return Vec::new();
+    };
+    let mut cursor = args.walk();
+    args.children(&mut cursor)
+        .filter(|arg| arg.is_named() && arg.kind() != "comment")
+        .collect()
+}
+
+/// The position of `node` in `params`, when `node` is a bare identifier naming
+/// one of them.
+fn js_parameter_index(
+    node: Option<&tree_sitter::Node>,
+    source: &[u8],
+    params: &[String],
+) -> Option<usize> {
+    let node = node?;
+    if node.kind() != "identifier" {
+        return None;
+    }
+    let text = node.utf8_text(source).ok()?;
+    if text.is_empty() {
+        return None;
+    }
+    params.iter().position(|param| param == text)
+}
+
+/// The position of the parameter a descriptor object hands to `get`, `set`, or
+/// `value`.
+fn js_descriptor_parameter_index(
+    descriptor: &tree_sitter::Node,
+    source: &[u8],
+    params: &[String],
+) -> Option<usize> {
+    if descriptor.kind() != "object" {
+        return None;
+    }
+    let mut cursor = descriptor.walk();
+    for property in descriptor.children(&mut cursor) {
+        if property.kind() != "pair" {
+            continue;
+        }
+        let Some(key) = property.child_by_field_name("key") else {
+            continue;
+        };
+        let key_text = key
+            .utf8_text(source)
+            .unwrap_or("")
+            .trim_matches(|c| c == '"' || c == '\'');
+        if !JS_DESCRIPTOR_FUNCTION_KEYS.contains(&key_text) {
+            continue;
+        }
+        let value = property.child_by_field_name("value")?;
+        if let Some(index) = js_parameter_index(Some(&value), source, params) {
+            return Some(index);
+        }
+    }
+    None
+}
+
+/// The implementation function a descriptor object supplies inline.
+fn js_descriptor_function<'t>(
+    descriptor: &tree_sitter::Node<'t>,
+    source: &[u8],
+) -> Option<tree_sitter::Node<'t>> {
+    if descriptor.kind() != "object" {
+        return None;
+    }
+    let mut cursor = descriptor.walk();
+    for property in descriptor.children(&mut cursor) {
+        if property.kind() != "pair" {
+            continue;
+        }
+        let Some(key) = property.child_by_field_name("key") else {
+            continue;
+        };
+        let key_text = key
+            .utf8_text(source)
+            .unwrap_or("")
+            .trim_matches(|c| c == '"' || c == '\'');
+        if !JS_DESCRIPTOR_FUNCTION_KEYS.contains(&key_text) {
+            continue;
+        }
+        if let Some(value) = property.child_by_field_name("value") {
+            if is_js_function_like_node(&value) {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+/// The string a literal argument spells, when it is usable as a property name.
+fn js_string_literal_value(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+    if node.kind() != "string" && node.kind() != "template_string" {
+        return None;
+    }
+    let text = node
+        .utf8_text(source)
+        .ok()?
+        .trim_matches(|c| c == '"' || c == '\'' || c == '`');
+    if text.is_empty() || text.contains(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$')) {
+        return None;
+    }
+    Some(text.to_string())
+}
+
+/// Extract the property a `defineProperty`-shaped statement defines.
+///
+/// `defineGetter(req, 'ip', function ip(){ ... })` defines `req.ip` exactly as
+/// `req.get = function header(){ ... }` defines `req.get`, and both are the
+/// same thing to a reader of express. Only the assignment form was ever an
+/// entity, so twelve of the request API's most-used properties, `query`,
+/// `protocol`, `secure`, `ip`, `ips`, `subdomains`, `path`, `host`,
+/// `hostname`, `fresh`, `stale` and `xhr`, could not be located, packed or
+/// traced at all.
+///
+/// The entity spans the whole statement rather than the getter body, because
+/// the body is inside the statement and a position lookup for a line in the
+/// body has to land here. It is kinded a method for the same reason its
+/// assignment-form siblings are: it is a function on an owner, and that kind is
+/// what puts `Owner.member` on the linker's receiver-method tier.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn extract_js_property_definition(
+    stmt: &tree_sitter::Node,
+    source: &[u8],
+    file_id: &FilePathId,
+    entities: &mut Vec<ExtractedEntity>,
+    relations: &mut Vec<ExtractedRelation>,
+    owners: &mut JsOwners,
+    definers: &std::collections::HashMap<String, JsPropertyDefiner>,
+) -> bool {
+    let mut cursor = stmt.walk();
+    let Some(call) = stmt
+        .children(&mut cursor)
+        .find(|child| child.kind() == "call_expression")
+    else {
+        return false;
+    };
+    let Some(function) = call.child_by_field_name("function") else {
+        return false;
+    };
+    let callee = function.utf8_text(source).unwrap_or("");
+    let args = js_call_arguments(&call);
+
+    let (target_node, name_node, implementation) = if callee == OBJECT_DEFINE_PROPERTY {
+        let (Some(target), Some(name), Some(descriptor)) = (args.first(), args.get(1), args.get(2))
+        else {
+            return false;
+        };
+        let Some(function_node) = js_descriptor_function(descriptor, source) else {
+            // A data property carries no implementation to model. Refused
+            // rather than recorded as a method it is not.
+            return false;
+        };
+        (*target, *name, function_node)
+    } else {
+        let Some(shape) = definers.get(callee) else {
+            return false;
+        };
+        let (Some(target), Some(name), Some(value)) = (
+            args.get(shape.target),
+            args.get(shape.name),
+            args.get(shape.value),
+        ) else {
+            return false;
+        };
+        if !is_js_function_like_node(value) {
+            return false;
+        }
+        (*target, *name, *value)
+    };
+
+    if target_node.kind() != "identifier" {
+        return false;
+    }
+    let receiver = target_node.utf8_text(source).unwrap_or("");
+    let Some(owner) = js_method_owner(receiver) else {
+        return false;
+    };
+    let Some(property) = js_string_literal_value(&name_node, source) else {
+        return false;
+    };
+
+    let qualified = format!("{owner}.{property}");
+    owners.record(owner, &target_node, source, file_id);
+    entities.push(ExtractedEntity {
+        kind: EntityKind::Method,
+        name: qualified.clone(),
+        signature: node_signature(stmt, source),
+        visibility: Visibility::Public,
+        doc_summary: extract_preceding_comment(stmt, source),
+        fingerprint: compute_fingerprint(stmt, source),
+        span: span_from_node(stmt, file_id),
+    });
+    relations.push(ExtractedRelation {
+        site: None,
+        receiver: None,
+        call_shape: None,
+        kind: kin_model::RelationKind::Contains,
+        src_name: owner.to_string(),
+        dst_name: qualified.clone(),
+        import_source: None,
+    });
+    extract_calls_from_context(&implementation, source, &qualified, Some(owner), relations);
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
 fn extract_js_node(
     node: &tree_sitter::Node,
     source: &[u8],
@@ -190,6 +556,7 @@ fn extract_js_node(
     entities: &mut Vec<ExtractedEntity>,
     relations: &mut Vec<ExtractedRelation>,
     owners: &mut JsOwners,
+    definers: &std::collections::HashMap<String, JsPropertyDefiner>,
 ) {
     match node.kind() {
         "function_declaration" | "function" => {
@@ -215,6 +582,15 @@ fn extract_js_node(
             }
         }
         "expression_statement" => {
+            // `Object.defineProperty(obj, 'name', {...})` and the local
+            // helpers that forward to it define a member exactly as an
+            // assignment does; neither is an assignment, so it is tried first
+            // and the assignment path is left untouched when it fires.
+            if extract_js_property_definition(
+                node, source, file_id, entities, relations, owners, definers,
+            ) {
+                return;
+            }
             // Handle prototype method assignments: obj.method = function() {}
             // and module.exports = function name() {}
             extract_js_assignment_function(node, source, file_id, entities, relations, owners);
@@ -316,7 +692,9 @@ fn extract_js_node(
                 if child.kind() == "default" || child.utf8_text(source).unwrap_or("") == "default" {
                     has_default = true;
                 }
-                extract_js_node(&child, source, file_id, entities, relations, owners);
+                extract_js_node(
+                    &child, source, file_id, entities, relations, owners, definers,
+                );
             }
             // If this is a default export and recursion didn't create any entities,
             // create a synthetic "default" entity so the linker can resolve
@@ -2492,5 +2870,317 @@ const tmp = 2;
                 "incidental local `{dropped}` should be dropped, got: {names:?}"
             );
         }
+    }
+
+    // ── defineProperty-shaped property definitions (FIR-2473) ───────────────
+    //
+    // express `lib/request.js` defines twelve of its most-used properties
+    // through `defineGetter(req, 'name', fn)` and none was an entity, so
+    // `req.ip` could not be located, packed, or traced while its
+    // assignment-form sibling `req.get` could. The fixtures below are that
+    // file's real shapes, plus the shapes a name-based rule would have
+    // wrongly admitted.
+
+    /// The express shape, verbatim in structure: the helper is declared BELOW
+    /// every call to it, so a single forward walk meets the calls first.
+    #[test]
+    fn parse_js_define_getter_helper_declared_after_its_uses() {
+        let adapter = JavaScriptAdapter;
+        let source = br#"
+var req = Object.create(http.IncomingMessage.prototype);
+
+defineGetter(req, 'ip', function ip(){
+  var trust = this.app.get('trust proxy fn');
+  return proxyaddr(this, trust);
+});
+
+defineGetter(req, 'protocol', function protocol(){
+  return this.connection.encrypted ? 'https' : 'http';
+});
+
+function defineGetter(obj, name, getter) {
+  Object.defineProperty(obj, name, {
+    configurable: true,
+    enumerable: true,
+    get: getter
+  });
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib/request.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let methods: Vec<&str> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Method)
+            .map(|e| e.name.as_str())
+            .collect();
+        assert!(
+            methods.contains(&"req.ip"),
+            "req.ip must be an entity, got {methods:?}"
+        );
+        assert!(
+            methods.contains(&"req.protocol"),
+            "req.protocol must be an entity, got {methods:?}"
+        );
+        let contains: Vec<(&str, &str)> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Contains)
+            .map(|r| (r.src_name.as_str(), r.dst_name.as_str()))
+            .collect();
+        assert!(contains.contains(&("req", "req.ip")));
+        assert!(contains.contains(&("req", "req.protocol")));
+    }
+
+    /// The span has to cover the getter BODY, because that is where the code a
+    /// reader is looking for lives. express's `req.ip` bug is on the line
+    /// inside the getter, not on the `defineGetter(` line, and a span stopping
+    /// at the call head would leave that line owned by nothing.
+    #[test]
+    fn parse_js_define_getter_span_covers_the_getter_body() {
+        let adapter = JavaScriptAdapter;
+        let source = br#"defineGetter(req, 'ip', function ip(){
+  var trust = this.app.get('trust proxy fn');
+  return proxyaddr(this, trust);
+});
+
+function defineGetter(obj, name, getter) {
+  Object.defineProperty(obj, name, { get: getter });
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib/request.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let ip = output
+            .entities
+            .iter()
+            .find(|e| e.name == "req.ip")
+            .expect("req.ip is an entity");
+        // Parser spans carry tree-sitter rows, which are 0-based: source line
+        // 1 is `start_line` 0. Asserted explicitly because a span read against
+        // the wrong base still looks like a span.
+        let span = &ip.span;
+        assert_eq!(span.start_line, 0, "starts at the defining statement");
+        // Source line 3, `return proxyaddr(this, trust);`, is the line a reader
+        // chasing the express bug lands on. It has to be inside this entity.
+        let body_line = 2;
+        assert!(
+            span.start_line <= body_line && body_line <= span.end_line,
+            "the getter body line {body_line} must fall inside [{}, {}]",
+            span.start_line,
+            span.end_line
+        );
+    }
+
+    /// Calls inside the getter belong to the property, not to the file. The
+    /// measured task was tracing `req.ip` to `proxyaddr`, which needs the edge.
+    #[test]
+    fn parse_js_define_getter_body_calls_belong_to_the_property() {
+        let adapter = JavaScriptAdapter;
+        let source = br#"defineGetter(req, 'ip', function ip(){
+  return proxyaddr(this, this.app.get('trust proxy fn'));
+});
+
+function defineGetter(obj, name, getter) {
+  Object.defineProperty(obj, name, { get: getter });
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib/request.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let from_ip: Vec<&str> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Calls && r.src_name == "req.ip")
+            .map(|r| r.dst_name.as_str())
+            .collect();
+        assert!(
+            from_ip.contains(&"proxyaddr"),
+            "req.ip must call proxyaddr, got {from_ip:?}"
+        );
+    }
+
+    /// `fresh` is the one of the twelve whose implementation is anonymous, so
+    /// the name can only come from the string argument.
+    #[test]
+    fn parse_js_define_getter_names_the_property_from_the_string_argument() {
+        let adapter = JavaScriptAdapter;
+        let source = br#"defineGetter(req, 'fresh', function(){
+  return true;
+});
+
+function defineGetter(obj, name, getter) {
+  Object.defineProperty(obj, name, { get: getter });
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib/request.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let methods: Vec<&str> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Method)
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(methods, vec!["req.fresh"]);
+    }
+
+    /// `Object.defineProperty` used directly needs no helper at all.
+    #[test]
+    fn parse_js_object_define_property_direct_call_defines_the_member() {
+        let adapter = JavaScriptAdapter;
+        let source = br#"Object.defineProperty(res, 'charset', {
+  get: function charset(){ return this._charset; }
+});
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib/response.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let methods: Vec<&str> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Method)
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(methods, vec!["res.charset"]);
+    }
+
+    /// FALSIFICATION. The rule reads what a helper DOES. A three-argument call
+    /// taking an object, a string and a function is also how every event
+    /// registration in JavaScript is written, and admitting it on shape alone
+    /// would invent `emitter.click`, a property no code defines.
+    #[test]
+    fn parse_js_a_three_argument_call_that_defines_nothing_produces_no_property() {
+        let adapter = JavaScriptAdapter;
+        let source = br#"registerHandler(emitter, 'click', function onClick(){
+  return handle();
+});
+
+function registerHandler(target, event, handler) {
+  target.addEventListener(event, handler);
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib/events.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let invented: Vec<&str> = output
+            .entities
+            .iter()
+            .filter(|e| e.name.starts_with("emitter."))
+            .map(|e| e.name.as_str())
+            .collect();
+        assert!(
+            invented.is_empty(),
+            "a handler registration defines no property, got {invented:?}"
+        );
+    }
+
+    /// FALSIFICATION. A helper that hands `Object.defineProperty` a name of its
+    /// own choosing rather than one of its parameters says nothing about what
+    /// its call sites define, so its call sites must mint nothing.
+    #[test]
+    fn parse_js_a_helper_that_does_not_forward_its_own_arguments_is_not_a_definer() {
+        let adapter = JavaScriptAdapter;
+        let source = br#"lockDown(req, 'ip', function ip(){ return 1; });
+
+function lockDown(obj, name, getter) {
+  Object.defineProperty(obj, 'frozen', { value: true });
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib/request.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let invented: Vec<&str> = output
+            .entities
+            .iter()
+            .filter(|e| e.name.starts_with("req."))
+            .map(|e| e.name.as_str())
+            .collect();
+        assert!(
+            invented.is_empty(),
+            "a helper that names its own property defines nothing for its callers, got {invented:?}"
+        );
+    }
+
+    /// FALSIFICATION. A computed property name is not a name. Recording the
+    /// expression's source text would put an entity called `req.[key]` in the
+    /// graph that nothing can ever be resolved against.
+    #[test]
+    fn parse_js_a_computed_property_name_produces_no_property() {
+        let adapter = JavaScriptAdapter;
+        let source = br#"defineGetter(req, key, function(){ return 1; });
+
+function defineGetter(obj, name, getter) {
+  Object.defineProperty(obj, name, { get: getter });
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib/request.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let invented: Vec<&str> = output
+            .entities
+            .iter()
+            .filter(|e| e.name.starts_with("req."))
+            .map(|e| e.name.as_str())
+            .collect();
+        assert!(invented.is_empty(), "got {invented:?}");
+    }
+
+    /// FALSIFICATION. A data property carries no implementation, so recording
+    /// it as a method would claim a function that does not exist.
+    #[test]
+    fn parse_js_a_data_property_is_not_recorded_as_a_method() {
+        let adapter = JavaScriptAdapter;
+        let source = br#"Object.defineProperty(res, 'version', { value: 3, enumerable: true });
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib/response.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let invented: Vec<&str> = output
+            .entities
+            .iter()
+            .filter(|e| e.name.starts_with("res."))
+            .map(|e| e.name.as_str())
+            .collect();
+        assert!(invented.is_empty(), "got {invented:?}");
+    }
+
+    /// The assignment path must keep working exactly as before. Both forms
+    /// appear in the same express file and both have to land.
+    #[test]
+    fn parse_js_assignment_and_define_getter_forms_coexist() {
+        let adapter = JavaScriptAdapter;
+        let source = br#"req.get =
+req.header = function header(name) {
+  return this.headers[name];
+};
+
+defineGetter(req, 'ip', function ip(){
+  return proxyaddr(this, trust);
+});
+
+function defineGetter(obj, name, getter) {
+  Object.defineProperty(obj, name, { get: getter });
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib/request.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let mut methods: Vec<&str> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Method)
+            .map(|e| e.name.as_str())
+            .collect();
+        methods.sort_unstable();
+        assert_eq!(methods, vec!["req.get", "req.header", "req.ip"]);
+        let owners: Vec<&str> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Class)
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(owners, vec!["req"], "one owner, not one per form");
     }
 }
