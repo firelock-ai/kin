@@ -3341,6 +3341,61 @@ pub async fn run_with_authority_on(
                         if total_relations > 0 {
                             lsp_state.mark_dirty();
                         }
+
+                        // Publish this sweep's enrichment ONCE, here, and wait
+                        // for it.
+                        //
+                        // Publication is not a separate path: it happens inside
+                        // save_snapshot_impl, so the background flush IS the
+                        // publication. Leaving it to that flush is what made
+                        // suppressing the flush lose the work entirely. Measured
+                        // on a converted psf/requests store: a sweep enriched 37
+                        // files and 4231 relations, the daemon began idle
+                        // shutdown 65 ms after the sweep ended, logged its final
+                        // shutdown flush, and then reported that tasks had not
+                        // stopped within 10 s. That flush takes about 96 s on
+                        // this store. Nothing was published, and the whole sweep
+                        // was lost on a path `kin init` takes every time.
+                        //
+                        // Ordering carries the guarantee. This runs BEFORE the
+                        // running flag clears and before the completion counter
+                        // advances, so the sweep is still in flight while it
+                        // happens: nothing reads the daemon as idle, and a
+                        // caller waiting for the sweep (`kin init` does) waits
+                        // for durability rather than for a promise of it.
+                        //
+                        // Both exits, deliberately. The loop reaches here after
+                        // a clean finish AND after breaking early on shutdown or
+                        // a supervisor halt, so an interrupted sweep still makes
+                        // durable what it actually completed, and the crash
+                        // window narrows to a hard kill, which the resume marker
+                        // already recovers by re-sweeping.
+                        let published = if total_relations > 0 {
+                            match save_snapshot_blocking(Arc::clone(&lsp_state)).await {
+                                Ok(()) => {
+                                    lsp_state.mark_clean();
+                                    true
+                                }
+                                Err(error) => {
+                                    // Loud, and not fatal. The relations stay in
+                                    // the live graph and the resume marker still
+                                    // records what was enriched, so the next
+                                    // sweep re-derives them; what must not happen
+                                    // is losing this silently, which is the
+                                    // defect being closed.
+                                    warn!(
+                                        %error,
+                                        relations = total_relations,
+                                        "could not publish this sweep's enrichment; the \
+                                         relations stay live and the next sweep re-derives them"
+                                    );
+                                    false
+                                }
+                            }
+                        } else {
+                            false
+                        };
+
                         // Marked complete even when the loop broke early on
                         // shutdown or a supervisor halt. A waiter blocked on a
                         // counter that only advances on a clean finish would
@@ -3371,6 +3426,7 @@ pub async fn run_with_authority_on(
                             definitions_over_budget = tally.definitions_over_budget,
                             not_visited,
                             ended_early = tally.ended_early,
+                            published,
                             unaccounted,
                             "LSP cold sweep complete"
                         );
