@@ -5679,9 +5679,7 @@ fn resolve_one_file_incremental(
 
     // See the batch resolver: an override is derived from declarations, not
     // resolved from an extracted relation.
-    for relation in
-        derive_override_relations_incremental(file, linker, import_map, class_bases)
-    {
+    for relation in derive_override_relations_incremental(file, linker, import_map, class_bases) {
         accumulate_relation(&mut resolved, &mut relation_indices, relation);
     }
 
