@@ -4472,6 +4472,46 @@ mod tests {
         );
     }
 
+    /// An interrupted sweep records exactly the files it completed, and no more.
+    ///
+    /// The accumulator is pushed only on the arm that increments
+    /// `tally.enriched`, so today the property holds by code shape and a runtime
+    /// warning reports any divergence. Neither is enough on its own: a shape
+    /// invariant is one refactor from silently gone, and the warning only speaks
+    /// in production, after the damage. This pins the property where CI sees it.
+    ///
+    /// The case is a sweep that broke early having finished three files of four.
+    /// The marker must name those three and must NOT name the file the sweep
+    /// never reached, because naming it would make the next sweep skip a file
+    /// that was never enriched at all.
+    #[test]
+    fn an_interrupted_sweep_records_exactly_what_it_completed() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = DaemonState::open(initialized.layout).unwrap();
+
+        let completed = vec![
+            "src/requests/sessions.py".to_string(),
+            "src/requests/adapters.py".to_string(),
+            "src/requests/auth.py".to_string(),
+        ];
+        let never_reached = "src/requests/models.py";
+
+        super::mark_files_enriched(&state, &completed);
+
+        for file in &completed {
+            assert!(
+                super::file_already_enriched(&state, file),
+                "a file the interrupted sweep completed and published must be recorded: {file}"
+            );
+        }
+        assert!(
+            !super::file_already_enriched(&state, never_reached),
+            "a file the sweep never reached must NOT be recorded, or the next sweep skips a \
+             file that was never enriched"
+        );
+    }
+
     #[test]
     fn shutdown_grace_parsing_is_robust() {
         let default = Duration::from_secs(25);
