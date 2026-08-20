@@ -12412,6 +12412,89 @@ fn bind_std_listener(
 
 #[cfg(test)]
 mod tests {
+    /// THE WIRING SPINE (FIR-2524, captain's rider). The envelope the impact
+    /// route hands the CLI must carry the daemon's degraded signals.
+    ///
+    /// This is the assertion the rejected wiring could not pass, and the reason
+    /// it lives HERE rather than beside the CLI's rendering test: the rejected
+    /// option's defect is in what this route BUILDS, and a unit test that
+    /// constructs its own envelope and passes it to `build_impact_response`
+    /// cannot see it. That test asserts the renderer inherits a degraded verdict
+    /// and passes under both wirings; only this one distinguishes them.
+    ///
+    /// A thinner snapshot carrying just `initialized` and `graph_loaded` reads
+    /// perfectly healthy, so the CLI would stay silent on a daemon whose
+    /// embedding worker has failed while `impact_analysis` refuses on the same
+    /// instant. Human surface more confident than agent surface is the exact
+    /// divergence this ticket closes.
+    #[test]
+    fn the_impact_envelope_carries_the_daemons_degraded_signals() {
+        let health = serde_json::json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 3,
+            "graph_generation": 7,
+            "embed_worker_failed": true,
+            "mass_deletion_blocked": false,
+        });
+        let envelope = kin_mcp::Envelope::daemon().with_health(&health);
+
+        // The verdict the CLI will render is the one this envelope produces, so
+        // assert the envelope actually carries the degradation into it rather
+        // than asserting on the JSON we just wrote.
+        // Coverage healthy, so the degraded flag is the ONLY variable. Without
+        // this the gate refuses both arms for `edge_coverage_unreported`, which
+        // is the gate working correctly and a test proving nothing.
+        let payload = serde_json::json!({
+            "entity_impacts": [],
+            kin_mcp::EDGE_COVERAGE_KEY: {
+                "scope": "language",
+                "language": "Rust",
+                "requested_classes": ["calls", "imports", "references"],
+                "classes": { "calls": "present", "imports": "absent", "references": "present" },
+                "cross_file_classes": ["calls", "references"],
+                "reference_enrichment": "available",
+                "budget_exhausted": false,
+                "entities_examined": 3,
+            }
+        });
+        let negative =
+            kin_mcp::negative::negative_for("impact_analysis", &payload, &envelope, &[])
+                .expect("impact_analysis always qualifies");
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            serde_json::json!(false),
+            "a degraded daemon must not certify: {negative}"
+        );
+        assert!(
+            negative["degraded_signals"]
+                .as_array()
+                .is_some_and(|signals| signals
+                    .iter()
+                    .any(|signal| signal.as_str() == Some("embed_worker_failed"))),
+            "the signal must reach the verdict the CLI renders: {negative}"
+        );
+
+        // The control that makes the assertion above mean something: the same
+        // shape with the flag cleared must certify, so this is not a test that
+        // passes on any envelope at all.
+        let healthy = kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 3,
+            "graph_generation": 7,
+            "embed_worker_failed": false,
+        }));
+        let negative =
+            kin_mcp::negative::negative_for("impact_analysis", &payload, &healthy, &[])
+                .expect("impact_analysis always qualifies");
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            serde_json::json!(true),
+            "an undegraded daemon must still certify: {negative}"
+        );
+    }
+
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
@@ -24541,6 +24624,88 @@ mod tests {
         assert!(
             !joined.contains("def handler"),
             "file body must not be served from disk: {joined}"
+        );
+    }
+
+    /// THE SPINE (FIR-2524, captain's rider). Drives the ROUTE, because that is
+    /// the only place the rejected wiring differs.
+    ///
+    /// The rendering test beside the CLI constructs its own degraded envelope
+    /// and passes it to `build_impact_response`, so it passes under BOTH
+    /// wirings; falsifying it against the thin-envelope option proved exactly
+    /// that, and proved the rendering test alone could not justify the choice.
+    /// The rejected option's defect lives in what this route BUILDS, so only a
+    /// test that lets the route build it can see the difference.
+    ///
+    /// Break `daemon_health_snapshot` down to `initialized` + `graph_loaded` and
+    /// this test fails: the CLI goes silent on a daemon whose embedding worker
+    /// has failed, while `impact_analysis` refuses on the same daemon at the
+    /// same instant. Human surface more confident than agent surface is the
+    /// divergence this ticket closes.
+    #[tokio::test]
+    async fn a_degraded_daemon_reaches_the_impact_cli_through_the_route() {
+        let state = test_state();
+        // Coverage healthy on purpose, so the degradation is the only reason
+        // left to refuse and the assertion cannot pass for the wrong cause.
+        let caller = test_entity("caller", "src/a.py");
+        let callee = test_entity("callee", "src/b.py");
+        let orphan = test_entity("orphan", "src/orphan.py");
+        for entity in [&caller, &callee, &orphan] {
+            state.graph.upsert_entity(entity).unwrap();
+        }
+        state
+            .graph
+            .upsert_relation(&kin_model::Relation {
+                id: kin_model::RelationId::new(),
+                kind: kin_model::RelationKind::Calls,
+                src: kin_model::GraphNodeId::Entity(caller.id),
+                dst: kin_model::GraphNodeId::Entity(callee.id),
+                confidence: 1.0,
+                origin: kin_model::RelationOrigin::Parsed,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        state
+            .embed_worker_failed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/impact")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "entity": "orphan", "depth": 3 }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let result: kin_cli::commands::impact::ImpactResponse =
+            serde_json::from_slice(&body).unwrap();
+        let rendered = result.lines.join("\n");
+
+        assert!(
+            rendered.contains("No local downstream impact found."),
+            "the orphan must still report no impact: {rendered}"
+        );
+        assert!(
+            rendered.contains("Kin cannot rule out dependents"),
+            "the route's envelope must carry the degradation into the rendered verdict; a \
+             thinner snapshot leaves this line out entirely: {rendered}"
+        );
+        assert!(
+            rendered.contains("embed_worker_failed"),
+            "the line names the signal the verdict disclosed rather than inventing a cause: \
+             {rendered}"
         );
     }
 
