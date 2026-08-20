@@ -24,8 +24,9 @@ use sha2::{Digest, Sha256};
 use crate::classifier::{FileClassification, FileClassifier};
 use crate::error::{IndexError, Result};
 use crate::linker::{
-    is_external_import_placeholder, link_cross_file_borrowed_with_completeness,
-    ArtifactIdentityMap, FileParseCompletenessMap, FileParseData,
+    is_external_import_placeholder, is_unresolved_receiver_placeholder,
+    link_cross_file_borrowed_with_completeness, split_unresolved_receiver_token,
+    unresolved_receiver_display_name, ArtifactIdentityMap, FileParseCompletenessMap, FileParseData,
 };
 use crate::pipeline::IndexPipeline;
 
@@ -48,7 +49,7 @@ use crate::pipeline::IndexPipeline;
 /// authored to contain until it is admitted again, and reports nothing about
 /// which version authored it. Coupling the dial to graph authority so a
 /// version gap can be detected and refused is open follow-up work.
-pub const HYDRATION_SEMANTICS_VERSION: u32 = 8;
+pub const HYDRATION_SEMANTICS_VERSION: u32 = 9;
 
 /// Semantic graph delta derived for one pre-enrichment change identity.
 ///
@@ -448,7 +449,59 @@ fn external_reference_targets(
             .push(source.language);
     }
 
+    // The second placeholder class: a member call whose receiver resolves to
+    // nothing this repository defines. It carries no import source, because
+    // there is no module to name, so its identity and its display name come
+    // from the member expression the evidence recorded as written.
+    let mut receivers: BTreeMap<EntityId, (String, Vec<LanguageId>)> = BTreeMap::new();
+    for relation in linked {
+        if !is_unresolved_receiver_placeholder(relation) {
+            continue;
+        }
+        let Some(destination) = relation.dst.as_entity() else {
+            continue;
+        };
+        if entities.contains_key(&destination) {
+            continue;
+        }
+        let (Some(source), Some(token)) = (
+            relation.src.as_entity().and_then(|id| entities.get(&id)),
+            relation
+                .evidence
+                .first()
+                .and_then(|evidence| evidence.token.as_deref()),
+        ) else {
+            continue;
+        };
+        let Some((receiver, symbol)) = split_unresolved_receiver_token(token) else {
+            continue;
+        };
+        receivers
+            .entry(destination)
+            .or_insert_with(|| {
+                (
+                    unresolved_receiver_display_name(receiver, symbol),
+                    Vec::new(),
+                )
+            })
+            .1
+            .push(source.language);
+    }
+
     let mut targets = BTreeMap::new();
+    for (destination, (display_name, languages)) in receivers {
+        let fingerprint = fingerprints
+            .entry(destination)
+            .or_insert_with(|| external_reference_fingerprint("", &display_name))
+            .clone();
+        let Some(language) = lowest_language(&languages) else {
+            continue;
+        };
+        targets.insert(
+            destination,
+            external_reference_entity(destination, &display_name, language, fingerprint),
+        );
+    }
     for (destination, (import_source, symbol, languages)) in importers {
         let fingerprint = fingerprints
             .entry(destination)
@@ -493,6 +546,45 @@ fn lowest_language(languages: &[LanguageId]) -> Option<LanguageId> {
 /// origin at all stands for a definition that lives elsewhere.
 pub fn is_external_reference_target(entity: &Entity) -> bool {
     entity.role == EntityRole::External && entity.file_origin.is_none()
+}
+
+/// The placeholder entity one placeholder relation's destination stands for,
+/// or `None` when the relation is not a placeholder.
+///
+/// Both placeholder classes are handled here so a caller cannot learn one and
+/// miss the other. That is not hypothetical: the historical ref view re-links
+/// source and inserts the result straight into a snapshot, and admission fails
+/// closed on an endpoint no entity backs, so a synthesis that knew only the
+/// cross-repo class turned a new class of edge into a hard error the moment one
+/// appeared.
+///
+/// The language comes from the caller because a target defined elsewhere has
+/// none of its own; the importing side is the only thing that observed it.
+pub fn placeholder_target_entity(relation: &Relation, language: LanguageId) -> Option<Entity> {
+    let destination = relation.dst.as_entity()?;
+    let token = relation.evidence.first()?.token.as_deref()?;
+    if is_external_import_placeholder(relation) {
+        let import_source = relation.import_source.as_deref()?;
+        let fingerprint = external_reference_fingerprint(import_source, token);
+        return Some(external_reference_entity(
+            destination,
+            token,
+            language,
+            fingerprint,
+        ));
+    }
+    if is_unresolved_receiver_placeholder(relation) {
+        let (receiver, symbol) = split_unresolved_receiver_token(token)?;
+        let name = unresolved_receiver_display_name(receiver, symbol);
+        let fingerprint = external_reference_fingerprint("", &name);
+        return Some(external_reference_entity(
+            destination,
+            &name,
+            language,
+            fingerprint,
+        ));
+    }
+    None
 }
 
 /// Build the external target a cross-repo reference resolves against.
