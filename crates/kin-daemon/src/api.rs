@@ -1562,6 +1562,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         )
         // LSP enrichment — trigger a full cold sweep
         .route("/lsp/sweep", post(lsp_sweep))
+        .route("/lsp/sweep/status", get(lsp_sweep_status))
 }
 
 #[derive(Clone)]
@@ -11138,8 +11139,46 @@ async fn lsp_sweep(
             &state.layout.working_dir().display().to_string(),
         ));
     }
-    state.queue_lsp_sweep();
-    Ok(Json(json!({"status": "sweep_queued"})))
+    // Read BEFORE queueing. This is the count a waiter must see exceeded, and
+    // it has to describe the moment before this sweep exists, whether this call
+    // queued one or found one already running.
+    let queued_after = state
+        .lsp_sweeps_completed
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let queued = state.queue_lsp_sweep();
+    // `sweeps_completed` at the moment of queueing is what makes the wait
+    // correct. A caller that polls `running` alone races the worker: it can read
+    // idle before the message is picked up and conclude the sweep it just asked
+    // for has finished. Handing back the count it must exceed removes the race
+    // without the caller having to know the worker exists.
+    Ok(Json(json!({
+        "status": if queued { "sweep_queued" } else { "sweep_already_running" },
+        "sweeps_completed": queued_after,
+        "enrichment_available": state.lsp_enrichment_tx.is_some(),
+    })))
+}
+
+/// GET /lsp/sweep/status, reporting how far the cold sweep has got.
+///
+/// A sweep takes minutes on a real repository and used to be unobservable: the
+/// queue endpoint answered once and nothing reported again, so no caller could
+/// tell a converged graph from one still being enriched. Every conversion needs
+/// exactly that distinction, which is why it exists.
+async fn lsp_sweep_status(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
+    use std::sync::atomic::Ordering;
+    let total = state.lsp_sweep_files_total.load(Ordering::SeqCst);
+    let done = state.lsp_sweep_files_done.load(Ordering::SeqCst);
+    Json(json!({
+        "running": state.lsp_sweep_running.load(Ordering::SeqCst),
+        "files_done": done,
+        "files_total": total,
+        "sweeps_completed": state.lsp_sweeps_completed.load(Ordering::SeqCst),
+        // Reported rather than left for the caller to infer from a zero total:
+        // a daemon with no language server never sweeps, and a caller waiting
+        // for one would otherwise wait out its whole budget for an event that
+        // cannot happen.
+        "enrichment_available": state.lsp_enrichment_tx.is_some(),
+    }))
 }
 
 /// Parse an entity kind string into an EntityKind enum value.

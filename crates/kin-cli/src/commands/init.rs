@@ -112,7 +112,20 @@ struct UncommittedPathPayload {
     state: &'static str,
 }
 
-pub async fn run(path: Option<String>, json: bool) -> Result<()> {
+/// Write one conversion-phase line to stderr, tolerating a closed pipe.
+///
+/// `eprintln!` PANICS when its pipe is gone, and `kin init` has a contract that
+/// its exit status reports the admission rather than the reader going away. A
+/// progress line is not worth an exit code, let alone a panic, so this drops the
+/// line instead.
+macro_rules! note {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
+pub async fn run(path: Option<String>, json: bool, no_enrich: bool) -> Result<()> {
     let _span = tracing::info_span!("kin.init").entered();
     let dir = path
         .map(PathBuf::from)
@@ -158,6 +171,30 @@ pub async fn run(path: Option<String>, json: bool) -> Result<()> {
         );
     }
 
+    // Conversion is not finished when the graph exists. Cross-file reference,
+    // override and type-use edges are not derivable from a single-file parse:
+    // they need a resolved program from a language server, and until this ran
+    // here nothing ever asked for one. The sweep had exactly one caller,
+    // `POST /lsp/sweep`, which nothing in the product called, so every converted
+    // repository answered cross-file questions by matching bare names.
+    //
+    // Runs before the result is printed so what a reader is told about their
+    // repository is true of the repository they now have.
+    if !no_enrich {
+        // Isolated on its own task so a panic inside it cannot decide init's
+        // exit status. `kin init 2>&1 | head -1` closes both streams after one
+        // line and every advisory write after that panics; init's contract is
+        // that its status reports the admission, not the reader going away. The
+        // phase's own writes are already pipe-safe, but it reaches shared
+        // advisory paths whose writes are not, and auditing every one of them
+        // forever is a worse guarantee than making the phase structurally unable
+        // to matter.
+        let kin_root = result.layout.root().to_path_buf();
+        if let Err(error) = tokio::spawn(async move { enrich_after_init(&kin_root).await }).await {
+            note!("note: the cross-file enrichment phase did not finish cleanly: {error}");
+        }
+    }
+
     if json {
         print_json_result(&result, boundary, enrichment)?;
     } else {
@@ -166,6 +203,187 @@ pub async fn run(path: Option<String>, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// How long the conversion phase will wait for the sweep before handing the
+/// repository over anyway.
+///
+/// Bounded because a language server can hang and a conversion that never
+/// returns is worse than one that finishes thin: the sweep is resumable, so
+/// what this budget cuts short the next daemon start continues. Generous
+/// because the alternative failure is worse, an enrichment abandoned at 80% on
+/// a large repository every single time.
+const ENRICH_BUDGET: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// Stop the daemon the conversion phase started, and only that one.
+///
+/// Called after the sweep has completed or its budget expired, never mid-pass:
+/// a sweep killed halfway is the failure this whole area exists to prevent, and
+/// the marker only makes it resumable, not free.
+async fn stop_conversion_daemon(borrowed_existing: bool, kin_root: &Path) {
+    if borrowed_existing {
+        return;
+    }
+    if let Err(error) = crate::commands::daemon::stop_current_repo_quiet(kin_root).await {
+        note!("note: the conversion daemon could not be stopped: {error:#}");
+    }
+}
+
+/// Run the language-server sweep as a phase of conversion, with progress.
+///
+/// Every line this prints goes to STDERR, including the progress. `kin init
+/// --json` writes one machine-readable document to stdout and callers parse it,
+/// so a progress line there is not chatty output, it is a corrupted response:
+/// twelve tests failed with `stdout should be valid json` and
+/// `expected value, line 1 column 1` the first time this wrote to stdout. The
+/// closed-pipe contract is the same fact from the other side, where an extra
+/// stdout write changes what `kin init` reports when its reader goes away.
+///
+/// Every failure here is reported and swallowed. A repository whose graph is
+/// built is a usable repository, and refusing the whole `kin init` because a
+/// language server was missing, slow, or broken would turn an enrichment
+/// shortfall into a conversion failure. The shortfall is visible afterwards:
+/// `kin doctor` reports the enrichment gap and names the command that closes it.
+/// `kin_root` is the `.kin` directory, which is what `ensure_daemon_running`
+/// takes. Passing the working directory instead resolves a store that is not
+/// there and fails with a version error naming a layout nothing wrote, which is
+/// exactly how this read as "no daemon could be started" on a repository whose
+/// store had just been created successfully.
+/// Run the conversion phase and ALWAYS clean up after it.
+///
+/// The cleanup used to sit after the happy-path wait, so every early return
+/// skipped it. On a CI runner the sweep POST was refused 401 and the phase
+/// returned before the stop, leaking the daemon it had started; two minutes
+/// later an independent daemon could not start because "another kin daemon (pid
+/// 10195) already owns" the repository. That is the fourth time this phase
+/// broke a contract it has no business touching, and the first three were all
+/// on the happy path, so the fix is structural rather than another audited exit.
+///
+/// The phase runs on its own task and the cleanup runs after the join, so it is
+/// reached on success, on refusal, on timeout and on panic alike.
+async fn enrich_after_init(kin_root: &Path) {
+    let Some(layout) = kin_core::KinLayout::discover(kin_root) else {
+        note!("note: cross-file reference enrichment was skipped: no Kin layout at this path");
+        return;
+    };
+
+    // Whether a daemon was already serving this repository. If not, anything
+    // running afterwards is ours, and a daemon left behind by `kin init` pins a
+    // repository cursor that makes the next mutation refuse.
+    let borrowed_existing = crate::daemon_client::resolve_daemon_url_if_running_async(&layout)
+        .await
+        .is_some();
+
+    let root = kin_root.to_path_buf();
+    let phase_layout = layout.clone();
+    let phase = tokio::spawn(async move { enrich_phase(&root, &phase_layout).await });
+    if let Err(error) = phase.await {
+        note!("note: the cross-file enrichment phase did not finish cleanly: {error}");
+    }
+
+    stop_conversion_daemon(borrowed_existing, kin_root).await;
+}
+
+async fn enrich_phase(kin_root: &Path, layout: &kin_core::KinLayout) {
+    let url = match crate::daemon_client::ensure_daemon_running(kin_root).await {
+        Ok(url) => url,
+        Err(error) => {
+            note!(
+                "note: cross-file reference enrichment was skipped because no daemon could be \
+                 started ({error}); run `kin doctor` to see what is missing"
+            );
+            return;
+        }
+    };
+    // FOR_LAYOUT, not the plain constructor. The plain one resolves the
+    // daemon bearer token from the PROCESS WORKING DIRECTORY, and `kin init`
+    // takes the repository as an argument, so on a runner whose cwd is not the
+    // new repository the token was never found and the sweep POST went out
+    // unauthenticated: "kin lsp sweep refused (HTTP 401)". The layout is the
+    // repository this phase is about, and its `.kin` holds the token the daemon
+    // just minted.
+    let client = match crate::daemon_client::DaemonClient::from_base_url_for_layout(url, layout) {
+        Ok(client) => client,
+        Err(error) => {
+            note!("note: cross-file reference enrichment was skipped: {error:#}");
+            return;
+        }
+    };
+
+    let queued = match client.queue_lsp_sweep().await {
+        Ok(value) => value,
+        Err(error) => {
+            note!("note: cross-file reference enrichment could not be started: {error:#}");
+            return;
+        }
+    };
+    // A daemon with no language server never sweeps. Saying so, with the
+    // command that fixes it, beats waiting fifteen minutes for an event that
+    // cannot happen.
+    if queued.get("enrichment_available").and_then(|v| v.as_bool()) == Some(false) {
+        note!(
+            "note: no language server is installed, so cross-file reference and override edges \
+             were not produced. Run `kin doctor --fix --install-language-servers` to install one, \
+             then `kin daemon stop`; the next command re-enriches this repository."
+        );
+        return;
+    }
+    let baseline = queued
+        .get("sweeps_completed")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    note!("Enriching cross-file references (language server)...");
+    let deadline = std::time::Instant::now() + ENRICH_BUDGET;
+    let mut last_reported = 0u64;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let status = match client.lsp_sweep_status().await {
+            Ok(status) => status,
+            Err(error) => {
+                note!("note: enrichment progress could not be read: {error:#}");
+                return;
+            }
+        };
+        let done = status
+            .get("files_done")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let total = status
+            .get("files_total")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        // Progress is printed per file rather than at the end, because a
+        // conversion that prints nothing for minutes reads as hung and gets
+        // interrupted, which is how the work a user asked for gets thrown away.
+        if done > last_reported {
+            last_reported = done;
+            note!("  enriched {done}/{total} files");
+        }
+        let completed = status
+            .get("sweeps_completed")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let running = status
+            .get("running")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        // Both, not either. The counter says a sweep ended; `running` says none
+        // is in flight now. Returning on the counter alone hands back a graph a
+        // later sweep is still mutating, and a query issued into that window
+        // fails to resolve entities it resolves fine before and after.
+        if completed > baseline && !running {
+            note!("  cross-file enrichment complete ({done}/{total} files)");
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            note!(
+                "note: cross-file enrichment did not finish within {}s and was left running; it \
+                 resumes from where it stopped on the next daemon start",
+                ENRICH_BUDGET.as_secs()
+            );
+            return;
+        }
+    }
+}
 fn ensure_directory(dir: &Path) -> Result<()> {
     match std::fs::symlink_metadata(dir) {
         Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
@@ -1255,7 +1473,10 @@ mod tests {
         let _kin_home_var = kin_core::test_env::EnvVarGuard::set("KIN_HOME", &kin_home);
         let _registry = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path);
 
-        run(Some(repo.to_str().unwrap().to_string()), false)
+        // Enrichment off: this case is about the conversion transaction, and
+        // starting a daemon to query a language server would make it depend on
+        // what the host has installed.
+        run(Some(repo.to_str().unwrap().to_string()), false, true)
             .await
             .expect("kin init must succeed under a scratch registry");
 

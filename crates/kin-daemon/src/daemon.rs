@@ -1253,6 +1253,61 @@ async fn run_idle_monitor(
     }
 }
 
+/// Where the sweep records the files it has finished.
+///
+/// Operational state, beside the pid and port files, not semantic authority: it
+/// records what a background pass DID, and nothing answers a query from it.
+fn lsp_enriched_marker_path(state: &DaemonState) -> std::path::PathBuf {
+    state.layout.root().join("lsp-enriched-files.json")
+}
+
+/// Load the marker set, so a daemon that restarts does not re-sweep a graph a
+/// previous one already enriched.
+///
+/// An unreadable or absent marker means "nothing is known to be enriched", which
+/// costs a re-sweep and never skips a file wrongly. That asymmetry is deliberate:
+/// a wrong skip is silent and loses the answers, a wrong re-sweep only costs
+/// time.
+fn load_lsp_enriched_marker(state: &DaemonState) {
+    let Ok(bytes) = std::fs::read(lsp_enriched_marker_path(state)) else {
+        return;
+    };
+    let Ok(files) = serde_json::from_slice::<Vec<String>>(&bytes) else {
+        return;
+    };
+    if let Ok(mut marked) = state.lsp_enriched_files.lock() {
+        marked.extend(files);
+    }
+}
+
+/// Record that the sweep finished this file, and persist the set.
+///
+/// Written per file rather than once at the end so a killed pass leaves the
+/// files it completed marked, which is what makes the next pass resume rather
+/// than restart. The write is a small JSON array over the files of one
+/// repository; a failure to persist is not fatal, it only costs a re-sweep.
+fn mark_file_enriched(state: &DaemonState, file: &str) {
+    let snapshot = {
+        let Ok(mut marked) = state.lsp_enriched_files.lock() else {
+            return;
+        };
+        marked.insert(file.to_string());
+        marked.iter().cloned().collect::<Vec<_>>()
+    };
+    if let Ok(bytes) = serde_json::to_vec(&snapshot) {
+        let _ = std::fs::write(lsp_enriched_marker_path(state), bytes);
+    }
+}
+
+/// Whether the sweep has already finished this file.
+fn file_already_enriched(state: &DaemonState, file: &str) -> bool {
+    state
+        .lsp_enriched_files
+        .lock()
+        .map(|marked| marked.contains(file))
+        .unwrap_or(false)
+}
+
 fn install_lsp_relations(state: &DaemonState, relations: &[kin_model::Relation]) -> usize {
     if relations.is_empty() {
         return 0;
@@ -1420,6 +1475,10 @@ pub async fn run_with_authority_on(
     // on every server it finds, and published unconditionally: a daemon with
     // enrichment switched off produces no reference edge either, so its answers
     // must not claim otherwise.
+    // Load what a previous daemon already enriched, so a restart resumes rather
+    // than re-sweeping a converged graph.
+    load_lsp_enriched_marker(&state);
+
     kin_mcp::edge_coverage::publish_installed_language_servers(
         kin_core::reference_coverage::installed_language_servers(),
     );
@@ -1455,6 +1514,25 @@ pub async fn run_with_authority_on(
     };
 
     let state = Arc::new(state);
+
+    // Nothing used to trigger a sweep. The enrichment worker started, blocked on
+    // a channel, and waited: the incremental path fires only on watcher
+    // file-change events, and the only caller of `queue_lsp_sweep` was
+    // `POST /lsp/sweep`, which nothing in the product calls. So a freshly
+    // converted repository sat with a running server, a wired adapter and zero
+    // cross-file reference edges, and the first daemon after `kin init` was
+    // signalled 189 ms after its enrichment worker started, taking the intent
+    // with it.
+    //
+    // Queued here, after the channel exists and before the listener binds, so a
+    // daemon that comes up for any reason converges the graph it was handed. The
+    // sweep skips files that already carry language-server evidence, so this is
+    // cheap on a converged repository, resumable after a kill, and safe to queue
+    // on every start.
+    if enrichment_enabled && state.lsp_enrichment_tx.is_some() {
+        info!("queueing an LSP sweep so a graph with unenriched files converges");
+        state.queue_lsp_sweep();
+    }
 
     // Bind the API listener so the daemon owns port selection. With
     // config.api_port == 0 the OS assigns a free ephemeral port; we then publish
@@ -2618,7 +2696,13 @@ pub async fn run_with_authority_on(
                     } // end Incremental
 
                     LspEnrichmentMessage::Sweep => {
-                        info!("LSP cold sweep started — enriching all entities");
+                        info!("LSP cold sweep started, enriching all entities");
+                        lsp_state
+                            .lsp_sweep_running
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                        lsp_state
+                            .lsp_sweep_files_done
+                            .store(0, std::sync::atomic::Ordering::SeqCst);
 
                         // Get all entities from the graph.
                         use kin_model::EntityStore;
@@ -2639,6 +2723,9 @@ pub async fn run_with_authority_on(
                         }
 
                         let total_files = by_file.len();
+                        lsp_state
+                            .lsp_sweep_files_total
+                            .store(total_files as u64, std::sync::atomic::Ordering::SeqCst);
                         let mut files_processed = 0usize;
                         let mut total_relations = 0usize;
 
@@ -2685,6 +2772,31 @@ pub async fn run_with_authority_on(
                                 _ => None,
                             };
                             let Some(lang) = language else { continue };
+
+                            // Skip a file this graph already holds language-server
+                            // evidence for. This is what makes the sweep idempotent
+                            // and resumable: a pass killed halfway leaves the files
+                            // it finished carrying Lsp-origin edges, so the next
+                            // pass starts where the last one stopped instead of
+                            // re-querying the server for every entity again. On the
+                            // requests corpus a full pass is about three minutes,
+                            // so re-running one from scratch on every daemon start
+                            // is not a cost anyone would accept, and a sweep nobody
+                            // dares run is a sweep that never runs.
+                            if file_already_enriched(&lsp_state, &file_id.0) {
+                                files_processed += 1;
+                                // Info, not debug. A skip and a zero are different
+                                // facts and both are findings, and a skip nobody can
+                                // see is how a predicate that dropped the three files
+                                // this ticket is about survived a run that reported
+                                // 37 of 37 complete.
+                                info!(
+                                    file = %file_id.0,
+                                    progress = %format!("{files_processed}/{total_files}"),
+                                    "sweep skipped an already-enriched file"
+                                );
+                                continue;
+                            }
 
                             // Lazily start LSP server for this language (same as incremental).
                             if !servers.contains_key(&lang) {
@@ -2810,6 +2922,10 @@ pub async fn run_with_authority_on(
                                 .await;
 
                             files_processed += 1;
+                            mark_file_enriched(&lsp_state, &file_id.0);
+                            lsp_state
+                                .lsp_sweep_files_done
+                                .store(files_processed as u64, std::sync::atomic::Ordering::SeqCst);
                             total_relations += file_relations;
                             // Credited per file rather than once at the end. A
                             // cold sweep walks the whole graph, and a pass that
@@ -2826,6 +2942,22 @@ pub async fn run_with_authority_on(
                                     relations = file_relations,
                                     progress = format!("{}/{}", files_processed, total_files),
                                     "sweep enriched file"
+                                );
+                            } else {
+                                // A file the sweep visited and got nothing from is a
+                                // finding, not a non-event. Only enriched files used
+                                // to be logged, so a pass could report itself complete
+                                // over 37 files while the three that carried the
+                                // answers produced nothing, and the log said only that
+                                // the other 34 went fine. On the requests corpus that
+                                // is exactly what happened: sessions.py, auth.py and
+                                // adapters.py each yielded zero while a test file
+                                // yielded a thousand.
+                                info!(
+                                    file = %file_id,
+                                    entities = file_entity_refs.len(),
+                                    progress = format!("{}/{}", files_processed, total_files),
+                                    "sweep enriched NOTHING for this file"
                                 );
                             }
 
@@ -2846,6 +2978,19 @@ pub async fn run_with_authority_on(
                         if total_relations > 0 {
                             lsp_state.mark_dirty();
                         }
+                        // Marked complete even when the loop broke early on
+                        // shutdown or a supervisor halt. A waiter blocked on a
+                        // counter that only advances on a clean finish would
+                        // wait out its whole budget on a sweep that already
+                        // stopped, and report a timeout for a pass that ended
+                        // seconds in. What was enriched is durable either way,
+                        // and the next sweep resumes from it.
+                        lsp_state
+                            .lsp_sweep_running
+                            .store(false, std::sync::atomic::Ordering::SeqCst);
+                        lsp_state
+                            .lsp_sweeps_completed
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         info!(
                             files = files_processed,
                             total_files,

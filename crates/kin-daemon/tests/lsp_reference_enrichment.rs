@@ -460,3 +460,145 @@ fn javascript_no_longer_reports_the_unsupported_state_it_shipped_with() {
         "an unwired language must still report Unsupported"
     );
 }
+
+/// DIAGNOSTIC: what pyright answers for the two real requests dispatch shapes.
+///
+/// Faithful to the annotations the real source carries, because they are what
+/// decides the answer and an unannotated fixture asks a different question:
+/// `get_adapter` is declared `-> BaseAdapter` (sessions.py:870) and
+/// `Response.connection` is declared `HTTPAdapter` (models.py:750).
+#[tokio::test(flavor = "multi_thread")]
+async fn pyright_resolves_the_one_hop_to_the_base_and_the_two_hop_to_the_override() {
+    const TEST: &str = "pyright_resolves_the_one_hop_to_the_base_and_the_two_hop_to_the_override";
+    let Some((command, args)) = server_command_or_skip(LanguageId::Python, TEST) else {
+        return;
+    };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    std::fs::write(
+        root.join("adapters.py"),
+        "class BaseAdapter:\n\
+         \x20   def send(self, request, **kwargs):\n\
+         \x20       raise NotImplementedError\n\
+         \n\
+         \n\
+         class HTTPAdapter(BaseAdapter):\n\
+         \x20   def send(self, request, **kwargs):\n\
+         \x20       return \"http\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("models.py"),
+        "from adapters import HTTPAdapter\n\
+         \n\
+         \n\
+         class Response:\n\
+         \x20   connection: HTTPAdapter\n\
+         \n\
+         \x20   def __init__(self):\n\
+         \x20       self.request = None\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("sessions.py"),
+        "from adapters import BaseAdapter, HTTPAdapter\n\
+         \n\
+         \n\
+         class Session:\n\
+         \x20   def __init__(self):\n\
+         \x20       self.adapters = {\"http://\": HTTPAdapter()}\n\
+         \n\
+         \x20   def get_adapter(self, url: str) -> BaseAdapter:\n\
+         \x20       return self.adapters[\"http://\"]\n\
+         \n\
+         \x20   def send(self, request, **kwargs):\n\
+         \x20       adapter = self.get_adapter(url=\"u\")\n\
+         \x20       r = adapter.send(request, **kwargs)\n\
+         \x20       return r\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("auth.py"),
+        "from models import Response\n\
+         \n\
+         \n\
+         class HTTPDigestAuth:\n\
+         \x20   def handle_401(self, r: Response, **kwargs):\n\
+         \x20       _r = r.connection.send(r, **kwargs)\n\
+         \x20       return _r\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("pyrightconfig.json"), "{\"include\": [\".\"]}\n").unwrap();
+
+    let server = start_server(&command, &args, root, LanguageId::Python).await;
+    open_documents(
+        &server,
+        root,
+        &["adapters.py", "models.py", "sessions.py", "auth.py"],
+        "python",
+    )
+    .await;
+
+    // `adapters.py` line 1 is `BaseAdapter.send`; line 6 is `HTTPAdapter.send`.
+    // The two cases must answer DIFFERENTLY, and that difference is the finding.
+    for (label, file, line, col, want_line) in [
+        (
+            "Session.send (one-hop through get_adapter -> BaseAdapter)",
+            "sessions.py",
+            10u32,
+            8u32,
+            1u64,
+        ),
+        (
+            "HTTPDigestAuth.handle_401 (two-hop through r.connection: HTTPAdapter)",
+            "auth.py",
+            4,
+            8,
+            6u64,
+        ),
+    ] {
+        let uri = kin_lsp::protocol::path_to_uri(&root.join(file));
+        let prepared = server
+            .client
+            .request(
+                "textDocument/prepareCallHierarchy",
+                serde_json::json!({
+                    "textDocument": {"uri": uri},
+                    "position": {"line": line, "character": col}
+                }),
+            )
+            .await
+            .unwrap_or(serde_json::json!(null));
+        let item = prepared.get(0).cloned().unwrap_or(serde_json::json!(null));
+        if item.is_null() {
+            eprintln!("{label}: prepareCallHierarchy found nothing at {file}:{line}");
+            continue;
+        }
+        let out = server
+            .client
+            .request(
+                "callHierarchy/outgoingCalls",
+                serde_json::json!({"item": item}),
+            )
+            .await;
+        let calls = match out {
+            Ok(value) => value.as_array().cloned().unwrap_or_default(),
+            Err(error) => panic!("{label}: outgoingCalls errored: {error}"),
+        };
+        let sends: Vec<u64> = calls
+            .iter()
+            .map(|call| &call["to"])
+            .filter(|to| to["name"] == "send")
+            .filter(|to| to["uri"].as_str().unwrap_or("").ends_with("/adapters.py"))
+            .filter_map(|to| to["selectionRange"]["start"]["line"].as_u64())
+            .collect();
+        assert!(
+            sends.contains(&want_line),
+            "{label}: pyright must resolve the `.send` call to adapters.py line {want_line}; it \
+             answered {sends:?}. Line 1 is BaseAdapter.send and line 6 is HTTPAdapter.send, and \
+             which one comes back decides whether the reference surface must compose over an \
+             Overrides edge or can count the caller directly."
+        );
+    }
+}

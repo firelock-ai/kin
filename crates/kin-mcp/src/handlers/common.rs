@@ -1081,6 +1081,17 @@ pub struct ReferenceRow {
     /// the strongest contributing edge is the row's evidence. `name_only` means
     /// the reference is a guess and should be confirmed before being acted on.
     pub resolution: Option<RelationResolution>,
+    /// The base method this row reaches the focal THROUGH, when it was composed
+    /// over a proven override rather than reaching the focal directly.
+    ///
+    /// A caller that provably calls `BaseAdapter.send` reaches every override of
+    /// it, including `HTTPAdapter.send`, and refusing to say so understates
+    /// blast radius on every dynamically dispatched call in the repository. But
+    /// it is not the same fact as a direct call, so it is not reported as one:
+    /// the base is named here and the row's label says `via_override_of`, which
+    /// lets a reader separate direct callers from dispatch-reachable ones
+    /// instead of having to trust one undifferentiated number.
+    pub via_override_of: Option<String>,
     /// Whether EVERY edge behind this row is a receiver-method call the linker
     /// matched on the bare leaf name.
     ///
@@ -1211,6 +1222,7 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
                 snippet,
                 relation_kinds: Vec::new(),
                 resolution: None,
+                via_override_of: None,
                 // Every contributing edge has to be a guess for the row to be
                 // one, so this starts true and any other edge clears it.
                 receiver_name_guess: true,
@@ -1243,6 +1255,102 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
         entry.receiver_name_guess &= kin_index::resolution::is_receiver_name_guess(&rel);
     }
 
+    // Compose over proven overrides.
+    //
+    // A call whose receiver is statically typed as a base reaches every override
+    // of that base at run time. pyright answers `Session.send`'s
+    // `adapter.send(...)` with `BaseAdapter.send`, because `get_adapter` is
+    // declared `-> BaseAdapter`, so without this the one caller that matters is
+    // withheld as a same-name candidate while the graph holds both halves of the
+    // proof: a type_resolved call to the base, and a proven override edge from
+    // the focal to it.
+    //
+    // BOTH legs must be proven, which is what keeps this from fabricating. The
+    // call must be `type_resolved` or better, and the override edge must come
+    // from a proven origin; an override inferred from a `name_only` base-class
+    // reference composes nothing. A language with no proven edges therefore
+    // composes nothing at all, which is why this is safe to run for every
+    // language rather than gated per language.
+    //
+    // It UPGRADES a row wherever one exists rather than inventing one, so the
+    // caller's own reference lines, recorded by the parser at the real call
+    // site, survive the composition.
+    for (base_id, base_name) in proven_override_bases(store, entity_id)? {
+        for rel in store
+            .get_all_relations_for_entity(&base_id)
+            .map_err(McpError::graph)?
+        {
+            if rel.dst != GraphNodeId::Entity(base_id) || !allowed.contains(&rel.kind) {
+                continue;
+            }
+            let Some(source_entity_id) = rel.src.as_entity() else {
+                continue;
+            };
+            // A base calling itself, or the focal calling its own base, is not
+            // another entity reaching the focal.
+            if source_entity_id == base_id || source_entity_id == *entity_id {
+                continue;
+            }
+            if !RelationResolution::of(&rel).is_proven() {
+                continue;
+            }
+            let Some(entity) = store
+                .get_entity(&source_entity_id)
+                .map_err(McpError::graph)?
+            else {
+                continue;
+            };
+            let snippet = match read_bounded_entity_snippet_held(
+                &held,
+                &entity,
+                EntitySourceScope::WorkspaceHead,
+            ) {
+                Ok(snippet) => snippet,
+                Err(error) if is_absent_at_generation(&error) => continue,
+                Err(error) => return Err(error),
+            };
+            let file_path = entity.file_origin.as_ref().map(|path| path.0.clone());
+            let entry = grouped
+                .entry(source_entity_id)
+                .or_insert_with(|| ReferenceRow {
+                    entity_id: Some(source_entity_id.to_string()),
+                    name: entity.name.clone(),
+                    kind: Some(format!("{:?}", entity.kind)),
+                    file_path,
+                    start_line: entity_presentation_start_line(&entity),
+                    reference_lines: Vec::new(),
+                    reference_lines_absent: None,
+                    signature: Some(entity.signature.clone()),
+                    snippet,
+                    relation_kinds: Vec::new(),
+                    resolution: None,
+                    via_override_of: None,
+                    // Set false immediately below; a composed row is never a
+                    // name guess, and starting true would leave a row created
+                    // here in `candidates` if the assignment were ever removed.
+                    receiver_name_guess: false,
+                });
+            let tally = relation_reference_lines(&rel, entity.file_origin.as_ref());
+            entry.reference_lines.extend(tally.lines);
+            *spans_outside_caller_file
+                .entry(source_entity_id)
+                .or_default() += tally.outside_caller_file;
+            push_reference_kind(&mut entry.relation_kinds, rel.kind);
+            let resolution = RelationResolution::of(&rel);
+            entry.resolution = Some(match entry.resolution {
+                Some(current) => current.max(resolution),
+                None => resolution,
+            });
+            // A composition is not a name guess by construction: both of its
+            // legs are proven. Clearing this is what moves the row out of
+            // `candidates` and into the counted headline.
+            entry.receiver_name_guess = false;
+            if entry.via_override_of.is_none() {
+                entry.via_override_of = Some(base_name.clone());
+            }
+        }
+    }
+
     let mut rows = Vec::with_capacity(grouped.len());
     for (source_entity_id, mut row) in grouped {
         row.relation_kinds.sort_by_key(relation_kind_rank);
@@ -1261,6 +1369,62 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
         rows.push(row);
     }
     Ok(rows)
+}
+
+/// The base methods `entity_id` provably overrides.
+///
+/// Proven-ness is the gate that makes composing over these safe. An override
+/// edge the linker matched from a `name_only` base-class reference is a guess
+/// about which class is the base, and composing a caller through a guess would
+/// manufacture exactly the fabricated reference this whole area exists to stop.
+/// A language-server override edge, or a parser edge that resolved the declared
+/// base name, both clear it.
+fn proven_override_bases<G: GraphStore>(
+    store: &G,
+    entity_id: &EntityId,
+) -> Result<Vec<(EntityId, String)>> {
+    let mut bases = Vec::new();
+    for rel in store
+        .get_all_relations_for_entity(entity_id)
+        .map_err(McpError::graph)?
+    {
+        if rel.kind != RelationKind::Overrides || rel.src != GraphNodeId::Entity(*entity_id) {
+            continue;
+        }
+        if !RelationResolution::of(&rel).is_proven() {
+            continue;
+        }
+        let Some(base_id) = rel.dst.as_entity() else {
+            continue;
+        };
+        if base_id == *entity_id {
+            continue;
+        }
+        let Some(base) = store.get_entity(&base_id).map_err(McpError::graph)? else {
+            continue;
+        };
+        // A method overrides a METHOD. An override edge landing on a class or
+        // interface is the known-degraded shape, not a base to compose over:
+        // `EntityIndex::find_at` returns the first entity whose span contains
+        // the target line and a class span contains its methods, so a
+        // method-level target can resolve to the enclosing class. Composing
+        // over that would attribute every caller of `BaseAdapter` to
+        // `HTTPAdapter.send`, which is precisely the fabrication the
+        // proven-ness gate exists to prevent, and it would do it wearing a
+        // proven label.
+        //
+        // Refused rather than tolerated so this starts working correctly the
+        // moment the enrichment fix lands, instead of producing plausible wrong
+        // rows in the meantime and having to be untangled later.
+        if !matches!(
+            base.kind,
+            kin_model::EntityKind::Method | kin_model::EntityKind::Function
+        ) {
+            continue;
+        }
+        bases.push((base_id, base.name.clone()));
+    }
+    Ok(bases)
 }
 
 /// What one relation's evidence says about where its reference sites are.
@@ -3109,4 +3273,234 @@ pub fn summarize_annotation(annotation: &kin_model::Annotation) -> serde_json::V
         "staleness": annotation.staleness.to_string(),
         "scopes": annotation.scopes.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
     })
+}
+
+#[cfg(test)]
+mod override_composition_tests {
+    use super::{collect_graph_reference_rows, ReferenceRow};
+    use kin_db::InMemoryGraph;
+    use kin_index::resolution::RECEIVER_NAME_FANOUT_CONFIDENCE;
+    use kin_model::relation::{Relation, RelationOrigin};
+    use kin_model::{
+        Entity, EntityId, EntityKind, EntityMetadata, EntityRole, EntityStore, FilePathId,
+        FingerprintAlgorithm, GraphNodeId, Hash256, LanguageId, RelationKind, SemanticFingerprint,
+        Visibility,
+    };
+
+    fn entity(name: &str, path: &str) -> Entity {
+        Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Method,
+            name: name.to_string(),
+            language: LanguageId::Python,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([0; 32]),
+                signature_hash: Hash256::from_bytes([0; 32]),
+                behavior_hash: Hash256::from_bytes([0; 32]),
+                equivalence_hash: Hash256::from_bytes([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(FilePathId::new(path)),
+            span: None,
+            signature: name.to_string(),
+            visibility: Visibility::Public,
+            role: EntityRole::Source,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    fn relation(
+        src: EntityId,
+        dst: EntityId,
+        kind: RelationKind,
+        origin: RelationOrigin,
+        confidence: f32,
+    ) -> Relation {
+        Relation {
+            id: kin_model::ids::RelationId::new(),
+            kind,
+            src: GraphNodeId::Entity(src),
+            dst: GraphNodeId::Entity(dst),
+            confidence,
+            origin,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        }
+    }
+
+    /// The requests shape, as a graph: `Session.send` provably calls
+    /// `BaseAdapter.send` because `get_adapter` is declared `-> BaseAdapter`,
+    /// and `HTTPAdapter.send` provably overrides `BaseAdapter.send`.
+    ///
+    /// `override_proven` and `call_proven` are the two legs, taken as arguments
+    /// so one fixture states every case: both proven composes, either unproven
+    /// must not.
+    fn requests_shape(
+        call_proven: bool,
+        override_proven: bool,
+    ) -> (InMemoryGraph, EntityId, EntityId) {
+        let graph = InMemoryGraph::new();
+        let base = entity("BaseAdapter.send", "src/requests/adapters.py");
+        let focal = entity("HTTPAdapter.send", "src/requests/adapters.py");
+        let caller = entity("Session.send", "src/requests/sessions.py");
+        for e in [&base, &focal, &caller] {
+            graph.upsert_entity(e).unwrap();
+        }
+        graph
+            .upsert_relation(&relation(
+                caller.id,
+                base.id,
+                RelationKind::Calls,
+                if call_proven {
+                    RelationOrigin::Lsp
+                } else {
+                    RelationOrigin::Parsed
+                },
+                if call_proven {
+                    0.95
+                } else {
+                    RECEIVER_NAME_FANOUT_CONFIDENCE
+                },
+            ))
+            .unwrap();
+        graph
+            .upsert_relation(&relation(
+                focal.id,
+                base.id,
+                RelationKind::Overrides,
+                if override_proven {
+                    RelationOrigin::Lsp
+                } else {
+                    RelationOrigin::Parsed
+                },
+                if override_proven {
+                    0.95
+                } else {
+                    RECEIVER_NAME_FANOUT_CONFIDENCE
+                },
+            ))
+            .unwrap();
+        (graph, focal.id, caller.id)
+    }
+
+    fn rows_for(graph: &InMemoryGraph, focal: &EntityId) -> Vec<ReferenceRow> {
+        collect_graph_reference_rows(graph, focal, &[RelationKind::Calls], None).unwrap()
+    }
+
+    /// Both legs proven: the caller counts, and the row says which base it came
+    /// through rather than passing itself off as a direct call.
+    #[test]
+    fn a_caller_of_a_proven_base_reaches_the_override_and_says_so() {
+        let (graph, focal, caller) = requests_shape(true, true);
+        let rows = rows_for(&graph, &focal);
+        let row = rows
+            .iter()
+            .find(|row| row.entity_id.as_deref() == Some(&caller.to_string()[..]))
+            .expect("the base's caller must reach the override");
+        assert_eq!(
+            row.via_override_of.as_deref(),
+            Some("BaseAdapter.send"),
+            "a composed row names the base it came through"
+        );
+        assert!(
+            !row.receiver_name_guess,
+            "a composition is not a name guess, and this is what counts it"
+        );
+    }
+
+    /// The first leg unproven: a name-guessed call to the base composes nothing.
+    #[test]
+    fn a_name_guessed_call_to_the_base_composes_nothing() {
+        let (graph, focal, caller) = requests_shape(false, true);
+        let rows = rows_for(&graph, &focal);
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.entity_id.as_deref() == Some(&caller.to_string()[..])),
+            "an unproven call to the base must not manufacture a reference"
+        );
+    }
+
+    /// The second leg unproven: an override the linker guessed composes nothing.
+    /// This is the fabrication guard the ruling turns on.
+    #[test]
+    fn a_name_guessed_override_composes_nothing() {
+        let (graph, focal, caller) = requests_shape(true, false);
+        let rows = rows_for(&graph, &focal);
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.entity_id.as_deref() == Some(&caller.to_string()[..])),
+            "an override matched from a name_only base-class reference must compose nothing"
+        );
+    }
+
+    /// The known-degraded shape: the override edge lands on the enclosing CLASS
+    /// rather than the base method, which is what `EntityIndex::find_at`
+    /// currently produces when a method-level target resolves to the first
+    /// entity whose span contains the line. Composing over it would attribute
+    /// every caller of `BaseAdapter` to `HTTPAdapter.send`, wearing a proven
+    /// label.
+    ///
+    /// This is asserted now, while the graph still has that shape, so the
+    /// composition starts working correctly the moment the enrichment fix lands
+    /// rather than producing plausible wrong rows in the meantime.
+    #[test]
+    fn an_override_edge_landing_on_a_class_composes_nothing() {
+        let graph = InMemoryGraph::new();
+        let mut base_class = entity("BaseAdapter", "src/requests/adapters.py");
+        base_class.kind = EntityKind::Class;
+        let focal = entity("HTTPAdapter.send", "src/requests/adapters.py");
+        let caller = entity("Session.send", "src/requests/sessions.py");
+        for e in [&base_class, &focal, &caller] {
+            graph.upsert_entity(e).unwrap();
+        }
+        // Both legs are PROVEN. Only the shape is wrong, which is what makes
+        // this the case proven-ness alone cannot catch.
+        graph
+            .upsert_relation(&relation(
+                caller.id,
+                base_class.id,
+                RelationKind::Calls,
+                RelationOrigin::Lsp,
+                0.95,
+            ))
+            .unwrap();
+        graph
+            .upsert_relation(&relation(
+                focal.id,
+                base_class.id,
+                RelationKind::Overrides,
+                RelationOrigin::Lsp,
+                0.95,
+            ))
+            .unwrap();
+        let rows = rows_for(&graph, &focal.id);
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.entity_id.as_deref() == Some(&caller.id.to_string()[..])),
+            "an override edge pointing at a class is the degraded shape and must compose \
+             nothing: {rows:?}"
+        );
+    }
+
+    /// A focal that overrides nothing is untouched, so the composition cannot
+    /// have widened every answer.
+    #[test]
+    fn an_entity_that_overrides_nothing_gains_no_rows() {
+        let graph = InMemoryGraph::new();
+        let focal = entity("Standalone.run", "src/a.py");
+        let other = entity("Other.run", "src/b.py");
+        graph.upsert_entity(&focal).unwrap();
+        graph.upsert_entity(&other).unwrap();
+        let rows = rows_for(&graph, &focal.id);
+        assert!(rows.is_empty(), "{rows:?}");
+    }
 }

@@ -1154,6 +1154,36 @@ impl DaemonClient {
         resp.json().await.context("parse daemon verify response")
     }
 
+    /// Queue a cold language-server sweep and report the count a waiter must
+    /// exceed. See `POST /lsp/sweep`.
+    pub async fn queue_lsp_sweep(&self) -> Result<serde_json::Value> {
+        let resp = self
+            .send(
+                self.client.post(format!("{}/lsp/sweep", self.base_url)),
+                "lsp sweep",
+            )
+            .await?;
+        if !resp.status().is_success() {
+            return Err(self.http_refusal("lsp sweep", resp).await);
+        }
+        Ok(resp.json().await.context("read lsp sweep response")?)
+    }
+
+    /// How far the cold sweep has got. See `GET /lsp/sweep/status`.
+    pub async fn lsp_sweep_status(&self) -> Result<serde_json::Value> {
+        let resp = self
+            .send(
+                self.client
+                    .get(format!("{}/lsp/sweep/status", self.base_url)),
+                "lsp sweep status",
+            )
+            .await?;
+        if !resp.status().is_success() {
+            return Err(self.http_refusal("lsp sweep status", resp).await);
+        }
+        Ok(resp.json().await.context("read lsp sweep status")?)
+    }
+
     pub async fn reconcile(
         &self,
         request: &crate::commands::reconcile::ReconcileRequest,

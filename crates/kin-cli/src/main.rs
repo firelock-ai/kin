@@ -107,6 +107,16 @@ enum Command {
         /// Output machine-readable JSON status instead of human text
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Skip the cross-file enrichment phase
+        ///
+        /// Conversion queries an installed language server for the reference,
+        /// override and type-use edges a single-file parse cannot derive. It is
+        /// the slowest phase and it needs a server, so a scripted conversion
+        /// that does not want it can say so. The sweep is resumable, so a
+        /// repository initialized with this flag is enriched by the next daemon
+        /// that starts on it rather than left thin forever.
+        #[arg(long = "no-enrich", default_value_t = false)]
+        no_enrich: bool,
     },
     /// Show coherent repository-v6 workspace status
     Status {
@@ -2545,7 +2555,11 @@ fn main() -> Result<()> {
                 Command::Capabilities { json, verbose } => {
                     commands::capabilities::run(json, verbose)
                 }
-                Command::Init { path, json } => commands::init::run(path, json).await,
+                Command::Init {
+                    path,
+                    json,
+                    no_enrich,
+                } => commands::init::run(path, json, no_enrich).await,
                 Command::Status { json, wait_quiesce } => {
                     commands::status::run(json, std::time::Duration::from_secs(wait_quiesce)).await
                 }
