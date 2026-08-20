@@ -440,18 +440,7 @@ fn deciding_classes_all_present(
         .iter()
         .map(|(kind, _)| class_name(*kind).to_string())
         .collect();
-    let mut deciding = crate::negative::load_bearing_classes(&requested);
-    // `load_bearing_classes` answers the question that holds on any host:
-    // `references` is legitimately absent wherever a language server has not
-    // run, so requiring it everywhere would report every real graph as
-    // inconclusive. On a host that CAN produce it the answer changes, and the
-    // class the verdict rests on has to be measured rather than assumed.
-    if references_producible
-        && requested.iter().any(|class| class == "references")
-        && !deciding.iter().any(|class| class == "references")
-    {
-        deciding.push("references".to_string());
-    }
+    let deciding = crate::negative::deciding_classes(&requested, references_producible);
     if deciding.is_empty() {
         return false;
     }
@@ -1139,7 +1128,10 @@ mod tests {
                 &kinds,
                 &[RelationKind::Calls],
             );
-            assert_eq!(coverage["reference_enrichment"], json!("no_language_server"));
+            assert_eq!(
+                coverage["reference_enrichment"],
+                json!("no_language_server")
+            );
             assert_eq!(
                 coverage["scan"], "skipped_answer_witnessed",
                 "an unproducible class must not cost a language-wide walk: {coverage}"

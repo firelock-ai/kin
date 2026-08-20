@@ -358,6 +358,52 @@ pub(crate) fn load_bearing_classes(requested: &[String]) -> Vec<String> {
     }
 }
 
+/// Whether this answer's own observation says cross-file reference edges were
+/// producible where it ran: this build wires an adapter for the language AND the
+/// host carries the server.
+///
+/// `unsupported` and `no_language_server` are the two ways the class could never
+/// have existed, and [`absence_coverage_gap`] already refuses both by name.
+/// `unknown` is an unread host, and unmeasured is not a finding anywhere else in
+/// this module either.
+pub(crate) fn references_producible(payload: &Value) -> bool {
+    payload
+        .get(crate::edge_coverage::EDGE_COVERAGE_KEY)
+        .and_then(|coverage| coverage.get("reference_enrichment"))
+        .and_then(Value::as_str)
+        == Some("available")
+}
+
+/// The classes this answer's verdict actually rests on: [`load_bearing_classes`]
+/// plus `references` wherever this host could have produced it.
+///
+/// One definition, because three consumers ask the same question and a fourth
+/// answer would only be somewhere for them to drift. [`absence_coverage_gap`]
+/// decides whether an absence may be certified, `deciding_classes_all_present`
+/// in [`crate::edge_coverage`] decides whether the language scan may be skipped,
+/// and `edge_class_states` in [`crate::envelope`] publishes `decided_by` and the
+/// completeness `status` computed from it. Before FIR-2505 all three read
+/// [`load_bearing_classes`] and all three were wrong together, which is how
+/// shipped v0.5.43 answered `status: "complete"`, `bound: "exact"` and "so the
+/// counts here are the whole set" about a graph holding no cross-file reference
+/// edge at all, while listing that very absence one field away under `limits`.
+///
+/// [`load_bearing_classes`] answers the question that holds on any host, and its
+/// narrowing to `calls` is measured rather than assumed. This adds the one fact
+/// that changes the answer: on a host that CAN produce reference edges, their
+/// absence is a finding rather than the ordinary silence of a language server
+/// that never ran.
+pub(crate) fn deciding_classes(requested: &[String], references_producible: bool) -> Vec<String> {
+    let mut deciding = load_bearing_classes(requested);
+    if references_producible
+        && requested.iter().any(|class| class == "references")
+        && !deciding.iter().any(|class| class == "references")
+    {
+        deciding.push("references".to_string());
+    }
+    deciding
+}
+
 /// Why the graph cannot certify this absence, or `None` when every substrate the
 /// claim actually rests on is demonstrably present.
 ///
@@ -443,7 +489,7 @@ pub(crate) fn absence_coverage_gap(tool: &str, payload: &Value) -> Option<String
     let mut gaps: Vec<String> = Vec::new();
 
     if !requested.is_empty() {
-        let required = load_bearing_classes(&requested);
+        let required = deciding_classes(&requested, references_producible(payload));
         let absent = classes_in_state(&required, states, "absent");
         let unknown = classes_in_state(&required, states, "unknown");
         let present = classes_in_state(&requested, states, "present");
@@ -465,11 +511,31 @@ pub(crate) fn absence_coverage_gap(tool: &str, payload: &Value) -> Option<String
                     present.join(", ")
                 )
             };
+            // Which half of "extraction/enrichment" it is, whenever the answer's
+            // own observation can say. A missing `references` class on a host
+            // that wires an adapter AND carries the server is not a capability
+            // the reader has to go install: the edges were producible here and
+            // were not produced, so the sweep is the thing to look at. Saying
+            // only "the gap is in enrichment" sends a reader off to check a
+            // language server already sitting on their PATH.
+            let producible = if absent.iter().any(|class| *class == "references")
+                && references_producible(payload)
+            {
+                format!(
+                    " (a language server for {language} is installed on this host and this build \
+                     wires an adapter for it, so those edges were producible here and were not \
+                     produced; the enrichment sweep is what to look at, not the build's \
+                     capability)"
+                )
+            } else {
+                String::new()
+            };
             gaps.push(format!(
                 "cross_file_edges_absent: the graph holds no cross-file {missing} edges for \
                  {language}{observed}, so a use that reaches the target through {missing} could \
                  not have been found and an empty result says nothing about whether the target is \
-                 used; the gap is in extraction/enrichment for that language, not in the code"
+                 used; the gap is in extraction/enrichment for that language, not in the \
+                 code{producible}"
             ));
         } else if !unknown.is_empty()
             || coverage.get("budget_exhausted").and_then(Value::as_bool) == Some(true)
@@ -478,45 +544,6 @@ pub(crate) fn absence_coverage_gap(tool: &str, payload: &Value) -> Option<String
                 "edge_coverage_unknown: whether the graph holds cross-file {named} edges for \
                  {language} could not be established, so an empty result may mean the query had \
                  no edges to answer from rather than that the target is unused"
-            ));
-        }
-
-        // `references` absent is ordinary wherever a language server has not
-        // run, which is why [`load_bearing_classes`] leaves it out of the set a
-        // certification rests on. It stops being ordinary the moment this build
-        // wires an adapter for the language AND the host carries the server: the
-        // class was producible here, a scan that ran to completion found none of
-        // it, and an absence read off the classes that survived is read off a
-        // gap rather than off evidence.
-        //
-        // That is the exact shape shipped v0.5.43 certified on expressjs/express,
-        // where all ten exports of `lib/express.js` came back `consumer_count: 0`
-        // and `safe_to_conclude_absent: true` with `decided_by: ["calls"]` beside
-        // `references: absent` and `reference_enrichment: available`
-        // (FIR-2505, FIR-2492). A use that reaches an export through a `require`
-        // and a property read is carried by exactly the class that went missing,
-        // so the question the caller asked lived entirely outside the evidence
-        // the verdict rested on.
-        //
-        // Scoped to `references` because that is the class enrichment produces.
-        // `calls` comes from the linker and is already gated above. `imports` is
-        // never minted as an entity-level relation on any language, healthy or
-        // not, so gating on its absence would report every answer on every real
-        // graph as inconclusive, which is the failure mode opposite to this one
-        // and no more useful. And `absent` is only ever written by a scan that
-        // ran to completion: a skipped or budget-exhausted scan leaves `unknown`,
-        // which the branch above already answers.
-        if requested.iter().any(|class| class == "references")
-            && class_state(states, "references") == "absent"
-            && coverage.get("reference_enrichment").and_then(Value::as_str) == Some("available")
-        {
-            gaps.push(format!(
-                "reference_enrichment_unproduced: this build wires a language-server adapter for \
-                 {language} and one is installed on this host, so cross-file reference edges were \
-                 producible for it, and a completed scan of this graph found none; the class that \
-                 carries a use reaching the target from another file is missing rather than empty, \
-                 so an empty result cannot be read as the target being unused and must not be \
-                 acted on as a deletion"
             ));
         }
     }
@@ -3651,14 +3678,36 @@ mod tests {
             let gap = absence_coverage_gap(tool, &payload)
                 .unwrap_or_else(|| panic!("{tool} must not certify the express deletion shape"));
             assert!(
-                gap.contains("reference_enrichment_unproduced"),
-                "{tool} names the produced-nothing gap: {gap}"
+                gap.starts_with("cross_file_edges_absent"),
+                "{tool} names the absent class the verdict rested on: {gap}"
             );
             assert!(
-                gap.contains("JavaScript"),
-                "{tool} names the language the gap is about: {gap}"
+                gap.contains("no cross-file references edges for JavaScript"),
+                "{tool} names the class and the language: {gap}"
+            );
+            // The diagnosis a reader acts on: the server is already installed,
+            // so this is the sweep rather than a missing capability.
+            assert!(
+                gap.contains("were producible here and were not produced"),
+                "{tool} separates an unproduced class from an unproducible one: {gap}"
             );
         }
+        // One verdict. The completeness block is computed from the same deciding
+        // set, so it can no longer call the counts whole while the gate calls the
+        // answer inconclusive. That pair is quoted inside FIR-2492.
+        let negative = negative_for("impact_analysis", &payload, &structural_ready_envelope())
+            .expect("impact_analysis always qualifies");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert_eq!(negative["trust"], json!("inconclusive"));
+        let advice = negative["advice"].as_str().unwrap();
+        assert!(
+            !advice.contains("authoritative negative"),
+            "the advice must stop telling a caller the row licenses a deletion: {advice}"
+        );
+        assert!(
+            advice.contains("were producible here and were not produced"),
+            "the advice carries the limiting factor a reader acts on: {advice}"
+        );
     }
 
     /// The control FIR-2404's descendants exist to protect: the gate must not
@@ -3692,7 +3741,10 @@ mod tests {
             "entity_impacts": [],
             "edge_coverage": express_deletion_coverage("present", "available")
         });
-        assert_eq!(payload["edge_coverage"]["classes"]["imports"], json!("absent"));
+        assert_eq!(
+            payload["edge_coverage"]["classes"]["imports"],
+            json!("absent")
+        );
         assert_eq!(absence_coverage_gap("impact_analysis", &payload), None);
     }
 
@@ -3714,9 +3766,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("{enrichment} must still be gated"));
             assert!(gap.contains(expected), "{enrichment}: {gap}");
             assert!(
-                !gap.contains("reference_enrichment_unproduced"),
-                "{enrichment} was never producible here, so the produced-nothing gap must not \
-                 claim it was: {gap}"
+                !gap.contains("were producible here and were not produced"),
+                "{enrichment} was never producible here, so nothing may claim it was: {gap}"
             );
         }
     }

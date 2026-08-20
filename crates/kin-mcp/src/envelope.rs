@@ -654,7 +654,14 @@ fn edge_class_states(
             .unwrap_or(STATE_UNKNOWN);
         classes.insert(class.clone(), json!(state));
     }
-    let decided_by = crate::negative::load_bearing_classes(requested);
+    // The same deciding set the absence gate and the language scan read, so this
+    // block cannot say "the counts here are the whole set" about a graph the
+    // verdict beside it has just called inconclusive. Shipped v0.5.43 published
+    // exactly that pair on expressjs/express (FIR-2505, FIR-2492).
+    let decided_by = crate::negative::deciding_classes(
+        requested,
+        crate::negative::references_producible(payload),
+    );
     let limits = crate::negative::edge_coverage_degradation_labels(tool, payload);
     (classes, decided_by, limits)
 }
@@ -1884,12 +1891,73 @@ mod tests {
         assert_eq!(completeness["bound"], "exact", "{completeness}");
         assert_eq!(completeness["counted"]["reported"], 5);
         assert_eq!(completeness["counted"]["exact"], true);
-        // `imports` and `references` are absent in this fixture and always are
-        // on a real graph, since Kin mints no entity-level import edge. They are
-        // disclosed and they do not decide, which is the only way both
-        // directions of this contract can hold at once.
+        // `imports` is absent here and on every real graph, since Kin mints no
+        // entity-level import edge, so it is disclosed and does not decide.
+        // `references` is absent here too, and does not decide because this
+        // fixture's `reference_enrichment` reads `unknown`: nothing established
+        // that this host could produce the class. Where a host CAN produce it,
+        // `references` does decide (FIR-2505), which is the case the test below
+        // pins. Both directions of this contract hold only because the deciding
+        // set is computed from that fact rather than fixed.
         assert_eq!(completeness["classes"]["imports"], "absent");
         assert_eq!(completeness["decided_by"], json!(["calls"]));
+    }
+
+    /// FIR-2505 and FIR-2492, on the block that carried the sentence. Shipped
+    /// v0.5.43 answered `status: "complete"`, `bound: "exact"`, `decided_by:
+    /// ["calls"]` and "so the counts here are the whole set" on expressjs/express,
+    /// over a graph holding no cross-file reference edge at all, while listing
+    /// that very absence one field away under `limits`.
+    ///
+    /// A verdict and a completeness block disagreeing inside one object is the
+    /// defect FIR-2463 named, so the deciding set is shared and this flips with
+    /// the gate rather than beside it.
+    #[test]
+    fn a_producible_reference_class_that_produced_nothing_makes_the_counts_a_floor() {
+        let payload = ToolCallResult::text(
+            json!({
+                "total_upstream": 0,
+                "references": [],
+                "relation_kinds": ["calls", "imports", "references"],
+                "edge_coverage": {
+                    "scope": "language",
+                    "language": "JavaScript",
+                    "classes": {
+                        "calls": "present",
+                        "imports": "absent",
+                        "references": "absent",
+                    },
+                    "reference_enrichment": "available",
+                    "budget_exhausted": false,
+                },
+                "focal_resolution": {
+                    "addressed_by": "entity_id",
+                    "same_name_candidates": 1,
+                    "matched": "exact_focal_name",
+                    "other_candidates": [],
+                },
+            })
+            .to_string(),
+        );
+        let annotated = finalize(payload, ready_daemon_envelope(), "find_references");
+        let completeness = completeness_of(&annotated);
+
+        assert_eq!(
+            completeness["decided_by"],
+            json!(["calls", "references"]),
+            "a class this host could produce is one the verdict rests on: {completeness}"
+        );
+        assert_eq!(completeness["status"], "partial", "{completeness}");
+        assert_eq!(completeness["bound"], "at_least", "{completeness}");
+        let note = completeness["note"].as_str().unwrap();
+        assert!(
+            !note.contains("the whole set"),
+            "a graph missing the class the question needed does not hold the whole set: {note}"
+        );
+        assert!(
+            note.contains("lower bound"),
+            "the note says what the counts actually are: {note}"
+        );
     }
 
     /// Unobserved is not healthy. A payload carrying no observation leaves every
