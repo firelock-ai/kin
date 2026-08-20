@@ -129,6 +129,7 @@ pub fn build_trace_response(
     binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &impl GraphStore,
     request: &TraceRequest,
+    envelope: &kin_mcp::Envelope,
 ) -> Result<TraceResponse> {
     if request.json {
         return build_trace_json_response(layout, graph, &request.entity);
@@ -146,9 +147,34 @@ pub fn build_trace_response(
             request.max_lines,
             request.nearby_limit,
             request.transitive_limit,
+            envelope,
         )?,
         entities: Vec::new(),
     })
+}
+
+/// The absence qualifier for a context pack with no dependencies.
+///
+/// Declares `get_context_pack`, which is what `kin trace` actually builds
+/// (`kin_context::build_context_pack` above), and deliberately NOT
+/// `trace_data_flow`: that tool describes a different walk, and gating this
+/// command on its declaration would be judging a class this answer never
+/// measured, the failure `IMPACT_REFERENCE_KINDS` warns about one level down.
+fn trace_absence_qualifier(
+    graph: &impl GraphStore,
+    target: &Entity,
+    envelope: &kin_mcp::Envelope,
+) -> Vec<String> {
+    let coverage = kin_mcp::edge_coverage::observe_cross_file_reference_coverage_for_languages(
+        graph,
+        &[target.language],
+        &kin_mcp::handlers::review::IMPACT_REFERENCE_KINDS,
+    );
+    let payload = serde_json::json!({
+        "dependents": [],
+        kin_mcp::EDGE_COVERAGE_KEY: coverage,
+    });
+    crate::commands::absence_qualifier::qualify("get_context_pack", &payload, envelope, "")
 }
 
 pub fn build_trace_json_response(
@@ -207,6 +233,7 @@ fn build_trace_lines(
     max_lines: usize,
     nearby_limit: usize,
     transitive_limit: usize,
+    envelope: &kin_mcp::Envelope,
 ) -> Result<Vec<String>> {
     // Agents sometimes pass file paths instead of entity names; resolve those to
     // the graph-owned entities declared in that file rather than a raw file read.
@@ -225,6 +252,7 @@ fn build_trace_lines(
         max_lines,
         nearby_limit,
         transitive_limit,
+        envelope,
     )
 }
 
@@ -269,6 +297,7 @@ fn build_trace_lines_with_graph(
     max_lines: usize,
     nearby_limit: usize,
     transitive_limit: usize,
+    envelope: &kin_mcp::Envelope,
 ) -> Result<Vec<String>> {
     let token_budget = parse_budget(budget)?;
     let focal_max_lines = if compact {
@@ -381,6 +410,14 @@ fn build_trace_lines_with_graph(
             .chain(pack.transitive_deps.iter())
             .map(|e| &e.entity_id)
             .collect();
+        if all_dep_ids.is_empty() {
+            // Where the silence was. An empty dependency set printed NOTHING at
+            // all, which is quieter than impact's bare line and says even less:
+            // a reader saw a pack with no Deps section and had no way to tell a
+            // focal nothing depends on from one whose dependency edges this
+            // graph could never have held (FIR-2524).
+            lines.extend(trace_absence_qualifier(graph, target, envelope));
+        }
         if !all_dep_ids.is_empty() {
             lines.push("\n--- Deps ---".to_string());
             let mut printed = 0usize;
@@ -804,6 +841,18 @@ fn trace_not_found_guidance(entity: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    /// A daemon whose substrate is sound, so the FIR-2524 absence qualifier
+    /// answers on coverage rather than on the envelope. These cases assert trace
+    /// CONTENT and must not start failing for a reason they are not about.
+    fn healthy_trace_envelope() -> kin_mcp::Envelope {
+        kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 2,
+            "graph_generation": 1,
+        }))
+    }
+
     use super::{
         entity_mentions_qualifier, fallback_leaf_trace_matches, query_trace_matches,
         select_best_match, trace_not_found_guidance,
@@ -1045,6 +1094,7 @@ issues.map((iss) => util.finalizeItem(iss, ctx, core.config()));
                 nearby_limit: 3,
                 transitive_limit: 0,
             },
+            &healthy_trace_envelope(),
         )
         .unwrap();
         let joined = response.lines.join("\n");

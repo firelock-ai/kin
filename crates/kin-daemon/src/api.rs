@@ -6002,11 +6002,16 @@ async fn trace(
     let repository_authority = state
         .local_repository_authority_binding()
         .map_err(repository_authority_error)?;
+    // Same substrate reading the impact route supplies, from the same helper, so
+    // `kin trace` and `get_context_pack` cannot disagree about one daemon at one
+    // instant (FIR-2524).
+    let envelope = kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state));
     let result = kin_cli::commands::trace::build_trace_response(
         &state.layout,
         &repository_authority,
         graph.as_ref(),
         &req,
+        &envelope,
     )
     .map_err(internal_error)?;
     Ok(Json(result))
