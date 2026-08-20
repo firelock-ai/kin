@@ -829,8 +829,12 @@ pub fn collect_inline_comments(diff: &SemanticDiff, impact: &ImpactReport) -> Ve
             EntityChangeKind::Modified { old, new } => {
                 collect_modified_comments(old, new, impact, &mut comments);
             }
-            EntityChangeKind::Removed(_) => {
-                // Removed entities have no span data — nothing to anchor.
+            EntityChangeKind::Removed { .. } => {
+                // The base-side record now travels with the removal, so a span
+                // usually exists, but it describes a line that is gone at head.
+                // Anchoring a head-side comment there would point at whatever
+                // now occupies it, so removals stay in the diff and findings
+                // surfaces, which name the entity and its file directly.
             }
         }
     }
