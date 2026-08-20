@@ -3004,8 +3004,7 @@ mod tests {
     }
 
     const NOTES_SOURCE: &str = "export class NoteStore {\n  open(): void {}\n  close(): void {}\n  stats(): number { return 0; }\n}\n";
-    const SEND_SOURCE: &str =
-        "export function sendFile(path: string): void {\n  void path;\n}\n";
+    const SEND_SOURCE: &str = "export function sendFile(path: string): void {\n  void path;\n}\n";
     const DOWNLOAD_SOURCE: &str =
         "export function download(path: string): void {\n  sendFile(path);\n}\n";
 
@@ -3403,9 +3402,9 @@ mod tests {
                 serde_json::json!(dependents.len()),
                 "the selection must count the group it describes (compact={compact}): {value}"
             );
-            let dependencies = value["dependencies"].as_array().unwrap_or_else(|| {
-                panic!("the pack must carry a dependencies group: {value}")
-            });
+            let dependencies = value["dependencies"]
+                .as_array()
+                .unwrap_or_else(|| panic!("the pack must carry a dependencies group: {value}"));
             assert!(
                 dependencies.iter().all(|row| row["id"] != caller_id),
                 "a caller must not also be served as something the focal depends on \
@@ -3479,7 +3478,9 @@ mod tests {
         );
         let certified: HashSet<String> = references["references"]
             .as_array()
-            .unwrap_or_else(|| panic!("the control must reach the references surface: {references}"))
+            .unwrap_or_else(|| {
+                panic!("the control must reach the references surface: {references}")
+            })
             .iter()
             .filter_map(|row| row["entity_id"].as_str().map(str::to_string))
             .collect();

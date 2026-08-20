@@ -897,12 +897,8 @@ pub fn handle_get_context_pack<G: GraphStore>(
     // -- is that function's, so the two cannot drift apart by being edited
     // separately.
     let reference_kinds = default_reference_kinds();
-    let reference_rows = collect_graph_reference_rows(
-        store,
-        &entity_id,
-        &reference_kinds,
-        repository_authority,
-    )?;
+    let reference_rows =
+        collect_graph_reference_rows(store, &entity_id, &reference_kinds, repository_authority)?;
     // Observed before the partition, because a candidate row still witnesses the
     // edge class it arrived on. Same rule as the reference tool's, so the
     // coverage the pack publishes is the coverage that tool would publish.
@@ -930,7 +926,8 @@ pub fn handle_get_context_pack<G: GraphStore>(
         .filter_map(|row| row.entity_id.as_deref())
         .filter_map(|id| parse_entity_id(id).ok())
         .collect();
-    let certified: std::collections::HashSet<kin_model::ids::EntityId> = certified_ids.iter().copied().collect();
+    let certified: std::collections::HashSet<kin_model::ids::EntityId> =
+        certified_ids.iter().copied().collect();
     // What the graph can structurally answer over the classes the group was
     // built from. An empty `dependents` is only evidence about the code when
     // this says the focal's language links those classes across files, and
@@ -1009,7 +1006,10 @@ pub fn handle_get_context_pack<G: GraphStore>(
             projection_level: kin_model::context::ProjectionLevel::SignatureOnly,
             content: String::new(),
         };
-        dependents.push(project_dep(&entry, Some(DependencyRelation::DependentEdge))?);
+        dependents.push(project_dep(
+            &entry,
+            Some(DependencyRelation::DependentEdge),
+        )?);
         packed.insert(*id);
     }
     let transitive: Vec<_> = pack
