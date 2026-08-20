@@ -19,6 +19,11 @@
 KIN_CI_LANGUAGE_SERVERS_INSTALLED
 KIN_AGENT_TEST_KIN_BIN
 KIN_GIT_TEST_NO_SYMLINK_PRIVILEGE
+# Read only by the admission memory tests' shared probe, to print a per-phase
+# live-heap line during a passing run. Recording is unconditional; this only
+# controls whether the run also narrates. No runtime behaviour keys on it and
+# nothing an operator sets.
+KIN_HEAP_PHASES
 KIN_INIT_INTERRUPTED_TEST_BARRIER
 KIN_INIT_INTERRUPTED_TEST_SOURCE
 KIN_INIT_STAGING_SIGNAL_TEST_PARENT
