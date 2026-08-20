@@ -2,6 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 pub mod admit;
+pub mod allow;
 pub mod agent;
 pub mod approvals;
 pub mod assistant;
