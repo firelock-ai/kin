@@ -471,8 +471,7 @@ pub(super) fn extract_js_property_definition(
     let args = js_call_arguments(&call);
 
     let (target_node, name_node, implementation) = if callee == OBJECT_DEFINE_PROPERTY {
-        let (Some(target), Some(name), Some(descriptor)) =
-            (args.first(), args.get(1), args.get(2))
+        let (Some(target), Some(name), Some(descriptor)) = (args.first(), args.get(1), args.get(2))
         else {
             return false;
         };
@@ -678,7 +677,9 @@ fn extract_js_node(
                 if child.kind() == "default" || child.utf8_text(source).unwrap_or("") == "default" {
                     has_default = true;
                 }
-                extract_js_node(&child, source, file_id, entities, relations, owners, definers);
+                extract_js_node(
+                    &child, source, file_id, entities, relations, owners, definers,
+                );
             }
             // If this is a default export and recursion didn't create any entities,
             // create a synthetic "default" entity so the linker can resolve
