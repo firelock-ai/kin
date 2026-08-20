@@ -159,10 +159,37 @@ impl SharedAdmissionPolicy {
     pub fn derive_from_tree(
         first_parent: Option<&Self>,
         tree: &ResolvedTree,
+        source_body_len: impl FnMut(Hash256) -> Result<u64>,
+    ) -> Result<(Self, Option<AdmissionPolicyDelta>)> {
+        Self::derive_from_tree_with_allowances(first_parent, tree, source_body_len, |_| {
+            Err(ModelError::InvalidOperation(format!(
+                "this build cannot read {SENSITIVE_ALLOWANCE_SOURCE_PATH}: upgrade to a consumer \
+                 that derives sensitive-artifact allowances, or remove the file"
+            )))
+        })
+    }
+
+    /// Derive the complete shared policy, including approvals carried by the tree.
+    ///
+    /// Separate from [`Self::derive_from_tree`] so consumers adopt allowance
+    /// derivation on their own schedule rather than in one synchronized bump.
+    /// The older entry point stays callable and refuses by name when a tree
+    /// carries approvals it cannot read, which is the loud half of that trade:
+    /// a consumer that silently ignored the file would drop approvals a
+    /// reviewer believes are in force.
+    pub fn derive_from_tree_with_allowances(
+        first_parent: Option<&Self>,
+        tree: &ResolvedTree,
         mut source_body_len: impl FnMut(Hash256) -> Result<u64>,
+        mut allowance_body: impl FnMut(Hash256) -> Result<Vec<u8>>,
     ) -> Result<(Self, Option<AdmissionPolicyDelta>)> {
         let mut sources = Vec::new();
+        let mut allowance_blob = None;
         for artifact in tree.artifacts() {
+            if let Some(hash) = sensitive_allowance_source_blob(artifact)? {
+                allowance_blob = Some(hash);
+                continue;
+            }
             let Some((base_directory, kind)) = shared_rule_source_path(&artifact.path)? else {
                 continue;
             };
@@ -178,6 +205,10 @@ impl SharedAdmissionPolicy {
                 precedence: 0,
             });
         }
+        let sensitive_allowances = match allowance_blob {
+            Some(hash) => parse_sensitive_allowances(&allowance_body(hash)?)?,
+            None => Vec::new(),
+        };
 
         sources.sort_by(compare_rule_sources);
         for (index, source) in sources.iter_mut().enumerate() {
@@ -189,20 +220,20 @@ impl SharedAdmissionPolicy {
         }
 
         let Some(old) = first_parent else {
-            let policy = Self::new(0, sources, Vec::new())?;
+            let policy = Self::new(0, sources, sensitive_allowances)?;
             let delta = AdmissionPolicyDelta::initialize(policy.clone());
             delta.validate()?;
             return Ok((policy, Some(delta)));
         };
 
-        if old.sources == sources {
+        if old.sources == sources && old.sensitive_allowances == sensitive_allowances {
             return Ok((old.clone(), None));
         }
 
         let generation = old.generation.checked_add(1).ok_or_else(|| {
             ModelError::InvalidOperation("shared admission-policy generation exhausted".to_string())
         })?;
-        let policy = Self::new(generation, sources, old.sensitive_allowances.clone())?;
+        let policy = Self::new(generation, sources, sensitive_allowances)?;
         let delta = AdmissionPolicyDelta::update(old.clone(), policy.clone());
         delta.validate()?;
         Ok((policy, Some(delta)))
@@ -272,6 +303,180 @@ impl SharedAdmissionPolicy {
             sensitive_allowances: &self.sensitive_allowances,
         };
         hash_json(b"kin-shared-admission-policy-v1\0", &identity).map(AdmissionPolicyHash)
+    }
+}
+
+/// Root-level tracked file carrying explicit sensitive-artifact approvals.
+///
+/// The approval rides the tree rather than policy state on purpose. Policy
+/// state dies at the repository boundary, so a teammate who clones and runs
+/// `kin init` would hit the same wall a colleague already cleared. A tracked
+/// file survives clone and convert, derives on init, and shows up in review as
+/// an ordinary diff.
+///
+/// # Format
+///
+/// UTF-8 text. Blank lines and lines beginning with `#` are ignored anywhere.
+/// The first line that is neither must be the version header
+/// `kin-allowances 1`. Every line after it is one approval, five tab-separated
+/// fields: the repository path, the artifact's sha256 as 64 hex digits, the
+/// entry kind as `blob`, `blob+x` or `symlink`, the approver, and a reason that
+/// runs to the end of the line and must not be blank.
+///
+/// The first three fields are the path, digest and entry kind the admission
+/// refusal names, and all three must match for the approval to apply, so
+/// re-editing a secret re-blocks it.
+///
+/// The file is the approval set rather than an addition to it: deleting a line
+/// revokes that approval on the next derivation. At most one line per path; a
+/// changed digest edits the existing line rather than adding a second.
+///
+/// A path holding a tab byte, or one that is not valid UTF-8, cannot be written
+/// here and is refused by name rather than mis-parsed.
+pub const SENSITIVE_ALLOWANCE_SOURCE_PATH: &str = ".kin-allowances";
+
+const SENSITIVE_ALLOWANCE_FORMAT_HEADER: &str = "kin-allowances 1";
+
+/// Parse the tracked allowance file into canonical, validated approvals.
+///
+/// Every refusal is loud. A malformed file fails the derivation rather than
+/// resolving to an empty approval set, because a silently ignored file leaves
+/// an author blocked by a rule they believe they cleared, and leaves a reader
+/// unable to tell an empty file from an unreadable one.
+pub fn parse_sensitive_allowances(body: &[u8]) -> Result<Vec<SensitiveArtifactAllowance>> {
+    let text = std::str::from_utf8(body).map_err(|error| {
+        ModelError::InvalidOperation(format!(
+            "{SENSITIVE_ALLOWANCE_SOURCE_PATH} is not valid UTF-8: {error}"
+        ))
+    })?;
+    let mut allowances = Vec::new();
+    let mut header_seen = false;
+    for (index, raw) in text.lines().enumerate() {
+        let number = index + 1;
+        let line = raw.trim_end_matches(['\r']);
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if !header_seen {
+            if line.trim() != SENSITIVE_ALLOWANCE_FORMAT_HEADER {
+                return Err(ModelError::InvalidOperation(format!(
+                    "{SENSITIVE_ALLOWANCE_SOURCE_PATH} line {number} must be the format header \
+                     \"{SENSITIVE_ALLOWANCE_FORMAT_HEADER}\", found \"{line}\""
+                )));
+            }
+            header_seen = true;
+            continue;
+        }
+        let allowance = parse_sensitive_allowance_line(line, number)?;
+        if let Some(earlier) = allowances
+            .iter()
+            .position(|seen: &SensitiveArtifactAllowance| seen.path == allowance.path)
+        {
+            return Err(ModelError::InvalidOperation(format!(
+                "{SENSITIVE_ALLOWANCE_SOURCE_PATH} line {number}: {} is already approved on an \
+                 earlier line; one approval per path, and a changed digest needs the existing \
+                 line edited rather than a second one",
+                allowances[earlier].path
+            )));
+        }
+        allowances.push(allowance);
+    }
+    if !header_seen {
+        return Err(ModelError::InvalidOperation(format!(
+            "{SENSITIVE_ALLOWANCE_SOURCE_PATH} is missing its format header \
+             \"{SENSITIVE_ALLOWANCE_FORMAT_HEADER}\""
+        )));
+    }
+    sort_canonical(&mut allowances)?;
+    Ok(allowances)
+}
+
+fn parse_sensitive_allowance_line(line: &str, number: usize) -> Result<SensitiveArtifactAllowance> {
+    let invalid = |detail: String| {
+        ModelError::InvalidOperation(format!(
+            "{SENSITIVE_ALLOWANCE_SOURCE_PATH} line {number}: {detail}"
+        ))
+    };
+    let mut fields = line.splitn(5, '\t');
+    let path = fields
+        .next()
+        .ok_or_else(|| invalid("missing path".to_string()))?;
+    let digest = fields
+        .next()
+        .ok_or_else(|| invalid("missing digest".to_string()))?;
+    let kind = fields
+        .next()
+        .ok_or_else(|| invalid("missing entry kind".to_string()))?;
+    let approved_by = fields
+        .next()
+        .ok_or_else(|| invalid("missing approver".to_string()))?;
+    let reason = fields.next().ok_or_else(|| {
+        invalid(
+            "expected five tab-separated fields: path, digest, kind, approver, reason".to_string(),
+        )
+    })?;
+
+    let path = RepoPath::from_utf8(path)
+        .map_err(|error| invalid(format!("invalid path \"{path}\": {error}")))?;
+    let decoded = hex::decode(digest)
+        .map_err(|error| invalid(format!("digest \"{digest}\" is not hex: {error}")))?;
+    let bytes: [u8; 32] = decoded.as_slice().try_into().map_err(|_| {
+        invalid(format!(
+            "digest \"{digest}\" must be 32 bytes of hex, found {}",
+            decoded.len()
+        ))
+    })?;
+    let kind = match kind {
+        "blob" => SensitiveArtifactKind::Blob { executable: false },
+        "blob+x" => SensitiveArtifactKind::Blob { executable: true },
+        "symlink" => SensitiveArtifactKind::Symlink,
+        other => {
+            return Err(invalid(format!(
+                "entry kind \"{other}\" must be one of blob, blob+x, symlink"
+            )))
+        }
+    };
+    if approved_by.trim().is_empty() {
+        return Err(invalid("approver must not be empty".to_string()));
+    }
+    let allowance = SensitiveArtifactAllowance {
+        path,
+        content_hash: Hash256::from_bytes(bytes),
+        kind,
+        approved_by: AuthorId::new(approved_by),
+        reason: reason.to_string(),
+    };
+    allowance
+        .validate()
+        .map_err(|error| invalid(error.to_string()))?;
+    Ok(allowance)
+}
+
+/// The blob carrying root-level approvals, if this artifact is that file.
+///
+/// A nested copy is refused rather than ignored. Silently skipping one would
+/// leave an author staring at a file they wrote, in a directory that looks
+/// reasonable, with no approval and no explanation.
+fn sensitive_allowance_source_blob(artifact: &crate::ResolvedArtifact) -> Result<Option<Hash256>> {
+    let bytes = artifact.path.as_bytes();
+    let name = match bytes.iter().rposition(|byte| *byte == b'/') {
+        Some(separator) => &bytes[separator + 1..],
+        None => bytes,
+    };
+    if name != SENSITIVE_ALLOWANCE_SOURCE_PATH.as_bytes() {
+        return Ok(None);
+    }
+    if bytes != SENSITIVE_ALLOWANCE_SOURCE_PATH.as_bytes() {
+        return Err(ModelError::InvalidOperation(format!(
+            "sensitive allowances are read only from the repository root: move {} to {}",
+            artifact.path, SENSITIVE_ALLOWANCE_SOURCE_PATH
+        )));
+    }
+    match artifact.entry {
+        TreeEntry::Blob { hash, .. } => Ok(Some(hash)),
+        _ => Err(ModelError::InvalidOperation(format!(
+            "{SENSITIVE_ALLOWANCE_SOURCE_PATH} must be a regular file"
+        ))),
     }
 }
 
@@ -650,6 +855,10 @@ mod tests {
     use super::*;
     use crate::{ArtifactId, ResolvedArtifact};
 
+    fn no_allowance_file(_: Hash256) -> Result<Vec<u8>> {
+        panic!("this tree carries no allowance file, so its body must never be read")
+    }
+
     fn allowance(hash: u8, kind: SensitiveArtifactKind) -> SensitiveArtifactAllowance {
         SensitiveArtifactAllowance {
             path: RepoPath::from_utf8(".env").unwrap(),
@@ -749,14 +958,18 @@ mod tests {
         ])
         .unwrap();
 
-        let (policy, delta) =
-            SharedAdmissionPolicy::derive_from_tree(None, &tree, |hash| match hash {
+        let (policy, delta) = SharedAdmissionPolicy::derive_from_tree_with_allowances(
+            None,
+            &tree,
+            |hash| match hash {
                 value if value == root_hash => Ok(11),
                 value if value == nested_git_hash => Ok(12),
                 value if value == nested_kin_hash => Ok(13),
                 other => panic!("unexpected source hash {other}"),
-            })
-            .unwrap();
+            },
+            no_allowance_file,
+        )
+        .unwrap();
 
         assert_eq!(policy.generation, 0);
         assert_eq!(
@@ -785,46 +998,284 @@ mod tests {
         );
     }
 
+    fn allowance_file(entries: &[(&str, [u8; 32], &str, &str, &str)]) -> Vec<u8> {
+        let mut body = String::from("# approvals reviewed in the pull request that adds them\n");
+        body.push_str(SENSITIVE_ALLOWANCE_FORMAT_HEADER);
+        body.push('\n');
+        for (path, digest, kind, approver, reason) in entries {
+            body.push_str(&format!(
+                "{path}\t{}\t{kind}\t{approver}\t{reason}\n",
+                hex::encode(digest)
+            ));
+        }
+        body.into_bytes()
+    }
+
+    fn tree_with(entries: &[(&str, Hash256)]) -> ResolvedTree {
+        ResolvedTree::from_artifacts(entries.iter().map(|(path, hash)| {
+            ResolvedArtifact::new(
+                ArtifactId::new(),
+                RepoPath::from_utf8(*path).unwrap(),
+                TreeEntry::blob(*hash, false),
+            )
+        }))
+        .unwrap()
+    }
+
     #[test]
-    fn shared_policy_transition_preserves_allowances_and_skips_noops() {
-        let old_hash = Hash256::from_bytes([0x37; 32]);
-        let old_tree = ResolvedTree::from_artifacts([ResolvedArtifact::new(
-            ArtifactId::new(),
-            RepoPath::from_utf8(".gitignore").unwrap(),
-            TreeEntry::blob(old_hash, false),
-        )])
-        .unwrap();
-        let (mut old, _) =
-            SharedAdmissionPolicy::derive_from_tree(None, &old_tree, |_| Ok(4)).unwrap();
-        old = SharedAdmissionPolicy::new(
-            old.generation,
-            old.sources,
-            vec![allowance(
-                0x38,
-                SensitiveArtifactKind::Blob { executable: false },
-            )],
+    fn allowances_derive_from_the_tracked_root_file() {
+        let ignore = Hash256::from_bytes([0x41; 32]);
+        let allowances = Hash256::from_bytes([0x42; 32]);
+        let tree = tree_with(&[
+            (".gitignore", ignore),
+            (SENSITIVE_ALLOWANCE_SOURCE_PATH, allowances),
+        ]);
+        let body = allowance_file(&[
+            (
+                "notekeeper/search.py",
+                [0x51; 32],
+                "blob",
+                "troy",
+                "tokenizer local, reviewed",
+            ),
+            (
+                "scripts/deploy.sh",
+                [0x52; 32],
+                "blob+x",
+                "troy",
+                "vendored fixture key, rotated",
+            ),
+            (
+                "config/link",
+                [0x53; 32],
+                "symlink",
+                "security",
+                "points at a mounted secret",
+            ),
+        ]);
+
+        let (policy, delta) = SharedAdmissionPolicy::derive_from_tree_with_allowances(
+            None,
+            &tree,
+            |_| Ok(9),
+            |hash| {
+                assert_eq!(hash, allowances, "only the allowance blob may be read");
+                Ok(body.clone())
+            },
         )
         .unwrap();
 
-        let (same, no_delta) =
-            SharedAdmissionPolicy::derive_from_tree(Some(&old), &old_tree, |_| Ok(4)).unwrap();
-        assert_eq!(same, old);
+        assert_eq!(policy.sensitive_allowances.len(), 3);
+        assert!(policy.sensitive_allowances.iter().any(|entry| {
+            entry.path == RepoPath::from_utf8("notekeeper/search.py").unwrap()
+                && entry.content_hash == Hash256::from_bytes([0x51; 32])
+                && entry.kind == SensitiveArtifactKind::Blob { executable: false }
+                && entry.approved_by == AuthorId::new("troy")
+                && entry.reason == "tokenizer local, reviewed"
+        }));
+        assert!(policy
+            .sensitive_allowances
+            .iter()
+            .any(|entry| { entry.kind == SensitiveArtifactKind::Blob { executable: true } }));
+        assert!(policy
+            .sensitive_allowances
+            .iter()
+            .any(|entry| entry.kind == SensitiveArtifactKind::Symlink));
+        assert_eq!(
+            policy.sources.len(),
+            1,
+            "the allowance file is not an ignore source"
+        );
+        policy.validate().unwrap();
+        assert_eq!(delta, Some(AdmissionPolicyDelta::initialize(policy)));
+    }
+
+    #[test]
+    fn an_edited_allowance_file_advances_the_policy_with_ignore_sources_unchanged() {
+        let ignore = Hash256::from_bytes([0x43; 32]);
+        let first_blob = Hash256::from_bytes([0x44; 32]);
+        let second_blob = Hash256::from_bytes([0x45; 32]);
+        let approved = allowance_file(&[(".env", [0x61; 32], "blob", "security", "staging only")]);
+        let rotated = allowance_file(&[(".env", [0x62; 32], "blob", "security", "staging only")]);
+
+        let tree = tree_with(&[
+            (".gitignore", ignore),
+            (SENSITIVE_ALLOWANCE_SOURCE_PATH, first_blob),
+        ]);
+        let (old, _) = SharedAdmissionPolicy::derive_from_tree_with_allowances(
+            None,
+            &tree,
+            |_| Ok(9),
+            |_| Ok(approved.clone()),
+        )
+        .unwrap();
+
+        let (same, no_delta) = SharedAdmissionPolicy::derive_from_tree_with_allowances(
+            Some(&old),
+            &tree,
+            |_| Ok(9),
+            |_| Ok(approved.clone()),
+        )
+        .unwrap();
+        assert_eq!(same, old, "an unchanged tree is a no-op");
         assert_eq!(no_delta, None);
 
-        let new_hash = Hash256::from_bytes([0x39; 32]);
-        let changed_tree = ResolvedTree::from_artifacts([ResolvedArtifact::new(
-            ArtifactId::new(),
-            RepoPath::from_utf8(".gitignore").unwrap(),
-            TreeEntry::blob(new_hash, false),
-        )])
+        let edited = tree_with(&[
+            (".gitignore", ignore),
+            (SENSITIVE_ALLOWANCE_SOURCE_PATH, second_blob),
+        ]);
+        let (changed, delta) = SharedAdmissionPolicy::derive_from_tree_with_allowances(
+            Some(&old),
+            &edited,
+            |_| Ok(9),
+            |_| Ok(rotated.clone()),
+        )
         .unwrap();
-        let (changed, delta) =
-            SharedAdmissionPolicy::derive_from_tree(Some(&old), &changed_tree, |_| Ok(7)).unwrap();
-        assert_eq!(changed.generation, old.generation + 1);
-        assert_eq!(changed.sensitive_allowances, old.sensitive_allowances);
+        assert_eq!(changed.sources, old.sources, "no ignore source moved");
         assert_eq!(
-            delta,
-            Some(AdmissionPolicyDelta::update(old, changed.clone()))
+            changed.generation,
+            old.generation + 1,
+            "an approval change must advance the policy even with sources unchanged"
+        );
+        assert_eq!(
+            changed.sensitive_allowances[0].content_hash,
+            Hash256::from_bytes([0x62; 32])
+        );
+        assert_eq!(delta, Some(AdmissionPolicyDelta::update(old, changed)));
+    }
+
+    #[test]
+    fn deleting_the_allowance_file_revokes_every_approval() {
+        let ignore = Hash256::from_bytes([0x46; 32]);
+        let blob = Hash256::from_bytes([0x47; 32]);
+        let body = allowance_file(&[(".env", [0x63; 32], "blob", "security", "staging only")]);
+        let with_file = tree_with(&[
+            (".gitignore", ignore),
+            (SENSITIVE_ALLOWANCE_SOURCE_PATH, blob),
+        ]);
+        let (old, _) = SharedAdmissionPolicy::derive_from_tree_with_allowances(
+            None,
+            &with_file,
+            |_| Ok(9),
+            |_| Ok(body.clone()),
+        )
+        .unwrap();
+        assert_eq!(old.sensitive_allowances.len(), 1);
+
+        let without_file = tree_with(&[(".gitignore", ignore)]);
+        let (revoked, delta) = SharedAdmissionPolicy::derive_from_tree_with_allowances(
+            Some(&old),
+            &without_file,
+            |_| Ok(9),
+            no_allowance_file,
+        )
+        .unwrap();
+        assert!(
+            revoked.sensitive_allowances.is_empty(),
+            "the tracked file is the approval set, so deleting it revokes"
+        );
+        assert_eq!(revoked.generation, old.generation + 1);
+        assert!(delta.is_some());
+    }
+
+    #[test]
+    fn the_compatibility_entry_point_refuses_a_tree_carrying_approvals() {
+        let ignore = Hash256::from_bytes([0x49; 32]);
+        let blob = Hash256::from_bytes([0x4a; 32]);
+
+        let plain = tree_with(&[(".gitignore", ignore)]);
+        SharedAdmissionPolicy::derive_from_tree(None, &plain, |_| Ok(9))
+            .expect("a tree with no approvals still derives through the older entry point");
+
+        let with_approvals = tree_with(&[
+            (".gitignore", ignore),
+            (SENSITIVE_ALLOWANCE_SOURCE_PATH, blob),
+        ]);
+        let error = SharedAdmissionPolicy::derive_from_tree(None, &with_approvals, |_| Ok(9))
+            .expect_err("a consumer that cannot read approvals must refuse rather than drop them");
+        assert!(
+            error.to_string().contains("this build cannot read"),
+            "unexpected compatibility refusal: {error}"
+        );
+    }
+
+    #[test]
+    fn a_nested_allowance_file_is_refused_rather_than_ignored() {
+        let nested = Hash256::from_bytes([0x48; 32]);
+        let tree = tree_with(&[(&format!("src/{SENSITIVE_ALLOWANCE_SOURCE_PATH}"), nested)]);
+        let error = SharedAdmissionPolicy::derive_from_tree_with_allowances(
+            None,
+            &tree,
+            |_| Ok(9),
+            |_| panic!("a nested file must be refused before its body is read"),
+        )
+        .expect_err("a nested allowance file must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("sensitive allowances are read only from the repository root"),
+            "unexpected nested-file error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_allowance_file_fails_the_derivation_rather_than_reading_empty() {
+        let header = SENSITIVE_ALLOWANCE_FORMAT_HEADER;
+        let digest = hex::encode([0x71; 32]);
+        for (body, expected) in [
+            (
+                format!("notekeeper/a.py\t{digest}\tblob\ttroy\treason\n"),
+                "must be the format header",
+            ),
+            (format!("{header}\n"), ""),
+            (
+                format!("{header}\nnotekeeper/a.py\t{digest}\tzip\ttroy\treason\n"),
+                "must be one of blob, blob+x, symlink",
+            ),
+            (
+                format!("{header}\nnotekeeper/a.py\tabcd\tblob\ttroy\treason\n"),
+                "must be 32 bytes of hex",
+            ),
+            (
+                format!("{header}\nnotekeeper/a.py\t{digest}\tblob\ttroy\n"),
+                "expected five tab-separated fields",
+            ),
+            (
+                format!("{header}\nnotekeeper/a.py\t{digest}\tblob\ttroy\t   \n"),
+                "requires a reason",
+            ),
+            (
+                format!("{header}\nnotekeeper/a.py\t{digest}\tblob\t\treason\n"),
+                "approver must not be empty",
+            ),
+            (
+                format!(
+                    "{header}\nnotekeeper/a.py\t{digest}\tblob\ttroy\tfirst\n\
+                     notekeeper/a.py\t{digest}\tblob\ttroy\tsecond\n"
+                ),
+                "is already approved on an earlier line",
+            ),
+        ] {
+            let parsed = parse_sensitive_allowances(body.as_bytes());
+            if expected.is_empty() {
+                assert_eq!(
+                    parsed.unwrap(),
+                    Vec::new(),
+                    "a header with no entries is a valid empty approval set"
+                );
+                continue;
+            }
+            let error = parsed.expect_err(&format!("must refuse: {body:?}"));
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected:?} for {body:?}, got: {error}"
+            );
+        }
+        let error =
+            parse_sensitive_allowances(&[0xff, 0xfe]).expect_err("invalid UTF-8 is refused");
+        assert!(
+            error.to_string().contains("is not valid UTF-8"),
+            "unexpected utf8 error: {error}"
         );
     }
 
