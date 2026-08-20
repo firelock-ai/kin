@@ -33,6 +33,16 @@ type ProjectionEntry = (kin_model::RepoPath, kin_model::TreeEntry, Arc<[u8]>);
 /// `source_hashes` name bodies already present in the daemon's admitted blob
 /// CAS. They are copied into repository-owned CAS immediately before the
 /// authority compare-and-swap; raw checkout bytes are never consulted.
+///
+/// The plan also carries the repository authority it was read from, still open.
+/// Opening one is O(store): it decodes the whole persisted authority and then
+/// re-verifies every body in repository CAS against its content address, which
+/// kin-db does unconditionally on every open. A commit that planned against one
+/// open authority and then published through a second paid that twice for one
+/// change. Carrying it is what makes the plan and the publication the same
+/// authority rather than two reads of the same generation, so the roots the
+/// transaction expects and the roots the publication compare-and-swaps against
+/// are the same in-memory state.
 pub struct NativeCommitPlan {
     pub change: SemanticChange,
     pub transaction: RepositoryTransaction,
@@ -51,6 +61,7 @@ pub struct NativeCommitPlan {
     previous_tree: kin_model::ResolvedTree,
     target_tree: kin_model::ResolvedTree,
     source_hashes: Vec<Hash256>,
+    authority: RepositoryAuthorityManager<LocalFileBackend>,
 }
 
 #[derive(Debug)]
@@ -934,6 +945,9 @@ fn plan_native_commit_inner(
     }
     source_hashes.extend(shared_policy.sources.iter().map(|source| source.body_hash));
 
+    // The lease is a read of this authority and the plan carries the authority
+    // itself, so the read ends here and the open does not.
+    drop(lease);
     Ok(NativeCommitPlan {
         change,
         transaction,
@@ -945,6 +959,7 @@ fn plan_native_commit_inner(
         previous_tree: workspace.tree,
         target_tree: deltas.expected_tree,
         source_hashes: source_hashes.into_iter().collect(),
+        authority,
     })
 }
 
@@ -1086,7 +1101,7 @@ pub(crate) fn commit_native_plan(
             plan.transaction.repository_id, repository_id
         )));
     }
-    let authority = authority_context.open().map_err(DaemonError::Graph)?;
+    let authority = plan.authority;
     for hash in &plan.source_hashes {
         if let Some(body) = read_publishable_source(blobs, &authority, *hash)?.body_to_publish() {
             authority.save_source_blob(*hash, body)?;
@@ -1205,10 +1220,14 @@ fn commit_native_plan_with_working_copy_proof(
             plan.transaction.repository_id, repository_id
         )));
     }
-    let authority = crate::mcp_commit::timed_commit_phase("open_repository_authority", || {
-        authority_context.open()
-    })
-    .map_err(DaemonError::Graph)?;
+    // The plan carries the authority it planned against, still open. The phase
+    // keeps its name and its place in the table so a reader can compare a trace
+    // against an older one; what it now measures is the handoff, and a commit
+    // whose plan and publication share one authority reports it as the near-zero
+    // span it is. A second open here would decode the whole persisted authority
+    // and re-verify every body in repository CAS a second time for one change.
+    let authority =
+        crate::mcp_commit::timed_commit_phase("open_repository_authority", || plan.authority);
     crate::mcp_commit::timed_commit_phase("stage_changed_source_blobs", || {
         for hash in &plan.source_hashes {
             if let Some(body) = read_publishable_source(blobs, &authority, *hash)?.body_to_publish()
@@ -1521,6 +1540,60 @@ mod tests {
             &test_authority_context(layout),
             plan,
         )
+    }
+
+    /// One commit opens the repository authority exactly once.
+    ///
+    /// An open is O(store) rather than a cheap handle: kin-db decodes the whole
+    /// persisted authority and then re-verifies every body in repository CAS
+    /// against its content address, unconditionally, on every one. A commit that
+    /// planned against one open authority and then published through a second
+    /// paid that whole cost twice to record one change, so the plan carries the
+    /// authority it planned against and the publication consumes it.
+    ///
+    /// The count is the invariant, not the timing. A publication that opens its
+    /// own authority again fails the second assertion here whatever the store
+    /// costs to open, including on a fixture small enough for the duplicate to
+    /// be invisible in wall time.
+    #[test]
+    fn one_commit_opens_the_repository_authority_once() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+        add_artifact(
+            &graph,
+            &blobs,
+            b"api.py",
+            b"def get():\n    pass\n",
+            |hash| TreeEntry::blob(hash, false),
+        );
+
+        crate::local_repository_authority::reset_authority_open_count();
+        let plan = plan_native_commit(
+            &init.layout,
+            &graph,
+            &blobs,
+            OperationId::new(),
+            fixed_timestamp(),
+            AuthorId::new("commitwall"),
+            "publish one artifact".to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::local_repository_authority::authority_open_count(),
+            1,
+            "planning must open the repository authority exactly once"
+        );
+
+        commit_native_plan_with_projection(&init.layout, &blobs, plan).unwrap();
+        assert_eq!(
+            crate::local_repository_authority::authority_open_count(),
+            1,
+            "the publication opened a second repository authority instead of consuming the \
+             one the plan carries; every open decodes the whole persisted authority and \
+             re-verifies every body in repository CAS, so this commit paid that twice"
+        );
     }
 
     /// A desired tree describes one transition out of one observed prior tree.
