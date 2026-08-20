@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.45] - 2026-08-20
+
+### Changed
+
+- Move the kin registry pins to kin-db 0.7.36 and kin-vfs-core 0.4.7 (#987)
+- Pin the typescript package the JS/TS language server needs (#988)
+- Bound the file-level definitions pass in wall time (#989)
+
+
 ## [0.5.44] - 2026-08-20
 
 ### Changed
