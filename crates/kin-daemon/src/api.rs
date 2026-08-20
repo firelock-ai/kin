@@ -6012,6 +6012,37 @@ async fn trace(
     Ok(Json(result))
 }
 
+/// The substrate reading an absence verdict rests on, in the shape
+/// [`kin_mcp::Envelope::with_health`] consumes.
+///
+/// Read from the same `DaemonState` fields `/health` reads, deliberately, so the
+/// CLI's rendered verdict and the MCP one cannot disagree about the same daemon
+/// at the same instant. A second, thinner source of these facts is how two
+/// surfaces come to answer differently, which is the defect FIR-2524 exists to
+/// close; building one here would have closed it while opening it.
+///
+/// `graph_loaded` is derived from a nonzero entity count exactly as `/health`
+/// derives it, rather than asserted.
+fn daemon_health_snapshot(state: &Arc<DaemonState>) -> serde_json::Value {
+    let entity_count = state.graph.entity_count();
+    serde_json::json!({
+        "initialized": state
+            .is_initialized
+            .load(std::sync::atomic::Ordering::Relaxed),
+        "graph_loaded": entity_count > 0,
+        "graph_entity_count": entity_count as u64,
+        "graph_generation": state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::Relaxed),
+        "embed_worker_failed": state
+            .embed_worker_failed
+            .load(std::sync::atomic::Ordering::Relaxed),
+        "mass_deletion_blocked": state
+            .mass_deletion_blocked
+            .load(std::sync::atomic::Ordering::Relaxed),
+    })
+}
+
 /// POST /impact — compute downstream impact against daemon-owned graph state.
 async fn impact(
     headers: axum::http::HeaderMap,
@@ -6030,10 +6061,25 @@ async fn impact(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let result =
-        kin_cli::commands::impact::build_impact_response(&state.layout, graph.as_ref(), &req)
-            .await
-            .map_err(internal_error)?;
+    // The CLI's absence qualifier is the MCP verdict rendered as prose, so it
+    // needs the same substrate reading the MCP path gets (FIR-2524). Built here
+    // because only the daemon holds it: `build_impact_response` sees a graph and
+    // a layout and could not observe a degraded worker if it wanted to.
+    //
+    // Passing a thinner envelope was the tempting shortcut and is the defect
+    // this ticket closes, wearing the fix's clothes: an envelope carrying no
+    // degraded signal makes the CLI MORE confident than MCP on exactly the
+    // degraded daemon nobody exercises, and every test written against a healthy
+    // one would pass.
+    let envelope = kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state));
+    let result = kin_cli::commands::impact::build_impact_response(
+        &state.layout,
+        graph.as_ref(),
+        &req,
+        &envelope,
+    )
+    .await
+    .map_err(internal_error)?;
     Ok(Json(result))
 }
 
