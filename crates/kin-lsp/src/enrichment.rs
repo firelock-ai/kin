@@ -577,14 +577,14 @@ fn lsp_language_id(path: &str) -> Option<&'static str> {
 /// The file being enriched is never opened here. Its caller already holds that
 /// document open, and re-opening a live document is a change notification this
 /// pass has no business sending.
-struct ScopedDocuments<'a> {
+pub(crate) struct ScopedDocuments<'a> {
     server: &'a LspServer,
     provider: Option<DocumentProvider<'a>>,
     open: std::collections::HashSet<String>,
 }
 
 impl<'a> ScopedDocuments<'a> {
-    fn new(server: &'a LspServer, provider: Option<DocumentProvider<'a>>) -> Self {
+    pub(crate) fn new(server: &'a LspServer, provider: Option<DocumentProvider<'a>>) -> Self {
         Self {
             server,
             provider,
@@ -594,7 +594,7 @@ impl<'a> ScopedDocuments<'a> {
 
     /// Hand `rel_path` to the server if it is not already open, and report
     /// whether the server now holds it.
-    async fn ensure_open(&mut self, rel_path: &str, uri: &str) -> bool {
+    pub(crate) async fn ensure_open(&mut self, rel_path: &str, uri: &str) -> bool {
         if self.open.contains(uri) {
             return true;
         }
@@ -641,7 +641,7 @@ impl<'a> ScopedDocuments<'a> {
     }
 
     /// Close every document this pass opened.
-    async fn close_all(&mut self) {
+    pub(crate) async fn close_all(&mut self) {
         for uri in self.open.drain() {
             let _ = self
                 .server
@@ -653,6 +653,107 @@ impl<'a> ScopedDocuments<'a> {
                 .await;
         }
     }
+}
+
+/// Whether the server proved the candidate export resolves where the member
+/// resolves.
+///
+/// `any` over `any`, and the emptiness behavior is the point rather than an
+/// accident: an un-opened document answers with NO locations, and an unproven
+/// candidate must not bind, so empty on either side has to be false. Written
+/// with `all` instead, empty would be vacuously true and every same-named
+/// export in the module file would bind on its name alone, which is the
+/// fallback this crate deleted.
+fn candidate_is_proven(
+    candidate_definitions: &[protocol::Location],
+    member_definitions: &[protocol::Location],
+) -> bool {
+    candidate_definitions.iter().any(|proven| {
+        member_definitions
+            .iter()
+            .any(|member| same_location(proven, member))
+    })
+}
+
+/// The in-tree exports a member expression on a module receiver binds to.
+///
+/// This is the equivalence join, and the reason it is not the bare-name
+/// fallback this crate deleted. The server proves where the MEMBER resolves;
+/// it proves separately where a candidate export's OWN token resolves. Binding
+/// requires those two answers to name the same place, so a same-named export of
+/// something else does not qualify: on express, `Router` and `exports.Router`
+/// both resolve to `node_modules/router/index.js:51` and join, while
+/// `exports.Route` resolves to `router/lib/route.js`, a different file, and is
+/// refused. Nothing is ever matched on the name alone.
+///
+/// The export's own token lives in the module file, which is not the file being
+/// enriched, and a server answers only about documents it holds. The caller
+/// opens the enriched file and nothing else, so `documents` is what makes the
+/// second leg answerable at all; without it every candidate declines rather
+/// than binding.
+///
+/// Both enrichment arms call this. They differ only in the relation kind they
+/// mint from the result, never in what they are willing to believe.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn member_export_bindings<'a>(
+    server: &LspServer,
+    index: &'a EntityIndex,
+    workspace_root: &Path,
+    documents: &mut ScopedDocuments<'_>,
+    enriched_file: &str,
+    uri: &str,
+    line: u32,
+    receiver_col: u32,
+    member_col: u32,
+    member_name: &str,
+) -> Vec<&'a EntityRef> {
+    let module_locations = locations_at(
+        server,
+        "textDocument/typeDefinition",
+        uri,
+        line,
+        receiver_col,
+    )
+    .await;
+    let member_definitions =
+        locations_at(server, "textDocument/definition", uri, line, member_col).await;
+    let mut bound: Vec<&EntityRef> = Vec::new();
+
+    for module_location in &module_locations {
+        let Some(module_path) = protocol::uri_to_path(&module_location.uri) else {
+            continue;
+        };
+        let module_path = module_path.to_string_lossy().to_string();
+        for candidate in index.entities_in_file(&module_path) {
+            if candidate.name != member_name {
+                continue;
+            }
+            let candidate_uri = protocol::path_to_uri(&workspace_root.join(&candidate.file_path));
+            if candidate.file_path != enriched_file
+                && !documents
+                    .ensure_open(&candidate.file_path, &candidate_uri)
+                    .await
+            {
+                continue;
+            }
+            let candidate_definitions = locations_at(
+                server,
+                "textDocument/definition",
+                &candidate_uri,
+                candidate.name_line,
+                candidate.name_col,
+            )
+            .await;
+            if !candidate_is_proven(&candidate_definitions, &member_definitions) {
+                continue;
+            }
+            if bound.iter().any(|already| already.id == candidate.id) {
+                continue;
+            }
+            bound.push(candidate);
+        }
+    }
+    bound
 }
 
 /// Query type definitions for entities referenced in a function's signature/body.
@@ -713,101 +814,57 @@ pub async fn enrich_entity_uses_type(
                 let receiver_definitions =
                     locations_at(server, "textDocument/definition", &uri, line, col).await;
                 if receiver_names_a_module(&receiver_definitions, &entity.file_path) {
-                    let module_locations =
-                        locations_at(server, "textDocument/typeDefinition", &uri, line, col).await;
-                    let member_definitions =
-                        locations_at(server, "textDocument/definition", &uri, line, member_col)
-                            .await;
-                    for module_location in &module_locations {
-                        let Some(module_path) = protocol::uri_to_path(&module_location.uri) else {
+                    for candidate in member_export_bindings(
+                        server,
+                        index,
+                        workspace_root,
+                        &mut scoped_documents,
+                        &entity.file_path,
+                        &uri,
+                        line,
+                        col,
+                        member_col,
+                        &member_name,
+                    )
+                    .await
+                    {
+                        if candidate.id == entity.id || !seen_targets.insert(candidate.id) {
                             continue;
-                        };
-                        let module_path = module_path.to_string_lossy().to_string();
-                        for candidate in index.entities_in_file(&module_path) {
-                            if candidate.name != member_name {
-                                continue;
-                            }
-                            // The join, and the reason this is not the bare-name
-                            // fallback this pass deleted. The server proved
-                            // where the member resolves; it proves separately
-                            // where this export's own token resolves. Binding
-                            // requires those two answers to be the same place,
-                            // so a same-named export of something else does not
-                            // qualify: `exports.Route` resolves to
-                            // `router/lib/route.js`, a different target, and is
-                            // refused. Nothing is matched on the name alone.
-                            let candidate_uri =
-                                protocol::path_to_uri(&workspace_root.join(&candidate.file_path));
-                            // The export's own token lives in the module file,
-                            // which is not the file being enriched, and a server
-                            // answers only about documents it holds. The caller
-                            // opens the enriched file and nothing else, so this
-                            // second leg queried a document the server had never
-                            // seen, came back empty, and declined every join:
-                            // `Router` stayed at zero references while the
-                            // misattribution it was meant to replace was already
-                            // gone. Hand the server that document first, from
-                            // repository authority, and close it below.
-                            if candidate.file_path != entity.file_path
-                                && !scoped_documents
-                                    .ensure_open(&candidate.file_path, &candidate_uri)
-                                    .await
-                            {
-                                continue;
-                            }
-                            let candidate_definitions = locations_at(
-                                server,
-                                "textDocument/definition",
-                                &candidate_uri,
-                                candidate.name_line,
-                                candidate.name_col,
-                            )
-                            .await;
-                            if !candidate_definitions.iter().any(|proven| {
-                                member_definitions
-                                    .iter()
-                                    .any(|member| same_location(proven, member))
-                            }) {
-                                continue;
-                            }
-                            if candidate.id == entity.id || !seen_targets.insert(candidate.id) {
-                                continue;
-                            }
-                            relations.push(Relation {
-                                id: deterministic_relation_id(
-                                    RelationKind::UsesType,
-                                    entity.id,
-                                    candidate.id,
-                                ),
-                                kind: RelationKind::UsesType,
-                                src: GraphNodeId::Entity(entity.id),
-                                dst: GraphNodeId::Entity(candidate.id),
-                                confidence: 0.85,
-                                origin: RelationOrigin::Lsp,
-                                created_in: None,
-                                import_source: None,
-                                evidence: query_position_evidence(
-                                    "lsp_member_on_module",
-                                    &entity.file_path,
-                                    &protocol::Range {
-                                        start: Position {
-                                            line,
-                                            character: member_col,
-                                        },
-                                        end: Position {
-                                            line,
-                                            character: member_col,
-                                        },
-                                    },
-                                ),
-                            });
-                            debug!(
-                                entity = %entity.name,
-                                member = %member_name,
-                                uses_type = %candidate.name,
-                                "bound a member on a module receiver to its export"
-                            );
                         }
+                        relations.push(Relation {
+                            id: deterministic_relation_id(
+                                RelationKind::UsesType,
+                                entity.id,
+                                candidate.id,
+                            ),
+                            kind: RelationKind::UsesType,
+                            src: GraphNodeId::Entity(entity.id),
+                            dst: GraphNodeId::Entity(candidate.id),
+                            confidence: 0.85,
+                            origin: RelationOrigin::Lsp,
+                            created_in: None,
+                            import_source: None,
+                            evidence: query_position_evidence(
+                                "lsp_member_on_module",
+                                &entity.file_path,
+                                &protocol::Range {
+                                    start: Position {
+                                        line,
+                                        character: member_col,
+                                    },
+                                    end: Position {
+                                        line,
+                                        character: member_col,
+                                    },
+                                },
+                            ),
+                        });
+                        debug!(
+                            entity = %entity.name,
+                            member = %member_name,
+                            uses_type = %candidate.name,
+                            "bound a member on a module receiver to its export"
+                        );
                     }
                     // The receiver's own type is not this entity's fact, whether
                     // or not the member bound to anything. Declining here is
@@ -1312,6 +1369,40 @@ mod member_on_module_tests {
         assert!(
             with.open.is_empty(),
             "every document this pass opened is closed with it"
+        );
+    }
+
+    /// The invariant both arms depend on, exercised on the decision rule with
+    /// real inputs rather than on an offline server that answers nothing.
+    ///
+    /// The empty cases are the ones that matter. A document the server was never
+    /// handed answers with NO locations, which is exactly what this join saw
+    /// before a provider existed, and an unproven candidate must not bind.
+    /// Written with `all` instead of `any`, empty would be vacuously true and
+    /// every same-named export in the module file would bind on its name alone.
+    #[test]
+    fn an_unproven_candidate_never_binds() {
+        use super::candidate_is_proven;
+        let member = [location("file:///w/node_modules/router/index.js", 51)];
+        let router_export = [location("file:///w/node_modules/router/index.js", 51)];
+        let route_export = [location("file:///w/node_modules/router/lib/route.js", 40)];
+
+        assert!(candidate_is_proven(&router_export, &member));
+        assert!(
+            !candidate_is_proven(&route_export, &member),
+            "a same-named export of something else must not bind"
+        );
+        assert!(
+            !candidate_is_proven(&[], &member),
+            "an un-opened document answers nothing, and nothing is not a proof"
+        );
+        assert!(
+            !candidate_is_proven(&router_export, &[]),
+            "a member the server could not resolve proves nothing either"
+        );
+        assert!(
+            !candidate_is_proven(&[], &[]),
+            "two silences are not an agreement"
         );
     }
 
