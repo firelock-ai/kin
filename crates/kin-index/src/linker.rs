@@ -11349,22 +11349,34 @@ void f();
             "src/requests/adapters.py",
             EntityRole::Source,
         );
+        // A tempting decoy: an unrelated class declaring the same method
+        // name, which a producer matching on names alone would bind to.
+        let decoy = py_class("Mailer", "src/mailer.py");
+        let decoy_send = py_method("Mailer.send", "src/mailer.py", EntityRole::Source);
 
-        let files = vec![FileParseData {
-            file_path: "src/requests/adapters.py".to_string(),
-            entities: vec![child.clone(), child_send.clone()],
-            relations: vec![
-                // `BaseAdapter` is declared nowhere in this universe.
-                py_extends("HTTPAdapter", "BaseAdapter"),
-                py_contains("HTTPAdapter", "HTTPAdapter.send"),
-            ],
-            imports: vec![],
-        }];
+        let files = vec![
+            FileParseData {
+                file_path: "src/requests/adapters.py".to_string(),
+                entities: vec![child.clone(), child_send.clone()],
+                relations: vec![
+                    // `BaseAdapter` is declared nowhere in this universe.
+                    py_extends("HTTPAdapter", "BaseAdapter"),
+                    py_contains("HTTPAdapter", "HTTPAdapter.send"),
+                ],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "src/mailer.py".to_string(),
+                entities: vec![decoy.clone(), decoy_send.clone()],
+                relations: vec![py_contains("Mailer", "Mailer.send")],
+                imports: vec![],
+            },
+        ];
 
         let result = link_cross_file(&files);
         assert!(
             all_override_edges(&result).is_empty(),
-            "an unresolvable base mints nothing"
+            "an unresolvable base mints nothing, decoy or no decoy"
         );
     }
 
@@ -11430,22 +11442,38 @@ void f();
             "src/requests/adapters.py",
             EntityRole::Source,
         );
+        // The name exists elsewhere in the repository, on a class the adapter
+        // does not descend from. A producer matching on names would take it.
+        let decoy = py_class("Renderer", "src/renderer.py");
+        let decoy_build = py_method(
+            "Renderer.build_response",
+            "src/renderer.py",
+            EntityRole::Source,
+        );
 
-        let files = vec![FileParseData {
-            file_path: "src/requests/adapters.py".to_string(),
-            entities: vec![
-                base.clone(),
-                base_send.clone(),
-                child.clone(),
-                child_build.clone(),
-            ],
-            relations: vec![
-                py_contains("BaseAdapter", "BaseAdapter.send"),
-                py_extends("HTTPAdapter", "BaseAdapter"),
-                py_contains("HTTPAdapter", "HTTPAdapter.build_response"),
-            ],
-            imports: vec![],
-        }];
+        let files = vec![
+            FileParseData {
+                file_path: "src/requests/adapters.py".to_string(),
+                entities: vec![
+                    base.clone(),
+                    base_send.clone(),
+                    child.clone(),
+                    child_build.clone(),
+                ],
+                relations: vec![
+                    py_contains("BaseAdapter", "BaseAdapter.send"),
+                    py_extends("HTTPAdapter", "BaseAdapter"),
+                    py_contains("HTTPAdapter", "HTTPAdapter.build_response"),
+                ],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "src/renderer.py".to_string(),
+                entities: vec![decoy.clone(), decoy_build.clone()],
+                relations: vec![py_contains("Renderer", "Renderer.build_response")],
+                imports: vec![],
+            },
+        ];
 
         let result = link_cross_file(&files);
         assert!(
