@@ -474,7 +474,7 @@ fn overlay_removed_entity_impact_from_base<G: GraphStore>(
         .entity_changes
         .iter()
         .filter_map(|change| match &change.kind {
-            EntityChangeKind::Removed(id) => Some(*id),
+            EntityChangeKind::Removed { .. } => Some(change.entity_id),
             _ => None,
         })
         .collect();
@@ -891,17 +891,20 @@ fn collect_changed_entities<G: GraphStore>(
                     role: new.role,
                 });
             }
-            EntityChangeKind::Removed(id) => {
-                // The diff carries only the removed entity's id, and the entity
-                // is absent at head. Resolve its name/kind/file where it still
-                // exists — the base ref — so findings and the entity list read
-                // as code, not opaque ids, and the breaking-removal rule keeps
-                // demotion only for a surface the BASE graph also cannot name.
-                // Fall back to the live store, then to the id string when the
-                // graph has genuinely forgotten the entity.
-                let removed = match at_base {
-                    Some(base) => base.get_entity(id)?,
-                    None => None,
+            EntityChangeKind::Removed { old } => {
+                let id = &change.entity_id;
+                // The diff now carries the removed entity's base-side record, so
+                // prefer it. The base ref and then the live store remain as
+                // fallbacks for a diff built before the payload existed, or for
+                // a removal whose record was genuinely unrecoverable, and the
+                // breaking-removal rule keeps demotion only for a surface none
+                // of the three can name.
+                let removed = match old {
+                    Some(entity) => Some(entity.clone()),
+                    None => match at_base {
+                        Some(base) => base.get_entity(id)?,
+                        None => None,
+                    },
                 };
                 let removed = match removed {
                     Some(entity) => Some(entity),
@@ -1244,8 +1247,8 @@ fn derive_policy(
                             rename_neutral,
                         )
                     }
-                    EntityChangeKind::Removed(id) => {
-                        let id_string = id.to_string();
+                    EntityChangeKind::Removed { .. } => {
+                        let id_string = change.entity_id.to_string();
                         let unresolvable = unresolvable_removed.contains(id_string.as_str());
                         let name = resolved_names
                             .get(id_string.as_str())
@@ -2556,7 +2559,7 @@ mod tests {
                 .iter()
                 .map(|&i| EntityChange {
                     entity_id: ids[i],
-                    kind: EntityChangeKind::Removed(ids[i]),
+                    kind: EntityChangeKind::Removed { old: None },
                 })
                 .collect();
             Review {
@@ -3638,7 +3641,7 @@ mod tests {
                 entity_changes: vec![
                     EntityChange {
                         entity_id: moved_old_id,
-                        kind: EntityChangeKind::Removed(moved_old_id),
+                        kind: EntityChangeKind::Removed { old: None },
                     },
                     EntityChange {
                         entity_id: readded.id,
@@ -4358,7 +4361,7 @@ mod tests {
                 head: None,
                 entity_changes: vec![EntityChange {
                     entity_id: removed_id,
-                    kind: EntityChangeKind::Removed(removed_id),
+                    kind: EntityChangeKind::Removed { old: None },
                 }],
                 relation_changes: vec![],
             },

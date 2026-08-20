@@ -392,7 +392,7 @@ pub fn analyze_impact_at<I: ImpactGraph>(
             EntityChangeKind::Modified { old, new } => {
                 vec![entity_identity_key(old), entity_identity_key(new)]
             }
-            EntityChangeKind::Removed(_) => Vec::new(),
+            EntityChangeKind::Removed { .. } => Vec::new(),
         })
         .collect();
 
