@@ -848,6 +848,16 @@ enum SnapshotSaveMode {
     Full,
 }
 
+fn authority_holds_entity(
+    authority: &kin_db::GraphSnapshot,
+    node: &kin_model::GraphNodeId,
+) -> bool {
+    match node {
+        kin_model::GraphNodeId::Entity(entity_id) => authority.entities.contains_key(entity_id),
+        _ => false,
+    }
+}
+
 fn exact_source_storage_error(message: impl Into<String>) -> DaemonError {
     DaemonError::Graph(kin_db::KinDbError::StorageError(message.into()))
 }
@@ -4626,28 +4636,29 @@ impl DaemonState {
             // Exact tree admission and explicit commit publication move that
             // authority before mutating this derived runtime graph. Detach the
             // current derived batch, prove its exact tree matches the persisted
-            // workspace at this generation, then acknowledge it after flushing
-            // query text. Never recreate graph.kndb as a second local truth.
+            // workspace at this generation, publish the language-server
+            // relations that authority does not hold yet, then acknowledge the
+            // batch after flushing query text. Never recreate graph.kndb as a
+            // second local truth.
+            //
+            // The acknowledgement sits after the publication on purpose. This
+            // arm used to detach a batch, discard it, and complete the epoch
+            // regardless, so every language-server relation the sweep had just
+            // installed was reported as persisted and was gone on the next
+            // open. A failure now returns before `complete`, the RAII attempt
+            // drops into `fail_persistence`, and nothing claims a batch it did
+            // not write.
             let persistence_attempt = self
                 .graph
                 .begin_delta_persistence(expected_gen)
                 .map(|(_, epoch)| GraphPersistenceAttempt::new(self.graph.as_ref(), epoch));
-            let authority_graph = self.load_committed_authority_graph(expected_gen)?;
-            let authority_tree = authority_graph.resolved_tree();
-            let live_tree = self.graph.resolved_tree();
-            if live_tree != authority_tree {
-                return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
-                    format!(
-                        "refusing to acknowledge derived graph state at repository generation {expected_gen}: live exact tree does not match workspace authority"
-                    ),
-                )));
-            }
+            let published_generation = self.publish_local_workspace_enrichment(expected_gen)?;
             self.graph.flush_text_index().map_err(DaemonError::from)?;
             if let Some(attempt) = persistence_attempt {
                 attempt.complete();
             }
             self.graph.clear_full_snapshot_required();
-            expected_gen
+            published_generation
         };
 
         // Backend saves advance their own authority here. Local authority was
@@ -4846,6 +4857,209 @@ impl DaemonState {
             sync_directory_metadata(parent).map_err(DaemonError::Io)?;
         }
         Ok(index_path)
+    }
+
+    /// Prove the derived graph still matches workspace authority at this
+    /// generation, publish the language-server relations authority does not
+    /// hold yet, and report the generation the workspace ends at.
+    ///
+    /// Language-server relations are the one part of this derived graph that
+    /// nothing rebuilds. Parser reconciliation re-derives its own output from
+    /// the exact tree, and authority owns that tree. An enrichment edge exists
+    /// only while a language server was running, and the sweep records the file
+    /// it finished, so a reopen that finds those edges missing does not go
+    /// looking again and the loss is permanent. Writing them into the workspace
+    /// semantic overlay is what makes them survive: `workspace_graph_snapshot`
+    /// replays that overlay on every open, which is the same path a daemon
+    /// loads its graph through at startup.
+    ///
+    /// The write set comes from the live graph rather than from the detached
+    /// persistence batch. A batch is swapped out of the pending buffer before
+    /// anything writes it, so a failed write loses its contents while the
+    /// relations themselves stay live, and no later batch carries them again.
+    /// Diffing live against authority is idempotent instead: it republishes
+    /// whatever an earlier attempt failed to land, and it does not care which
+    /// batch an edge arrived in.
+    ///
+    /// One authority open serves the whole pass. An open is O(store) rather
+    /// than a cheap handle, because kin-db decodes the complete persisted
+    /// authority and then re-verifies every body in repository CAS against its
+    /// content address, so the tree proof, the diff, and the commit all run
+    /// against this one lease.
+    fn publish_local_workspace_enrichment(&self, expected_generation: u64) -> Result<u64> {
+        let binding = self.local_repository_authority_binding()?;
+        let authority = binding.open_manager().map_err(DaemonError::from)?;
+        let workspace_id = binding.workspace_id();
+        let lease = authority.read_authority();
+        let observed_generation = lease.roots().generation;
+        if observed_generation != expected_generation {
+            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                format!(
+                    "post-commit authority moved for repo {}: expected generation {expected_generation}, recovered {observed_generation}; reopen before finalizing derived indexes",
+                    self.cached_repo_id
+                ),
+            )));
+        }
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == workspace_id)
+            .cloned()
+            .ok_or_else(|| {
+                DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
+                    "local repository {} authority has no startup-pinned workspace {workspace_id}",
+                    self.cached_repo_id
+                )))
+            })?;
+        let authority_snapshot = lease
+            .workspace_graph_snapshot(&workspace_id)
+            .map_err(DaemonError::from)?
+            .ok_or_else(|| {
+                DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
+                    "local repository {} authority has no graph for workspace {workspace_id}",
+                    self.cached_repo_id
+                )))
+            })?;
+        let roots = lease.roots().clone();
+        // The lease is a read of this authority and the commit below goes
+        // through the authority itself, so the read ends here and the open
+        // does not.
+        drop(lease);
+
+        let live_tree = self.graph.resolved_tree();
+        if live_tree != authority_snapshot.resolved_tree {
+            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                format!(
+                    "refusing to acknowledge derived graph state at repository generation {expected_generation}: live exact tree does not match workspace authority"
+                ),
+            )));
+        }
+
+        let live_snapshot = self.graph.to_snapshot();
+        let (semantic_delta, unpublishable) =
+            Self::language_server_enrichment_delta(&live_snapshot, &authority_snapshot)?;
+        if unpublishable > 0 {
+            debug!(
+                unpublishable,
+                "language-server relations name a node this workspace authority does not hold and were not published"
+            );
+        }
+        if semantic_delta.is_empty() {
+            return Ok(expected_generation);
+        }
+        let published = semantic_delta.relation_deltas().len();
+
+        let new_generation = workspace.generation.checked_add(1).ok_or_else(|| {
+            DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
+                "workspace {workspace_id} is at generation {}, the highest kin can record, so language-server enrichment cannot be published",
+                workspace.generation
+            )))
+        })?;
+        let transaction = kin_model::RepositoryTransaction {
+            schema_version: kin_model::REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: OperationId::new(),
+            repository_id: binding.repository_id().clone(),
+            expected_generation,
+            expected_roots: roots,
+            actor: kin_model::AuthorId::new("kin"),
+            reason: "publish language-server reference enrichment".to_string(),
+            external_objects: Vec::new(),
+            changes: Vec::new(),
+            aliases: Vec::new(),
+            git_authority_delta: None,
+            ref_mutations: Vec::new(),
+            default_ref_mutation: None,
+            workspace_mutation: Some(kin_model::WorkspaceMutation {
+                workspace_id,
+                expected: kin_model::WorkspaceExpectation::MustEqual {
+                    generation: workspace.generation,
+                    head: workspace.head.clone(),
+                    base_target: workspace.base_target.clone(),
+                    base_tree_hash: workspace.base_tree_hash,
+                    tree_hash: workspace.tree_hash,
+                    semantic_overlay_hash: workspace.semantic_overlay_hash,
+                    admission_policy: workspace.admission_policy,
+                },
+                new_generation,
+                new_head: workspace.head.clone(),
+                new_base_target: workspace.base_target.clone(),
+                new_base_tree_hash: workspace.base_tree_hash,
+                // Enrichment changes what kin knows about the tree, never the
+                // tree. Restating the exact tree hash unchanged is what keeps
+                // this a semantic publication rather than a tree admission.
+                tree_deltas: Vec::new(),
+                new_tree_hash: workspace.tree_hash,
+                semantic_delta,
+                new_shared_admission_policy: workspace.shared_admission_policy.clone(),
+                new_admission_policy: workspace.admission_policy,
+            }),
+            local_overlay_delta: None,
+            merge_transaction_delta: None,
+            sealed_observation: None,
+        };
+        let receipt = authority
+            .commit_repository_transaction(transaction)
+            .map_err(DaemonError::from)?;
+        self.record_repository_authority_commit(receipt.generation)?;
+        info!(
+            repo_id = self.cached_repo_id.as_str(),
+            published,
+            generation = receipt.generation,
+            "published language-server enrichment into workspace authority"
+        );
+        Ok(receipt.generation)
+    }
+
+    /// The canonical workspace semantic transition that publishes every
+    /// language-server relation the live graph holds and authority does not,
+    /// paired with the count this workspace cannot carry.
+    ///
+    /// Only `RelationOrigin::Lsp` edges are published. The rest of the derived
+    /// graph is reproducible from the exact tree authority already owns, so
+    /// promoting it here would turn a derived view into authority rather than
+    /// repair a loss.
+    ///
+    /// The desired set starts from what authority already holds, so this can
+    /// only add or refine. Enrichment never retracts an authority relation:
+    /// a language server that is absent this run, or slower than the last one,
+    /// would otherwise delete durable truth by failing to reproduce it.
+    ///
+    /// An edge is skipped unless authority holds both of its endpoints as
+    /// entities. A relation is not a place to introduce an entity, and the
+    /// endpoint an enrichment edge names may be an artifact, a test, or a
+    /// symbol owned outside this repository; publishing one of those here would
+    /// ask authority to accept a relation into a node it cannot resolve.
+    fn language_server_enrichment_delta(
+        live: &kin_db::GraphSnapshot,
+        authority: &kin_db::GraphSnapshot,
+    ) -> Result<(kin_model::WorkspaceSemanticDelta, usize)> {
+        let mut desired = authority.relations.clone();
+        let mut unpublishable = 0usize;
+        for (relation_id, relation) in &live.relations {
+            if relation.origin != kin_model::RelationOrigin::Lsp {
+                continue;
+            }
+            if !authority_holds_entity(authority, &relation.src)
+                || !authority_holds_entity(authority, &relation.dst)
+            {
+                unpublishable += 1;
+                continue;
+            }
+            desired.insert(*relation_id, relation.clone());
+        }
+        let delta = kin_core::diff_workspace_semantics(
+            &authority.entities,
+            &authority.relations,
+            &authority.entities,
+            &desired,
+        )
+        .map_err(|error| {
+            DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
+                "canonicalize language-server enrichment transition: {error}"
+            )))
+        })?;
+        Ok((delta, unpublishable))
     }
 
     fn load_committed_authority_graph(
