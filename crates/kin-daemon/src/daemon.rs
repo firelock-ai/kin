@@ -629,14 +629,45 @@ fn duration_from_env_secs(name: &str, default: Duration) -> Duration {
 /// The post-pass snapshot persists the final state once the pass completes, and
 /// a mid-pass crash only loses re-derivable enrichment, never primary truth.
 /// O(gaps × graph size) writes on large repos are the failure mode being closed.
+///
+/// An LSP cold sweep is suppressed for the SAME reason, and the paragraph above
+/// described it before it was covered: a sweep's only graph mutations are
+/// re-derivable enrichment, and a background flush mid-sweep re-serializes the
+/// whole graph to persist edges the next sweep would recompute. Measured on a
+/// converted psf/requests store (6491 commits): one 188-second sweep triggered a
+/// single flush costing 96.6 seconds, which carried a 56.2-second repository
+/// authority successor preparation whose own `change_bodies_ms` was 0. That is
+/// a whole-workspace rebuild and a whole-store re-admission performed for zero
+/// changed content bodies.
+///
+/// Suppression is bounded by the sweep, not open-ended: the sweep marks the
+/// graph dirty when it finishes, so the flush fires immediately after rather
+/// than never, and the sweep's own duration is bounded by the per-file
+/// definitions budget and the per-query caps. A live-only write landing
+/// mid-sweep therefore waits at most one sweep before it is persisted.
+/// Which background pass, if any, is holding the flush clocks down.
+///
+/// Named rather than passed as a second bool beside the first: two adjacent
+/// booleans at a call site say nothing about which is which, and the reason a
+/// flush was suppressed is exactly what a reader of this decision wants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlushSuppression {
+    /// Nothing is holding the clocks; the durability bounds apply as written.
+    None,
+    /// A daemon-side embed pass is in flight.
+    EmbedPass,
+    /// An LSP cold sweep is in flight.
+    LspSweep,
+}
+
 fn should_flush_now(
     since_save: Duration,
     since_mutation: Duration,
-    embed_pass_active: bool,
+    suppression: FlushSuppression,
     idle_flush: Duration,
     periodic_flush: Duration,
 ) -> bool {
-    if embed_pass_active {
+    if suppression != FlushSuppression::None {
         return false;
     }
     since_save >= periodic_flush || since_mutation >= idle_flush
@@ -2205,10 +2236,20 @@ pub async fn run_with_authority_on(
                 continue;
             }
 
+            let suppression = if persist_state.embed_pass_active() {
+                FlushSuppression::EmbedPass
+            } else if persist_state
+                .lsp_sweep_running
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                FlushSuppression::LspSweep
+            } else {
+                FlushSuppression::None
+            };
             let should_flush = should_flush_now(
                 persist_state.time_since_save(),
                 persist_state.time_since_mutation(),
-                persist_state.embed_pass_active(),
+                suppression,
                 idle_flush,
                 periodic_flush,
             );
@@ -3649,7 +3690,8 @@ mod tests {
         format_singleton_contention, next_embed_error_backoff, parse_duration_secs,
         parse_owner_watch_pid, should_enable_lsp_enrichment, should_flush_now, shutdown_signalled,
         watched_process_is_alive, ControlPlane, CoverageDrainVerdict, DaemonConfig, DaemonState,
-        DEFAULT_RUNTIME_SHUTDOWN_GRACE, DEFAULT_SHUTDOWN_ESCALATION_GRACE, RECON_IDLE,
+        FlushSuppression, DEFAULT_RUNTIME_SHUTDOWN_GRACE, DEFAULT_SHUTDOWN_ESCALATION_GRACE,
+        RECON_IDLE,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -4175,7 +4217,7 @@ mod tests {
         assert!(!should_flush_now(
             Duration::from_secs(10),
             Duration::from_secs(1),
-            false,
+            FlushSuppression::None,
             idle,
             periodic,
         ));
@@ -4183,7 +4225,7 @@ mod tests {
         assert!(should_flush_now(
             Duration::from_secs(10),
             Duration::from_secs(3),
-            false,
+            FlushSuppression::None,
             idle,
             periodic,
         ));
@@ -4198,7 +4240,7 @@ mod tests {
         assert!(!should_flush_now(
             Duration::from_secs(10),
             Duration::from_secs(5),
-            true,
+            FlushSuppression::EmbedPass,
             idle,
             periodic,
         ));
@@ -4209,7 +4251,7 @@ mod tests {
         assert!(!should_flush_now(
             Duration::from_secs(31),
             Duration::from_secs(5),
-            true,
+            FlushSuppression::EmbedPass,
             idle,
             periodic,
         ));
@@ -4217,10 +4259,108 @@ mod tests {
         assert!(should_flush_now(
             Duration::from_secs(31),
             Duration::from_secs(5),
-            false,
+            FlushSuppression::None,
             idle,
             periodic,
         ));
+    }
+
+    /// A cold sweep suppresses both clocks, for the reason the embed-pass arm
+    /// above already documents.
+    ///
+    /// Measured on a converted psf/requests store: one 188-second sweep
+    /// triggered a single background flush costing 96.6 seconds, carrying a
+    /// 56.2-second successor preparation whose `change_bodies_ms` was 0. A
+    /// whole-workspace rebuild and whole-store re-admission, for zero changed
+    /// content bodies, to persist edges the next sweep recomputes.
+    #[test]
+    fn an_lsp_sweep_suppresses_both_flush_clocks() {
+        let idle = Duration::from_secs(2);
+        let periodic = Duration::from_secs(30);
+        // A gap between files mid-sweep looks mutation-quiet; the idle clock
+        // must not read that as a moment to serialize the whole graph.
+        assert!(!should_flush_now(
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+            FlushSuppression::LspSweep,
+            idle,
+            periodic,
+        ));
+        // The periodic clock is suppressed too. A sweep runs for minutes, so a
+        // 30-second bound fires inside it by construction.
+        assert!(!should_flush_now(
+            Duration::from_secs(31),
+            Duration::from_secs(5),
+            FlushSuppression::LspSweep,
+            idle,
+            periodic,
+        ));
+    }
+
+    /// Suppression that became never-flushing would be a worse defect than the
+    /// flush it removed, so this is the arm that says it ends.
+    ///
+    /// The sweep marks the graph dirty when it finishes, so the very next pass
+    /// of the persistence loop sees a mutation-quiet dirty graph with no
+    /// suppression and flushes. Both clocks are checked, because a fix that
+    /// only restored the periodic bound would leave a sweep's own output
+    /// unpersisted for up to thirty seconds after it converged.
+    #[test]
+    fn the_flush_fires_as_soon_as_the_sweep_ends() {
+        let idle = Duration::from_secs(2);
+        let periodic = Duration::from_secs(30);
+        // Mutation-quiet past the idle threshold, sweep over: flush now.
+        assert!(should_flush_now(
+            Duration::from_secs(10),
+            Duration::from_secs(3),
+            FlushSuppression::None,
+            idle,
+            periodic,
+        ));
+        // And the periodic durability bound is intact the moment it lifts.
+        assert!(should_flush_now(
+            Duration::from_secs(31),
+            Duration::from_secs(1),
+            FlushSuppression::None,
+            idle,
+            periodic,
+        ));
+    }
+
+    /// A mutation that is NOT the sweep's own is still persisted, just later.
+    ///
+    /// This is the consequence worth stating rather than discovering: a live
+    /// write landing mid-sweep waits for the sweep to end before it is
+    /// flushed. The staleness is bounded by the sweep's own duration, and the
+    /// predicate cannot tell whose mutation it was, so the guarantee is
+    /// "flushed at sweep end", not "flushed immediately". Both rows below are
+    /// the same dirty state; only the suppression differs.
+    #[test]
+    fn a_non_sweep_mutation_mid_sweep_is_flushed_when_the_sweep_ends() {
+        let idle = Duration::from_secs(2);
+        let periodic = Duration::from_secs(30);
+        let since_save = Duration::from_secs(45);
+        let since_mutation = Duration::from_secs(10);
+        assert!(
+            !should_flush_now(
+                since_save,
+                since_mutation,
+                FlushSuppression::LspSweep,
+                idle,
+                periodic
+            ),
+            "a live write mid-sweep waits: this is the bounded staleness the change accepts"
+        );
+        assert!(
+            should_flush_now(
+                since_save,
+                since_mutation,
+                FlushSuppression::None,
+                idle,
+                periodic
+            ),
+            "and it is flushed as soon as the sweep ends, from the same dirty state"
+        );
     }
 
     #[test]
