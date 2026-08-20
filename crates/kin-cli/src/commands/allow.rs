@@ -17,10 +17,8 @@
 //! reviewer sees, bound to a digest, so editing the artifact blocks it again.
 
 use anyhow::{bail, Context, Result};
-use kin_model::{
-    parse_sensitive_allowances, RepoPath, SensitiveArtifactAllowance, SensitiveArtifactKind,
-    SENSITIVE_ALLOWANCE_SOURCE_PATH,
-};
+use kin_model::admission::{parse_sensitive_allowances, SENSITIVE_ALLOWANCE_SOURCE_PATH};
+use kin_model::{RepoPath, SensitiveArtifactAllowance, SensitiveArtifactKind};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
