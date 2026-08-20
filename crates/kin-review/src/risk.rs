@@ -4,11 +4,52 @@
 use std::collections::BTreeMap;
 
 use crate::diff::{EntityChangeKind, RelationChangeKind, SemanticDiff};
-use crate::impact::ImpactReport;
+use crate::impact::{EntityImpact, ImpactReport};
 use kin_model::entity::{Entity, EntityKind, EntityRole, Visibility};
 use kin_model::ids::EntityId;
 use kin_model::relation::GraphNodeId;
 use kin_model::review::{RiskLevel, RiskSummary};
+
+/// This entity's own inbound attribution, or an all-zero record when the report
+/// carries none for it.
+///
+/// FIR-2485. Every condition in [`assess_risk`]'s per-change loop used to read a
+/// DIFF-GLOBAL bucket off the report and attribute it to whichever change was in
+/// hand, so a finding about one entity fired on another entity's evidence. The
+/// principle is `shadow.rs`'s and is stated there: another entity's consumers do
+/// not make this entity's surface change risky, the per-entity inbound
+/// attribution decides.
+///
+/// It fails in BOTH directions, which is why one pass fixes six sites rather
+/// than five. The consumer conditions fire when their bucket is non-empty, so
+/// diff-global INVENTED findings. The coverage conditions fire when their bucket
+/// is empty, so diff-global SUPPRESSED them: a modified entity with no tests of
+/// its own read as covered because a different entity in the diff had one. The
+/// suppressing half hides risk rather than inventing it, and nothing in the
+/// output said so.
+///
+/// The all-zero fallback is conservative in both directions at once, which is
+/// what lets one accessor serve every condition: zero consumers does not raise a
+/// finding on absent evidence, and zero covering tests does report the gap on
+/// absent evidence. `analyze_impact` records every changed entity, so the
+/// fallback is reached only where a report was built without computing impact,
+/// and those paths already carry their own blocking evidence gap.
+fn per_entity(impact: &ImpactReport, entity_id: &EntityId) -> EntityImpact {
+    impact
+        .entity_impact(entity_id)
+        .cloned()
+        .unwrap_or_else(|| EntityImpact {
+            entity_id: *entity_id,
+            consumer_count: 0,
+            strong_consumer_count: 0,
+            proven_consumer_count: 0,
+            contract_consumer_count: 0,
+            consumer_files: Vec::new(),
+            covering_tests: 0,
+            consumers_migrated_in_diff: 0,
+            call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
+        })
+}
 
 /// `name (Kind) at file:line` for a removed entity, so a finding reads as code.
 fn describe_entity(entity: &Entity) -> String {
@@ -162,10 +203,8 @@ pub fn assess_risk(diff: &SemanticDiff, impact: &ImpactReport) -> RiskSummary {
             EntityChangeKind::Modified { old, new } => {
                 // Signature changed?
                 if old.signature != new.signature {
-                    let has_callers = impact.affected_callers.iter().any(|_| true);
-                    let has_consumers = !impact.affected_contract_consumers.is_empty();
-
-                    if has_callers || has_consumers {
+                    let entity = per_entity(impact, &change.entity_id);
+                    if entity.consumer_count > 0 || entity.contract_consumer_count > 0 {
                         breaking_changes.push(format!(
                             "Signature change on `{}`: `{}` -> `{}`",
                             new.name, old.signature, new.signature,
@@ -181,23 +220,22 @@ pub fn assess_risk(diff: &SemanticDiff, impact: &ImpactReport) -> RiskSummary {
                 }
 
                 // Contract entity modified with consumers
+                let contract_consumers =
+                    per_entity(impact, &change.entity_id).contract_consumer_count;
                 if matches!(
                     new.kind,
                     EntityKind::ApiEndpoint | EntityKind::EventContract | EntityKind::Schema
-                ) && !impact.affected_contract_consumers.is_empty()
+                ) && contract_consumers > 0
                 {
                     contract_violations.push(format!(
                         "Contract `{}` ({:?}) modified with {} consumer(s)",
-                        new.name,
-                        new.kind,
-                        impact.affected_contract_consumers.len(),
+                        new.name, new.kind, contract_consumers,
                     ));
                 }
 
                 // Check test coverage gap
                 if new.role != EntityRole::Test {
-                    let has_test_coverage = impact.affected_tests.iter().any(|_| true);
-                    if !has_test_coverage {
+                    if per_entity(impact, &change.entity_id).covering_tests == 0 {
                         test_coverage_gaps.push(format!(
                             "Modified entity `{}` has no test coverage",
                             new.name,
@@ -206,9 +244,30 @@ pub fn assess_risk(diff: &SemanticDiff, impact: &ImpactReport) -> RiskSummary {
                 }
             }
             EntityChangeKind::Removed { old } => {
-                let has_dependents =
-                    !impact.affected_dependents.is_empty() || !impact.affected_callers.is_empty();
-                if has_dependents {
+                // Two per-entity sources, unioned, because a removal has two
+                // and neither alone covers the path the other serves.
+                //
+                // `removed_entity_dependents` reads the relations THIS diff
+                // removed, which are exactly the edges that pointed at this
+                // entity. It also feeds the message below, so gating on it makes
+                // it impossible for the gate and the message to disagree: the
+                // pre-fix code could assert dependents and then name none, which
+                // is what the defect looked like on a report.
+                //
+                // The recorded per-entity count covers what that cannot see.
+                // `analyze_impact` walks the LIVE graph, where a removed entity
+                // is already gone, so its inbound edges may reach this function
+                // only through `shadow.rs`'s base-side overlay. Gating on the
+                // relation walk alone would silence a removal whose dependents
+                // were recovered that way, including the unresolvable-record
+                // case, which is the one a reviewer can least afford to lose.
+                //
+                // Neither source is the diff-global bucket, which is the point:
+                // both answer for THIS entity.
+                let (dependents, total) =
+                    removed_entity_dependents(diff, impact, &change.entity_id);
+                let recorded_consumers = per_entity(impact, &change.entity_id).consumer_count;
+                if total > 0 || recorded_consumers > 0 {
                     let subject = match old {
                         Some(entity) => describe_entity(entity),
                         // An unrecoverable base-side record is reported as one.
@@ -218,12 +277,7 @@ pub fn assess_risk(diff: &SemanticDiff, impact: &ImpactReport) -> RiskSummary {
                             change.entity_id
                         ),
                     };
-                    let (dependents, total) =
-                        removed_entity_dependents(diff, impact, &change.entity_id);
-                    if dependents.is_empty() {
-                        breaking_changes
-                            .push(format!("Removed entity {subject} still has dependents"));
-                    } else {
+                    {
                         // The overflow is counted rather than dropped: a reader
                         // must be able to tell five of five from five of forty.
                         let more = total
@@ -241,8 +295,7 @@ pub fn assess_risk(diff: &SemanticDiff, impact: &ImpactReport) -> RiskSummary {
             EntityChangeKind::Added(entity) => {
                 // New public API without tests
                 if entity.visibility == Visibility::Public && entity.role != EntityRole::Test {
-                    let has_test_coverage = impact.affected_tests.iter().any(|_| true);
-                    if !has_test_coverage {
+                    if per_entity(impact, &change.entity_id).covering_tests == 0 {
                         notes.push(format!(
                             "New public entity `{}` has no test coverage",
                             entity.name,
@@ -614,15 +667,22 @@ mod tests {
     #[test]
     fn unresolvable_removal_is_reported_as_unresolved_not_as_a_name() {
         let dependent = placed_entity("caller", "src/lib.rs", 10);
+        let removed_id = EntityId::new();
         let diff = SemanticDiff {
             entity_changes: vec![EntityChange {
-                entity_id: EntityId::new(),
+                entity_id: removed_id,
                 kind: EntityChangeKind::Removed { old: None },
             }],
             ..Default::default()
         };
         let impact = ImpactReport {
             affected_callers: vec![dependent],
+            // FIR-2485. See the note on the sibling fixtures: the per-entity row
+            // is what a real report carries, and it is what makes this removal's
+            // dependents ITS dependents. An unrecoverable base-side record does
+            // not imply unrecoverable impact, which is the whole reason this
+            // case can still be reported as unresolved rather than dropped.
+            entity_impacts: vec![entity_impact_counts(removed_id, 1, 0, 0)],
             ..Default::default()
         };
 
@@ -1057,6 +1117,15 @@ mod tests {
         let impact = ImpactReport {
             affected_callers: vec![caller],
             changed_ids: vec![new.id],
+            // FIR-2485. The per-entity row a real report always carries for
+            // this change. `analyze_impact` records one for every changed
+            // entity, so a fixture naming a consumer in a diff-global bucket
+            // with no per-entity trace is not a smaller report, it is a shape
+            // the analyzer cannot produce. Every assertion below is unchanged:
+            // the test was always about this entity's own evidence, and only
+            // the fixture was written in the form that let another entity's
+            // evidence answer for it.
+            entity_impacts: vec![entity_impact_counts(new.id, 1, 0, 0)],
             ..Default::default()
         };
 
@@ -1088,6 +1157,15 @@ mod tests {
         let impact = ImpactReport {
             affected_contract_consumers: vec![consumer],
             changed_ids: vec![new.id],
+            // FIR-2485. The per-entity row a real report always carries for
+            // this change. `analyze_impact` records one for every changed
+            // entity, so a fixture naming a consumer in a diff-global bucket
+            // with no per-entity trace is not a smaller report, it is a shape
+            // the analyzer cannot produce. Every assertion below is unchanged:
+            // the test was always about this entity's own evidence, and only
+            // the fixture was written in the form that let another entity's
+            // evidence answer for it.
+            entity_impacts: vec![entity_impact_counts(new.id, 1, 1, 0)],
             ..Default::default()
         };
 
@@ -1126,6 +1204,15 @@ mod tests {
         let impact = ImpactReport {
             affected_tests: vec![test_entity_val],
             changed_ids: vec![entity.id],
+            // FIR-2485. The per-entity row a real report always carries for
+            // this change. `analyze_impact` records one for every changed
+            // entity, so a fixture naming a consumer in a diff-global bucket
+            // with no per-entity trace is not a smaller report, it is a shape
+            // the analyzer cannot produce. Every assertion below is unchanged:
+            // the test was always about this entity's own evidence, and only
+            // the fixture was written in the form that let another entity's
+            // evidence answer for it.
+            entity_impacts: vec![entity_impact_counts(entity.id, 0, 0, 1)],
             ..Default::default()
         };
 
@@ -1173,6 +1260,15 @@ mod tests {
         let impact = ImpactReport {
             affected_dependents: vec![dependent],
             changed_ids: vec![entity_id],
+            // FIR-2485. The per-entity row a real report always carries for
+            // this change. `analyze_impact` records one for every changed
+            // entity, so a fixture naming a consumer in a diff-global bucket
+            // with no per-entity trace is not a smaller report, it is a shape
+            // the analyzer cannot produce. Every assertion below is unchanged:
+            // the test was always about this entity's own evidence, and only
+            // the fixture was written in the form that let another entity's
+            // evidence answer for it.
+            entity_impacts: vec![entity_impact_counts(entity_id, 1, 0, 0)],
             ..Default::default()
         };
 
@@ -1226,6 +1322,15 @@ mod tests {
         let impact = ImpactReport {
             affected_tests: vec![test_ent],
             changed_ids: vec![new.id],
+            // FIR-2485. The per-entity row a real report always carries for
+            // this change. `analyze_impact` records one for every changed
+            // entity, so a fixture naming a consumer in a diff-global bucket
+            // with no per-entity trace is not a smaller report, it is a shape
+            // the analyzer cannot produce. Every assertion below is unchanged:
+            // the test was always about this entity's own evidence, and only
+            // the fixture was written in the form that let another entity's
+            // evidence answer for it.
+            entity_impacts: vec![entity_impact_counts(new.id, 0, 0, 1)],
             ..Default::default()
         };
 
@@ -1260,6 +1365,15 @@ mod tests {
         let impact = ImpactReport {
             affected_callers: vec![caller],
             changed_ids: vec![new.id],
+            // FIR-2485. The per-entity row a real report always carries for
+            // this change. `analyze_impact` records one for every changed
+            // entity, so a fixture naming a consumer in a diff-global bucket
+            // with no per-entity trace is not a smaller report, it is a shape
+            // the analyzer cannot produce. Every assertion below is unchanged:
+            // the test was always about this entity's own evidence, and only
+            // the fixture was written in the form that let another entity's
+            // evidence answer for it.
+            entity_impacts: vec![entity_impact_counts(new.id, 1, 0, 0)],
             ..Default::default()
         };
 
@@ -1486,6 +1600,15 @@ mod tests {
         let impact = ImpactReport {
             affected_contract_consumers: vec![consumer],
             changed_ids: vec![new.id],
+            // FIR-2485. The per-entity row a real report always carries for
+            // this change. `analyze_impact` records one for every changed
+            // entity, so a fixture naming a consumer in a diff-global bucket
+            // with no per-entity trace is not a smaller report, it is a shape
+            // the analyzer cannot produce. Every assertion below is unchanged:
+            // the test was always about this entity's own evidence, and only
+            // the fixture was written in the form that let another entity's
+            // evidence answer for it.
+            entity_impacts: vec![entity_impact_counts(new.id, 1, 1, 0)],
             ..Default::default()
         };
 
@@ -1516,6 +1639,15 @@ mod tests {
         let impact = ImpactReport {
             affected_contract_consumers: vec![consumer],
             changed_ids: vec![new.id],
+            // FIR-2485. The per-entity row a real report always carries for
+            // this change. `analyze_impact` records one for every changed
+            // entity, so a fixture naming a consumer in a diff-global bucket
+            // with no per-entity trace is not a smaller report, it is a shape
+            // the analyzer cannot produce. Every assertion below is unchanged:
+            // the test was always about this entity's own evidence, and only
+            // the fixture was written in the form that let another entity's
+            // evidence answer for it.
+            entity_impacts: vec![entity_impact_counts(new.id, 1, 1, 0)],
             ..Default::default()
         };
 
