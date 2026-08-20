@@ -11172,6 +11172,11 @@ async fn lsp_sweep_status(State(state): State<Arc<DaemonState>>) -> impl IntoRes
         "running": state.lsp_sweep_running.load(Ordering::SeqCst),
         "files_done": done,
         "files_total": total,
+        // A sweep that enriched nothing and a sweep that had nothing left to
+        // enrich both report files_done 0. This is what separates them, and
+        // without it `kin init` printed "complete (0/66 files)" over a sweep
+        // whose language server never started.
+        "files_blocked": state.lsp_sweep_files_blocked.load(Ordering::SeqCst),
         "sweeps_completed": state.lsp_sweeps_completed.load(Ordering::SeqCst),
         // Reported rather than left for the caller to infer from a zero total:
         // a daemon with no language server never sweeps, and a caller waiting

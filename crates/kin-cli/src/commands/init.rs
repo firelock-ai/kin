@@ -371,7 +371,23 @@ async fn enrich_phase(kin_root: &Path, layout: &kin_core::KinLayout) {
         // later sweep is still mutating, and a query issued into that window
         // fails to resolve entities it resolves fine before and after.
         if completed > baseline && !running {
-            note!("  cross-file enrichment complete ({done}/{total} files)");
+            let blocked = status
+                .get("files_blocked")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            // A sweep that enriched nothing reported the same sentence as one
+            // that had nothing left to do, and on a JavaScript repository with
+            // 66 admitted files that sentence was "complete (0/66 files)". The
+            // conversion had not failed and nothing said the enrichment had.
+            if done == 0 && total > 0 {
+                note!(
+                    "note: cross-file enrichment finished without enriching any of the {total} \
+                     files it walked ({blocked} blocked); reference and import edges will be \
+                     missing until it can run"
+                );
+            } else {
+                note!("  cross-file enrichment complete ({done}/{total} files)");
+            }
             return;
         }
         if std::time::Instant::now() >= deadline {
