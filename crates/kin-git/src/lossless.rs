@@ -14,8 +14,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use gix::bstr::ByteSlice;
 use gix::objs::tree::EntryKind;
@@ -30,6 +29,27 @@ use crate::error::{GitError, Result};
 
 #[cfg(unix)]
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// How many times this process has decompressed a snapshot's whole object
+/// closure.
+///
+/// Counted because the cost is invisible from any one call site. Every caller
+/// that wants the closure asks [`validate_snapshot`] for it, and that call
+/// reads and verifies EVERY object body in the repository, so a conversion that
+/// asks eleven times pays eleven whole-repository decompressions for one
+/// import. On a 1,200-commit flask corpus that is 162.5 MiB decompressed
+/// against 13 MB packed, per rebuild, and it was the dominant repeated wall
+/// clock cost of `kin init` before anyone counted it.
+///
+/// This is a measurement rather than a guard, so it is `Relaxed`: nothing
+/// branches on it, and a test that reads it does so after the work it is
+/// measuring has finished on the same thread.
+static CLOSURE_RECONSTRUCTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// How many whole-closure decompressions this process has performed.
+pub fn closure_reconstruction_count() -> usize {
+    CLOSURE_RECONSTRUCTIONS.load(Ordering::Relaxed)
+}
 
 #[cfg(all(unix, test))]
 std::thread_local! {
@@ -645,6 +665,11 @@ pub(crate) fn validate_snapshot(
         }
     }
     validate_head_and_default(snapshot)?;
+
+    // Counted here rather than at the entry, because everything above this
+    // point is cheap ref arithmetic. The loop below is the whole-repository
+    // decompression this counter exists to make visible.
+    CLOSURE_RECONSTRUCTIONS.fetch_add(1, Ordering::Relaxed);
 
     let mut bodies = BTreeMap::new();
     let mut object_ids = BTreeSet::new();
