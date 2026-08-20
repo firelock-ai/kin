@@ -2894,6 +2894,126 @@ mod tests {
         );
     }
 
+    /// A context pack with an empty `dependents` group, over `coverage`.
+    ///
+    /// The group is the reference surface's answer (FIR-2474), so the payload
+    /// carries the same observation `find_references` publishes beside its own
+    /// empty list. A pack that shipped the group without it would be claiming an
+    /// absence with no evidence the query could have found anything, which is
+    /// the FIR-2353 failure arriving through a second tool.
+    fn empty_pack_dependents(kind: &str, coverage: Value) -> Value {
+        json!({
+            "focal_entity": {
+                "id": "00000000-0000-0000-0000-000000000001",
+                "kind": kind,
+                "name": "sendFile",
+            },
+            "dependencies": [{ "id": "00000000-0000-0000-0000-000000000002" }],
+            "dependents": [],
+            "dependency_selection": {
+                "source": "dependency_edges",
+                "returned": 1,
+                "dependents_returned": 0,
+                "certified_dependents": 0,
+                "dependents_withheld": 0,
+                "same_file_candidates": 0,
+                "same_file_dropped": 0,
+            },
+            "edge_coverage": coverage,
+        })
+    }
+
+    /// FIR-2474, the half an agent acts on. `get_context_pack` published
+    /// `dependents: []` with no verdict of any kind, so "nothing depends on
+    /// this" and "this graph links none of this language's edges across files"
+    /// serialized identically, and the empty list was the readable one.
+    ///
+    /// The express shape is the case: JavaScript, no cross-file class produced.
+    #[test]
+    fn a_pack_with_no_dependents_is_inconclusive_when_the_language_links_no_edges() {
+        let payload = empty_pack_dependents(
+            "function",
+            json!({
+                "scope": "language",
+                "language": "JavaScript",
+                "requested_classes": ["calls", "imports", "references"],
+                "classes": { "calls": "absent", "imports": "absent", "references": "absent" },
+                "cross_file_classes": [],
+                "budget_exhausted": false,
+                "entities_examined": 66,
+            }),
+        );
+        let negative = negative_for("get_context_pack", &payload, &structural_ready_envelope())
+            .expect("an empty dependents group yields a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert_eq!(negative["trust"], json!("inconclusive"));
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            reason.starts_with("cross_file_edges_absent"),
+            "the limiting factor must lead the reason: {reason}"
+        );
+        assert!(
+            reason.contains("JavaScript"),
+            "the reason names the language whose edges are missing: {reason}"
+        );
+    }
+
+    /// The control that makes the case above mean something. A gate that
+    /// answered "inconclusive" for every pack would pass it and would be just as
+    /// useless: an empty group on a graph that demonstrably links this
+    /// language's calls across files IS an answer, and it has to read as one.
+    #[test]
+    fn a_pack_with_no_dependents_is_authoritative_when_the_graph_links_them() {
+        let payload = empty_pack_dependents("function", cross_file_edges_observed());
+        let negative = negative_for("get_context_pack", &payload, &structural_ready_envelope())
+            .expect("an empty dependents group yields a negative");
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(true),
+            "a graph that links this language's calls across files can answer: {negative}"
+        );
+        assert_eq!(negative["trust"], json!("authoritative"));
+    }
+
+    /// The pack inherits the reference surface's gap along with its authority.
+    /// A receiver-method call is linked by bare name, so a method's incoming
+    /// edges are routinely unresolved, and `find_references` has always refused
+    /// to certify an empty answer for one. A pack reading the same edges must
+    /// refuse identically, or the two tools disagree about one entity in one
+    /// store, which is the defect this ticket is.
+    #[test]
+    fn a_pack_with_no_dependents_is_inconclusive_for_a_method_focal() {
+        let payload = empty_pack_dependents("method", cross_file_edges_observed());
+        let negative = negative_for("get_context_pack", &payload, &structural_ready_envelope())
+            .expect("an empty dependents group yields a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert!(
+            negative["trust_reason"]
+                .as_str()
+                .unwrap()
+                .contains("method_call_resolution_incomplete"),
+            "the method gap must be named: {negative}"
+        );
+    }
+
+    /// A pack that returned dependents is qualified too, because FIR-2463 asks
+    /// every retrieval answer for one verdict rather than only the empty ones.
+    /// What it must never do is claim an absence it is not making.
+    #[test]
+    fn a_populated_pack_is_qualified_without_claiming_an_absence() {
+        let mut payload = empty_pack_dependents("function", cross_file_edges_observed());
+        payload["dependents"] = json!([{ "id": "00000000-0000-0000-0000-000000000003" }]);
+        payload["dependency_selection"]["dependents_returned"] = json!(1);
+        payload["dependency_selection"]["certified_dependents"] = json!(1);
+        let negative = negative_for("get_context_pack", &payload, &structural_ready_envelope())
+            .expect("a populated pack still carries the response's one verdict");
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(false),
+            "an answer with rows claims no absence: {negative}"
+        );
+    }
+
     /// A payload that reports no observation at all is the unknown case. This is
     /// the shape every retrieval tool had before FIR-2353, and reading it as
     /// healthy is precisely how absence was certified on a graph that could not

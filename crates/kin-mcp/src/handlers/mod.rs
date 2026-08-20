@@ -3414,6 +3414,42 @@ mod tests {
         }
     }
 
+    /// The gate in `negative` that separates "nothing depends on this" from
+    /// "this graph could not have found a dependent" reads `edge_coverage` off
+    /// the payload. A pack that did not publish one would leave that gate
+    /// silent, and a silent gate reports the same trustworthy-looking answer for
+    /// both cases, which is the defect wearing the fix's clothes. So the pack
+    /// has to carry the object, and it has to be the observation the reference
+    /// surface publishes rather than a second one.
+    #[test]
+    fn a_context_pack_publishes_the_coverage_its_dependents_claim_rests_on() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = pack_provenance_fixture();
+
+        for compact in [false, true] {
+            let value = context_pack_json(&fixture, &fixture.sender, compact);
+            let coverage = value[crate::edge_coverage::EDGE_COVERAGE_KEY]
+                .as_object()
+                .unwrap_or_else(|| {
+                    panic!("the pack must report what its dependents claim rests on: {value}")
+                });
+            assert!(
+                coverage.contains_key("classes"),
+                "the observation must name the per-class states the gate reads \
+                 (compact={compact}): {value}"
+            );
+            assert_eq!(
+                coverage.get("scope").and_then(serde_json::Value::as_str),
+                Some("language"),
+                "extraction gaps are per-language, so the observation is too \
+                 (compact={compact}): {value}"
+            );
+        }
+    }
+
     /// The other half of FIR-2474, and the reason an empty group was readable as
     /// an answer at all: the two surfaces must not be able to disagree in EITHER
     /// direction. `find_references` withholds a row whose only edge is a

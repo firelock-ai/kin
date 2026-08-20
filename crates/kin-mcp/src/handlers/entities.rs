@@ -726,9 +726,19 @@ edge leaving the focal, `relation: \"dependent_edge\"` is an edge arriving at it
 `relation: \"same_file_neighbor\"` means the focal had no dependency edge in either \
 direction, so the row is a neighbour sharing the focal's file rather than anything the \
 focal depends on. That last one is the usual shape for a class whose only edges are \
-containment, and those rows sort after the real edges. `dependency_selection` names \
-which of the two filled the list, how many rows each group returned, and, for the \
-fallback, how many same-file candidates there were and how many were dropped to fit. \
+containment, and those rows sort after the real edges. A row carrying \
+`bidirectional: true` is joined to the focal BOTH ways; it is grouped by the arriving \
+edge because that is the one that decides whether changing the focal breaks it. \
+`dependents` is assembled by the same collector `find_references` uses, on the same \
+graph, so the two tools cannot answer differently about one entity: a caller that tool \
+returns is in this group, and a bare-name receiver guess it declines to certify is in \
+neither. `dependency_selection` names which selection filled the dependency list, how \
+many rows each group returned, how many dependents the reference authority certified, \
+how many were withheld to stay inside the pack's budget, and, for the fallback, how many \
+same-file candidates there were and how many were dropped to fit. Read `edge_coverage` \
+and the response's `negative` verdict before acting on an EMPTY `dependents`: a graph \
+that does not link this language's calls across files returns the same `[]` for a symbol \
+with twenty callers as for one with none. \
 If get_entity_source is available to you it is cheaper for a raw \
 body alone; if you need to follow an actual call chain step by step, use trace_data_flow.";
 
