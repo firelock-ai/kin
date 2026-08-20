@@ -85,10 +85,42 @@ struct SemanticFileState {
     parse_data: Arc<FileParseData>,
 }
 
+/// An entity a tree holds, without holding a second copy of it.
+///
+/// Almost every entity in a tree already lives inside a file's parsed result,
+/// which the same state carries as `Arc<FileParseData>` and shares with every
+/// parent whose copy of that file is unchanged. Storing the entity again by
+/// value duplicated all of it, per commit, for the whole repository: the
+/// comment above the linker input warns that materializing it "would re-copy
+/// every entity, relation, and import in the repository for every commit in
+/// history", and the entity map eighteen lines below did exactly that.
+///
+/// So a parsed entity is addressed rather than copied. Cloning one is a
+/// refcount bump and an index. Entities the tree synthesizes rather than parses,
+/// which is the external reference targets, have no file to point into and are
+/// owned here.
+#[derive(Clone)]
+enum TreeEntity {
+    Parsed {
+        file: Arc<FileParseData>,
+        index: usize,
+    },
+    Synthesized(Entity),
+}
+
+impl TreeEntity {
+    fn get(&self) -> &Entity {
+        match self {
+            TreeEntity::Parsed { file, index } => &file.entities[*index],
+            TreeEntity::Synthesized(entity) => entity,
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 struct SemanticTreeState {
     files: BTreeMap<ArtifactId, SemanticFileState>,
-    entities: BTreeMap<EntityId, Entity>,
+    entities: BTreeMap<EntityId, TreeEntity>,
     relations: BTreeMap<RelationId, Relation>,
 }
 
@@ -322,8 +354,13 @@ fn semantic_state_for_tree(
             )));
         }
         completeness.insert(path.to_string(), (*file.completeness).clone());
-        for entity in &file.parse_data.entities {
-            if let Some(previous) = entities.insert(entity.id, entity.clone()) {
+        for (index, entity) in file.parse_data.entities.iter().enumerate() {
+            let handle = TreeEntity::Parsed {
+                file: Arc::clone(&file.parse_data),
+                index,
+            };
+            if let Some(previous) = entities.insert(entity.id, handle) {
+                let previous = previous.get();
                 return Err(invalid(format!(
                     "semantic entity identity {} is duplicated in one tree: {} {:?} from {:?} and {} {:?} from {}",
                     entity.id,
@@ -342,11 +379,11 @@ fn semantic_state_for_tree(
 
     let linked =
         link_cross_file_borrowed_with_completeness(&parse_data, &artifact_ids, &completeness)?;
-    entities.extend(external_reference_targets(
-        &linked,
-        &entities,
-        external_fingerprints,
-    ));
+    entities.extend(
+        external_reference_targets(&linked, &entities, external_fingerprints)
+            .into_iter()
+            .map(|(id, entity)| (id, TreeEntity::Synthesized(entity))),
+    );
     let mut relations = BTreeMap::new();
     for relation in linked {
         if let Some(absent) = absent_local_endpoint(&relation, &entities) {
@@ -410,7 +447,7 @@ struct AbsentEndpoint {
 /// modification to a node it never touched.
 fn external_reference_targets(
     linked: &[Relation],
-    entities: &BTreeMap<EntityId, Entity>,
+    entities: &BTreeMap<EntityId, TreeEntity>,
     fingerprints: &mut BTreeMap<EntityId, SemanticFingerprint>,
 ) -> BTreeMap<EntityId, Entity> {
     // One target can be imported by several files, and in a polyglot tree those
@@ -446,7 +483,7 @@ fn external_reference_targets(
             .entry(destination)
             .or_insert((import_source, symbol, Vec::new()))
             .2
-            .push(source.language);
+            .push(source.get().language);
     }
 
     // The second placeholder class: a member call whose receiver resolves to
@@ -485,7 +522,7 @@ fn external_reference_targets(
                 )
             })
             .1
-            .push(source.language);
+            .push(source.get().language);
     }
 
     let mut targets = BTreeMap::new();
@@ -647,7 +684,7 @@ fn external_reference_fingerprint(import_source: &str, symbol: &str) -> Semantic
 /// entity state a change replays, so they are never reported.
 fn absent_local_endpoint(
     relation: &Relation,
-    entities: &BTreeMap<EntityId, Entity>,
+    entities: &BTreeMap<EntityId, TreeEntity>,
 ) -> Option<AbsentEndpoint> {
     [(relation.src, false), (relation.dst, true)]
         .into_iter()
@@ -760,12 +797,16 @@ fn displaced_historical_entity_id(
 }
 
 fn diff_entities(
-    old: &BTreeMap<EntityId, Entity>,
-    new: &BTreeMap<EntityId, Entity>,
+    old: &BTreeMap<EntityId, TreeEntity>,
+    new: &BTreeMap<EntityId, TreeEntity>,
 ) -> Vec<EntityDelta> {
+    // A delta owns its entities, so the clones here are the ones the output
+    // genuinely needs. What the handle removes is the per-commit copy of every
+    // entity the tree merely CONTINUES to hold, which is almost all of them.
     let mut deltas = Vec::new();
     for (id, old_entity) in old {
-        match new.get(id) {
+        let old_entity = old_entity.get();
+        match new.get(id).map(TreeEntity::get) {
             Some(new_entity) if old_entity == new_entity => {}
             Some(new_entity) => deltas.push(EntityDelta::Modified {
                 old: old_entity.clone(),
@@ -779,7 +820,7 @@ fn diff_entities(
     for (id, new_entity) in new {
         if !old.contains_key(id) {
             deltas.push(EntityDelta::Added {
-                new: new_entity.clone(),
+                new: new_entity.get().clone(),
             });
         }
     }
