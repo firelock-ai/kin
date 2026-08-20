@@ -24,8 +24,9 @@ use sha2::{Digest, Sha256};
 use crate::classifier::{FileClassification, FileClassifier};
 use crate::error::{IndexError, Result};
 use crate::linker::{
-    is_external_import_placeholder, link_cross_file_borrowed_with_completeness,
-    ArtifactIdentityMap, FileParseCompletenessMap, FileParseData,
+    is_external_import_placeholder, is_unresolved_receiver_placeholder,
+    link_cross_file_borrowed_with_completeness, split_unresolved_receiver_token,
+    unresolved_receiver_display_name, ArtifactIdentityMap, FileParseCompletenessMap, FileParseData,
 };
 use crate::pipeline::IndexPipeline;
 
@@ -448,7 +449,59 @@ fn external_reference_targets(
             .push(source.language);
     }
 
+    // The second placeholder class: a member call whose receiver resolves to
+    // nothing this repository defines. It carries no import source, because
+    // there is no module to name, so its identity and its display name come
+    // from the member expression the evidence recorded as written.
+    let mut receivers: BTreeMap<EntityId, (String, Vec<LanguageId>)> = BTreeMap::new();
+    for relation in linked {
+        if !is_unresolved_receiver_placeholder(relation) {
+            continue;
+        }
+        let Some(destination) = relation.dst.as_entity() else {
+            continue;
+        };
+        if entities.contains_key(&destination) {
+            continue;
+        }
+        let (Some(source), Some(token)) = (
+            relation.src.as_entity().and_then(|id| entities.get(&id)),
+            relation
+                .evidence
+                .first()
+                .and_then(|evidence| evidence.token.as_deref()),
+        ) else {
+            continue;
+        };
+        let Some((receiver, symbol)) = split_unresolved_receiver_token(token) else {
+            continue;
+        };
+        receivers
+            .entry(destination)
+            .or_insert_with(|| {
+                (
+                    unresolved_receiver_display_name(receiver, symbol),
+                    Vec::new(),
+                )
+            })
+            .1
+            .push(source.language);
+    }
+
     let mut targets = BTreeMap::new();
+    for (destination, (display_name, languages)) in receivers {
+        let fingerprint = fingerprints
+            .entry(destination)
+            .or_insert_with(|| external_reference_fingerprint("", &display_name))
+            .clone();
+        let Some(language) = lowest_language(&languages) else {
+            continue;
+        };
+        targets.insert(
+            destination,
+            external_reference_entity(destination, &display_name, language, fingerprint),
+        );
+    }
     for (destination, (import_source, symbol, languages)) in importers {
         let fingerprint = fingerprints
             .entry(destination)
