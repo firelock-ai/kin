@@ -130,6 +130,20 @@ export function judgePreflight(record, sha) {
   return { archives };
 }
 
+// What a satisfied gate does and does not say.
+//
+// This accepts a record from a stranger run that FAILED, and that is deliberate.
+// The tests are that the run finished and that it ran the bytes a preflight leg
+// judged; the arm's own result is not a test, because the doctrine is that the
+// report must EXIST, and "the run found nothing" is a finding about the run
+// rather than about the build. The first real back-fill proves the point rather
+// than leaving it theoretical: rc0545's run.env finished at 2026-08-20T21:35:26Z
+// with its brown arm having exited rc=30, and this function accepts it.
+//
+// So a gate that passes means A STRANGER RUN HAPPENED ON THESE BYTES. It never
+// means the stranger passed. Those two readings are one careless sentence apart
+// in a status update, and only one of them is true. Anyone quoting this gate as
+// evidence of a good release is quoting it wrong.
 export function judgeStranger(env, sha, archives) {
   const where = evidencePath(sha, STRANGER_RECORD);
   const archive = env?.archive_sha256;
