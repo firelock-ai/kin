@@ -2577,8 +2577,8 @@ fn override_relation(child: EntityId, base: EntityId, span: Option<&SourceSpan>)
 ///
 /// A base that resolves to nothing yields nothing. `locate_base_class` returns
 /// `None` for an external, builtin, or ambiguous base name, and the walk ends
-/// that branch rather than guessing, so a name-only base reference never mints
-/// an edge — it is not evidence that anything was overridden.
+/// that branch rather than guessing. A name-only base reference never mints an
+/// edge, because it is not evidence that anything was overridden.
 ///
 /// Class membership comes from the parser's `Contains` edges rather than from
 /// splitting qualified entity names, so a language whose parser names members
