@@ -1347,23 +1347,50 @@ fn graph_holds_language_server_relations(state: &DaemonState) -> bool {
         .any(|relation| relation.origin == kin_model::RelationOrigin::Lsp)
 }
 
-/// Record that the sweep finished this file, and persist the set.
+/// Record that a sweep's files are DURABLE, and persist the set once.
 ///
-/// Written per file rather than once at the end so a killed pass leaves the
-/// files it completed marked, which is what makes the next pass resume rather
-/// than restart. The write is a small JSON array over the files of one
-/// repository; a failure to persist is not fatal, it only costs a re-sweep.
-fn mark_file_enriched(state: &DaemonState, file: &str) {
+/// This was written per FILE, as the sweep finished each one, so that a killed
+/// pass resumed rather than restarted. That ordering records the wrong fact.
+/// The marker's only reader skips a file it names, so what it must mean is "the
+/// enrichment for this file is durable", and per-file it meant "this file was
+/// visited". A sweep whose publication then failed left every file marked and
+/// the next sweep skipped them, permanently, behind a clean log.
+///
+/// The pre-existing mitigation does not close that: `load_lsp_enriched_marker`
+/// discards the marker only when `graph_holds_language_server_relations` is
+/// false, and that helper is an `.any()` over the snapshot. Any single surviving
+/// Lsp relation, from an earlier sweep or from the incremental path, keeps the
+/// marker and with it the skip.
+///
+/// So the set is written once, after publication succeeds. Resume-after-kill
+/// degrades in the correct direction: a hard kill now re-sweeps, which is right,
+/// because a hard kill did not publish either.
+fn mark_files_enriched(state: &DaemonState, files: &[String]) {
+    if files.is_empty() {
+        return;
+    }
     let snapshot = {
         let Ok(mut marked) = state.lsp_enriched_files.lock() else {
             return;
         };
-        marked.insert(file.to_string());
+        for file in files {
+            marked.insert(file.clone());
+        }
         marked.iter().cloned().collect::<Vec<_>>()
     };
     if let Ok(bytes) = serde_json::to_vec(&snapshot) {
         let _ = std::fs::write(lsp_enriched_marker_path(state), bytes);
     }
+}
+
+/// Whether a finished sweep may record its files as enriched.
+///
+/// Marking is safe when the sweep published, and also when it produced nothing
+/// to publish: a file that yielded no relations has nothing that can be lost, so
+/// re-sweeping it forever would be waste rather than safety. Everything else
+/// stays unmarked and is swept again.
+fn sweep_marker_is_durable(total_relations: usize, published: bool) -> bool {
+    total_relations == 0 || published
 }
 
 /// Whether the sweep has already finished this file.
@@ -3039,6 +3066,7 @@ pub async fn run_with_authority_on(
                             .lsp_sweep_files_total
                             .store(total_files as u64, std::sync::atomic::Ordering::SeqCst);
                         let mut tally = SweepTally::default();
+                        let mut enriched_this_sweep: Vec<String> = Vec::new();
                         let file_definitions_budget = lsp_file_definitions_budget();
                         let mut total_relations = 0usize;
                         // Languages whose server refused to start, remembered for
@@ -3282,7 +3310,7 @@ pub async fn run_with_authority_on(
                                 .await;
 
                             tally.enriched += 1;
-                            mark_file_enriched(&lsp_state, &file_id.0);
+                            enriched_this_sweep.push(file_id.0.clone());
                             lsp_state.lsp_sweep_files_done.store(
                                 tally.files_processed() as u64,
                                 std::sync::atomic::Ordering::SeqCst,
@@ -3395,6 +3423,31 @@ pub async fn run_with_authority_on(
                         } else {
                             false
                         };
+
+                        // The marker records durability, so it is written here
+                        // and only here, after the publication above settled it.
+                        // The set and the count come from the same arm, so a
+                        // divergence means a file was counted enriched without
+                        // being recorded, or recorded without being counted.
+                        // Either way the marker would stop describing the sweep.
+                        if enriched_this_sweep.len() != tally.enriched {
+                            warn!(
+                                recorded = enriched_this_sweep.len(),
+                                counted = tally.enriched,
+                                "the enriched-file set and the enriched count disagree; the \
+                                 marker no longer describes this sweep"
+                            );
+                        }
+                        if sweep_marker_is_durable(total_relations, published) {
+                            mark_files_enriched(&lsp_state, &enriched_this_sweep);
+                        } else {
+                            warn!(
+                                files = enriched_this_sweep.len(),
+                                relations = total_relations,
+                                "not recording these files as enriched: their relations were \
+                                 not published, so the next sweep must redo them"
+                            );
+                        }
 
                         // Marked complete even when the loop broke early on
                         // shutdown or a supervisor halt. A waiter blocked on a
@@ -5076,7 +5129,7 @@ mod lsp_query_column_tests {
 
 #[cfg(test)]
 mod sweep_tally_tests {
-    use super::{file_definitions_within_budget, SweepTally};
+    use super::{file_definitions_within_budget, sweep_marker_is_durable, SweepTally};
     use std::time::Duration;
 
     /// The number the sweep reports as `files`, and the one `/lsp/sweep/status`
@@ -5173,6 +5226,43 @@ mod sweep_tally_tests {
             leaking.unaccounted(66),
             36,
             "36 files left the sweep without reaching any counter and must be visible"
+        );
+    }
+
+    /// A sweep whose publication failed must NOT record its files as enriched.
+    ///
+    /// This is the arm that keeps a failure recoverable. The marker's only
+    /// reader skips what it names, so marking unpublished files converts a
+    /// transient publication failure into a permanent skip: the relations are
+    /// gone, the marker says the files are done, and the next sweep passes over
+    /// them reporting `already_enriched`.
+    ///
+    /// The pre-existing recovery check cannot catch that, because
+    /// `graph_holds_language_server_relations` is an `.any()` over the graph and
+    /// a single surviving Lsp relation from any earlier pass keeps the marker.
+    #[test]
+    fn a_sweep_that_did_not_publish_records_nothing() {
+        assert!(
+            !sweep_marker_is_durable(4231, false),
+            "a sweep with relations that failed to publish must leave its files unmarked, \
+             so the next sweep redoes them instead of skipping them forever"
+        );
+        assert!(
+            sweep_marker_is_durable(4231, true),
+            "a sweep that published records what it enriched"
+        );
+    }
+
+    /// A sweep that produced nothing to publish still records its files.
+    ///
+    /// Without this arm the fix would trade a permanent skip for a permanent
+    /// re-sweep: a file that yields no relations has nothing that can be lost,
+    /// and sweeping it again on every daemon start forever is waste, not safety.
+    #[test]
+    fn a_sweep_with_nothing_to_publish_still_records_its_files() {
+        assert!(
+            sweep_marker_is_durable(0, false),
+            "no relations means nothing could be lost, so the visit is worth recording"
         );
     }
 
