@@ -1307,7 +1307,20 @@ impl RepositoryTransaction {
     }
 
     pub fn transaction_hash(&self) -> Result<Hash256> {
+        // Deliberately first, and deliberately still here: hash-implies-valid is
+        // contract other callers rely on, so the canonicalization below is split
+        // out beneath it rather than in front of it.
         self.validate()?;
+        self.canonical_hash()
+    }
+
+    /// Canonical identity of this transaction, without validating it.
+    ///
+    /// Split from [`Self::transaction_hash`] so the canonicalization can be
+    /// exercised against transactions built purely to vary ordering, which need
+    /// not satisfy `validate`. Callers outside tests want `transaction_hash`,
+    /// which validates first.
+    fn canonical_hash(&self) -> Result<Hash256> {
         let mut canonical = self.clone();
         canonical.changes.sort_by_key(|change| change.id);
         for change in &mut canonical.changes {
@@ -2707,6 +2720,418 @@ mod tests {
         let mut mismatched = state;
         mismatched.shared_admission_policy = SharedAdmissionPolicy::empty(1);
         assert!(mismatched.validate().is_err());
+    }
+
+    /// A transaction carrying every collection `transaction_hash` canonicalizes.
+    ///
+    /// Deliberately built with each collection OUT of its canonical order, so a
+    /// test that reorders one of them is comparing two genuinely different
+    /// literals rather than two copies of the same sorted vector.
+    fn canonicalizable_transaction() -> RepositoryTransaction {
+        let repository_id = RepositoryId::new("repo").unwrap();
+        let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(9));
+        let (shared_policy, policy, local_overlay_delta) = admission_policy(workspace_id);
+        let mutation = create_workspace_mutation(
+            workspace_id,
+            shared_policy,
+            policy,
+            vec![
+                add_artifact(
+                    ArtifactId(Uuid::from_u128(11)),
+                    b"assets/data-\xff.bin".to_vec(),
+                    0x42,
+                    false,
+                ),
+                add_artifact(
+                    ArtifactId(Uuid::from_u128(10)),
+                    b"compose.yaml".to_vec(),
+                    0x41,
+                    false,
+                ),
+            ],
+        );
+
+        let first = native_change(0xa0, 220, 210, 120, 110);
+        let second = native_change(0xb0, 240, 230, 140, 130);
+        let (low, high) = if first.id <= second.id {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let low_oid = match low.origin {
+            crate::ChangeOrigin::GitCommit { oid } => oid,
+            crate::ChangeOrigin::Native => unreachable!("fixture changes are Git-origin"),
+        };
+        let high_oid = match high.origin {
+            crate::ChangeOrigin::GitCommit { oid } => oid,
+            crate::ChangeOrigin::Native => unreachable!("fixture changes are Git-origin"),
+        };
+
+        let commit_object = |oid: GitObjectId| ExternalObjectRecord {
+            object: ExternalObjectId::new(ExternalObjectKind::Commit, oid),
+            body_hash: Hash256::from_bytes([0x5a; 32]),
+            body_len: 42,
+        };
+        let alias = |oid: GitObjectId, change_id: SemanticChangeId| {
+            ExternalChangeAlias::new(repository_id.clone(), oid, change_id)
+        };
+        let ref_mutation = |name: &[u8], byte: u8| RefMutation {
+            name: RefName::branch(name).unwrap(),
+            expected: RefExpectation::MustNotExist,
+            new_target: Some(RefTarget::change(SemanticChangeId::from_hash(
+                Hash256::from_bytes([byte; 32]),
+            ))),
+            policy: RefUpdatePolicy::FastForwardOnly,
+        };
+
+        RepositoryTransaction {
+            schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: OperationId::from_uuid(Uuid::from_u128(12)),
+            repository_id: repository_id.clone(),
+            expected_generation: 7,
+            expected_roots: roots(),
+            actor: AuthorId::new("actor"),
+            reason: "canonicalization fixture".to_string(),
+            // every vector below is out of canonical order on purpose
+            external_objects: vec![commit_object(high_oid), commit_object(low_oid)],
+            git_authority_delta: None,
+            changes: vec![high.clone(), low.clone()],
+            aliases: vec![alias(high_oid, high.id), alias(low_oid, low.id)],
+            ref_mutations: vec![ref_mutation(b"zeta", 0x71), ref_mutation(b"alpha", 0x70)],
+            default_ref_mutation: None,
+            workspace_mutation: Some(mutation),
+            local_overlay_delta: Some(local_overlay_delta),
+            merge_transaction_delta: None,
+            sealed_observation: None,
+        }
+    }
+
+    /// A native change whose own delta vectors are out of canonical order.
+    ///
+    /// Valid despite that, because `compute_semantic_change_id` canonicalizes
+    /// before hashing, which is the property that makes reordering a change's
+    /// deltas testable at all.
+    fn native_change(
+        seed: u8,
+        entity_high: u128,
+        entity_low: u128,
+        artifact_high: u128,
+        artifact_low: u128,
+    ) -> SemanticChange {
+        let mut change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: crate::ChangeOrigin::GitCommit {
+                oid: GitObjectId::sha1([seed; 20]),
+            },
+            parents: Vec::new(),
+            timestamp: crate::Timestamp::from(
+                chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            author: AuthorId::new("actor"),
+            message: format!("native change {seed}"),
+            entity_deltas: vec![
+                crate::EntityDelta::Added {
+                    new: semantic_entity(entity_high, "later"),
+                },
+                crate::EntityDelta::Added {
+                    new: semantic_entity(entity_low, "earlier"),
+                },
+            ],
+            relation_deltas: Vec::new(),
+            tree_deltas: vec![
+                add_artifact(
+                    ArtifactId(Uuid::from_u128(artifact_high)),
+                    format!("z-{seed}.rs").into_bytes(),
+                    seed,
+                    false,
+                ),
+                add_artifact(
+                    ArtifactId(Uuid::from_u128(artifact_low)),
+                    format!("a-{seed}.rs").into_bytes(),
+                    seed,
+                    false,
+                ),
+            ],
+            admission_policy_delta: None,
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            // Out of canonical order like every other vector here, so the sort
+            // that orders them has something to do.
+            external_reference_deltas: vec![
+                ExternalReferenceDelta::Added {
+                    new: ExternalReference::new_resolved("python-module-v1", "zzz-later", "sym")
+                        .unwrap(),
+                },
+                ExternalReferenceDelta::Added {
+                    new: ExternalReference::new_resolved("python-module-v1", "aaa-early", "sym")
+                        .unwrap(),
+                },
+            ],
+        };
+        change.id = crate::compute_semantic_change_id(&change).unwrap();
+        change
+    }
+
+    /// The canonicalization as it stood before it was optimized, kept verbatim
+    /// as the reference the production implementation is diffed against.
+    ///
+    /// Clones the whole transaction and sorts the copy. That is precisely the
+    /// cost the production version exists to avoid, which is why this stays: an
+    /// optimization of a durable identity is only safe if it can be shown to
+    /// produce the same bytes as the implementation it replaces, on inputs
+    /// chosen to vary exactly what it changed.
+    fn reference_canonical_hash(transaction: &RepositoryTransaction) -> Result<Hash256> {
+        let mut canonical = transaction.clone();
+        canonical.changes.sort_by_key(|change| change.id);
+        for change in &mut canonical.changes {
+            change
+                .entity_deltas
+                .sort_by_key(crate::EntityDelta::target_id);
+            change
+                .relation_deltas
+                .sort_by_key(crate::RelationDelta::target_id);
+            change.tree_deltas.sort_by_key(TreeDelta::artifact_id);
+            change
+                .external_reference_deltas
+                .sort_by_key(ExternalReferenceDelta::target_id);
+        }
+        canonical
+            .external_objects
+            .sort_by_key(|record| record.object);
+        canonical.aliases.sort_by_key(|alias| alias.oid);
+        canonical
+            .ref_mutations
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        if let Some(workspace) = &mut canonical.workspace_mutation {
+            workspace.tree_deltas.sort_by_key(TreeDelta::artifact_id);
+            workspace.semantic_delta.sort_canonical();
+        }
+        hash_serialized(b"kin-repository-transaction-v4\0", &canonical)
+    }
+
+    /// Deterministic permutation, so a failure is reproducible from its seed.
+    fn permute<T>(items: &mut [T], seed: u64) {
+        if items.len() < 2 {
+            return;
+        }
+        let mut state = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        for index in (1..items.len()).rev() {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let pick = usize::try_from(state >> 33).unwrap_or(0) % (index + 1);
+            items.swap(index, pick);
+        }
+    }
+
+    /// Permute every collection the canonicalization sorts, including the ones
+    /// `validate` would refuse out of order.
+    ///
+    /// Reachable only because `canonical_hash` does not validate: the workspace
+    /// semantic delta's vectors are rejected by `WorkspaceSemanticDelta::validate`
+    /// when non-canonical, so no valid transaction can carry them shuffled, and
+    /// no fixture-based test can reach that sort at all.
+    fn permute_every_canonicalized_collection(transaction: &mut RepositoryTransaction, seed: u64) {
+        permute(&mut transaction.changes, seed);
+        for (index, change) in transaction.changes.iter_mut().enumerate() {
+            let seed = seed.wrapping_add(index as u64).wrapping_mul(31);
+            permute(&mut change.entity_deltas, seed);
+            permute(&mut change.relation_deltas, seed ^ 0x11);
+            permute(&mut change.tree_deltas, seed ^ 0x22);
+            permute(&mut change.external_reference_deltas, seed ^ 0x33);
+        }
+        permute(&mut transaction.external_objects, seed ^ 0x44);
+        permute(&mut transaction.aliases, seed ^ 0x55);
+        permute(&mut transaction.ref_mutations, seed ^ 0x66);
+        if let Some(workspace) = &mut transaction.workspace_mutation {
+            permute(&mut workspace.tree_deltas, seed ^ 0x77);
+            permute(&mut workspace.semantic_delta.entity_deltas, seed ^ 0x88);
+            permute(&mut workspace.semantic_delta.relation_deltas, seed ^ 0x99);
+            permute(
+                &mut workspace.semantic_delta.external_reference_deltas,
+                seed ^ 0xaa,
+            );
+        }
+    }
+
+    /// [`canonicalizable_transaction`] plus a workspace semantic delta held out
+    /// of canonical order.
+    ///
+    /// Deliberately NOT a valid transaction. `WorkspaceSemanticDelta::validate`
+    /// refuses non-canonical order, so this shape can never reach
+    /// `transaction_hash`, and the `sort_canonical()` call inside the
+    /// canonicalization is unreachable from any valid fixture. Driving
+    /// `canonical_hash` directly is the only way to exercise it.
+    fn differential_fixture() -> RepositoryTransaction {
+        let mut transaction = canonicalizable_transaction();
+        let workspace = transaction.workspace_mutation.as_mut().unwrap();
+        workspace.semantic_delta.external_reference_deltas = vec![
+            ExternalReferenceDelta::Added {
+                new: ExternalReference::new_resolved("npm-package-v1", "zzz-pkg", "merge").unwrap(),
+            },
+            ExternalReferenceDelta::Added {
+                new: ExternalReference::new_resolved("npm-package-v1", "aaa-pkg", "merge").unwrap(),
+            },
+        ];
+        assert!(
+            transaction.validate().is_err(),
+            "this fixture is meant to be unvalidatable; if it validates, the \
+             sort_canonical path it exists to reach is reachable another way"
+        );
+        transaction
+    }
+
+    /// The optimized canonicalization must produce the same bytes as the one it
+    /// replaced, on inputs that vary exactly what it changed.
+    ///
+    /// This is the bar for touching `transaction_hash` at all. The identity is
+    /// durable: it is stored in every `RepositoryCommitReceipt` and compared on
+    /// idempotent replay, so an implementation that hashes differently by one
+    /// byte invalidates receipts already on disk. A pinned digest cannot carry
+    /// that load alone, because it fixes one value for one fixture; this fixes
+    /// equality against the previous implementation across many orderings.
+    ///
+    /// It drives `canonical_hash` rather than `transaction_hash` on purpose, so
+    /// the inputs need not satisfy `validate` and can therefore include
+    /// orderings no valid transaction may carry. That is what reaches the
+    /// workspace semantic delta's `sort_canonical()`, which no fixture-based
+    /// test can exercise, because `WorkspaceSemanticDelta::validate` refuses
+    /// non-canonical order outright.
+    ///
+    /// Coverage was measured, not assumed. Each of the ten sorts was removed in
+    /// turn and this test was required to fail: nine did. The exception is the
+    /// per-change `relation_deltas` sort, which this fixture cannot reach
+    /// because it carries no relations, and an empty collection makes its sort
+    /// unobservable. Populating it needs a `Relation` fixture this module does
+    /// not have. That gap is named here rather than left for a reader to
+    /// discover, because a test that appears to cover ten sorts and covers nine
+    /// is worse than one that says which nine.
+    #[test]
+    fn the_canonicalization_matches_the_implementation_it_replaced() {
+        let base = differential_fixture();
+        for seed in 0..64_u64 {
+            let mut permuted = base.clone();
+            permute_every_canonicalized_collection(&mut permuted, seed);
+            assert_eq!(
+                permuted.canonical_hash().unwrap(),
+                reference_canonical_hash(&permuted).unwrap(),
+                "optimized canonicalization disagrees with the implementation it \
+                 replaced, at permutation seed {seed}"
+            );
+            assert_eq!(
+                permuted.canonical_hash().unwrap(),
+                base.canonical_hash().unwrap(),
+                "canonicalization is order-dependent at permutation seed {seed}"
+            );
+        }
+    }
+
+    /// Transaction identity must not depend on the order a caller built its
+    /// collections in.
+    ///
+    /// `transaction_hash` canonicalizes by sorting before it serializes, and
+    /// until this test nothing asserted that any of those sorts work. The pinned
+    /// digest in `a_transaction_without_a_merge_keeps_its_pre_merge_identity` is
+    /// built from `workspace_transaction()`, whose `changes`, `aliases`,
+    /// `external_objects` and `ref_mutations` are all empty, so it pins a value
+    /// for a transaction that has nothing to canonicalize. A sort that was
+    /// dropped or keyed wrong keeps that digest green while changing the
+    /// identity of every repository that actually carries history, and identity
+    /// here is durable: it is stored in every `RepositoryCommitReceipt` and
+    /// compared on idempotent replay.
+    ///
+    /// Each collection is reordered on its own so a removed sort fails by name
+    /// rather than as one undifferentiated mismatch.
+    ///
+    /// Not covered, and stated rather than implied: the per-change
+    /// `relation_deltas` and `external_reference_deltas` orderings, which this
+    /// fixture leaves empty, and the workspace semantic delta's own three
+    /// vectors, whose order cannot be varied here because
+    /// `WorkspaceSemanticDelta::validate` REJECTS non-canonical order outright
+    /// rather than canonicalizing it. That last one is guarded by rejection, not
+    /// by invariance, which is a different contract and a different test.
+    #[test]
+    fn transaction_identity_ignores_the_order_of_every_collection_it_canonicalizes() {
+        let base = canonicalizable_transaction();
+        base.validate().unwrap();
+        let expected = base.transaction_hash().unwrap();
+
+        let check = |reordered: RepositoryTransaction, collection: &str| {
+            reordered.validate().unwrap_or_else(|error| {
+                panic!("reordering {collection} produced an invalid transaction: {error}")
+            });
+            assert_eq!(
+                reordered.transaction_hash().unwrap(),
+                expected,
+                "transaction identity moved when only the order of {collection} changed, so \
+                 transaction_hash does not canonicalize {collection}"
+            );
+        };
+
+        let mut changes = base.clone();
+        changes.changes.reverse();
+        assert_ne!(
+            changes.changes, base.changes,
+            "the fixture must have >1 change"
+        );
+        check(changes, "changes");
+
+        let mut entity_deltas = base.clone();
+        for change in &mut entity_deltas.changes {
+            assert!(
+                change.entity_deltas.len() > 1,
+                "each fixture change must carry more than one entity delta"
+            );
+            change.entity_deltas.reverse();
+        }
+        check(entity_deltas, "per-change entity deltas");
+
+        let mut change_trees = base.clone();
+        for change in &mut change_trees.changes {
+            assert!(
+                change.tree_deltas.len() > 1,
+                "each fixture change must carry more than one tree delta"
+            );
+            change.tree_deltas.reverse();
+        }
+        check(change_trees, "per-change tree deltas");
+
+        let mut objects = base.clone();
+        objects.external_objects.reverse();
+        assert_ne!(
+            objects.external_objects, base.external_objects,
+            "the fixture must have >1 external object"
+        );
+        check(objects, "external objects");
+
+        let mut aliases = base.clone();
+        aliases.aliases.reverse();
+        assert_ne!(
+            aliases.aliases, base.aliases,
+            "the fixture must have >1 alias"
+        );
+        check(aliases, "aliases");
+
+        let mut refs = base.clone();
+        refs.ref_mutations.reverse();
+        assert_ne!(
+            refs.ref_mutations, base.ref_mutations,
+            "the fixture must have >1 ref mutation"
+        );
+        check(refs, "ref mutations");
+
+        let mut workspace_trees = base.clone();
+        let workspace = workspace_trees.workspace_mutation.as_mut().unwrap();
+        assert!(
+            workspace.tree_deltas.len() > 1,
+            "the fixture workspace must carry more than one tree delta"
+        );
+        workspace.tree_deltas.reverse();
+        check(workspace_trees, "workspace tree deltas");
     }
 
     #[test]
