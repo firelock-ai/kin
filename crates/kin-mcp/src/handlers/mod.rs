@@ -3314,6 +3314,14 @@ mod tests {
                 serde_json::json!("dependent_edge"),
                 "an arriving edge must say which way it points (compact={compact}): {value}"
             );
+            // The control for the marker: this caller reaches the focal one way
+            // only, so claiming both would be a fabrication rather than a label.
+            assert_eq!(
+                dependents[0]["bidirectional"],
+                serde_json::Value::Null,
+                "a one-way caller must not be marked as joined both ways \
+                 (compact={compact}): {value}"
+            );
 
             let dependencies = value["dependencies"]
                 .as_array()
@@ -3392,9 +3400,28 @@ mod tests {
             let dependents = value["dependents"].as_array().unwrap_or_else(|| {
                 panic!("the pack must name the group holding what depends on the focal: {value}")
             });
-            assert!(
-                dependents.iter().any(|row| row["id"] == caller_id),
-                "the caller find_references reports must reach the pack's dependents \
+            let caller = dependents
+                .iter()
+                .find(|row| row["id"] == caller_id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the caller find_references reports must reach the pack's dependents \
+                         (compact={compact}): {value}"
+                    )
+                });
+            assert_eq!(
+                caller["relation"],
+                serde_json::json!("dependent_edge"),
+                "an arriving edge must say which way it points (compact={compact}): {value}"
+            );
+            // The fixture's pair IS joined both ways, so the marker has to be
+            // here. Without this the group could be right for the wrong reason:
+            // a build that simply relabelled every neighbour a dependent would
+            // pass every other assertion in this test.
+            assert_eq!(
+                caller["bidirectional"],
+                serde_json::json!(true),
+                "a pair joined both ways must keep the other direction on the row \
                  (compact={compact}): {value}"
             );
             assert_eq!(
