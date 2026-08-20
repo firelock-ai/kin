@@ -46,7 +46,8 @@ pub use fingerprint::{
     behavior_equivalence_hash, compute_entity_fingerprint, language_supports_equivalence,
 };
 pub use history::{
-    derive_historical_semantic_deltas, is_external_reference_target, HistoricalSemanticDelta,
+    derive_historical_semantic_deltas, is_external_reference_target, placeholder_target_entity,
+    HistoricalSemanticDelta,
 };
 pub use linker::{
     bare_entity_name, build_projection_derived_relations_for_file,
