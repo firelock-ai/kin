@@ -18,62 +18,17 @@
 //!
 //! This binary installs a counting global allocator, so it holds exactly one
 //! test on purpose. The counter is process-wide, and a second test running
-//! beside it would charge its allocations to this one.
+//! beside it would charge its allocations to this one. The allocator and the
+//! per-phase probe both live in `support`, so other admission memory tests can
+//! install the same instrument.
 
-use std::alloc::{GlobalAlloc, Layout, System};
+mod support;
+
 use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-static LIVE: AtomicUsize = AtomicUsize::new(0);
-static PEAK: AtomicUsize = AtomicUsize::new(0);
-
-struct Counting;
-
-fn charge(bytes: usize) {
-    let live = LIVE.fetch_add(bytes, Ordering::Relaxed) + bytes;
-    PEAK.fetch_max(live, Ordering::Relaxed);
-}
-
-// SAFETY: every branch forwards to the system allocator with the same pointer
-// and layout it was given, and only adjusts counters around that call.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = unsafe { System.alloc(layout) };
-        if !ptr.is_null() {
-            charge(layout.size());
-        }
-        ptr
-    }
-
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let ptr = unsafe { System.alloc_zeroed(layout) };
-        if !ptr.is_null() {
-            charge(layout.size());
-        }
-        ptr
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
-        unsafe { System.dealloc(ptr, layout) };
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let fresh = unsafe { System.realloc(ptr, layout, new_size) };
-        if !fresh.is_null() {
-            if new_size >= layout.size() {
-                charge(new_size - layout.size());
-            } else {
-                LIVE.fetch_sub(layout.size() - new_size, Ordering::Relaxed);
-            }
-        }
-        fresh
-    }
-}
 
 #[global_allocator]
-static ALLOC: Counting = Counting;
+static ALLOC: support::Counting = support::Counting;
 
 /// Commits in the fixture history.
 ///
@@ -171,13 +126,17 @@ fn admitting_git_history_stays_under_the_init_heap_ceiling() {
     std::fs::create_dir(&repo).unwrap();
     build_history(&repo);
 
+    // Installed before the measured call so every admission phase is sampled.
+    // Without it a breach reports a number and no way to act on it.
+    support::install_phase_layer();
+
     let repo = repo.canonicalize().unwrap();
-    PEAK.store(LIVE.load(Ordering::SeqCst), Ordering::SeqCst);
-    let baseline = LIVE.load(Ordering::SeqCst);
+    support::reset_peak();
+    let baseline = support::live();
 
     kin_core::init_from_git(&repo).expect("admit the fixture repository");
 
-    let peak = PEAK.load(Ordering::SeqCst).saturating_sub(baseline);
+    let peak = support::peak().saturating_sub(baseline);
     println!(
         "peak live heap admitting {COMMITS} commits: {peak} bytes ({:.1} MiB), ceiling {} MiB",
         peak as f64 / 1024.0 / 1024.0,
@@ -190,6 +149,10 @@ fn admitting_git_history_stays_under_the_init_heap_ceiling() {
          plan, and the bootstrap transaction at the same time, so a structure kept live for \
          a phase longer than it needs to be is charged where the working set is already \
          largest. On a repository with real history that is the difference between init \
-         running on a small machine and swapping it."
+         running on a small machine and swapping it.\n\n{}\n\
+         Read the grew column to find which phase moved, and the retained column to tell a \
+         structure held too long from allocation churn inside one phase. They need opposite \
+         fixes.",
+        support::phase_attribution_table()
     );
 }

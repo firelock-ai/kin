@@ -59,6 +59,7 @@ winapi-util = "0.1"
 [dev-dependencies]
 kin-git = { workspace = true, features = ["test-support"] }
 pretty_assertions = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
 kin-daemon-spawn = { workspace = true }
