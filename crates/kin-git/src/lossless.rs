@@ -89,6 +89,30 @@ struct ClosureKey {
 
 type ClosureBodies = BTreeMap<ExternalObjectId, Vec<u8>>;
 
+/// Whether a caller may be handed a closure this thread already decompressed.
+///
+/// The cache key covers the object DESCRIPTORS, not the state of the CAS they
+/// point at, so a hit asserts something the key cannot see: that the bodies are
+/// still there and still those bytes. Inside one conversion that holds, because
+/// nothing mutates the CAS underneath a pipeline that is only reading it.
+///
+/// It does not hold for every caller, and the difference is not a detail.
+/// `rehydrate_lossless_git_repository` documents that it preflights all CAS
+/// bodies before mutating the filesystem, so its contract INCLUDES proving the
+/// CAS can supply them right now. A shared closure would let it write an export
+/// from bytes it never re-read, and a deleted body would stop failing closed.
+/// It reads fresh.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClosureSharing {
+    /// Re-use this thread's closure when the object set is identical.
+    Shared,
+    /// Read every body from the CAS, whatever is cached.
+    ///
+    /// For callers whose contract is that the CAS holds these bodies NOW, which
+    /// only a read can establish.
+    Fresh,
+}
+
 fn closure_key(snapshot: &LosslessGitRepository) -> ClosureKey {
     ClosureKey {
         object_format: snapshot.object_format,
@@ -303,7 +327,12 @@ pub fn rehydrate_lossless_git_repository(
         ));
     }
     reject_existing_destination(output_path)?;
-    let bodies = validate_snapshot(snapshot, blob_store)?;
+    // Fresh, never shared. This function's contract is that every CAS body is
+    // preflighted before the filesystem is touched, and only a read establishes
+    // that the CAS still holds them. Handing it a closure decompressed earlier
+    // in this process would let an export be written from bytes nobody re-read,
+    // and a body deleted since would stop failing closed.
+    let bodies = validate_snapshot_with(snapshot, blob_store, ClosureSharing::Fresh)?;
 
     let parent = output_path.parent().ok_or_else(|| {
         GitError::InvalidSnapshot(format!(
@@ -714,6 +743,16 @@ pub(crate) fn validate_snapshot(
     snapshot: &LosslessGitRepository,
     blob_store: &BlobStore,
 ) -> Result<Rc<ClosureBodies>> {
+    validate_snapshot_with(snapshot, blob_store, ClosureSharing::Shared)
+}
+
+/// [`validate_snapshot`], with the caller stating whether a shared closure is
+/// sound for what it is about to do.
+fn validate_snapshot_with(
+    snapshot: &LosslessGitRepository,
+    blob_store: &BlobStore,
+    sharing: ClosureSharing,
+) -> Result<Rc<ClosureBodies>> {
     snapshot.refs.validate()?;
     for repository_ref in &snapshot.refs.refs {
         if repository_ref.repository_id != snapshot.repository_id {
@@ -725,7 +764,7 @@ pub(crate) fn validate_snapshot(
     }
     validate_head_and_default(snapshot)?;
 
-    let bodies = decompressed_closure(snapshot, blob_store)?;
+    let bodies = decompressed_closure(snapshot, blob_store, sharing)?;
 
     // Outside the shared closure on purpose. Reachability is a function of the
     // refs and HEAD as well as the objects, and those are NOT part of the cache
@@ -754,16 +793,19 @@ pub(crate) fn validate_snapshot(
 fn decompressed_closure(
     snapshot: &LosslessGitRepository,
     blob_store: &BlobStore,
+    sharing: ClosureSharing,
 ) -> Result<Rc<ClosureBodies>> {
     let key = closure_key(snapshot);
-    if let Some(shared) = CLOSURE_CACHE.with(|cache| {
-        cache
-            .borrow()
-            .as_ref()
-            .filter(|(cached, _)| *cached == key)
-            .map(|(_, bodies)| Rc::clone(bodies))
-    }) {
-        return Ok(shared);
+    if sharing == ClosureSharing::Shared {
+        if let Some(shared) = CLOSURE_CACHE.with(|cache| {
+            cache
+                .borrow()
+                .as_ref()
+                .filter(|(cached, _)| *cached == key)
+                .map(|(_, bodies)| Rc::clone(bodies))
+        }) {
+            return Ok(shared);
+        }
     }
 
     // Counted here rather than at the function entry, because a hit above costs
@@ -2281,6 +2323,52 @@ mod tests {
             Err(GitError::Blob(_))
         ));
         assert!(!cas_output.exists());
+    }
+
+    #[test]
+    fn a_warm_shared_closure_never_satisfies_rehydrations_cas_proof() {
+        let fixture = Fixture::simple();
+        let snapshot = capture_lossless_git_repository(
+            &fixture.repo,
+            RepositoryId::new("warm-closure").unwrap(),
+            &fixture.blob_store,
+        )
+        .unwrap();
+
+        // Assert the cache is warm rather than assume it. A body deleted while
+        // the cache is cold gets re-read by any implementation, so that test
+        // passes whatever rehydration does and would stop guarding this
+        // boundary without ever failing.
+        let before = closure_reconstruction_count();
+        validate_snapshot(&snapshot, &fixture.blob_store).unwrap();
+        assert_eq!(
+            closure_reconstruction_count(),
+            before,
+            "a second shared validation of one object set must hit the cache",
+        );
+
+        fixture
+            .blob_store
+            .delete(&snapshot.objects[0].body_hash)
+            .unwrap();
+
+        // The shared closure is now stale in the only way it can be: the
+        // descriptors are untouched, so the key still matches, and it still
+        // hands out a body the CAS can no longer supply.
+        let served = validate_snapshot(&snapshot, &fixture.blob_store).unwrap();
+        assert!(
+            served.contains_key(&snapshot.objects[0].object),
+            "the shared closure must still hold the deleted body for this to prove anything",
+        );
+
+        // Rehydration reads fresh, so it fails closed on the CAS rather than
+        // exporting from bytes nobody re-read.
+        let output = fixture._root.path().join("warm-closure.git");
+        assert!(matches!(
+            rehydrate_lossless_git_repository(&snapshot, &fixture.blob_store, &output),
+            Err(GitError::Blob(kin_blobs::BlobError::NotFound { .. }))
+        ));
+        assert!(!output.exists());
     }
 
     #[test]
