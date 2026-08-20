@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Put the one verdict on every retrieval answer and stop certifying an unprobed scan (#970)
 - Make the LSP sweep run, finish and be observable, and count callers that reach an override through a proven base (#971)
 - Carry the planned repository authority into the commit that publishes it (#972)
+- Produce the Overrides edge kin already consumes six ways (#973)
 
 
 ## [0.5.42] - 2026-08-19
