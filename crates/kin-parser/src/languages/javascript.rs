@@ -259,6 +259,13 @@ pub(super) fn collect_js_property_definers(
 /// A function's parameter names in declaration order. A destructured or
 /// defaulted parameter yields an empty slot rather than being skipped, so the
 /// positions of the parameters around it stay truthful.
+///
+/// TypeScript wraps each parameter in a `required_parameter` or
+/// `optional_parameter` carrying the binding under a `pattern` field, so the
+/// name is read through that wrapper as well as bare. Without it the shared
+/// rule silently reads every TypeScript parameter as unnamed and no helper is
+/// ever recognized in a `.ts` file, which is a difference between the two
+/// adapters that nothing in either one would report.
 fn js_parameter_names(function: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
     let Some(params) = function.child_by_field_name("parameters") else {
         return Vec::new();
@@ -266,14 +273,22 @@ fn js_parameter_names(function: &tree_sitter::Node, source: &[u8]) -> Vec<String
     let mut names = Vec::new();
     let mut cursor = params.walk();
     for param in params.children(&mut cursor) {
-        if !param.is_named() {
+        if !param.is_named() || param.kind() == "comment" {
             continue;
         }
-        names.push(if param.kind() == "identifier" {
-            param.utf8_text(source).unwrap_or("").to_string()
+        let binding = if param.kind() == "identifier" {
+            Some(param)
         } else {
-            String::new()
-        });
+            param
+                .child_by_field_name("pattern")
+                .filter(|pattern| pattern.kind() == "identifier")
+        };
+        names.push(
+            binding
+                .and_then(|node| node.utf8_text(source).ok())
+                .unwrap_or("")
+                .to_string(),
+        );
     }
     names
 }
