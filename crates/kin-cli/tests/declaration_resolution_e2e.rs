@@ -142,6 +142,14 @@ async fn impact_lines(graph: &InMemoryGraph, entity: &str, file: Option<&str>) -
             signature: None,
             require_unique: false,
         },
+        // Substrate sound, so the FIR-2524 absence qualifier answers on coverage
+        // rather than on the envelope. These cases assert impact CONTENT.
+        &kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 2,
+            "graph_generation": 1,
+        })),
     )
     .await
     .expect("impact response")

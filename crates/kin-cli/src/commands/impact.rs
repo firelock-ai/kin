@@ -400,20 +400,35 @@ fn impact_absence_qualifier(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("this language");
     let classes = observed.and_then(|coverage| coverage.get("classes"));
-    let in_state = |state: &str| -> Vec<&'static str> {
-        ["calls", "imports", "references"]
-            .into_iter()
-            .filter(|class| {
-                classes
-                    .and_then(|classes| classes.get(*class))
-                    .and_then(serde_json::Value::as_str)
-                    == Some(state)
-            })
-            .map(edge_class_noun)
-            .collect()
+    let state_of = |class: &str| -> Option<&str> {
+        classes
+            .and_then(|classes| classes.get(class))
+            .and_then(serde_json::Value::as_str)
     };
-    let missing = in_state("absent");
-    let present = in_state("present");
+    // Only the classes the gate actually rested on may be named. Listing every
+    // absent class would tell a reader their import edges were the problem on a
+    // store where imports never mattered: Kin's linker mints no entity-level
+    // `Imports` relation on any language, so that class reads absent on healthy
+    // graphs too, and naming it is a small fabrication of the same kind this
+    // change exists to stop.
+    let requested: Vec<String> = kin_mcp::handlers::review::IMPACT_REFERENCE_KINDS
+        .iter()
+        .map(|kind| format!("{kind:?}").to_lowercase())
+        .collect();
+    let deciding = kin_mcp::negative::deciding_classes(
+        &requested,
+        kin_mcp::negative::references_producible(&payload),
+    );
+    let missing: Vec<&'static str> = deciding
+        .iter()
+        .filter(|class| state_of(class) == Some("absent"))
+        .map(|class| edge_class_noun(class))
+        .collect();
+    let present: Vec<&'static str> = requested
+        .iter()
+        .filter(|class| state_of(class) == Some("present"))
+        .map(|class| edge_class_noun(class))
+        .collect();
 
     // Naming a missing class the observation did not report would be the same
     // fabrication this ticket family exists to end, so when nothing is absent
@@ -789,6 +804,115 @@ mod tests {
         build_impact_response, downstream_impact_by_hop, impact_not_found_guidance, ImpactRequest,
         ImpactResponse, ImpactWalkGraph,
     };
+
+    /// THE SPINE (FIR-2524, captain's rider). A degraded daemon must make the CLI
+    /// inherit the MCP verdict for that degradation.
+    ///
+    /// This is the test the cheap wiring could never pass, and it is why the
+    /// expensive wiring was chosen. The rejected option built a thin envelope in
+    /// the route from facts it had locally, `initialized` and `graph_loaded`,
+    /// which carries no degraded signal. Under it the CLI would print nothing
+    /// here while `impact_analysis` refused on the same daemon at the same
+    /// instant: the human surface MORE confident than the agent surface, which
+    /// is precisely the divergence this ticket exists to close, reintroduced by
+    /// its own fix. Every other test in this file runs against a healthy daemon
+    /// and would have passed regardless, so without this case the choice between
+    /// the two wirings was unfalsifiable.
+    ///
+    /// It asserts inheritance rather than wording: the same `negative_for` call
+    /// the daemon's MCP handler makes, on the same payload, must reach the same
+    /// `safe_to_conclude_absent`, and the rendered line must name the signal the
+    /// verdict disclosed rather than inventing a cause.
+    #[tokio::test]
+    async fn a_degraded_daemon_makes_the_cli_inherit_the_mcp_verdict() {
+        let graph = kin_db::InMemoryGraph::new();
+        let target = entity("orphan", "src/orphan.rs");
+        graph.upsert_entity(&target).unwrap();
+        // Coverage is HEALTHY on purpose, so the degraded signal is the only
+        // reason left to refuse. Without this the store is genuinely
+        // coverage-poor, the refusal is over-determined, and the test would pass
+        // while proving nothing about the envelope.
+        let caller = entity("caller", "src/a.rs");
+        let callee = entity("callee", "src/b.rs");
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&callee).unwrap();
+        calls(&graph, &caller, &callee);
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+
+        let degraded = kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 1,
+            "graph_generation": 1,
+            "embed_worker_failed": true,
+        }));
+
+        let response = build_impact_response(
+            &layout,
+            &graph,
+            &ImpactRequest {
+                entity: "orphan".to_string(),
+                depth: 3,
+                file: None,
+                kind: None,
+                signature: None,
+                require_unique: false,
+            },
+            &degraded,
+        )
+        .await
+        .expect("impact response");
+        let rendered = response.lines.join("\n");
+
+        // What the MCP surface would say about this same daemon and this same
+        // empty answer. Not a re-implementation: the identical entry point.
+        let coverage = kin_mcp::edge_coverage::observe_cross_file_reference_coverage_for_languages(
+            &graph,
+            &[target.language],
+            &kin_mcp::handlers::review::IMPACT_REFERENCE_KINDS,
+        );
+        let payload = serde_json::json!({
+            "entity_impacts": [],
+            kin_mcp::EDGE_COVERAGE_KEY: coverage,
+        });
+        let mcp = kin_mcp::negative::negative_for("impact_analysis", &payload, &degraded, &[])
+            .expect("impact_analysis always qualifies");
+        assert_eq!(
+            mcp["safe_to_conclude_absent"],
+            serde_json::json!(false),
+            "the MCP verdict must refuse on a degraded daemon, or this test asserts nothing: {mcp}"
+        );
+
+        assert!(
+            rendered.contains("Kin cannot rule out dependents"),
+            "the CLI must inherit the refusal the MCP surface reached: {rendered}"
+        );
+        assert!(
+            rendered.contains("embed_worker_failed"),
+            "the line names the signal the verdict disclosed rather than inventing a cause: \
+             {rendered}"
+        );
+        // And it must not fabricate a missing edge class. Nothing here observed
+        // one, and naming one anyway is the fabrication this family exists to end.
+        assert!(
+            !rendered.contains("holds no cross-file"),
+            "no absent class was observed, so none may be claimed: {rendered}"
+        );
+    }
+
+    /// A daemon whose substrate is sound, so the absence gate answers on
+    /// coverage rather than on the envelope. The tests that predate FIR-2524
+    /// assert impact CONTENT, and a synthetic envelope reading uninitialised
+    /// would make every one of them inconclusive for a reason they are not about.
+    fn healthy_test_envelope() -> kin_mcp::Envelope {
+        kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 2,
+            "graph_generation": 1,
+        }))
+    }
     use kin_model::{
         Entity, EntityId, EntityKind, EntityMetadata, EntityRole, EntityStore, FilePathId,
         FingerprintAlgorithm, GraphNodeId, Hash256, LanguageId, Relation, RelationId, RelationKind,
@@ -870,6 +994,7 @@ mod tests {
                 signature: None,
                 require_unique: false,
             },
+            &healthy_test_envelope(),
         )
         .await
         .unwrap();
@@ -897,6 +1022,7 @@ mod tests {
                 signature: None,
                 require_unique: true,
             },
+            &healthy_test_envelope(),
         )
         .await
         .unwrap();
@@ -942,6 +1068,7 @@ mod tests {
                 signature: Some("fn changed()".to_string()),
                 require_unique: true,
             },
+            &healthy_test_envelope(),
         )
         .await
         .unwrap();
@@ -975,6 +1102,7 @@ mod tests {
                 signature: None,
                 require_unique: true,
             },
+            &healthy_test_envelope(),
         )
         .await
         .unwrap();
@@ -1006,6 +1134,7 @@ mod tests {
                 signature: Some("fn   handle(value: String)".to_string()),
                 require_unique: true,
             },
+            &healthy_test_envelope(),
         )
         .await
         .unwrap();
@@ -1063,6 +1192,7 @@ mod tests {
                 signature: None,
                 require_unique: false,
             },
+            &healthy_test_envelope(),
         )
         .await
         .unwrap();
@@ -1120,6 +1250,7 @@ mod tests {
                 signature: None,
                 require_unique: false,
             },
+            &healthy_test_envelope(),
         )
         .await
         .unwrap();
@@ -1166,6 +1297,7 @@ mod tests {
                 signature: None,
                 require_unique: false,
             },
+            &healthy_test_envelope(),
         )
         .await
         .unwrap();
@@ -1205,6 +1337,7 @@ mod tests {
                 signature: None,
                 require_unique: false,
             },
+            &healthy_test_envelope(),
         )
         .await
         .unwrap();
@@ -1242,6 +1375,7 @@ mod tests {
                 signature: None,
                 require_unique: false,
             },
+            &healthy_test_envelope(),
         )
         .await
         .unwrap();
@@ -1293,6 +1427,7 @@ mod tests {
                 signature: None,
                 require_unique: false,
             },
+            &healthy_test_envelope(),
         )
         .await
         .unwrap();
@@ -1316,6 +1451,7 @@ mod tests {
                 signature: None,
                 require_unique: false,
             },
+            &healthy_test_envelope(),
         )
         .await
         .unwrap();
@@ -1361,6 +1497,7 @@ mod tests {
                 signature: None,
                 require_unique: false,
             },
+            &healthy_test_envelope(),
         )
         .await
         .unwrap();
@@ -1609,6 +1746,7 @@ mod tests {
                 signature: None,
                 require_unique: false,
             },
+            &healthy_test_envelope(),
         )
         .await
         .unwrap();

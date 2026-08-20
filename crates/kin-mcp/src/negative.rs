@@ -366,7 +366,7 @@ pub(crate) fn load_bearing_classes(requested: &[String]) -> Vec<String> {
 /// have existed, and [`absence_coverage_gap`] already refuses both by name.
 /// `unknown` is an unread host, and unmeasured is not a finding anywhere else in
 /// this module either.
-pub(crate) fn references_producible(payload: &Value) -> bool {
+pub fn references_producible(payload: &Value) -> bool {
     payload
         .get(crate::edge_coverage::EDGE_COVERAGE_KEY)
         .and_then(|coverage| coverage.get("reference_enrichment"))
@@ -376,6 +376,13 @@ pub(crate) fn references_producible(payload: &Value) -> bool {
 
 /// The classes this answer's verdict actually rests on: [`load_bearing_classes`]
 /// plus `references` wherever this host could have produced it.
+///
+/// Public for RENDERING, not for deciding. `kin impact` prints which classes the
+/// gate rested on, and naming a class the gate never weighed is its own small
+/// fabrication: `imports` is absent on every healthy graph, so a renderer that
+/// listed every absent class would tell a user their import edges were the
+/// problem on a store where they never mattered (FIR-2524). The DECISION stays
+/// [`negative_for`]'s alone.
 ///
 /// One definition, because three consumers ask the same question and a fourth
 /// answer would only be somewhere for them to drift. [`absence_coverage_gap`]
@@ -393,7 +400,7 @@ pub(crate) fn references_producible(payload: &Value) -> bool {
 /// that changes the answer: on a host that CAN produce reference edges, their
 /// absence is a finding rather than the ordinary silence of a language server
 /// that never ran.
-pub(crate) fn deciding_classes(requested: &[String], references_producible: bool) -> Vec<String> {
+pub fn deciding_classes(requested: &[String], references_producible: bool) -> Vec<String> {
     let mut deciding = load_bearing_classes(requested);
     if references_producible
         && requested.iter().any(|class| class == "references")
