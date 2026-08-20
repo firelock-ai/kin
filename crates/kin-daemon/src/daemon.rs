@@ -1278,6 +1278,10 @@ fn lsp_enriched_marker_path(state: &DaemonState) -> std::path::PathBuf {
 /// produced no relation at all is re-swept too, which is the same asymmetry
 /// again and the cheap direction to be wrong in.
 ///
+/// The file is left alone rather than deleted. The judgment is made again from
+/// the graph on every load, and the sweep that follows rewrites the marker with
+/// what it finished, so removing it would change nothing a later open decides.
+///
 /// The scan runs only when a marker exists, and costs one snapshot at startup
 /// beside a read-index build that already walks the whole graph.
 fn load_lsp_enriched_marker(state: &DaemonState) {
@@ -1293,9 +1297,8 @@ fn load_lsp_enriched_marker(state: &DaemonState) {
     if !graph_holds_language_server_relations(state) {
         warn!(
             marked = files.len(),
-            "discarding the language-server enrichment marker: this graph holds none of the relations it records, so the files it marks are swept again"
+            "ignoring the language-server enrichment marker: this graph holds none of the relations it records, so the files it marks are swept again"
         );
-        let _ = std::fs::remove_file(lsp_enriched_marker_path(state));
         return;
     }
     if let Ok(mut marked) = state.lsp_enriched_files.lock() {
@@ -4480,9 +4483,11 @@ mod enrichment_marker_tests {
             !file_already_enriched(&state, "src/sessions.py"),
             "a marker the graph cannot corroborate must not skip the file it names"
         );
+        load_lsp_enriched_marker(&state);
         assert!(
-            !lsp_enriched_marker_path(&state).exists(),
-            "and the marker itself is removed, so the repair is not re-decided on every open"
+            !file_already_enriched(&state, "src/sessions.py"),
+            "and it stays unhonored while the graph still cannot corroborate it, so the \
+             judgment does not depend on having deleted the file"
         );
     }
 

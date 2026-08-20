@@ -4900,8 +4900,12 @@ impl DaemonState {
                 ),
             )));
         }
-        let workspace = lease
-            .metadata()
+        // One expression on one line, because the zero-file-search guard pins
+        // this authority accessor by its exact source text: it shares a name
+        // with the filesystem metadata probe in the shared deny set and is
+        // otherwise indistinguishable from one.
+        let authority_metadata = lease.metadata();
+        let workspace = authority_metadata
             .workspaces
             .iter()
             .find(|workspace| workspace.workspace_id == workspace_id)
@@ -9515,8 +9519,8 @@ mod tests {
         let lease = authority.read_authority();
         let roots = lease.roots().clone();
         let expected_generation = roots.generation;
-        let workspace = lease
-            .metadata()
+        let authority_metadata = lease.metadata();
+        let workspace = authority_metadata
             .workspaces
             .iter()
             .find(|workspace| workspace.workspace_id == workspace_id)
