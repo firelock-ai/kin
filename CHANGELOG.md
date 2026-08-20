@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Pin kin-lsp to =0.6.14 so runtime resolution carries the enrichment fixes (#975)
 - Decide a context pack's dependents with the authority find_references reads (#976)
 - Make a defineProperty-shaped JavaScript property an entity (#977)
+- Carry a removed entity's record into the diff so review names what was deleted (#978)
 
 
 ## [0.5.42] - 2026-08-19
