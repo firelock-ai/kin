@@ -11696,8 +11696,17 @@ void f();
             "src/requests/logging_adapter.py",
             EntityRole::Source,
         );
+        // The same decoy the cold path is tested against: a class the adapter
+        // does not descend from, declaring the same method name.
+        let decoy = py_class("Mailer", "src/mailer.py");
+        let decoy_send = py_method("Mailer.send", "src/mailer.py", EntityRole::Source);
 
         let mut linker = IncrementalLinker::new();
+        linker.add_file(
+            "src/mailer.py",
+            admitted_artifact_id("src/mailer.py"),
+            &[decoy.clone(), decoy_send.clone()],
+        );
         linker.add_file(
             "src/requests/logging_adapter.py",
             admitted_artifact_id("src/requests/logging_adapter.py"),
