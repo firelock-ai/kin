@@ -755,6 +755,23 @@ fn push_gap(trustworthy: &mut bool, trust_reason: &mut String, gap: String) {
 /// Number of items in the tool's result collection within `payload`, or `None`
 /// when the expected collection is absent or not an array (in which case no
 /// negative is synthesized — we never guess emptiness).
+/// Whether `payload` is a real answer from `tool` that simply left its answer
+/// group out, as opposed to a payload this module has no business qualifying.
+///
+/// Absence of the key is not enough on its own: an error object is also missing
+/// it, and qualifying one would report a verdict about a graph nobody queried.
+/// The gate is the marker that the tool did produce an answer. For a context
+/// pack that is `focal_entity`, which is the pack's whole reason to exist and is
+/// present in every mode.
+fn omits_its_answer_group(tool: &str, payload: &Value) -> bool {
+    match tool {
+        "get_context_pack" => payload
+            .get("focal_entity")
+            .is_some_and(|focal| !focal.is_null()),
+        _ => false,
+    }
+}
+
 fn collection_len(payload: &Value, field: &str) -> Option<usize> {
     if field.is_empty() {
         payload.as_array().map(Vec::len)
@@ -1498,7 +1515,19 @@ pub fn negative_for(
     let count = if tool == "semantic_locate" {
         locate_result_count(payload)?
     } else {
-        collection_len(payload, spec.field)?
+        match collection_len(payload, spec.field) {
+            Some(count) => count,
+            // An omitted group makes the same claim as an empty one, and it is
+            // the more dangerous of the two: `[]` at least names the question,
+            // while a missing key reads as a question the tool does not answer.
+            // Bailing out here would leave the shape with no verdict at all,
+            // which is the defect this module exists to prevent wearing its
+            // sharpest costume. `get_context_pack` shipped exactly that in
+            // 0.5.42, where the pack carried no `dependents` key, and nothing
+            // qualified it.
+            None if omits_its_answer_group(tool, payload) => 0,
+            None => return None,
+        }
     };
     // A locate page has a second way of being a negative: it came back full, and
     // not one hit is the symbol the query named. Qualifying that page is the
@@ -2993,6 +3022,51 @@ mod tests {
                 .unwrap()
                 .contains("method_call_resolution_incomplete"),
             "the method gap must be named: {negative}"
+        );
+    }
+
+    /// The shipped 0.5.42 pack carried NO `dependents` key at all, not an empty
+    /// one, and the agentadopt lane hit that shape on flask. A missing key is the
+    /// worse of the two: `[]` at least names the question and can be qualified,
+    /// while an absent key reads as a question this tool does not answer, and the
+    /// gate that would have refused to certify it never ran.
+    ///
+    /// The two-group split has since made the key unconditional, so this is a
+    /// regression guard rather than a live bug. It is worth its cost because the
+    /// regression is invisible: dropping the key silently disables the verdict
+    /// instead of failing anything.
+    #[test]
+    fn a_pack_that_omits_its_dependents_group_is_qualified_like_an_empty_one() {
+        let mut payload = empty_pack_dependents("function", cross_file_edges_observed());
+        payload
+            .as_object_mut()
+            .unwrap()
+            .remove("dependents")
+            .expect("the fixture carries the group to remove");
+        let negative = negative_for("get_context_pack", &payload, &structural_ready_envelope())
+            .expect("an omitted dependents group is still an absence claim");
+        assert_eq!(negative["kind"], json!("no_dependents"));
+        assert_eq!(negative["result_count"], json!(0));
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(true),
+            "the omitted shape must be qualified exactly as the empty one is: {negative}"
+        );
+    }
+
+    /// The control that keeps the case above from swallowing payloads it has no
+    /// business judging. A pack that failed before producing a focal has no
+    /// answer to qualify, and inventing a verdict for it would report on a graph
+    /// nobody queried.
+    #[test]
+    fn a_pack_payload_with_no_focal_gets_no_verdict() {
+        let mut payload = empty_pack_dependents("function", cross_file_edges_observed());
+        let map = payload.as_object_mut().unwrap();
+        map.remove("dependents");
+        map.remove("focal_entity");
+        assert!(
+            negative_for("get_context_pack", &payload, &structural_ready_envelope()).is_none(),
+            "a payload carrying no answer must not be handed a verdict about one"
         );
     }
 
