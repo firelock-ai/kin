@@ -18,7 +18,7 @@ pub mod proof;
 pub mod protocol;
 pub mod registry;
 
-pub use enrichment::{EnrichmentResult, EntityIndex, EntityRef};
+pub use enrichment::{DocumentProvider, EnrichmentResult, EntityIndex, EntityRef};
 pub use error::{LspError, Result};
 pub use proof::{
     FileFailure, LanguageEnrichment, LspEnrichmentProof, ProofMode, ProofRecorder, ProofViolation,

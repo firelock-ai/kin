@@ -119,6 +119,37 @@ pub async fn enrich_file_definitions(
         };
 
         for col in positions {
+            // A member expression on a MODULE receiver is answered by its
+            // member. Asked at the receiver, the server returns the module, and
+            // `find_at` turns that into whichever entity holds the line, so
+            // every file that names `express` was recorded as referencing
+            // express's default export: 50 inbound edges on `createApplication`
+            // against 32 real reference sites on `Router`, which had none.
+            //
+            // Value receivers keep their edges. `res` in `res.send(...)`
+            // resolves to its own parameter in this file and says something
+            // true about the enclosing function. The two are told apart by
+            // where the server puts the receiver's definition, which is the
+            // server answering rather than this code guessing.
+            if let Some((_receiver, _member_col, _member_name)) =
+                crate::enrichment::member_expression_at(line_text, col)
+            {
+                let receiver_definitions = crate::enrichment::locations_at(
+                    server,
+                    "textDocument/definition",
+                    &uri,
+                    line,
+                    col,
+                )
+                .await;
+                if crate::enrichment::receiver_names_a_module(&receiver_definitions, &rel_path) {
+                    // The member's own position is queried by this same loop on
+                    // its next turn, so declining here drops the receiver's
+                    // attribution without dropping the member's.
+                    continue;
+                }
+            }
+
             let def_result = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
                 server.client.request(

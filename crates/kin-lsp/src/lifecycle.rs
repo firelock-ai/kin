@@ -90,6 +90,30 @@ impl LspServer {
         })
     }
 
+    /// A server whose process accepts input and answers nothing.
+    ///
+    /// For tests that assert on what this crate SENDS. The document lifecycle
+    /// the enrichment join needs is notifications, which expect no reply, so a
+    /// process that swallows them exercises the real code path without needing
+    /// a language server installed on the machine running the suite.
+    #[cfg(test)]
+    pub(crate) fn offline_for_tests() -> Self {
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn a process that accepts input");
+        let stdin = child.stdin.take().expect("captured stdin");
+        let stdout = child.stdout.take().expect("captured stdout");
+        Self {
+            client: JsonRpcClient::new(stdin, stdout),
+            capabilities: protocol::ServerCapabilities::default(),
+            child,
+        }
+    }
+
     /// Send shutdown request and exit notification.
     pub async fn shutdown(self) -> Result<()> {
         let _ = self

@@ -412,13 +412,262 @@ pub async fn enrich_entity_overrides(
     Ok(relations)
 }
 
+/// The member expression an identifier position opens, when it opens one.
+///
+/// Returns the receiver text, the member's column, and the member's text for
+/// `express.Router` asked at `express`. Returns `None` for a bare identifier,
+/// for the member half of an expression (which is not itself a receiver), and
+/// for a dot followed by anything that is not an identifier.
+pub(crate) fn member_expression_at(line_text: &str, col: u32) -> Option<(String, u32, String)> {
+    let chars: Vec<char> = line_text.chars().collect();
+    let start = col as usize;
+    if start >= chars.len() {
+        return None;
+    }
+    // Both halves must START like an identifier rather than merely contain
+    // identifier characters, so `1.5` is a number and not a member expression.
+    // The caller only offers identifier starts today, but a predicate that
+    // depends on its caller's filtering is one refactor from being wrong.
+    if !(chars[start].is_alphabetic() || chars[start] == '_') {
+        return None;
+    }
+    let mut end = start;
+    while end < chars.len() && (chars[end].is_alphanumeric() || chars[end] == '_') {
+        end += 1;
+    }
+    if chars.get(end) != Some(&'.') {
+        return None;
+    }
+    let member_start = end + 1;
+    if !chars
+        .get(member_start)
+        .is_some_and(|ch| ch.is_alphabetic() || *ch == '_')
+    {
+        return None;
+    }
+    let mut member_end = member_start;
+    while member_end < chars.len()
+        && (chars[member_end].is_alphanumeric() || chars[member_end] == '_')
+    {
+        member_end += 1;
+    }
+    Some((
+        chars[start..end].iter().collect(),
+        member_start as u32,
+        chars[member_start..member_end].iter().collect(),
+    ))
+}
+
+/// One location answer for a request at a position, flattened out of the two
+/// shapes a server may reply with.
+pub(crate) async fn locations_at(
+    server: &LspServer,
+    method: &'static str,
+    uri: &str,
+    line: u32,
+    character: u32,
+) -> Vec<protocol::Location> {
+    let result = server
+        .client
+        .request(
+            method,
+            protocol::TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: uri.to_string(),
+                },
+                position: Position { line, character },
+            },
+        )
+        .await;
+    let Ok(value) = result else {
+        return Vec::new();
+    };
+    serde_json::from_value::<Vec<protocol::Location>>(value.clone()).unwrap_or_else(|_| {
+        serde_json::from_value::<protocol::Location>(value)
+            .map(|one| vec![one])
+            .unwrap_or_default()
+    })
+}
+
+/// Whether this receiver names a module rather than a value in this file.
+///
+/// Measured on express with typescript-language-server: `express` in
+/// `express.Router()` answers `definition` with `./index.js:10`, another file
+/// entirely, because the server follows the require through to the module it
+/// resolves. The value receivers on the same page stay home: `res` answers with
+/// its own parameter at `api_v1.js:6` and `apiv1` with its declaration at
+/// `api_v1.js:4`.
+///
+/// So the question "is this a module" is answered by where its definition
+/// lives, and it is the server answering rather than this code guessing. A
+/// receiver whose definition is a declaration in the file being enriched is a
+/// value in that file; one whose definition is another file's module entry is a
+/// reference to that module.
+pub(crate) fn receiver_names_a_module(
+    definitions: &[protocol::Location],
+    enriched_path: &str,
+) -> bool {
+    definitions.iter().any(|location| {
+        protocol::uri_to_path(&location.uri)
+            .map(|path| {
+                let path = path.to_string_lossy().to_string();
+                !(path.ends_with(enriched_path) || enriched_path.ends_with(path.as_str()))
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Whether two answers name the same place.
+fn same_location(left: &protocol::Location, right: &protocol::Location) -> bool {
+    left.uri == right.uri && left.range.start.line == right.range.start.line
+}
+
+/// Graph-owned text for a repository-relative path, supplied by the caller.
+///
+/// The join below has to ask the server about a token in a file OTHER than the
+/// one being enriched, and a language server answers only about documents it
+/// has been handed. The daemon opens exactly the file it is enriching, so that
+/// second document does not exist as far as the server is concerned and every
+/// query against it comes back empty.
+///
+/// Reading the second file off disk here would answer the question and break
+/// the rule that matters more: after graph truth exists, a runtime query path
+/// does not get its answer from raw filesystem contents. So the content arrives
+/// from the caller, which holds repository authority: the daemon passes its
+/// graph/CAS source view, exactly the bytes it already opens the enriched file
+/// with. A caller that supplies no provider, or a provider that has nothing for
+/// a path, leaves the join declining precisely as it does today.
+pub type DocumentProvider<'a> = &'a (dyn Fn(&str) -> Option<String> + Send + Sync);
+
+/// The LSP language id for a path, by extension.
+///
+/// `None` means this code cannot name the language, and the caller declines
+/// rather than opening the document under a guess: a document opened as the
+/// wrong language answers nothing, which is indistinguishable at the call site
+/// from a document that was never opened, and only one of those is honest.
+fn lsp_language_id(path: &str) -> Option<&'static str> {
+    let extension = path.rsplit_once('.').map(|(_, ext)| ext)?;
+    Some(match extension {
+        "js" | "mjs" | "cjs" => "javascript",
+        "jsx" => "javascriptreact",
+        "ts" | "mts" | "cts" => "typescript",
+        "tsx" => "typescriptreact",
+        "py" | "pyi" => "python",
+        "rs" => "rust",
+        "go" => "go",
+        "java" => "java",
+        "c" | "h" => "c",
+        "cc" | "cpp" | "cxx" | "hpp" | "hh" => "cpp",
+        "rb" => "ruby",
+        "php" => "php",
+        "swift" => "swift",
+        "kt" | "kts" => "kotlin",
+        "cs" => "csharp",
+        _ => return None,
+    })
+}
+
+/// Documents this pass handed to the server itself, closed when it is done.
+///
+/// Scoped to one entity's enrichment. Opening is lazy and each path is opened
+/// at most once, because the join reaches the same module file for every
+/// candidate export it considers and a per-candidate open would be both slower
+/// and a lifecycle the server has no reason to expect.
+///
+/// The file being enriched is never opened here. Its caller already holds that
+/// document open, and re-opening a live document is a change notification this
+/// pass has no business sending.
+struct ScopedDocuments<'a> {
+    server: &'a LspServer,
+    provider: Option<DocumentProvider<'a>>,
+    open: std::collections::HashSet<String>,
+}
+
+impl<'a> ScopedDocuments<'a> {
+    fn new(server: &'a LspServer, provider: Option<DocumentProvider<'a>>) -> Self {
+        Self {
+            server,
+            provider,
+            open: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Hand `rel_path` to the server if it is not already open, and report
+    /// whether the server now holds it.
+    async fn ensure_open(&mut self, rel_path: &str, uri: &str) -> bool {
+        if self.open.contains(uri) {
+            return true;
+        }
+        let Some(provider) = self.provider else {
+            debug!(
+                path = %rel_path,
+                "declined a cross-file query: no document provider was supplied"
+            );
+            return false;
+        };
+        let Some(language_id) = lsp_language_id(rel_path) else {
+            debug!(path = %rel_path, "declined a cross-file query: unknown language for this path");
+            return false;
+        };
+        let Some(text) = provider(rel_path) else {
+            debug!(
+                path = %rel_path,
+                "declined a cross-file query: repository authority has no text for this path"
+            );
+            return false;
+        };
+        let notified = self
+            .server
+            .client
+            .notify(
+                "textDocument/didOpen",
+                serde_json::json!({
+                    "textDocument": {
+                        "uri": uri,
+                        "languageId": language_id,
+                        "version": 1,
+                        "text": text,
+                    }
+                }),
+            )
+            .await;
+        if let Err(error) = notified {
+            debug!(path = %rel_path, error = %error, "failed to open a document for a cross-file query");
+            return false;
+        }
+        debug!(path = %rel_path, "opened a graph-owned document for a cross-file query");
+        self.open.insert(uri.to_string());
+        true
+    }
+
+    /// Close every document this pass opened.
+    async fn close_all(&mut self) {
+        for uri in self.open.drain() {
+            let _ = self
+                .server
+                .client
+                .notify(
+                    "textDocument/didClose",
+                    serde_json::json!({ "textDocument": { "uri": uri } }),
+                )
+                .await;
+        }
+    }
+}
+
 /// Query type definitions for entities referenced in a function's signature/body.
 /// For each resolved type, find it in the graph index and emit UsesType relations.
+///
+/// `documents` supplies graph-owned text for files this pass needs the server
+/// to hold besides the one being enriched. It is optional: without it the
+/// member-on-module join declines rather than binding, which is the behavior
+/// this pass had before a provider existed.
 pub async fn enrich_entity_uses_type(
     server: &LspServer,
     entity: &EntityRef,
     index: &EntityIndex,
     workspace_root: &Path,
+    documents: Option<DocumentProvider<'_>>,
 ) -> Result<Vec<Relation>> {
     if !server.has_type_definition() {
         return Ok(Vec::new());
@@ -440,6 +689,7 @@ pub async fn enrich_entity_uses_type(
     // types, return types, and type references in the body.
     let mut relations = Vec::new();
     let mut seen_targets = std::collections::HashSet::new();
+    let mut scoped_documents = ScopedDocuments::new(server, documents);
 
     for line in entity.start_line..=entity.end_line {
         let Some(line_text) = lines.get(line as usize) else {
@@ -447,6 +697,125 @@ pub async fn enrich_entity_uses_type(
         };
 
         for col in identifier_positions_in_line(line_text) {
+            // A member expression on a MODULE receiver is answered by its
+            // member, never by the receiver. `express.Router()` asked at
+            // `express` returns the module's own type, `lib/express.js:35`,
+            // which `find_at` reads as `createApplication`, so every file that
+            // so much as names `express` was recorded as using that one
+            // function: 50 inbound edges on express's default export and zero
+            // on `Router`, which has 32 real reference sites.
+            //
+            // Value receivers are untouched. `res` in `res.send(...)` genuinely
+            // tells the enclosing function it uses the Response type, and that
+            // edge is not this pass's mistake.
+            if let Some((_receiver, member_col, member_name)) = member_expression_at(line_text, col)
+            {
+                let receiver_definitions =
+                    locations_at(server, "textDocument/definition", &uri, line, col).await;
+                if receiver_names_a_module(&receiver_definitions, &entity.file_path) {
+                    let module_locations =
+                        locations_at(server, "textDocument/typeDefinition", &uri, line, col).await;
+                    let member_definitions =
+                        locations_at(server, "textDocument/definition", &uri, line, member_col)
+                            .await;
+                    for module_location in &module_locations {
+                        let Some(module_path) = protocol::uri_to_path(&module_location.uri) else {
+                            continue;
+                        };
+                        let module_path = module_path.to_string_lossy().to_string();
+                        for candidate in index.entities_in_file(&module_path) {
+                            if candidate.name != member_name {
+                                continue;
+                            }
+                            // The join, and the reason this is not the bare-name
+                            // fallback this pass deleted. The server proved
+                            // where the member resolves; it proves separately
+                            // where this export's own token resolves. Binding
+                            // requires those two answers to be the same place,
+                            // so a same-named export of something else does not
+                            // qualify: `exports.Route` resolves to
+                            // `router/lib/route.js`, a different target, and is
+                            // refused. Nothing is matched on the name alone.
+                            let candidate_uri =
+                                protocol::path_to_uri(&workspace_root.join(&candidate.file_path));
+                            // The export's own token lives in the module file,
+                            // which is not the file being enriched, and a server
+                            // answers only about documents it holds. The caller
+                            // opens the enriched file and nothing else, so this
+                            // second leg queried a document the server had never
+                            // seen, came back empty, and declined every join:
+                            // `Router` stayed at zero references while the
+                            // misattribution it was meant to replace was already
+                            // gone. Hand the server that document first, from
+                            // repository authority, and close it below.
+                            if candidate.file_path != entity.file_path
+                                && !scoped_documents
+                                    .ensure_open(&candidate.file_path, &candidate_uri)
+                                    .await
+                            {
+                                continue;
+                            }
+                            let candidate_definitions = locations_at(
+                                server,
+                                "textDocument/definition",
+                                &candidate_uri,
+                                candidate.name_line,
+                                candidate.name_col,
+                            )
+                            .await;
+                            if !candidate_definitions.iter().any(|proven| {
+                                member_definitions
+                                    .iter()
+                                    .any(|member| same_location(proven, member))
+                            }) {
+                                continue;
+                            }
+                            if candidate.id == entity.id || !seen_targets.insert(candidate.id) {
+                                continue;
+                            }
+                            relations.push(Relation {
+                                id: deterministic_relation_id(
+                                    RelationKind::UsesType,
+                                    entity.id,
+                                    candidate.id,
+                                ),
+                                kind: RelationKind::UsesType,
+                                src: GraphNodeId::Entity(entity.id),
+                                dst: GraphNodeId::Entity(candidate.id),
+                                confidence: 0.85,
+                                origin: RelationOrigin::Lsp,
+                                created_in: None,
+                                import_source: None,
+                                evidence: query_position_evidence(
+                                    "lsp_member_on_module",
+                                    &entity.file_path,
+                                    &protocol::Range {
+                                        start: Position {
+                                            line,
+                                            character: member_col,
+                                        },
+                                        end: Position {
+                                            line,
+                                            character: member_col,
+                                        },
+                                    },
+                                ),
+                            });
+                            debug!(
+                                entity = %entity.name,
+                                member = %member_name,
+                                uses_type = %candidate.name,
+                                "bound a member on a module receiver to its export"
+                            );
+                        }
+                    }
+                    // The receiver's own type is not this entity's fact, whether
+                    // or not the member bound to anything. Declining here is
+                    // what makes the inflated attribution stop.
+                    continue;
+                }
+            }
+
             let type_def_result = server
                 .client
                 .request(
@@ -522,6 +891,8 @@ pub async fn enrich_entity_uses_type(
             }
         }
     }
+
+    scoped_documents.close_all().await;
 
     Ok(relations)
 }
@@ -786,6 +1157,175 @@ mod innermost_span_tests {
                 .find_at("file:///repo/src/requests/adapters.py", 6)
                 .map(|e| e.name.as_str()),
             Some("Outer.only")
+        );
+    }
+}
+
+#[cfg(test)]
+mod member_on_module_tests {
+    use super::{member_expression_at, receiver_names_a_module, same_location};
+    use crate::protocol::{Location, Position, Range};
+
+    fn location(uri: &str, line: u32) -> Location {
+        Location {
+            uri: uri.to_string(),
+            range: Range {
+                start: Position { line, character: 0 },
+                end: Position { line, character: 0 },
+            },
+        }
+    }
+
+    /// The express case: asked at the receiver, the member is what matters.
+    #[test]
+    fn a_receiver_reports_the_member_it_opens() {
+        let (receiver, col, member) =
+            member_expression_at("var apiv1 = express.Router();", 12).expect("a member expression");
+        assert_eq!(receiver, "express");
+        assert_eq!(member, "Router");
+        assert_eq!(col, 20);
+    }
+
+    /// Asked at the member half, there is no further member to bind, so the
+    /// position falls through to the ordinary type query rather than recursing.
+    #[test]
+    fn the_member_half_is_not_itself_a_receiver() {
+        assert!(member_expression_at("var apiv1 = express.Router();", 20).is_none());
+    }
+
+    /// A bare call has no receiver at all.
+    #[test]
+    fn a_bare_identifier_opens_nothing() {
+        assert!(member_expression_at("finalhandler(req, res);", 0).is_none());
+    }
+
+    /// A dot that opens no identifier is not a member expression, so a numeric
+    /// literal or a trailing dot cannot be read as one.
+    #[test]
+    fn a_dot_without_a_member_opens_nothing() {
+        assert!(member_expression_at("value.", 0).is_none());
+        assert!(member_expression_at("wait 1.5 seconds", 5).is_none());
+    }
+
+    /// The module-versus-value rule, as measured. `express` answers with
+    /// another file; `res` and `apiv1` answer with their own declarations in
+    /// the file being enriched.
+    #[test]
+    fn a_definition_in_another_file_names_a_module() {
+        assert!(receiver_names_a_module(
+            &[location("file:///w/index.js", 10)],
+            "examples/multi-router/controllers/api_v1.js"
+        ));
+    }
+
+    #[test]
+    fn a_definition_in_this_file_names_a_value() {
+        let here = "examples/multi-router/controllers/api_v1.js";
+        assert!(!receiver_names_a_module(
+            &[location(&format!("file:///w/{here}"), 6)],
+            here
+        ));
+        assert!(
+            !receiver_names_a_module(&[], here),
+            "a receiver the server said nothing about is not promoted to a module"
+        );
+    }
+
+    /// The document this pass opens is named by its own extension. A path it
+    /// cannot classify is declined rather than opened under a guess.
+    #[test]
+    fn a_document_is_opened_under_the_language_its_extension_names() {
+        use super::lsp_language_id;
+        assert_eq!(lsp_language_id("lib/express.js"), Some("javascript"));
+        assert_eq!(lsp_language_id("src/app.mjs"), Some("javascript"));
+        assert_eq!(lsp_language_id("src/app.tsx"), Some("typescriptreact"));
+        assert_eq!(lsp_language_id("requests/sessions.py"), Some("python"));
+        assert_eq!(lsp_language_id("src/enrichment.rs"), Some("rust"));
+        assert_eq!(
+            lsp_language_id("LICENSE"),
+            None,
+            "a path with no extension names no language"
+        );
+        assert_eq!(
+            lsp_language_id("docs/readme.md"),
+            None,
+            "an extension this map does not carry is declined, never guessed"
+        );
+    }
+
+    /// A provider is what makes the second leg answerable, and its absence is
+    /// what makes the join decline. Both are the same code path, so both are
+    /// asserted against the same helper the join calls.
+    #[tokio::test]
+    async fn a_missing_provider_declines_and_a_present_one_opens() {
+        use super::{DocumentProvider, ScopedDocuments};
+
+        let server = crate::lifecycle::LspServer::offline_for_tests();
+
+        let mut without = ScopedDocuments::new(&server, None);
+        assert!(
+            !without
+                .ensure_open("lib/express.js", "file:///w/lib/express.js")
+                .await,
+            "no provider means the join keeps declining, never a disk read"
+        );
+        assert!(without.open.is_empty());
+
+        // The provider counts its calls, so "opened at most once" is observable
+        // rather than merely consistent with a set that cannot hold duplicates.
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let provider: &(dyn Fn(&str) -> Option<String> + Send + Sync) = &|path: &str| {
+            asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (path == "lib/express.js").then(|| "exports.Router = Router;".to_string())
+        };
+        let mut with = ScopedDocuments::new(&server, Some(provider as DocumentProvider<'_>));
+        assert!(
+            with.ensure_open("lib/express.js", "file:///w/lib/express.js")
+                .await,
+            "a provider that answers hands the document to the server"
+        );
+        assert_eq!(with.open.len(), 1);
+        assert!(
+            with.ensure_open("lib/express.js", "file:///w/lib/express.js")
+                .await,
+            "a document already open stays open"
+        );
+        assert_eq!(
+            asked.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the same document is opened at most once per entity"
+        );
+
+        assert!(
+            !with
+                .ensure_open("lib/other.js", "file:///w/lib/other.js")
+                .await,
+            "a path repository authority has nothing for declines"
+        );
+        assert!(
+            !with.ensure_open("NOTICE", "file:///w/NOTICE").await,
+            "a path whose language cannot be named declines"
+        );
+        assert_eq!(with.open.len(), 1);
+
+        with.close_all().await;
+        assert!(
+            with.open.is_empty(),
+            "every document this pass opened is closed with it"
+        );
+    }
+
+    /// The join compares a place, not a name, which is what keeps this apart
+    /// from the bare-name fallback this pass deleted.
+    #[test]
+    fn the_join_compares_the_place_two_answers_name() {
+        let member = location("file:///w/node_modules/router/index.js", 51);
+        let router_export = location("file:///w/node_modules/router/index.js", 51);
+        let route_export = location("file:///w/node_modules/router/lib/route.js", 40);
+        assert!(same_location(&router_export, &member));
+        assert!(
+            !same_location(&route_export, &member),
+            "a same-shaped export of something else must not join"
         );
     }
 }
