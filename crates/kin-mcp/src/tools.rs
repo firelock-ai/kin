@@ -55,15 +55,18 @@ fn destructive_idempotent(title: &str) -> ToolAnnotations {
 
 /// Honest JSON Schema for one transaction operation.
 ///
-/// The product daemon accepts five materially different shapes. A source-body
-/// edit, a new source file, a retirement, and a rename are all intentionally
-/// payload-less; structured entity/relation mutations require `payload`.
-/// Keeping these as disjoint `oneOf` branches prevents MCP clients from being
-/// told that the preferred source-edit form is invalid.
+/// The product daemon accepts six materially different shapes. A source-body
+/// edit, a new source file, a rewritten source file, a retirement, and a rename
+/// are all intentionally payload-less; structured entity/relation mutations
+/// require `payload`. Keeping these as disjoint `oneOf` branches prevents MCP
+/// clients from being told that the preferred source-edit form is invalid.
 ///
-/// No two branches can match one operation: the four payload-less branches
+/// No two branches can match one operation: the five payload-less branches
 /// carry disjoint verb enums, and the structured branch requires `payload`,
-/// which none of the others accepts.
+/// which none of the others accepts. The rewrite has a verb of its own rather
+/// than a path reading of `update` for that reason: an entity name and a
+/// repository path are both bare strings, so one verb covering both would make
+/// an operation's meaning depend on how its target happened to resolve.
 fn transaction_operation_schema() -> serde_json::Value {
     serde_json::json!({
         "oneOf": [
@@ -128,12 +131,39 @@ fn transaction_operation_schema() -> serde_json::Value {
                     "target": {
                         "type": "string",
                         "minLength": 1,
-                        "description": "Repository-relative path of the new file, such as \"src/parser.py\". No leading slash, no \"..\", and no Kin or Git control component. A path the graph already tracks is refused; edit that one with verb 'update' instead."
+                        "description": "Repository-relative path of the new file, such as \"src/parser.py\". No leading slash, no \"..\", and no Kin or Git control component. A path the graph already tracks is refused; rewrite that one with verb 'replace' instead."
                     },
                     "body": {
                         "type": "string",
                         "minLength": 1,
                         "description": "The file's complete UTF-8 source text. Kin parses it with the same extractor the ingest path uses, so every entity in it enters the graph, and writes the file into the working directory when the transaction commits. You do not need to write the file yourself first."
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Human-readable explanation of this change."
+                    }
+                },
+                "required": ["verb", "target", "body", "description"],
+                "additionalProperties": false
+            },
+            {
+                "title": "Replaced source file",
+                "type": "object",
+                "properties": {
+                    "verb": {
+                        "type": "string",
+                        "enum": ["replace", "overwrite"],
+                        "description": "Rewrite a tracked file from its complete new text. This is the operation to use when you hold a path and the file's new contents, which is what a local edit or write leaves you holding."
+                    },
+                    "target": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Repository-relative path of the file to rewrite, such as \"src/parser.py\". It must be a path repository authority already tracks; a path the graph has never seen is refused, and 'create' is the verb for it."
+                    },
+                    "body": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "The file's complete new UTF-8 source text, never a fragment or a diff. Kin reparses it with the same extractor the ingest path uses, so entities the new text adds enter the graph, entities it drops leave it, and the rest keep their identity. A body identical to the tracked contents is refused as an empty change."
                     },
                     "description": {
                         "type": "string",
@@ -1702,7 +1732,7 @@ mod tests {
             let variants = tool["inputSchema"]["properties"]["operations"]["items"]["oneOf"]
                 .as_array()
                 .expect("transaction operations must be disjoint oneOf variants");
-            assert_eq!(variants.len(), 5, "{tool_name}");
+            assert_eq!(variants.len(), 6, "{tool_name}");
 
             let retirement = variants
                 .iter()
@@ -1755,6 +1785,45 @@ mod tests {
                 new_source_file["properties"].get("payload").is_none(),
                 "payload-less new-source-file branch must reject payload"
             );
+
+            let replaced_source_file = variants
+                .iter()
+                .find(|variant| variant["title"] == "Replaced source file")
+                .expect("payload-less replaced-source-file branch");
+            assert_eq!(
+                required_set(replaced_source_file),
+                ["body", "description", "target", "verb"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+            );
+            assert!(
+                replaced_source_file["properties"].get("payload").is_none(),
+                "payload-less replaced-source-file branch must reject payload"
+            );
+            // The rewrite is only decidable from the operation itself while its
+            // verbs belong to it alone among the payload-less branches. Sharing
+            // one with the entity edit would make the shape depend on how a
+            // bare target string happened to resolve. The structured branch is
+            // exempt because `payload` already separates it from all five.
+            let verbs = |variant: &serde_json::Value| {
+                variant["properties"]["verb"]["enum"]
+                    .as_array()
+                    .expect("every branch pins its verbs")
+                    .iter()
+                    .map(|verb| verb.as_str().expect("a verb is a string").to_string())
+                    .collect::<std::collections::BTreeSet<String>>()
+            };
+            for other in variants.iter().filter(|variant| {
+                variant["title"] != "Replaced source file"
+                    && variant["title"] != "Structured entity or relation mutation"
+            }) {
+                assert!(
+                    verbs(replaced_source_file).is_disjoint(&verbs(other)),
+                    "the rewrite branch shares a verb with {}",
+                    other["title"]
+                );
+            }
 
             let body_edit = variants
                 .iter()

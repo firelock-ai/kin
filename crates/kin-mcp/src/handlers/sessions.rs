@@ -692,6 +692,17 @@ tool does NOT put it in the graph; nothing ambient admits it, and only this oper
 Create several files in one transaction to have them reference each other, and edit an \
 existing file with 'update' in that same transaction if you need to. A path the graph \
 already tracks is refused by name rather than quietly overwritten. \
+Use verb 'replace' (or 'overwrite') to rewrite a file the graph already tracks from its \
+complete new text: {verb: \"replace\", target: \"<repository-relative path>\", \
+body: \"<the file's complete new source text>\", description: \"...\"}. This is the shape \
+for what a local edit or write leaves you holding, a path and the file's new contents, and \
+it needs no entity: Kin reparses the body with the same extractor the ingest path uses, so \
+entities the new text adds enter the graph, entities it drops leave it, and the commit \
+writes the new contents into the working file. Send the WHOLE file, never a fragment or a \
+diff. A path the graph does not track is refused by name ('create' is the verb for that \
+one), and a body byte-identical to the tracked contents is refused as an empty change. \
+Prefer 'update' when you are changing one function or class and you know which: it names \
+what you meant, and it cannot lose the rest of the file to a truncated body. \
 Use verb 'update' (or 'modify') to change an entity the graph already holds. That is a \
 payload-less entity source edit: {verb: \"update\", target: \"<entity name or id>\", \
 body: \"<the entity's full new source text>\", description: \"...\"}. Prefer the entity \
@@ -711,14 +722,15 @@ resolved fail-closed server-side and on \
 commit the graph-to-file projection writes the body into the entity's working-directory \
 file. Structured payloads (full entity, relation add/remove) are also accepted. Each \
 operation is validated at stage time: anything the commit path would silently drop (a \
-missing or unknown verb, a missing payload outside the two payload-less source forms, a \
-nameless entity, a relation update/modify, a blob payload, a new-file path that is \
-absolute, escapes the repository, or names Kin or Git control metadata, or a 'create' \
-naming a path repository authority already tracks) is rejected immediately with an \
-actionable error instead of vanishing at commit. The already-tracked check reads a \
-snapshot of the graph this call is authoritative over: it catches the ordinary case, but \
-a path another transaction creates between this stage call and your commit is still only \
-caught at commit, which stays the final authority. This rejection is identical in daemon \
+missing or unknown verb, a missing payload outside the payload-less source forms, a \
+nameless entity, a relation update/modify, a blob payload, a file path that is \
+absolute, escapes the repository, or names Kin or Git control metadata, a 'create' \
+naming a path repository authority already tracks, or a 'replace' naming one it does not \
+track or carrying the text it already holds) is rejected immediately with an \
+actionable error instead of vanishing at commit. The tracked-path checks read a \
+snapshot of the graph this call is authoritative over: they catch the ordinary case, but \
+a path another transaction creates or rewrites between this stage call and your commit is \
+still only caught at commit, which stays the final authority. This rejection is identical in daemon \
 and in-process modes. Accepted operations are queued and can be validated or committed \
 together.";
 
@@ -764,9 +776,50 @@ pub async fn handle_transaction_stage<G: GraphStore>(
                 return Err(crate::error::McpError::InvalidParams(format!(
                     "operation #{idx} ('create'): {target:?} is already tracked by repository \
                      authority, so it cannot be created; 'create' admits only source the graph \
-                     has never seen. Edit it with verb 'update' naming an entity inside it, or \
-                     create a path that does not exist yet"
+                     has never seen. Rewrite it with verb 'replace' carrying its complete new \
+                     text, edit one entity inside it with verb 'update', or create a path that \
+                     does not exist yet"
                 )));
+            }
+            continue;
+        }
+        // A rewrite is the create's mirror: it names a path the graph must
+        // already hold, and it is refused when the text it carries is the text
+        // authority already has. Both answers come from the same snapshot this
+        // call is authoritative over, and neither reads the working copy. The
+        // tracked contents are identified by the artifact's own content hash,
+        // so comparing it against the hash of the submitted body settles the
+        // empty-change question without loading a single byte of source.
+        if crate::session::is_replaced_source_file(operation) {
+            let verb = operation.verb.trim().to_lowercase();
+            let target = operation.target.trim();
+            let Ok(path) = kin_model::RepoPath::from_utf8(target.to_string()) else {
+                continue;
+            };
+            if store.artifact_id_at_path(&path).is_none() {
+                return Err(crate::error::McpError::InvalidParams(format!(
+                    "operation #{idx} ('{verb}'): {target:?} is not tracked by repository \
+                     authority, so there is nothing to replace; '{verb}' rewrites source the \
+                     graph already holds. Admit a path the graph has never seen with verb \
+                     'create' instead, carrying the same body"
+                )));
+            }
+            let body = operation
+                .body
+                .as_deref()
+                .expect("a replaced source file always carries a body");
+            let tracked = store
+                .get_tree_entry(&kin_model::FilePathId::new(target))
+                .ok()
+                .flatten();
+            if let Some(kin_model::TreeEntry::Blob { hash, .. }) = tracked {
+                if hash == kin_blobs::digest(body.as_bytes()) {
+                    return Err(crate::error::McpError::InvalidParams(format!(
+                        "operation #{idx} ('{verb}'): the body sent for {target:?} is byte-identical \
+                         to the contents repository authority already tracks, so this operation \
+                         changes nothing. Send the file's new text, or drop the operation"
+                    )));
+                }
             }
             continue;
         }
@@ -1024,6 +1077,9 @@ fn offline_only_uncommittable_operations(operations: &[McpMutationOperation]) ->
                 "a payload-less retirement (target naming a tracked path)"
             } else if crate::session::is_renamed_source_file(op) {
                 "a payload-less rename (target plus destination)"
+            } else if crate::session::is_replaced_source_file(op) {
+                "a payload-less rewrite (target naming a tracked path, plus the file's complete \
+                 new body)"
             } else if op.payload.is_some() {
                 "an entity payload plus a source body"
             } else {

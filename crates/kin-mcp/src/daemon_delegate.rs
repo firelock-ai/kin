@@ -3237,7 +3237,9 @@ mod tests {
             "`body` (string, optional)",
             "`payload` (object, optional)",
             "`destination` (string, optional)",
-            "create/add/upsert/insert, update/modify, delete/remove, or rename/move",
+            "a rewritten source file",
+            "create/add/upsert/insert, update/modify, replace/overwrite, delete/remove, or \
+             rename/move",
         ] {
             assert!(err.contains(expected), "refusal omits {expected:?}: {err}");
         }
