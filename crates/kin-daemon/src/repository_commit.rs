@@ -249,15 +249,15 @@ pub(crate) fn plan_session_workspace_admission(
             source_lengths.insert(hash, length);
             Ok(length)
         },
-    |hash| {
-    read_publishable_source(blobs, &authority, hash)
-        .map(|source| source.body().to_vec())
-        .map_err(|error| {
-            ModelError::InvalidOperation(format!(
-                "{error}, while reading the approvals the exact session policy derives"
-            ))
-        })
-},
+        |hash| {
+            read_publishable_source(blobs, &authority, hash)
+                .map(|source| source.body().to_vec())
+                .map_err(|error| {
+                    ModelError::InvalidOperation(format!(
+                        "{error}, while reading the approvals the exact session policy derives"
+                    ))
+                })
+        },
     )?;
     let tree_hash = compute_resolved_tree_hash(desired_tree)?;
     let new_generation = base
@@ -523,15 +523,15 @@ pub(crate) fn publish_workspace_tree(
             source_lengths.insert(hash, length);
             Ok(length)
         },
-    |hash| {
-    read_publishable_source(blobs, &authority, hash)
-        .map(|source| source.body().to_vec())
-        .map_err(|error| {
-            ModelError::InvalidOperation(format!(
+        |hash| {
+            read_publishable_source(blobs, &authority, hash)
+                .map(|source| source.body().to_vec())
+                .map_err(|error| {
+                    ModelError::InvalidOperation(format!(
                 "{error}, while reading the approvals the admitted workspace policy derives"
             ))
-        })
-},
+                })
+        },
     )?;
     let tree_hash = compute_resolved_tree_hash(desired_tree)?;
     let new_generation = workspace.generation.checked_add(1).ok_or_else(|| {
@@ -853,15 +853,15 @@ fn plan_native_commit_inner(
                     source_lengths.insert(hash, length);
                     Ok(length)
                 },
-            |hash| {
-    read_publishable_source(blobs, &authority, hash)
-        .map(|source| source.body().to_vec())
-        .map_err(|error| {
-            ModelError::InvalidOperation(format!(
+                |hash| {
+                    read_publishable_source(blobs, &authority, hash)
+                        .map(|source| source.body().to_vec())
+                        .map_err(|error| {
+                            ModelError::InvalidOperation(format!(
                 "{error}, while reading the approvals the graph-owned policy derives"
             ))
-        })
-},
+                        })
+                },
             )
         })?;
 

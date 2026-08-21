@@ -356,13 +356,14 @@ fn push(
         &daemon_relations,
     )
     .context("plan the exact sealed workspace semantic transition")?;
-    let (sealed_policy, admission_policy_delta) = SharedAdmissionPolicy::derive_from_tree_with_allowances(
-        parent_policy.as_ref(),
-        &sealed.expected_tree,
-        |hash| repository_source_length(&authority.manager, hash),
-    |hash| repository_source_body(&authority.manager, hash),
-    )
-    .context("derive the exact admission policy for the sealed workspace tree")?;
+    let (sealed_policy, admission_policy_delta) =
+        SharedAdmissionPolicy::derive_from_tree_with_allowances(
+            parent_policy.as_ref(),
+            &sealed.expected_tree,
+            |hash| repository_source_length(&authority.manager, hash),
+            |hash| repository_source_body(&authority.manager, hash),
+        )
+        .context("derive the exact admission policy for the sealed workspace tree")?;
     let sealed_tree = sealed.expected_tree;
     let sealed_tree_hash =
         compute_resolved_tree_hash(&sealed_tree).context("hash the exact sealed workspace tree")?;

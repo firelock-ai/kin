@@ -42,8 +42,8 @@ pub async fn run(path: String, reason: String) -> Result<()> {
             .context("approval paths must be valid UTF-8 to be written to the allowance file")?,
     );
 
-    let metadata = std::fs::symlink_metadata(&target)
-        .with_context(|| format!("read {}", target.display()))?;
+    let metadata =
+        std::fs::symlink_metadata(&target).with_context(|| format!("read {}", target.display()))?;
     if metadata.is_dir() {
         bail!(
             "{} is a directory; approve the exact file that admission named",
@@ -104,10 +104,7 @@ pub async fn run(path: String, reason: String) -> Result<()> {
         repo_path
     );
     println!("  digest  {content_hash}");
-    println!(
-        "  kind    {}",
-        if executable { "blob+x" } else { "blob" }
-    );
+    println!("  kind    {}", if executable { "blob+x" } else { "blob" });
     println!("  reason  {reason}");
     println!();
     println!(
@@ -133,11 +130,7 @@ fn render(allowances: &[SensitiveArtifactAllowance]) -> Vec<u8> {
         };
         out.push_str(&format!(
             "{}\t{}\t{}\t{}\t{}\n",
-            allowance.path,
-            allowance.content_hash,
-            kind,
-            allowance.approved_by,
-            allowance.reason
+            allowance.path, allowance.content_hash, kind, allowance.approved_by, allowance.reason
         ));
     }
     out.into_bytes()
