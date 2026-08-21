@@ -534,6 +534,152 @@ pub fn handle_list_file_entities<G: GraphStore>(
 mod tests {
     use super::*;
 
+    use kin_db::InMemoryGraph;
+    use kin_model::graph::EntityStore;
+    use kin_model::layout::{FileLayout, ImportSection, SourceRegion};
+    use kin_model::{ArtifactId, LocatedEntry, RepoPath, TransactionDelta, TreeDelta, TreeEntry};
+    use kin_model::{
+        EntityId, EntityMetadata, FingerprintAlgorithm, Hash256, SemanticFingerprint, SourceSpan,
+    };
+
+    const FILE: &str = "lib/express.js";
+
+    fn entity_at(name: &str, file: &str, start_byte: usize) -> Entity {
+        Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: name.to_string(),
+            language: LanguageId::JavaScript,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([0; 32]),
+                signature_hash: Hash256::from_bytes([0; 32]),
+                behavior_hash: Hash256::from_bytes([0; 32]),
+                equivalence_hash: Hash256::from_bytes([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(FilePathId::new(file)),
+            span: Some(SourceSpan {
+                file: FilePathId::new(file),
+                start_byte,
+                end_byte: start_byte + 40,
+                start_line: start_byte as u32 / 10,
+                start_col: 0,
+                end_line: start_byte as u32 / 10 + 2,
+                end_col: 0,
+            }),
+            signature: format!("function {name}()"),
+            visibility: Visibility::Public,
+            role: EntityRole::Source,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    fn layout_for(file: &str, completeness: ParseCompleteness, regions: usize) -> FileLayout {
+        FileLayout {
+            file_id: FilePathId::new(file),
+            parse_completeness: completeness,
+            imports: ImportSection {
+                byte_range: 0..0,
+                items: Vec::new(),
+            },
+            regions: (0..regions)
+                .map(|index| SourceRegion::EntityRef {
+                    entity_id: EntityId::new(),
+                    byte_range: index..index + 1,
+                })
+                .collect(),
+        }
+    }
+
+    /// Admit one path into the graph's repository tree through the real tree
+    /// transaction, which is what a layout or artifact facet requires.
+    fn admit(store: &InMemoryGraph, path: &str) -> ArtifactId {
+        let repo_path = RepoPath::from_utf8(path.to_string()).expect("valid test path");
+        if let Some(artifact_id) = store.artifact_id_at_path(&repo_path) {
+            return artifact_id;
+        }
+        let artifact_id = ArtifactId::new();
+        store
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id,
+                    new: LocatedEntry::new(
+                        repo_path,
+                        TreeEntry::blob(Hash256::from_bytes([7; 32]), false),
+                    ),
+                }],
+                admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
+            })
+            .expect("test admission goes through the repository tree transaction");
+        artifact_id
+    }
+
+    /// A store holding `count` entities in [`FILE`], plus one entity in another
+    /// file so every "not in the list" assertion has a live control: the graph
+    /// can see that entity, and this tool still must not report it.
+    fn store_with(count: usize, parse: Option<ParseCompleteness>) -> InMemoryGraph {
+        let store = InMemoryGraph::new();
+        admit(&store, FILE);
+        admit(&store, "lib/router.js");
+        for index in 0..count {
+            store
+                .upsert_entity(&entity_at(&format!("export{index}"), FILE, index * 100))
+                .unwrap();
+        }
+        store
+            .upsert_entity(&entity_at("elsewhere", "lib/router.js", 0))
+            .unwrap();
+        if let Some(parse) = parse {
+            store
+                .upsert_file_layout(&layout_for(FILE, parse, count))
+                .unwrap();
+        }
+        store
+    }
+
+    fn call(
+        store: &InMemoryGraph,
+        args: &[(&str, serde_json::Value)],
+    ) -> Result<serde_json::Value> {
+        let args: HashMap<String, serde_json::Value> = args
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.clone()))
+            .collect();
+        let result = handle_list_file_entities(&args, store)?;
+        let crate::types::ContentBlock::Text { text } = &result.content[0];
+        Ok(serde_json::from_str(text).expect("payload is JSON"))
+    }
+
+    fn names(payload: &serde_json::Value) -> Vec<String> {
+        payload["entities"]
+            .as_array()
+            .expect("entities array")
+            .iter()
+            .map(|row| row["name"].as_str().expect("name").to_string())
+            .collect()
+    }
+
+    /// A daemon envelope whose STRUCTURAL substrate is clean: the only state in
+    /// which this tool's absence could be certified at all, so a refusal under
+    /// it is a refusal this tool's own gate produced rather than one it
+    /// inherited.
+    fn structural_authoritative_envelope() -> crate::envelope::Envelope {
+        let mut envelope = crate::envelope::Envelope::daemon();
+        envelope.graph_state.initialized = Some(true);
+        envelope.graph_state.loaded = Some(true);
+        envelope.graph_state.entity_count = Some(42);
+        envelope.graph_as_of = Some(serde_json::json!("change:deadbeef"));
+        envelope
+    }
+
     #[test]
     fn normalize_path_drops_dot_slash_and_swaps_separators() {
         assert_eq!(normalize_path("lib/express.js"), "lib/express.js");
@@ -562,5 +708,372 @@ mod tests {
         assert!(!ParsedState::Partial.certifies_enumeration());
         assert!(!ParsedState::Failed.certifies_enumeration());
         assert!(!ParsedState::Absent.certifies_enumeration());
+    }
+
+    /// The ticket's own case: a file with N entities enumerates exactly N, and a
+    /// name that is not in it is absent.
+    ///
+    /// The control is `elsewhere`, a real entity this store holds in another
+    /// file. Without it, "absent" would be satisfied by a tool that returns
+    /// nothing at all, and the fabricated name would prove only that the graph
+    /// does not invent rows.
+    #[test]
+    fn enumerates_exactly_the_file_and_nothing_else() {
+        let store = store_with(5, Some(ParseCompleteness::Full));
+        let payload = call(&store, &[("path", serde_json::json!(FILE))]).unwrap();
+
+        assert_eq!(payload["total_in_file"], serde_json::json!(5));
+        assert_eq!(payload["returned"], serde_json::json!(5));
+        let names = names(&payload);
+        for index in 0..5 {
+            assert!(
+                names.contains(&format!("export{index}")),
+                "export{index} missing from {names:?}"
+            );
+        }
+        assert!(
+            !names.contains(&"elsewhere".to_string()),
+            "an entity in another file leaked into {names:?}"
+        );
+        assert!(
+            !names.contains(&"neverDefinedAnywhere".to_string()),
+            "a fabricated name appeared in {names:?}"
+        );
+        assert_eq!(
+            payload[FILE_COVERAGE_KEY]["certifies_enumeration"],
+            serde_json::json!(true)
+        );
+        assert_eq!(payload["next_cursor"], serde_json::Value::Null);
+    }
+
+    /// A leading `./` is the one path spelling a caller reliably types that the
+    /// graph never stores, so it must resolve rather than read as a miss.
+    #[test]
+    fn a_dot_slash_path_resolves_to_the_same_file() {
+        let store = store_with(3, Some(ParseCompleteness::Full));
+        let payload = call(&store, &[("path", serde_json::json!("./lib/express.js"))]).unwrap();
+        assert_eq!(payload["total_in_file"], serde_json::json!(3));
+        assert_eq!(payload["path"], serde_json::json!(FILE));
+    }
+
+    /// The refusal the ticket asks for. A path this graph has never seen must
+    /// not come back as `entities: []`, because that response says "this file
+    /// holds no entities" about a file Kin cannot see.
+    #[test]
+    fn an_unknown_path_refuses_rather_than_returning_an_empty_list() {
+        let store = InMemoryGraph::new();
+        let error = call(&store, &[("path", serde_json::json!("lib/nonexistent.js"))])
+            .expect_err("an untracked path must refuse");
+        let message = error.to_string();
+        assert!(
+            message.contains("graph gap"),
+            "refusal must name the gap; got {message}"
+        );
+        assert!(
+            message.contains("not a claim that the file has no entities"),
+            "refusal must deny the absence reading; got {message}"
+        );
+
+        // Control: the identical call on a store that holds the file answers,
+        // so the refusal is about this path rather than about the tool.
+        let seeded = store_with(2, Some(ParseCompleteness::Full));
+        let payload = call(&seeded, &[("path", serde_json::json!(FILE))]).unwrap();
+        assert_eq!(payload["total_in_file"], serde_json::json!(2));
+    }
+
+    /// A path with no admitted identity that DOES carry a layout is a tracked
+    /// file, so it answers rather than refusing. This is what stops the refusal
+    /// above from firing on every legitimately empty source file.
+    #[test]
+    fn a_parsed_but_empty_file_answers_empty_instead_of_refusing() {
+        let store = InMemoryGraph::new();
+        admit(&store, FILE);
+        store
+            .upsert_file_layout(&layout_for(FILE, ParseCompleteness::Full, 0))
+            .unwrap();
+        let payload = call(&store, &[("path", serde_json::json!(FILE))]).unwrap();
+        assert_eq!(payload["total_in_file"], serde_json::json!(0));
+        assert_eq!(
+            payload[FILE_COVERAGE_KEY]["parsed"],
+            serde_json::json!("full")
+        );
+        assert_eq!(
+            payload[FILE_COVERAGE_KEY]["tier"],
+            serde_json::json!("entity_source")
+        );
+    }
+
+    /// Parse state decides certification, and each state is distinguishable.
+    /// A file the extractor never parsed and a file it parsed completely both
+    /// return rows; only one of them may be read as the file's whole surface.
+    #[test]
+    fn parse_state_decides_whether_the_enumeration_is_certified() {
+        for (parse, expected, certified) in [
+            (Some(ParseCompleteness::Full), "full", true),
+            (
+                Some(ParseCompleteness::Partial("2 parse error range(s)".into())),
+                "partial",
+                false,
+            ),
+            (
+                Some(ParseCompleteness::Failed("last known good".into())),
+                "failed",
+                false,
+            ),
+            (None, "absent", false),
+        ] {
+            let store = store_with(4, parse);
+            let payload = call(&store, &[("path", serde_json::json!(FILE))]).unwrap();
+            assert_eq!(
+                payload[FILE_COVERAGE_KEY]["parsed"],
+                serde_json::json!(expected)
+            );
+            assert_eq!(
+                payload[FILE_COVERAGE_KEY]["certifies_enumeration"],
+                serde_json::json!(certified),
+                "parse state {expected} certified the wrong way"
+            );
+            // Rows are served either way. Withholding real graph truth because
+            // it cannot be certified teaches an agent nothing and costs it the
+            // answer it can still act on.
+            assert_eq!(payload["total_in_file"], serde_json::json!(4));
+        }
+    }
+
+    /// Pagination walks the whole set with no duplicates and no silent cap.
+    #[test]
+    fn pagination_covers_the_whole_set_without_duplicates() {
+        let store = store_with(7, Some(ParseCompleteness::Full));
+        let mut seen: Vec<String> = Vec::new();
+        let mut pages = 0;
+        let mut cursor: Option<String> = None;
+
+        loop {
+            let mut args = vec![("page_size", serde_json::json!(3))];
+            match &cursor {
+                Some(token) => args.push(("cursor", serde_json::json!(token))),
+                None => args.push(("path", serde_json::json!(FILE))),
+            }
+            let payload = call(&store, &args).unwrap();
+            pages += 1;
+            assert_eq!(
+                payload["total_in_file"],
+                serde_json::json!(7),
+                "every page must report the whole-file count"
+            );
+            seen.extend(names(&payload));
+            match payload["next_cursor"].as_str() {
+                Some(token) => cursor = Some(token.to_string()),
+                None => break,
+            }
+            assert!(pages < 10, "cursor walk did not terminate");
+        }
+
+        assert_eq!(pages, 3, "7 entities at page_size 3 is three pages");
+        assert_eq!(seen.len(), 7, "walk returned {} rows, want 7", seen.len());
+        let unique: std::collections::BTreeSet<&String> = seen.iter().collect();
+        assert_eq!(unique.len(), 7, "walk repeated a row: {seen:?}");
+        for index in 0..7 {
+            assert!(
+                seen.contains(&format!("export{index}")),
+                "export{index} was never returned across {pages} pages"
+            );
+        }
+    }
+
+    /// A page is not a file. The first page of three carries every entity it
+    /// returned and still may not be read as the whole set.
+    #[test]
+    fn a_partial_page_is_not_certified() {
+        let store = store_with(7, Some(ParseCompleteness::Full));
+        let payload = call(
+            &store,
+            &[
+                ("path", serde_json::json!(FILE)),
+                ("page_size", serde_json::json!(3)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(payload["returned"], serde_json::json!(3));
+        assert_eq!(payload["total_in_file"], serde_json::json!(7));
+        assert_eq!(payload["truncated"], serde_json::json!(true));
+        assert_eq!(
+            payload[FILE_COVERAGE_KEY]["whole_file_in_response"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            payload[FILE_COVERAGE_KEY]["certifies_enumeration"],
+            serde_json::json!(false),
+            "a page of a file must not certify the file"
+        );
+    }
+
+    /// A cursor minted before the file changed is served, and the shift is named
+    /// rather than paged over in silence.
+    #[test]
+    fn a_cursor_from_a_changed_file_reports_the_shift() {
+        let store = store_with(7, Some(ParseCompleteness::Full));
+        let stale = PageCursor {
+            path: FILE.to_string(),
+            offset: 3,
+            total: 99,
+        }
+        .encode();
+        let payload = call(&store, &[("cursor", serde_json::json!(stale))]).unwrap();
+        assert_eq!(payload["enumeration_shifted"], serde_json::json!(true));
+        assert_eq!(
+            payload[FILE_COVERAGE_KEY]["certifies_enumeration"],
+            serde_json::json!(false)
+        );
+
+        // Control: the matching cursor pages cleanly and claims no shift.
+        let fresh = PageCursor {
+            path: FILE.to_string(),
+            offset: 3,
+            total: 7,
+        }
+        .encode();
+        let clean = call(&store, &[("cursor", serde_json::json!(fresh))]).unwrap();
+        assert_eq!(clean["enumeration_shifted"], serde_json::json!(false));
+    }
+
+    /// A cursor names its file, so paging one file with another's cursor is a
+    /// refusal rather than a window into a list nobody asked for.
+    #[test]
+    fn a_cursor_for_another_file_is_refused() {
+        let store = store_with(7, Some(ParseCompleteness::Full));
+        let token = PageCursor {
+            path: "lib/router.js".to_string(),
+            offset: 0,
+            total: 1,
+        }
+        .encode();
+        let error = call(
+            &store,
+            &[
+                ("path", serde_json::json!(FILE)),
+                ("cursor", serde_json::json!(token)),
+            ],
+        )
+        .expect_err("mismatched cursor must refuse");
+        assert!(
+            error.to_string().contains("page one file at a time"),
+            "got {error}"
+        );
+    }
+
+    /// An absolute path or a `..` escape is refused by name. Without this it
+    /// becomes an exact-match miss, which reads as "this file has no entities".
+    #[test]
+    fn an_inadmissible_path_is_refused_by_name() {
+        let store = store_with(3, Some(ParseCompleteness::Full));
+        for bad in ["/etc/passwd", "../outside.js", ""] {
+            let error = call(&store, &[("path", serde_json::json!(bad))])
+                .expect_err("an inadmissible path must refuse");
+            let message = error.to_string();
+            assert!(
+                message.contains("invalid parameter"),
+                "{bad:?} refused without naming the parameter: {message}"
+            );
+        }
+        // Control: the admissible path still answers, so the guard rejects bad
+        // paths rather than every path.
+        let payload = call(&store, &[("path", serde_json::json!(FILE))]).unwrap();
+        assert_eq!(payload["total_in_file"], serde_json::json!(3));
+    }
+
+    /// The verdict an agent reads. An empty enumeration on a fully parsed file
+    /// is a certifiable absence; the same empty enumeration on a file no adapter
+    /// parsed is not, and the reason names the parse rather than store health.
+    #[test]
+    fn absence_is_certified_only_when_the_file_was_parsed() {
+        let envelope = structural_authoritative_envelope();
+
+        let parsed = InMemoryGraph::new();
+        admit(&parsed, FILE);
+        parsed
+            .upsert_file_layout(&layout_for(FILE, ParseCompleteness::Full, 0))
+            .unwrap();
+        let payload = call(&parsed, &[("path", serde_json::json!(FILE))]).unwrap();
+        let negative = crate::negative::negative_for(TOOL_NAME, &payload, &envelope, &[])
+            .expect("an empty enumeration must carry a negative");
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            serde_json::json!(true),
+            "a fully parsed empty file is a certifiable absence: {negative}"
+        );
+        assert_eq!(negative["kind"], serde_json::json!("no_file_entities"));
+
+        let unparsed = InMemoryGraph::new();
+        admit(&unparsed, FILE);
+        unparsed
+            .upsert_opaque_artifact(&kin_model::layout::OpaqueArtifact {
+                file_id: FilePathId::new(FILE),
+                content_hash: Hash256::from_bytes([0; 32]),
+                mime_type: None,
+                text_preview: None,
+            })
+            .unwrap();
+        let payload = call(&unparsed, &[("path", serde_json::json!(FILE))]).unwrap();
+        let negative = crate::negative::negative_for(TOOL_NAME, &payload, &envelope, &[])
+            .expect("an empty enumeration must carry a negative");
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            serde_json::json!(false),
+            "an unparsed file must never certify an absence: {negative}"
+        );
+        assert!(
+            negative["trust_reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("file_not_parsed"),
+            "the reason must name the parse, not store health: {negative}"
+        );
+    }
+
+    /// The completeness signal a caller reads instead of the row count. A page
+    /// of a file reports its counts as a floor and names why.
+    #[test]
+    fn completeness_reports_a_page_as_a_floor() {
+        let envelope = structural_authoritative_envelope();
+        let store = store_with(7, Some(ParseCompleteness::Full));
+
+        let whole = call(&store, &[("path", serde_json::json!(FILE))]).unwrap();
+        let annotated = crate::envelope::finalize(
+            ToolCallResult::text(serde_json::to_string(&whole).unwrap()),
+            envelope.clone(),
+            TOOL_NAME,
+        );
+        let crate::types::ContentBlock::Text { text } = &annotated.content[0];
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        let counted = &value["_kin"]["completeness"]["counted"];
+        assert_eq!(counted["unit"], serde_json::json!("entities_in_file"));
+        assert_eq!(counted["reported"], serde_json::json!(7));
+        assert_eq!(counted["exact"], serde_json::json!(true));
+        assert_eq!(
+            value["_kin"]["completeness"]["classes"]["file_parsed"],
+            serde_json::json!("present")
+        );
+
+        let page = call(
+            &store,
+            &[
+                ("path", serde_json::json!(FILE)),
+                ("page_size", serde_json::json!(3)),
+            ],
+        )
+        .unwrap();
+        let annotated = crate::envelope::finalize(
+            ToolCallResult::text(serde_json::to_string(&page).unwrap()),
+            envelope.clone(),
+            TOOL_NAME,
+        );
+        let crate::types::ContentBlock::Text { text } = &annotated.content[0];
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        let counted = &value["_kin"]["completeness"]["counted"];
+        assert_eq!(counted["reported"], serde_json::json!(7));
+        assert_eq!(counted["returned"], serde_json::json!(3));
+        assert_eq!(counted["exact"], serde_json::json!(false));
+        assert_eq!(counted["floor_reason"], serde_json::json!("page_bounded"));
     }
 }

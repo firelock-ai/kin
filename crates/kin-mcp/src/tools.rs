@@ -1790,8 +1790,9 @@ mod tests {
     fn expected_tool_count() {
         let list = tool_definitions();
         // 54 + 5 transaction tools + 1 semantic_locate + 1 shadow_gate_report
-        // + 1 get_entity_sources + 2 exact artifact tools = 64
-        assert_eq!(list.tools.len(), 64);
+        // + 1 get_entity_sources + 2 exact artifact tools
+        // + 1 list_file_entities = 65
+        assert_eq!(list.tools.len(), 65);
     }
 
     /// The reference lists each category's members on a line opening with this
@@ -2020,7 +2021,7 @@ The Kin MCP server exposes 2 semantic tools to AI assistants.
         let profile = agent_default_tool_names();
 
         assert!(
-            profile.len() >= 10 && profile.len() <= 19,
+            profile.len() >= 10 && profile.len() <= 20,
             "agent-default should be small but cover the wedge; got {}",
             profile.len()
         );

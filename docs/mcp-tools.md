@@ -1,6 +1,6 @@
 # Model Context Protocol (MCP) Tool Surface Reference
 
-The Kin MCP server exposes 64 semantic tools to AI assistants (Claude, Cursor, Gemini,
+The Kin MCP server exposes 65 semantic tools to AI assistants (Claude, Cursor, Gemini,
 Codex, etc.). These tools bridge the gap between traditional file-first navigation and
 Kin's graph-first semantic substrate: instead of issuing raw shell commands or reading raw
 files, an assistant interacts with the codebase through entity-level primitives.
@@ -121,10 +121,11 @@ boundary you can rely on.
 ---
 
 ## 1. Retrieval & Codebase Exploration
-*Tools:* `semantic_search`, `semantic_locate`, `get_entity`, `get_entity_source`, `get_entity_body`, `get_entity_sources`, `get_context_pack`, `explore_codebase`, `graph_neighborhood`
+*Tools:* `semantic_search`, `semantic_locate`, `list_file_entities`, `get_entity`, `get_entity_source`, `get_entity_body`, `get_entity_sources`, `get_context_pack`, `explore_codebase`, `graph_neighborhood`
 
 - **`semantic_search`**: Find declarations by **name, kind, or language** (functions, classes, structs, traits, enums, interfaces, types, constants). This matches real parsed declarations rather than raw string occurrences like grep, and returns each match's file path, line range, signature, and stable entity ID. Note: despite the name, this is a metadata matcher; it does **not** rank by vector similarity. Use it as your first step to find "the thing called X."
 - **`semantic_locate`**: Rank the code most relevant to a **natural-language** query using Kin's vector index, the same embedding-backed retrieval that powers `kin locate`. Use it when you only have a description of the behavior, not an exact symbol name. Supports `granularity` of `entity` (default) or `file`, reports `semantic_coverage` as the counter object, and requires the running daemon. Each hit carries its inline source once: on `body` for the fused pipeline (the default, `routing: "fused-v1"`) and on `snippet` for the cosine pipeline. Multi-query fan-out echoes the variants once under `queries`, and a hit names the ones that surfaced it by position in `matched_variant_indexes`.
+- **`list_file_entities`**: Enumerate every entity the graph holds for one repository-relative file. This is the enumeration surface, and it is the one to reach for when the question is "what is in this file" rather than "what is most relevant to this query". `semantic_search` and `semantic_locate` both return a bounded set they cannot certify, so a short answer and a whole one read identically; this one reports `total_in_file` on every page and says whether the set is complete. Completeness rests on the file's own parse record rather than on store-wide health: `file_coverage.parsed` is `full` only when a language adapter parsed the file completely, and `_kin.completeness` and `negative.safe_to_conclude_absent` follow that fact. A path the graph does not track is refused by name instead of answered with an empty list, because a caller cannot tell those two answers apart and only one of them means the file holds no entities. Large files page through `next_cursor`.
 - **`get_entity`**: Fetch metadata about a specific entity (kind, language, path, line range, signature) without its source body.
 - **`get_entity_source` / `get_entity_body`**: Retrieve the implementation source of an entity, served from the graph.
 - **`get_entity_sources`**: The batch form of `get_entity_source`. Hand it up to 50 entity IDs in priority order and it returns each entity's metadata plus its body in one budgeted call, which replaces the N separate round-trips and N response envelopes those reads would otherwise cost. Bodies fill in the order you list the IDs until the shared `token_budget` is reached, and entities past that point come back signature-only with `omitted=true`.
