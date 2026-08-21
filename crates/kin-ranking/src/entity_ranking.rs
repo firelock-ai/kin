@@ -334,9 +334,9 @@ impl TraceTerminal {
     /// let two short chains read as whole ones.
     pub fn truncates(self) -> bool {
         match self {
-            TraceTerminal::ExternalReference | TraceTerminal::TypeAnnotation | TraceTerminal::Leaf => {
-                false
-            }
+            TraceTerminal::ExternalReference
+            | TraceTerminal::TypeAnnotation
+            | TraceTerminal::Leaf => false,
             TraceTerminal::BoundReached | TraceTerminal::CoverageGap => true,
         }
     }

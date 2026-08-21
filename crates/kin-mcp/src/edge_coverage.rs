@@ -1325,7 +1325,11 @@ mod tests {
         let linked = observe_cross_file_reference_coverage(
             &store,
             &caller,
-            &[RelationKind::Calls, RelationKind::Imports, RelationKind::References],
+            &[
+                RelationKind::Calls,
+                RelationKind::Imports,
+                RelationKind::References,
+            ],
         );
         assert_eq!(linked["classes"]["calls"], json!("present"));
         assert_eq!(
@@ -1344,7 +1348,11 @@ mod tests {
         let empty = observe_cross_file_reference_coverage(
             &unlinked,
             &lone,
-            &[RelationKind::Calls, RelationKind::Imports, RelationKind::References],
+            &[
+                RelationKind::Calls,
+                RelationKind::Imports,
+                RelationKind::References,
+            ],
         );
         assert_eq!(empty["classes"]["calls"], json!("absent"));
         assert!(

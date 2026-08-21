@@ -1156,8 +1156,11 @@ fn classify_walk_terminals<S: EntityStore>(
     // what `find_references` publishes and what the envelope's absence gate
     // reads. Per-step verdicts below may consult another language's, but the
     // published object stays the focal's so one payload carries one scope.
-    let focal_observation =
-        kin_mcp::edge_coverage::observe_cross_file_reference_coverage(store, focal, reference_kinds);
+    let focal_observation = kin_mcp::edge_coverage::observe_cross_file_reference_coverage(
+        store,
+        focal,
+        reference_kinds,
+    );
     let mut certain: HashMap<kin_model::ids::LanguageId, bool> = HashMap::new();
     certain.insert(
         focal.language,
