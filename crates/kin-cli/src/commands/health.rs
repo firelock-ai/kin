@@ -5848,7 +5848,11 @@ mod tests {
 
         // Exactly what setup writes now: the hook in the interactive file, the
         // PATH line in the file every zsh reads, and neither in the other.
-        std::fs::write(home.join(".zshrc"), format!("source \"{}\"\n", hook.display())).unwrap();
+        std::fs::write(
+            home.join(".zshrc"),
+            format!("source \"{}\"\n", hook.display()),
+        )
+        .unwrap();
         std::fs::write(
             home.join(".zshenv"),
             format!("export PATH=\"{}:$PATH\"\n", kin_home.join("bin").display()),

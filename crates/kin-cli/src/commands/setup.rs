@@ -18423,7 +18423,14 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         install_shell_hook("zsh").unwrap();
 
         let rc = fs::read_to_string(home.join(".zshrc")).unwrap();
-        let env_rc = fs::read_to_string(home.join(".zshenv")).unwrap();
+        let env_path = home.join(".zshenv");
+        let env_rc = fs::read_to_string(&env_path).unwrap_or_else(|error| {
+            panic!(
+                "setup wrote no {}, so a non-interactive zsh has no PATH line to \
+                 read: {error}",
+                env_path.display()
+            )
+        });
         let path_line = rc_path_line("zsh", &kin_home.join("bin"));
 
         assert_eq!(
