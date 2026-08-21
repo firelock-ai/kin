@@ -2152,6 +2152,45 @@ mod tests {
         );
     }
 
+    /// FIR-2499. The graph-status path sets durability after `with_health` has
+    /// already read the reconcile block, so it has to requalify rather than
+    /// assign.
+    ///
+    /// This is the sibling of the case above and it needed its own: a plain
+    /// assignment here restores the all-clear the reconcile block exists to
+    /// withdraw, and every assertion on the `with_health` path stays green
+    /// while it does, because that path is not the one this call rewrites.
+    #[test]
+    fn a_graph_status_reading_over_a_behind_store_does_not_restore_the_all_clear() {
+        let env = Envelope::daemon()
+            .with_health(&serde_json::json!({
+                "graph_entity_count": 51,
+                "durable_entity_count": 51,
+                "reconcile": {
+                    "untracked_path_count": 2,
+                    "untracked_paths_sample": ["notekeeper/search.py"],
+                    "last_admission_success_at": "2026-08-20T13:00:00Z",
+                },
+            }))
+            .with_selected_graph_observation(51, 51, 0, 51, Some(51));
+
+        let durability = env.durability.expect("graph status reports the counts");
+        assert!(
+            !durability
+                .note
+                .contains("records everything answering here"),
+            "the graph-status reading restored an all-clear over a behind store: {}",
+            durability.note
+        );
+        assert!(
+            durability
+                .note
+                .contains("host path(s) on disk that no admission has taken"),
+            "the note has to keep naming what it does not cover: {}",
+            durability.note
+        );
+    }
+
     /// The control for the case above, and the one that keeps this from
     /// qualifying every answer: a store with nothing unadmitted says so exactly
     /// as before.
