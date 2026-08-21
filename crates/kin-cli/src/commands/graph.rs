@@ -2795,6 +2795,7 @@ mod tests {
             &Default::default(),
             &crate::commands::resources::EmbedRuntimeState::default(),
             &Default::default(),
+            None,
         )
         .unwrap();
         assert!(
@@ -2815,6 +2816,7 @@ mod tests {
                 ..Default::default()
             },
             &Default::default(),
+            None,
         )
         .unwrap();
         let drained_line = drained
@@ -2857,6 +2859,7 @@ mod tests {
                 ..Default::default()
             },
             &Default::default(),
+            None,
         )
         .unwrap();
         let filling_line = filling
@@ -2885,6 +2888,7 @@ mod tests {
             &Default::default(),
             &crate::commands::resources::EmbedRuntimeState::default(),
             &Default::default(),
+            None,
         )
         .unwrap();
         let filling_quiet_line = filling_quiet
