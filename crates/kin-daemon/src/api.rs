@@ -18906,6 +18906,106 @@ mod tests {
         );
     }
 
+    /// The body the approval under test names.
+    ///
+    /// Deliberately harmless. This test asks one question, whether the sealed
+    /// tree's derivation reads a tracked approval at all, and answering it does
+    /// not require the approval to be clearing a live refusal. Approving a real
+    /// secret would drag in authority's separate rule that an approved body must
+    /// already be in repository CAS before the transition that approves it, and
+    /// this test would then fail for a reason that has nothing to do with the
+    /// derivation site.
+    #[cfg(unix)]
+    const STASH_APPROVED_BODY: &[u8] = b"def normalize(term):\n    return term.strip()\n";
+
+    /// Sealing a workspace derives the policy for the sealed tree, and it has to
+    /// derive it through the entry point that reads a tracked `.kin-allowances`.
+    ///
+    /// Reverting `repository_stash::push`'s derivation to `derive_from_tree`
+    /// fails here, because the compatibility entry point refuses by name the
+    /// moment the sealed tree carries approvals it cannot read.
+    ///
+    /// Three details in this fixture are load-bearing and none is obvious.
+    /// The approval file is committed rather than left dirty, because stash
+    /// reads allowance bodies through `manager.load_source_blob`, which consults
+    /// repository CAS alone; a dirty approval file lives only in ingest CAS and
+    /// fails with "repository source CAS is missing", a refusal that looks
+    /// nothing like the one this test exists to provoke. The workspace has to be
+    /// dirty, because `push` refuses a clean one before it reaches the
+    /// derivation at all. And the request goes through the route rather than
+    /// straight into `execute`, because the route runs the complete-scan
+    /// admission first, which is what turns a working-copy write into workspace
+    /// dirtiness that authority can see.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sealing_a_workspace_derives_the_approvals_its_tree_carries() {
+        let state = committed_test_state();
+
+        // The approved artifact is committed first, so authority owns its body
+        // before any approval names its digest.
+        let approved_digest =
+            Hash256::from_bytes(state.blobs.write(STASH_APPROVED_BODY).unwrap().0);
+        install_repository_file(&state, "notekeeper/client.py", STASH_APPROVED_BODY);
+        install_working_copy_file(&state, "notekeeper/client.py", STASH_APPROVED_BODY, false);
+
+        let approvals = format!(
+            "# approvals for this fixture\n\
+             kin-allowances 1\n\
+             notekeeper/client.py\t{approved_digest}\tblob\tcredscan@firelock.ai\tpinned by \
+             the test covering the sealed-tree derivation site\n"
+        );
+        install_repository_file(&state, ".kin-allowances", approvals.as_bytes());
+        install_working_copy_file(&state, ".kin-allowances", approvals.as_bytes(), false);
+
+        // Dirty the workspace through the host, which is what the route's scan
+        // admits and what makes the workspace sealable.
+        std::fs::write(
+            state.layout.working_dir().join("scratch.txt"),
+            b"sealed while dirty\n",
+        )
+        .unwrap();
+
+        let request = kin_cli::commands::stash::StashRequest::Push {
+            message: Some("seal a workspace whose tree carries approvals".to_string()),
+            operation_id: kin_model::OperationId::new(),
+            timestamp: Timestamp::now(),
+            actor: AuthorId::new("credscan"),
+        };
+        let (status, body) = post_stash_request(Arc::clone(&state), &request).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "sealing a workspace whose tree carries .kin-allowances must derive its approvals \
+             rather than refusing: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let response: kin_cli::commands::stash::StashResponse =
+            serde_json::from_slice(&body).unwrap();
+        let sealed = response
+            .entry
+            .expect("a push reports the entry it sealed")
+            .change_id;
+
+        let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
+        let lease = authority.manager.read_authority();
+        let policy = lease
+            .metadata()
+            .admission_policies
+            .iter()
+            .find(|resolved| resolved.change_id == sealed)
+            .expect("the sealed change carries an admission-policy record")
+            .policy
+            .clone()
+            .expect("the sealed change's policy is resolved");
+        assert_eq!(
+            policy.sensitive_allowances.len(),
+            1,
+            "the sealed policy must carry the tree's one approval: {:?}",
+            policy.sensitive_allowances
+        );
+        assert_eq!(policy.sensitive_allowances[0].content_hash, approved_digest);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn command_checkout_projection_only_repairs_universal_bytes_and_replays_after_restart() {
@@ -21915,6 +22015,96 @@ mod tests {
             .clone()
             .unwrap();
         lease.resolve_target_change_id(&target).unwrap()
+    }
+
+    /// A rollback derives the policy for the tree it restores, and it has to
+    /// derive it through the entry point that reads a tracked `.kin-allowances`.
+    ///
+    /// Reverting `repository_rollback::plan_and_commit`'s derivation to
+    /// `derive_from_tree` fails here, because the compatibility entry point
+    /// refuses by name the moment the restored tree carries approvals it cannot
+    /// read. That is the shape this covers: an approval a reviewer accepted,
+    /// silently dropped by rolling back to the very change that carried it.
+    ///
+    /// The approval rides the FIRST change, because rollback derives from the
+    /// target tree rather than from the tree it is leaving. The approved body is
+    /// harmless for the same reason it is in the sealed-tree test: this asks
+    /// whether the derivation reads the approval, and approving a real secret
+    /// would pull in authority's separate rule about repository CAS ordering.
+    #[tokio::test]
+    async fn rolling_back_derives_the_approvals_the_restored_tree_carries() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let root = state.layout.working_dir().to_path_buf();
+        let app = router(Arc::clone(&state));
+
+        let approved_body = b"def normalize(term):\n    return term.strip()\n";
+        let approved_digest = Hash256::from_bytes(state.blobs.write(approved_body).unwrap().0);
+        std::fs::create_dir_all(root.join("notekeeper")).unwrap();
+        std::fs::write(root.join("notekeeper/client.py"), approved_body).unwrap();
+        let approvals = format!(
+            "# approvals for this fixture\n\
+             kin-allowances 1\n\
+             notekeeper/client.py\t{approved_digest}\tblob\tcredscan@firelock.ai\tpinned by \
+             the test covering the restored-tree derivation site\n"
+        );
+        std::fs::write(root.join(".kin-allowances"), approvals.as_bytes()).unwrap();
+        let restored = commit_through_api(
+            &app,
+            kin_model::OperationId::new(),
+            "publish a tree carrying an approval",
+        )
+        .await;
+
+        std::fs::write(
+            root.join("notekeeper/client.py"),
+            b"def normalize(term):\n    return term\n",
+        )
+        .unwrap();
+        let regression =
+            commit_through_api(&app, kin_model::OperationId::new(), "publish a regression").await;
+        assert_eq!(branch_change(&state), regression);
+
+        let (status, body) =
+            rollback_through_api(&app, kin_model::OperationId::new(), restored).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "rolling back to a tree carrying .kin-allowances must derive its approvals rather \
+             than refusing: {body}"
+        );
+        // A rollback publishes a NEW change that restores the old tree rather
+        // than moving the branch back onto the old id, so the branch must have
+        // left the regression without landing on `restored` itself.
+        let after = branch_change(&state);
+        assert_ne!(
+            after, regression,
+            "the rollback must move the branch off the regression"
+        );
+        assert_ne!(
+            after, restored,
+            "a rollback publishes a restoring change rather than re-pointing at the old one"
+        );
+
+        let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
+        let lease = authority.manager.read_authority();
+        let carried = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == authority.workspace_id)
+            .expect("the bound workspace survives the rollback")
+            .shared_admission_policy
+            .sensitive_allowances
+            .clone();
+        assert_eq!(
+            carried.len(),
+            1,
+            "the restored policy must carry the tree's one approval: {carried:?}"
+        );
+        assert_eq!(carried[0].content_hash, approved_digest);
     }
 
     /// An operation id is matched before any history validation runs, and an

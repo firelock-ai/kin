@@ -575,22 +575,36 @@ pub(crate) fn absence_coverage_gap(tool: &str, payload: &Value) -> Option<String
         return None;
     }
     let named = requested.join(", ");
+    let claims_absence = answer_claims_absence(tool, payload);
 
     let Some(coverage) = payload
         .get(crate::edge_coverage::EDGE_COVERAGE_KEY)
         .and_then(Value::as_object)
     else {
-        return Some(if requested.is_empty() {
-            "absence_coverage_unreported: this answer did not report which languages the absence \
-             claim spans or whether this build can resolve their programs, so an empty result \
-             cannot be distinguished from a scope the extractor never populated"
-                .to_string()
-        } else {
+        return Some(if !requested.is_empty() {
             format!(
                 "edge_coverage_unreported: this answer did not report whether the graph holds \
                  cross-file {named} edges, so an empty result cannot be distinguished from a graph \
                  that could not have found a reference in the first place"
             )
+        } else if claims_absence {
+            "absence_coverage_unreported: this answer did not report which languages the absence \
+             claim spans or whether this build can resolve their programs, so an empty result \
+             cannot be distinguished from a scope the extractor never populated"
+                .to_string()
+        } else {
+            // FIR-2496. The same missing observation, read against the claim the
+            // answer actually made. A response holding rows asserts no absence,
+            // and handing it the sentence above put the one caveat about
+            // absences on the one call that was not making one: on the v0.5.43
+            // stranger run three empty searches certified byte-identically while
+            // `notes_with_tag`, which returned a row, was the response that read
+            // `limiting_factor: absence_coverage_unreported`. The limit is real
+            // either way, and what it limits is different, so it says so.
+            "answer_coverage_unreported: this answer did not report which languages its rows \
+             span or whether this build can resolve their programs, so the rows here are a floor \
+             and a declaration the extractor never admitted could not be among them"
+                .to_string()
         });
     };
     let language = coverage
@@ -787,7 +801,104 @@ pub(crate) fn absence_coverage_gap(tool: &str, payload: &Value) -> Option<String
         });
     }
 
+    // FIR-2496, and the gate every other one in this function was standing in
+    // for. An observation that measured no coverage class states nothing about
+    // what the extractor admitted, and nothing observed is not the same fact as
+    // every input agreeing. Until FIR-2496 an empty class map read as the
+    // second: on the v0.5.43 stranger run `semantic_search("SCHEMA")` and
+    // `semantic_search("build_match_query")` both returned zero over
+    // `"classes": {}` and both certified `safe_to_conclude_absent: true`,
+    // `trust: "authoritative"`, `limiting_factor: null`. `SCHEMA` was a
+    // module-level constant at `storage.py:24` that the Python extractor skips
+    // because it is a triple-quoted string, sitting between two one-line
+    // constants the same file's parse admitted (FIR-2509), and
+    // `build_match_query` was a function in a file the graph had not admitted at
+    // all. Neither was absent from the repository. Both were absent from the
+    // index, which is the one thing an unmeasured class map cannot tell apart.
+    //
+    // It reads the observation rather than the tool name, so it is not a
+    // blocklist: a producer that measures a class for this scope lifts the
+    // refusal by publishing the measurement, and no producer does today. The
+    // requested-class tools are excluded because the block above already reports
+    // their unmeasured classes by name, and one fact stated twice in one reason
+    // is not stated better.
+    //
+    // Last in the list on purpose. Every gap above is a positive finding about a
+    // measured thing, and a sharper reason has to lead a composed one; this is
+    // the reason that applies when nothing sharper was observed.
+    //
+    // Fires only on a real language, for the reason the enrichment gate above
+    // fires only on a positive finding: an answer that resolved no language has
+    // no language's extractor coverage to be missing, and a sentence about one
+    // would displace the reason such an answer actually carries, which is that
+    // its focal is not in the graph or that its filter selected an empty region.
+    // Both of those are reported by name, so nothing here is left ungated.
+    if coverage_classes_unmeasured(coverage, &requested) {
+        gaps.push(if claims_absence {
+            format!(
+                "absence_coverage_unmeasured: no coverage class was measured for {language}, so \
+                 nothing established what the extractor admitted for it, and an empty result \
+                 cannot be separated from a declaration the extractor never admitted as an entity \
+                 or from a file the graph does not hold yet"
+            )
+        } else {
+            format!(
+                "answer_coverage_unmeasured: no coverage class was measured for {language}, so \
+                 the rows here are a floor and a declaration the extractor never admitted could \
+                 not be among them"
+            )
+        });
+    }
+
     (!gaps.is_empty()).then(|| gaps.join("; "))
+}
+
+/// Whether this response asserts that something is NOT there, as opposed to
+/// returning rows and leaving the question of how complete they are.
+///
+/// One definition, read by [`absence_coverage_gap`] so a coverage limit is
+/// stated against the claim the answer actually made, and by [`negative_for`] so
+/// the two cannot drift. Before FIR-2496 the gate had no idea which it was
+/// looking at, so an answer with rows was handed a sentence about what an empty
+/// result cannot be distinguished from, and three empty answers beside it were
+/// handed nothing at all.
+///
+/// The reading is the spec's: a tool whose spec `always` qualifies is making a
+/// per-row verdict claim (`bulk_check_references`, `impact_analysis`), a locate
+/// page whose ranking names nothing is claiming the name is not there, and every
+/// other tool claims an absence exactly when its answer group came back empty. A
+/// tool with no spec claims nothing, because this module does not qualify it.
+///
+/// An answer group the payload does not carry reads as an absence claim, which
+/// is [`negative_for`]'s own reading of the same shape: an omitted group makes
+/// the same claim as an empty one and is the more dangerous of the two, since a
+/// missing key reads as a question the tool does not answer. Only a group that
+/// is present and populated makes this false, so the rows phrasing is reached
+/// from evidence of rows rather than from the absence of evidence.
+fn answer_claims_absence(tool: &str, payload: &Value) -> bool {
+    let Some(spec) = spec_for(tool) else {
+        return false;
+    };
+    // A walk that expanded edges is reporting what it found, whatever its
+    // entity collection reads: `graph_neighborhood` returns the focal itself in
+    // that collection, so the count alone cannot tell a populated walk from an
+    // isolated focal. `relation_count` can.
+    if tool == "graph_neighborhood"
+        && payload
+            .get("relation_count")
+            .and_then(Value::as_u64)
+            .is_some_and(|total| total > 0)
+    {
+        return false;
+    }
+    if spec.always {
+        return true;
+    }
+    if tool == "semantic_locate" {
+        return locate_result_count(payload).is_none_or(|count| count == 0)
+            || locate_ranking_names_nothing(payload);
+    }
+    collection_len(payload, spec.field).is_none_or(|count| count == 0)
 }
 
 /// Whether a POPULATED answer from `tool` carries the response's verdict too,
@@ -829,6 +940,42 @@ pub(crate) fn declares_absence_dependency(tool: &str, payload: &Value) -> bool {
     !absence_cross_file_classes(tool, payload).is_empty()
         || absence_is_language_scoped(tool)
         || tool == FILE_ENTITIES_TOOL
+}
+
+/// Whether this observation measured no coverage class at all for a language it
+/// named, which is the state FIR-2496 found certifying absences.
+///
+/// Three readers ask the same question and one answer serves them:
+/// [`absence_coverage_gap`] refuses the certification,
+/// [`edge_coverage_degradation_labels`] discloses the shortfall beside it, and
+/// [`crate::verdict`] records the coverage input's own reading. A reason with no
+/// signal beside it, or a signal with no reason, is the drift this module keeps
+/// catching, so the three read one function rather than three copies of a
+/// condition.
+///
+/// Scoped to an observation that named a language and declared no edge class.
+/// The class-declaring tools report their unmeasured classes by name one gate
+/// above, and an answer that resolved no language has no language's extractor
+/// coverage to be missing.
+pub(crate) fn coverage_classes_unmeasured(
+    coverage: &Map<String, Value>,
+    requested: &[String],
+) -> bool {
+    if !requested.is_empty() {
+        return false;
+    }
+    let named = coverage
+        .get("language")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|language| {
+            !language.is_empty() && language != crate::edge_coverage::NO_RESOLVED_LANGUAGE
+        });
+    named
+        && coverage
+            .get("classes")
+            .and_then(Value::as_object)
+            .is_none_or(Map::is_empty)
 }
 
 /// One class's observed state, defaulting to `unknown` for a class the
@@ -891,6 +1038,9 @@ pub(crate) fn edge_coverage_degradation_labels(tool: &str, payload: &Value) -> V
             state => Some(format!("edge_coverage:{class}_{state}")),
         })
         .collect();
+    if coverage_classes_unmeasured(coverage, &requested) {
+        labels.push("absence_coverage:classes_unmeasured".to_string());
+    }
     if coverage.get("scope_entities").and_then(Value::as_u64) == Some(0) {
         labels.push("absence_coverage:scope_empty".to_string());
     }
@@ -1831,7 +1981,12 @@ pub fn negative_for(
     // rows asserts nothing of the kind, and still gets qualified: the gates
     // below decide how far its rows can be trusted as the whole set, which is
     // the question `graph_neighborhood` used to leave unanswered.
-    let mut claims_absence = count == 0 || spec.always || ranking_names_nothing;
+    //
+    // Read from [`answer_claims_absence`] rather than recomputed, because
+    // [`absence_coverage_gap`] states its limit against the same claim and two
+    // readings of one question are how a caveat about absences came to ride on
+    // an answer with rows (FIR-2496).
+    let claims_absence = answer_claims_absence(tool, payload);
     if !claims_absence && !qualifies_populated_answers(tool) {
         return None;
     }
@@ -1986,7 +2141,9 @@ pub fn negative_for(
         // The emitted edge array is capped by the caller's `limit`, and a
         // `limit` of zero empties it while the walk still found neighbors. The
         // pre-truncation total is what decides whether anything was there, so a
-        // truncated answer is never dressed up as an absence.
+        // truncated answer is never dressed up as an absence. That reading lives
+        // in [`answer_claims_absence`] since FIR-2496, so the gate reads the same
+        // one rather than a second copy of it.
         //
         // It stops the ABSENCE framing and no longer stops the qualifier. This
         // returned `None` until FIR-2463, which is why a neighborhood that walked
@@ -1994,13 +2151,6 @@ pub fn negative_for(
         // claim at all, in the same session where `find_references` refused to
         // certify the same entity over the same edges. Whichever tool you reached
         // for first decided what you believed.
-        if payload
-            .get("relation_count")
-            .and_then(Value::as_u64)
-            .is_some_and(|total| total > 0)
-        {
-            claims_absence = false;
-        }
         let neighborhood_gap = if payload.get("entity_count").and_then(Value::as_u64) == Some(0) {
             kind = "focal_not_in_graph";
             subject = "the focal entity is not in the graph, so no neighborhood was walked";
@@ -2434,6 +2584,30 @@ mod tests {
         observation
     }
 
+    /// The same scope observation with one coverage class actually measured for
+    /// the language, which is the shape that lifts the FIR-2496 refusal.
+    ///
+    /// It exists because the refusal reads the observation and not the tool
+    /// name, and every case below that asserts a certification has to be able to
+    /// prove that. A rule that refused these tools by name would pass every test
+    /// that only ever shows it an unmeasured map, and would go on refusing after
+    /// the measurement arrived. It is also what keeps those cases falsifiable:
+    /// with no payload that can certify, a control asserting "the gate can still
+    /// pass" is a check that cannot pass, which is no more evidence than one
+    /// that cannot fail.
+    ///
+    /// No producer emits this today. `observe_absence_scope` measures no class
+    /// on purpose, so every `semantic_search`, `find_dead_code_seeded` and
+    /// `graph_neighborhood` absence this build produces is inconclusive, and
+    /// FIR-2509's extractor-coverage measurement is the work that would change
+    /// that.
+    fn scope_with_a_measured_class(scope_entities: Option<usize>) -> Value {
+        let mut observation = resolvable_language_scope(scope_entities);
+        observation["classes"] = json!({ "calls": "present" });
+        observation["cross_file_classes"] = json!(["calls"]);
+        observation
+    }
+
     /// The same observation over a language nothing resolved: the express
     /// shape, where `imports` and `references` were never produced.
     ///
@@ -2713,8 +2887,10 @@ mod tests {
         // embeddings were complete. It answers to the graph gate instead, which
         // is the substrate it actually reads. Since FIR-2430 that substrate has
         // to be OBSERVED rather than assumed, so the page carries the scope its
-        // filter selected; embedding coverage is still not what decides.
-        let payload = empty_search_page(resolvable_language_scope(Some(12)));
+        // filter selected, and since FIR-2496 that observation has to have
+        // measured something; embedding coverage is still not what decides
+        // either way.
+        let payload = empty_search_page(scope_with_a_measured_class(Some(12)));
         let negative = negative_for("semantic_search", &payload, &structural_ready_envelope())
             .expect("empty results yields a negative");
         assert_eq!(negative["safe_to_conclude_absent"], json!(true));
@@ -2780,12 +2956,18 @@ mod tests {
     }
 
     #[test]
-    fn a_resolvable_language_still_certifies_a_genuinely_absent_declaration() {
+    fn a_measured_scope_still_certifies_a_genuinely_absent_declaration() {
         // The other direction, and the regression bar FIR-2404 set: the fix must
         // not degrade into marking everything inconclusive. Python is a language
-        // this build wires an adapter for, so an empty name filter over a
-        // populated region is still a certifiable absence.
-        let payload = empty_search_page(resolvable_language_scope(Some(29)));
+        // this build wires an adapter for, and this answer's observation measured
+        // a class over it, so an empty name filter over a populated region is
+        // still a certifiable absence.
+        //
+        // The measurement is what carries it since FIR-2496, and the pair below
+        // is the whole rule in two readings: the same payload with the same
+        // language, the same populated region and the same healthy envelope
+        // certifies when a class was measured and refuses when none was.
+        let payload = empty_search_page(scope_with_a_measured_class(Some(29)));
         let negative = negative_for("semantic_search", &payload, &structural_ready_envelope())
             .expect("empty results yields a negative");
         assert_eq!(negative["safe_to_conclude_absent"], json!(true));
@@ -2794,6 +2976,148 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("structural_authoritative"));
+
+        let unmeasured = empty_search_page(resolvable_language_scope(Some(29)));
+        let negative = negative_for("semantic_search", &unmeasured, &structural_ready_envelope())
+            .expect("empty results yields a negative");
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(false),
+            "an unmeasured class map is the FIR-2496 shape and cannot certify: {negative}"
+        );
+    }
+
+    /// FIR-2496, the reported shape. Three empty searches in one session on a
+    /// green store certified byte-identical verdicts over `"classes": {}`, and
+    /// two of them were wrong: `SCHEMA` is a module-level constant at
+    /// `storage.py:24` that the Python extractor skips because it is
+    /// triple-quoted, sitting between two one-line constants the same parse
+    /// admitted, and `build_match_query` is a function in a file the graph had
+    /// not admitted at all. Neither was absent from the repository. Both were
+    /// absent from the index, and an unmeasured class map is exactly the
+    /// observation that cannot tell those apart.
+    #[test]
+    fn an_unmeasured_class_map_cannot_certify_an_absence() {
+        let payload = empty_search_page(resolvable_language_scope(Some(51)));
+        let negative = negative_for("semantic_search", &payload, &structural_ready_envelope())
+            .expect("empty results yields a negative");
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(false),
+            "nothing observed is not every input agreeing: {negative}"
+        );
+        assert_eq!(negative["trust"], json!("inconclusive"));
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            reason.starts_with("absence_coverage_unmeasured"),
+            "the limiting factor names the measurement nothing took: {reason}"
+        );
+        assert!(
+            reason.contains("for Python"),
+            "it names the language whose coverage went unmeasured: {reason}"
+        );
+        assert!(
+            reason.contains("never admitted"),
+            "and what that leaves indistinguishable from a true absence: {reason}"
+        );
+        let advice = negative["advice"].as_str().unwrap();
+        assert!(
+            !advice.contains("Absence is authoritative"),
+            "the advice a reader acts on follows the verdict: {advice}"
+        );
+        assert!(
+            negative["degraded_signals"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("absence_coverage:classes_unmeasured")),
+            "the shortfall the verdict rests on is disclosed beside it, so a reader never has \
+             to parse the reason sentence to find it: {negative}"
+        );
+
+        // Every other gate reads healthy on this payload, which is why it
+        // certified for four releases: the region holds 51 entities, the
+        // language resolves on this host, and no narrowing filter removed a
+        // candidate. Asserted so a later change cannot make this case pass for
+        // one of those reasons instead.
+        assert!(
+            !reason.contains("absence_scope_empty") && !reason.contains("entity_index_unresolved"),
+            "no other gate fired here, so this one is doing the work: {reason}"
+        );
+    }
+
+    /// The other half of FIR-2496, and the one the stranger noticed first: the
+    /// caveat about absences was riding the one call that asserted none. Of four
+    /// searches in that session, `notes_with_tag` returned a row and was the
+    /// response that read `limiting_factor: absence_coverage_unreported`, while
+    /// the three empty ones carried nothing. A limit stated against a claim the
+    /// answer never made teaches a reader to skip the limit.
+    #[test]
+    fn a_search_that_returned_rows_is_not_qualified_by_a_caveat_about_absences() {
+        let populated = json!({
+            "query": "notes_with_tag",
+            "limit": 10,
+            "total_matches": 1,
+            "truncated": false,
+            "results": [{ "name": "notes_with_tag", "kind": "Function" }],
+        });
+        let negative = negative_for("semantic_search", &populated, &structural_ready_envelope())
+            .expect("every retrieval answer carries the response verdict");
+        assert_eq!(negative["interpretation"], json!("qualified_answer"));
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            !reason.contains("absence_coverage_unreported"),
+            "an answer with rows asserts no absence and must not be limited by one: {negative}"
+        );
+        assert!(
+            reason.starts_with("answer_coverage_unreported"),
+            "the same missing observation, stated against the claim this answer made: {reason}"
+        );
+        assert!(
+            reason.contains("rows here are a floor"),
+            "which is that its rows may be short, not that an absence is unsafe: {reason}"
+        );
+
+        // The empty answer from the same tool keeps the absence wording, so the
+        // split is between the two claims rather than a rename of one of them.
+        let empty = json!({
+            "query": "notes_with_tag",
+            "limit": 10,
+            "total_matches": 0,
+            "truncated": false,
+            "results": [],
+        });
+        let negative = negative_for("semantic_search", &empty, &structural_ready_envelope())
+            .expect("empty results yields a negative");
+        assert!(
+            negative["trust_reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("absence_coverage_unreported"),
+            "{negative}"
+        );
+    }
+
+    /// The regression bar in the other direction, on the surface that measures
+    /// what it reads. A tool whose observation carries a class map is judged on
+    /// that map, so a fully enriched store still certifies a true absence and
+    /// FIR-2496 has not degraded into marking every answer uncertain.
+    #[test]
+    fn a_healthy_enriched_store_still_certifies_a_true_absence() {
+        let payload = authoritative_empty_references("function");
+        let negative = negative_for("find_references", &payload, &structural_ready_envelope())
+            .expect("an empty reference list carries a negative");
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(true),
+            "a measured class map certifies exactly as it did before: {negative}"
+        );
+        assert_eq!(negative["trust"], json!("authoritative"));
+        assert_eq!(
+            payload[crate::edge_coverage::EDGE_COVERAGE_KEY]["classes"]["calls"],
+            json!("present"),
+            "and the measurement it rests on is in the payload: {payload}"
+        );
     }
 
     /// A narrowing filter that removed every candidate the name DID match
@@ -2846,8 +3170,10 @@ mod tests {
 
         // Positive control on the same payload shape: the name matched nothing
         // on its own, so the narrowing filter removed nothing and the absence is
-        // the name's, not the filter's. The gate reads the count.
-        let mut matched_nothing = resolvable_language_scope(Some(256));
+        // the name's, not the filter's. The gate reads the count. It carries a
+        // measured class since FIR-2496, or the control could not pass whatever
+        // this gate did.
+        let mut matched_nothing = scope_with_a_measured_class(Some(256));
         matched_nothing["name_filter"] = json!({ "narrowed_by": ["kind"], "candidates": 0 });
         let negative = negative_for(
             "semantic_search",
@@ -2867,7 +3193,7 @@ mod tests {
     /// sentence supplied the word anyway.
     #[test]
     fn a_certified_search_absence_states_no_verdict_about_use() {
-        let payload = empty_search_page(resolvable_language_scope(Some(29)));
+        let payload = empty_search_page(scope_with_a_measured_class(Some(29)));
         let negative = negative_for("semantic_search", &payload, &structural_ready_envelope())
             .expect("empty results yields a negative");
         assert_eq!(
@@ -2986,8 +3312,10 @@ mod tests {
             .unwrap()
             .contains(&json!("absence_coverage:scope_empty")));
         // Positive control on the same payload shape: one entity in the region
-        // and the same absence certifies, so the gate reads the count.
-        let populated = empty_search_page(resolvable_language_scope(Some(1)));
+        // and the same absence certifies, so the gate reads the count. It carries
+        // a measured class since FIR-2496, which is the other input a
+        // certification needs.
+        let populated = empty_search_page(scope_with_a_measured_class(Some(1)));
         let negative = negative_for("semantic_search", &populated, &structural_ready_envelope())
             .expect("empty results yields a negative");
         assert_eq!(negative["safe_to_conclude_absent"], json!(true));
@@ -3001,7 +3329,7 @@ mod tests {
         // was never what backed a structural claim. A negative names the basis
         // its verdict rests on and recites THAT, so an unknown coverage can no
         // longer sit beside a certification it did not back.
-        let payload = empty_search_page(resolvable_language_scope(Some(29)));
+        let payload = empty_search_page(scope_with_a_measured_class(Some(29)));
         let negative = negative_for("semantic_search", &payload, &structural_ready_envelope())
             .expect("empty results yields a negative");
         assert_eq!(negative["trust"], json!("authoritative"));
@@ -3072,10 +3400,10 @@ mod tests {
             .unwrap()
             .starts_with("entity_index_unresolved"));
 
-        // Positive control for both: a resolvable language certifies, so
-        // neither gate is one that always fires.
+        // Positive control for both: a resolvable language whose observation
+        // measured a class certifies, so neither gate is one that always fires.
         let mut neighborhood = neighborhood_payload("in", 0);
-        neighborhood["edge_coverage"] = resolvable_language_scope(None);
+        neighborhood["edge_coverage"] = scope_with_a_measured_class(None);
         assert_eq!(
             negative_for(
                 "graph_neighborhood",
@@ -3089,7 +3417,7 @@ mod tests {
             "query": "utils",
             "total_searched": 0,
             "candidates": [],
-            "edge_coverage": resolvable_language_scope(Some(29)),
+            "edge_coverage": scope_with_a_measured_class(Some(29)),
         });
         assert_eq!(
             negative_for(
@@ -3268,7 +3596,7 @@ mod tests {
             "initialized": true,
             "graph_entity_count": 0,
         }));
-        let payload = empty_search_page(resolvable_language_scope(Some(12)));
+        let payload = empty_search_page(scope_with_a_measured_class(Some(12)));
         let negative = negative_for("semantic_search", &payload, &empty_graph)
             .expect("empty results yields a negative");
         assert_eq!(negative["safe_to_conclude_absent"], json!(false));
@@ -3983,7 +4311,7 @@ mod tests {
     /// so, so the repair adds a fact rather than removing one.
     #[test]
     fn a_verdict_with_no_signals_still_says_it_has_none() {
-        let payload = empty_search_page(resolvable_language_scope(Some(12)));
+        let payload = empty_search_page(scope_with_a_measured_class(Some(12)));
         let negative = negative_for("semantic_search", &payload, &structural_ready_envelope())
             .expect("empty results yields a negative");
         assert_eq!(negative["degraded_signals"], json!([]));
@@ -4441,7 +4769,7 @@ mod tests {
 
     /// The neighborhood always returns the focal itself, so keying its absence
     /// on the entity list meant the qualifier the tool's own description
-    /// promises never fired for an entity that is in the graph — the only case
+    /// promises never fired for an entity that is in the graph, the only case
     /// an agent asks "is this really isolated?" about.
     #[test]
     fn neighborhood_with_no_neighbors_is_qualified() {
@@ -4450,7 +4778,21 @@ mod tests {
             .expect("an indexed focal with no neighbors must carry a negative");
         assert_eq!(negative["kind"], json!("no_neighbors"));
         assert_eq!(negative["result_count"], json!(0));
-        assert_eq!(negative["safe_to_conclude_absent"], json!(true));
+        // The qualifier arriving is what this case is about, and since FIR-2496
+        // what it says is that the walk cannot certify isolation: the handler's
+        // observation measures no coverage class, so an entity nothing reaches
+        // and an entity whose incoming edges were never linked read the same
+        // here. The same payload with a class measured certifies, which is the
+        // control in
+        // `the_neighborhood_and_the_seeded_scan_answer_to_the_same_gate`.
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert!(
+            negative["trust_reason"]
+                .as_str()
+                .unwrap()
+                .contains("absence_coverage_unmeasured"),
+            "the reason names the measurement nothing took: {negative}"
+        );
     }
 
     /// One neighbor is not an absence, whichever side it sits on.

@@ -38,11 +38,13 @@ or merely \"not indexed yet\" — check it before treating \"none found\" as gro
 truth. This filter reads the entity index rather than the vector index, so its \
 absence is gated on the graph being complete, not on embedding coverage. An empty \
 answer also carries `edge_coverage`, naming the languages the filter's own scope \
-spans and how many entities it holds with the name pattern removed, and the absence \
-is NOT certified when that scope is empty or when its language is one this build \
-wires no language-server adapter for: nothing then resolves the program behind the \
-declarations, so a miss cannot separate a symbol the repository lacks from one the \
-extractor never admitted as an entity of that kind.";
+spans and how many entities it holds with the name pattern removed. Nothing measures \
+a coverage class for those languages yet, so an empty answer is never certified: a \
+miss cannot separate a declaration the repository lacks from one the extractor never \
+admitted as an entity, and a file the graph has not admitted reads the same way. \
+Where a sharper reason applies it leads instead, naming a scope the index never \
+populated, a language this build wires no adapter for, or the narrowing filter that \
+removed every candidate the name did match.";
 
 pub fn handle_semantic_search<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
@@ -3055,10 +3057,11 @@ candidate and exhaust your round-trips on a large repo. Use dead_code instead wh
 want a whole-repo or file-scoped sweep rather than a concept-seeded one, and \
 bulk_check_references when you already hold the exact set of entity IDs to classify. \
 When the seed matches nothing the response carries an additive `negative` object beside \
-an `edge_coverage` naming the languages the graph holds, and that absence is not \
-certified on a language this build wires no language-server adapter for, because a seed \
-that matched no declaration cannot then separate a symbol the repository lacks from one \
-the extractor never admitted.";
+an `edge_coverage` naming the languages the graph holds. Nothing measures a coverage \
+class for them yet, so that absence is never certified: a seed that matched no \
+declaration cannot separate a symbol the repository lacks from one the extractor never \
+admitted. A language this build wires no language-server adapter for is named as the \
+sharper reason where it applies.";
 
 /// Seeded find-dead-code primitive: `semantic_search(query)` + per-candidate
 /// reference counting + dead-filter, returned as one structured response, so
@@ -4118,8 +4121,10 @@ When no neighbors come back, the additive `negative` object's `safe_to_conclude_
 flag says whether that absence is authoritative or merely \"not indexed yet\", and its \
 `subject` scopes the absence to the side that was walked, so an empty 'in' result is never \
 read as \"no dependencies\". A walk that expanded no edge also carries `edge_coverage` \
-naming the focal's language, and the absence is not certified when this build wires no \
-language-server adapter for it. A focal that is not in the graph is reported as that gap \
+naming the focal's language. Nothing measures a coverage class for it yet, so an empty \
+walk is never certified as isolation: an entity nothing reaches and one whose incoming \
+edges were never linked read the same here. A build that wires no language-server \
+adapter for that language is named as the sharper reason where it applies. A focal that is not in the graph is reported as that gap \
 rather than as an isolated entity. Every edge also carries `resolution` \
 (`type_resolved`, `import_scoped`, `name_only`) saying how strongly its destination was \
 proven; a `name_only` edge was matched by bare name and is a candidate, not structure you \
@@ -5089,7 +5094,8 @@ mod tests {
     /// absence on the same repository because this build wires no
     /// language-server adapter for JavaScript.
     #[test]
-    fn a_javascript_search_absence_is_inconclusive_while_a_python_one_still_certifies() {
+    fn a_javascript_search_absence_names_an_unresolved_program_and_a_python_one_names_unmeasured_coverage(
+    ) {
         // A Python developer's machine: pyright installed, no JavaScript server.
         // Stated rather than inherited, because the whole contrast below is
         // between a language something resolved and one nothing did, and a test
@@ -5157,10 +5163,14 @@ mod tests {
             "{negative}"
         );
 
-        // The other direction on the same code path. Python is a language this
-        // build wires an adapter for, so a name nothing carries is still a
-        // certifiable absence and the fix has not degraded into marking
-        // everything uncertain.
+        // The other direction on the same code path, and what makes it a test
+        // rather than a tautology: both arms refuse this zero and they refuse it
+        // for different reasons, which is the discrimination the gate exists to
+        // make. JavaScript's program is unresolved, so nothing could have linked
+        // it; Python's resolves, and what stops the certification there is the
+        // coverage class nothing measured (FIR-2496). Read the reasons, not the
+        // flags: if the enrichment gate were removed, this arm's reason would
+        // appear on the arm above.
         let python = InMemoryGraph::new();
         python
             .upsert_entity(&module_entity(LanguageId::Python, "utils", "app/utils.py"))
@@ -5198,13 +5208,23 @@ mod tests {
             &[],
         )
         .expect("an empty search carries a negative");
-        // The Python half certifies, and FIR-2464 is what earns it: the host
-        // probe found a server for this language, so the observation reports
-        // `available` rather than leaving the question open. What stops a
-        // narrowed name filter certifying a false zero is FIR-2452's own gate on
-        // the name's side, not this one.
-        assert_eq!(negative["safe_to_conclude_absent"], true);
-        assert_eq!(negative["trust"], "authoritative");
+        // The Python half clears the enrichment gate, and FIR-2464 is what earns
+        // it: the host probe found a server for this language, so the
+        // observation reports `available` rather than leaving the question open.
+        // It still does not certify, because `observe_absence_scope` measures no
+        // coverage class and the shipped v0.5.43 answer that did certify on this
+        // exact shape was wrong twice in one session.
+        assert_eq!(negative["safe_to_conclude_absent"], false);
+        assert_eq!(negative["trust"], "inconclusive");
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            reason.contains("absence_coverage_unmeasured"),
+            "a resolved program with no measured coverage names that: {negative}"
+        );
+        assert!(
+            !reason.contains("entity_index_unresolved"),
+            "the JavaScript reason must not appear on a language this host resolves: {negative}"
+        );
     }
 
     /// The reported call from the v0.5.41 stranger run, end to end (FIR-2452).
@@ -5281,11 +5301,16 @@ mod tests {
             "{negative}"
         );
 
-        // Positive control on the same store and the same kind filter: a name
-        // nothing carries matches nothing on its own, so no filter removed
-        // anything and the absence is still certifiable. Without this the fix
-        // would be indistinguishable from marking every kind-filtered answer
-        // uncertain.
+        // Control on the same store and the same kind filter: a name nothing
+        // carries matches nothing on its own, so no filter removed anything and
+        // this gate stays quiet. Without it the fix would be indistinguishable
+        // from firing the name-filter reason on every kind-filtered answer.
+        //
+        // The zero is not certifiable either, since FIR-2496: this store's
+        // observation measures no coverage class, so nothing separates a
+        // declaration the repository lacks from one the extractor never
+        // admitted. What separates the two cases is which reason leads, and that
+        // is what this control now reads.
         let absent = parsed_response(
             &handle_semantic_search(&search_args("zzz_not_a_symbol", Some("method")), &store)
                 .unwrap(),
@@ -5304,8 +5329,18 @@ mod tests {
         )
         .expect("an empty search carries a negative");
         assert_eq!(
-            negative["safe_to_conclude_absent"], true,
-            "a name that matches nothing at all is still a certifiable absence: {negative}"
+            negative["safe_to_conclude_absent"], false,
+            "an unmeasured coverage class stops this zero too: {negative}"
+        );
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            reason.starts_with("absence_coverage_unmeasured"),
+            "a name that matched nothing is limited by the coverage nobody measured, not by a \
+             filter that removed nothing: {negative}"
+        );
+        assert!(
+            !reason.contains("name_filter_narrowed_to_zero"),
+            "no candidate was removed here, so that gate must stay quiet: {negative}"
         );
 
         // And a query that applied no narrowing filter publishes no name-filter
@@ -7630,7 +7665,20 @@ mod tests {
         );
         let response = parsed_response(&annotated);
         assert_eq!(response["negative"]["kind"], "no_neighbors");
-        assert_eq!(response["negative"]["safe_to_conclude_absent"], true);
+        // The promise is that the object arrives and says how far the walk can
+        // be trusted. Since FIR-2496 the answer on this store is that it cannot
+        // certify: the walk publishes an observation that measured no coverage
+        // class, so "isolated" and "never linked" are the same reading of the
+        // same zero, and the flag says so rather than picking one.
+        assert_eq!(response["negative"]["safe_to_conclude_absent"], false);
+        assert!(
+            response["negative"]["trust_reason"]
+                .as_str()
+                .expect("the negative must carry a trust reason")
+                .contains("absence_coverage_unmeasured"),
+            "the reason names the measurement nothing took: {}",
+            response["negative"]
+        );
         assert!(
             response["negative"]["subject"]
                 .as_str()
