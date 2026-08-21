@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use kin_index::{
     FileClassification, FileClassifier, FileEvent, FileWatcher, IndexPipeline, IndexedAny,
@@ -1812,11 +1812,161 @@ async fn park_reconcile_loop(
 /// 4. Projects overlay mutations back to files (overlay -> file)
 ///
 /// The loop runs on a tokio task and shares state through `DaemonState`.
+/// The reconcile loop's one-shot promise that its file watcher exists.
+///
+/// Fired on arming, and fired again on drop if the loop never got that far.
+/// Drop-firing is the whole safety argument for making endpoint publication
+/// wait on it. A loop can end before it ever builds a watcher — filesystem
+/// reconcile switched off, a bare checkout, a watcher the host refused — and a
+/// daemon that waited on a signal none of those paths sends would never publish
+/// its endpoint at all, which is a worse failure than the unobserved window
+/// this exists to close.
+#[derive(Debug)]
+pub struct WatchArmed(Option<tokio::sync::oneshot::Sender<()>>);
+
+impl WatchArmed {
+    pub fn new(signal: tokio::sync::oneshot::Sender<()>) -> Self {
+        Self(Some(signal))
+    }
+
+    /// Report the watch, once. Later calls and the drop below do nothing.
+    fn arm(&mut self) {
+        if let Some(signal) = self.0.take() {
+            let _ = signal.send(());
+        }
+    }
+}
+
+impl Drop for WatchArmed {
+    fn drop(&mut self) {
+        self.arm();
+    }
+}
+
+/// When a startup catch-up should begin, or `None` when no window can be named.
+///
+/// The window opens at the last complete admission this store recorded, because
+/// that is the last moment anything is known to have observed the working copy.
+/// A file watcher only ever reports edits it was alive for, so everything the
+/// host did between one daemon's last admission and the next daemon's watch was
+/// seen by nobody, and nothing replays it. That stretch is the whole of the
+/// "graph is one commit behind the work" complaint, and it is not only a
+/// startup artifact: an idle timeout ends a daemon mid-session and the next
+/// command starts a fresh one.
+///
+/// A store with no marker gets no catch-up. Absent means either never admitted
+/// or admitted by a build older than the marker, and neither supplies a window;
+/// with no lower bound the pass would propose the entire working copy, which is
+/// exactly the sweep startup must not perform. An unreadable marker is the same
+/// answer said louder, so it is logged rather than silently treated as absent.
+fn startup_catch_up_window(state: &DaemonState) -> Option<SystemTime> {
+    match kin_core::last_admission::read(&state.layout) {
+        kin_core::last_admission::LastAdmissionRead::Recorded(recorded) => {
+            let since = unix_instant(recorded.at);
+            info!(
+                since = %recorded.at.to_rfc3339(),
+                "planning a startup catch-up over host paths modified since the last complete \
+                 admission"
+            );
+            Some(since)
+        }
+        kin_core::last_admission::LastAdmissionRead::Absent => {
+            debug!(
+                "no last-admission marker, so no catch-up window can be named; working-copy \
+                 divergence stays projection drift until an explicit seam admits it"
+            );
+            None
+        }
+        kin_core::last_admission::LastAdmissionRead::Unreadable(reason) => {
+            warn!(
+                reason = %reason,
+                "the last-admission marker will not parse, so no catch-up window can be named; \
+                 `kin admit` takes whatever the host changed while nothing was watching"
+            );
+            None
+        }
+    }
+}
+
+/// A UTC instant as a [`SystemTime`], for comparison against host modification
+/// times.
+///
+/// A marker stamped before the epoch clamps to the epoch rather than wrapping.
+/// No real store carries one, and a wrap would silently move the window to the
+/// far future, which is the direction that loses every file.
+fn unix_instant(at: chrono::DateTime<chrono::Utc>) -> SystemTime {
+    let seconds = at.timestamp();
+    if seconds < 0 {
+        return SystemTime::UNIX_EPOCH;
+    }
+    SystemTime::UNIX_EPOCH + Duration::new(seconds as u64, at.timestamp_subsec_nanos())
+}
+
+/// Host events for every path the working copy changed at or after `since`.
+///
+/// Stat-only: the walk that produces this opens nothing and hashes nothing, so
+/// a store whose host did not move since its last admission pays one traversal
+/// and returns an empty list. The events it does return go through the ordinary
+/// tick, so a catch-up path is admitted by the same bounded observation, the
+/// same policy filter and the same compare-and-swap as one the watcher saw.
+/// This plans no transition of its own and publishes nothing.
+///
+/// The bound is inclusive because filesystem modification times are coarse. A
+/// file written in the same second the marker was stamped is re-observed, and
+/// re-observing an unchanged path costs one admission that plans nothing.
+fn plan_catch_up_events(state: &DaemonState, since: SystemTime) -> Result<Vec<FileEvent>> {
+    let working_dir = state.layout.working_dir();
+    let (_, policy) = current_authority_admission(state)?;
+    let previous = state.graph.resolved_tree();
+    let tracked_paths = previous
+        .artifacts_by_path()
+        .map(|artifact| artifact.path.clone())
+        .collect::<Vec<_>>();
+    let graph_only_paths = crate::graph_only_members::members_of(&previous)?;
+    let ignore =
+        kin_index::RepositoryIgnore::load(working_dir).map_err(kin_index::IndexError::from)?;
+    let modified = kin_index::scan_repository_modified_since(
+        working_dir,
+        &ignore,
+        policy.as_ref(),
+        tracked_paths.iter(),
+        graph_only_paths.iter(),
+        since,
+    )
+    .map_err(kin_index::IndexError::from)?;
+    Ok(modified
+        .iter()
+        .filter_map(|path| kin_index::host_path_from_repo_path(working_dir, path).ok())
+        .map(FileEvent::Changed)
+        .collect())
+}
+
 pub async fn run_loop(
     state: Arc<DaemonState>,
     config: LoopConfig,
     cancel: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
+    run_loop_armed(state, config, cancel, None).await
+}
+
+/// Run the loop and report the moment its file watcher exists.
+///
+/// The daemon publishes `.kin/daemon.port` only after this fires, so a client
+/// that finds the endpoint is finding a daemon that is already observing the
+/// working copy. Before this signal existed the endpoint was published first
+/// and the loop was spawned afterwards, so a write landing in between raised no
+/// event and nothing ever replayed it: the graph simply never learned about
+/// that file (FIR-2466).
+pub async fn run_loop_armed(
+    state: Arc<DaemonState>,
+    config: LoopConfig,
+    cancel: tokio::sync::watch::Receiver<bool>,
+    armed: Option<WatchArmed>,
+) -> Result<()> {
+    // Held for the whole body so every early return below still releases the
+    // daemon, through `WatchArmed`'s drop rather than through a call each of
+    // those paths would have to remember.
+    let mut armed = armed;
     if state.filesystem_reconcile_disabled() {
         info!(
             env = DISABLE_FILESYSTEM_RECONCILE_ENV,
@@ -1842,6 +1992,16 @@ pub async fn run_loop(
     }
 
     let watcher = FileWatcher::new(working_dir).map_err(DaemonError::from)?;
+    // Read while the watcher is already reporting and before the endpoint can
+    // be published, so the catch-up window and the watch meet rather than leave
+    // a seam between them. Planning the pass itself is deliberately left to the
+    // first round: the window is fixed here, the walk is not on the path to
+    // publication, and a client finding the port is never waiting on a
+    // traversal.
+    let mut catch_up_owed = startup_catch_up_window(&state);
+    if let Some(armed) = armed.as_mut() {
+        armed.arm();
+    }
     let enrichment_pipeline = IndexPipeline::new();
     // The watcher's running total of host events it could not place inside this
     // repository, as this loop last disclosed it. Held so a standing count is
@@ -1854,16 +2014,21 @@ pub async fn run_loop(
         "reconciliation loop started"
     );
 
-    // Startup deliberately admits nothing. Repository authority is already
-    // complete when the daemon opens it, and the working copy is a derived
-    // view of that authority. Sweeping the working copy here would publish
-    // whatever bytes happen to sit on disk into the repository-v6 workspace
-    // before any command runs, so a command that spawned this daemon would
-    // observe ambiently ingested content as graph-owned workspace state.
-    // Working-copy content crosses the compare-and-swap only through live
-    // watcher-observed edits below and through explicit admission seams such
-    // as `/commands/commit`. Divergence introduced while no daemon was
-    // running stays projection drift until one of those seams admits it.
+    // Startup sweeps nothing. Repository authority is already complete when the
+    // daemon opens it, and the working copy is a derived view of that
+    // authority. Admitting whatever bytes happen to sit on disk would publish
+    // them into the repository-v6 workspace before any command runs, so a
+    // command that spawned this daemon would observe ambiently ingested content
+    // as graph-owned workspace state.
+    //
+    // The one exception is bounded by a clock rather than by taste. A file
+    // watcher reports only the edits it was alive for, so the stretch between
+    // one daemon's last complete admission and the next daemon's watch was
+    // observed by nobody and nothing replays it. `catch_up_owed` above names
+    // that stretch, and the first round below re-observes exactly the paths the
+    // host modified inside it. Everything older is untouched: it predates the
+    // last admission, which already covered it, and divergence with no window
+    // to place it in stays projection drift until an explicit seam admits it.
 
     let interval = Duration::from_millis(config.poll_interval_ms);
     let mut cancel = cancel;
@@ -1955,6 +2120,36 @@ pub async fn run_loop(
         }
 
         sweep_expired_intents(&state).await;
+
+        // The catch-up, owed once and taken on the first round that gets this
+        // far. Enqueued as ordinary host events rather than admitted here, so
+        // every one of them crosses authority through the same bounded
+        // observation, the same policy filter and the same compare-and-swap a
+        // watcher-observed edit does. A pass that fails is logged and dropped:
+        // it is a repair, and retrying it forever would spend a traversal per
+        // round on a store that already has an explicit seam for this.
+        if let Some(since) = catch_up_owed.take() {
+            match plan_catch_up_events(&state, since) {
+                Ok(events) if events.is_empty() => {
+                    debug!("no host path changed since the last complete admission");
+                }
+                Ok(events) => {
+                    info!(
+                        count = events.len(),
+                        "admitting host paths modified since the last complete admission"
+                    );
+                    enqueue_file_events(&mut pending_events, events);
+                }
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "could not plan the startup catch-up, so host content written while \
+                         nothing was watching stays unadmitted until `kin admit` or a commit \
+                         takes it"
+                    );
+                }
+            }
+        }
 
         // Collect retries first and real watcher notifications second. Dedup once per tick,
         // only when something new arrived; a real remove/recreate therefore supersedes a

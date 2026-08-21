@@ -1075,6 +1075,25 @@ pub(crate) fn edge_coverage_degradation_labels(tool: &str, payload: &Value) -> V
 /// `trust_reason` directly. Direct assignment is how a cross-repo topology note
 /// came to overwrite the reason an absence was actually limited by, leaving a
 /// correct verdict beside an unrelated explanation.
+/// Host content on disk that no admission has taken, which no absence claim can
+/// see past.
+///
+/// The store answered from graph truth, and graph truth does not carry these
+/// paths at all. A symbol defined only inside one of them is missing from every
+/// index the query reads, so the answer is right about the graph and wrong about
+/// the repository. That is how `semantic_search` returned
+/// `safe_to_conclude_absent: true` for a function sitting in a 140-line module
+/// on disk, with `durability` in the same payload reading "0 uncommitted"
+/// (FIR-2499).
+///
+/// Silence here is the absence of a reading, never an all-clear: the envelope
+/// carries this object only when the runtime reported that the store is behind,
+/// and a runtime that reported no reconcile block at all is already refused by
+/// the runtime gates above.
+fn unadmitted_host_content_gap(envelope: &Envelope) -> Option<String> {
+    Some(envelope.behind.as_ref()?.limiting_factor())
+}
+
 fn push_gap(trustworthy: &mut bool, trust_reason: &mut String, gap: String) {
     *trust_reason = if *trustworthy {
         gap
@@ -2003,6 +2022,17 @@ pub fn negative_for(
     // if it were.
     if let Some(gap) = absence_coverage_gap(tool, payload) {
         push_gap(&mut trustworthy, &mut trust_reason, gap);
+    }
+
+    // Scoped to answers that actually claim an absence, for the same reason the
+    // cross-repo gate below is. A store being behind bounds what "nothing is
+    // there" can mean; it says nothing about whether the rows a populated answer
+    // did return are real, and applying it there would put a floor under every
+    // answer on every working copy holding one untracked file.
+    if claims_absence {
+        if let Some(gap) = unadmitted_host_content_gap(envelope) {
+            push_gap(&mut trustworthy, &mut trust_reason, gap);
+        }
     }
 
     // Gaps the response carries that this function cannot observe from the
