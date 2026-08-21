@@ -333,6 +333,13 @@ pub struct Degraded {
     /// message and no flag claims it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_killed_by_memory: Option<bool>,
+    /// This store's language-server enrichment has been switched off by the
+    /// sweep circuit, so the producer that would fill missing cross-file
+    /// relations is not running. Set from the store's own tally, which the
+    /// daemon resets when a sweep completes, so it clears itself rather than
+    /// needing a second event to retract it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sweep_suspended: Option<bool>,
 }
 
 impl Degraded {
@@ -345,6 +352,7 @@ impl Degraded {
             self.offline_fallback,
             self.workspace_mismatch,
             self.daemon_killed_by_memory,
+            self.sweep_suspended,
         ]
         .into_iter()
         .any(|flag| flag == Some(true))
@@ -372,6 +380,9 @@ impl Degraded {
         }
         if self.daemon_killed_by_memory == Some(true) {
             labels.push("daemon_killed_by_memory");
+        }
+        if self.sweep_suspended == Some(true) {
+            labels.push("sweep_suspended");
         }
         labels
     }
@@ -1477,6 +1488,28 @@ impl Envelope {
     ) -> Self {
         if record.is_some_and(|record| record.attributed_to_memory()) {
             self.degraded.daemon_killed_by_memory = Some(true);
+        }
+        self
+    }
+
+    /// Stamp that this store's enrichment sweeps have been suspended.
+    ///
+    /// A flag rather than prose because the caller acting on it is an agent
+    /// deciding whether an absence it just measured is authoritative. A missing
+    /// cross-file relation on a suspended store is a gap nothing is working on,
+    /// which is a different answer from a gap a running sweep is about to fill,
+    /// and only a structural signal separates them without parsing a sentence.
+    ///
+    /// Absent rather than `false` when the circuit is closed, for the reason
+    /// every flag here is: `None` says this envelope makes no claim, and a
+    /// fabricated `false` would say the store was checked and found healthy on
+    /// a call that never looked.
+    pub fn with_suspended_sweep(
+        mut self,
+        suspended: Option<&kin_daemon_spawn::SuspendedSweep>,
+    ) -> Self {
+        if suspended.is_some() {
+            self.degraded.sweep_suspended = Some(true);
         }
         self
     }
@@ -3041,6 +3074,51 @@ mod tests {
     /// Only the kernel's own attribution becomes a flag. A client keying on
     /// `daemon_killed_by_memory` must never read it out of a host that
     /// publishes no accounting and therefore never said memory at all.
+    /// The flag is what separates a gap something is working on from a gap
+    /// nothing is, and an agent certifying an absence reads the flag rather
+    /// than the prose. A closed circuit must claim nothing at all, because a
+    /// fabricated `false` says this store was checked and found sweeping on a
+    /// call that never looked.
+    #[test]
+    fn a_suspended_sweep_is_stamped_and_a_running_one_claims_nothing() {
+        let running = Envelope::daemon().with_suspended_sweep(None);
+        assert_eq!(running.degraded.sweep_suspended, None);
+        assert!(!running.degraded.any());
+        assert!(!running
+            .degraded
+            .active_labels()
+            .contains(&"sweep_suspended"));
+
+        let suspended = Envelope::daemon()
+            .with_suspended_sweep(Some(&kin_daemon_spawn::SuspendedSweep { interruptions: 3 }));
+        assert_eq!(suspended.degraded.sweep_suspended, Some(true));
+        assert!(suspended.degraded.any());
+        assert!(suspended
+            .degraded
+            .active_labels()
+            .contains(&"sweep_suspended"));
+    }
+
+    /// Absent rather than `false` on the wire, for the reason every flag in
+    /// this struct is absent when unobserved: a client cannot tell a
+    /// serialized `false` from an answer that looked and found nothing wrong.
+    #[test]
+    fn a_running_sweep_puts_no_key_on_the_wire() {
+        let running = Envelope::daemon().with_suspended_sweep(None);
+        let json = serde_json::to_string(&running.degraded).expect("serialize degraded");
+        assert!(
+            !json.contains("sweep_suspended"),
+            "an unobserved flag is absent, never false: {json}"
+        );
+        let suspended = Envelope::daemon()
+            .with_suspended_sweep(Some(&kin_daemon_spawn::SuspendedSweep { interruptions: 4 }));
+        let json = serde_json::to_string(&suspended.degraded).expect("serialize degraded");
+        assert!(
+            json.contains("\"sweep_suspended\":true"),
+            "an observed suspension is structural: {json}"
+        );
+    }
+
     #[test]
     fn only_a_kernel_attributed_kill_is_stamped_on_the_envelope() {
         let stamped =

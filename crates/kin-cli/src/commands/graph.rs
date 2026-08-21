@@ -909,6 +909,13 @@ fn build_graph_status_response_for_store(
     if let Some(record) = kin_root.and_then(kin_daemon_spawn::read_daemon_kill_record) {
         warnings.push(record.summary());
     }
+    // A suspended sweep is invisible in the same way, and worse: every counter
+    // above reads as work still pending, so a store whose enrichment has been
+    // switched off looks exactly like one that is converging. The producer that
+    // would close the gap is off, and only the store's tally remembers.
+    if let Some(suspended) = kin_root.and_then(kin_daemon_spawn::SuspendedSweep::read) {
+        warnings.push(suspended.summary());
+    }
     if warnings.is_empty() && criticals.is_empty() {
         lines.push(String::new());
         lines.push("✓ No issues detected.".to_string());
