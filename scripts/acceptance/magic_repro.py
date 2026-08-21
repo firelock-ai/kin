@@ -5,10 +5,12 @@
 # Ported from the kin-ecosystem umbrella's bin/kin-magic-repro on 2026-08-21.
 # kin owns this copy from now on, so the suite versions with the product it
 # tests and every pull request runs it against its own build. The umbrella copy
-# is still what bin/kin-parity and the release tooling call; until those become
-# wrappers around this file, a change to either copy has to be reconciled with
-# the other, and the CHECK line format, exit codes, and fixtures are what make
-# that reconciliation mechanical.
+# is still what bin/kin-release-preflight and bin/kin-shipped-gate call; until
+# those become wrappers around this file, a change to either copy has to be
+# reconciled with the other. The CHECK line format, the exit codes, the
+# fixtures, and the `kin-magic-repro:` summary-line prefix are what make that
+# reconciliation mechanical, and kin-shipped-gate parses two of those summary
+# lines by prefix.
 """Falsifiable repro suite for the 2026-08-17 isolation-experiment defects.
 
 Each check builds a fixture, probes the surface the ticket's claim is about, and

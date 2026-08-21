@@ -5,10 +5,12 @@
 # Ported from the kin-ecosystem umbrella's bin/kin-brownfield-repro on
 # 2026-08-21. kin owns this copy from now on, so the suite versions with the
 # product it tests and every pull request runs it against its own build. The
-# umbrella copy is still what bin/kin-parity and the release tooling call;
-# until those become wrappers around this file, a change to either copy has to
-# be reconciled with the other, and the CHECK line format, exit codes, corpus
-# pins, and fixtures are what make that reconciliation mechanical.
+# umbrella copy is still what bin/kin-magic-at-scale imports as a module, for
+# its checks 2 and 3 at real history depth; until that becomes a wrapper around
+# this file, a change to either copy has to be reconciled with the other. The
+# CHECK line format, the exit codes, the corpus pins, the fixtures, and the
+# `kin-brownfield-repro:` summary-line prefix are what make that reconciliation
+# mechanical.
 """NON-CITABLE brownfield acceptance suite for reference enrichment.
 
 Its output is a regression gate, never proof, never investor-facing, and never a
