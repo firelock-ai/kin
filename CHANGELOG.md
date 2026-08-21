@@ -45,6 +45,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Decide the embedding class from the coverage counters, not from a conjunction (#1026)
 - Compare the relation census to the one this store last recorded (#1007)
 - Write the Kin PATH line where a non-interactive zsh reads it (#1037)
+- Refuse to certify an absence over a coverage map that measured nothing (#1043)
+- Cover the sealed-tree and restored-tree allowance derivation sites with fixtures (#1045)
+- Retire projection readers after an admission rollback (#1046)
 
 
 ## [0.5.46] - 2026-08-21
