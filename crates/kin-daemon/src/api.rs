@@ -3510,6 +3510,14 @@ async fn command_graph(
             }),
         );
     let embedding_runtime = graph_status_embedding_runtime(&state, &graph);
+    // Read here rather than inside the renderer, for the reason the freshness
+    // marker is read in the CLI: the record is a property of the store on disk,
+    // and the environment worth auditing is the DAEMON's, because the daemon is
+    // the process that built the graph being reported. Auditing the caller's
+    // environment would name a knob the reader's shell carries and the graph
+    // never saw.
+    let census =
+        kin_core::relation_census::CensusContext::for_layout(&state.layout, std::env::vars());
     let response = kin_cli::commands::graph::execute_graph_command(
         &repository_authority,
         graph.as_ref(),
@@ -3518,6 +3526,7 @@ async fn command_graph(
             .background_work
             .reconcile_report(std::time::Instant::now()),
         &embedding_runtime,
+        &census,
     )
     .map_err(internal_error)?;
     Ok(Json(response))
@@ -4920,6 +4929,16 @@ fn command_commit_after_admission(
     // live graph rather than from the plan, because a plan's `entity_count` is
     // the size of its delta and this is the size of the whole.
     state.record_durable_entity_count(graph.entity_count() as u64);
+    // The relation set just moved and the change is installed, so this is the
+    // baseline the next `kin graph status` compares against. Recorded after the
+    // install rather than from the plan, for the reason the entity count above
+    // is: a plan carries the size of its delta and this is a census of the
+    // whole graph.
+    crate::background_work::record_relation_census(
+        &state.layout,
+        graph,
+        kin_core::relation_census::CensusSource::Commit,
+    );
     state.bump_version();
     state.emit_event(DaemonEvent::GraphRootChanged {
         old_root_hash: None,
@@ -14361,6 +14380,7 @@ mod tests {
             &kin_cli::commands::graph::GraphCommandRequest::Status,
             &Default::default(),
             &runtime,
+            &Default::default(),
         )
         .unwrap();
 

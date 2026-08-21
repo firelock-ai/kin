@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use kin_mcp::handlers::common::presentation_span_lines;
@@ -38,6 +38,15 @@ pub struct GraphCommandResponse {
     /// an older daemon sends none at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reference_edge_coverage: Option<kin_core::reference_coverage::ReferenceEdgeCoverage>,
+    /// The relation-kind census set beside the one this store last recorded.
+    ///
+    /// Carried structurally as well as in `lines` so `kin doctor` reads the
+    /// comparison rather than parsing prose out of a terminal rendering, which
+    /// is how the reference-edge coverage beside it reaches the same surface.
+    /// Optional because a subcommand that compares nothing has none to report
+    /// and an older daemon sends none at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relation_census: Option<kin_core::relation_census::RelationCensusComparison>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -247,10 +256,11 @@ pub fn execute_graph_command(
     request: &GraphCommandRequest,
     reconcile: &crate::commands::resources::ReconcileHealth,
     embedding_runtime: &crate::commands::resources::EmbedRuntimeState,
+    census: &kin_core::relation_census::CensusContext,
 ) -> Result<GraphCommandResponse> {
     match request {
         GraphCommandRequest::Status => {
-            build_graph_status_response(authority, graph, reconcile, embedding_runtime)
+            build_graph_status_response(authority, graph, reconcile, embedding_runtime, census)
         }
         GraphCommandRequest::Validate => build_graph_validate_response(authority, graph),
         GraphCommandRequest::Inspect { name } => build_graph_inspect_response(graph, name),
@@ -310,6 +320,45 @@ fn graph_relation_totals(
     }
 }
 
+/// The relation-kind census, in the one form the durable record and the status
+/// row both read.
+///
+/// Formatting lives here rather than at each call site because the recorded
+/// census and the compared census have to key on the same strings. A record
+/// written as `UsesType` and read as `uses_type` would report every kind as
+/// vanished and every kind as new on the same screen.
+fn kind_census(counts: &HashMap<RelationKind, usize>) -> BTreeMap<String, u64> {
+    counts
+        .iter()
+        .map(|(kind, count)| (format!("{kind:?}"), *count as u64))
+        .collect()
+}
+
+/// Take the entity-rooted relation-kind census of `graph`.
+///
+/// Entity-rooted, and de-duplicated by relation id, because that is exactly
+/// what the `Entity-to-entity relation kinds` line reports: an edge reachable
+/// from both endpoints is one edge. A census taken any other way would compare
+/// a different measurement against the printed one and report movement that
+/// never happened.
+///
+/// Deliberately not `graph_stats()`, which counts the whole relation table and
+/// probes the text and vector indexes once per entity on the way. Those probes
+/// are the cost `kin graph status` is already known for, and the writers of this
+/// record are a sweep and a commit, neither of which should pay it.
+pub fn measure_relation_census(graph: &kin_db::InMemoryGraph) -> Result<BTreeMap<String, u64>> {
+    let mut counts: HashMap<RelationKind, usize> = HashMap::new();
+    let mut seen = HashSet::new();
+    for entity in graph.list_all_entities()? {
+        for relation in graph.get_all_relations_for_entity(&entity.id)? {
+            if seen.insert(relation.id) {
+                *counts.entry(relation.kind).or_insert(0) += 1;
+            }
+        }
+    }
+    Ok(kind_census(&counts))
+}
+
 /// The one line that answers "how much of this repository can I query".
 ///
 /// Pure so both arms are testable without a store. A repository with nothing
@@ -333,6 +382,7 @@ fn build_graph_status_response(
     graph: &kin_db::InMemoryGraph,
     reconcile: &crate::commands::resources::ReconcileHealth,
     embedding_runtime: &crate::commands::resources::EmbedRuntimeState,
+    census: &kin_core::relation_census::CensusContext,
 ) -> Result<GraphCommandResponse> {
     // One sample for every embedding line in this response. The counter below
     // and the health warning used to sample coverage independently, and an
@@ -547,6 +597,20 @@ fn build_graph_status_response(
         "Entity-to-entity relation kinds: {}",
         rel_parts.join(", ")
     ));
+    // The line above is a census, and until this one existed it was compared to
+    // nothing. A store that lost an entire relation kind printed the histogram
+    // that proved it and then printed the all-clear: on the rc0545c run
+    // `UsesType` went 94 to 0 in 36 minutes under `✓ No issues detected.` This
+    // row sits directly beneath the histogram because it is the histogram's
+    // own reading, and it renders in every state, including the two where
+    // nothing can be compared. A row that fell silent when it had no previous
+    // census would be indistinguishable from one reporting a healthy store.
+    let census_comparison = kin_core::relation_census::RelationCensusComparison::build(
+        &census.previous,
+        &kind_census(&relation_counts),
+        census.causes.clone(),
+    );
+    lines.push(census_comparison.summary_line());
 
     // Kind distribution
     let mut kind_pairs: Vec<_> = kind_counts.iter().collect();
@@ -755,6 +819,13 @@ fn build_graph_status_response(
     for reason in reconcile.degraded_reasons() {
         warnings.push(format!("reconcile loop degraded — {reason}"));
     }
+    // Warnings rather than criticals, for the reason stated directly above:
+    // criticals set the response error and would turn `kin graph status`
+    // nonzero for every caller scripting it. A lost relation kind is a real
+    // defect in graph truth and it must withhold the all-clear, which a warning
+    // does; changing an exit code is a separate decision from killing a false
+    // all-clear, and only the second is what this closes.
+    warnings.extend(census_comparison.loss_lines());
     if warnings.is_empty() && criticals.is_empty() {
         lines.push(String::new());
         lines.push("✓ No issues detected.".to_string());
@@ -786,6 +857,7 @@ fn build_graph_status_response(
             .then(|| format!("{} critical graph health issue(s) found", criticals.len())),
         source: None,
         reference_edge_coverage: Some(health.reference_edge_coverage.clone()),
+        relation_census: Some(census_comparison),
     })
 }
 
@@ -978,6 +1050,7 @@ fn build_graph_validate_response(
         error: (!issues.is_empty()).then(|| format!("{} issue(s) found", issues.len())),
         source: None,
         reference_edge_coverage: Some(health.reference_edge_coverage.clone()),
+        relation_census: None,
     })
 }
 
@@ -1001,6 +1074,7 @@ fn build_graph_inspect_response(
             error: Some(format!("no entity found matching '{}'", name)),
             source: None,
             reference_edge_coverage: None,
+            relation_census: None,
         });
     }
 
@@ -1048,6 +1122,7 @@ fn build_graph_inspect_response(
         error: None,
         source: None,
         reference_edge_coverage: None,
+        relation_census: None,
     })
 }
 
@@ -1213,6 +1288,7 @@ pub fn build_graph_source_response(
                 error: None,
                 source: Some(record),
                 reference_edge_coverage: None,
+                relation_census: None,
             })
         }
         EntitySourceOutcome::NotFound(message) => Ok(GraphCommandResponse {
@@ -1220,6 +1296,7 @@ pub fn build_graph_source_response(
             error: Some(message),
             source: None,
             reference_edge_coverage: None,
+            relation_census: None,
         }),
         // A valid entity with no retrievable source is an error for the text/`?`
         // command paths (the CLI `kin graph source` and `trace_data_flow`, which
@@ -1631,6 +1708,159 @@ mod tests {
         (temp, binding, kin_db::InMemoryGraph::new())
     }
 
+    /// The rc0545c case, driven end to end through the record this store
+    /// actually carries.
+    ///
+    /// A census is taken and written for the store, the graph then loses a
+    /// whole relation kind, and status is asked again against the same layout.
+    /// The two arms share one fixture and differ only in whether `UsesType`
+    /// still has an edge, so a pass in the first arm is the control that makes
+    /// the second arm's failure mean something: without it, a build that never
+    /// printed the all-clear at all would read as a pass.
+    #[test]
+    fn a_relation_kind_that_vanished_since_the_recorded_census_refuses_no_issues() {
+        let temp = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(temp.path()).unwrap();
+        let layout = initialized.layout.clone();
+        let binding =
+            kin_core::LocalRepositoryAuthorityBinding::from_layout(&initialized.layout).unwrap();
+
+        let enriched = kin_db::InMemoryGraph::new();
+        let caller = test_entity("run_task");
+        let callee = test_entity("finalize");
+        let typed = test_entity("Payload");
+        for entity in [&caller, &callee, &typed] {
+            enriched.upsert_entity(entity).unwrap();
+        }
+        enriched
+            .upsert_relation(&test_relation(RelationKind::Calls, caller.id, callee.id))
+            .unwrap();
+        enriched
+            .upsert_relation(&test_relation(RelationKind::UsesType, caller.id, typed.id))
+            .unwrap();
+
+        // What a completed sweep records. Taken through the same measurement
+        // the status row compares against, which is the point of the shared
+        // function: a record written by one walk and read by another would
+        // report movement no graph ever made.
+        let recorded = kin_core::relation_census::RelationCensus::new(
+            chrono::Utc::now(),
+            kin_core::relation_census::CensusSource::Sweep,
+            measure_relation_census(&enriched).unwrap(),
+            Vec::new(),
+        );
+        assert_eq!(
+            recorded.kinds.get("UsesType"),
+            Some(&1),
+            "the recorded census holds the kind that is about to be lost: {:?}",
+            recorded.kinds
+        );
+        kin_core::relation_census::write(&layout, &recorded).unwrap();
+
+        // The control. Nothing has been lost yet, so the census row withholds
+        // nothing and the all-clear is reachable.
+        let unchanged = build_graph_status_response(
+            &pinned(&binding),
+            &enriched,
+            &Default::default(),
+            &Default::default(),
+            &kin_core::relation_census::CensusContext::for_layout(
+                &layout,
+                Vec::<(String, String)>::new(),
+            ),
+        )
+        .unwrap();
+        assert!(
+            !unchanged
+                .lines
+                .iter()
+                .any(|line| line.contains("relation kind UsesType")),
+            "an unchanged census reports no loss: {}",
+            unchanged.lines.join("\n")
+        );
+        assert!(
+            unchanged
+                .lines
+                .iter()
+                .any(|line| line.contains("No issues detected")),
+            "the control reaches the all-clear, so its absence below means something: {}",
+            unchanged.lines.join("\n")
+        );
+
+        // The kind is disabled. This is what `KIN_DAEMON_DISABLE_LSP=1` did to
+        // the stranger's store: the edges were re-derived without it.
+        let stripped = kin_db::InMemoryGraph::new();
+        for entity in [&caller, &callee, &typed] {
+            stripped.upsert_entity(entity).unwrap();
+        }
+        stripped
+            .upsert_relation(&test_relation(RelationKind::Calls, caller.id, callee.id))
+            .unwrap();
+
+        let lost = build_graph_status_response(
+            &pinned(&binding),
+            &stripped,
+            &Default::default(),
+            &Default::default(),
+            &kin_core::relation_census::CensusContext::for_layout(
+                &layout,
+                vec![("KIN_DAEMON_DISABLE_LSP".to_string(), "1".to_string())],
+            ),
+        )
+        .unwrap();
+        let rendered = lost.lines.join("\n");
+        assert!(
+            !rendered.contains("No issues detected"),
+            "a store that lost a whole relation kind is not issue-free: {rendered}"
+        );
+        assert!(
+            rendered.contains("UsesType went 1 to 0"),
+            "the loss is named with both counts: {rendered}"
+        );
+        assert!(
+            rendered.contains("KIN_DAEMON_DISABLE_LSP"),
+            "the recorded cause is named beside the loss: {rendered}"
+        );
+        assert!(
+            lost.relation_census
+                .as_ref()
+                .is_some_and(|census| census.reports_loss()),
+            "doctor reads the same verdict structurally rather than by parsing prose"
+        );
+    }
+
+    /// The absent arm, so the row above cannot be trivially true. A store with
+    /// no recorded census says it cannot compare, and says nothing about health.
+    #[test]
+    fn a_store_with_no_recorded_census_says_so_and_still_reaches_the_all_clear() {
+        let (_temp, binding, graph) = graph_validation_fixture();
+        let caller = test_entity("run_task");
+        let callee = test_entity("finalize");
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&callee).unwrap();
+        graph
+            .upsert_relation(&test_relation(RelationKind::Calls, caller.id, callee.id))
+            .unwrap();
+
+        let response = build_graph_status_response(
+            &pinned(&binding),
+            &graph,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
+        let rendered = response.lines.join("\n");
+        assert!(
+            rendered.contains("no previous relation census is recorded"),
+            "the row states what it cannot do: {rendered}"
+        );
+        assert!(
+            rendered.contains("No issues detected"),
+            "an unrecorded census is not an issue: {rendered}"
+        );
+    }
+
     /// The exact reported failure. `kin graph status` on the umbrella store
     /// printed "No issues detected" while the daemon had failed every
     /// whole-tree admission since Aug 6, because every check this command runs
@@ -1657,6 +1887,7 @@ mod tests {
             &graph,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         )
         .unwrap();
         assert!(
@@ -1678,6 +1909,7 @@ mod tests {
                 last_admission_success_age_seconds: Some(172_800),
                 ..Default::default()
             },
+            &Default::default(),
             &Default::default(),
         )
         .unwrap();
@@ -1727,6 +1959,7 @@ mod tests {
                 ..Default::default()
             },
             &Default::default(),
+            &Default::default(),
         )
         .unwrap();
         assert!(
@@ -1768,6 +2001,7 @@ mod tests {
                 last_error_age_seconds: Some(90),
                 ..Default::default()
             },
+            &Default::default(),
             &Default::default(),
         )
         .unwrap();
@@ -1846,6 +2080,7 @@ mod tests {
             &graph,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         )
         .unwrap();
 
@@ -1904,6 +2139,7 @@ mod tests {
         let response = build_graph_status_response(
             &pinned(&binding),
             &graph,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         )
@@ -1966,6 +2202,7 @@ mod tests {
             &graph,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         )
         .unwrap();
 
@@ -2020,6 +2257,7 @@ mod tests {
             &graph,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         )
         .unwrap();
 
@@ -2059,6 +2297,7 @@ mod tests {
         let response = build_graph_status_response(
             &pinned(&binding),
             &graph,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         )
@@ -2271,6 +2510,7 @@ mod tests {
                 embedding_coverage_ever_complete: true,
                 ..Default::default()
             },
+            &Default::default(),
         )
         .unwrap();
         let embeddings_line = no_sidecar
@@ -2321,6 +2561,7 @@ mod tests {
             &graph,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         )
         .unwrap();
         let first_fill_line = first_fill
@@ -2364,6 +2605,7 @@ mod tests {
                 embed_persistence_unavailable: true,
                 ..Default::default()
             },
+            &Default::default(),
         )
         .unwrap();
         let embeddings_line = remote
@@ -2411,6 +2653,7 @@ mod tests {
                 embedding_coverage_ever_complete: true,
                 ..Default::default()
             },
+            &Default::default(),
         )
         .unwrap();
         let embeddings_line = discarded
@@ -2457,6 +2700,7 @@ mod tests {
                 embedding_coverage_ever_complete: true,
                 ..Default::default()
             },
+            &Default::default(),
         )
         .unwrap();
         assert!(
@@ -2639,6 +2883,7 @@ mod tests {
                 model_fetch: kin_cli_model_fetch(137 * 1024 * 1024, true),
                 ..Default::default()
             },
+            &Default::default(),
         )
         .unwrap();
         let embeddings_line = downloading
@@ -2665,6 +2910,7 @@ mod tests {
                 model_fetch: kin_cli_model_fetch(0, false),
                 ..Default::default()
             },
+            &Default::default(),
         )
         .unwrap();
         let cached_line = cached
@@ -2714,6 +2960,7 @@ mod tests {
             &graph,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         )
         .unwrap();
 
@@ -2751,6 +2998,7 @@ mod tests {
         let response = build_graph_status_response(
             &pinned(&binding),
             &graph,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         )
@@ -3732,6 +3980,7 @@ mod tests {
         let status = build_graph_status_response(
             &pinned(&binding),
             &graph,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         )

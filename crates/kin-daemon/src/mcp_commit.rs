@@ -2219,6 +2219,15 @@ fn finalize_committed_transaction(
             &carried_pending_files,
         )
     })?;
+    // The second commit path, recorded for the same reason the first one is.
+    // An agent that only ever writes through MCP would otherwise leave the
+    // store's census frozen at whatever the last CLI commit or sweep left, and
+    // every comparison after that would span a window nobody can date.
+    crate::background_work::record_relation_census(
+        &state.layout,
+        state.graph.as_ref(),
+        kin_core::relation_census::CensusSource::Commit,
+    );
 
     let observed_generation = state.snapshot_generation.load(Ordering::SeqCst);
     if observed_generation < committed.receipt.generation {

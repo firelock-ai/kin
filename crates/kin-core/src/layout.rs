@@ -146,6 +146,21 @@ impl KinLayout {
         self.kindb_dir().join("last-admission")
     }
 
+    /// `.kin/kindb/relation-census` — the relation-kind histogram as it stood
+    /// when the graph's relations were last settled.
+    ///
+    /// Durable rather than in-process for the same reason the last-admission
+    /// marker beside it is: a census is only interpretable against the census
+    /// before it, and an in-memory one dies with the daemon that took it. It is
+    /// written where relations actually change, at the end of a completed
+    /// enrichment sweep and at the end of a commit, and never on a read path.
+    /// Stamping it from `graph status` would make every reading compare against
+    /// the reading before it, so a store that lost a whole relation kind would
+    /// announce the loss once and then report itself clean forever.
+    pub fn kindb_relation_census_path(&self) -> PathBuf {
+        self.kindb_dir().join("relation-census")
+    }
+
     /// `.kin/kindb/graph.kvec` — persisted vector index aligned with the snapshot.
     pub fn kindb_vector_index_path(&self) -> PathBuf {
         self.kindb_snapshot_path().with_extension("kvec")
