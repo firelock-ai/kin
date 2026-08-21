@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Make kin doctor --fix honest about the repairs it could not make (#1013)
+- Bound what an LSP sweep holds, and stop a re-sweep rewriting what the graph already has (#1015)
+- Let the release train own a region of its PR body, not the whole message (#1011)
+- Read a member that exited mid-classification as contained, and scale the settle by load (#1012)
+- Document a registration and an install a stranger can actually run (#1014)
 
 
 ## [0.5.46] - 2026-08-21
