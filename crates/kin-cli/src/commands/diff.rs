@@ -633,8 +633,42 @@ pub fn run(base: Option<String>, head: Option<String>, json: bool) -> Result<()>
         for line in render_lines(&report) {
             println!("{line}");
         }
+        println!("{}", admitted_scope_line(&layout));
     }
     Ok(())
+}
+
+/// What this diff does not cover, and when the graph last caught up.
+///
+/// Both endpoints are admitted authority, so a file the working copy holds and
+/// no admission has taken contributes nothing to either side and the summary
+/// reads `+0 ~0 -0`. That answer is exactly right about authority and reads as
+/// "nothing changed" to anyone who just wrote a file, which is how a session
+/// concluded the graph could not see its own new module (FIR-2499). Naming the
+/// scope beside the counts is what tells those two apart.
+///
+/// The clock comes from the durable last-admission marker rather than from a
+/// daemon, because this command talks to none. That bounds what it can say: it
+/// reports WHEN the graph last caught up, never HOW MANY host paths are
+/// outstanding, which needs the daemon's own reconcile reading.
+fn admitted_scope_line(layout: &kin_core::KinLayout) -> String {
+    let scope = "Admitted scope: both endpoints are admitted repository authority, so host \
+                 content no admission has taken appears on neither side";
+    match kin_core::last_admission::read(layout) {
+        kin_core::last_admission::LastAdmissionRead::Recorded(recorded) => format!(
+            "{scope}; graph truth was last admitted at {} over {} artifact(s).",
+            recorded.at.to_rfc3339(),
+            recorded.tracked_artifacts
+        ),
+        kin_core::last_admission::LastAdmissionRead::Absent => format!(
+            "{scope}; this store records no complete admission, so how far it is behind is \
+             unknown. `kin admit` takes what the working copy holds."
+        ),
+        kin_core::last_admission::LastAdmissionRead::Unreadable(reason) => format!(
+            "{scope}; the last-admission marker will not parse ({reason}), so how far this store \
+             is behind is unknown. `kin admit` takes what the working copy holds."
+        ),
+    }
 }
 
 pub fn build_diff_response(

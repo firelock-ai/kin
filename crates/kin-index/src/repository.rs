@@ -43,6 +43,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
+use std::time::SystemTime;
 
 use kin_model::RepoPath;
 use sha2::{Digest, Sha256};
@@ -860,6 +861,45 @@ pub fn scan_repository_preserving_graph_only<'a>(
     tracked_paths: impl IntoIterator<Item = &'a RepoPath>,
     graph_only_paths: impl IntoIterator<Item = &'a RepoPath>,
 ) -> Result<CompleteRepositoryScan, IncompleteRepositoryScan> {
+    let mut scanner = prepare_scanner(
+        root,
+        ignore,
+        policy,
+        tracked_paths,
+        graph_only_paths,
+        ScanMode::Content,
+    )?;
+    scanner.walk(root, false, true)?;
+    scanner.diagnostics.admitted_entries = scanner.entries.len();
+    scanner.diagnostics.graph_only_entries_preserved = scanner.graph_only_paths.len();
+    scanner.diagnostics.ignored_tracked_entries_unverified = scanner.unverified_ignored_paths.len();
+    Ok(CompleteRepositoryScan {
+        entries: scanner.entries,
+        graph_only_paths: scanner.graph_only_paths,
+        unverified_ignored_paths: scanner.unverified_ignored_paths,
+        policy_excluded_sample: scanner.policy_excluded_sample,
+        diagnostics: scanner.diagnostics,
+        completion: CompleteScanToken { _private: () },
+    })
+}
+
+/// How many policy-excluded paths one walk names outright. See
+/// [`CompleteRepositoryScan::policy_excluded_paths_sample`].
+const POLICY_EXCLUDED_SAMPLE_LIMIT: usize = 8;
+
+/// Validate the scan baseline and build the walker both modes share.
+///
+/// Extracted so a stat-only pass cannot acquire its own idea of which paths are
+/// tracked, which are graph-only, and which the rules already excluded before
+/// the walk begins.
+fn prepare_scanner<'a, 'b>(
+    root: &'b Path,
+    ignore: &'b RepositoryIgnore,
+    policy: Option<&'b ResolvedAdmissionMatcher>,
+    tracked_paths: impl IntoIterator<Item = &'a RepoPath>,
+    graph_only_paths: impl IntoIterator<Item = &'a RepoPath>,
+    mode: ScanMode,
+) -> Result<Scanner<'b>, IncompleteRepositoryScan> {
     let tracked_paths = tracked_paths.into_iter().cloned().collect::<BTreeSet<_>>();
     let graph_only_paths = graph_only_paths
         .into_iter()
@@ -882,7 +922,7 @@ pub fn scan_repository_preserving_graph_only<'a>(
     let (unverified_ignored_paths, tracked_paths): (BTreeSet<_>, BTreeSet<_>) = tracked_paths
         .into_iter()
         .partition(|path| ignore.matches(path) && !graph_only_paths.contains(path));
-    let mut scanner = Scanner {
+    Ok(Scanner {
         root,
         ignore,
         policy,
@@ -892,24 +932,90 @@ pub fn scan_repository_preserving_graph_only<'a>(
         policy_excluded_sample: Vec::new(),
         entries: BTreeMap::new(),
         diagnostics: RepositoryScanDiagnostics::default(),
-    };
-    scanner.walk(root, false)?;
-    scanner.diagnostics.admitted_entries = scanner.entries.len();
-    scanner.diagnostics.graph_only_entries_preserved = scanner.graph_only_paths.len();
-    scanner.diagnostics.ignored_tracked_entries_unverified = scanner.unverified_ignored_paths.len();
-    Ok(CompleteRepositoryScan {
-        entries: scanner.entries,
-        graph_only_paths: scanner.graph_only_paths,
-        unverified_ignored_paths: scanner.unverified_ignored_paths,
-        policy_excluded_sample: scanner.policy_excluded_sample,
-        diagnostics: scanner.diagnostics,
-        completion: CompleteScanToken { _private: () },
+        mode,
+        modified: Vec::new(),
     })
 }
 
-/// How many policy-excluded paths one walk names outright. See
-/// [`CompleteRepositoryScan::policy_excluded_paths_sample`].
-const POLICY_EXCLUDED_SAMPLE_LIMIT: usize = 8;
+/// What a repository walk does when it reaches a leaf it may admit.
+///
+/// The two modes share every exclusion rule and differ only in what they do
+/// once a leaf survives them. Sharing the walk is the point: a second traversal
+/// written beside this one would decide membership by its own rules, and the
+/// two would drift the first time an exclusion changed.
+#[derive(Debug, Clone, Copy)]
+enum ScanMode {
+    /// Read and hash every admissible leaf, producing byte-exact entries and a
+    /// completion proof.
+    Content,
+    /// Stat every admissible leaf and keep only the paths whose directory entry
+    /// was last modified at or after this instant. Opens nothing, hashes
+    /// nothing, and produces no completion proof, because it observed no
+    /// content and must never be mistaken for a walk that did. Narrower than
+    /// [`ScanMode::Content`] by two rules: a tracked path is never kept, and
+    /// neither is a leaf inside a directory graph truth has never met.
+    ModifiedSince(SystemTime),
+}
+
+/// Repository paths whose host entry was last modified at or after `since`.
+///
+/// This is the cheap half of catching a graph up after a stretch with nobody
+/// watching. A daemon that starts holds authority that is complete as of its
+/// last admission and no evidence at all about what the host did afterwards,
+/// and the file watcher can only report edits it was alive for. Walking with
+/// the same rules the content scan uses, and stopping at the directory entry's
+/// modification time, names exactly the paths worth re-observing without
+/// reading a byte of the ones that did not move.
+///
+/// A leaf whose modification time will not read counts as modified. The window
+/// exists to find work the graph missed, so losing a file is the worse error;
+/// re-observing an unchanged path costs one admission that plans nothing.
+///
+/// What this names is bounded on both sides. Below, by `since`, so the pass is
+/// never a whole-working-copy sweep. Across, by two rules the content walk does
+/// not apply: a path graph truth already tracks stays projection drift for
+/// `kin doctor` to report and repair rather than being admitted from under it,
+/// and a leaf inside a directory graph truth has never met is left to the
+/// behind disclosure and to `kin admit`, because a directory arriving whole is
+/// a move or a clone and its entries carry fresh modification times whatever
+/// their content's age.
+///
+/// A leaf that vanished between the directory read and the stat is left out. It
+/// is not there to admit, and if it comes back the watcher that is already
+/// armed reports its arrival.
+pub fn scan_repository_modified_since<'a>(
+    root: &Path,
+    ignore: &RepositoryIgnore,
+    policy: Option<&ResolvedAdmissionMatcher>,
+    tracked_paths: impl IntoIterator<Item = &'a RepoPath>,
+    graph_only_paths: impl IntoIterator<Item = &'a RepoPath>,
+    since: SystemTime,
+) -> Result<Vec<RepoPath>, IncompleteRepositoryScan> {
+    let mut scanner = prepare_scanner(
+        root,
+        ignore,
+        policy,
+        tracked_paths,
+        graph_only_paths,
+        ScanMode::ModifiedSince(since),
+    )?;
+    scanner.walk(root, false, true)?;
+    Ok(scanner.modified)
+}
+
+/// Was this directory entry last modified at or after `since`?
+///
+/// `None` means the entry is no longer there. An unreadable modification time
+/// reads as modified, which is the direction that cannot lose a file.
+fn host_entry_modified_since(path: &Path, since: SystemTime) -> io::Result<Option<bool>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(
+            metadata.modified().map(|at| at >= since).unwrap_or(true),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
 
 struct Scanner<'a> {
     root: &'a Path,
@@ -921,6 +1027,9 @@ struct Scanner<'a> {
     policy_excluded_sample: Vec<RepoPath>,
     entries: BTreeMap<RepoPath, ScannedRepositoryEntry>,
     diagnostics: RepositoryScanDiagnostics,
+    mode: ScanMode,
+    /// Paths [`ScanMode::ModifiedSince`] kept. Empty in every other mode.
+    modified: Vec<RepoPath>,
 }
 
 impl Scanner<'_> {
@@ -987,6 +1096,7 @@ impl Scanner<'_> {
         &mut self,
         directory: &Path,
         within_excluded_environment: bool,
+        directory_known_to_graph: bool,
     ) -> Result<(), IncompleteRepositoryScan> {
         self.diagnostics.directories_visited += 1;
         let entries = fs::read_dir(directory)
@@ -1050,6 +1160,7 @@ impl Scanner<'_> {
                 self.walk(
                     &host_path,
                     within_excluded_environment || excluded_environment,
+                    holds_tracked,
                 )?;
                 continue;
             }
@@ -1086,6 +1197,56 @@ impl Scanner<'_> {
             if !self.tracked_paths.contains(&repo_path)
                 && self.policy_excludes_untracked(&repo_path, false)
             {
+                continue;
+            }
+
+            // A stat-only pass stops here. Every exclusion above has already
+            // run, so what it keeps is exactly what a content walk would have
+            // admitted, minus the reads. Restricted to the two leaf kinds the
+            // content walk admits so this mode invents no membership of its
+            // own: a special entry is not admissible either way.
+            if let ScanMode::ModifiedSince(since) = self.mode {
+                // Two narrowings this mode applies and the content walk does
+                // not, because the two modes answer different questions. A
+                // content walk states what the working copy holds. This mode
+                // proposes what a daemon should re-observe after a stretch
+                // nobody watched, and a proposal is admitted with no operator
+                // in the loop, so it may only reach the population where
+                // admitting is the safe direction.
+                //
+                // A path graph truth already tracks is never proposed.
+                // Repository authority holds bytes for it, so a host edit to it
+                // is projection drift: `kin doctor --drift` reports it, `kin
+                // doctor --heal` restores it from authority and `kin admit`
+                // takes it, and each of those is a seam somebody chose.
+                // Proposing it here would instead advance the workspace over
+                // graph-owned content at daemon start, behind the back of the
+                // report an operator is about to read.
+                //
+                // A leaf inside a directory graph truth has never met is not
+                // proposed either. One file appearing beside files the graph
+                // already tracks is an edit to a part of the tree the graph
+                // knows; a directory nobody has ever admitted, arriving whole,
+                // is a clone, a move, an unpacked archive or a renamed control
+                // directory, and modification times cannot tell those from
+                // authored work because a move restamps every entry it carries.
+                // Admitting one silently at startup is the working-copy sweep
+                // startup must never perform. Nothing is lost by declining:
+                // that content is exactly what the behind disclosure counts and
+                // names, so it is announced rather than hidden, and `kin admit`
+                // is the seam that takes it.
+                if self.tracked_paths.contains(&repo_path) || !directory_known_to_graph {
+                    continue;
+                }
+                if file_type.is_file() || file_type.is_symlink() {
+                    let modified =
+                        host_entry_modified_since(&host_path, since).map_err(|error| {
+                            self.fail(&host_path, "read entry modification time", error)
+                        })?;
+                    if modified == Some(true) {
+                        self.modified.push(repo_path);
+                    }
+                }
                 continue;
             }
 
@@ -2171,6 +2332,8 @@ mod tests {
             policy_excluded_sample: Vec::new(),
             entries: BTreeMap::new(),
             diagnostics: RepositoryScanDiagnostics::default(),
+            mode: ScanMode::Content,
+            modified: Vec::new(),
         };
 
         let error = scanner
@@ -2360,6 +2523,8 @@ mod tests {
             policy_excluded_sample: Vec::new(),
             entries: BTreeMap::new(),
             diagnostics: RepositoryScanDiagnostics::default(),
+            mode: ScanMode::Content,
+            modified: Vec::new(),
         };
 
         let error = scanner
