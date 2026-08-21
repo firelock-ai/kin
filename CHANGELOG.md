@@ -42,6 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Record the complete admission init conversion and stash perform, and fetch doctor's graph status once per run (#1040)
 - Roll a refused admission back instead of leaving the derived graph ahead of authority (#1041)
 - Add the profiling layer to the logging stack instead of replacing it (#1042)
+- Decide the embedding class from the coverage counters, not from a conjunction (#1026)
 
 
 ## [0.5.46] - 2026-08-21
