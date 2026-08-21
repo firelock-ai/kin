@@ -3843,6 +3843,25 @@ async fn drain_handles(
 ) {
     let drain_timeout = Duration::from_secs(10);
     info!("draining task handles before cleanup...");
+
+    // Persistence drains on its own budget, and before the rest.
+    //
+    // It used to share the ten seconds below with six other tasks, and it is the
+    // only one that can need minutes: its shutdown arm performs the final
+    // flush, and a flush IS the publication, so a store with pending work
+    // cannot become durable in ten seconds. Measured on a converted psf/requests
+    // store (6491 commits), flushes completed at 96245, 96636 and 107496 ms
+    // against that ten-second drain, and the daemon logged only that "one or
+    // more daemon tasks did not stop within 10s", which reads as a slow
+    // shutdown rather than as discarded durability.
+    //
+    // A longer budget costs an idle daemon nothing. The persistence task's
+    // shutdown arm returns immediately when the graph is not dirty, so this is
+    // a ceiling on waiting rather than an amount of waiting: time is spent here
+    // only when there is work to lose, which is exactly when spending it is
+    // right.
+    let persistence = drain_persistence(persist_handle, shutdown_flush_budget()).await;
+
     let mut drain_tasks = Vec::new();
 
     macro_rules! join_or_warn {
@@ -3863,7 +3882,6 @@ async fn drain_handles(
     join_or_warn!("sweeper", sweep_handle);
     join_or_warn!("embedding", embed_handle);
     join_or_warn!("idle-monitor", idle_handle);
-    join_or_warn!("persistence", persist_handle);
     join_or_warn!("supervisor-registration", supervisor_handle);
 
     if tokio::time::timeout(drain_timeout, async {
@@ -3874,7 +3892,69 @@ async fn drain_handles(
     .await
     .is_err()
     {
-        warn!("one or more daemon tasks did not stop within 10s, proceeding");
+        warn!(
+            drain_timeout_s = drain_timeout.as_secs(),
+            "one or more daemon tasks did not stop within the drain budget, proceeding. \
+             Persistence is not among them; it drains separately and reported above."
+        );
+    }
+    if persistence == PersistenceDrain::Abandoned {
+        // Named, because the generic drain warning above is what hid this. A
+        // reader must be able to tell "a task was slow to stop" from "durable
+        // work was discarded", and only one of those is data loss.
+        warn!(
+            budget_s = shutdown_flush_budget().as_secs(),
+            "the final persistence flush did not finish within its shutdown budget and was \
+             abandoned; graph mutations it had not yet published are NOT durable and will be \
+             re-derived or lost. Raise KIN_DAEMON_SHUTDOWN_FLUSH_SECS if this store needs longer."
+        );
+    }
+}
+
+/// How long shutdown waits for the final persistence flush.
+///
+/// Generous by default because the cost is bounded by the work outstanding: an
+/// idle daemon's persistence arm returns at once and never touches this budget.
+/// Measured flushes on a converted psf/requests store ran 96 to 108 seconds, so
+/// a ten-second drain could not have completed one, and five minutes clears them
+/// with room while still bounding a pathological case rather than hanging.
+fn shutdown_flush_budget() -> Duration {
+    duration_from_env_secs("KIN_DAEMON_SHUTDOWN_FLUSH_SECS", Duration::from_secs(300))
+}
+
+/// What became of the persistence task during shutdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistenceDrain {
+    /// No persistence task was running.
+    NotRunning,
+    /// It finished within its budget; whatever it was flushing is durable.
+    Completed,
+    /// It outlived its budget and shutdown proceeded without it.
+    Abandoned,
+}
+
+/// Wait for the persistence task, bounded, and report which happened.
+///
+/// Split out so the budget's behaviour can be tested in both directions: that a
+/// flush finishing inside the budget is not delayed by it, and that one
+/// outliving it returns at the budget rather than hanging shutdown forever.
+async fn drain_persistence(
+    handle: Option<tokio::task::JoinHandle<()>>,
+    budget: Duration,
+) -> PersistenceDrain {
+    let Some(handle) = handle else {
+        return PersistenceDrain::NotRunning;
+    };
+    match tokio::time::timeout(budget, handle).await {
+        Ok(Ok(())) => {
+            info!(task = "persistence", "task drained");
+            PersistenceDrain::Completed
+        }
+        Ok(Err(error)) => {
+            warn!(task = "persistence", %error, "task panicked during drain");
+            PersistenceDrain::Abandoned
+        }
+        Err(_) => PersistenceDrain::Abandoned,
     }
 }
 
@@ -4684,6 +4764,58 @@ mod tests {
             !super::file_already_enriched(&state, never_reached),
             "a file the sweep never reached must NOT be recorded, or the next sweep skips a \
              file that was never enriched"
+        );
+    }
+
+    /// A flush that outlives its budget is ABANDONED, and shutdown proceeds.
+    ///
+    /// The loss half of the defect: the persistence task's shutdown arm performs
+    /// the final flush, a flush is the publication, and on a converted
+    /// psf/requests store those ran 96 to 108 seconds against a ten-second drain
+    /// shared with six other tasks. Shutdown must still end rather than hang, so
+    /// the budget is a ceiling; what changes is that the outcome is now named
+    /// instead of hidden inside a generic drain warning.
+    #[tokio::test]
+    async fn a_flush_outliving_its_budget_is_reported_abandoned() {
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let started = std::time::Instant::now();
+        let outcome = super::drain_persistence(Some(handle), Duration::from_millis(80)).await;
+        assert_eq!(
+            outcome,
+            super::PersistenceDrain::Abandoned,
+            "a flush that outlives its budget must be reported as abandoned, because a reader \
+             has to tell discarded durability from a merely slow task"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "shutdown must proceed at the budget rather than wait the flush out forever"
+        );
+    }
+
+    /// The other direction, and the one that keeps the fix from overcorrecting.
+    ///
+    /// An idle daemon's persistence arm returns at once, because its shutdown
+    /// path skips the flush when nothing is dirty. A generous budget must
+    /// therefore cost such a shutdown NOTHING: it is a ceiling on waiting, not
+    /// an amount of waiting. A fix that made every shutdown sit out a full flush
+    /// window would be worse than the bug it replaced.
+    #[tokio::test]
+    async fn a_fast_shutdown_is_not_delayed_by_a_generous_budget() {
+        let handle = tokio::spawn(async {});
+        let started = std::time::Instant::now();
+        let outcome = super::drain_persistence(Some(handle), Duration::from_secs(300)).await;
+        assert_eq!(outcome, super::PersistenceDrain::Completed);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a persistence task with nothing to flush must return at once, however large the \
+             budget is"
+        );
+        assert_eq!(
+            super::drain_persistence(None, Duration::from_secs(300)).await,
+            super::PersistenceDrain::NotRunning,
+            "no persistence task at all is not an abandonment"
         );
     }
 
