@@ -942,6 +942,32 @@ fn resolve_one_file(
                     .map(|id| is_class_like(ctx.entity_kind_by_id.get(id)))
                     .unwrap_or(false);
                 if owner_is_class {
+                    // (a2a) The owner half came from the receiver's DECLARED
+                    // type and that type names a class right here, so the
+                    // method the class declares is the destination the source
+                    // wrote down. The inheritance walk below starts at the
+                    // bases on the documented assumption that an earlier tier
+                    // already gave a same-file own method its win, and for a
+                    // receiver-typed call none did: tier (a) passes over the
+                    // same-file entity precisely because the receiver is an
+                    // object. Without this tier the call reaches nothing able
+                    // to look inside its own file — (b), (c) and (c4) are
+                    // skipped for an object receiver and (c2) drops same-file
+                    // candidates — and `ingest_directory(database: Database)`
+                    // calling `database.upsert_note()` in the file that
+                    // declares `Database` produced no edge at all.
+                    if rel.receiver.is_some() {
+                        if let Some(dst_id) =
+                            resolve_own_method(&file.file_path, owner, method, ctx)
+                        {
+                            accumulate_relation(
+                                &mut resolved,
+                                &mut relation_indices,
+                                make_relation(rel, src_id, dst_id, RECEIVER_TYPE_CONFIDENCE),
+                            );
+                            continue;
+                        }
+                    }
                     if let Some(dst_id) =
                         resolve_inherited_method(&file.file_path, owner, method, ctx)
                     {
@@ -2568,10 +2594,29 @@ fn locate_base_class(
 ///
 /// [`resolve_inherited_method`] deliberately starts at the class's bases: its
 /// caller has already given a same-file own method its win. A call bound
-/// through the receiver's declared type has had no such tier, because the owner
-/// is usually defined in another file, so it asks for the class's own method
-/// first and walks the hierarchy only when the class does not declare it.
+/// through the receiver's declared type has had no such tier, because tier (a)
+/// passes over the same-file entity whenever the receiver is an object, so it
+/// asks for the class's own method first and walks the hierarchy only when the
+/// class does not declare it.
 fn resolve_declared_method(
+    owner_file: &str,
+    owner_class: &str,
+    method: &str,
+    ctx: &LinkContext<'_>,
+) -> Option<EntityId> {
+    resolve_own_method(owner_file, owner_class, method, ctx)
+        .or_else(|| resolve_inherited_method(owner_file, owner_class, method, ctx))
+}
+
+/// The method entity `owner_class` declares under its own name in
+/// `owner_file`, with no ancestor consulted.
+///
+/// The lookup is keyed on the class-qualified entity name (`Class.method` or
+/// `Class::method`), so a free function in the same file that happens to share
+/// the method's leaf name is not a candidate here. That is what lets a
+/// receiver-typed call ask a same-file class for its own method without
+/// reopening the decoy tier (a) refuses.
+fn resolve_own_method(
     owner_file: &str,
     owner_class: &str,
     method: &str,
@@ -2584,7 +2629,6 @@ fn resolve_declared_method(
                 .get(&(owner_file, key.as_str()))
                 .copied()
         })
-        .or_else(|| resolve_inherited_method(owner_file, owner_class, method, ctx))
 }
 
 /// The incremental mirror of [`resolve_declared_method`].
@@ -2596,6 +2640,25 @@ fn resolve_declared_method_incremental(
     import_map: &HashMap<&str, HashMap<&str, (&str, &str)>>,
     class_bases: &HashMap<String, Vec<(String, Vec<String>)>>,
 ) -> Option<EntityId> {
+    resolve_own_method_incremental(owner_file, owner_class, method, linker).or_else(|| {
+        resolve_inherited_method_incremental(
+            owner_file,
+            owner_class,
+            method,
+            linker,
+            import_map,
+            class_bases,
+        )
+    })
+}
+
+/// The incremental mirror of [`resolve_own_method`].
+fn resolve_own_method_incremental(
+    owner_file: &str,
+    owner_class: &str,
+    method: &str,
+    linker: &IncrementalLinker,
+) -> Option<EntityId> {
     receiver_method_keys(owner_class, method)
         .iter()
         .find_map(|key| {
@@ -2604,16 +2667,6 @@ fn resolve_declared_method_incremental(
                 .get(owner_file)
                 .and_then(|by_name| by_name.get(key.as_str()))
                 .copied()
-        })
-        .or_else(|| {
-            resolve_inherited_method_incremental(
-                owner_file,
-                owner_class,
-                method,
-                linker,
-                import_map,
-                class_bases,
-            )
         })
 }
 
@@ -5663,6 +5716,24 @@ fn resolve_one_file_incremental(
                     .map(|id| is_class_like(linker.entity_kind_by_id.get(id)))
                     .unwrap_or(false);
                 if owner_is_class {
+                    // (a2a) mirrors the batch linker: a receiver whose
+                    // declared type names a class in this very file binds to
+                    // that class's own method, which the bases-first walk
+                    // below never consults and no later tier can reach for an
+                    // object receiver. A live edit must resolve this call the
+                    // same way a cold index does.
+                    if rel.receiver.is_some() {
+                        if let Some(dst_id) =
+                            resolve_own_method_incremental(&file.file_path, owner, method, linker)
+                        {
+                            accumulate_relation(
+                                &mut resolved,
+                                &mut relation_indices,
+                                make_relation(rel, src_id, dst_id, RECEIVER_TYPE_CONFIDENCE),
+                            );
+                            continue;
+                        }
+                    }
                     if let Some(dst_id) = resolve_inherited_method_incremental(
                         &file.file_path,
                         owner,
