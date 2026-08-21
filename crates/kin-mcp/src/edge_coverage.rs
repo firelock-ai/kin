@@ -430,6 +430,51 @@ pub fn languages_of(entities: &[Entity]) -> Vec<LanguageId> {
 /// of its own: Kin mints no entity-level `Imports` edge, so a rule that waited
 /// for every requested class would never skip a scan and would report every
 /// answer on every healthy graph as short of coverage.
+/// [`deciding_classes_all_present`], asked of a PUBLISHED observation.
+///
+/// The private form above reads the scan's own working state and decides
+/// whether a scan is still needed. This form reads the object that scan
+/// published, so a producer that has to state a per-hop fact ("is this empty
+/// read a leaf, or a graph that could not have held the hop") reaches the same
+/// verdict [`crate::negative::absence_coverage_gap`] will reach over the same
+/// payload. Two rules for one question is exactly how a chain came to say
+/// `truncated: false` beside an envelope saying coverage was never reported.
+///
+/// A missing or malformed observation is `false`: unmeasured coverage is the
+/// unknown case, not the healthy one, which is the reading the whole module
+/// already takes.
+pub fn deciding_classes_observed_present(observation: &Value) -> bool {
+    let Some(observation) = observation.as_object() else {
+        return false;
+    };
+    let requested: Vec<String> = observation
+        .get("requested_classes")
+        .and_then(Value::as_array)
+        .map(|classes| {
+            classes
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let references_producible = observation
+        .get("reference_enrichment")
+        .and_then(Value::as_str)
+        == Some("available");
+    let deciding = crate::negative::deciding_classes(&requested, references_producible);
+    if deciding.is_empty() {
+        return false;
+    }
+    let states = observation.get("classes").and_then(Value::as_object);
+    deciding.iter().all(|class| {
+        states
+            .and_then(|states| states.get(class.as_str()))
+            .and_then(Value::as_str)
+            == Some("present")
+    })
+}
+
 fn deciding_classes_all_present(
     merged: &[(RelationKind, ClassState)],
     references_producible: bool,
@@ -1261,5 +1306,74 @@ mod tests {
         let coverage =
             observe_cross_file_reference_coverage(&store, &first, &[RelationKind::Calls]);
         assert_eq!(coverage["classes"]["calls"], json!("absent"));
+    }
+
+    /// The published form and the private form must reach the same verdict over
+    /// the same store, or a per-hop terminal and the response-level gate can
+    /// disagree inside one payload.
+    #[test]
+    fn the_published_verdict_matches_the_scan_that_produced_it() {
+        let store = InMemoryGraph::new();
+        let caller = entity("outer", "nk/a.py", LanguageId::Python);
+        let callee = entity("inner", "nk/b.py", LanguageId::Python);
+        store.upsert_entity(&caller).unwrap();
+        store.upsert_entity(&callee).unwrap();
+        store
+            .upsert_relation(&relation(caller.id, callee.id, RelationKind::Calls))
+            .unwrap();
+
+        let linked = observe_cross_file_reference_coverage(
+            &store,
+            &caller,
+            &[RelationKind::Calls, RelationKind::Imports, RelationKind::References],
+        );
+        assert_eq!(linked["classes"]["calls"], json!("present"));
+        assert_eq!(
+            linked["classes"]["imports"],
+            json!("absent"),
+            "the fixture holds no import edge, and the deciding rule must not need one"
+        );
+        assert!(
+            deciding_classes_observed_present(&linked),
+            "cross-file calls decide a trace absence: {linked}"
+        );
+
+        let unlinked = InMemoryGraph::new();
+        let lone = entity("outer", "nk/a.py", LanguageId::Python);
+        unlinked.upsert_entity(&lone).unwrap();
+        let empty = observe_cross_file_reference_coverage(
+            &unlinked,
+            &lone,
+            &[RelationKind::Calls, RelationKind::Imports, RelationKind::References],
+        );
+        assert_eq!(empty["classes"]["calls"], json!("absent"));
+        assert!(
+            !deciding_classes_observed_present(&empty),
+            "a graph with no cross-file calls cannot certify that a hop is absent: {empty}"
+        );
+    }
+
+    /// An unmeasured observation is the unknown case. A producer that read a
+    /// missing object as healthy would publish exactly the confident terminal
+    /// this gate exists to withhold.
+    #[test]
+    fn an_unreported_observation_never_certifies() {
+        assert!(!deciding_classes_observed_present(&Value::Null));
+        assert!(!deciding_classes_observed_present(&json!({})));
+        assert!(!deciding_classes_observed_present(&json!({
+            "requested_classes": ["calls"],
+        })));
+        assert!(!deciding_classes_observed_present(&json!({
+            "requested_classes": [],
+            "classes": {},
+        })));
+        assert!(!deciding_classes_observed_present(&json!({
+            "requested_classes": ["calls"],
+            "classes": {"calls": "unknown"},
+        })));
+        assert!(deciding_classes_observed_present(&json!({
+            "requested_classes": ["calls"],
+            "classes": {"calls": "present"},
+        })));
     }
 }

@@ -18,7 +18,9 @@
 use anyhow::{Context, Result};
 use kin_index::RelationResolution;
 use kin_model::{Entity, EntityId, EntityStore, GraphNodeId, RelationKind};
-use kin_ranking::entity_ranking::TraceTerminal;
+use kin_ranking::entity_ranking::{
+    trace_terminal_named, trace_walk_terminal, TraceExpansion, TraceTerminal,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -537,6 +539,45 @@ pub struct TraceDataFlowResponse {
     pub terminal_external_steps: usize,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub terminal_annotation_steps: usize,
+    /// Steps whose relations were read and held no admissible edge, split by
+    /// whether the graph could have held one.
+    ///
+    /// `terminal_leaf_steps` is the only count in this response that asserts a
+    /// branch ended because the code ends. `terminal_coverage_gap_steps` is the
+    /// same empty read on a language whose deciding coverage classes were not
+    /// observed present, so the walk cannot tell an absent hop from a graph
+    /// that never held one. `terminal_bound_steps` counts nodes whose relations
+    /// were never read at all, because the requested depth or a work budget
+    /// stopped the walk first.
+    ///
+    /// Kept apart rather than summed, and counted rather than left to a scan of
+    /// `chain`, because a caller acts differently on each: raise `depth` for a
+    /// bound, repair enrichment for a gap, and believe a leaf.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub terminal_leaf_steps: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub terminal_bound_steps: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub terminal_coverage_gap_steps: usize,
+    /// Why the walk stopped at the FOCAL itself, in the same vocabulary each
+    /// step's `terminal` uses, or null when the focal was expanded and had
+    /// neighbors.
+    ///
+    /// The focal is not a member of `chain`, so an empty chain otherwise
+    /// carries no statement at all about why it is empty, and an empty chain is
+    /// precisely the answer whose trust depends on that statement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focal_terminal: Option<String>,
+    /// This walk's own cross-file edge-class observation for the focal's
+    /// language, in the shape every reference tool publishes it in.
+    ///
+    /// Published on every walk rather than only on an empty one. A chain built
+    /// over a graph holding no cross-file calls has stayed inside one file, and
+    /// a response that reported nothing about coverage made the envelope say
+    /// `edge_coverage_unreported` on complete walks and short ones alike, which
+    /// is a limit that distinguishes nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_coverage: Option<serde_json::Value>,
     /// The ceiling this response was measured against, echoed so a caller that
     /// wants more (or less) knows the name and the number to send.
     ///
@@ -737,6 +778,20 @@ pub fn build_trace_data_flow_response_within(
     let mut clipped_steps: Vec<TraceFanoutClip> = Vec::new();
     let mut truncated = false;
     let mut stop = TraceStop::Exhausted;
+    // What each node's expansion produced, keyed by step index (`0` is the
+    // focal). Recorded here because none of it survives into the chain: a step
+    // with no children looks the same whether its relations were read and held
+    // nothing or were never read at all, which is the whole defect.
+    //
+    // Only expanded nodes are inserted. Everything else is read as "never
+    // expanded" below, which covers both ways that happens: a step at the
+    // requested depth is never pushed onto the frontier, and a walk that hits a
+    // work ceiling abandons the frontier it had.
+    let mut expansion: HashMap<usize, TraceExpansion> = HashMap::new();
+    // Each step's language, so a coverage verdict is read for the node it is
+    // about rather than borrowed from the focal. A chain that crosses a
+    // language boundary crosses an extraction boundary with it.
+    let mut step_language: HashMap<usize, kin_model::ids::LanguageId> = HashMap::new();
 
     let mut frontier: Vec<FrontierNode> = vec![FrontierNode::rooted(&focal_entity)];
     let mut next_frontier: Vec<FrontierNode>;
@@ -779,6 +834,13 @@ pub fn build_trace_data_flow_response_within(
             // file and were in the graph the whole time.
             let mut candidates: Vec<FanoutCandidate> = Vec::new();
             let mut candidate_index: HashMap<(EntityId, &'static str), usize> = HashMap::new();
+            // Counted before the visited filter, and before the per-step cap.
+            // The question a terminal answers is whether the GRAPH held a next
+            // hop for this node, not whether this response admitted one: a node
+            // whose only neighbors are already in the chain has neighbors, and
+            // calling it a leaf would claim the code ends where the walk merely
+            // stopped repeating itself.
+            let mut admissible_neighbors = 0usize;
             for rel in &relations {
                 if let Some(reason) = meter.charge_edge() {
                     stop = reason;
@@ -809,6 +871,8 @@ pub fn build_trace_data_flow_response_within(
                 } else {
                     continue;
                 };
+
+                admissible_neighbors += 1;
 
                 // Already in the chain by another edge. Not a candidate, and not
                 // a drop either: the caller has the node, so counting it as
@@ -853,6 +917,17 @@ pub fn build_trace_data_flow_response_within(
                     }
                 }
             }
+
+            // This node's relations were read to the end, so what the graph
+            // held for it is now a fact rather than a guess.
+            expansion.insert(
+                node.step,
+                if admissible_neighbors > 0 {
+                    TraceExpansion::HadEdges
+                } else {
+                    TraceExpansion::NoEdges
+                },
+            );
 
             // Independent budgets per direction so `direction=both` doesn't
             // starve callers when callees are listed first (or vice versa).
@@ -935,6 +1010,10 @@ pub fn build_trace_data_flow_response_within(
                         .map(|terminal| terminal.as_str().to_string());
                         let promoted_terminal = promoted.terminal.is_some();
                         let promoted_depth = promoted.depth;
+                        // The record that replaced the placeholder brings its
+                        // own language, and the coverage verdict this step is
+                        // read against has to follow it.
+                        step_language.insert(existing, candidate.entity.language);
                         visited.insert(candidate.entity.id);
                         external_identities_merged += 1;
                         // The placeholder had no edges to walk; the record that
@@ -982,6 +1061,7 @@ pub fn build_trace_data_flow_response_within(
                     fanout_dropped: 0,
                     terminal: terminal.map(|terminal| terminal.as_str().to_string()),
                 });
+                step_language.insert(step_index, candidate.entity.language);
 
                 if terminal.is_none() && next_depth < depth {
                     next_frontier.push(FrontierNode::at(step_index, next_depth, &candidate.entity));
@@ -1032,13 +1112,110 @@ pub fn build_trace_data_flow_response_within(
         external_identities_merged,
         terminal_external_steps: 0,
         terminal_annotation_steps: 0,
+        terminal_leaf_steps: 0,
+        terminal_bound_steps: 0,
+        terminal_coverage_gap_steps: 0,
+        focal_terminal: None,
+        edge_coverage: None,
         max_response_chars: request.budget_chars(),
         degradations,
     };
+    // Before the budget, because it reads facts the walk recorded per node and
+    // the budget only ever removes steps. Counting them is what happens after.
+    classify_walk_terminals(
+        graph,
+        &focal_entity,
+        &reference_kinds,
+        &expansion,
+        &step_language,
+        &mut response,
+    );
     enforce_response_budget(&mut response);
     record_unproven_steps(&mut response);
     record_terminal_steps(&mut response);
     Ok(response)
+}
+
+/// Give every node the walk did not continue through a reason, and publish the
+/// coverage observation those reasons rest on.
+///
+/// Runs once, after the walk and before the response budget. The three states
+/// it decides between are the ticket this exists for: a walk that stopped
+/// because the code ends, one that stopped at a bound the caller can raise, and
+/// one that stopped on a graph that could not have held the next hop. Before
+/// this, all three arrived as a step with no children and `truncated: false`.
+fn classify_walk_terminals<S: EntityStore>(
+    store: &S,
+    focal: &Entity,
+    reference_kinds: &[RelationKind],
+    expansion: &HashMap<usize, TraceExpansion>,
+    step_language: &HashMap<usize, kin_model::ids::LanguageId>,
+    response: &mut TraceDataFlowResponse,
+) {
+    // The focal's own observation is the one the response publishes, matching
+    // what `find_references` publishes and what the envelope's absence gate
+    // reads. Per-step verdicts below may consult another language's, but the
+    // published object stays the focal's so one payload carries one scope.
+    let focal_observation =
+        kin_mcp::edge_coverage::observe_cross_file_reference_coverage(store, focal, reference_kinds);
+    let mut certain: HashMap<kin_model::ids::LanguageId, bool> = HashMap::new();
+    certain.insert(
+        focal.language,
+        kin_mcp::edge_coverage::deciding_classes_observed_present(&focal_observation),
+    );
+    response.edge_coverage = Some(focal_observation);
+
+    // A walk whose focal was never expanded, or was expanded and held nothing,
+    // is the answer whose trust depends most on saying which. The chain carries
+    // no row for the focal, so the statement has nowhere else to go.
+    let focal_expansion = expansion
+        .get(&0)
+        .copied()
+        .unwrap_or(TraceExpansion::BoundStopped);
+    let focal_certain = certain.get(&focal.language).copied().unwrap_or(false);
+    response.focal_terminal = trace_walk_terminal(focal_expansion, focal_certain)
+        .map(|terminal| terminal.as_str().to_string());
+
+    for index in 0..response.chain.len() {
+        // An external or annotation boundary was decided at the edge that
+        // reached the node and is a stronger statement than anything the
+        // expansion can add: there is nothing on the other side to walk.
+        if response.chain[index].terminal.is_some() {
+            continue;
+        }
+        let step_number = response.chain[index].step;
+        let outcome = expansion
+            .get(&step_number)
+            .copied()
+            .unwrap_or(TraceExpansion::BoundStopped);
+        // Only an empty read consults coverage, so a healthy chain pays one
+        // language scan for the focal and none for its steps.
+        let coverage_certain = if matches!(outcome, TraceExpansion::NoEdges) {
+            let language = step_language
+                .get(&step_number)
+                .copied()
+                .unwrap_or(focal.language);
+            match certain.get(&language) {
+                Some(&known) => known,
+                None => {
+                    let observation =
+                        kin_mcp::edge_coverage::observe_cross_file_reference_coverage_for_languages(
+                            store,
+                            &[language],
+                            reference_kinds,
+                        );
+                    let known =
+                        kin_mcp::edge_coverage::deciding_classes_observed_present(&observation);
+                    certain.insert(language, known);
+                    known
+                }
+            }
+        } else {
+            false
+        };
+        response.chain[index].terminal = trace_walk_terminal(outcome, coverage_certain)
+            .map(|terminal| terminal.as_str().to_string());
+    }
 }
 
 /// Count the leaves this walk refused to expand, from the chain the caller
@@ -1050,18 +1227,38 @@ pub fn build_trace_data_flow_response_within(
 /// describing steps the payload no longer carries. A placeholder promoted to a
 /// located record mid-walk has the same effect from the other direction.
 fn record_terminal_steps(response: &mut TraceDataFlowResponse) {
-    let external = TraceTerminal::ExternalReference.as_str();
-    let annotation = TraceTerminal::TypeAnnotation.as_str();
-    response.terminal_external_steps = response
-        .chain
-        .iter()
-        .filter(|step| step.terminal.as_deref() == Some(external))
-        .count();
-    response.terminal_annotation_steps = response
-        .chain
-        .iter()
-        .filter(|step| step.terminal.as_deref() == Some(annotation))
-        .count();
+    let count = |terminal: TraceTerminal| {
+        let name = terminal.as_str();
+        response
+            .chain
+            .iter()
+            .filter(|step| step.terminal.as_deref() == Some(name))
+            .count()
+    };
+    response.terminal_external_steps = count(TraceTerminal::ExternalReference);
+    response.terminal_annotation_steps = count(TraceTerminal::TypeAnnotation);
+    response.terminal_leaf_steps = count(TraceTerminal::Leaf);
+    response.terminal_bound_steps = count(TraceTerminal::BoundReached);
+    response.terminal_coverage_gap_steps = count(TraceTerminal::CoverageGap);
+
+    // The flag follows the hops, and one rule decides which hops move it.
+    //
+    // A bound the caller can raise and a graph that could not have held the
+    // next hop are both cases where the chain may be shorter than the code, and
+    // both used to arrive as `truncated: false`. That is the whole defect: two
+    // real walks on `psf/requests` stopped one caller short and reported
+    // themselves complete. Never cleared here, because the walk's own ceilings
+    // set it first and this pass must not overturn them.
+    let shortfall = response.terminal_bound_steps > 0
+        || response.terminal_coverage_gap_steps > 0
+        || response
+            .focal_terminal
+            .as_deref()
+            .and_then(trace_terminal_named)
+            .is_some_and(TraceTerminal::truncates);
+    if shortfall {
+        response.truncated = true;
+    }
 }
 
 /// Count the hops this response rests on that were matched by name alone, and
@@ -2266,6 +2463,11 @@ mod tests {
             external_identities_merged: 0,
             terminal_external_steps: 0,
             terminal_annotation_steps: 0,
+            terminal_leaf_steps: 0,
+            terminal_bound_steps: 0,
+            terminal_coverage_gap_steps: 0,
+            focal_terminal: None,
+            edge_coverage: None,
             max_response_chars: DEFAULT_MAX_RESPONSE_CHARS,
             degradations: Vec::new(),
         }
@@ -2790,44 +2992,247 @@ mod tests {
         );
     }
 
-    /// An ordinary chain must be untouched by both gates, or the fix would have
-    /// bought correctness with coverage.
+    /// An ordinary chain must be untouched by the external and annotation
+    /// gates, or the fix would have bought correctness with coverage.
     #[test]
-    fn an_ordinary_call_chain_reports_no_terminal_at_all() {
-        let graph = InMemoryGraph::new();
-        let focal = make_entity("send", "src/sessions.rs");
-        let focal_id = focal.id;
-        let inner = make_entity("resolve_redirects", "src/sessions.rs");
-        let inner_id = inner.id;
-        let leaf = make_entity("rebuild_method", "src/sessions.rs");
-        graph.upsert_entity(&focal).unwrap();
-        graph.upsert_entity(&inner).unwrap();
-        graph.upsert_entity(&leaf).unwrap();
-        graph
-            .upsert_relation(&make_relation(focal_id, inner_id, RelationKind::Calls))
-            .unwrap();
-        graph
-            .upsert_relation(&make_relation(inner_id, leaf.id, RelationKind::Calls))
-            .unwrap();
+    fn an_ordinary_call_chain_reports_no_boundary_terminal_at_all() {
+        let (graph, focal_id) = call_chain(&[
+            ("send", "src/sessions.rs"),
+            ("resolve_redirects", "src/adapters.rs"),
+            ("rebuild_method", "src/models.rs"),
+        ]);
 
         let mut request = trace_request(&focal_id, 3, TraceDirection::Calls, 8);
         request.include_body = Some(false);
         let response = traced(&graph, &request);
 
         assert_eq!(response.total_steps, 2);
-        assert!(response.chain.iter().all(|step| step.terminal.is_none()));
         assert_eq!(response.terminal_external_steps, 0);
         assert_eq!(response.terminal_annotation_steps, 0);
-        // Present as an explicit null on every step, never omitted: one array
+        // Present as an explicit key on every step, never omitted: one array
         // holding two key sets is the shape `every_step_carries_the_same_keys`
         // exists to bar.
         let json = serde_json::to_value(&response).unwrap();
         for step in json["chain"].as_array().unwrap() {
-            assert_eq!(
-                step["terminal"],
-                serde_json::Value::Null,
-                "an ordinary step reports a null terminal: {step}"
+            assert!(
+                step.as_object().unwrap().contains_key("terminal"),
+                "every step carries the key whatever its value: {step}"
             );
         }
+        // The middle of a chain is an ordinary step and says nothing.
+        assert_eq!(response.chain[0].terminal, None);
+    }
+
+    /// Three entities in the given files, each calling the next, and the id of
+    /// the first. The files decide whether the graph holds cross-file call
+    /// edges, which is the fact a leaf terminal rests on.
+    fn call_chain(nodes: &[(&str, &str)]) -> (InMemoryGraph, EntityId) {
+        let graph = InMemoryGraph::new();
+        let entities: Vec<Entity> = nodes
+            .iter()
+            .map(|(name, file)| make_entity(name, file))
+            .collect();
+        for entity in &entities {
+            graph.upsert_entity(entity).unwrap();
+        }
+        for pair in entities.windows(2) {
+            graph
+                .upsert_relation(&make_relation(pair[0].id, pair[1].id, RelationKind::Calls))
+                .unwrap();
+        }
+        (graph, entities[0].id)
+    }
+
+    fn terminals(response: &TraceDataFlowResponse) -> Vec<Option<&str>> {
+        response
+            .chain
+            .iter()
+            .map(|step| step.terminal.as_deref())
+            .collect()
+    }
+
+    /// The positive control for the whole ticket. A chain that ran out of code
+    /// on a graph that links calls across files says so, and says it without
+    /// claiming a shortfall.
+    #[test]
+    fn a_chain_that_ran_out_of_code_reports_a_leaf_and_no_shortfall() {
+        let (graph, focal_id) = call_chain(&[
+            ("cert_verify", "src/adapters.py"),
+            ("send", "src/sessions.py"),
+            ("request", "src/api.py"),
+        ]);
+        let mut request = trace_request(&focal_id, 5, TraceDirection::Calls, 15);
+        request.include_body = Some(false);
+        let response = traced(&graph, &request);
+
+        assert_eq!(response.total_steps, 2, "the fixture must produce a chain");
+        assert_eq!(
+            terminals(&response),
+            vec![None, Some("leaf")],
+            "only the last hop ended, and it ended because the code ends"
+        );
+        assert_eq!(response.terminal_leaf_steps, 1);
+        assert_eq!(response.terminal_bound_steps, 0);
+        assert_eq!(response.terminal_coverage_gap_steps, 0);
+        assert!(
+            !response.truncated,
+            "a walk that reached the end of the code received the whole chain"
+        );
+        assert_eq!(
+            response.focal_terminal, None,
+            "the focal had a neighbor, so it is not an end of any kind"
+        );
+        // The observation the leaf rests on travels with the answer, so the
+        // envelope's absence gate reads a measured class instead of reporting
+        // that nothing was measured.
+        let coverage = response
+            .edge_coverage
+            .as_ref()
+            .expect("a walk must publish the coverage its terminals rest on");
+        assert_eq!(
+            coverage["classes"]["calls"],
+            serde_json::json!("present"),
+            "the fixture links calls across files: {coverage}"
+        );
+    }
+
+    /// The defect's own shape, in the smallest graph that has it: every call
+    /// edge sits inside one file, so an empty read cannot be told apart from a
+    /// graph that could never have held the next hop.
+    #[test]
+    fn a_chain_that_stopped_on_an_unlinked_graph_reports_a_coverage_gap() {
+        let (graph, focal_id) = call_chain(&[
+            ("cert_verify", "src/one.py"),
+            ("send", "src/one.py"),
+            ("request", "src/one.py"),
+        ]);
+        let mut request = trace_request(&focal_id, 5, TraceDirection::Calls, 15);
+        request.include_body = Some(false);
+        let response = traced(&graph, &request);
+
+        assert_eq!(response.total_steps, 2, "the fixture must produce a chain");
+        assert_eq!(
+            terminals(&response),
+            vec![None, Some("coverage_gap")],
+            "the walk cannot know whether this hop was the last one"
+        );
+        assert_eq!(response.terminal_coverage_gap_steps, 1);
+        assert_eq!(response.terminal_leaf_steps, 0);
+        assert!(
+            response.truncated,
+            "an answer the graph could not have completed is not a complete answer"
+        );
+        let coverage = response.edge_coverage.as_ref().expect("published");
+        assert_eq!(
+            coverage["classes"]["calls"],
+            serde_json::json!("absent"),
+            "the fixture holds no cross-file call edge: {coverage}"
+        );
+    }
+
+    /// The third state. A node whose relations were never read is not a leaf on
+    /// any graph, however well linked, and the caller has a number to raise.
+    #[test]
+    fn a_chain_cut_by_the_depth_bound_reports_a_bound_and_not_a_leaf() {
+        let (graph, focal_id) = call_chain(&[
+            ("cert_verify", "src/adapters.py"),
+            ("send", "src/sessions.py"),
+            ("request", "src/api.py"),
+        ]);
+        let mut request = trace_request(&focal_id, 2, TraceDirection::Calls, 15);
+        request.include_body = Some(false);
+        let response = traced(&graph, &request);
+
+        assert_eq!(response.total_steps, 2, "the fixture must produce a chain");
+        assert_eq!(
+            terminals(&response),
+            vec![None, Some("bound_reached")],
+            "the last hop sits at the requested depth and was never expanded"
+        );
+        assert_eq!(response.terminal_bound_steps, 1);
+        assert_eq!(response.terminal_leaf_steps, 0);
+        assert_eq!(response.terminal_coverage_gap_steps, 0);
+        assert!(
+            response.truncated,
+            "a chain the caller can lengthen by raising depth is truncated"
+        );
+        // Same graph, same focal, one more level of depth: the identical last
+        // entity now reads as an end rather than as a cut. Without this the
+        // bound arm could be passing because the fixture has no third hop.
+        let mut deeper = trace_request(&focal_id, 5, TraceDirection::Calls, 15);
+        deeper.include_body = Some(false);
+        let opened = traced(&graph, &deeper);
+        assert_eq!(terminals(&opened), vec![None, Some("leaf")]);
+        assert!(!opened.truncated);
+    }
+
+    /// An empty chain is the answer whose trust depends most on why it is
+    /// empty, and the focal has no row in `chain` to say so on.
+    #[test]
+    fn an_empty_chain_says_why_it_is_empty() {
+        // A lone entity on a graph that links nothing: nothing was found, and
+        // nothing could have been.
+        let (unlinked, alone) = call_chain(&[("cert_verify", "src/one.py")]);
+        let mut request = trace_request(&alone, 3, TraceDirection::Calls, 15);
+        request.include_body = Some(false);
+        let blind = traced(&unlinked, &request);
+        assert_eq!(blind.total_steps, 0);
+        assert_eq!(blind.focal_terminal.as_deref(), Some("coverage_gap"));
+        assert!(
+            blind.truncated,
+            "an empty chain on a graph holding no cross-file calls is not a proven absence"
+        );
+
+        // The same empty answer on a graph that demonstrably links calls across
+        // files. Now the emptiness is a fact about the code.
+        let (linked, _) = call_chain(&[("send", "src/a.py"), ("request", "src/b.py")]);
+        let lone = make_entity("cert_verify", "src/c.py");
+        linked.upsert_entity(&lone).unwrap();
+        let mut request = trace_request(&lone.id, 3, TraceDirection::Calls, 15);
+        request.include_body = Some(false);
+        let certain = traced(&linked, &request);
+        assert_eq!(certain.total_steps, 0);
+        assert_eq!(
+            certain.focal_terminal.as_deref(),
+            Some("leaf"),
+            "the same empty chain, on a graph that can tell empty from blind"
+        );
+        assert!(!certain.truncated);
+    }
+
+    /// A node whose only neighbors are already in the chain has neighbors. A
+    /// counter placed after the visited filter would call it a leaf and claim
+    /// the code ends where the walk merely stopped repeating itself.
+    #[test]
+    fn a_cycle_back_into_the_chain_is_not_a_leaf() {
+        let (graph, focal_id) = call_chain(&[
+            ("send", "src/sessions.py"),
+            ("resolve_redirects", "src/adapters.py"),
+        ]);
+        graph
+            .upsert_relation(&make_relation(
+                graph
+                    .query_entities(&kin_model::graph::EntityFilter::default())
+                    .unwrap()
+                    .iter()
+                    .find(|entity| entity.name == "resolve_redirects")
+                    .unwrap()
+                    .id,
+                focal_id,
+                RelationKind::Calls,
+            ))
+            .unwrap();
+
+        let mut request = trace_request(&focal_id, 5, TraceDirection::Calls, 15);
+        request.include_body = Some(false);
+        let response = traced(&graph, &request);
+
+        assert_eq!(response.total_steps, 1);
+        assert_eq!(
+            terminals(&response),
+            vec![None],
+            "its one neighbor is the focal, which the response already carries"
+        );
+        assert!(!response.truncated);
     }
 }

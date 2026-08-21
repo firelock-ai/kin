@@ -3556,6 +3556,15 @@ pub fn handle_trace_data_flow<G: GraphStore>(
     let mut external_identities_merged = 0usize;
     let mut clipped_steps: Vec<serde_json::Value> = Vec::new();
     let mut truncated = false;
+    // What each node's expansion produced, keyed by step index (`0` is the
+    // focal), and each step's language. Neither survives into the chain: a step
+    // with no children looks the same whether its relations were read and held
+    // nothing or were never read at all, and a coverage verdict borrowed from
+    // the focal would cross an extraction boundary the chain crossed.
+    let mut expansion: std::collections::HashMap<usize, TraceExpansion> =
+        std::collections::HashMap::new();
+    let mut step_language: std::collections::HashMap<usize, kin_model::ids::LanguageId> =
+        std::collections::HashMap::new();
 
     // Frontier: (step, entity, depth, file, dir) — the expanded node's own
     // location travels with it, because relevance is scored against the node
@@ -3579,6 +3588,10 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                 (kin_model::ids::EntityId, &'static str),
                 usize,
             > = std::collections::HashMap::new();
+            // Counted before the visited filter and before the per-step cap: a
+            // terminal answers whether the GRAPH held a next hop, not whether
+            // this response admitted one.
+            let mut admissible_neighbors = 0usize;
             for rel in &relations {
                 if !allowed.contains(&rel.kind) {
                     continue;
@@ -3603,6 +3616,8 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                 } else {
                     continue;
                 };
+
+                admissible_neighbors += 1;
 
                 // Already in the chain by another edge: not a candidate, and not
                 // a drop either.
@@ -3639,6 +3654,17 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                     }
                 }
             }
+
+            // This node's relations were read to the end, so what the graph held
+            // for it is now a fact rather than a guess.
+            expansion.insert(
+                node.step,
+                if admissible_neighbors > 0 {
+                    TraceExpansion::HadEdges
+                } else {
+                    TraceExpansion::NoEdges
+                },
+            );
 
             // Independent per-direction budgets so `direction=both` doesn't
             // starve one side when relations are emitted in either order.
@@ -3720,6 +3746,10 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                             promoted_terminal,
                         );
                         chain[existing - 1] = promoted;
+                        // The record that replaced the placeholder brings its
+                        // own language, and the coverage verdict this step is
+                        // read against has to follow it.
+                        step_language.insert(existing, candidate.entity.language);
                         visited.insert(candidate.entity.id);
                         external_identities_merged += 1;
                         if promoted_terminal.is_none() && promoted_depth < depth {
@@ -3757,6 +3787,7 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                     &candidate.entity,
                     terminal,
                 ));
+                step_language.insert(step_index, candidate.entity.language);
                 if terminal.is_none() && next_depth < depth {
                     next_frontier.push(TraceFrontierNode::at(
                         step_index,
@@ -3794,6 +3825,85 @@ pub fn handle_trace_data_flow<G: GraphStore>(
         &focal_entity,
         &reference_kinds,
     );
+
+    // Give every node the walk did not continue through a reason, in the same
+    // vocabulary and by the same rule the daemon arm uses. A step with no
+    // children arrived here indistinguishable from three different endings: the
+    // code ends, a bound stopped the walk, or the graph could not have held the
+    // next hop. Only the first is a complete answer.
+    let mut certain: std::collections::HashMap<kin_model::ids::LanguageId, bool> =
+        std::collections::HashMap::new();
+    certain.insert(
+        focal_entity.language,
+        crate::edge_coverage::deciding_classes_observed_present(&edge_coverage),
+    );
+    let focal_terminal = trace_walk_terminal(
+        expansion
+            .get(&0)
+            .copied()
+            .unwrap_or(TraceExpansion::BoundStopped),
+        certain
+            .get(&focal_entity.language)
+            .copied()
+            .unwrap_or(false),
+    );
+    for index in 0..chain.len() {
+        // An external or annotation boundary was decided at the edge that
+        // reached the node and is the stronger statement: there is nothing on
+        // the other side to walk.
+        if chain[index]["terminal"].as_str().is_some() {
+            continue;
+        }
+        let step_number = chain[index]["step"].as_u64().unwrap_or(0) as usize;
+        let outcome = expansion
+            .get(&step_number)
+            .copied()
+            .unwrap_or(TraceExpansion::BoundStopped);
+        // Only an empty read consults coverage, so a healthy chain pays one
+        // language scan for the focal and none for its steps.
+        let coverage_certain = if matches!(outcome, TraceExpansion::NoEdges) {
+            let language = step_language
+                .get(&step_number)
+                .copied()
+                .unwrap_or(focal_entity.language);
+            match certain.get(&language) {
+                Some(&known) => known,
+                None => {
+                    let observation =
+                        crate::edge_coverage::observe_cross_file_reference_coverage_for_languages(
+                            store,
+                            &[language],
+                            &reference_kinds,
+                        );
+                    let known =
+                        crate::edge_coverage::deciding_classes_observed_present(&observation);
+                    certain.insert(language, known);
+                    known
+                }
+            }
+        } else {
+            false
+        };
+        chain[index]["terminal"] = match trace_walk_terminal(outcome, coverage_certain) {
+            Some(terminal) => serde_json::Value::from(terminal.as_str()),
+            None => serde_json::Value::Null,
+        };
+    }
+    // A bound the caller can raise and a graph that could not have held the next
+    // hop both mean the chain may be shorter than the code, which is what this
+    // flag has always meant. Never cleared here: the walk's own ceilings set it
+    // first and this pass must not overturn them.
+    if focal_terminal.is_some_and(TraceTerminal::truncates)
+        || chain.iter().any(|step| {
+            step["terminal"]
+                .as_str()
+                .and_then(trace_terminal_named)
+                .is_some_and(TraceTerminal::truncates)
+        })
+    {
+        truncated = true;
+    }
+
     let mut result = serde_json::json!({
         "focal_id": focal_entity.id.to_string(),
         "focal_name": focal_entity.name.clone(),
@@ -3852,13 +3962,32 @@ pub fn handle_trace_data_flow<G: GraphStore>(
             })
             .unwrap_or(0)
     };
-    let terminal_external_steps = terminal_count(TraceTerminal::ExternalReference);
-    let terminal_annotation_steps = terminal_count(TraceTerminal::TypeAnnotation);
-    if terminal_external_steps > 0 {
-        result["terminal_external_steps"] = serde_json::Value::from(terminal_external_steps);
+    // Every count is taken before the first write, because the counter reads
+    // `result` and a write would end its borrow of it.
+    //
+    // The three walk terminals are counted the same way and kept apart for the
+    // same reason the two boundary ones are: a caller raises `depth` for a
+    // bound, repairs enrichment for a gap, and believes a leaf.
+    let counted: Vec<(&str, usize)> = [
+        ("terminal_external_steps", TraceTerminal::ExternalReference),
+        ("terminal_annotation_steps", TraceTerminal::TypeAnnotation),
+        ("terminal_leaf_steps", TraceTerminal::Leaf),
+        ("terminal_bound_steps", TraceTerminal::BoundReached),
+        ("terminal_coverage_gap_steps", TraceTerminal::CoverageGap),
+    ]
+    .into_iter()
+    .map(|(key, class)| (key, terminal_count(class)))
+    .collect();
+    for (key, total) in counted {
+        if total > 0 {
+            result[key] = serde_json::Value::from(total);
+        }
     }
-    if terminal_annotation_steps > 0 {
-        result["terminal_annotation_steps"] = serde_json::Value::from(terminal_annotation_steps);
+    // The chain carries no row for the focal, so an empty chain has nowhere
+    // else to say why it is empty, and an empty chain is the answer whose trust
+    // depends on that most.
+    if let Some(focal_terminal) = focal_terminal {
+        result["focal_terminal"] = serde_json::Value::from(focal_terminal.as_str());
     }
 
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
