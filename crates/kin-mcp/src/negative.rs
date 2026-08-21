@@ -3361,7 +3361,12 @@ mod tests {
     /// no index the query reads.
     #[test]
     fn an_absence_over_unadmitted_host_content_certifies_nothing() {
-        let payload = empty_search_page(resolvable_language_scope(Some(29)));
+        // The scope carries a measured coverage class, which is what lets this
+        // payload certify at all. Without it the FIR-2496 refusal answers first
+        // and the control below asserts a certification no payload of this shape
+        // can make, which would leave this case unable to tell a working gate
+        // from a broken one.
+        let payload = empty_search_page(scope_with_a_measured_class(Some(29)));
 
         // The positive control first, so a failure below cannot be the payload
         // simply never certifying.
