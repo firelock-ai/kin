@@ -311,6 +311,90 @@ pub(crate) fn reset_vector_index_and_requeue_after_contention_for_test(
 /// for this language", and two surfaces outside the enrichment loop need that
 /// answer to agree with it: the provisioning advice that tells an operator what
 /// to install, and the proof that starts a real server against a fixture.
+/// Probe what each enrichable language's server can actually do, then publish
+/// it for the query paths.
+///
+/// Spawned rather than awaited. Probing means starting each server and running
+/// the initialize handshake, and four languages against the probe budget would
+/// add seconds to daemon startup in the healthy case and far more when a server
+/// hangs. Nothing waits on the answer: until it publishes, every observation
+/// reads the readiness as unknown, which already keeps the absence-trust gate
+/// silent and is the honest state for a daemon that has not finished looking.
+///
+/// Safe against the daemon's own enrichment path by construction, not by
+/// timing. The sweep decides what to start from `lsp_adapter_for` and its own
+/// `servers` map, and enrichment availability comes from `discover_servers`;
+/// neither reads the published verdict, so a probe still in flight cannot
+/// change what the daemon does. The publish is write-only here and consumed
+/// only by kin-mcp.
+///
+/// The probes run concurrently, so the worst case is one probe budget rather
+/// than one per language.
+fn spawn_language_server_readiness_probe(workspace_root: std::path::PathBuf) {
+    use kin_core::reference_coverage::{
+        LanguageServerReadiness, LanguageServerReadinessMap, ENRICHABLE_LANGUAGES,
+    };
+    use kin_lsp::registry::{ProviderGapReason, ProviderRegistry};
+
+    tokio::spawn(async move {
+        // One task per language so the probes overlap: the worst case is one
+        // probe budget rather than one per language.
+        let probes: Vec<_> = ENRICHABLE_LANGUAGES
+            .iter()
+            .copied()
+            .map(|language| {
+                let workspace_root = workspace_root.clone();
+                tokio::spawn(async move {
+                    let registry = ProviderRegistry::with_defaults();
+                    let initialization_options = lsp_adapter_for(language, &workspace_root)
+                        .and_then(|(_, _, init_opts)| init_opts);
+                    let readiness = match kin_lsp::lifecycle::probe_readiness(
+                        &registry,
+                        language,
+                        &workspace_root,
+                        initialization_options,
+                    )
+                    .await
+                    {
+                        Ok(_) => LanguageServerReadiness::Usable,
+                        Err(gap) => match gap.reason {
+                            ProviderGapReason::ServerUnusable { message } => {
+                                LanguageServerReadiness::Unusable { reason: message }
+                            }
+                            _ => LanguageServerReadiness::Absent,
+                        },
+                    };
+                    (language, readiness)
+                })
+            })
+            .collect();
+
+        let mut readiness = LanguageServerReadinessMap::new();
+        for probe in probes {
+            match probe.await {
+                Ok((language, state)) => {
+                    if let LanguageServerReadiness::Unusable { reason } = &state {
+                        warn!(
+                            %language,
+                            %reason,
+                            "a language server is installed but cannot start, so this \
+                             language's cross-file reference edges cannot be produced on \
+                             this host"
+                        );
+                    }
+                    readiness.insert(language, state);
+                }
+                // A probe task that panicked establishes nothing about its
+                // language, and recording it as Absent would be a claim this
+                // process did not earn. Leaving it out reads as unknown.
+                Err(error) => warn!(%error, "a language server readiness probe did not finish"),
+            }
+        }
+
+        kin_mcp::edge_coverage::publish_language_server_readiness(readiness);
+    });
+}
+
 pub fn lsp_adapter_for(
     language: kin_model::LanguageId,
     workspace_root: &std::path::Path,
@@ -629,14 +713,45 @@ fn duration_from_env_secs(name: &str, default: Duration) -> Duration {
 /// The post-pass snapshot persists the final state once the pass completes, and
 /// a mid-pass crash only loses re-derivable enrichment, never primary truth.
 /// O(gaps × graph size) writes on large repos are the failure mode being closed.
+///
+/// An LSP cold sweep is suppressed for the SAME reason, and the paragraph above
+/// described it before it was covered: a sweep's only graph mutations are
+/// re-derivable enrichment, and a background flush mid-sweep re-serializes the
+/// whole graph to persist edges the next sweep would recompute. Measured on a
+/// converted psf/requests store (6491 commits): one 188-second sweep triggered a
+/// single flush costing 96.6 seconds, which carried a 56.2-second repository
+/// authority successor preparation whose own `change_bodies_ms` was 0. That is
+/// a whole-workspace rebuild and a whole-store re-admission performed for zero
+/// changed content bodies.
+///
+/// Suppression is bounded by the sweep, not open-ended: the sweep marks the
+/// graph dirty when it finishes, so the flush fires immediately after rather
+/// than never, and the sweep's own duration is bounded by the per-file
+/// definitions budget and the per-query caps. A live-only write landing
+/// mid-sweep therefore waits at most one sweep before it is persisted.
+/// Which background pass, if any, is holding the flush clocks down.
+///
+/// Named rather than passed as a second bool beside the first: two adjacent
+/// booleans at a call site say nothing about which is which, and the reason a
+/// flush was suppressed is exactly what a reader of this decision wants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlushSuppression {
+    /// Nothing is holding the clocks; the durability bounds apply as written.
+    None,
+    /// A daemon-side embed pass is in flight.
+    EmbedPass,
+    /// An LSP cold sweep is in flight.
+    LspSweep,
+}
+
 fn should_flush_now(
     since_save: Duration,
     since_mutation: Duration,
-    embed_pass_active: bool,
+    suppression: FlushSuppression,
     idle_flush: Duration,
     periodic_flush: Duration,
 ) -> bool {
-    if embed_pass_active {
+    if suppression != FlushSuppression::None {
         return false;
     }
     since_save >= periodic_flush || since_mutation >= idle_flush
@@ -1316,23 +1431,100 @@ fn graph_holds_language_server_relations(state: &DaemonState) -> bool {
         .any(|relation| relation.origin == kin_model::RelationOrigin::Lsp)
 }
 
-/// Record that the sweep finished this file, and persist the set.
+/// Record that a sweep's files are DURABLE, and persist the set once.
 ///
-/// Written per file rather than once at the end so a killed pass leaves the
-/// files it completed marked, which is what makes the next pass resume rather
-/// than restart. The write is a small JSON array over the files of one
-/// repository; a failure to persist is not fatal, it only costs a re-sweep.
-fn mark_file_enriched(state: &DaemonState, file: &str) {
+/// This was written per FILE, as the sweep finished each one, so that a killed
+/// pass resumed rather than restarted. That ordering records the wrong fact.
+/// The marker's only reader skips a file it names, so what it must mean is "the
+/// enrichment for this file is durable", and per-file it meant "this file was
+/// visited". A sweep whose publication then failed left every file marked and
+/// the next sweep skipped them, permanently, behind a clean log.
+///
+/// The pre-existing mitigation does not close that: `load_lsp_enriched_marker`
+/// discards the marker only when `graph_holds_language_server_relations` is
+/// false, and that helper is an `.any()` over the snapshot. Any single surviving
+/// Lsp relation, from an earlier sweep or from the incremental path, keeps the
+/// marker and with it the skip.
+///
+/// So the set is written once, after publication succeeds. Resume-after-kill
+/// degrades in the correct direction: a hard kill now re-sweeps, which is right,
+/// because a hard kill did not publish either.
+fn mark_files_enriched(state: &DaemonState, files: &[String]) {
+    if files.is_empty() {
+        return;
+    }
     let snapshot = {
         let Ok(mut marked) = state.lsp_enriched_files.lock() else {
             return;
         };
-        marked.insert(file.to_string());
+        for file in files {
+            marked.insert(file.clone());
+        }
         marked.iter().cloned().collect::<Vec<_>>()
     };
     if let Ok(bytes) = serde_json::to_vec(&snapshot) {
         let _ = std::fs::write(lsp_enriched_marker_path(state), bytes);
     }
+}
+
+/// How many consecutive fruitless interrupted sweeps disable the next one.
+///
+/// Three, not one. A single interrupted sweep is ordinary: a plain SIGTERM
+/// during shutdown ends a sweep early, and reading that as a failing store
+/// would trip the breaker on every clean stop.
+const SWEEP_INTERRUPTION_LIMIT: u32 = 3;
+
+/// The count after a sweep that ended the way this tally describes.
+///
+/// A clean finish resets, because the loop this guards is defined by never
+/// finishing. An interruption that still enriched files made progress and is
+/// left alone; the pathological case is the sweep that dies before enriching
+/// anything, over and over, which is what a store too small for its own sweep
+/// produces.
+fn next_interruption_count(previous: u32, ended_early: bool, enriched: usize) -> u32 {
+    if !ended_early {
+        0
+    } else if enriched == 0 {
+        previous.saturating_add(1)
+    } else {
+        previous
+    }
+}
+
+/// Whether the sweep circuit is open, so the next sweep must not be queued.
+fn sweep_circuit_open(consecutive_fruitless_interruptions: u32) -> bool {
+    consecutive_fruitless_interruptions >= SWEEP_INTERRUPTION_LIMIT
+}
+
+fn sweep_interruption_path(state: &DaemonState) -> std::path::PathBuf {
+    state.layout.root().join("lsp-sweep-interruptions")
+}
+
+/// Read the consecutive-interruption count this store carries.
+///
+/// Persisted rather than held in memory because the loop it guards spans daemon
+/// RESTARTS: a sweep dies, the daemon comes back, queues another sweep at
+/// startup, and dies again. One stranger session did that 24 times. An
+/// in-memory counter resets on every start and can never see the pattern.
+fn read_sweep_interruptions(state: &DaemonState) -> u32 {
+    std::fs::read_to_string(sweep_interruption_path(state))
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+fn write_sweep_interruptions(state: &DaemonState, count: u32) {
+    let _ = std::fs::write(sweep_interruption_path(state), count.to_string());
+}
+
+/// Whether a finished sweep may record its files as enriched.
+///
+/// Marking is safe when the sweep published, and also when it produced nothing
+/// to publish: a file that yielded no relations has nothing that can be lost, so
+/// re-sweeping it forever would be waste rather than safety. Everything else
+/// stays unmarked and is swept again.
+fn sweep_marker_is_durable(total_relations: usize, published: bool) -> bool {
+    total_relations == 0 || published
 }
 
 /// Whether the sweep has already finished this file.
@@ -1403,6 +1595,12 @@ struct SweepTally {
     server_unavailable: usize,
     /// Files whose source could not be loaded from graph authority.
     source_unreadable: usize,
+    /// Files whose file-level definitions pass exceeded its wall-clock budget.
+    ///
+    /// Counted rather than merely logged so the sweep's own completion record
+    /// carries it. These files are still visited and still get the per-entity
+    /// arm, so they are not blocked; what they lost is the definitions pass.
+    definitions_over_budget: usize,
     /// Whether the loop stopped before walking every file, on shutdown or on
     /// the background-work supervisor's verdict.
     ///
@@ -1484,6 +1682,61 @@ impl SweepTally {
             return Some("this build enriches no language they are written in");
         }
         Some("the sweep reached none of them")
+    }
+}
+
+/// How long the file-level definitions pass may take for one file.
+///
+/// The pass had no bound of any kind. It is called at its sweep site as
+/// `.await.unwrap_or_default()`, and `locations_at` wraps nothing of its own, so
+/// every query inherits only the JSON-RPC client's own 10-second cap and a
+/// timeout yields an empty result that lets the loop continue to the NEXT
+/// identifier. A file whose language server stops answering therefore costs
+/// identifiers times ten seconds rather than failing, which on a large file is
+/// hours. Its sibling `enrich_single_entity` caps every query at 5 seconds, so
+/// the per-entity arm was bounded and the per-file arm was not.
+///
+/// 120 seconds is chosen from measurement, not taste. On a converted
+/// psf/requests store the whole per-file pass, both arms together, ran to a
+/// median of 1.2 s, a p90 of 12.0 s and a maximum of 62.4 s. The budget sits at
+/// nearly twice the slowest healthy file, so it cannot truncate work that is
+/// merely slow; it exists to turn an unbounded hang into a bounded, counted one.
+fn lsp_file_definitions_budget() -> Duration {
+    duration_from_env_secs("KIN_DAEMON_LSP_FILE_BUDGET_SECS", Duration::from_secs(120))
+}
+
+/// Run the file-level definitions pass under a wall-clock budget.
+///
+/// A pass that overruns yields the empty result the call site already used for
+/// a failed pass, and is counted on the tally so the sweep reports it rather
+/// than losing it. Split out from the call site so the budget decision can be
+/// tested against a provider that never answers, which is the case that
+/// motivated it and the one a live language server will not reproduce on demand.
+async fn file_definitions_within_budget<F, E>(
+    pass: F,
+    budget: Duration,
+    file: &str,
+    tally: &mut SweepTally,
+) -> kin_lsp::file_enrichment::FileEnrichmentResult
+where
+    F: std::future::Future<
+        Output = std::result::Result<kin_lsp::file_enrichment::FileEnrichmentResult, E>,
+    >,
+{
+    match tokio::time::timeout(budget, pass).await {
+        Ok(Ok(result)) => result,
+        // A pass that failed keeps the behaviour the call site always had.
+        Ok(Err(_)) => kin_lsp::file_enrichment::FileEnrichmentResult::default(),
+        Err(_) => {
+            tally.definitions_over_budget += 1;
+            warn!(
+                file = %file,
+                budget_s = budget.as_secs(),
+                "the file-level definitions pass exceeded its budget and was abandoned for \
+                 this file; its language server is not answering"
+            );
+            kin_lsp::file_enrichment::FileEnrichmentResult::default()
+        }
     }
 }
 
@@ -1686,9 +1939,12 @@ pub async fn run_with_authority_on(
     // than re-sweeping a converged graph.
     load_lsp_enriched_marker(&state);
 
-    kin_mcp::edge_coverage::publish_installed_language_servers(
-        kin_core::reference_coverage::installed_language_servers(),
-    );
+    // The working directory as the layout already holds it. Deliberately not
+    // canonicalized: a readiness probe asks whether a server starts and
+    // completes a handshake, never resolving a file through this path, so the
+    // filesystem round trip would buy nothing and this is an authority-path
+    // crate where every such call has to earn itself.
+    spawn_language_server_readiness_probe(state.layout.working_dir().to_path_buf());
 
     // Set up LSP enrichment channel before wrapping state in Arc.
     let enrichment_enabled =
@@ -1737,8 +1993,23 @@ pub async fn run_with_authority_on(
     // cheap on a converged repository, resumable after a kill, and safe to queue
     // on every start.
     if enrichment_enabled && state.lsp_enrichment_tx.is_some() {
-        info!("queueing an LSP sweep so a graph with unenriched files converges");
-        state.queue_lsp_sweep();
+        // A store whose sweeps keep dying before enriching anything gets one
+        // fewer, not another. Queued on EVERY daemon start, this is the point
+        // the marker-discard loop turns at: a sweep dies, the daemon restarts,
+        // queues another, dies again. One stranger session logged 24 of them.
+        let interruptions = read_sweep_interruptions(&state);
+        if sweep_circuit_open(interruptions) {
+            warn!(
+                consecutive_fruitless_interruptions = interruptions,
+                limit = SWEEP_INTERRUPTION_LIMIT,
+                "not queueing an LSP sweep: this store's last sweeps all ended early without \
+                 enriching anything, so another would repeat what has been failing. Enrichment \
+                 stays at what is already durable; one sweep that completes clears this."
+            );
+        } else {
+            info!("queueing an LSP sweep so a graph with unenriched files converges");
+            state.queue_lsp_sweep();
+        }
     }
 
     // Bind the API listener so the daemon owns port selection. With
@@ -2144,10 +2415,20 @@ pub async fn run_with_authority_on(
                 continue;
             }
 
+            let suppression = if persist_state.embed_pass_active() {
+                FlushSuppression::EmbedPass
+            } else if persist_state
+                .lsp_sweep_running
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                FlushSuppression::LspSweep
+            } else {
+                FlushSuppression::None
+            };
             let should_flush = should_flush_now(
                 persist_state.time_since_save(),
                 persist_state.time_since_mutation(),
-                persist_state.embed_pass_active(),
+                suppression,
                 idle_flush,
                 periodic_flush,
             );
@@ -2907,6 +3188,18 @@ pub async fn run_with_authority_on(
 
                     LspEnrichmentMessage::Sweep => {
                         info!("LSP cold sweep started, enriching all entities");
+                        // Re-probe here, not only at daemon start. Readiness
+                        // taken once latches: a user who follows Kin's own
+                        // advice and installs the server it just named leaves a
+                        // long-lived daemon reporting that language unavailable
+                        // for the rest of its life, and the stale answer is an
+                        // input under an agent-facing verdict. A sweep is the
+                        // moment the daemon is about to want servers, so it is
+                        // the firing point that needs no new signal invented.
+                        // Same probe-then-publish as at start, and it overwrites
+                        // rather than merges, because a fresh answer supersedes
+                        // an old one wholesale.
+                        spawn_language_server_readiness_probe(lsp_root.clone());
                         lsp_state
                             .lsp_sweep_running
                             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -2937,6 +3230,8 @@ pub async fn run_with_authority_on(
                             .lsp_sweep_files_total
                             .store(total_files as u64, std::sync::atomic::Ordering::SeqCst);
                         let mut tally = SweepTally::default();
+                        let mut enriched_this_sweep: Vec<String> = Vec::new();
+                        let file_definitions_budget = lsp_file_definitions_budget();
                         let mut total_relations = 0usize;
                         // Languages whose server refused to start, remembered for
                         // the rest of this sweep. Without it the loop retries the
@@ -3140,16 +3435,20 @@ pub async fn run_with_authority_on(
 
                             // File-level enrichment: query definition at every identifier
                             // to capture ALL relationships (40-50x more than per-entity).
-                            let file_result = kin_lsp::file_enrichment::enrich_file_definitions(
-                                server,
-                                &abs_path,
-                                &file_content,
-                                &index,
-                                &lsp_root,
-                                documents,
+                            let file_result = file_definitions_within_budget(
+                                kin_lsp::file_enrichment::enrich_file_definitions(
+                                    server,
+                                    &abs_path,
+                                    &file_content,
+                                    &index,
+                                    &lsp_root,
+                                    documents,
+                                ),
+                                file_definitions_budget,
+                                &file_id.0,
+                                &mut tally,
                             )
-                            .await
-                            .unwrap_or_default();
+                            .await;
 
                             let mut file_relations =
                                 install_lsp_relations(&lsp_state, &file_result.relations);
@@ -3175,7 +3474,7 @@ pub async fn run_with_authority_on(
                                 .await;
 
                             tally.enriched += 1;
-                            mark_file_enriched(&lsp_state, &file_id.0);
+                            enriched_this_sweep.push(file_id.0.clone());
                             lsp_state.lsp_sweep_files_done.store(
                                 tally.files_processed() as u64,
                                 std::sync::atomic::Ordering::SeqCst,
@@ -3234,6 +3533,96 @@ pub async fn run_with_authority_on(
                         if total_relations > 0 {
                             lsp_state.mark_dirty();
                         }
+
+                        // Publish this sweep's enrichment ONCE, here, and wait
+                        // for it.
+                        //
+                        // Publication is not a separate path: it happens inside
+                        // save_snapshot_impl, so the background flush IS the
+                        // publication. Leaving it to that flush is what made
+                        // suppressing the flush lose the work entirely. Measured
+                        // on a converted psf/requests store: a sweep enriched 37
+                        // files and 4231 relations, the daemon began idle
+                        // shutdown 65 ms after the sweep ended, logged its final
+                        // shutdown flush, and then reported that tasks had not
+                        // stopped within 10 s. That flush takes about 96 s on
+                        // this store. Nothing was published, and the whole sweep
+                        // was lost on a path `kin init` takes every time.
+                        //
+                        // Ordering carries the guarantee. This runs BEFORE the
+                        // running flag clears and before the completion counter
+                        // advances, so the sweep is still in flight while it
+                        // happens: nothing reads the daemon as idle, and a
+                        // caller waiting for the sweep (`kin init` does) waits
+                        // for durability rather than for a promise of it.
+                        //
+                        // Both exits, deliberately. The loop reaches here after
+                        // a clean finish AND after breaking early on shutdown or
+                        // a supervisor halt, so an interrupted sweep still makes
+                        // durable what it actually completed, and the crash
+                        // window narrows to a hard kill, which the resume marker
+                        // already recovers by re-sweeping.
+                        let published = if total_relations > 0 {
+                            match save_snapshot_blocking(Arc::clone(&lsp_state)).await {
+                                Ok(()) => {
+                                    lsp_state.mark_clean();
+                                    true
+                                }
+                                Err(error) => {
+                                    // Loud, and not fatal. The relations stay in
+                                    // the live graph and the resume marker still
+                                    // records what was enriched, so the next
+                                    // sweep re-derives them; what must not happen
+                                    // is losing this silently, which is the
+                                    // defect being closed.
+                                    warn!(
+                                        %error,
+                                        relations = total_relations,
+                                        "could not publish this sweep's enrichment; the \
+                                         relations stay live and the next sweep re-derives them"
+                                    );
+                                    false
+                                }
+                            }
+                        } else {
+                            false
+                        };
+
+                        // The breaker's count moves on the sweep's own outcome,
+                        // and is persisted because the loop it guards spans
+                        // daemon restarts rather than living inside one.
+                        let interruptions = next_interruption_count(
+                            read_sweep_interruptions(&lsp_state),
+                            tally.ended_early,
+                            tally.enriched,
+                        );
+                        write_sweep_interruptions(&lsp_state, interruptions);
+
+                        // The marker records durability, so it is written here
+                        // and only here, after the publication above settled it.
+                        // The set and the count come from the same arm, so a
+                        // divergence means a file was counted enriched without
+                        // being recorded, or recorded without being counted.
+                        // Either way the marker would stop describing the sweep.
+                        if enriched_this_sweep.len() != tally.enriched {
+                            warn!(
+                                recorded = enriched_this_sweep.len(),
+                                counted = tally.enriched,
+                                "the enriched-file set and the enriched count disagree; the \
+                                 marker no longer describes this sweep"
+                            );
+                        }
+                        if sweep_marker_is_durable(total_relations, published) {
+                            mark_files_enriched(&lsp_state, &enriched_this_sweep);
+                        } else {
+                            warn!(
+                                files = enriched_this_sweep.len(),
+                                relations = total_relations,
+                                "not recording these files as enriched: their relations were \
+                                 not published, so the next sweep must redo them"
+                            );
+                        }
+
                         // Marked complete even when the loop broke early on
                         // shutdown or a supervisor halt. A waiter blocked on a
                         // counter that only advances on a clean finish would
@@ -3261,8 +3650,11 @@ pub async fn run_with_authority_on(
                             unsupported_language = tally.unsupported_language,
                             server_unavailable = tally.server_unavailable,
                             source_unreadable = tally.source_unreadable,
+                            definitions_over_budget = tally.definitions_over_budget,
                             not_visited,
                             ended_early = tally.ended_early,
+                            published,
+                            consecutive_fruitless_interruptions = interruptions,
                             unaccounted,
                             "LSP cold sweep complete"
                         );
@@ -3451,6 +3843,25 @@ async fn drain_handles(
 ) {
     let drain_timeout = Duration::from_secs(10);
     info!("draining task handles before cleanup...");
+
+    // Persistence drains on its own budget, and before the rest.
+    //
+    // It used to share the ten seconds below with six other tasks, and it is the
+    // only one that can need minutes: its shutdown arm performs the final
+    // flush, and a flush IS the publication, so a store with pending work
+    // cannot become durable in ten seconds. Measured on a converted psf/requests
+    // store (6491 commits), flushes completed at 96245, 96636 and 107496 ms
+    // against that ten-second drain, and the daemon logged only that "one or
+    // more daemon tasks did not stop within 10s", which reads as a slow
+    // shutdown rather than as discarded durability.
+    //
+    // A longer budget costs an idle daemon nothing. The persistence task's
+    // shutdown arm returns immediately when the graph is not dirty, so this is
+    // a ceiling on waiting rather than an amount of waiting: time is spent here
+    // only when there is work to lose, which is exactly when spending it is
+    // right.
+    let persistence = drain_persistence(persist_handle, shutdown_flush_budget()).await;
+
     let mut drain_tasks = Vec::new();
 
     macro_rules! join_or_warn {
@@ -3471,7 +3882,6 @@ async fn drain_handles(
     join_or_warn!("sweeper", sweep_handle);
     join_or_warn!("embedding", embed_handle);
     join_or_warn!("idle-monitor", idle_handle);
-    join_or_warn!("persistence", persist_handle);
     join_or_warn!("supervisor-registration", supervisor_handle);
 
     if tokio::time::timeout(drain_timeout, async {
@@ -3482,7 +3892,69 @@ async fn drain_handles(
     .await
     .is_err()
     {
-        warn!("one or more daemon tasks did not stop within 10s, proceeding");
+        warn!(
+            drain_timeout_s = drain_timeout.as_secs(),
+            "one or more daemon tasks did not stop within the drain budget, proceeding. \
+             Persistence is not among them; it drains separately and reported above."
+        );
+    }
+    if persistence == PersistenceDrain::Abandoned {
+        // Named, because the generic drain warning above is what hid this. A
+        // reader must be able to tell "a task was slow to stop" from "durable
+        // work was discarded", and only one of those is data loss.
+        warn!(
+            budget_s = shutdown_flush_budget().as_secs(),
+            "the final persistence flush did not finish within its shutdown budget and was \
+             abandoned; graph mutations it had not yet published are NOT durable and will be \
+             re-derived or lost. Raise KIN_DAEMON_SHUTDOWN_FLUSH_SECS if this store needs longer."
+        );
+    }
+}
+
+/// How long shutdown waits for the final persistence flush.
+///
+/// Generous by default because the cost is bounded by the work outstanding: an
+/// idle daemon's persistence arm returns at once and never touches this budget.
+/// Measured flushes on a converted psf/requests store ran 96 to 108 seconds, so
+/// a ten-second drain could not have completed one, and five minutes clears them
+/// with room while still bounding a pathological case rather than hanging.
+fn shutdown_flush_budget() -> Duration {
+    duration_from_env_secs("KIN_DAEMON_SHUTDOWN_FLUSH_SECS", Duration::from_secs(300))
+}
+
+/// What became of the persistence task during shutdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistenceDrain {
+    /// No persistence task was running.
+    NotRunning,
+    /// It finished within its budget; whatever it was flushing is durable.
+    Completed,
+    /// It outlived its budget and shutdown proceeded without it.
+    Abandoned,
+}
+
+/// Wait for the persistence task, bounded, and report which happened.
+///
+/// Split out so the budget's behaviour can be tested in both directions: that a
+/// flush finishing inside the budget is not delayed by it, and that one
+/// outliving it returns at the budget rather than hanging shutdown forever.
+async fn drain_persistence(
+    handle: Option<tokio::task::JoinHandle<()>>,
+    budget: Duration,
+) -> PersistenceDrain {
+    let Some(handle) = handle else {
+        return PersistenceDrain::NotRunning;
+    };
+    match tokio::time::timeout(budget, handle).await {
+        Ok(Ok(())) => {
+            info!(task = "persistence", "task drained");
+            PersistenceDrain::Completed
+        }
+        Ok(Err(error)) => {
+            warn!(task = "persistence", %error, "task panicked during drain");
+            PersistenceDrain::Abandoned
+        }
+        Err(_) => PersistenceDrain::Abandoned,
     }
 }
 
@@ -3582,7 +4054,8 @@ mod tests {
         format_singleton_contention, next_embed_error_backoff, parse_duration_secs,
         parse_owner_watch_pid, should_enable_lsp_enrichment, should_flush_now, shutdown_signalled,
         watched_process_is_alive, ControlPlane, CoverageDrainVerdict, DaemonConfig, DaemonState,
-        DEFAULT_RUNTIME_SHUTDOWN_GRACE, DEFAULT_SHUTDOWN_ESCALATION_GRACE, RECON_IDLE,
+        FlushSuppression, DEFAULT_RUNTIME_SHUTDOWN_GRACE, DEFAULT_SHUTDOWN_ESCALATION_GRACE,
+        RECON_IDLE,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -4108,7 +4581,7 @@ mod tests {
         assert!(!should_flush_now(
             Duration::from_secs(10),
             Duration::from_secs(1),
-            false,
+            FlushSuppression::None,
             idle,
             periodic,
         ));
@@ -4116,7 +4589,7 @@ mod tests {
         assert!(should_flush_now(
             Duration::from_secs(10),
             Duration::from_secs(3),
-            false,
+            FlushSuppression::None,
             idle,
             periodic,
         ));
@@ -4131,7 +4604,7 @@ mod tests {
         assert!(!should_flush_now(
             Duration::from_secs(10),
             Duration::from_secs(5),
-            true,
+            FlushSuppression::EmbedPass,
             idle,
             periodic,
         ));
@@ -4142,7 +4615,7 @@ mod tests {
         assert!(!should_flush_now(
             Duration::from_secs(31),
             Duration::from_secs(5),
-            true,
+            FlushSuppression::EmbedPass,
             idle,
             periodic,
         ));
@@ -4150,10 +4623,200 @@ mod tests {
         assert!(should_flush_now(
             Duration::from_secs(31),
             Duration::from_secs(5),
-            false,
+            FlushSuppression::None,
             idle,
             periodic,
         ));
+    }
+
+    /// A cold sweep suppresses both clocks, for the reason the embed-pass arm
+    /// above already documents.
+    ///
+    /// Measured on a converted psf/requests store: one 188-second sweep
+    /// triggered a single background flush costing 96.6 seconds, carrying a
+    /// 56.2-second successor preparation whose `change_bodies_ms` was 0. A
+    /// whole-workspace rebuild and whole-store re-admission, for zero changed
+    /// content bodies, to persist edges the next sweep recomputes.
+    #[test]
+    fn an_lsp_sweep_suppresses_both_flush_clocks() {
+        let idle = Duration::from_secs(2);
+        let periodic = Duration::from_secs(30);
+        // A gap between files mid-sweep looks mutation-quiet; the idle clock
+        // must not read that as a moment to serialize the whole graph.
+        assert!(!should_flush_now(
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+            FlushSuppression::LspSweep,
+            idle,
+            periodic,
+        ));
+        // The periodic clock is suppressed too. A sweep runs for minutes, so a
+        // 30-second bound fires inside it by construction.
+        assert!(!should_flush_now(
+            Duration::from_secs(31),
+            Duration::from_secs(5),
+            FlushSuppression::LspSweep,
+            idle,
+            periodic,
+        ));
+    }
+
+    /// Suppression that became never-flushing would be a worse defect than the
+    /// flush it removed, so this is the arm that says it ends.
+    ///
+    /// The sweep marks the graph dirty when it finishes, so the very next pass
+    /// of the persistence loop sees a mutation-quiet dirty graph with no
+    /// suppression and flushes. Both clocks are checked, because a fix that
+    /// only restored the periodic bound would leave a sweep's own output
+    /// unpersisted for up to thirty seconds after it converged.
+    #[test]
+    fn the_flush_fires_as_soon_as_the_sweep_ends() {
+        let idle = Duration::from_secs(2);
+        let periodic = Duration::from_secs(30);
+        // Mutation-quiet past the idle threshold, sweep over: flush now.
+        assert!(should_flush_now(
+            Duration::from_secs(10),
+            Duration::from_secs(3),
+            FlushSuppression::None,
+            idle,
+            periodic,
+        ));
+        // And the periodic durability bound is intact the moment it lifts.
+        assert!(should_flush_now(
+            Duration::from_secs(31),
+            Duration::from_secs(1),
+            FlushSuppression::None,
+            idle,
+            periodic,
+        ));
+    }
+
+    /// A mutation that is NOT the sweep's own is still persisted, just later.
+    ///
+    /// This is the consequence worth stating rather than discovering: a live
+    /// write landing mid-sweep waits for the sweep to end before it is
+    /// flushed. The staleness is bounded by the sweep's own duration, and the
+    /// predicate cannot tell whose mutation it was, so the guarantee is
+    /// "flushed at sweep end", not "flushed immediately". Both rows below are
+    /// the same dirty state; only the suppression differs.
+    #[test]
+    fn a_non_sweep_mutation_mid_sweep_is_flushed_when_the_sweep_ends() {
+        let idle = Duration::from_secs(2);
+        let periodic = Duration::from_secs(30);
+        let since_save = Duration::from_secs(45);
+        let since_mutation = Duration::from_secs(10);
+        assert!(
+            !should_flush_now(
+                since_save,
+                since_mutation,
+                FlushSuppression::LspSweep,
+                idle,
+                periodic
+            ),
+            "a live write mid-sweep waits: this is the bounded staleness the change accepts"
+        );
+        assert!(
+            should_flush_now(
+                since_save,
+                since_mutation,
+                FlushSuppression::None,
+                idle,
+                periodic
+            ),
+            "and it is flushed as soon as the sweep ends, from the same dirty state"
+        );
+    }
+
+    /// An interrupted sweep records exactly the files it completed, and no more.
+    ///
+    /// The accumulator is pushed only on the arm that increments
+    /// `tally.enriched`, so today the property holds by code shape and a runtime
+    /// warning reports any divergence. Neither is enough on its own: a shape
+    /// invariant is one refactor from silently gone, and the warning only speaks
+    /// in production, after the damage. This pins the property where CI sees it.
+    ///
+    /// The case is a sweep that broke early having finished three files of four.
+    /// The marker must name those three and must NOT name the file the sweep
+    /// never reached, because naming it would make the next sweep skip a file
+    /// that was never enriched at all.
+    #[test]
+    fn an_interrupted_sweep_records_exactly_what_it_completed() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = DaemonState::open(initialized.layout).unwrap();
+
+        let completed = vec![
+            "src/requests/sessions.py".to_string(),
+            "src/requests/adapters.py".to_string(),
+            "src/requests/auth.py".to_string(),
+        ];
+        let never_reached = "src/requests/models.py";
+
+        super::mark_files_enriched(&state, &completed);
+
+        for file in &completed {
+            assert!(
+                super::file_already_enriched(&state, file),
+                "a file the interrupted sweep completed and published must be recorded: {file}"
+            );
+        }
+        assert!(
+            !super::file_already_enriched(&state, never_reached),
+            "a file the sweep never reached must NOT be recorded, or the next sweep skips a \
+             file that was never enriched"
+        );
+    }
+
+    /// A flush that outlives its budget is ABANDONED, and shutdown proceeds.
+    ///
+    /// The loss half of the defect: the persistence task's shutdown arm performs
+    /// the final flush, a flush is the publication, and on a converted
+    /// psf/requests store those ran 96 to 108 seconds against a ten-second drain
+    /// shared with six other tasks. Shutdown must still end rather than hang, so
+    /// the budget is a ceiling; what changes is that the outcome is now named
+    /// instead of hidden inside a generic drain warning.
+    #[tokio::test]
+    async fn a_flush_outliving_its_budget_is_reported_abandoned() {
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let started = std::time::Instant::now();
+        let outcome = super::drain_persistence(Some(handle), Duration::from_millis(80)).await;
+        assert_eq!(
+            outcome,
+            super::PersistenceDrain::Abandoned,
+            "a flush that outlives its budget must be reported as abandoned, because a reader \
+             has to tell discarded durability from a merely slow task"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "shutdown must proceed at the budget rather than wait the flush out forever"
+        );
+    }
+
+    /// The other direction, and the one that keeps the fix from overcorrecting.
+    ///
+    /// An idle daemon's persistence arm returns at once, because its shutdown
+    /// path skips the flush when nothing is dirty. A generous budget must
+    /// therefore cost such a shutdown NOTHING: it is a ceiling on waiting, not
+    /// an amount of waiting. A fix that made every shutdown sit out a full flush
+    /// window would be worse than the bug it replaced.
+    #[tokio::test]
+    async fn a_fast_shutdown_is_not_delayed_by_a_generous_budget() {
+        let handle = tokio::spawn(async {});
+        let started = std::time::Instant::now();
+        let outcome = super::drain_persistence(Some(handle), Duration::from_secs(300)).await;
+        assert_eq!(outcome, super::PersistenceDrain::Completed);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a persistence task with nothing to flush must return at once, however large the \
+             budget is"
+        );
+        assert_eq!(
+            super::drain_persistence(None, Duration::from_secs(300)).await,
+            super::PersistenceDrain::NotRunning,
+            "no persistence task at all is not an abandonment"
+        );
     }
 
     #[test]
@@ -4813,7 +5476,11 @@ mod lsp_query_column_tests {
 
 #[cfg(test)]
 mod sweep_tally_tests {
-    use super::SweepTally;
+    use super::{
+        file_definitions_within_budget, next_interruption_count, sweep_circuit_open,
+        sweep_marker_is_durable, SweepTally, SWEEP_INTERRUPTION_LIMIT,
+    };
+    use std::time::Duration;
 
     /// The number the sweep reports as `files`, and the one `/lsp/sweep/status`
     /// serves as `files_done`, is unchanged in meaning by the tally: a file the
@@ -4826,6 +5493,7 @@ mod sweep_tally_tests {
             unsupported_language: 5,
             server_unavailable: 6,
             source_unreadable: 7,
+            definitions_over_budget: 0,
             ended_early: false,
         };
         assert_eq!(tally.files_processed(), 7);
@@ -4909,6 +5577,192 @@ mod sweep_tally_tests {
             36,
             "36 files left the sweep without reaching any counter and must be visible"
         );
+    }
+
+    /// One interrupted sweep must NOT open the circuit.
+    ///
+    /// A plain SIGTERM during shutdown ends a sweep early, so a breaker that
+    /// tripped on a single interruption would fire on every clean stop and stop
+    /// enriching a perfectly healthy store. This is the arm that keeps the
+    /// breaker from being worse than the loop it guards.
+    #[test]
+    fn a_single_interrupted_sweep_does_not_open_the_circuit() {
+        let after_one = next_interruption_count(0, true, 0);
+        assert_eq!(after_one, 1);
+        assert!(
+            !sweep_circuit_open(after_one),
+            "one interrupted sweep is ordinary, not a failing store"
+        );
+        assert!(
+            !sweep_circuit_open(SWEEP_INTERRUPTION_LIMIT - 1),
+            "the breaker opens at the limit, not before it"
+        );
+    }
+
+    /// A store that keeps killing fruitless sweeps must back off.
+    ///
+    /// This is the marker-discard loop's own shape: a sweep dies before
+    /// enriching anything, the daemon restarts, queues another, dies again. One
+    /// stranger session logged 24 such sweeps.
+    #[test]
+    fn repeated_fruitless_interruptions_open_the_circuit() {
+        let mut count = 0;
+        for _ in 0..SWEEP_INTERRUPTION_LIMIT {
+            count = next_interruption_count(count, true, 0);
+        }
+        assert!(
+            sweep_circuit_open(count),
+            "after {SWEEP_INTERRUPTION_LIMIT} consecutive fruitless interruptions the next \
+             sweep must not be queued"
+        );
+    }
+
+    /// One clean completion clears it, and progress is not punished.
+    ///
+    /// Two distinct cases. A sweep that FINISHED resets the count outright, so a
+    /// store that recovers is not left permanently unswept. And a sweep that was
+    /// interrupted but still enriched files made progress, so it neither trips
+    /// the breaker nor resets it: the loop being guarded is the one that never
+    /// achieves anything.
+    #[test]
+    fn a_clean_completion_resets_and_progress_is_not_punished() {
+        assert_eq!(
+            next_interruption_count(SWEEP_INTERRUPTION_LIMIT, false, 0),
+            0,
+            "a sweep that ran to completion clears the breaker"
+        );
+        assert!(!sweep_circuit_open(0));
+        assert_eq!(
+            next_interruption_count(2, true, 19),
+            2,
+            "an interrupted sweep that still enriched 19 files made progress: neither a trip \
+             nor a reset"
+        );
+    }
+
+    /// A sweep whose publication failed must NOT record its files as enriched.
+    ///
+    /// This is the arm that keeps a failure recoverable. The marker's only
+    /// reader skips what it names, so marking unpublished files converts a
+    /// transient publication failure into a permanent skip: the relations are
+    /// gone, the marker says the files are done, and the next sweep passes over
+    /// them reporting `already_enriched`.
+    ///
+    /// The pre-existing recovery check cannot catch that, because
+    /// `graph_holds_language_server_relations` is an `.any()` over the graph and
+    /// a single surviving Lsp relation from any earlier pass keeps the marker.
+    #[test]
+    fn a_sweep_that_did_not_publish_records_nothing() {
+        assert!(
+            !sweep_marker_is_durable(4231, false),
+            "a sweep with relations that failed to publish must leave its files unmarked, \
+             so the next sweep redoes them instead of skipping them forever"
+        );
+        assert!(
+            sweep_marker_is_durable(4231, true),
+            "a sweep that published records what it enriched"
+        );
+    }
+
+    /// A sweep that produced nothing to publish still records its files.
+    ///
+    /// Without this arm the fix would trade a permanent skip for a permanent
+    /// re-sweep: a file that yields no relations has nothing that can be lost,
+    /// and sweeping it again on every daemon start forever is waste, not safety.
+    #[test]
+    fn a_sweep_with_nothing_to_publish_still_records_its_files() {
+        assert!(
+            sweep_marker_is_durable(0, false),
+            "no relations means nothing could be lost, so the visit is worth recording"
+        );
+    }
+
+    /// A provider that never answers is abandoned at its budget and counted.
+    ///
+    /// This is the case the budget exists for and the one a live language server
+    /// will not reproduce on demand: the pass had no bound at all, and every
+    /// query inside it inherits only the client's 10-second cap and yields an
+    /// empty result that lets the loop continue to the next identifier, so a
+    /// dead server costs identifiers times ten seconds instead of failing.
+    #[tokio::test]
+    async fn a_definitions_pass_that_never_answers_is_abandoned_and_counted() {
+        let mut tally = SweepTally::default();
+        let stalled = std::future::pending::<
+            std::result::Result<kin_lsp::file_enrichment::FileEnrichmentResult, ()>,
+        >();
+        let result = file_definitions_within_budget(
+            stalled,
+            Duration::from_millis(60),
+            "src/requests/models.py",
+            &mut tally,
+        )
+        .await;
+        assert_eq!(
+            tally.definitions_over_budget, 1,
+            "a pass abandoned at its budget must be counted, not merely logged"
+        );
+        assert!(
+            result.relations.is_empty(),
+            "an abandoned pass yields the same empty result a failed pass always did"
+        );
+    }
+
+    /// The other direction: a pass that answers inside its budget is handed
+    /// back UNCHANGED and costs the tally nothing.
+    ///
+    /// Without this arm the budget could quietly truncate healthy enrichment and
+    /// every test above would still pass, which is the failure mode that matters
+    /// most here: relations silently going missing look exactly like a corpus
+    /// that had none.
+    #[tokio::test]
+    async fn a_pass_inside_its_budget_is_returned_byte_identical() {
+        use kin_model::{GraphNodeId, Relation, RelationId, RelationKind, RelationOrigin};
+        let src = kin_model::EntityId::new();
+        let dst = kin_model::EntityId::new();
+        let build = || kin_lsp::file_enrichment::FileEnrichmentResult {
+            relations: vec![Relation {
+                id: RelationId::from_bytes([9u8; 16]),
+                kind: RelationKind::References,
+                src: GraphNodeId::Entity(src),
+                dst: GraphNodeId::Entity(dst),
+                confidence: 0.85,
+                origin: RelationOrigin::Lsp,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            }],
+            definitions_resolved: 7,
+            positions_queried: 913,
+        };
+        let expected = build();
+        let mut tally = SweepTally::default();
+        // The pass must take REAL time before answering. An instantly-ready
+        // future is polled once and returned before any budget can apply, so a
+        // test written that way passes even with the budget set to a
+        // nanosecond, and proves nothing about truncation. Found by falsifying
+        // this very test: at a 1 ns budget it stayed green.
+        let healthy = async move {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            std::result::Result::<_, ()>::Ok(build())
+        };
+        let result = file_definitions_within_budget(
+            healthy,
+            Duration::from_secs(120),
+            "src/requests/models.py",
+            &mut tally,
+        )
+        .await;
+        assert_eq!(
+            tally.definitions_over_budget, 0,
+            "a pass that answered in time must not be counted against the budget"
+        );
+        assert_eq!(
+            result.relations, expected.relations,
+            "a healthy pass must come back with its relations unchanged; a budget that \
+             quietly truncated them would look exactly like a corpus that had none"
+        );
+        assert_eq!(result.definitions_resolved, expected.definitions_resolved);
+        assert_eq!(result.positions_queried, expected.positions_queried);
     }
 
     /// An interrupted sweep is not a miscounted one, and the guard must not

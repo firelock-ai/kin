@@ -48,9 +48,9 @@ pub use error::{
 };
 pub use global_config::empty_global_git_config;
 pub use lossless::{
-    capture_lossless_git_repository, rehydrate_lossless_git_repository,
-    sync_git_repository_for_authority_handoff, GitObjectFormat, GitRehydrationResult,
-    LosslessGitRepository,
+    capture_lossless_git_repository, closure_reconstruction_count,
+    rehydrate_lossless_git_repository, sync_git_repository_for_authority_handoff, GitObjectFormat,
+    GitRehydrationResult, LosslessGitRepository,
 };
 pub use preflight::{
     kin_store_is_git_ignored, preflight_git_migration, preflight_git_migration_after_publication,

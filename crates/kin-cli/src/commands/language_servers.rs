@@ -23,7 +23,6 @@
 //! download into a shared global prefix, and Kin does not spend a user's
 //! bandwidth or mutate their toolchain on a probe's say-so.
 
-use std::collections::HashSet;
 use std::process::Command;
 
 use kin_model::LanguageId;
@@ -73,6 +72,19 @@ impl LanguageServerRecipe {
     }
 }
 
+/// The typescript package `typescript-language-server` is installed beside.
+///
+/// Pinned to 5.x, and the pin is load-bearing. `typescript-language-server`
+/// runs `tsserver`, which ships as `lib/tsserver.js` inside the typescript
+/// package. TypeScript 7 dropped that entry point: its package exposes only a
+/// `tsc` binary and carries no `lib/tsserver.js`. Installing typescript
+/// unpinned resolves the `latest` dist-tag, which is 7.x, and the server then
+/// answers Kin's `initialize` with "Could not find a valid TypeScript
+/// installation" and exits. Nothing in npm metadata prevents that pairing,
+/// because `typescript-language-server` declares no peer dependency on
+/// typescript at all.
+const TYPESCRIPT_PACKAGE: &str = "typescript@^5";
+
 /// Every language this build can enrich, with the server that enriches it.
 ///
 /// JavaScript and TypeScript are separate rows resolving to one binary and one
@@ -100,7 +112,12 @@ pub(crate) const LANGUAGE_SERVERS: &[LanguageServerRecipe] = &[
         language: LanguageId::TypeScript,
         binaries: &["typescript-language-server", "vtsls"],
         program: "npm",
-        args: &["install", "-g", "typescript-language-server", "typescript"],
+        args: &[
+            "install",
+            "-g",
+            "typescript-language-server",
+            TYPESCRIPT_PACKAGE,
+        ],
         disclosure: "downloads the typescript-language-server and typescript npm packages into \
                      your global npm prefix",
     },
@@ -108,7 +125,12 @@ pub(crate) const LANGUAGE_SERVERS: &[LanguageServerRecipe] = &[
         language: LanguageId::JavaScript,
         binaries: &["typescript-language-server"],
         program: "npm",
-        args: &["install", "-g", "typescript-language-server", "typescript"],
+        args: &[
+            "install",
+            "-g",
+            "typescript-language-server",
+            TYPESCRIPT_PACKAGE,
+        ],
         disclosure: "downloads the typescript-language-server and typescript npm packages into \
                      your global npm prefix",
     },
@@ -132,15 +154,6 @@ pub(crate) fn language_server_binaries() -> Vec<(LanguageId, &'static [&'static 
     LANGUAGE_SERVERS
         .iter()
         .map(|recipe| (recipe.language, recipe.binaries))
-        .collect()
-}
-
-/// Languages whose enrichment server is installed on this host.
-pub(crate) fn installed_language_servers() -> HashSet<LanguageId> {
-    LANGUAGE_SERVERS
-        .iter()
-        .filter(|recipe| recipe.installed())
-        .map(|recipe| recipe.language)
         .collect()
 }
 
@@ -422,24 +435,38 @@ mod tests {
 
     /// The advice and the runtime must name the same binaries.
     ///
+    /// The advice and the runtime must name the same binaries, asserted against
+    /// the crate that actually launches them.
+    ///
     /// `kin doctor` tells an operator to install a binary and the daemon starts
     /// one; a difference between the two names is advice that leaves the gap
-    /// open while reporting it closed. These are the names in
-    /// `kin_lsp::discovery::KNOWN_SERVERS` and in the daemon's adapter map,
-    /// asserted here because kin-cli cannot see either at compile time.
+    /// open while reporting it closed. This used to restate the names by hand,
+    /// because kin-cli could not see kin-lsp at compile time. It can, and
+    /// kin-lsp now exports the list its own resolver reads, so the expectation
+    /// comes from there instead. A hardcoded copy could agree with nothing and
+    /// still pass.
     #[test]
     fn recipes_name_the_binaries_the_daemon_starts() {
-        for (language, expected) in [
-            (LanguageId::Rust, "rust-analyzer"),
-            (LanguageId::Python, "pyright-langserver"),
-            (LanguageId::TypeScript, "typescript-language-server"),
-            (LanguageId::JavaScript, "typescript-language-server"),
-        ] {
-            let recipe = recipe_for(language).expect("language must have a recipe");
+        let runtime: std::collections::HashMap<LanguageId, Vec<String>> =
+            kin_lsp::registry::ProviderRegistry::with_defaults()
+                .known_binaries()
+                .into_iter()
+                .collect();
+
+        for recipe in LANGUAGE_SERVERS {
+            let expected = runtime.get(&recipe.language).unwrap_or_else(|| {
+                panic!(
+                    "{}: kin-cli advertises an install for a language kin-lsp registers no \
+                     provider for, so the advice names a server nothing will start",
+                    recipe.language
+                )
+            });
+            let advertised: Vec<String> =
+                recipe.binaries.iter().map(|b| (*b).to_string()).collect();
             assert_eq!(
-                recipe.binaries.first().copied(),
-                Some(expected),
-                "{language}: first binary is what the daemon's adapter starts"
+                &advertised, expected,
+                "{}: the install advice and the runtime name different binaries",
+                recipe.language
             );
         }
     }
@@ -474,12 +501,40 @@ mod tests {
         );
         assert_eq!(
             recipe_for(LanguageId::TypeScript).unwrap().command_line(),
-            "npm install -g typescript-language-server typescript"
+            "npm install -g typescript-language-server typescript@^5"
         );
         assert_eq!(
             recipe_for(LanguageId::Rust).unwrap().command_line(),
             "rustup component add rust-analyzer"
         );
+    }
+
+    /// The typescript package must never be installed unpinned.
+    ///
+    /// TypeScript 7 ships no `lib/tsserver.js`, so a bare `typescript`
+    /// argument resolves the `latest` dist-tag to 7.x and the language server
+    /// refuses to initialize. The failure is invisible from the install side:
+    /// `npm install -g` succeeds, `typescript-language-server` lands on PATH,
+    /// and `installed()` reports the language served. Only a start attempt
+    /// disagrees, which is why the pin is asserted here rather than left to a
+    /// runtime check.
+    #[test]
+    fn the_typescript_package_is_pinned_away_from_the_version_without_tsserver() {
+        for language in [LanguageId::TypeScript, LanguageId::JavaScript] {
+            let recipe = recipe_for(language).expect("language must have a recipe");
+            let typescript_arg = recipe
+                .args
+                .iter()
+                .find(|arg| arg.starts_with("typescript@") || **arg == "typescript")
+                .unwrap_or_else(|| panic!("{language}: recipe installs no typescript package"));
+            assert_eq!(
+                *typescript_arg, "typescript@^5",
+                "{language}: the typescript package must carry the 5.x pin. Unpinned, npm \
+                 resolves latest to TypeScript 7, which ships no lib/tsserver.js, and \
+                 typescript-language-server answers initialize with \"Could not find a valid \
+                 TypeScript installation\" and exits."
+            );
+        }
     }
 
     /// One npm package serves both JavaScript and TypeScript, so the advice is
@@ -489,7 +544,7 @@ mod tests {
         let commands = install_commands_for(&[LanguageId::JavaScript, LanguageId::TypeScript]);
         assert_eq!(
             commands,
-            vec!["npm install -g typescript-language-server typescript".to_string()]
+            vec!["npm install -g typescript-language-server typescript@^5".to_string()]
         );
     }
 
@@ -745,4 +800,63 @@ mod tests {
             "the advice must not promise a pickup the startup gate cannot deliver"
         );
     }
+}
+
+/// Ask what each enrichable language's server can actually do on this host.
+///
+/// The question every surface here used to answer with `which::which`. A binary
+/// on `PATH` is not a working language server: a host carrying
+/// `typescript-language-server` beside a TypeScript that ships no `tsserver`
+/// resolves fine and fails every start. Only a handshake tells them apart, so
+/// this starts each server and runs one.
+///
+/// Probes run concurrently, so the wait is one probe budget rather than one per
+/// language. Belongs to command paths, which may spawn; a query path must read
+/// the verdict a spawner published instead.
+pub(crate) async fn probe_language_server_readiness(
+    workspace_root: &std::path::Path,
+) -> kin_core::reference_coverage::LanguageServerReadinessMap {
+    use kin_core::reference_coverage::{
+        LanguageServerReadiness, LanguageServerReadinessMap, ENRICHABLE_LANGUAGES,
+    };
+    use kin_lsp::registry::{ProviderGapReason, ProviderRegistry};
+
+    let probes: Vec<_> = ENRICHABLE_LANGUAGES
+        .iter()
+        .copied()
+        .map(|language| {
+            let workspace_root = workspace_root.to_path_buf();
+            tokio::spawn(async move {
+                let registry = ProviderRegistry::with_defaults();
+                let readiness = match kin_lsp::lifecycle::probe_readiness(
+                    &registry,
+                    language,
+                    &workspace_root,
+                    None,
+                )
+                .await
+                {
+                    Ok(_) => LanguageServerReadiness::Usable,
+                    Err(gap) => match gap.reason {
+                        ProviderGapReason::ServerUnusable { message } => {
+                            LanguageServerReadiness::Unusable { reason: message }
+                        }
+                        _ => LanguageServerReadiness::Absent,
+                    },
+                };
+                (language, readiness)
+            })
+        })
+        .collect();
+
+    let mut readiness = LanguageServerReadinessMap::new();
+    for probe in probes {
+        // A probe that did not finish establishes nothing about its language,
+        // and recording it as absent would be a claim this process did not
+        // earn. Leaving it out reads as unknown.
+        if let Ok((language, state)) = probe.await {
+            readiness.insert(language, state);
+        }
+    }
+    readiness
 }

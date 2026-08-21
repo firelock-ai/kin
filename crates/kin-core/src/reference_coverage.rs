@@ -57,36 +57,28 @@ pub const ENRICHABLE_LANGUAGES: &[LanguageId] = &[
     LanguageId::JavaScript,
 ];
 
-/// The binaries that provide each enrichable language's server.
+/// What a host's language server can actually do for one language.
 ///
-/// Mirrors `kin_lsp::discovery::KNOWN_SERVERS` for exactly the languages
-/// [`ENRICHABLE_LANGUAGES`] names, and is the ONE table every surface reads:
-/// the doctor row that reports the gap, the install recipes that close it, and
-/// the trust gate that decides whether an empty answer may be certified. Those
-/// three used to be able to disagree, and a probe looking for a binary the
-/// installer never provides is a gap that reports itself closed.
+/// Three states, not two, because a missing server and a present-but-broken one
+/// need different repairs and a surface handed a boolean cannot tell an operator
+/// which it is in. `Unusable` carries the server's own message, which is the
+/// only text that names the repair.
 ///
-/// Probed with a `PATH` lookup rather than through
-/// `kin_lsp::discovery::discover_servers`, which runs `--version` on every
-/// server it finds; a query path must not spawn subprocesses.
-pub const LANGUAGE_SERVER_BINARIES: &[(LanguageId, &[&str])] = &[
-    (LanguageId::Rust, &["rust-analyzer"]),
-    (LanguageId::Python, &["pyright-langserver", "pylsp"]),
-    (
-        LanguageId::TypeScript,
-        &["typescript-language-server", "vtsls"],
-    ),
-    (LanguageId::JavaScript, &["typescript-language-server"]),
-];
-
-/// Languages whose enrichment server is present on this host.
-pub fn installed_language_servers() -> HashSet<LanguageId> {
-    LANGUAGE_SERVER_BINARIES
-        .iter()
-        .filter(|(_, binaries)| binaries.iter().any(|binary| which::which(binary).is_ok()))
-        .map(|(language, _)| *language)
-        .collect()
+/// Produced by whichever process can actually start a server and PUBLISHED to
+/// the query paths, which must not spawn subprocesses to answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LanguageServerReadiness {
+    /// Resolved, completed the initialize handshake, and reported capabilities.
+    Usable,
+    /// A binary was found and the server refused to initialize.
+    Unusable { reason: String },
+    /// No server binary for this language was found at all.
+    Absent,
 }
+
+/// Per-language readiness as published by the process that probed.
+pub type LanguageServerReadinessMap =
+    std::collections::HashMap<LanguageId, LanguageServerReadiness>;
 
 /// Whether cross-file reference evidence is available for one language.
 
@@ -103,6 +95,15 @@ pub enum ReferenceEnrichment {
     /// An adapter is wired but no language server for it is installed, so
     /// reference and override edges cannot be produced on this host.
     NoLanguageServer,
+    /// An adapter is wired and a server binary was found, but the server
+    /// refuses to initialize, so no edge can be produced either.
+    ///
+    /// Kept apart from [`ReferenceEnrichment::NoLanguageServer`] because the
+    /// repairs differ: one is an install, the other is a broken install, and a
+    /// host reporting the wrong one sends an operator to the wrong fix. Binary
+    /// presence alone cannot tell them apart, which is why this state only
+    /// exists once something asks the server to start.
+    LanguageServerUnusable,
     /// This build wires no adapter for the language, so reference and override
     /// edges are unavailable regardless of what is installed.
     Unsupported,
@@ -116,22 +117,27 @@ impl ReferenceEnrichment {
     /// nothing about is noise rather than a finding. `Unknown` is not a gap
     /// either: nothing looked, so nothing was found missing.
     pub fn is_actionable_gap(&self) -> bool {
-        matches!(self, ReferenceEnrichment::NoLanguageServer)
+        matches!(
+            self,
+            ReferenceEnrichment::NoLanguageServer | ReferenceEnrichment::LanguageServerUnusable
+        )
     }
 }
 
 /// Whether the language server for `language` can enrich this host's graph.
 pub fn reference_enrichment_for(
     language: LanguageId,
-    servers_found: &HashSet<LanguageId>,
+    readiness: &LanguageServerReadinessMap,
 ) -> ReferenceEnrichment {
     if !ENRICHABLE_LANGUAGES.contains(&language) {
         return ReferenceEnrichment::Unsupported;
     }
-    if servers_found.contains(&language) {
-        ReferenceEnrichment::Available
-    } else {
-        ReferenceEnrichment::NoLanguageServer
+    match readiness.get(&language) {
+        Some(LanguageServerReadiness::Usable) => ReferenceEnrichment::Available,
+        Some(LanguageServerReadiness::Unusable { .. }) => {
+            ReferenceEnrichment::LanguageServerUnusable
+        }
+        Some(LanguageServerReadiness::Absent) | None => ReferenceEnrichment::NoLanguageServer,
     }
 }
 
@@ -401,11 +407,15 @@ impl ReferenceEdgeCoverage {
         self
     }
 
-    /// Fill in each language's enrichment state from the servers a caller found.
+    /// Fill in each language's enrichment state from the readiness a caller
+    /// probed.
     ///
     /// Kept off the collector because probing the host is not reading the graph,
-    /// and this module measures graph truth alone.
-    pub fn with_language_servers(mut self, servers_found: &HashSet<LanguageId>) -> Self {
+    /// and this module measures graph truth alone. Readiness rather than a set
+    /// of found binaries, because a server that is present and cannot start
+    /// produces exactly as many edges as one that is absent, and only the
+    /// repair differs.
+    pub fn with_language_servers(mut self, readiness: &LanguageServerReadinessMap) -> Self {
         for language in &mut self.languages {
             // The rows carry a language's display name, and kin-model has no
             // parse back from one. Matching against the enrichable set's own
@@ -416,7 +426,7 @@ impl ReferenceEdgeCoverage {
                 .copied()
                 .find(|candidate| candidate.to_string() == language.language);
             language.reference_enrichment = match enrichable {
-                Some(id) => reference_enrichment_for(id, servers_found),
+                Some(id) => reference_enrichment_for(id, readiness),
                 None => ReferenceEnrichment::Unsupported,
             };
         }
@@ -837,28 +847,14 @@ fn read_count(entity: &Entity, key: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-
-    /// Every enrichable language must name the binaries that provide its
-    /// server, and nothing else may.
-    ///
-    /// The two lists feed different surfaces: one decides whether an adapter
-    /// exists, the other decides whether an operator can close the gap and
-    /// whether the trust gate may certify an absence. A language in one and not
-    /// the other is a surface reporting about a language no other surface can
-    /// act on.
-    #[test]
-    fn the_binaries_table_covers_exactly_the_enrichable_languages() {
-        let tabled: std::collections::HashSet<LanguageId> = LANGUAGE_SERVER_BINARIES
+    /// A host where exactly these languages have a usable server.
+    fn usable(languages: &[LanguageId]) -> LanguageServerReadinessMap {
+        languages
             .iter()
-            .map(|(language, _)| *language)
-            .collect();
-        let enrichable: std::collections::HashSet<LanguageId> =
-            ENRICHABLE_LANGUAGES.iter().copied().collect();
-        assert_eq!(tabled, enrichable);
-        for (language, binaries) in LANGUAGE_SERVER_BINARIES {
-            assert!(!binaries.is_empty(), "{language} names no server binary");
-        }
+            .map(|language| (*language, LanguageServerReadiness::Usable))
+            .collect()
     }
+
     use super::*;
     use kin_db::InMemoryGraph;
     use kin_model::entity::{
@@ -1344,7 +1340,7 @@ mod tests {
 
         let filled = unfilled
             .clone()
-            .with_language_servers(&[LanguageId::Go].into_iter().collect());
+            .with_language_servers(&usable(&[LanguageId::Go]));
         assert_eq!(
             filled.languages_missing_a_language_server(),
             vec!["python"],
@@ -1356,8 +1352,8 @@ mod tests {
             "gopls on PATH gives Go nothing: no adapter consumes it"
         );
 
-        let complete = unfilled
-            .with_language_servers(&[LanguageId::Python, LanguageId::Rust].into_iter().collect());
+        let complete =
+            unfilled.with_language_servers(&usable(&[LanguageId::Python, LanguageId::Rust]));
         assert!(complete.languages_missing_a_language_server().is_empty());
     }
 

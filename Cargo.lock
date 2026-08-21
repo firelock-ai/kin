@@ -3046,7 +3046,7 @@ dependencies = [
 
 [[package]]
 name = "kin-agent"
-version = "0.5.43"
+version = "0.5.45"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3075,14 +3075,14 @@ dependencies = [
 
 [[package]]
 name = "kin-buildinfo"
-version = "0.5.43"
+version = "0.5.45"
 dependencies = [
  "sha2 0.11.0",
 ]
 
 [[package]]
 name = "kin-cli"
-version = "0.5.43"
+version = "0.5.45"
 dependencies = [
  "age",
  "anyhow",
@@ -3162,7 +3162,7 @@ dependencies = [
 
 [[package]]
 name = "kin-context"
-version = "0.5.43"
+version = "0.5.45"
 dependencies = [
  "kin-blobs",
  "kin-db",
@@ -3178,7 +3178,7 @@ dependencies = [
 
 [[package]]
 name = "kin-core"
-version = "0.5.43"
+version = "0.5.45"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
@@ -3203,6 +3203,7 @@ dependencies = [
  "thiserror 2.0.18",
  "toml 1.1.2+spec-1.1.0",
  "tracing",
+ "tracing-subscriber",
  "unicode-normalization",
  "uuid",
  "which 8.0.4",
@@ -3212,7 +3213,7 @@ dependencies = [
 
 [[package]]
 name = "kin-daemon"
-version = "0.5.43"
+version = "0.5.45"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3268,7 +3269,7 @@ dependencies = [
 
 [[package]]
 name = "kin-daemon-spawn"
-version = "0.5.43"
+version = "0.5.45"
 dependencies = [
  "fs2",
  "libc",
@@ -3283,9 +3284,9 @@ dependencies = [
 
 [[package]]
 name = "kin-db"
-version = "0.7.35"
+version = "0.7.38"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "5b18910b72d016935672f59e17477b15ead9ca46e0b66c8692edea58f7c910ac"
+checksum = "9a91460113b99ffac03b62f011d76ce7eb4570b9affde59ede4c24688f061382"
 dependencies = [
  "bincode",
  "bstr",
@@ -3329,7 +3330,7 @@ dependencies = [
 
 [[package]]
 name = "kin-git"
-version = "0.5.43"
+version = "0.5.45"
 dependencies = [
  "cap-std",
  "chrono",
@@ -3354,7 +3355,7 @@ dependencies = [
 
 [[package]]
 name = "kin-index"
-version = "0.5.43"
+version = "0.5.45"
 dependencies = [
  "hex",
  "kin-blobs",
@@ -3406,7 +3407,7 @@ dependencies = [
 
 [[package]]
 name = "kin-integration-tests"
-version = "0.5.43"
+version = "0.5.45"
 dependencies = [
  "kin-blobs",
  "kin-context",
@@ -3426,9 +3427,9 @@ dependencies = [
 
 [[package]]
 name = "kin-lsp"
-version = "0.6.16"
+version = "0.7.0"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "5ef67e9479a739aea7286339c3ed34aaf24bd114c38a5b2ff0352b71f97d2581"
+checksum = "de8108477768a3f1470f7719c0e6cd572efbe71a750edb2f086045e71a9fae60"
 dependencies = [
  "kin-model",
  "serde",
@@ -3441,7 +3442,7 @@ dependencies = [
 
 [[package]]
 name = "kin-mcp"
-version = "0.5.43"
+version = "0.5.45"
 dependencies = [
  "base64 0.23.0",
  "hex",
@@ -3472,7 +3473,7 @@ dependencies = [
 
 [[package]]
 name = "kin-migrate"
-version = "0.5.43"
+version = "0.5.45"
 dependencies = [
  "chrono",
  "kin-blobs",
@@ -3501,9 +3502,9 @@ dependencies = [
 
 [[package]]
 name = "kin-model"
-version = "0.7.9"
+version = "0.7.10"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "859744dbb2855216be40ea258c0ff608888f00f19435d1bdf3714314176d93d3"
+checksum = "be211911c8cf30d0afd21673f4807f1fe4d7ac288b2324f7cf13c3f7667b4714"
 dependencies = [
  "chrono",
  "gix-hash",
@@ -3522,7 +3523,7 @@ dependencies = [
 
 [[package]]
 name = "kin-notifier-macos"
-version = "0.5.43"
+version = "0.5.45"
 dependencies = [
  "block2",
  "objc2 0.6.4",
@@ -3534,7 +3535,7 @@ dependencies = [
 
 [[package]]
 name = "kin-notify"
-version = "0.5.43"
+version = "0.5.45"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3545,7 +3546,7 @@ dependencies = [
 
 [[package]]
 name = "kin-parser"
-version = "0.5.43"
+version = "0.5.45"
 dependencies = [
  "kin-model",
  "pretty_assertions",
@@ -3575,7 +3576,7 @@ dependencies = [
 
 [[package]]
 name = "kin-projection"
-version = "0.5.43"
+version = "0.5.45"
 dependencies = [
  "kin-blobs",
  "kin-db",
@@ -3590,7 +3591,7 @@ dependencies = [
 
 [[package]]
 name = "kin-ranking"
-version = "0.5.43"
+version = "0.5.45"
 dependencies = [
  "kin-model",
  "serde",
@@ -3599,7 +3600,7 @@ dependencies = [
 
 [[package]]
 name = "kin-reconcile"
-version = "0.5.43"
+version = "0.5.45"
 dependencies = [
  "kin-blobs",
  "kin-db",
@@ -3619,7 +3620,7 @@ dependencies = [
 
 [[package]]
 name = "kin-registry"
-version = "0.5.43"
+version = "0.5.45"
 dependencies = [
  "async-stream",
  "axum",
@@ -3652,7 +3653,7 @@ dependencies = [
 
 [[package]]
 name = "kin-remote"
-version = "0.5.43"
+version = "0.5.45"
 dependencies = [
  "base64 0.23.0",
  "chrono",
@@ -3673,7 +3674,7 @@ dependencies = [
 
 [[package]]
 name = "kin-review"
-version = "0.5.43"
+version = "0.5.45"
 dependencies = [
  "kin-blobs",
  "kin-db",
@@ -3689,7 +3690,7 @@ dependencies = [
 
 [[package]]
 name = "kin-runtime"
-version = "0.5.43"
+version = "0.5.45"
 dependencies = [
  "chrono",
  "kin-blobs",
@@ -3720,7 +3721,7 @@ dependencies = [
 
 [[package]]
 name = "kin-semantic-contracts"
-version = "0.5.43"
+version = "0.5.45"
 dependencies = [
  "kin-db",
  "kin-model",
@@ -3735,7 +3736,7 @@ dependencies = [
 
 [[package]]
 name = "kin-spine"
-version = "0.5.43"
+version = "0.5.45"
 dependencies = [
  "chrono",
  "hashbrown 0.15.5",
@@ -3777,9 +3778,9 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-core"
-version = "0.4.6"
+version = "0.4.7"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "7f82f2985f00428a2ec1c115cd74cade89785e70565e56407388755e4b104cdf"
+checksum = "710f3abce2a31d8408509fc8c4dac9b3d4c56ea4d29e3d138ae0ea5b7637dd58"
 dependencies = [
  "lru",
  "parking_lot",

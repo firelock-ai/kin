@@ -21,7 +21,6 @@
 //! and never passes quietly: a proof that silently degrades to a no-op is worse
 //! than no proof, because the run is green either way.
 
-use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
@@ -402,9 +401,12 @@ async fn javascript_resolves_a_require_chain_that_a_name_match_cannot() {
 /// a runner where both tests above skip.
 #[test]
 fn without_a_server_an_enrichable_language_reports_an_actionable_gap() {
-    use kin_core::reference_coverage::{reference_enrichment_for, ReferenceEnrichment};
+    use kin_core::reference_coverage::{
+        reference_enrichment_for, LanguageServerReadiness, LanguageServerReadinessMap,
+        ReferenceEnrichment,
+    };
 
-    let none_installed: HashSet<LanguageId> = HashSet::new();
+    let none_installed = LanguageServerReadinessMap::new();
     for language in [
         LanguageId::Python,
         LanguageId::JavaScript,
@@ -425,11 +427,33 @@ fn without_a_server_an_enrichable_language_reports_an_actionable_gap() {
 
     // And with the server present the same call reports the capability rather
     // than the gap, so the row above cannot be an unconditional warning.
-    let mut installed = HashSet::new();
-    installed.insert(LanguageId::JavaScript);
+    let mut installed = LanguageServerReadinessMap::new();
+    installed.insert(LanguageId::JavaScript, LanguageServerReadiness::Usable);
     let state = reference_enrichment_for(LanguageId::JavaScript, &installed);
     assert_eq!(state, ReferenceEnrichment::Available);
     assert!(!state.is_actionable_gap());
+
+    // The state binary presence cannot see: the server is installed and cannot
+    // start. It must read as its own gap rather than as Available, and it must
+    // still be actionable, because a broken install is something an operator
+    // can repair.
+    let mut broken = LanguageServerReadinessMap::new();
+    broken.insert(
+        LanguageId::JavaScript,
+        LanguageServerReadiness::Unusable {
+            reason: "Could not find a valid TypeScript installation".to_string(),
+        },
+    );
+    let state = reference_enrichment_for(LanguageId::JavaScript, &broken);
+    assert_eq!(
+        state,
+        ReferenceEnrichment::LanguageServerUnusable,
+        "an installed server that cannot start must not report as Available"
+    );
+    assert!(
+        state.is_actionable_gap(),
+        "a broken install is a gap an operator can close, so it must be surfaced"
+    );
 }
 
 /// JavaScript and TypeScript must no longer report `Unsupported`.
@@ -440,9 +464,11 @@ fn without_a_server_an_enrichable_language_reports_an_actionable_gap() {
 /// deliberately NOT an actionable gap: a reader is told there is nothing to do.
 #[test]
 fn javascript_no_longer_reports_the_unsupported_state_it_shipped_with() {
-    use kin_core::reference_coverage::{reference_enrichment_for, ReferenceEnrichment};
+    use kin_core::reference_coverage::{
+        reference_enrichment_for, LanguageServerReadinessMap, ReferenceEnrichment,
+    };
 
-    let none_installed: HashSet<LanguageId> = HashSet::new();
+    let none_installed = LanguageServerReadinessMap::new();
     for language in [LanguageId::JavaScript, LanguageId::TypeScript] {
         assert_ne!(
             reference_enrichment_for(language, &none_installed),

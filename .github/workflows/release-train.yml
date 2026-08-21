@@ -58,7 +58,7 @@ jobs:
       # reads exactly like one that never came, which is the reading that keeps
       # the alarm quiet. The artifact stays, because later cycles need this run
       # to be readable from outside it.
-      marker: ${{ steps.plan.outputs.marker }}
+      marker: ${{ steps.proof.outputs.marker || steps.plan.outputs.marker }}
     steps:
       - name: Mint repository-scoped release branch token
         id: app-token
@@ -653,8 +653,118 @@ jobs:
             -m "Activate protected checks for the automated release PR"
           git push origin "HEAD:refs/heads/${BRANCH}"
 
-      - name: Arm protected auto-merge
+      # A release bump is ready only when the candidate has been proven. On
+      # 2026-08-20 the train merged its own bump kin#986, tagged v0.5.44 and
+      # promoted it to Latest with no preflight record for that candidate and no
+      # stranger run on its bytes. The only thing that had ever stood between
+      # the autonomous cadence and an unproofed cut was a session-local holder
+      # monitor, correctly retired when its pause-era purpose ended, and the
+      # autopilot flew through the open gate the same evening. A gate that lives
+      # in a monitor can always be retired correctly again, so this one lives in
+      # the train.
+      #
+      # Keyed on the pull request head, which is the sha the proof loop judges
+      # and the same sha the arming step below pins the merge to with
+      # --match-head-commit. Gating one sha and merging another would leave open
+      # the window this step exists to close.
+      #
+      # The policy is read from origin/main rather than from the checkout, for
+      # the same reason the release intent resolver is: the branch under
+      # judgement must not be able to lower the bar it is judged against.
+      - name: Require proof-loop artifacts for the candidate
+        id: proof
         if: steps.plan.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ steps.pr.outputs.number }}
+          BASE_TAG: ${{ steps.plan.outputs.base_tag }}
+          MAIN_SHA: ${{ steps.plan.outputs.main_sha }}
+          DRIFT: ${{ steps.plan.outputs.drift }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          head_sha="$(gh pr view "$PR" \
+            --repo "$REPO" \
+            --json headRefOid \
+            --jq .headRefOid)"
+          [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]]
+
+          gate="$RUNNER_TEMP/check-release-proof-artifacts.mjs"
+          git show \
+            "refs/remotes/origin/main:scripts/check-release-proof-artifacts.mjs" \
+            > "$gate"
+          test -s "$gate"
+
+          if out="$(CANDIDATE_SHA="$head_sha" GITHUB_REPOSITORY="$REPO" \
+            node "$gate" 2>&1)"; then
+            echo "held=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::${out}"
+            exit 0
+          fi
+
+          # Keep the whole failure on one line rather than its last line. A
+          # multi-line message whose final line is blank reads exactly like a
+          # pass, which is how a guard in this fleet once reported green while
+          # failing.
+          detail="$(printf '%s' "$out" \
+            | tr '\n' ' ' \
+            | sed -e 's/::error:://g' -e 's/  */ /g' -e 's/^ //' -e 's/ $//')"
+          echo "::notice::${detail}"
+
+          # Hold the bump in draft. Standing down is correct here and will be
+          # frequent, but standing down invisibly is how a held rail once sat
+          # for roughly twenty hours, so this writes the same marker the plan
+          # step writes and the alarm job reads.
+          if [ "$(gh pr view "$PR" --repo "$REPO" --json isDraft --jq .isDraft)" != "true" ]; then
+            gh pr ready "$PR" --repo "$REPO" --undo
+          fi
+
+          # One comment per candidate head, not one per cycle: this workflow
+          # runs on a schedule, and a hold that comments every cycle buries the
+          # PR it is trying to explain.
+          existing="$(gh pr view "$PR" --repo "$REPO" \
+            --json comments --jq '.comments[].body' 2>/dev/null || true)"
+          if [ "$(printf '%s' "$existing" | command grep -cF "$head_sha" || true)" -eq 0 ]; then
+            gh pr comment "$PR" --repo "$REPO" --body "$(printf '%s\n\n%s\n' \
+              "Held: the release proof loop has not recorded candidate ${head_sha}." \
+              "${detail}")"
+          fi
+
+          latest_tag="$(gh api "repos/${REPO}/releases/latest" --jq .tag_name 2>/dev/null || true)"
+          marker="$RUNNER_TEMP/release-hold-marker.json"
+          jq -n \
+            --arg detail "$detail" \
+            --arg latest_tag "$latest_tag" \
+            --arg base_tag "$BASE_TAG" \
+            --arg main_sha "$MAIN_SHA" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_url "${GITHUB_SERVER_URL}/${REPO}/actions/runs/${GITHUB_RUN_ID}" \
+            --argjson drift "${DRIFT:-0}" \
+            '{
+              schema: "kin.release-hold.v1",
+              state: "held",
+              reason: "proof_artifacts_missing",
+              detail: $detail,
+              blocking_tag: "",
+              latest_tag: $latest_tag,
+              base_tag: $base_tag,
+              drift: $drift,
+              main_sha: $main_sha,
+              run_id: $run_id,
+              run_url: $run_url,
+              failed_release_run_id: null,
+              failed_release_run_url: null,
+              observed_at: (now | todateiso8601)
+            }' > "$marker"
+          {
+            echo "marker<<KIN_RELEASE_HOLD_MARKER"
+            jq -c . "$marker"
+            echo "KIN_RELEASE_HOLD_MARKER"
+            echo "held=true"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Arm protected auto-merge
+        if: steps.plan.outputs.needed == 'true' && steps.proof.outputs.held != 'true'
         env:
           # Register auto-merge as the release App, not GITHUB_TOKEN. GitHub
           # suppresses most workflow events caused by GITHUB_TOKEN; an

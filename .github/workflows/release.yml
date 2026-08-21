@@ -528,7 +528,7 @@ jobs:
           repository: firelock-ai/kin-vfs
           path: kin-vfs
           # Release inputs must never move under an unchanged Kin tag.
-          ref: 2596a4477cfb0b389d9c52026cf9da8f7ff40138
+          ref: 3ad20e675b58d227e3100ef0012ce048dbc1fc5a
           persist-credentials: false
 
       - name: Verify canonical release input bytes
@@ -1154,7 +1154,7 @@ jobs:
           ARTIFACT: ${{ matrix.artifact }}
           TARGET: ${{ matrix.target }}
           VFS_TARGET: ${{ matrix.vfs_target || matrix.target }}
-          EXPECTED_VFS_COMMIT: 2596a4477cfb0b389d9c52026cf9da8f7ff40138
+          EXPECTED_VFS_COMMIT: 3ad20e675b58d227e3100ef0012ce048dbc1fc5a
         run: |
           set -euo pipefail
           node <<'NODE'
@@ -1442,7 +1442,7 @@ jobs:
         with:
           repository: firelock-ai/kin-vfs
           path: release-inputs/kin-vfs
-          ref: 2596a4477cfb0b389d9c52026cf9da8f7ff40138
+          ref: 3ad20e675b58d227e3100ef0012ce048dbc1fc5a
           persist-credentials: false
 
       - name: Download all artifacts
@@ -1510,7 +1510,7 @@ jobs:
 
       - name: Verify and aggregate release provenance
         env:
-          EXPECTED_VFS_COMMIT: 2596a4477cfb0b389d9c52026cf9da8f7ff40138
+          EXPECTED_VFS_COMMIT: 3ad20e675b58d227e3100ef0012ce048dbc1fc5a
         run: |
           set -euo pipefail
           node <<'NODE'
@@ -1872,7 +1872,7 @@ jobs:
     uses: ./.github/workflows/install-proof.yml
     with:
       release_tag: ${{ github.ref_name }}
-      expected_vfs_commit: 2596a4477cfb0b389d9c52026cf9da8f7ff40138
+      expected_vfs_commit: 3ad20e675b58d227e3100ef0012ce048dbc1fc5a
     permissions:
       contents: read
       attestations: read
@@ -2320,11 +2320,34 @@ jobs:
     environment: release
     permissions:
       contents: write
+      # Resolving the pull request behind the tagged commit, which is how the
+      # proof gate below bridges a squash back to the candidate that was proven.
+      pull-requests: read
     steps:
       - name: Checkout release policy
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
+
+      # The same evidence the release train requires before it merges a bump,
+      # required again here against the tag actually being promoted. The train's
+      # gate protects the path the train owns; this one protects every other
+      # path into Latest, because a tag reaches Latest through this job no
+      # matter how it was minted. On 2026-08-20 v0.5.44 reached Latest with no
+      # preflight record and no stranger run, and nothing in the train knew the
+      # proof loop existed.
+      #
+      # A squash mints a new commit, so a tag's own sha is never the sha the
+      # proof loop judged: v0.5.44's tag commit a4ffe620 is kin#986's squash,
+      # while the preflight for that line judged the release-next head. The
+      # resolver bridges that through the merged pull request. A commit no
+      # merged pull request produced resolves to nothing and is refused, which
+      # is the intended answer for a hand-pushed tag.
+      - name: Require proof-loop artifacts for the tagged candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESOLVE_FROM_COMMIT: ${{ github.sha }}
+        run: node scripts/check-release-proof-artifacts.mjs
 
       - name: Promote stable tag after public and npm proof
         if: ${{ !contains(github.ref_name, '-') }}

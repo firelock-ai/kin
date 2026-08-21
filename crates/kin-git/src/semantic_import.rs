@@ -1772,6 +1772,55 @@ mod tests {
         admitted.validate(&blob_store).unwrap();
     }
 
+    /// What one conversion costs in whole-repository decompressions.
+    ///
+    /// The number is the point. Every step below asks for the same object
+    /// closure over the same unchanged objects, and before the closure was
+    /// shared each ask rebuilt it from the CAS: reading and verifying every
+    /// object body in the repository. On this fixture the repository is three
+    /// objects, so the rebuilds are free and only the COUNT is visible. On the
+    /// 1,200-commit flask corpus each one is 162.5 MiB decompressed against
+    /// 13 MB packed, which is what made this the conversion wall.
+    ///
+    /// Deliberately not a threshold. A test that asserted "fewer than before"
+    /// would keep passing as the count crept back up, so this pins the exact
+    /// number and fails in both directions.
+    #[test]
+    fn one_conversion_rebuilds_the_object_closure_once() {
+        let root = tempdir().unwrap();
+        let repo = root.path().join("source");
+        fs::create_dir(&repo).unwrap();
+        git_ok(&repo, ["init", "--initial-branch=main"]);
+        configure_git(&repo);
+        write(&repo, "lib.rs", b"pub fn f() -> u32 { 1 }\n");
+        git_ok(&repo, ["add", "--all"]);
+        git_ok(&repo, ["commit", "-m", "initial"]);
+        let blob_store = BlobStore::new(root.path().join("cas")).unwrap();
+
+        let before = crate::lossless::closure_reconstruction_count();
+        let snapshot = capture_lossless_git_repository(
+            &repo,
+            RepositoryId::new("closure-count").unwrap(),
+            &blob_store,
+        )
+        .unwrap();
+        let plan = plan_semantic_git_import(&snapshot, &blob_store).unwrap();
+        // The two proofs a conversion runs over the same objects: the plan
+        // re-derived from raw objects, and the enriched fold checked against
+        // that derivation.
+        plan.validate(&blob_store).unwrap();
+        let admitted = admit_semantic_git_import(&plan, &blob_store).unwrap();
+        admitted.validate(&blob_store).unwrap();
+        let rebuilds = crate::lossless::closure_reconstruction_count() - before;
+
+        assert_eq!(
+            rebuilds, 1,
+            "one conversion over one unchanged object set must decompress that set ONCE; \
+             {rebuilds} rebuilds means the closure is being rebuilt per caller again, which is \
+             the conversion wall this sharing removed"
+        );
+    }
+
     #[test]
     fn missing_tampered_cas_and_mutated_plan_fail_closed() {
         let root = tempdir().unwrap();
