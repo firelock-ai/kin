@@ -55,6 +55,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Stage what kin agent writes, so a run lands a commit (#1049)
 - Order the LSP cold sweep behind the embedding backfill on first boot (#1050)
 - Rank a public entity above its private helpers on a description query (#1051)
+- Admit a path-keyed rewrite of a tracked file as a stage operation (#1052)
 
 
 ## [0.5.46] - 2026-08-21
