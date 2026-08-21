@@ -563,9 +563,11 @@ pub fn collect_daemon_search_response(
 fn collect_daemon_semantic_search_response(
     graph: &kin_db::InMemoryGraph,
     request: &DaemonSearchRequest,
+    envelope: &kin_mcp::Envelope,
 ) -> Result<DaemonSearchResponse> {
     let _ = graph;
     let _ = request;
+    let _ = envelope;
     anyhow::bail!("semantic search requires vector-enabled Kin embeddings")
 }
 
