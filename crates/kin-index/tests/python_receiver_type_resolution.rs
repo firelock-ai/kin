@@ -586,6 +586,304 @@ class Session:
     );
 }
 
+// ── The declared receiver whose class is in the calling file ────────────────
+//
+// Every fixture above splits the annotated receiver from its class across two
+// files, which is the shape FIR-2500 was filed on. The greenfield miss is the
+// other half: one module holds the class and the module-level function that
+// takes it as an annotated parameter, and the call between them is the one a
+// reader would expect to be easiest.
+
+/// One module, both halves. `Database` and the function annotating a parameter
+/// with it live in `storage.py`, so the owner half of the qualified callee
+/// names a class in the calling file.
+const STORAGE_PY: &str = r#"
+class Database:
+    def upsert_note(self, path, body):
+        return path
+
+
+def ingest_directory(database: Database, root):
+    return database.upsert_note(root, "")
+"#;
+
+/// A second file so the fixture universe is a real cross-file link rather than
+/// a single-file degenerate case, and so its own cross-file call can serve as
+/// the positive control that the linker ran at all.
+const NOTEKEEPER_CLI_PY: &str = r#"
+from storage import ingest_directory
+
+
+def main(database, root):
+    return ingest_directory(database, root)
+"#;
+
+#[test]
+fn a_declared_receiver_binds_when_its_class_is_in_the_calling_file() {
+    let files = vec![
+        parse_py("storage.py", STORAGE_PY),
+        parse_py("cli.py", NOTEKEEPER_CLI_PY),
+    ];
+    let target = entity_id(
+        &files,
+        "storage.py",
+        "Database.upsert_note",
+        EntityKind::Method,
+    );
+    let caller = entity_id(
+        &files,
+        "storage.py",
+        "ingest_directory",
+        EntityKind::Function,
+    );
+    let main = entity_id(&files, "cli.py", "main", EntityKind::Function);
+
+    let relations = link_cross_file(&files);
+
+    assert!(
+        has_call(&relations, main, caller),
+        "positive control: this fixture's cross-file call must bind, or the \
+         same-file assertion below is measuring a linker that never ran"
+    );
+
+    assert!(
+        has_call(&relations, caller, target),
+        "`database.upsert_note(root, \"\")` under `database: Database` must \
+         bind to Database.upsert_note when Database is declared in this very \
+         file; a declared type the caller can see without an import is the \
+         easiest case, not the hardest"
+    );
+
+    let edge = relations
+        .iter()
+        .find(|r| {
+            r.kind == RelationKind::Calls
+                && r.src.as_entity() == Some(caller)
+                && r.dst.as_entity() == Some(target)
+        })
+        .expect("the declared receiver type binds this call");
+
+    assert_eq!(
+        RelationResolution::of(edge).as_str(),
+        "type_resolved",
+        "and it must publish as proven from the declared type, exactly as the \
+         cross-file twin does; a disclaimed bare-name edge is withheld from \
+         the counts find_references reports"
+    );
+}
+
+#[test]
+fn the_same_declared_receiver_binds_with_its_class_moved_to_another_file() {
+    // The control, and a minimal pair with the test above: same annotation,
+    // same call text, same callee. The one difference is that `Database` now
+    // lives in its own file and an import brings the name back. This is the
+    // path the rest of this suite covers, so it must pass, which is what makes
+    // a failure above a statement about the class's file and nothing else.
+    let files = vec![
+        parse_py(
+            "db.py",
+            r#"
+class Database:
+    def upsert_note(self, path, body):
+        return path
+"#,
+        ),
+        parse_py(
+            "storage.py",
+            r#"
+from db import Database
+
+
+def ingest_directory(database: Database, root):
+    return database.upsert_note(root, "")
+"#,
+        ),
+        parse_py("cli.py", NOTEKEEPER_CLI_PY),
+    ];
+    let target = entity_id(&files, "db.py", "Database.upsert_note", EntityKind::Method);
+    let caller = entity_id(
+        &files,
+        "storage.py",
+        "ingest_directory",
+        EntityKind::Function,
+    );
+
+    let relations = link_cross_file(&files);
+
+    assert!(
+        has_call(&relations, caller, target),
+        "the cross-file half of the pair must bind through the declared type"
+    );
+
+    let edge = relations
+        .iter()
+        .find(|r| {
+            r.kind == RelationKind::Calls
+                && r.src.as_entity() == Some(caller)
+                && r.dst.as_entity() == Some(target)
+        })
+        .expect("the declared receiver type binds this call");
+
+    assert_eq!(
+        RelationResolution::of(edge).as_str(),
+        "type_resolved",
+        "the cross-file half publishes the declared-type marker"
+    );
+}
+
+#[test]
+fn the_incremental_linker_binds_the_same_file_declared_receiver() {
+    // The live-edit twin of the pair above. A daemon relinking a touched file
+    // runs its own copy of these tiers, so a rule proven on the batch linker
+    // says nothing about the path a running editor session actually uses.
+    let files = vec![
+        parse_py("storage.py", STORAGE_PY),
+        parse_py("cli.py", NOTEKEEPER_CLI_PY),
+    ];
+    let target = entity_id(
+        &files,
+        "storage.py",
+        "Database.upsert_note",
+        EntityKind::Method,
+    );
+    let caller = entity_id(
+        &files,
+        "storage.py",
+        "ingest_directory",
+        EntityKind::Function,
+    );
+    let main = entity_id(&files, "cli.py", "main", EntityKind::Function);
+
+    let relations = link_incremental(&files);
+
+    assert!(
+        has_call(&relations, main, caller),
+        "positive control: the incremental linker must bind this fixture's \
+         cross-file call, or the same-file assertion below is measuring a \
+         linker that never ran"
+    );
+
+    assert!(
+        has_call(&relations, caller, target),
+        "the incremental linker must bind `database.upsert_note(root, \"\")` \
+         under `database: Database` to Database.upsert_note when Database is \
+         declared in the same file, exactly as the batch linker does"
+    );
+
+    let edge = relations
+        .iter()
+        .find(|r| {
+            r.kind == RelationKind::Calls
+                && r.src.as_entity() == Some(caller)
+                && r.dst.as_entity() == Some(target)
+        })
+        .expect("the declared receiver type binds this call incrementally too");
+
+    assert_eq!(
+        RelationResolution::of(edge).as_str(),
+        "type_resolved",
+        "and it must publish the same declared-type marker on both paths, or a \
+         live edit would quietly downgrade an edge a full index proves"
+    );
+}
+
+/// The same shape with the decoy the same-file tier refuses. `upsert_note` is
+/// a module-level function here as well as a method on `Database`, and
+/// `ingest_untyped` calls the leaf through a receiver carrying no annotation.
+const DECOY_STORAGE_PY: &str = r#"
+class Database:
+    def upsert_note(self, path, body):
+        return path
+
+
+def upsert_note(path, body):
+    return path
+
+
+def ingest_directory(database: Database, root):
+    return database.upsert_note(root, "")
+
+
+def ingest_untyped(database, root):
+    return database.upsert_note(root, "")
+"#;
+
+/// The ids the decoy fixture's two assertions are written against.
+struct DecoyIds {
+    method: EntityId,
+    free_function: EntityId,
+    typed_caller: EntityId,
+    untyped_caller: EntityId,
+    main: EntityId,
+}
+
+fn decoy_fixture() -> (Vec<FileParseData>, DecoyIds) {
+    let files = vec![
+        parse_py("storage.py", DECOY_STORAGE_PY),
+        parse_py("cli.py", NOTEKEEPER_CLI_PY),
+    ];
+    let ids = DecoyIds {
+        method: entity_id(
+            &files,
+            "storage.py",
+            "Database.upsert_note",
+            EntityKind::Method,
+        ),
+        free_function: entity_id(&files, "storage.py", "upsert_note", EntityKind::Function),
+        typed_caller: entity_id(
+            &files,
+            "storage.py",
+            "ingest_directory",
+            EntityKind::Function,
+        ),
+        untyped_caller: entity_id(&files, "storage.py", "ingest_untyped", EntityKind::Function),
+        main: entity_id(&files, "cli.py", "main", EntityKind::Function),
+    };
+    (files, ids)
+}
+
+/// Assert the decoy stayed refused and the declared type still won, whichever
+/// linker produced `relations`.
+fn assert_decoy_refused(relations: &[kin_model::Relation], ids: &DecoyIds, path: &str) {
+    assert!(
+        has_call(relations, ids.main, ids.typed_caller),
+        "positive control on the {path} linker: this fixture's cross-file call \
+         must bind, or the assertions below are measuring a linker that never ran"
+    );
+
+    assert!(
+        has_call(relations, ids.typed_caller, ids.method),
+        "the {path} linker must still bind the annotated call to the class's \
+         own method; the decoy sharing the leaf name must not cost the edge"
+    );
+
+    assert!(
+        !has_call(relations, ids.typed_caller, ids.free_function),
+        "the {path} linker must not bind `database.upsert_note()` to the \
+         module-level `upsert_note`: the leaf is a member name read off a \
+         value, and a same-file free function sharing it is a decoy"
+    );
+
+    assert!(
+        !has_call(relations, ids.untyped_caller, ids.free_function),
+        "and with no annotation to name an owner, the {path} linker must \
+         refuse the decoy outright rather than fall back to it, which is the \
+         guard the same-file tier's receiver filter exists for"
+    );
+}
+
+#[test]
+fn a_same_file_free_function_sharing_the_method_name_still_loses_to_the_class() {
+    let (files, ids) = decoy_fixture();
+    assert_decoy_refused(&link_cross_file(&files), &ids, "batch");
+}
+
+#[test]
+fn the_incremental_linker_keeps_the_same_file_decoy_refused_too() {
+    let (files, ids) = decoy_fixture();
+    assert_decoy_refused(&link_incremental(&files), &ids, "incremental");
+}
+
 // ── FIR-2508: a module and a same-named function ────────────────────────────
 
 const SEARCH_PY: &str = r#"
