@@ -1120,6 +1120,334 @@ impl Serialize for RepositoryTransaction {
     }
 }
 
+/// Canonically ordered view of a transaction that borrows rather than clones.
+///
+/// [`RepositoryTransaction::canonical_hash`] must sort several collections
+/// before it serializes, and the only way to sort an owned `Vec` is to own it.
+/// The implementation this replaced cloned the entire transaction to get
+/// something mutable, which on a whole-history import is a second copy of every
+/// change, every tree delta and every external object, charged at the point
+/// admission already holds its largest working set. Measured at 259 MiB
+/// transient on a 32-commit fixture, and it ran on every commit.
+///
+/// This holds `&` to the original plus one `Vec` of references per sorted
+/// collection, so the cost is a pointer per element instead of a deep copy.
+///
+/// # The obligation these types carry
+///
+/// The bytes are a durable identity. `transaction_hash` is stored in every
+/// [`RepositoryCommitReceipt`] and compared on idempotent replay, so a view that
+/// serializes one byte differently from the owned type invalidates receipts
+/// already on disk. Each type below therefore mirrors its owned counterpart's
+/// serialization exactly: the same struct name, the same field names in the
+/// same order, the same field count, and the same skip rules. Where the owned
+/// type hand-writes its encoding, the view hand-writes the same one; where the
+/// owned type derives, the view reproduces what that derive emits.
+///
+/// Enforced by `the_canonicalization_matches_the_implementation_it_replaced`
+/// and `the_canonical_view_serializes_positionally_identical_bytes`. The first
+/// runs the production hash against the retained cloning reference over 64
+/// permutations. The second is not redundant: the hash encodes through
+/// `canonical_json_bytes`, whose object encoder sorts keys, so field ORDER is
+/// invisible to it. The positional test drives the non-human-readable branch,
+/// where order, struct name and field count are all load-bearing.
+struct CanonicalTransaction<'a> {
+    source: &'a RepositoryTransaction,
+    changes: Vec<CanonicalChange<'a>>,
+    external_objects: Vec<&'a ExternalObjectRecord>,
+    aliases: Vec<&'a ExternalChangeAlias>,
+    ref_mutations: Vec<&'a RefMutation>,
+    workspace_mutation: Option<CanonicalWorkspaceMutation<'a>>,
+}
+
+impl<'a> CanonicalTransaction<'a> {
+    fn new(source: &'a RepositoryTransaction) -> Self {
+        let mut changes: Vec<CanonicalChange<'a>> =
+            source.changes.iter().map(CanonicalChange::new).collect();
+        changes.sort_by_key(|change| change.source.id);
+
+        let mut external_objects: Vec<&'a ExternalObjectRecord> =
+            source.external_objects.iter().collect();
+        external_objects.sort_by_key(|record| record.object);
+
+        let mut aliases: Vec<&'a ExternalChangeAlias> = source.aliases.iter().collect();
+        aliases.sort_by_key(|alias| alias.oid);
+
+        let mut ref_mutations: Vec<&'a RefMutation> = source.ref_mutations.iter().collect();
+        ref_mutations.sort_by(|left, right| left.name.cmp(&right.name));
+
+        Self {
+            source,
+            changes,
+            external_objects,
+            aliases,
+            ref_mutations,
+            workspace_mutation: source
+                .workspace_mutation
+                .as_ref()
+                .map(CanonicalWorkspaceMutation::new),
+        }
+    }
+}
+
+impl Serialize for CanonicalTransaction<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let source = self.source;
+
+        if serializer.is_human_readable() {
+            use serde::ser::SerializeStruct;
+
+            // Mirrors the derive on `RepositoryTransactionHumanReadable`,
+            // including its name: a serializer that records struct names must
+            // see the same one. Its two tail fields skip independently on their
+            // own `Option::is_none`, which is NOT the positional branch's rule.
+            const HUMAN_READABLE_FIELD_COUNT: usize = 15;
+            let field_count = HUMAN_READABLE_FIELD_COUNT
+                + usize::from(source.merge_transaction_delta.is_some())
+                + usize::from(source.sealed_observation.is_some());
+            let mut state =
+                serializer.serialize_struct("RepositoryTransactionHumanReadable", field_count)?;
+            state.serialize_field("schema_version", &source.schema_version)?;
+            state.serialize_field("operation_id", &source.operation_id)?;
+            state.serialize_field("repository_id", &source.repository_id)?;
+            state.serialize_field("expected_generation", &source.expected_generation)?;
+            state.serialize_field("expected_roots", &source.expected_roots)?;
+            state.serialize_field("actor", &source.actor)?;
+            state.serialize_field("reason", source.reason.as_str())?;
+            state.serialize_field("external_objects", &self.external_objects)?;
+            state.serialize_field("git_authority_delta", &source.git_authority_delta)?;
+            state.serialize_field("changes", &self.changes)?;
+            state.serialize_field("aliases", &self.aliases)?;
+            state.serialize_field("ref_mutations", &self.ref_mutations)?;
+            state.serialize_field("default_ref_mutation", &source.default_ref_mutation)?;
+            state.serialize_field("workspace_mutation", &self.workspace_mutation)?;
+            state.serialize_field("local_overlay_delta", &source.local_overlay_delta)?;
+            if source.merge_transaction_delta.is_some() {
+                state
+                    .serialize_field("merge_transaction_delta", &source.merge_transaction_delta)?;
+            }
+            if source.sealed_observation.is_some() {
+                state.serialize_field("sealed_observation", &source.sealed_observation)?;
+            }
+            return state.end();
+        }
+
+        use serde::ser::SerializeSeq;
+
+        // Mirrors the positional branch of `impl Serialize for
+        // RepositoryTransaction`, whose element count varies with which
+        // optional tail fields are present.
+        const LEGACY_FIELD_COUNT: usize = 15;
+        let has_merge_slot =
+            source.merge_transaction_delta.is_some() || source.sealed_observation.is_some();
+        let field_count = LEGACY_FIELD_COUNT
+            + usize::from(has_merge_slot)
+            + usize::from(source.sealed_observation.is_some());
+        let mut sequence = serializer.serialize_seq(Some(field_count))?;
+        sequence.serialize_element(&source.schema_version)?;
+        sequence.serialize_element(&source.operation_id)?;
+        sequence.serialize_element(&source.repository_id)?;
+        sequence.serialize_element(&source.expected_generation)?;
+        sequence.serialize_element(&source.expected_roots)?;
+        sequence.serialize_element(&source.actor)?;
+        sequence.serialize_element(&source.reason)?;
+        sequence.serialize_element(&self.external_objects)?;
+        sequence.serialize_element(&source.git_authority_delta)?;
+        sequence.serialize_element(&self.changes)?;
+        sequence.serialize_element(&self.aliases)?;
+        sequence.serialize_element(&self.ref_mutations)?;
+        sequence.serialize_element(&source.default_ref_mutation)?;
+        sequence.serialize_element(&self.workspace_mutation)?;
+        sequence.serialize_element(&source.local_overlay_delta)?;
+        if has_merge_slot {
+            sequence.serialize_element(&source.merge_transaction_delta)?;
+        }
+        if source.sealed_observation.is_some() {
+            sequence.serialize_element(&source.sealed_observation)?;
+        }
+        sequence.end()
+    }
+}
+
+/// Canonically ordered view of one [`SemanticChange`].
+///
+/// Mirrors that type's derive rather than a hand-written encoding, so the
+/// obligation is field order, the struct name, and the trailing
+/// `skip_serializing_if = "Vec::is_empty"` on `external_reference_deltas`.
+struct CanonicalChange<'a> {
+    source: &'a SemanticChange,
+    entity_deltas: Vec<&'a EntityDelta>,
+    relation_deltas: Vec<&'a RelationDelta>,
+    tree_deltas: Vec<&'a TreeDelta>,
+    external_reference_deltas: Vec<&'a ExternalReferenceDelta>,
+}
+
+impl<'a> CanonicalChange<'a> {
+    fn new(source: &'a SemanticChange) -> Self {
+        let mut entity_deltas: Vec<&'a EntityDelta> = source.entity_deltas.iter().collect();
+        entity_deltas.sort_by_key(|delta| EntityDelta::target_id(delta));
+
+        let mut relation_deltas: Vec<&'a RelationDelta> = source.relation_deltas.iter().collect();
+        relation_deltas.sort_by_key(|delta| RelationDelta::target_id(delta));
+
+        let mut tree_deltas: Vec<&'a TreeDelta> = source.tree_deltas.iter().collect();
+        tree_deltas.sort_by_key(|delta| TreeDelta::artifact_id(delta));
+
+        let mut external_reference_deltas: Vec<&'a ExternalReferenceDelta> =
+            source.external_reference_deltas.iter().collect();
+        external_reference_deltas.sort_by_key(|delta| ExternalReferenceDelta::target_id(delta));
+
+        Self {
+            source,
+            entity_deltas,
+            relation_deltas,
+            tree_deltas,
+            external_reference_deltas,
+        }
+    }
+}
+
+impl Serialize for CanonicalChange<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let source = self.source;
+        const ALWAYS_PRESENT_FIELD_COUNT: usize = 14;
+        let field_count =
+            ALWAYS_PRESENT_FIELD_COUNT + usize::from(!self.external_reference_deltas.is_empty());
+        let mut state = serializer.serialize_struct("SemanticChange", field_count)?;
+        state.serialize_field("id", &source.id)?;
+        state.serialize_field("origin", &source.origin)?;
+        state.serialize_field("parents", &source.parents)?;
+        state.serialize_field("timestamp", &source.timestamp)?;
+        state.serialize_field("author", &source.author)?;
+        state.serialize_field("message", &source.message)?;
+        state.serialize_field("entity_deltas", &self.entity_deltas)?;
+        state.serialize_field("relation_deltas", &self.relation_deltas)?;
+        state.serialize_field("tree_deltas", &self.tree_deltas)?;
+        state.serialize_field("admission_policy_delta", &source.admission_policy_delta)?;
+        state.serialize_field("projected_files", &source.projected_files)?;
+        state.serialize_field("spec_link", &source.spec_link)?;
+        state.serialize_field("evidence", &source.evidence)?;
+        state.serialize_field("risk_summary", &source.risk_summary)?;
+        if !self.external_reference_deltas.is_empty() {
+            state.serialize_field("external_reference_deltas", &self.external_reference_deltas)?;
+        }
+        state.end()
+    }
+}
+
+/// Canonically ordered view of one [`WorkspaceMutation`].
+///
+/// Mirrors that type's derive: eleven fields, none skipped.
+struct CanonicalWorkspaceMutation<'a> {
+    source: &'a WorkspaceMutation,
+    tree_deltas: Vec<&'a TreeDelta>,
+    semantic_delta: CanonicalWorkspaceSemanticDelta<'a>,
+}
+
+impl<'a> CanonicalWorkspaceMutation<'a> {
+    fn new(source: &'a WorkspaceMutation) -> Self {
+        let mut tree_deltas: Vec<&'a TreeDelta> = source.tree_deltas.iter().collect();
+        tree_deltas.sort_by_key(|delta| TreeDelta::artifact_id(delta));
+        Self {
+            source,
+            tree_deltas,
+            semantic_delta: CanonicalWorkspaceSemanticDelta::new(&source.semantic_delta),
+        }
+    }
+}
+
+impl Serialize for CanonicalWorkspaceMutation<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let source = self.source;
+        let mut state = serializer.serialize_struct("WorkspaceMutation", 11)?;
+        state.serialize_field("workspace_id", &source.workspace_id)?;
+        state.serialize_field("expected", &source.expected)?;
+        state.serialize_field("new_generation", &source.new_generation)?;
+        state.serialize_field("new_head", &source.new_head)?;
+        state.serialize_field("new_base_target", &source.new_base_target)?;
+        state.serialize_field("new_base_tree_hash", &source.new_base_tree_hash)?;
+        state.serialize_field("tree_deltas", &self.tree_deltas)?;
+        state.serialize_field("new_tree_hash", &source.new_tree_hash)?;
+        state.serialize_field("semantic_delta", &self.semantic_delta)?;
+        state.serialize_field(
+            "new_shared_admission_policy",
+            &source.new_shared_admission_policy,
+        )?;
+        state.serialize_field("new_admission_policy", &source.new_admission_policy)?;
+        state.end()
+    }
+}
+
+/// Canonically ordered view of one [`WorkspaceSemanticDelta`].
+///
+/// The only collection here that a valid transaction can carry out of order is
+/// none of them: `WorkspaceSemanticDelta::validate` REJECTS non-canonical order
+/// rather than canonicalizing it, so this view's sorting is defensive against
+/// input that cannot legally arrive. It is still exercised, because the
+/// differential drives `canonical_hash` directly and can therefore feed it
+/// orderings no valid transaction may carry.
+struct CanonicalWorkspaceSemanticDelta<'a> {
+    source: &'a WorkspaceSemanticDelta,
+    entity_deltas: Vec<&'a EntityDelta>,
+    relation_deltas: Vec<&'a RelationDelta>,
+    external_reference_deltas: Vec<&'a ExternalReferenceDelta>,
+}
+
+impl<'a> CanonicalWorkspaceSemanticDelta<'a> {
+    fn new(source: &'a WorkspaceSemanticDelta) -> Self {
+        let mut entity_deltas: Vec<&'a EntityDelta> = source.entity_deltas.iter().collect();
+        entity_deltas.sort_by_key(|delta| EntityDelta::target_id(delta));
+
+        let mut relation_deltas: Vec<&'a RelationDelta> = source.relation_deltas.iter().collect();
+        relation_deltas.sort_by_key(|delta| RelationDelta::target_id(delta));
+
+        let mut external_reference_deltas: Vec<&'a ExternalReferenceDelta> =
+            source.external_reference_deltas.iter().collect();
+        external_reference_deltas.sort_by_key(|delta| ExternalReferenceDelta::target_id(delta));
+
+        Self {
+            source,
+            entity_deltas,
+            relation_deltas,
+            external_reference_deltas,
+        }
+    }
+}
+
+impl Serialize for CanonicalWorkspaceSemanticDelta<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        const ALWAYS_PRESENT_FIELD_COUNT: usize = 3;
+        let field_count =
+            ALWAYS_PRESENT_FIELD_COUNT + usize::from(!self.external_reference_deltas.is_empty());
+        let mut state = serializer.serialize_struct("WorkspaceSemanticDelta", field_count)?;
+        state.serialize_field("version", &self.source.version)?;
+        state.serialize_field("entity_deltas", &self.entity_deltas)?;
+        state.serialize_field("relation_deltas", &self.relation_deltas)?;
+        if !self.external_reference_deltas.is_empty() {
+            state.serialize_field("external_reference_deltas", &self.external_reference_deltas)?;
+        }
+        state.end()
+    }
+}
+
 impl RepositoryTransaction {
     pub fn validate(&self) -> Result<()> {
         if self.schema_version != REPOSITORY_TRANSACTION_SCHEMA_VERSION {
@@ -1321,32 +1649,10 @@ impl RepositoryTransaction {
     /// not satisfy `validate`. Callers outside tests want `transaction_hash`,
     /// which validates first.
     fn canonical_hash(&self) -> Result<Hash256> {
-        let mut canonical = self.clone();
-        canonical.changes.sort_by_key(|change| change.id);
-        for change in &mut canonical.changes {
-            change
-                .entity_deltas
-                .sort_by_key(crate::EntityDelta::target_id);
-            change
-                .relation_deltas
-                .sort_by_key(crate::RelationDelta::target_id);
-            change.tree_deltas.sort_by_key(TreeDelta::artifact_id);
-            change
-                .external_reference_deltas
-                .sort_by_key(ExternalReferenceDelta::target_id);
-        }
-        canonical
-            .external_objects
-            .sort_by_key(|record| record.object);
-        canonical.aliases.sort_by_key(|alias| alias.oid);
-        canonical
-            .ref_mutations
-            .sort_by(|left, right| left.name.cmp(&right.name));
-        if let Some(workspace) = &mut canonical.workspace_mutation {
-            workspace.tree_deltas.sort_by_key(TreeDelta::artifact_id);
-            workspace.semantic_delta.sort_canonical();
-        }
-        hash_serialized(b"kin-repository-transaction-v4\0", &canonical)
+        hash_serialized(
+            b"kin-repository-transaction-v4\0",
+            &CanonicalTransaction::new(self),
+        )
     }
 }
 
@@ -1714,6 +2020,88 @@ mod tests {
             merge_transaction_delta: None,
             sealed_observation: None,
         }
+    }
+
+    /// Thread-local peak-live-bytes probe for the canonicalization measurement.
+    ///
+    /// Thread-local rather than process-wide on purpose: `cargo test` runs this
+    /// binary's tests in parallel threads, and a global counter would be moved
+    /// by whatever else happens to be running, which is the difference between
+    /// a measurement and a coincidence.
+    ///
+    /// Counts live heap rather than RSS. RSS keeps counting pages the allocator
+    /// freed but has not returned to the OS, so it is not reproducible across
+    /// allocators or platforms; live bytes are.
+    mod alloc_probe {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static ARMED: Cell<bool> = const { Cell::new(false) };
+            static LIVE: Cell<isize> = const { Cell::new(0) };
+            static PEAK: Cell<isize> = const { Cell::new(0) };
+        }
+
+        pub struct CountingAllocator;
+
+        fn record(delta: isize) {
+            // `try_with` because a thread tearing down has no thread-local
+            // left to reach, and an allocator must not panic there.
+            let _ = ARMED.try_with(|armed| {
+                if !armed.get() {
+                    return;
+                }
+                let _ = LIVE.try_with(|live| {
+                    let now = live.get() + delta;
+                    live.set(now);
+                    let _ = PEAK.try_with(|peak| {
+                        if now > peak.get() {
+                            peak.set(now);
+                        }
+                    });
+                });
+            });
+        }
+
+        unsafe impl GlobalAlloc for CountingAllocator {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                let pointer = unsafe { System.alloc(layout) };
+                if !pointer.is_null() {
+                    record(layout.size() as isize);
+                }
+                pointer
+            }
+
+            unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+                record(-(layout.size() as isize));
+                unsafe { System.dealloc(pointer, layout) }
+            }
+
+            unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+                let moved = unsafe { System.realloc(pointer, layout, new_size) };
+                if !moved.is_null() {
+                    record(new_size as isize - layout.size() as isize);
+                }
+                moved
+            }
+        }
+
+        /// Peak live bytes allocated by `body` on this thread.
+        pub fn peak_live_bytes(body: impl FnOnce()) -> usize {
+            LIVE.with(|live| live.set(0));
+            PEAK.with(|peak| peak.set(0));
+            ARMED.with(|armed| armed.set(true));
+            body();
+            ARMED.with(|armed| armed.set(false));
+            usize::try_from(PEAK.with(Cell::get)).unwrap_or(0)
+        }
+    }
+
+    #[global_allocator]
+    static COUNTING_ALLOCATOR: alloc_probe::CountingAllocator = alloc_probe::CountingAllocator;
+
+    fn measure_peak_live_bytes(body: impl FnOnce()) -> usize {
+        alloc_probe::peak_live_bytes(body)
     }
 
     fn sealed_observation() -> SealedObservationBinding {
@@ -2885,6 +3273,22 @@ mod tests {
     /// produce the same bytes as the implementation it replaces, on inputs
     /// chosen to vary exactly what it changed.
     fn reference_canonical_hash(transaction: &RepositoryTransaction) -> Result<Hash256> {
+        hash_serialized(
+            b"kin-repository-transaction-v4\0",
+            &reference_canonical_transaction(transaction),
+        )
+    }
+
+    /// The owned, sorted transaction the reference implementation built.
+    ///
+    /// Split out of [`reference_canonical_hash`] so the same reference can be
+    /// serialized directly, which is what
+    /// `the_canonical_view_serializes_positionally_identical_bytes` needs: the
+    /// hash encodes through `canonical_json_bytes`, whose object encoder sorts
+    /// keys, so comparing hashes alone cannot see a field order difference.
+    fn reference_canonical_transaction(
+        transaction: &RepositoryTransaction,
+    ) -> RepositoryTransaction {
         let mut canonical = transaction.clone();
         canonical.changes.sort_by_key(|change| change.id);
         for change in &mut canonical.changes {
@@ -2910,7 +3314,7 @@ mod tests {
             workspace.tree_deltas.sort_by_key(TreeDelta::artifact_id);
             workspace.semantic_delta.sort_canonical();
         }
-        hash_serialized(b"kin-repository-transaction-v4\0", &canonical)
+        canonical
     }
 
     /// Deterministic permutation, so a failure is reproducible from its seed.
@@ -3030,6 +3434,274 @@ mod tests {
         }
     }
 
+    /// The canonical view must produce the same bytes POSITIONALLY, not merely
+    /// the same hash.
+    ///
+    /// This is not a duplicate of
+    /// [`the_canonicalization_matches_the_implementation_it_replaced`]. That
+    /// test compares hashes, and the hash is built by `canonical_json_bytes`,
+    /// which routes through `serde_json::to_value` and then an encoder that
+    /// SORTS object keys (`identity.rs`, the `Value::Object` arm). Field order
+    /// is therefore invisible to it: swapping two fields in a mirror view type
+    /// keeps every one of those 64 permutations green.
+    ///
+    /// A field order the mirror got wrong is exactly the failure mode these
+    /// view types can have, so the guard against it has to be a serializer that
+    /// can see order. MessagePack is not human-readable, so it drives the
+    /// positional branch of the transaction's own `Serialize` impl, where the
+    /// element count varies with the optional tail fields, and it encodes each
+    /// struct as an ordered array. Order, element count and skip rules are all
+    /// load-bearing here.
+    #[test]
+    fn the_canonical_view_serializes_positionally_identical_bytes() {
+        let base = differential_fixture();
+        for seed in 0..64_u64 {
+            let mut permuted = base.clone();
+            permute_every_canonicalized_collection(&mut permuted, seed);
+            let view = rmp_serde::to_vec(&CanonicalTransaction::new(&permuted)).unwrap();
+            let reference = rmp_serde::to_vec(&reference_canonical_transaction(&permuted)).unwrap();
+            assert_eq!(
+                view, reference,
+                "canonical view bytes differ from the cloning implementation at \
+                 permutation seed {seed}"
+            );
+        }
+    }
+
+    /// Both optional tail combinations, because the element count depends on
+    /// them and the two branches compute it by different rules.
+    ///
+    /// The positional branch emits an explicit absent merge slot when a sealed
+    /// observation is present without a merge delta; the human-readable branch
+    /// skips each independently. A mirror that copied one rule onto both would
+    /// pass every permutation above, since the differential fixture carries
+    /// neither field.
+    #[test]
+    fn the_canonical_view_matches_across_every_optional_tail_combination() {
+        let base = canonicalizable_transaction();
+        for (label, merge, sealed) in [
+            ("neither", false, false),
+            ("merge only", true, false),
+            ("sealed only", false, true),
+            ("both", true, true),
+        ] {
+            let mut transaction = base.clone();
+            if merge {
+                let workspace_id = transaction
+                    .workspace_mutation
+                    .as_ref()
+                    .unwrap()
+                    .workspace_id;
+                transaction.merge_transaction_delta = Some(MergeTransactionDelta::open(
+                    crate::merge::tests::sample_record(
+                        transaction.repository_id.clone(),
+                        workspace_id,
+                    ),
+                ));
+            }
+            if sealed {
+                transaction.sealed_observation = Some(sealed_observation());
+            }
+            assert_eq!(
+                rmp_serde::to_vec(&CanonicalTransaction::new(&transaction)).unwrap(),
+                rmp_serde::to_vec(&reference_canonical_transaction(&transaction)).unwrap(),
+                "positional bytes differ with {label}"
+            );
+            assert_eq!(
+                serde_json::to_value(CanonicalTransaction::new(&transaction)).unwrap(),
+                serde_json::to_value(reference_canonical_transaction(&transaction)).unwrap(),
+                "human-readable form differs with {label}"
+            );
+            assert_eq!(
+                transaction.canonical_hash().unwrap(),
+                reference_canonical_hash(&transaction).unwrap(),
+                "hash differs with {label}"
+            );
+        }
+    }
+
+    /// The view must BORROW the transaction, which is the whole point of it.
+    ///
+    /// Hash equality cannot show this: a version that cloned the transaction
+    /// and sorted the copy would satisfy every differential above while costing
+    /// exactly what this change exists to remove. Pointer identity can show it,
+    /// and it is exact rather than statistical, so it neither flakes nor needs
+    /// a threshold.
+    ///
+    /// Each element the view claims to reference is required to be the very
+    /// element inside the caller's transaction, not an equal copy of it.
+    #[test]
+    fn the_canonical_view_borrows_the_transaction_rather_than_cloning_it() {
+        let transaction = canonicalizable_transaction();
+        let view = CanonicalTransaction::new(&transaction);
+
+        assert!(
+            std::ptr::eq(view.source, &transaction),
+            "canonical view does not point at the transaction it was built from"
+        );
+
+        let borrows_one_of = |target: *const SemanticChange| {
+            transaction
+                .changes
+                .iter()
+                .any(|change| std::ptr::eq(change, target))
+        };
+        assert_eq!(view.changes.len(), transaction.changes.len());
+        for change in &view.changes {
+            assert!(
+                borrows_one_of(change.source),
+                "canonical change is a copy rather than a reference into the transaction"
+            );
+        }
+
+        assert!(
+            view.external_objects.iter().all(|record| transaction
+                .external_objects
+                .iter()
+                .any(|source| std::ptr::eq(*record, source))),
+            "external object records were copied rather than referenced"
+        );
+        assert!(
+            view.aliases.iter().all(|alias| transaction
+                .aliases
+                .iter()
+                .any(|source| std::ptr::eq(*alias, source))),
+            "aliases were copied rather than referenced"
+        );
+        assert!(
+            view.ref_mutations.iter().all(|mutation| transaction
+                .ref_mutations
+                .iter()
+                .any(|source| std::ptr::eq(*mutation, source))),
+            "ref mutations were copied rather than referenced"
+        );
+
+        let workspace = view
+            .workspace_mutation
+            .as_ref()
+            .expect("fixture carries a workspace mutation");
+        assert!(
+            std::ptr::eq(
+                workspace.source,
+                transaction.workspace_mutation.as_ref().unwrap()
+            ),
+            "workspace mutation view is a copy rather than a reference"
+        );
+        assert!(
+            std::ptr::eq(
+                workspace.semantic_delta.source,
+                &transaction
+                    .workspace_mutation
+                    .as_ref()
+                    .unwrap()
+                    .semantic_delta
+            ),
+            "workspace semantic delta view is a copy rather than a reference"
+        );
+
+        // The sort still has to have happened; a view that borrowed and did
+        // nothing else would pass everything above.
+        assert!(
+            view.changes
+                .windows(2)
+                .all(|pair| pair[0].source.id <= pair[1].source.id),
+            "canonical view did not sort the changes it borrowed"
+        );
+    }
+
+    /// A transaction large enough that a whole-transaction clone is visible in
+    /// the heap, which the 32-commit fixtures above are not.
+    fn large_transaction(change_count: usize) -> RepositoryTransaction {
+        let mut transaction = canonicalizable_transaction();
+        transaction.changes = (0..change_count)
+            .map(|index| {
+                let seed = u8::try_from(index % 251).unwrap_or(0);
+                let base = u128::try_from(index).unwrap_or(0) * 16 + 1_000;
+                native_change(seed, base + 3, base + 2, base + 1, base)
+            })
+            .collect();
+        transaction
+    }
+
+    /// The canonicalization must not allocate a copy of the transaction, and
+    /// the saving must be the clone rather than noise.
+    ///
+    /// This is the quantitative half of
+    /// [`the_canonical_view_borrows_the_transaction_rather_than_cloning_it`].
+    /// That test proves the view holds references; this one prices what the
+    /// references save, and calibrates the threshold against the clone's own
+    /// measured cost so there is no magic constant to drift.
+    ///
+    /// # What this measured, which is not what removing the clone was expected
+    /// to buy
+    ///
+    /// On a 200-change transaction, debug profile, macOS, live heap:
+    ///
+    /// | quantity | bytes |
+    /// |---|---|
+    /// | cloning the transaction, alone | 603_850 |
+    /// | building the borrowing view, alone | 51_200 |
+    /// | the `serde_json::Value` tree the encoder builds | 6_667_601 |
+    /// | whole hash, cloning implementation | 9_339_027 |
+    /// | whole hash, borrowing implementation | 8_765_641 |
+    ///
+    /// The clone is gone: the saving of 573_386 bytes is 94.9 percent of what
+    /// the clone cost. But it is 6.1 percent of the call's peak, because
+    /// `canonical_json_bytes` materializes a whole `serde_json::Value` tree,
+    /// and that tree is eleven times the size of the transaction it encodes.
+    /// The clone was never the dominant term inside this call.
+    ///
+    /// So the assertion is deliberately NOT a peak ceiling. A ceiling here
+    /// would be pinning the encoder, would drift with any serde change, and
+    /// would say nothing about whether a clone came back. The invariants that
+    /// matter are that the view costs a small fraction of a clone, and that
+    /// removing the clone removed approximately the clone.
+    ///
+    /// The counter is thread-local, so tests running in parallel in this same
+    /// binary cannot contaminate it.
+    #[test]
+    fn the_canonicalization_does_not_allocate_a_copy_of_the_transaction() {
+        let transaction = large_transaction(200);
+
+        // Warm any lazily-initialized state so it is not charged to one arm.
+        transaction.canonical_hash().unwrap();
+        reference_canonical_hash(&transaction).unwrap();
+
+        let clone_cost = measure_peak_live_bytes(|| {
+            let copy = transaction.clone();
+            std::hint::black_box(&copy);
+        });
+        let view_cost = measure_peak_live_bytes(|| {
+            let view = CanonicalTransaction::new(&transaction);
+            std::hint::black_box(&view);
+        });
+        let cloning = measure_peak_live_bytes(|| {
+            reference_canonical_hash(&transaction).unwrap();
+        });
+        let borrowing = measure_peak_live_bytes(|| {
+            transaction.canonical_hash().unwrap();
+        });
+        println!("clone {clone_cost} view {view_cost} cloning {cloning} borrowing {borrowing}");
+
+        assert!(
+            clone_cost > 0 && view_cost > 0 && cloning > 0 && borrowing > 0,
+            "the allocation probe measured nothing, so it cannot fail: clone \
+             {clone_cost}, view {view_cost}, cloning {cloning}, borrowing {borrowing}"
+        );
+        assert!(
+            view_cost * 4 < clone_cost,
+            "building the canonical view cost {view_cost} bytes against a clone's \
+             {clone_cost}, which is not the shape of a view over references"
+        );
+        let saved = cloning.saturating_sub(borrowing);
+        assert!(
+            saved * 4 >= clone_cost * 3,
+            "removing the clone saved {saved} bytes of a clone that costs \
+             {clone_cost}; the canonicalization is allocating a copy again \
+             ({cloning} cloning against {borrowing} borrowing)"
+        );
+    }
+
     /// Transaction identity must not depend on the order a caller built its
     /// collections in.
     ///
@@ -3054,6 +3726,7 @@ mod tests {
     /// `WorkspaceSemanticDelta::validate` REJECTS non-canonical order outright
     /// rather than canonicalizing it. That last one is guarded by rejection, not
     /// by invariance, which is a different contract and a different test.
+
     #[test]
     fn transaction_identity_ignores_the_order_of_every_collection_it_canonicalizes() {
         let base = canonicalizable_transaction();
