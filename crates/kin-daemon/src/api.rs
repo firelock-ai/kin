@@ -4120,6 +4120,26 @@ async fn command_stash(
     crate::loop_runner::sync_filesystem_with_graph_under_coordination(&state)
         .await
         .map_err(internal_error)?;
+    // That sync is a complete exact-tree admission publishing its tree standalone,
+    // so the admission is durable the moment it returns and is recorded here, on
+    // the same probes and in the same durable marker the ambient reconcile tick,
+    // `kin admit` and a commit write. Without it a user who sealed or restored a
+    // stash had just had their whole working copy admitted and `kin graph status`
+    // still answered that no complete admission was recorded for the store.
+    //
+    // Before the stash executes rather than after, and counted here, because this
+    // is the tree the admission published. The seal that follows returns the
+    // workspace to its base and writes that move as its own authority, which is
+    // the stash operating rather than a second admission; counting after it would
+    // record a tree no admission had passed over.
+    state
+        .background_work
+        .reconcile()
+        .record_admission_success(std::time::Instant::now());
+    crate::background_work::record_durable_admission(
+        &state.layout,
+        state.graph.resolved_tree().len() as u64,
+    );
     let response = crate::repository_stash::execute(&state, &request)?;
     Ok(Json(response))
 }
@@ -18706,6 +18726,160 @@ mod tests {
             stash_entries(Arc::clone(&state)).await.len(),
             1,
             "the refused restore left the sealed state intact"
+        );
+    }
+
+    /// A stash performs a complete exact-tree admission, so it must leave the
+    /// durable record of one behind.
+    ///
+    /// Seal and restore both decide against the exact workspace the host holds,
+    /// so the endpoint runs a complete-scan admission first and publishes its
+    /// tree standalone. Nothing recorded it, and the marker's two writers, the
+    /// ambient reconcile tick and `kin admit`, need not run on a store whose tick
+    /// is quiet. So a user who had just had their whole working copy admitted was
+    /// told that how far graph truth had fallen behind the repository was
+    /// unknown.
+    ///
+    /// The absent read before the request is the control, and the read-only
+    /// `list` beside it is the second one: `list` returns before the admission,
+    /// so a marker appearing there would mean the recording had attached to the
+    /// endpoint rather than to the admission.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stash_records_the_complete_admission_it_performed() {
+        use kin_core::last_admission::LastAdmissionRead;
+
+        let (state, _layout, repository, _main, _feature) =
+            universal_branch_test_state("stash-records-admission");
+
+        // The fixture converts a Git repository, and a clean conversion now
+        // records its own complete admission, so the control is the conversion's
+        // timestamp rather than an absent marker: whatever this stash writes has
+        // to be strictly later than what the store was born with.
+        let born_with = match kin_core::last_admission::read(&state.layout) {
+            LastAdmissionRead::Recorded(recorded) => recorded,
+            other => {
+                panic!("the conversion that built this fixture records a marker, read {other:?}")
+            }
+        };
+        assert!(
+            stash_entries(Arc::clone(&state)).await.is_empty(),
+            "the fixture starts with nothing sealed"
+        );
+        assert_eq!(
+            kin_core::last_admission::read(&state.layout),
+            LastAdmissionRead::Recorded(born_with.clone()),
+            "a read-only stash list returns before the admission, so it must record nothing"
+        );
+
+        // A modification to a tracked file, so the admitted tree holds the same
+        // paths the base does and the count is stable across the seal that
+        // follows.
+        std::fs::write(
+            repository.join("selected/compose.yaml"),
+            b"services:\n  api:\n    image: sealed\n",
+        )
+        .unwrap();
+        let tracked_before = state.graph.resolved_tree().len() as u64;
+
+        let (status, body) = post_stash_request(Arc::clone(&state), &stash_push()).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+        let recorded = match kin_core::last_admission::read(&state.layout) {
+            LastAdmissionRead::Recorded(recorded) => recorded,
+            other => {
+                panic!("a stash must record the complete admission it performed, read {other:?}")
+            }
+        };
+        assert_eq!(
+            recorded.tracked_artifacts, tracked_before,
+            "the record must cover the tree the admission passed over"
+        );
+        assert_eq!(
+            recorded.tracked_artifacts,
+            state.graph.resolved_tree().len() as u64,
+            "and the seal returned the workspace to a base holding the same paths"
+        );
+        assert!(
+            recorded.at > born_with.at,
+            "the record must be stamped by this stash rather than left as the conversion wrote \
+             it: {} against {}",
+            recorded.at.to_rfc3339(),
+            born_with.at.to_rfc3339()
+        );
+
+        // The in-memory probes carry the same fact, so `/health`, `kin doctor`
+        // and `kin admit` name the stash's admission instead of reporting that
+        // none has succeeded in this daemon's life.
+        assert!(
+            state
+                .background_work
+                .reconcile_report(std::time::Instant::now())
+                .last_admission_success_age_seconds
+                .is_some(),
+            "a stash's admission must reach the reconcile probes as a success"
+        );
+    }
+
+    /// A stash the seal itself refuses still records the admission that ran
+    /// before the refusal.
+    ///
+    /// This is where the stash path differs from the commit path and why the
+    /// recording sits where it does. A commit defers its admitted tree to its own
+    /// transaction, so nothing is durable until that transaction reaches
+    /// authority and a marker stamped earlier would claim a complete admission
+    /// for a tree authority never accepted. A stash publishes its tree standalone
+    /// before the seal is even attempted, so the admission is complete and
+    /// durable whatever the seal then answers, and withholding the marker would
+    /// report a store as staler than the daemon had just made it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refused_stash_still_records_the_admission_that_ran_before_it() {
+        use kin_core::last_admission::LastAdmissionRead;
+
+        let (state, _layout, _repository, _main, _feature) =
+            universal_branch_test_state("stash-refused-records-admission");
+
+        let born_with = match kin_core::last_admission::read(&state.layout) {
+            LastAdmissionRead::Recorded(recorded) => recorded,
+            other => {
+                panic!("the conversion that built this fixture records a marker, read {other:?}")
+            }
+        };
+
+        // A clean workspace has nothing to seal, so the endpoint admits the exact
+        // tree and then refuses.
+        let (status, body) = post_stash_request(Arc::clone(&state), &stash_push()).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            String::from_utf8_lossy(&body).contains("no graph-owned changes to seal"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let recorded = match kin_core::last_admission::read(&state.layout) {
+            LastAdmissionRead::Recorded(recorded) => recorded,
+            other => panic!(
+                "the admission published its tree standalone before the refusal, so it must be \
+                 recorded, read {other:?}"
+            ),
+        };
+        assert!(
+            recorded.at > born_with.at,
+            "the refused stash still admitted, so the marker must have moved past the one the \
+             conversion wrote: {} against {}",
+            recorded.at.to_rfc3339(),
+            born_with.at.to_rfc3339()
+        );
+        assert_eq!(
+            recorded.tracked_artifacts,
+            state.graph.resolved_tree().len() as u64,
+            "the record must cover the tree the admission passed over"
         );
     }
 

@@ -725,3 +725,97 @@ fn init_status_and_graph_status_use_their_real_durable_and_live_routes() {
         "{graph_stdout}"
     );
 }
+
+/// FIR-2559 end to end, through the shipped binaries. A store the product has
+/// just converted reports the admission that conversion performed, rather than
+/// telling its owner that how far graph truth has fallen behind is unknown.
+///
+/// `--no-enrich` is load-bearing rather than a speed-up: it is what keeps the
+/// conversion the only thing that could have written the marker. The enrichment
+/// phase starts a daemon, whose ambient reconcile tick is one of the two writers
+/// that existed before this, so a marker read after it would be evidence about
+/// the tick instead. The read below therefore happens with no daemon in this
+/// fixture's life at all.
+///
+/// The rendered line is asserted afterwards, once a daemon is serving, because
+/// that is the sentence a user actually reads.
+#[test]
+fn a_converted_store_reports_its_admission_rather_than_unknown_freshness() {
+    let root = tempdir().expect("temp root");
+    let home = root.path().join("home");
+    let repo = root.path().join("repo");
+    fs::create_dir_all(&home).expect("create home");
+    fs::create_dir_all(&repo).expect("create repo");
+    seed_repository(&repo);
+
+    let init = Command::new(env!("CARGO_BIN_EXE_kin"))
+        .args(["init", ".", "--json", "--no-enrich"])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env_remove("KIN_DAEMON_URL")
+        .current_dir(&repo)
+        .output()
+        .expect("run production kin init route");
+    assert!(
+        init.status.success(),
+        "init stdout={} stderr={}",
+        String::from_utf8_lossy(&init.stdout),
+        String::from_utf8_lossy(&init.stderr)
+    );
+    assert!(
+        !repo.join(".kin/daemon.port").exists(),
+        "no daemon ran for this store, so the marker below can only be the conversion's"
+    );
+
+    let layout = kin_core::KinLayout::discover(&repo).expect("the conversion published a store");
+    let freshness = kin_core::last_admission::read(&layout);
+    let recorded = match &freshness {
+        kin_core::last_admission::LastAdmissionRead::Recorded(recorded) => recorded,
+        other => panic!("a converted store must record its complete admission, read {other:?}"),
+    };
+    assert_eq!(
+        recorded.tracked_artifacts, 3,
+        "the record must cover the three files this repository commits"
+    );
+
+    let line = freshness.describe(chrono::Utc::now());
+    assert!(
+        line.contains("last complete admission"),
+        "the freshness surface must name the admission: {line}"
+    );
+    assert!(
+        !line.contains("unknown"),
+        "and must not report unknown freshness on a store converted a moment ago: {line}"
+    );
+
+    // The same fact through the shipped `kin graph status` route, which is where
+    // a user meets it.
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let mut daemon = IsolatedDaemon::spawn(&repo, &runtime);
+    let port = daemon.wait_until_serving(&repo.join(".kin"));
+    let graph_status = Command::new(env!("CARGO_BIN_EXE_kin"))
+        .args(["graph", "status"])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("KIN_DAEMON_URL", format!("http://127.0.0.1:{port}"))
+        .current_dir(&repo)
+        .output()
+        .expect("run production kin graph status route");
+    daemon.stop();
+
+    assert!(
+        graph_status.status.success(),
+        "graph status stdout={} stderr={}",
+        String::from_utf8_lossy(&graph_status.stdout),
+        String::from_utf8_lossy(&graph_status.stderr)
+    );
+    let graph_stdout = String::from_utf8_lossy(&graph_status.stdout);
+    assert!(
+        graph_stdout.contains("graph truth: last complete admission"),
+        "{graph_stdout}"
+    );
+    assert!(
+        !graph_stdout.contains("no complete admission is recorded"),
+        "{graph_stdout}"
+    );
+}
