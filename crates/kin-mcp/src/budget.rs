@@ -253,6 +253,20 @@ fn shape_for(tool: &str) -> Option<ResponseShape> {
             bulk_keys: &[],
             narrow_param: "limit",
         },
+        // The enumeration surface. `narrow_param` is `page_size` rather than a
+        // limit, because this tool's answer to "too large" is a smaller page
+        // plus a cursor to the rest, never a smaller answer. Nothing is listed
+        // under `body_keys`: the rows carry a signature and a span and no source
+        // body at all, so there is no body layer to shed before rows are.
+        FILE_ENTITIES_TOOL => ResponseShape {
+            collections: &["entities"],
+            body_keys: &["doc_summary"],
+            explain_keys: &[],
+            top_explain_keys: &[],
+            duplicate_keys: &[],
+            bulk_keys: &[],
+            narrow_param: "page_size",
+        },
         "semantic_search" => ResponseShape {
             collections: &["results"],
             body_keys: &["doc_summary"],
@@ -352,6 +366,10 @@ fn shape_for(tool: &str) -> Option<ResponseShape> {
 }
 
 /// Whether this tool's response is governed by the budget.
+/// The file-enumeration tool, named from the handler that defines it so this
+/// table cannot come to describe a tool under a name the registry stopped using.
+const FILE_ENTITIES_TOOL: &str = crate::handlers::file_entities::TOOL_NAME;
+
 pub fn is_budgeted(tool: &str) -> bool {
     shape_for(tool).is_some()
 }

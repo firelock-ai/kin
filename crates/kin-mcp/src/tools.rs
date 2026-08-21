@@ -685,6 +685,19 @@ fn registered_tools() -> ToolsListResult {
                 }),
             },
             ToolDefinition {
+                name: crate::handlers::file_entities::TOOL_NAME.into(),
+                description: crate::handlers::file_entities::LIST_FILE_ENTITIES_DESC.into(),
+                annotations: read_only("List file entities"),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Repository-relative path of the file to enumerate, such as \"lib/express.js\". No leading slash, no \"..\", and no Kin or Git control component. A leading \"./\" is dropped and backslashes are read as separators; nothing else is rewritten, because a path resolved by suffix resolves to whichever file happened to end that way. Optional only when `cursor` is given, which already names the file." },
+                        "page_size": { "type": "integer", "description": "Entities per page (default 200, clamped 1..1000). `total_in_file` is the whole-file count on every page, so a page smaller than it is a page, never the file.", "default": 200, "minimum": 1, "maximum": 1000 },
+                        "cursor": { "type": "string", "description": "Opaque token from a prior result's `next_cursor`, returning the next page of the same enumeration. Pass it back unedited; it carries the path and the count the page was cut from, so a file that changed under the walk is reported as `enumeration_shifted` rather than paged silently against a different list." }
+                    }
+                }),
+            },
+            ToolDefinition {
                 name: "benchmark".into(),
                 description: crate::handlers::bench::BENCHMARK_DESC.into(),
                 annotations: read_only("Benchmark metrics"),
@@ -1357,6 +1370,13 @@ pub fn agent_default_tool_names() -> &'static [&'static str] {
         "trace_data_flow",
         "find_references",
         "graph_neighborhood",
+        // The enumeration half of discovery. Every other retrieval tool in this
+        // profile ranks, filters, or walks, and none of them can say what it
+        // left out, so "what is in this file" -- the cheapest question the graph
+        // answers and the first one a file-first user asks -- had to be answered
+        // by scavenging ids out of a locate ranking and hoping it was whole
+        // (FIR-2546).
+        crate::handlers::file_entities::TOOL_NAME,
         "kin_session_start",
         "kin_session_heartbeat",
         "kin_session_end",

@@ -10,6 +10,7 @@ pub mod common;
 // two from drifting apart.
 pub mod bench;
 pub mod entities;
+pub mod file_entities;
 pub mod provenance;
 pub(crate) mod repository_authority;
 pub mod review;
@@ -74,6 +75,7 @@ pub async fn handle_tool_call<G: GraphStore>(
         "dead_code" => entities::handle_dead_code(arguments, store),
         "find_dead_code_seeded" => entities::handle_find_dead_code_seeded(arguments, store),
         "graph_neighborhood" => entities::handle_graph_neighborhood(arguments, store),
+        "list_file_entities" => file_entities::handle_list_file_entities(arguments, store),
         // Review
         "semantic_diff" => review::handle_semantic_diff(arguments, store),
         "impact_analysis" => review::handle_impact_analysis(arguments, store, sessions).await,

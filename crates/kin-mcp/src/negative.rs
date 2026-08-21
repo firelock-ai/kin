@@ -60,6 +60,99 @@ use crate::envelope::{Envelope, NegativeClass};
 /// Distinctive enough not to collide with any tool payload's own fields.
 pub const NEGATIVE_KEY: &str = "negative";
 
+/// The file-enumeration tool, named once here so the spec, the gate and the
+/// dependency declaration below cannot drift from the registry that serves it.
+const FILE_ENTITIES_TOOL: &str = crate::handlers::file_entities::TOOL_NAME;
+
+/// Why a file enumeration cannot be certified as the file's whole entity set,
+/// or `None` when nothing stops it.
+///
+/// Read from the tool's own `file_coverage` observation rather than from the
+/// envelope, because the question is about one file and every envelope signal is
+/// about the store. A completely embedded, fully loaded, undegraded graph
+/// carries no entities at all for a file no language adapter parsed, and every
+/// store-level gate reads healthy while it says so.
+///
+/// Four things can stop the certification and each is named separately, because
+/// the remediation differs: a file nothing parsed needs an adapter, a partial
+/// parse needs the syntax fixed, a page needs its cursor followed, and a shifted
+/// enumeration needs re-walking from the start.
+fn file_enumeration_gap(payload: &Value) -> Option<String> {
+    let Some(coverage) = payload
+        .get(crate::handlers::file_entities::FILE_COVERAGE_KEY)
+        .and_then(Value::as_object)
+    else {
+        return Some(
+            "file_coverage_unreported: this answer did not report whether a language adapter \
+             parsed the file, so an empty enumeration cannot be distinguished from a file \
+             nothing ever extracted entities from"
+                .to_string(),
+        );
+    };
+
+    let parsed = coverage
+        .get("parsed")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let detail = coverage
+        .get("parse_detail")
+        .and_then(Value::as_str)
+        .map(|detail| format!(" ({detail})"))
+        .unwrap_or_default();
+    match parsed {
+        "full" => {}
+        "absent" => {
+            return Some(
+                "file_not_parsed: no language adapter produced a layout for this file, so the \
+                 graph holds no entity set for it to be missing from. An empty enumeration here \
+                 is a fact about Kin's extraction coverage, not about the file's contents"
+                    .to_string(),
+            )
+        }
+        "partial" => {
+            return Some(format!(
+                "file_parsed_partially: the adapter hit parse errors in this file{detail}, so the \
+                 entities it produced are a floor and the enumeration may be short"
+            ))
+        }
+        "failed" => {
+            return Some(format!(
+                "file_parse_failed: the adapter could not parse this file{detail}, so whatever \
+                 entities the graph still carries for it describe an earlier state"
+            ))
+        }
+        other => {
+            return Some(format!(
+                "file_parse_state_unknown: this answer reported the parse state as {other:?}, \
+                 which is not a state that licenses reading the enumeration as whole"
+            ))
+        }
+    }
+
+    if coverage.get("enumeration_shifted").and_then(Value::as_bool) == Some(true) {
+        return Some(
+            "enumeration_shifted: the file gained or lost entities between the page that minted \
+             this cursor and the page it served, so these pages do not assemble into one state of \
+             the repository. Re-walk from the start"
+                .to_string(),
+        );
+    }
+
+    if coverage
+        .get("whole_file_in_response")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        return Some(
+            "page_bounded: this response holds one page of the file rather than all of it, so its \
+             rows are a floor. Follow `next_cursor` to the end before reading the set as whole"
+                .to_string(),
+        );
+    }
+
+    None
+}
+
 /// How one tool's payload expresses "no result", and how to frame the resulting
 /// negative. One row per negative-capable tool — the single source of truth.
 struct RetrievalSpec {
@@ -144,6 +237,20 @@ fn spec_for(tool: &str) -> Option<RetrievalSpec> {
             field: "relations",
             kind: "no_neighbors",
             subject: "the entity has no graph neighbors at the requested depth",
+            always: false,
+            class: NegativeClass::Structural,
+        },
+        // The enumeration surface. Its absence claim is the sharpest one any
+        // retrieval tool here makes -- "this file holds no entities" -- and it
+        // is also the one with a decisive per-file fact behind it, so it is
+        // gated on that fact rather than on store-wide health. `Structural`
+        // because it reads the entity index; no embedding is consulted, and
+        // gating it on embedding coverage would report a complete answer as
+        // uncertain for a substrate it never touched.
+        FILE_ENTITIES_TOOL => RetrievalSpec {
+            field: "entities",
+            kind: "no_file_entities",
+            subject: "the graph holds no entities for this file",
             always: false,
             class: NegativeClass::Structural,
         },
@@ -719,7 +826,9 @@ fn qualifies_populated_answers(tool: &str) -> bool {
 /// extracted graph has nothing for this gate to say, and silence is not
 /// agreement.
 pub(crate) fn declares_absence_dependency(tool: &str, payload: &Value) -> bool {
-    !absence_cross_file_classes(tool, payload).is_empty() || absence_is_language_scoped(tool)
+    !absence_cross_file_classes(tool, payload).is_empty()
+        || absence_is_language_scoped(tool)
+        || tool == FILE_ENTITIES_TOOL
 }
 
 /// One class's observed state, defaulting to `unknown` for a class the
@@ -1742,6 +1851,17 @@ pub fn negative_for(
     // resolves a name.
     if tool == "find_references" {
         if let Some(gap) = focal_resolution_gap(payload, "this reference list") {
+            push_gap(&mut trustworthy, &mut trust_reason, gap);
+        }
+    }
+
+    // The enumeration's own gate, and the only one that can certify it. Every
+    // other signal here describes the store; this describes the file, and a
+    // file no adapter parsed holds no entities in a graph of any health at all.
+    // Reading store health as licence for that absence is exactly the
+    // substitution FIR-2430 made on the language axis.
+    if tool == FILE_ENTITIES_TOOL {
+        if let Some(gap) = file_enumeration_gap(payload) {
             push_gap(&mut trustworthy, &mut trust_reason, gap);
         }
     }
