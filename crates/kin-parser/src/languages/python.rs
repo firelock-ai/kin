@@ -1076,31 +1076,110 @@ fn emit_python_value_references(
     }
 }
 
+/// Name a module-level assignment binds, when the graph should own the value.
+///
+/// Two independent rules admit a binding, because they answer to different
+/// evidence and either one alone leaves a real constant invisible.
+///
+/// The first is the name's spelling, and it is decided by
+/// [`looks_like_py_constant_name`].
+///
+/// The second is the value's shape: a name bound to a CALL is a module
+/// singleton other files import and read, whatever case it is written in.
+/// `codes = LookupDict(name="status_codes")` in requests is the case that named
+/// the rule; three files import that name and the redirect path is built
+/// entirely out of it, and with no entity behind it `kin impact codes` retargeted
+/// to the enclosing module and answered "No local downstream impact found". The
+/// same rule is already what JavaScript applies to a module-level binding: a
+/// value containing a call expression is not data-only there and is admitted as
+/// a `Constant` regardless of the name (`is_data_only_js_value` in
+/// javascript.rs), which is how `React.forwardRef`, `styled` and `memo` bindings
+/// become entities. Python's import is a statement rather than a call, so the
+/// dependency-line flood that forced JavaScript to exclude `require(...)`
+/// bindings has no equivalent here.
+///
+/// Only a bare identifier target qualifies for the call rule. `a, b = make()`
+/// and `obj.attr = make()` reach here as `pattern_list` and `attribute`, and
+/// their text is a destructuring or an attribute write rather than a name the
+/// graph can carry.
+///
+/// Both rules run only where the caller already stands at module scope: the
+/// `assignment` arm of `extract_py_node` is guarded by `class_ctx.is_none()`, so
+/// class attributes never reach it, and the module-root walk never descends into
+/// a function body, so locals never reach it either.
 fn extract_py_constant_name(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
     let target = node
         .child_by_field_name("left")
         .or_else(|| node.named_child(0))?;
     let name = target.utf8_text(source).ok()?.trim().to_string();
     if looks_like_py_constant_name(&name) {
-        Some(name)
-    } else {
-        None
+        return Some(name);
+    }
+    if target.kind() == "identifier"
+        && node
+            .child_by_field_name("right")
+            .is_some_and(|value| py_value_is_call(&value))
+    {
+        return Some(name);
+    }
+    None
+}
+
+/// Whether an assignment's right-hand side is a call.
+///
+/// `await make()` and `(make())` bind the same singleton the bare call does, so
+/// both unwrap to the call underneath rather than reading as some other shape.
+fn py_value_is_call(node: &tree_sitter::Node) -> bool {
+    match node.kind() {
+        "call" => true,
+        "await" | "parenthesized_expression" => node
+            .named_child(0)
+            .is_some_and(|inner| py_value_is_call(&inner)),
+        _ => false,
     }
 }
 
+/// Whether a module-level assignment target is SPELLED as a constant.
+///
+/// PEP 8 writes constants in upper case "with underscores separating words", so
+/// the underscore is a word separator rather than part of the convention.
+/// Requiring one dropped every single-word constant while admitting its
+/// multi-word siblings in the same file: on the store behind FIR-2509, five of
+/// six module-level constants in one package were entities and `SCHEMA` at
+/// `nk/storage.py:22` was not, so `semantic_search("SCHEMA")` certified
+/// `safe_to_conclude_absent: true` over a constant that is plainly there. The
+/// graph was self-consistently missing it, which is what made the certification
+/// dangerous rather than merely wrong.
+///
+/// Two spellings are accepted. An all-uppercase name of two characters or more
+/// is the PEP 8 constant with or without a separator (`SCHEMA`, `TAG_RE`,
+/// `HTTP2`). A mixed-case name carrying an underscore is the looser shape this
+/// predicate already admitted, kept so that no name which is an entity today
+/// stops being one.
+///
+/// A single character stays out. At module level `T = TypeVar("T")` and a bare
+/// `E` read as type parameters and scratch names far more often than as
+/// constants, and the ones genuinely built by a call are admitted by the call
+/// rule in [`extract_py_constant_name`] instead.
 fn looks_like_py_constant_name(name: &str) -> bool {
     let mut has_upper = false;
+    let mut has_lower = false;
     let mut has_underscore = false;
     for ch in name.chars() {
         if ch == '_' {
             has_underscore = true;
         } else if ch.is_ascii_uppercase() {
             has_upper = true;
-        } else if !ch.is_ascii_alphanumeric() {
+        } else if ch.is_ascii_lowercase() {
+            has_lower = true;
+        } else if !ch.is_ascii_digit() {
             return false;
         }
     }
-    !name.is_empty() && has_upper && has_underscore
+    if name.is_empty() || !has_upper {
+        return false;
+    }
+    (!has_lower && name.len() >= 2) || has_underscore
 }
 
 /// Extract decorator names from a `decorated_definition` node.
@@ -1673,6 +1752,230 @@ mod tests {
             constants
         );
         assert_eq!(constants[0].name, "PROBE_SECRET_abcd1234");
+    }
+
+    /// FIR-2509: a single-word module-level constant was never an entity while
+    /// its multi-word siblings in the same package were, so `semantic_search`
+    /// certified `safe_to_conclude_absent: true` over a constant plainly in the
+    /// file. The multi-word names are asserted beside the single-word ones so a
+    /// fix in one direction cannot quietly cost the other.
+    #[test]
+    fn parse_python_single_word_uppercase_constants_are_entities() {
+        let adapter = PythonAdapter;
+        let source = br##"SCHEMA = """
+CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);
+"""
+LIMIT = 50
+TIMEOUT = 30
+DEBUG = False
+PORT = 8080
+VERSION = "1.0"
+HTTP2 = True
+TAG_RE = "#(\w+)"
+DEFAULT_REDIRECT_LIMIT = 30
+"##;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("storage.py");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let mut names: Vec<&str> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Constant)
+            .map(|e| e.name.as_str())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec![
+                "DEBUG",
+                "DEFAULT_REDIRECT_LIMIT",
+                "HTTP2",
+                "LIMIT",
+                "PORT",
+                "SCHEMA",
+                "TAG_RE",
+                "TIMEOUT",
+                "VERSION",
+            ],
+            "every all-uppercase module-level assignment is a constant, with or \
+             without a word separator; got {names:?}"
+        );
+        let schema = output
+            .entities
+            .iter()
+            .find(|e| e.name == "SCHEMA")
+            .expect("SCHEMA is the single-word triple-quoted constant FIR-2509 named");
+        assert_eq!(schema.kind, EntityKind::Constant);
+        assert_eq!(
+            schema.span.start_line, 0,
+            "SCHEMA's span must name its own assignment (tree-sitter rows are 0-based, \
+             so source line 1) rather than the module's"
+        );
+    }
+
+    /// FIR-2481: `codes = LookupDict(name="status_codes")` in requests produced
+    /// no entity, so `kin impact codes` retargeted to the enclosing module and
+    /// answered "No local downstream impact found" for a name three files
+    /// import. The uppercase sibling in the same file is asserted beside it
+    /// because the case is the only thing that distinguished them.
+    #[test]
+    fn parse_python_module_level_call_binding_is_an_entity() {
+        let adapter = PythonAdapter;
+        let source = br#"class LookupDict(dict):
+    pass
+
+
+codes = LookupDict(name="status_codes")
+session = build_session()
+awaited = await make_client()
+wrapped = (make_wrapped())
+annotated: LookupDict = LookupDict(name="annotated")
+DEFAULT_REDIRECT_LIMIT = 30
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("status_codes.py");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let mut names: Vec<&str> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Constant)
+            .map(|e| e.name.as_str())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec![
+                "DEFAULT_REDIRECT_LIMIT",
+                "annotated",
+                "awaited",
+                "codes",
+                "session",
+                "wrapped",
+            ],
+            "a module-level name bound to a call is an entity whatever its case, \
+             including through `await` and parentheses; got {names:?}"
+        );
+        let codes = output
+            .entities
+            .iter()
+            .find(|e| e.name == "codes")
+            .expect("codes is the lowercase call-bound constant FIR-2481 named");
+        assert_eq!(codes.kind, EntityKind::Constant);
+        assert_eq!(
+            codes.span.start_line, 4,
+            "codes' span must name its own assignment (tree-sitter rows are 0-based, \
+             so source line 5) rather than the module's"
+        );
+    }
+
+    /// The other direction of both rules. A lowercase module-level name with no
+    /// call behind it, a single uppercase character, a destructuring target and
+    /// an attribute write all stay out, so neither rule is a licence to promote
+    /// every assignment in the file.
+    #[test]
+    fn parse_python_module_level_non_constants_stay_out() {
+        let adapter = PythonAdapter;
+        let source = br#"schema = "notes"
+total = 0
+_cache = {}
+T = 1
+E = "x"
+first, second = make_pair()
+holder.attr = make_attr()
+holder["key"] = make_item()
+__all__ = ["schema"]
+KEPT = make_kept()
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("scope.py");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let mut names: Vec<&str> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Constant)
+            .map(|e| e.name.as_str())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec!["KEPT"],
+            "only the uppercase call-bound name qualifies; a lowercase literal \
+             binding, a single character, a destructuring and an attribute write \
+             must not become constants; got {names:?}"
+        );
+    }
+
+    /// Scope, in both places the rules must not reach. A class attribute and a
+    /// function-local carry exactly the spellings the two new rules admit at
+    /// module level, and neither may produce a constant.
+    #[test]
+    fn parse_python_constant_rules_do_not_reach_class_or_function_scope() {
+        let adapter = PythonAdapter;
+        let source = br#"class Store:
+    SCHEMA = "create table"
+    codes = LookupDict(name="attr")
+
+    def build(self):
+        LIMIT = 50
+        rows = fetch_rows()
+        return LIMIT, rows
+
+
+def helper():
+    TIMEOUT = 30
+    client = make_client()
+    return TIMEOUT, client
+
+
+MODULE_LIMIT = 50
+module_client = make_client()
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("scope.py");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let mut names: Vec<&str> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Constant)
+            .map(|e| e.name.as_str())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec!["MODULE_LIMIT", "module_client"],
+            "only the two module-level bindings are constants; the class \
+             attributes SCHEMA and codes and the locals LIMIT, rows, TIMEOUT and \
+             client must stay out; got {names:?}"
+        );
+    }
+
+    /// The reference edge the impact answer is built from. Once `codes` is an
+    /// entity, a consumer that imports it and reads a member off it references
+    /// the name rather than nothing, which is what `kin impact codes` walks.
+    #[test]
+    fn parse_python_call_bound_constant_receives_reference_edges() {
+        let adapter = PythonAdapter;
+        let source = br#"from .status_codes import codes
+
+
+class Response:
+    def is_redirect(self):
+        return codes.moved
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("models.py");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let refs: Vec<(&str, &str)> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::References)
+            .map(|r| (r.src_name.as_str(), r.dst_name.as_str()))
+            .collect();
+        assert!(
+            refs.contains(&("Response.is_redirect", "codes")),
+            "the consumer must reference `codes` by name so the impact walk can \
+             reach it; got {refs:?}"
+        );
     }
 
     #[test]
