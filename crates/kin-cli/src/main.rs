@@ -11,6 +11,7 @@ use kin_cli::commands;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use tracing::Instrument;
+use tracing_subscriber::filter::FilterExt;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
@@ -2543,27 +2544,15 @@ fn main() -> Result<()> {
         .clone()
         .map(|path| kin_cli::profile::ProfileSession::new(command_name.clone(), cwd.clone(), path));
 
-    if let Some(session) = profile_session.clone() {
-        tracing_subscriber::registry()
-            .with(kin_cli::profile::ProfilingLayer::new(session))
-            .init();
-    } else {
-        tracing_subscriber::registry()
-            .with(default_env_filter(&command_name))
-            .with(AdmissionProgressLayer)
-            .with(
-                tracing_subscriber::fmt::layer()
-                    .with_writer(std::io::stderr)
-                    // The fmt layer does not sniff for a terminal, so without
-                    // this it writes colour escapes into a redirected log or a
-                    // captured transcript.
-                    .with_ansi(std::io::stderr().is_terminal())
-                    .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
-                        !is_periodic_admission_progress(metadata.target())
-                    })),
-            )
-            .init();
-    }
+    tracing_stack(
+        &installed_directives(&command_name),
+        profile_session.clone(),
+        std::io::stderr,
+        // The fmt layer does not sniff for a terminal, so without this it
+        // writes colour escapes into a redirected log or a captured transcript.
+        std::io::stderr().is_terminal(),
+    )
+    .init();
 
     // Validate the KIN_* environment surface once logging is live. Unknown names
     // (likely typos) and out-of-range values are surfaced loudly instead of
@@ -3973,21 +3962,63 @@ const ADMISSION_PROGRESS_TARGETS: [&str; 3] = [
     "kin_db::storage::history_replay",
 ];
 
-fn default_env_filter(command: &str) -> EnvFilter {
-    if std::env::var_os("RUST_LOG").is_some() {
-        return EnvFilter::from_default_env();
+/// The filter directives this process installs, `RUST_LOG` winning when set.
+fn installed_directives(command: &str) -> String {
+    match std::env::var_os("RUST_LOG") {
+        Some(directives) => directives.to_string_lossy().into_owned(),
+        None => default_filter_directives(command),
     }
-    EnvFilter::new(default_filter_directives(command))
 }
 
-/// The directive string [`default_env_filter`] would install, absent `RUST_LOG`.
+/// Compose this process's subscriber from the layers the run asked for.
+///
+/// `--profile-out` ADDS the profiling layer. It does not replace the logging
+/// stack, and the two are independent: installing one instead of the other made
+/// a profiled run the quietest run there is, with `RUST_LOG` having no effect,
+/// the admission ladder losing its ticks, and an operator who reached for the
+/// profiler to explain a slow conversion losing the output that would have
+/// explained it. It read as a quiet run rather than as a flag conflict.
+///
+/// The env filter is attached per layer rather than to the registry, and that is
+/// what makes the composition possible at all. A registry-wide filter gates
+/// every layer under it, the profiling layer included, and the default
+/// directives are `warn`, so filtering the whole stack would hand back a profile
+/// of an ordinary command with no `info` span in it. The profiling layer carries
+/// no filter and records what it is given, which is what the JSON report is for;
+/// each logging layer carries the directives the operator asked for.
+fn tracing_stack<W>(
+    directives: &str,
+    profile_session: Option<kin_cli::profile::ProfileSession>,
+    writer: W,
+    ansi: bool,
+) -> impl tracing::Subscriber + Send + Sync + 'static
+where
+    W: for<'writer> tracing_subscriber::fmt::MakeWriter<'writer> + Send + Sync + 'static,
+{
+    tracing_subscriber::registry()
+        .with(profile_session.map(kin_cli::profile::ProfilingLayer::new))
+        .with(AdmissionProgressLayer.with_filter(EnvFilter::new(directives)))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(writer)
+                .with_ansi(ansi)
+                .with_filter(EnvFilter::new(directives).and(
+                    tracing_subscriber::filter::filter_fn(|metadata| {
+                        !is_periodic_admission_progress(metadata.target())
+                    }),
+                )),
+        )
+}
+
+/// The directive string [`installed_directives`] returns, absent `RUST_LOG`.
 ///
 /// Split out so the choice is testable without mutating process environment,
 /// which no test can do without racing every other test in the binary.
 ///
-/// Profiling is deliberately absent here. That path installs its own subscriber
-/// with no `EnvFilter` at all, so it never reaches this function; carrying a
-/// `profile_enabled` branch would only invite a test that proves a dead arm.
+/// Profiling is deliberately absent here, and now for a better reason than the
+/// one that used to be written down: a profiled run installs these same
+/// directives on these same logging layers, so there is no profiling branch for
+/// this function to carry.
 fn default_filter_directives(command: &str) -> String {
     if !PROGRESS_REPORTING_COMMANDS.contains(&command) {
         return "warn".to_string();
@@ -4095,7 +4126,7 @@ mod tests {
     // reaches a writer.
     //
     // They build the filter from `default_filter_directives` rather than calling
-    // `default_env_filter`, deliberately: that function consults `RUST_LOG`, and
+    // `installed_directives`, deliberately: that function consults `RUST_LOG`, and
     // a probe inheriting the developer's or the runner's environment would fail
     // or pass vacuously depending on it. `EnvFilter::new` over the pure
     // directive string is exactly what production installs when `RUST_LOG` is
@@ -4244,6 +4275,70 @@ mod tests {
                 "{printed} must keep printing as a record"
             );
         }
+    }
+
+    /// `--profile-out` adds the profiling layer to the logging stack rather
+    /// than replacing it.
+    ///
+    /// Installing one instead of the other made a profiled run the quietest run
+    /// there is. On one 3,111 second conversion `RUST_LOG=info,kin_db=info` had
+    /// no effect at all and only one of the commit phase's four sub-step ticks
+    /// reached the log, so the single run meant to explain where the time went
+    /// produced the least output of any run.
+    ///
+    /// All three halves are asserted, because each fails differently. A stack
+    /// that logs but never profiles is the same defect pointed the other way. A
+    /// stack that logs everything has lost the filter, which is how the phase
+    /// ladder gets scribbled over. And the span has to reach the report, not
+    /// merely be created, or `--profile-out` writes an empty ladder.
+    #[test]
+    fn profiling_adds_a_layer_rather_than_replacing_the_logging_stack() {
+        // The session is read in memory through `report()`; nothing is written,
+        // so this path never has to exist.
+        let session = kin_cli::profile::ProfileSession::new(
+            "init",
+            "/tmp",
+            std::env::temp_dir().join("kin-profile-composition-test.json"),
+        );
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_stack(
+            &default_filter_directives("init"),
+            Some(session.clone()),
+            CapturedLog(buffer.clone()),
+            false,
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info_span!("kin.init.commit_bootstrap_transaction").in_scope(|| {
+                tracing::info!(target: "kin_core::init", "admitted the repository");
+                tracing::debug!(target: "kin_core::init", "under the installed floor");
+            });
+        });
+
+        let logged = String::from_utf8(buffer.lock().expect("log buffer poisoned").clone())
+            .expect("captured log is utf-8");
+        assert!(
+            logged.contains("admitted the repository"),
+            "a profiled run must keep the logging its unprofiled twin has; captured {logged:?}"
+        );
+        assert!(
+            !logged.contains("under the installed floor"),
+            "the installed directives must still filter under profiling; captured {logged:?}"
+        );
+
+        let report = session.report();
+        assert!(
+            report
+                .spans
+                .iter()
+                .any(|span| span.name == "kin.init.commit_bootstrap_transaction"),
+            "the profile must carry the span the run opened; spans={:?}",
+            report
+                .spans
+                .iter()
+                .map(|span| span.name.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 
     /// With no admission ladder open, a progress event is printed rather than
