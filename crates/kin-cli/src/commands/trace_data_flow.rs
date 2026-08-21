@@ -1241,7 +1241,15 @@ fn record_terminal_steps(response: &mut TraceDataFlowResponse) {
     response.terminal_bound_steps = count(TraceTerminal::BoundReached);
     response.terminal_coverage_gap_steps = count(TraceTerminal::CoverageGap);
 
-    // The flag follows the hops, and one rule decides which hops move it.
+    // The flag follows the hops, and ONE rule decides which hops move it.
+    //
+    // Deliberately read back off each terminal through
+    // [`TraceTerminal::truncates`] rather than off the counts above, even
+    // though the counts are right there. Two derivations of one fact is how
+    // they come to disagree: an earlier draft summed the counts here and
+    // consulted the shared rule only for the focal, so deleting the rule left
+    // every chain-side shortfall still reporting itself correctly and the
+    // guard could not fail.
     //
     // A bound the caller can raise and a graph that could not have held the
     // next hop are both cases where the chain may be shorter than the code, and
@@ -1249,14 +1257,16 @@ fn record_terminal_steps(response: &mut TraceDataFlowResponse) {
     // real walks on `psf/requests` stopped one caller short and reported
     // themselves complete. Never cleared here, because the walk's own ceilings
     // set it first and this pass must not overturn them.
-    let shortfall = response.terminal_bound_steps > 0
-        || response.terminal_coverage_gap_steps > 0
+    let shortfall = |name: Option<&str>| {
+        name.and_then(trace_terminal_named)
+            .is_some_and(TraceTerminal::truncates)
+    };
+    if shortfall(response.focal_terminal.as_deref())
         || response
-            .focal_terminal
-            .as_deref()
-            .and_then(trace_terminal_named)
-            .is_some_and(TraceTerminal::truncates);
-    if shortfall {
+            .chain
+            .iter()
+            .any(|step| shortfall(step.terminal.as_deref()))
+    {
         response.truncated = true;
     }
 }
@@ -2958,9 +2968,22 @@ mod tests {
             vec!["WikiLink".to_string(), "normalize_target".to_string()],
             "a field typed with a repo class flows into it, so the hop continues"
         );
-        assert!(response.chain.iter().all(|step| step.terminal.is_none()));
+        assert_eq!(
+            response.chain[0].terminal, None,
+            "the annotation gate opened, so the type is an ordinary step"
+        );
         assert_eq!(response.terminal_annotation_steps, 0);
         assert!(response.include_type_edges);
+        // The fixture's only call edge sits inside one file, so the walk cannot
+        // certify the hop past `normalize_target` as absent. Asserted rather
+        // than ignored: this is the FIR-2353 graph shape, and a walk that
+        // reported a leaf here would be making exactly the claim FIR-2542 is
+        // about.
+        assert_eq!(
+            response.chain[1].terminal.as_deref(),
+            Some("coverage_gap"),
+            "no cross-file call edge exists in this fixture, so an empty read proves nothing"
+        );
     }
 
     /// The CLI parses this payload from whatever daemon is already running, and
