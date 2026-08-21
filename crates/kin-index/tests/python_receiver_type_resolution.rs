@@ -521,6 +521,48 @@ fn module_name_collision_package() -> Vec<FileParseData> {
 }
 
 #[test]
+fn a_package_re_export_reaches_the_function_past_its_module_twin() {
+    // `nk/__init__.py` re-exports `search`, so a caller writing
+    // `from nk import search` pins its callee to the package rather than to the
+    // module file. The package's own file does not declare the symbol, so the
+    // linker falls back to the one same-named entity in that directory — and
+    // the module entity named for `search.py` sits there too, making it two.
+    // Two is not one, so the pinned call was refused outright and the caller
+    // got no edge at all, which is a stricter loss than parking the edge on the
+    // wrong node.
+    let files = vec![
+        parse_py("nk/__init__.py", "from nk.search import search\n"),
+        parse_py("nk/search.py", SEARCH_PY),
+        parse_py(
+            "app.py",
+            r#"
+from nk import search
+
+
+def run(store, terms):
+    return search(store, terms)
+"#,
+        ),
+    ];
+    let function = entity_id(&files, "nk/search.py", "search", EntityKind::Function);
+    let module = entity_id(&files, "nk/search.py", "search", EntityKind::Module);
+    let run = entity_id(&files, "app.py", "run", EntityKind::Function);
+
+    let relations = link_cross_file(&files);
+
+    assert!(
+        has_call(&relations, run, function),
+        "a call pinned to a package must reach the function that package \
+         re-exports; the module entity sharing its name is not a second \
+         candidate, because a module is not callable"
+    );
+    assert!(
+        callers_of(&relations, module).is_empty(),
+        "and the module must still hold no call edges of its own"
+    );
+}
+
+#[test]
 fn a_module_does_not_take_the_call_edges_of_its_same_named_function() {
     let files = module_name_collision_package();
     let function = entity_id(&files, "nk/search.py", "search", EntityKind::Function);
