@@ -2761,6 +2761,7 @@ mod tests {
             &drained_graph,
             &Default::default(),
             &crate::commands::resources::EmbedRuntimeState::default(),
+            &Default::default(),
         )
         .unwrap();
         assert!(
@@ -2780,6 +2781,7 @@ mod tests {
                 deferred_vector_checkpoint: Some(REFUSAL.to_string()),
                 ..Default::default()
             },
+            &Default::default(),
         )
         .unwrap();
         let drained_line = drained
@@ -2821,6 +2823,7 @@ mod tests {
                 deferred_vector_checkpoint: Some(REFUSAL.to_string()),
                 ..Default::default()
             },
+            &Default::default(),
         )
         .unwrap();
         let filling_line = filling
@@ -2848,6 +2851,7 @@ mod tests {
             &filling_graph,
             &Default::default(),
             &crate::commands::resources::EmbedRuntimeState::default(),
+            &Default::default(),
         )
         .unwrap();
         let filling_quiet_line = filling_quiet
