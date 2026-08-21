@@ -1850,7 +1850,10 @@ fn nearest_unclaimed<'a>(
                 && accept(candidate, parsed)
         })
         .min_by_key(|candidate| {
-            let distance = match (candidate.span.as_ref().map(|span| span.start_line), parsed_line) {
+            let distance = match (
+                candidate.span.as_ref().map(|span| span.start_line),
+                parsed_line,
+            ) {
                 (Some(candidate_line), Some(parsed_line)) => {
                     Some(candidate_line.abs_diff(parsed_line))
                 }

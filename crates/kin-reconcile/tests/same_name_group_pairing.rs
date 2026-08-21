@@ -138,10 +138,7 @@ def trailing(value):
 "#;
 
 /// Every `(old signature, new signature)` a modification on `name` reported.
-fn signature_transitions<'a>(
-    delta: &'a TransactionDelta,
-    name: &str,
-) -> Vec<(&'a str, &'a str)> {
+fn signature_transitions<'a>(delta: &'a TransactionDelta, name: &str) -> Vec<(&'a str, &'a str)> {
     delta
         .entity_deltas
         .iter()
