@@ -192,6 +192,7 @@ pub async fn run_health_checks() -> HealthReport {
     // operator is most likely to be running doctor because something is wrong.
     let graph_status = RunGraphStatus::for_run();
     checks.push(check_reference_edge_coverage(&graph_status).await);
+    checks.push(check_relation_census(&graph_status).await);
     checks.push(check_background_work().await);
     checks.push(check_embedding_model().await);
     checks.push(check_commit_memory_headroom());
@@ -2797,6 +2798,122 @@ async fn fetch_graph_status() -> GraphStatusForRun {
     }
 }
 
+/// Report whether this store has lost relation coverage it once held.
+///
+/// The relation-kind histogram `kin graph status` prints is a census, and until
+/// this row existed nothing compared it to anything. On the rc0545c stranger
+/// run a store went from 1985 entity-to-entity relations to 1807 and lost the
+/// `UsesType` kind entirely, from 94 edges to none, and the health line
+/// underneath the numbers that proved it read `✓ No issues detected.` Every
+/// counter needed to notice was on the screen. Nothing on the screen noticed.
+///
+/// The comparison is read structurally off the graph command rather than parsed
+/// out of its rendered lines, exactly as the reference-edge coverage above it
+/// is, so a wording change on one surface cannot silently break the other.
+async fn check_relation_census(graph_status: &RunGraphStatus) -> HealthCheck {
+    let response = match relation_census_row_for_unread_graph(graph_status.get().await) {
+        Ok(response) => response,
+        Err(row) => return row,
+    };
+    let Some(comparison) = response.relation_census.as_ref() else {
+        return HealthCheck::new(
+            "relation_census",
+            "Relation census",
+            HealthStatus::Stale,
+            "the daemon serving this repository does not report a relation census; it predates \
+             the measurement",
+        )
+        .with_manual_fix("restart the daemon with `kin daemon restart` to pick up this build");
+    };
+    relation_census_health(comparison)
+}
+
+/// This row's words for a graph status the run could not read, or the response
+/// when it could.
+fn relation_census_row_for_unread_graph(
+    status: &GraphStatusForRun,
+) -> Result<&crate::commands::graph::GraphCommandResponse, HealthCheck> {
+    const ID: &str = "relation_census";
+    const LABEL: &str = "Relation census";
+
+    match status {
+        GraphStatusForRun::Answered(response) => Ok(response),
+        GraphStatusForRun::NotInRepository => Err(HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Unsupported,
+            "n/a — not in a Kin repository",
+        )),
+        GraphStatusForRun::NoDaemon => Err(HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Unsupported,
+            "n/a — no daemon running for this repository, so the relation census cannot be \
+             read; a daemon starts on first use",
+        )
+        .with_manual_fix("run any `kin` command in the repo to auto-start the daemon")),
+        GraphStatusForRun::DaemonUrlInvalid { daemon_url, error } => Err(HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Stale,
+            format!("daemon reachable ({daemon_url}), but its URL is invalid: {error}"),
+        )
+        .with_manual_fix("check the daemon URL recorded for this repository")),
+        GraphStatusForRun::Unavailable { daemon_url, error } => Err(HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Stale,
+            format!(
+                "daemon reachable ({daemon_url}), but the relation census is unavailable: \
+                 {error}"
+            ),
+        )
+        .with_manual_fix("run `kin graph status` and resolve the reported daemon error")),
+    }
+}
+
+/// Turn the comparison into a verdict, split from its fetch so the rule is
+/// testable without a daemon.
+///
+/// A lost kind reads `Stale` rather than `Missing`: the store held those edges
+/// and no longer does, which is drift rather than a broken install, and a row
+/// that blocked readiness on it would refuse every repository whose enrichment
+/// is legitimately narrower than its last pass. It still counts as attention,
+/// so the doctor summary can no longer report a whole-kind loss as a pass.
+pub(crate) fn relation_census_health(
+    comparison: &kin_core::relation_census::RelationCensusComparison,
+) -> HealthCheck {
+    const ID: &str = "relation_census";
+    const LABEL: &str = "Relation census";
+
+    if let Some(unavailable) = &comparison.unavailable {
+        // Pending, not healthy. A store with no baseline is not a store that
+        // kept its coverage; it is one nothing can answer the question about
+        // yet, and those must not render the same.
+        return HealthCheck::new(ID, LABEL, HealthStatus::Pending, unavailable.clone())
+            .with_manual_fix(
+                "run `kin commit`, or let the enrichment sweep finish, to record the first census",
+            );
+    }
+    let losses = comparison.loss_lines();
+    if losses.is_empty() {
+        return HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Healthy,
+            format!(
+                "no relation kind has lost ground since the last recorded census ({} kind(s) \
+                 compared)",
+                comparison.changes.len()
+            ),
+        );
+    }
+    HealthCheck::new(ID, LABEL, HealthStatus::Stale, losses.join("; ")).with_manual_fix(
+        "compare `kin graph status` against the named cause, then re-run enrichment with it \
+         cleared",
+    )
+}
+
 /// The row for every state where the graph itself could not be read.
 ///
 /// It still reports the host probe, because that needed no daemon. Reporting
@@ -3925,6 +4042,96 @@ mod tests {
         assert!(check.manual_fix.is_some());
     }
 
+    fn census_pair(
+        previous: &[(&str, u64)],
+        current: &[(&str, u64)],
+        causes: Vec<String>,
+    ) -> kin_core::relation_census::RelationCensusComparison {
+        let recorded = kin_core::relation_census::RelationCensus::new(
+            chrono::Utc::now(),
+            kin_core::relation_census::CensusSource::Sweep,
+            previous
+                .iter()
+                .map(|(kind, count)| ((*kind).to_string(), *count))
+                .collect(),
+            Vec::new(),
+        );
+        kin_core::relation_census::RelationCensusComparison::build(
+            &kin_core::relation_census::RelationCensusRead::Recorded(recorded),
+            &current
+                .iter()
+                .map(|(kind, count)| ((*kind).to_string(), *count))
+                .collect(),
+            causes,
+        )
+    }
+
+    /// The rc0545c shape, at the doctor row. A store that lost a whole relation
+    /// kind must not be tallied as a pass.
+    #[test]
+    fn doctor_reports_a_relation_kind_that_vanished_since_the_recorded_census() {
+        let check = relation_census_health(&census_pair(
+            &[("Calls", 951), ("UsesType", 94)],
+            &[("Calls", 940)],
+            vec!["KIN_DAEMON_DISABLE_LSP set to non-default value \"1\"".to_string()],
+        ));
+        assert!(
+            matches!(check.status, HealthStatus::Stale),
+            "a lost kind needs attention: {:?}",
+            check.status
+        );
+        assert!(
+            check.detail.contains("UsesType went 94 to 0"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("KIN_DAEMON_DISABLE_LSP"),
+            "the row carries the cause: {}",
+            check.detail
+        );
+    }
+
+    /// The counterpart, so the row above cannot be an unconditional warning.
+    #[test]
+    fn doctor_stays_green_when_no_relation_kind_lost_ground() {
+        let check = relation_census_health(&census_pair(
+            &[("Calls", 940), ("UsesType", 94)],
+            &[("Calls", 951), ("UsesType", 94)],
+            Vec::new(),
+        ));
+        assert!(
+            matches!(check.status, HealthStatus::Healthy),
+            "growth is not a loss: {:?} {}",
+            check.status,
+            check.detail
+        );
+    }
+
+    /// A store with no baseline cannot answer the question, and must not read
+    /// the same as one that kept its coverage.
+    #[test]
+    fn doctor_separates_a_store_with_no_recorded_census_from_a_healthy_one() {
+        let check =
+            relation_census_health(&kin_core::relation_census::RelationCensusComparison::build(
+                &kin_core::relation_census::RelationCensusRead::Absent,
+                &std::collections::BTreeMap::from([("Calls".to_string(), 940)]),
+                Vec::new(),
+            ));
+        assert!(
+            matches!(check.status, HealthStatus::Pending),
+            "an unrecorded census is pending, never healthy: {:?}",
+            check.status
+        );
+        assert!(
+            check
+                .detail
+                .contains("no previous relation census is recorded"),
+            "{}",
+            check.detail
+        );
+    }
+
     /// The counterpart, so the row above cannot be an unconditional warning:
     /// with every wired language's server installed there is no gap to report.
     #[test]
@@ -4025,6 +4232,7 @@ mod tests {
             reference_edge_coverage: Some(
                 kin_core::reference_coverage::ReferenceEdgeCoverage::default(),
             ),
+            relation_census: Some(census_pair(&[], &[], Vec::new())),
         }))
     }
 
@@ -4035,7 +4243,7 @@ mod tests {
     /// psf/requests store against 0.091 s on express, so a second fetch does not
     /// cost a little more, it roughly doubles the wall time of a doctor run on
     /// exactly the stores where an operator is most likely to be running doctor.
-    /// Three consumers here rather than the one the tree holds today, because the
+    /// Three consumers here rather than the two the tree holds today, because the
     /// cost this pins is the one a fourth row would add.
     #[tokio::test]
     async fn one_doctor_run_fetches_graph_status_once_however_many_rows_read_it() {
@@ -4112,18 +4320,22 @@ mod tests {
             ),
         ];
         for (status, expected) in unreadable {
-            let row = coverage_row_for_unread_graph(&status, &no_servers)
+            let coverage_row = coverage_row_for_unread_graph(&status, &no_servers)
                 .expect_err("an unread graph must produce a row rather than a response");
-            assert!(
-                !matches!(row.status, HealthStatus::Healthy),
-                "an unread graph must never render as healthy: {status:?} gave {:?}",
-                row.status
-            );
-            assert!(
-                row.detail.contains(expected),
-                "the row must name what happened: {status:?} gave {}",
-                row.detail
-            );
+            let census_row = relation_census_row_for_unread_graph(&status)
+                .expect_err("an unread graph must reach the census row too");
+            for row in [coverage_row, census_row] {
+                assert!(
+                    !matches!(row.status, HealthStatus::Healthy),
+                    "an unread graph must never render as healthy: {status:?} gave {:?}",
+                    row.status
+                );
+                assert!(
+                    row.detail.contains(expected),
+                    "the row must name what happened: {status:?} gave {}",
+                    row.detail
+                );
+            }
         }
 
         // And the readable case still yields the response, or the four arms
@@ -4131,7 +4343,11 @@ mod tests {
         // measurement.
         assert!(
             coverage_row_for_unread_graph(&answered_graph_status(), &no_servers).is_ok(),
-            "a graph the run did read must hand its response to the row"
+            "a graph the run did read must hand its response to the coverage row"
+        );
+        assert!(
+            relation_census_row_for_unread_graph(&answered_graph_status()).is_ok(),
+            "a graph the run did read must hand its response to the census row"
         );
     }
 

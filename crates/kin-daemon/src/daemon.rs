@@ -3959,6 +3959,25 @@ pub async fn run_with_authority_on(
                             lsp_state.mark_dirty();
                         }
 
+                        // Record the relation census this sweep produced,
+                        // before the publication below makes it durable.
+                        //
+                        // The sweep's relations are all in the live graph by
+                        // here; what remains is writing them to disk. Taking
+                        // the census now means the record describes the graph
+                        // the snapshot is about to publish, and a census taken
+                        // afterwards would be a second reading of the same
+                        // graph for no gain. `kin graph status` compares its
+                        // own census against this record, which is what lets it
+                        // notice a relation kind that went to zero instead of
+                        // printing the histogram that proves the loss and then
+                        // an all-clear over it.
+                        crate::background_work::record_relation_census(
+                            &lsp_state.layout,
+                            lsp_state.graph.as_ref(),
+                            kin_core::relation_census::CensusSource::Sweep,
+                        );
+
                         // Publish this sweep's enrichment ONCE, here, and wait
                         // for it.
                         //
