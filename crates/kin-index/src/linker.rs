@@ -590,7 +590,13 @@ fn build_link_context<'a>(
             };
             known_files.insert(file_path);
             *entity_count_by_file.entry(file_path).or_insert(0) += 1;
-            entity_by_file_name.insert((file_path, &entity.name), entity.id);
+            let slot_free = entity_by_file_name
+                .get(&(file_path, entity.name.as_str()))
+                .and_then(|occupant| entity_kind_by_id.get(occupant))
+                .is_none_or(|occupant| file_name_slot_admits(entity.kind, *occupant));
+            if slot_free {
+                entity_by_file_name.insert((file_path, &entity.name), entity.id);
+            }
             entity_by_name
                 .entry(&*entity.name)
                 .or_default()
@@ -947,6 +953,34 @@ fn resolve_one_file(
                         continue;
                     }
                     dst_lookup = method;
+                } else if rel.receiver.is_some() {
+                    // (a2b) The owner half came from the receiver's DECLARED
+                    // type rather than from a path the caller wrote, so the
+                    // class it names is one the file imports or the repository
+                    // holds exactly one of, not necessarily one defined here.
+                    // `adapter.send(request)` under `adapter: HTTPAdapter`
+                    // binds to `HTTPAdapter.send`, which is the call
+                    // `find_references` counted as zero while the annotation
+                    // proving it sat in the graph.
+                    if let Some((owner_file, owner_class)) =
+                        locate_base_class(&file.file_path, owner, ctx)
+                    {
+                        if let Some(dst_id) =
+                            resolve_inherited_method(&owner_file, &owner_class, method, ctx)
+                        {
+                            accumulate_relation(
+                                &mut resolved,
+                                &mut relation_indices,
+                                make_relation(rel, src_id, dst_id, RECEIVER_TYPE_CONFIDENCE),
+                            );
+                            continue;
+                        }
+                    }
+                    // The declared type names nothing this repository defines,
+                    // or defines no such method. The call keeps the bare leaf
+                    // it arrived with before the type was consulted, so the
+                    // disclaimed same-name path below runs exactly as it did.
+                    dst_lookup = method;
                 }
             }
         }
@@ -1021,6 +1055,8 @@ fn resolve_one_file(
             .filter(|(fp, _)| *fp != file.file_path.as_str())
             .map(|&(fp, id)| (fp, id))
             .collect();
+        let other_file_candidates =
+            drop_module_call_targets(rel.kind, other_file_candidates, &ctx.entity_kind_by_id);
 
         // (b3) Parser-pinned import resolution: the relation carries the module
         // its callee was imported from. A pinned callee must resolve inside
@@ -1845,6 +1881,15 @@ const QUALIFIED_SUFFIX_CONFIDENCE: f32 = 0.6;
 /// and well above the review-side strong-consumer floor, below an
 /// import-verified edge (0.95) because the base-class link itself may have been
 /// name-resolved.
+/// Confidence for a call bound through the receiver's declared type.
+///
+/// The type is written in the source the call sits in, the owner resolved to a
+/// class entity, and the method was selected inside that class or an ancestor
+/// of it, so nothing here is inferred from a name matching a name. It sits
+/// above the inherited-method walk, which infers the dispatch class, and below
+/// the same-file parser-certain edge.
+const RECEIVER_TYPE_CONFIDENCE: f32 = 0.95;
+
 const INHERITED_METHOD_CONFIDENCE: f32 = 0.85;
 
 /// Split a dotted `Owner.method` dst_name into its owner and method parts at
@@ -2374,6 +2419,23 @@ fn resolve_qualified_suffix_incremental(
 }
 
 /// Whether an entity id names a type that can anchor an inheritance walk.
+/// Whether an entity may take the `(file, name)` slot another entity holds.
+///
+/// A Python file's Module entity is named for the file stem, so `nk/search.py`
+/// containing `def search(...)` puts a Module and a Function on one
+/// `(file, name)` key. Inside a module that name binds to the function: Python
+/// binds no name for the module itself in the module's own namespace. Letting
+/// the Module take the slot parked every caller of `search` on the module node,
+/// left the function holding zero incoming edges, and made `kin dead-code`
+/// print the program's primary function as unreferenced.
+///
+/// So a Module never displaces a non-Module here, and a non-Module always
+/// displaces a Module. Two entities of any other kinds keep the prior
+/// last-one-wins behaviour.
+fn file_name_slot_admits(candidate: EntityKind, occupant: EntityKind) -> bool {
+    candidate != EntityKind::Module || occupant == EntityKind::Module
+}
+
 fn is_class_like(kind: Option<&EntityKind>) -> bool {
     matches!(
         kind,
@@ -3193,6 +3255,32 @@ fn rust_bare_call_may_reach_owned(
 ///
 /// Non-method candidates are left to the builtin and import tiers above; this
 /// filter only answers the receiver question.
+/// Drop the module entities a call can never reach.
+///
+/// A module is not callable in any language this indexes, and its Python entity
+/// is named for the file stem, so `nk/search.py` puts a Module named `search`
+/// in the same-name bucket as the function `def search(...)`. Leaving it there
+/// made the bucket hold two ids for one callable name, which the exact-name
+/// tier reads as an unresolvable ambiguity and the package-directory fallback
+/// reads as two candidates, so a caller writing `from nk.search import search`
+/// got no edge at all rather than the wrong one.
+///
+/// A `References` edge is left alone: `import nk.search` then passing
+/// `nk.search` as a value genuinely names the module.
+fn drop_module_call_targets<'a>(
+    kind: RelationKind,
+    candidates: Vec<(&'a str, EntityId)>,
+    kinds: &HashMap<EntityId, EntityKind>,
+) -> Vec<(&'a str, EntityId)> {
+    if kind != RelationKind::Calls {
+        return candidates;
+    }
+    candidates
+        .into_iter()
+        .filter(|(_, id)| kinds.get(id) != Some(&EntityKind::Module))
+        .collect()
+}
+
 fn drop_method_candidates<'a>(
     candidates: Vec<(&'a str, EntityId)>,
     kinds: &HashMap<EntityId, EntityKind>,
@@ -5085,8 +5173,14 @@ impl IncrementalLinker {
         let mut file_entities_list = Vec::new();
 
         for entity in entities {
-            file_entities_map.insert(entity.name.clone(), entity.id);
             self.entity_kind_by_id.insert(entity.id, entity.kind);
+            let slot_free = file_entities_map
+                .get(&entity.name)
+                .and_then(|occupant| self.entity_kind_by_id.get(occupant))
+                .is_none_or(|occupant| file_name_slot_admits(entity.kind, *occupant));
+            if slot_free {
+                file_entities_map.insert(entity.name.clone(), entity.id);
+            }
             self.entity_language_by_id
                 .insert(entity.id, entity.language);
             self.entity_role_by_id.insert(entity.id, entity.role);
@@ -5532,6 +5626,31 @@ fn resolve_one_file_incremental(
                         continue;
                     }
                     dst_lookup = method;
+                } else if rel.receiver.is_some() {
+                    // (a2b) mirrors the batch linker: an owner half that came
+                    // from the receiver's declared type resolves through the
+                    // class that type names, wherever the repository defines
+                    // it, and falls back to the bare leaf when it names none.
+                    if let Some((owner_file, owner_class)) =
+                        locate_base_class_incremental(&file.file_path, owner, linker, import_map)
+                    {
+                        if let Some(dst_id) = resolve_inherited_method_incremental(
+                            &owner_file,
+                            &owner_class,
+                            method,
+                            linker,
+                            import_map,
+                            class_bases,
+                        ) {
+                            accumulate_relation(
+                                &mut resolved,
+                                &mut relation_indices,
+                                make_relation(rel, src_id, dst_id, RECEIVER_TYPE_CONFIDENCE),
+                            );
+                            continue;
+                        }
+                    }
+                    dst_lookup = method;
                 }
             }
         }
@@ -5603,6 +5722,8 @@ fn resolve_one_file_incremental(
                     .collect()
             })
             .unwrap_or_default();
+        let other_file_candidates =
+            drop_module_call_targets(rel.kind, other_file_candidates, &linker.entity_kind_by_id);
 
         // (b3) Parser-pinned import resolution — mirrors the batch linker:
         // a callee pinned to a module must resolve inside that module (or

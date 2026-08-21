@@ -389,7 +389,16 @@ fn extract_py_node(
                     span: span_from_node(node, file_id),
                 });
                 // Extract calls within function/method body
-                extract_calls_from_context(node, source, &name, class_ctx, relations, call_audit);
+                let receiver_types = python_receiver_types(node, source);
+                extract_calls_from_context(
+                    node,
+                    source,
+                    &name,
+                    class_ctx,
+                    &receiver_types,
+                    relations,
+                    call_audit,
+                );
                 extract_value_refs_from_definition(node, source, &name, value_refs);
                 if let Some(cls) = class_ctx {
                     relations.push(ExtractedRelation {
@@ -1251,6 +1260,7 @@ fn extract_named_callee(
     function: &tree_sitter::Node,
     source: &[u8],
     class_ctx: Option<&str>,
+    receiver_types: &PythonReceiverTypes,
 ) -> Option<PythonNamedCallee> {
     let callee = match function.kind() {
         "parenthesized_expression" => {
@@ -1260,7 +1270,7 @@ fn extract_named_callee(
             if named.next().is_some() {
                 return None;
             }
-            return extract_named_callee(&inner, source, class_ctx);
+            return extract_named_callee(&inner, source, class_ctx, receiver_types);
         }
         "attribute" => {
             let attr = function
@@ -1276,11 +1286,26 @@ fn extract_named_callee(
                 .filter(|obj| obj.kind() == "identifier")
                 .and_then(|obj| obj.utf8_text(source).ok())
                 .is_some_and(|text| text == "self" || text == "cls");
-            match class_ctx {
-                Some(cls) if self_or_cls_receiver => PythonNamedCallee {
+            let declared_owner = receiver_text
+                .as_deref()
+                .and_then(|receiver| receiver_types.get(receiver));
+            match (class_ctx, declared_owner) {
+                (Some(cls), _) if self_or_cls_receiver => PythonNamedCallee {
                     name: format!("{cls}.{attr}"),
                     resolution_proven: true,
                     receiver: None,
+                },
+                // The receiver's type is declared here, so the call names one
+                // owner and arrives owner-qualified exactly as a `self.m()`
+                // call does. The receiver is still carried: it is what tells
+                // the linker this owner came from a declaration rather than
+                // from a written path, so a type the repository does not
+                // define falls back to the bare leaf instead of resolving to
+                // nothing.
+                (_, Some(owner)) => PythonNamedCallee {
+                    name: format!("{owner}.{attr}"),
+                    resolution_proven: true,
+                    receiver: receiver_text,
                 },
                 _ => PythonNamedCallee {
                     name: attr.to_string(),
@@ -1299,12 +1324,203 @@ fn extract_named_callee(
     is_valid_callee_name(&callee.name).then_some(callee)
 }
 
+/// The declared type of every receiver expression a call in this scope can be
+/// written through, keyed by the receiver exactly as source spells it.
+///
+/// Two spellings reach it. A plain name the enclosing definition annotates
+/// (`def send(self, adapter: HTTPAdapter)`, `adapter: HTTPAdapter = ...`) keys
+/// on that name, and an attribute of the enclosing class the class body
+/// annotates (`connection: HTTPAdapter`) keys on `self.connection` and
+/// `cls.connection`, which is how such an attribute is read.
+///
+/// Only a declaration populates this. Nothing is inferred from an assignment's
+/// right-hand side, so a name the file never annotates has no entry and its
+/// calls keep the bare-leaf behaviour they had before.
+type PythonReceiverTypes = std::collections::HashMap<String, String>;
+
+/// Collect the receiver types one `function_definition` can dispatch through.
+///
+/// Without this, `adapter.send(request)` reached the linker as the bare leaf
+/// `send`, so `find_references(HTTPAdapter.send)` on a requests-shaped package
+/// counted zero callers and held the real one as an unproven same-name
+/// candidate, while the annotation naming the receiver's type sat in the graph
+/// one lookup away.
+fn python_receiver_types(node: &tree_sitter::Node, source: &[u8]) -> PythonReceiverTypes {
+    let mut types = PythonReceiverTypes::new();
+    if let Some(params) = node.child_by_field_name("parameters") {
+        let mut cursor = params.walk();
+        for param in params.named_children(&mut cursor) {
+            let (Some(name), Some(annotation)) = (
+                param
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok()),
+                param.child_by_field_name("type"),
+            ) else {
+                continue;
+            };
+            if let Some(declared) = python_annotation_type_name(&annotation, source) {
+                types.insert(name.to_string(), declared);
+            }
+        }
+    }
+    if let Some(body) = node.child_by_field_name("body") {
+        collect_python_annotated_bindings(&body, source, "", &mut types);
+    }
+    if let Some(class) = python_enclosing_class(node) {
+        if let Some(body) = class.child_by_field_name("body") {
+            for prefix in ["self.", "cls."] {
+                collect_python_annotated_bindings(&body, source, prefix, &mut types);
+            }
+        }
+    }
+    types
+}
+
+/// The `class_definition` a method is written inside, if any.
+///
+/// A method's parent is its class body; a decorated method sits one
+/// `decorated_definition` further out, which is why the walk is a short climb
+/// rather than a single `parent()` call. A nested function inside a method
+/// still reaches the class, which is correct: `self` means the same thing there.
+fn python_enclosing_class<'tree>(
+    node: &tree_sitter::Node<'tree>,
+) -> Option<tree_sitter::Node<'tree>> {
+    let mut current = node.parent();
+    for _ in 0..PYTHON_CLASS_ANCESTOR_DEPTH {
+        let ancestor = current?;
+        if ancestor.kind() == "class_definition" {
+            return Some(ancestor);
+        }
+        current = ancestor.parent();
+    }
+    None
+}
+
+/// How far above a definition its class may sit. A method's body, its own
+/// definition node and one decorator wrapper are the three steps a class
+/// member can be nested behind; the cap keeps the climb off unrelated
+/// enclosing classes when a definition is nested deeper than that.
+const PYTHON_CLASS_ANCESTOR_DEPTH: usize = 4;
+
+/// Record every `name: Type` binding written directly in `body`, under
+/// `prefix`.
+///
+/// Only statements at this level are read. A binding written inside a nested
+/// `if` or `for` is skipped rather than hoisted, because the annotation there
+/// is conditional and a receiver type has to be the one the reader can see.
+fn collect_python_annotated_bindings(
+    body: &tree_sitter::Node,
+    source: &[u8],
+    prefix: &str,
+    types: &mut PythonReceiverTypes,
+) {
+    let mut cursor = body.walk();
+    for statement in body.named_children(&mut cursor) {
+        let assignment = match statement.kind() {
+            "assignment" => Some(statement),
+            "expression_statement" => statement
+                .named_child(0)
+                .filter(|child| child.kind() == "assignment"),
+            _ => None,
+        };
+        let Some(assignment) = assignment else {
+            continue;
+        };
+        let (Some(left), Some(annotation)) = (
+            assignment.child_by_field_name("left"),
+            assignment.child_by_field_name("type"),
+        ) else {
+            continue;
+        };
+        let bound = match left.kind() {
+            "identifier" => left.utf8_text(source).ok().map(str::to_string),
+            // `self.connection: HTTPAdapter` inside a method declares the same
+            // attribute a class-body `connection: HTTPAdapter` does.
+            "attribute" => python_self_attribute_path(&left, source),
+            _ => None,
+        };
+        let (Some(bound), Some(declared)) =
+            (bound, python_annotation_type_name(&annotation, source))
+        else {
+            continue;
+        };
+        if bound.contains('.') {
+            types.insert(bound, declared);
+        } else {
+            types.insert(format!("{prefix}{bound}"), declared);
+        }
+    }
+}
+
+/// `self.connection` for a `self.connection` attribute node, `None` for any
+/// other receiver. Only `self` and `cls` name the enclosing instance, so an
+/// annotation on anything else declares a field of some other object and says
+/// nothing about a call written here.
+fn python_self_attribute_path(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let object = node.child_by_field_name("object")?;
+    if object.kind() != "identifier" {
+        return None;
+    }
+    let root = object.utf8_text(source).ok()?;
+    if root != "self" && root != "cls" {
+        return None;
+    }
+    let leaf = node
+        .child_by_field_name("attribute")?
+        .utf8_text(source)
+        .ok()?;
+    (!leaf.is_empty()).then(|| format!("{root}.{leaf}"))
+}
+
+/// The class name one type annotation declares, or `None` when the annotation
+/// names no single class.
+///
+/// A bare `HTTPAdapter` and a module-qualified `adapters.HTTPAdapter` both name
+/// one type, and `Optional[HTTPAdapter]` names the same type with `None` added,
+/// which does not change what a call through it dispatches to. Everything else
+/// stays out: a union, a container and a string forward reference each leave
+/// the receiver's type undecided, and a receiver whose type is undecided must
+/// keep the bare-name behaviour rather than pick one arm of it.
+fn python_annotation_type_name(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let inner = if node.kind() == "type" {
+        node.named_child(0)?
+    } else {
+        *node
+    };
+    match inner.kind() {
+        "identifier" => inner
+            .utf8_text(source)
+            .ok()
+            .filter(|name| !name.is_empty())
+            .map(str::to_string),
+        "attribute" => {
+            let text = inner.utf8_text(source).ok()?;
+            (!text.is_empty() && text.split('.').all(|seg| !seg.is_empty())).then(|| text.to_string())
+        }
+        "subscript" => {
+            let value = inner.child_by_field_name("value")?;
+            let wrapper = value.utf8_text(source).ok()?;
+            if !matches!(wrapper, "Optional" | "typing.Optional") {
+                return None;
+            }
+            let mut cursor = inner.walk();
+            let mut arguments = inner
+                .children_by_field_name("subscript", &mut cursor)
+                .collect::<Vec<_>>();
+            let argument = arguments.pop().filter(|_| arguments.is_empty())?;
+            python_annotation_type_name(&argument, source)
+        }
+        _ => None,
+    }
+}
+
 /// Extract all function/method calls within a function/method body.
 fn extract_calls_from_context(
     node: &tree_sitter::Node,
     source: &[u8],
     context_name: &str,
     class_ctx: Option<&str>,
+    receiver_types: &PythonReceiverTypes,
     relations: &mut Vec<ExtractedRelation>,
     call_audit: &mut PythonCallExtractionAudit,
 ) {
@@ -1316,7 +1532,9 @@ fn extract_calls_from_context(
                 .insert((child.start_byte(), child.end_byte()));
             let callee = child
                 .child_by_field_name("function")
-                .and_then(|function| extract_named_callee(&function, source, class_ctx));
+                .and_then(|function| {
+                    extract_named_callee(&function, source, class_ctx, receiver_types)
+                });
             if let Some(callee) = callee {
                 relations.push(ExtractedRelation {
                     // The call expression itself, so a reference row can report the
@@ -1343,6 +1561,7 @@ fn extract_calls_from_context(
             source,
             context_name,
             class_ctx,
+            receiver_types,
             relations,
             call_audit,
         );
