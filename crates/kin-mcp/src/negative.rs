@@ -60,6 +60,99 @@ use crate::envelope::{Envelope, NegativeClass};
 /// Distinctive enough not to collide with any tool payload's own fields.
 pub const NEGATIVE_KEY: &str = "negative";
 
+/// The file-enumeration tool, named once here so the spec, the gate and the
+/// dependency declaration below cannot drift from the registry that serves it.
+const FILE_ENTITIES_TOOL: &str = crate::handlers::file_entities::TOOL_NAME;
+
+/// Why a file enumeration cannot be certified as the file's whole entity set,
+/// or `None` when nothing stops it.
+///
+/// Read from the tool's own `file_coverage` observation rather than from the
+/// envelope, because the question is about one file and every envelope signal is
+/// about the store. A completely embedded, fully loaded, undegraded graph
+/// carries no entities at all for a file no language adapter parsed, and every
+/// store-level gate reads healthy while it says so.
+///
+/// Four things can stop the certification and each is named separately, because
+/// the remediation differs: a file nothing parsed needs an adapter, a partial
+/// parse needs the syntax fixed, a page needs its cursor followed, and a shifted
+/// enumeration needs re-walking from the start.
+fn file_enumeration_gap(payload: &Value) -> Option<String> {
+    let Some(coverage) = payload
+        .get(crate::handlers::file_entities::FILE_COVERAGE_KEY)
+        .and_then(Value::as_object)
+    else {
+        return Some(
+            "file_coverage_unreported: this answer did not report whether a language adapter \
+             parsed the file, so an empty enumeration cannot be distinguished from a file \
+             nothing ever extracted entities from"
+                .to_string(),
+        );
+    };
+
+    let parsed = coverage
+        .get("parsed")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let detail = coverage
+        .get("parse_detail")
+        .and_then(Value::as_str)
+        .map(|detail| format!(" ({detail})"))
+        .unwrap_or_default();
+    match parsed {
+        "full" => {}
+        "absent" => {
+            return Some(
+                "file_not_parsed: no language adapter produced a layout for this file, so the \
+                 graph holds no entity set for it to be missing from. An empty enumeration here \
+                 is a fact about Kin's extraction coverage, not about the file's contents"
+                    .to_string(),
+            )
+        }
+        "partial" => {
+            return Some(format!(
+                "file_parsed_partially: the adapter hit parse errors in this file{detail}, so the \
+                 entities it produced are a floor and the enumeration may be short"
+            ))
+        }
+        "failed" => {
+            return Some(format!(
+                "file_parse_failed: the adapter could not parse this file{detail}, so whatever \
+                 entities the graph still carries for it describe an earlier state"
+            ))
+        }
+        other => {
+            return Some(format!(
+                "file_parse_state_unknown: this answer reported the parse state as {other:?}, \
+                 which is not a state that licenses reading the enumeration as whole"
+            ))
+        }
+    }
+
+    if coverage.get("enumeration_shifted").and_then(Value::as_bool) == Some(true) {
+        return Some(
+            "enumeration_shifted: the file gained or lost entities between the page that minted \
+             this cursor and the page it served, so these pages do not assemble into one state of \
+             the repository. Re-walk from the start"
+                .to_string(),
+        );
+    }
+
+    if coverage
+        .get("whole_file_in_response")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        return Some(
+            "page_bounded: this response holds one page of the file rather than all of it, so its \
+             rows are a floor. Follow `next_cursor` to the end before reading the set as whole"
+                .to_string(),
+        );
+    }
+
+    None
+}
+
 /// How one tool's payload expresses "no result", and how to frame the resulting
 /// negative. One row per negative-capable tool — the single source of truth.
 struct RetrievalSpec {
@@ -144,6 +237,20 @@ fn spec_for(tool: &str) -> Option<RetrievalSpec> {
             field: "relations",
             kind: "no_neighbors",
             subject: "the entity has no graph neighbors at the requested depth",
+            always: false,
+            class: NegativeClass::Structural,
+        },
+        // The enumeration surface. Its absence claim is the sharpest one any
+        // retrieval tool here makes -- "this file holds no entities" -- and it
+        // is also the one with a decisive per-file fact behind it, so it is
+        // gated on that fact rather than on store-wide health. `Structural`
+        // because it reads the entity index; no embedding is consulted, and
+        // gating it on embedding coverage would report a complete answer as
+        // uncertain for a substrate it never touched.
+        FILE_ENTITIES_TOOL => RetrievalSpec {
+            field: "entities",
+            kind: "no_file_entities",
+            subject: "the graph holds no entities for this file",
             always: false,
             class: NegativeClass::Structural,
         },
@@ -719,7 +826,9 @@ fn qualifies_populated_answers(tool: &str) -> bool {
 /// extracted graph has nothing for this gate to say, and silence is not
 /// agreement.
 pub(crate) fn declares_absence_dependency(tool: &str, payload: &Value) -> bool {
-    !absence_cross_file_classes(tool, payload).is_empty() || absence_is_language_scoped(tool)
+    !absence_cross_file_classes(tool, payload).is_empty()
+        || absence_is_language_scoped(tool)
+        || tool == FILE_ENTITIES_TOOL
 }
 
 /// One class's observed state, defaulting to `unknown` for a class the
@@ -1109,11 +1218,7 @@ fn trace_flow_gaps(payload: &Value) -> Vec<String> {
     let direction = payload.get("direction").and_then(Value::as_str);
     let walked_callers = !matches!(direction, Some("calls"));
     if walked_callers && focal_is_method(payload) {
-        gaps.push(
-            "method_call_resolution_incomplete: receiver-method calls are linked by bare name \
-             and may be unresolved, so an empty chain is not an authoritative absence for a method"
-                .to_string(),
-        );
+        gaps.push(kin_core::reference_coverage::method_absence_limiting_factor("an empty chain"));
     }
 
     // A name the graph holds more than once (the cfg-twin shape: two arms of the
@@ -1484,10 +1589,18 @@ fn focal_kind(payload: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
-/// True when the payload's focal is a method, the entity kind whose call edges
-/// the linker under-resolves, so absence must not be certified as authoritative.
+/// True when the payload's focal is a kind whose incoming call edges the linker
+/// under-resolves, so absence must not be certified as authoritative.
+///
+/// The extraction above is payload plumbing, because two tools nest the focal
+/// differently. The judgement itself is
+/// [`kin_core::reference_coverage::kind_under_resolves_incoming_calls`], shared
+/// with `kin dead-code`, which printed a delete list this gate would have
+/// refused while the rule sat here where a CLI command could not read it
+/// (FIR-2550).
 fn focal_is_method(payload: &Value) -> bool {
-    focal_kind(payload).is_some_and(|kind| kind.eq_ignore_ascii_case("method"))
+    focal_kind(payload)
+        .is_some_and(kin_core::reference_coverage::kind_name_under_resolves_incoming_calls)
 }
 
 /// The label an unavailable cross-repo answer reports, and its detail.
@@ -1746,14 +1859,22 @@ pub fn negative_for(
         }
     }
 
+    // The enumeration's own gate, and the only one that can certify it. Every
+    // other signal here describes the store; this describes the file, and a
+    // file no adapter parsed holds no entities in a graph of any health at all.
+    // Reading store health as licence for that absence is exactly the
+    // substitution FIR-2430 made on the language axis.
+    if tool == FILE_ENTITIES_TOOL {
+        if let Some(gap) = file_enumeration_gap(payload) {
+            push_gap(&mut trustworthy, &mut trust_reason, gap);
+        }
+    }
+
     if matches!(tool, "find_references" | "get_context_pack") && focal_is_method(payload) {
         push_gap(
             &mut trustworthy,
             &mut trust_reason,
-            "method_call_resolution_incomplete: receiver-method calls are \
-             linked by bare name and may be unresolved, so an empty result is not an \
-             authoritative absence for a method"
-                .to_string(),
+            kin_core::reference_coverage::method_absence_limiting_factor("an empty result"),
         );
     }
 
@@ -5228,5 +5349,60 @@ mod tests {
         assert!(!query_names_a_symbol("Checks That Cannot Fail"));
         assert!(!query_names_a_symbol("graph-native repo substrate"));
         assert!(!query_names_a_symbol(""));
+    }
+
+    /// FIR-2542's second half. `edge_coverage_unreported` reached every
+    /// `trace_data_flow` response, complete ones included, because the daemon
+    /// route published no observation at all. A limit that is always set
+    /// distinguishes nothing, so the fix is the walk publishing what it
+    /// measured; this asserts the gate reacts to that and still refuses when
+    /// the measurement says the graph could not have answered.
+    #[test]
+    fn a_trace_that_publishes_its_coverage_stops_reporting_it_as_unreported() {
+        let chain = json!({
+            "chain": [{"step": 1, "terminal": "leaf"}],
+            "total_steps": 1,
+            "truncated": false,
+        });
+
+        // Before: no observation, so every walk carried the same limit.
+        let unreported =
+            absence_coverage_gap("trace_data_flow", &chain).expect("an unmeasured walk is unknown");
+        assert!(
+            unreported.starts_with("edge_coverage_unreported"),
+            "{unreported}"
+        );
+        assert!(edge_coverage_degradation_labels("trace_data_flow", &chain)
+            .contains(&"edge_coverage:unreported".to_string()));
+
+        // After: the walk publishes what it measured, and a graph that links
+        // calls across files leaves the gate with nothing to say.
+        let mut measured = chain.clone();
+        measured["edge_coverage"] = json!({
+            "scope": "language",
+            "language": "Python",
+            "requested_classes": ["calls", "imports", "references"],
+            "classes": {"calls": "present", "imports": "absent", "references": "absent"},
+            "reference_enrichment": "unknown",
+            "budget_exhausted": false,
+        });
+        assert_eq!(
+            absence_coverage_gap("trace_data_flow", &measured),
+            None,
+            "a complete walk over a linked graph must carry no coverage limit"
+        );
+        let labels = edge_coverage_degradation_labels("trace_data_flow", &measured);
+        assert!(
+            !labels.contains(&"edge_coverage:unreported".to_string()),
+            "the limit that distinguished nothing must be gone: {labels:?}"
+        );
+
+        // And the gate still fires on the graph shape it exists for, so the fix
+        // is not simply a way of never reporting a gap.
+        let mut unlinked = measured.clone();
+        unlinked["edge_coverage"]["classes"]["calls"] = json!("absent");
+        let gap = absence_coverage_gap("trace_data_flow", &unlinked)
+            .expect("a graph holding no cross-file calls cannot complete a call chain");
+        assert!(gap.starts_with("cross_file_edges_absent"), "{gap}");
     }
 }

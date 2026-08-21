@@ -974,6 +974,20 @@ enum Command {
     /// a graph that fell behind its working tree and is waiting for churn that
     /// is not coming.
     Admit,
+    /// Approve one blocked sensitive artifact for publication
+    ///
+    /// Admission refuses untracked content that looks like a leaked credential
+    /// and names the path, digest, and entry kind an approval must carry. This
+    /// records exactly that triple in the tracked .kin-allowances file, so the
+    /// approval travels with the repository and a reviewer sees it in the diff.
+    /// Editing the artifact changes its digest and blocks it again.
+    Allow {
+        /// Path to the artifact admission blocked
+        path: String,
+        /// Why this artifact is safe to publish, read by whoever reviews it
+        #[arg(long)]
+        reason: String,
+    },
     /// Admit one exact disposable-session observation into repository-v6 authority
     Reconcile {
         /// Session ID (defaults to most recent session)
@@ -1139,7 +1153,7 @@ enum Command {
         #[command(subcommand)]
         action: Option<RegistryAction>,
     },
-    /// Inspect and gracefully stop Kin daemons
+    /// Inspect Kin daemons, stop them gracefully, or ask one to enrich
     Daemon {
         #[command(subcommand)]
         action: DaemonAction,
@@ -1865,12 +1879,29 @@ enum McpAction {
     /// A server that bound a repository of its own keeps serving it and ignores
     /// client workspace roots it cannot resolve to a Kin repository. That is
     /// what makes a container or remote registration work: with
-    /// `docker exec -i -w /work/repo <container> kin mcp start`, the client
-    /// announces host paths that do not exist inside the container, and treating
-    /// them as a workspace change would refuse every call. Roots that do name a
-    /// Kin repository this server can see, and does not serve, are still a real
-    /// disagreement and are refused rather than answered from the wrong
-    /// repository.
+    /// `docker exec -i -w /work/repo <container> /absolute/path/to/kin mcp start`,
+    /// the client announces host paths that do not exist inside the container,
+    /// and treating them as a workspace change would refuse every call. Roots
+    /// that do name a Kin repository this server can see, and does not serve,
+    /// are still a real disagreement and are refused rather than answered from
+    /// the wrong repository.
+    ///
+    /// Register the absolute path to the binary, never a bare `kin`.
+    /// `docker exec` resolves a bare command against the image's own PATH,
+    /// which carries neither `~/.kin/bin` nor an npm user prefix, so a bare
+    /// registration dies with `exec: "kin": executable file not found in
+    /// $PATH` and blames Docker for a Kin configuration gap. After
+    /// `kin setup`, the managed binary is at `~/.kin/bin/kin`; after
+    /// `npm install -g @kinlab/kin`, it is at `$(npm prefix -g)/bin/kin`. To
+    /// keep the bare command instead, hand `docker exec` the environment it
+    /// needs: `docker exec -e PATH=/home/<user>/.kin/bin:$PATH -i -w
+    /// /work/repo <container> kin mcp start`.
+    ///
+    /// Reinstalling as root is not a shortcut past this on an image that gives
+    /// every user the same HOME. Root's npm reads that HOME's `.npmrc` and
+    /// reinstalls into the user prefix while reporting success, so nothing new
+    /// lands on the default PATH. Name the prefix outright when that is what
+    /// you want: `npm install -g --prefix /usr/local @kinlab/kin`.
     Start {
         /// Run in global mode, serving all registered repos from ~/.kin/registry.toml
         #[arg(long)]
@@ -2216,6 +2247,19 @@ enum DaemonAction {
         /// Widen --all to every daemon on this machine, whatever KIN_HOME it runs under
         #[arg(long, requires = "all")]
         machine: bool,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Ask this repository's daemon for a language-server enrichment sweep
+    Sweep {
+        /// Return as soon as the sweep is queued, instead of waiting for it
+        ///
+        /// The sweep is background work, so a daemon this command started can
+        /// reach its idle timeout and stop while the sweep is still running.
+        /// Waiting is the default for that reason.
+        #[arg(long, default_value_t = false)]
+        no_wait: bool,
         /// Emit machine-readable JSON
         #[arg(long)]
         json: bool,
@@ -3522,6 +3566,7 @@ fn main() -> Result<()> {
                     commands::capabilities::require_ready("admit")?;
                     commands::admit::run().await
                 }
+                Command::Allow { path, reason } => commands::allow::run(path, reason).await,
                 Command::Reconcile {
                     session,
                     confirm_mass_deletion,
@@ -3612,6 +3657,9 @@ fn main() -> Result<()> {
                     DaemonAction::Status { json } => commands::daemon::status(json).await,
                     DaemonAction::Stop { all, machine, json } => {
                         commands::daemon::stop(all, machine, json).await
+                    }
+                    DaemonAction::Sweep { no_wait, json } => {
+                        commands::daemon::sweep(no_wait, json).await
                     }
                 },
                 Command::Doctor {
@@ -4771,6 +4819,72 @@ mod tests {
             // assertions above green.
             assert!(
                 !flattened.contains("ignores client workspace roots entirely"),
+                "the check must be able to fail: {flattened}"
+            );
+        });
+    }
+
+    /// The registration this help documents has to be one an operator can paste
+    /// into a stock image.
+    ///
+    /// It was not. `docker exec` with a bare command resolves it against the
+    /// image's own `ENV PATH`, which carries neither `~/.kin/bin` nor an npm
+    /// user prefix, so the documented shape died with `exec: "kin": executable
+    /// file not found in $PATH` on npm-served 0.5.45 in a Debian 12 container
+    /// (FIR-2553). The error names Docker, so a reader has no way back to the
+    /// cause from the failure. Documenting a command that cannot run is worse
+    /// than documenting none, which is why the absolute-path form is asserted
+    /// here rather than left to review.
+    #[test]
+    fn mcp_start_help_registers_an_absolute_binary_path_for_docker_exec() {
+        on_cli_test_stack(|| {
+            let command = Cli::command();
+            let start = command
+                .get_subcommands()
+                .find(|subcommand| subcommand.get_name() == "mcp")
+                .expect("kin mcp must exist")
+                .get_subcommands()
+                .find(|subcommand| subcommand.get_name() == "start")
+                .expect("kin mcp start must exist")
+                .clone();
+            let help = start
+                .get_long_about()
+                .or_else(|| start.get_about())
+                .expect("kin mcp start must carry help text")
+                .to_string();
+            let flattened = help.split_whitespace().collect::<Vec<_>>().join(" ");
+
+            assert!(
+                flattened
+                    .contains("docker exec -i -w /work/repo <container> /absolute/path/to/kin"),
+                "help must register an absolute path to the binary, since a bare `kin` is not on \
+                 the PATH docker exec uses: {flattened}"
+            );
+            assert!(
+                flattened.contains("executable file not found in $PATH"),
+                "help must quote the failure a bare registration produces, so a reader who hits \
+                 it can find their way back: {flattened}"
+            );
+            assert!(
+                flattened.contains("~/.kin/bin/kin"),
+                "help must say where the managed binary is, or the absolute path it asks for is \
+                 one the reader still has to hunt for: {flattened}"
+            );
+
+            // The npm reinstall that looks like the obvious fix and is not: an
+            // image with one shared HOME sends root's install back into the
+            // user prefix while reporting success.
+            assert!(
+                flattened.contains("npm install -g --prefix /usr/local @kinlab/kin"),
+                "help must name the prefix-explicit install, since the plain root reinstall \
+                 reports success and lands nothing on the default PATH: {flattened}"
+            );
+
+            // Falsification: a phrase that was never written must be absent, so
+            // a `contains` that matches anything cannot be what made the
+            // assertions above green.
+            assert!(
+                !flattened.contains("docker exec resolves the managed binary automatically"),
                 "the check must be able to fail: {flattened}"
             );
         });

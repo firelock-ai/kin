@@ -296,9 +296,12 @@ fn plan_and_commit(
     // change was published from it. Reading lengths back through authority
     // proves that, and fails closed if any source is missing.
     let (shared_policy, admission_policy_delta) =
-        SharedAdmissionPolicy::derive_from_tree(Some(&previous_policy), &target_tree, |hash| {
-            source_body_len(authority, hash)
-        })
+        SharedAdmissionPolicy::derive_from_tree_with_allowances(
+            Some(&previous_policy),
+            &target_tree,
+            |hash| source_body_len(authority, hash),
+            |hash| source_body(authority, hash),
+        )
         .context("derive the restored shared admission policy")?;
 
     let mut change = SemanticChange {
@@ -740,6 +743,25 @@ fn relation_transition(
     }
     deltas.sort_by_key(RelationDelta::target_id);
     deltas
+}
+
+fn source_body(
+    authority: &ActiveLocalRepositoryAuthority,
+    hash: Hash256,
+) -> std::result::Result<Vec<u8>, kin_model::ModelError> {
+    authority
+        .manager
+        .load_source_blob(hash)
+        .map_err(|error| {
+            kin_model::ModelError::InvalidOperation(format!(
+                "read restored admission source {hash}: {error}"
+            ))
+        })?
+        .ok_or_else(|| {
+            kin_model::ModelError::InvalidOperation(format!(
+                "repository source CAS is missing restored admission source {hash}"
+            ))
+        })
 }
 
 fn source_body_len(

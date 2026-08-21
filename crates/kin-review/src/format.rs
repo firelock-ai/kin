@@ -69,8 +69,25 @@ fn entity_location(entity: &kin_model::entity::Entity) -> Option<String> {
 pub fn format_diff(diff: &SemanticDiff) -> String {
     let mut out = String::new();
 
+    // The provenance note comes before the empty check on purpose. A change
+    // that re-emitted a whole file and edited nothing in it is exactly the case
+    // where a bare "No entity changes." would look like the review had read
+    // nothing, so the line that explains the discrepancy has to survive it.
+    let provenance_note = if diff.provenance_only_entity_changes > 0 {
+        Some(format!(
+            "{} entity record(s) in the touched file(s) advanced only their span or source-blob \
+             provenance and are not listed as modified.",
+            diff.provenance_only_entity_changes,
+        ))
+    } else {
+        None
+    };
+
     if diff.is_empty() {
         writeln!(out, "No entity changes.").unwrap();
+        if let Some(note) = provenance_note {
+            writeln!(out, "{note}").unwrap();
+        }
         return out;
     }
 
@@ -93,6 +110,10 @@ pub fn format_diff(diff: &SemanticDiff) -> String {
                 writeln!(out, "    file: {}", file).unwrap();
             }
         }
+    }
+
+    if let Some(note) = provenance_note {
+        writeln!(out, "\n{note}").unwrap();
     }
 
     if !modified.is_empty() {

@@ -3343,6 +3343,7 @@ async fn command_resources(
         hybrid_metrics: hybrid_metrics_runtime(),
         metal_profile: metal_profile_runtime(),
         vector_index_discarded: state.vector_index_discarded().map(str::to_string),
+        deferred_vector_checkpoint: state.deferred_vector_checkpoint(),
         embedding_coverage_ever_complete: state.embedding_coverage_ever_complete(),
         embed_persistence_unavailable: !state.can_persist_embed_progress_locally(),
         model_fetch: kin_cli::embed_model::EmbedModelFetch::probe(embed_pass_is_working(&state)),
@@ -3445,6 +3446,7 @@ fn graph_status_embedding_runtime(
     }
     kin_cli::commands::resources::EmbedRuntimeState {
         vector_index_discarded: state.vector_index_discarded().map(str::to_string),
+        deferred_vector_checkpoint: state.deferred_vector_checkpoint(),
         embedding_coverage_ever_complete: state.embedding_coverage_ever_complete(),
         embed_persistence_unavailable: !state.can_persist_embed_progress_locally(),
         model_fetch: kin_cli::embed_model::EmbedModelFetch::probe(embed_pass_is_working(state)),
@@ -4752,6 +4754,34 @@ async fn command_commit(
                 .background_work
                 .reconcile()
                 .clear_deferred_tree_wedge();
+            // The forced admission above is a complete exact-tree admission by
+            // every measure the freshness surfaces use, so it is recorded on the
+            // same probes and in the same durable marker the ambient reconcile
+            // tick and `kin admit` write. Leaving it out made a commit the one
+            // complete admission no surface could see.
+            //
+            // Recorded here rather than beside the admission because this is the
+            // point the admitted tree is durable. The admission defers its
+            // publication to this transaction, and a marker stamped before the
+            // transaction reached authority would claim a complete admission for
+            // a tree authority never accepted, on exactly the path where the
+            // commit fails and the deferred publication fails behind it.
+            //
+            // Without this the marker had two writers, the ambient tick and
+            // `kin admit`, and neither runs on a convert-then-commit session: the
+            // tick stands its own round down for a commit inside the daemon. So a
+            // store that had just been converted and committed to reported that
+            // no complete admission was recorded for it, minutes after one had
+            // completed, while a sibling store that happened to get an ambient
+            // tick milliseconds before its commit reported a healthy timestamp.
+            state
+                .background_work
+                .reconcile()
+                .record_admission_success(std::time::Instant::now());
+            crate::background_work::record_durable_admission(
+                &state.layout,
+                state.graph.resolved_tree().len() as u64,
+            );
             Ok(response)
         }
         Err(error) => {
@@ -5949,9 +5979,15 @@ async fn search(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let mut result =
-        kin_cli::commands::search::collect_daemon_search_response(graph.as_ref(), &req)
-            .map_err(internal_error)?;
+    let mut result = kin_cli::commands::search::collect_daemon_search_response(
+        graph.as_ref(),
+        &req,
+        // Same substrate reading the impact and trace routes supply, from the
+        // same helper, so no CLI surface can be more confident than its MCP
+        // counterpart about one daemon at one instant (FIR-2524).
+        &kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state)),
+    )
+    .map_err(internal_error)?;
     if req.show_body {
         attach_search_bodies(&state, &mut result, req.body_limit.unwrap_or(10));
     }
@@ -6002,11 +6038,16 @@ async fn trace(
     let repository_authority = state
         .local_repository_authority_binding()
         .map_err(repository_authority_error)?;
+    // Same substrate reading the impact route supplies, from the same helper, so
+    // `kin trace` and `get_context_pack` cannot disagree about one daemon at one
+    // instant (FIR-2524).
+    let envelope = kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state));
     let result = kin_cli::commands::trace::build_trace_response(
         &state.layout,
         &repository_authority,
         graph.as_ref(),
         &req,
+        &envelope,
     )
     .map_err(internal_error)?;
     Ok(Json(result))
@@ -11201,7 +11242,127 @@ async fn lsp_sweep(
         "status": if queued { "sweep_queued" } else { "sweep_already_running" },
         "sweeps_completed": queued_after,
         "enrichment_available": state.lsp_enrichment_tx.is_some(),
+        "enrichment_unavailable": enrichment_unavailable(&state),
     })))
+}
+
+/// Why enrichment is unavailable, when it is, and `None` when it is available.
+///
+/// `lsp_enrichment_tx.is_some()` collapses several different causes into one
+/// boolean, and every caller that read it alone had to invent a cause to
+/// explain it. `kin init` invented "no language server is installed", which is
+/// false on a deliberately disabled daemon and false again on a host that
+/// installed a server after this daemon started.
+///
+/// The distinctions matter because the repairs differ: installing a server,
+/// changing a config, restarting a daemon, or fixing a broken install are four
+/// different actions. When the readiness probe has not finished, this says so
+/// rather than guessing, because an unfinished check is not evidence of a
+/// missing server.
+fn enrichment_unavailable(state: &DaemonState) -> Option<serde_json::Value> {
+    let readiness = kin_mcp::edge_coverage::published_language_server_readiness();
+    enrichment_unavailable_reason(
+        state.lsp_enrichment_tx.is_some(),
+        state.lsp_enrichment_enabled,
+        readiness.as_ref(),
+    )
+    .map(|(reason, detail)| json!({ "reason": reason, "detail": detail }))
+}
+
+/// The decision behind [`enrichment_unavailable`], as a pure rule.
+///
+/// Split out so every row can be exercised without standing up a daemon. The
+/// rows are the point: they are the states one boolean used to hide.
+///
+/// One observation is available on every row below and is what they are built
+/// on: a closed channel on an enabled daemon means `discover_servers` returned
+/// nothing when this daemon started, because that is the only way
+/// `enrichment_channel_opens` refuses. The readiness probe then sharpens the
+/// cause when it has published, and until it does the startup observation
+/// stands on its own rather than waiting. That ordering matters because the
+/// probe is asynchronous: a rule that could only speak once it landed would
+/// leave a genuinely bare host with no install advice whenever `kin init` asked
+/// first.
+fn enrichment_unavailable_reason(
+    channel_open: bool,
+    enrichment_enabled: bool,
+    readiness: Option<&kin_core::reference_coverage::LanguageServerReadinessMap>,
+) -> Option<(&'static str, String)> {
+    use kin_core::reference_coverage::LanguageServerReadiness;
+
+    if channel_open {
+        return None;
+    }
+
+    if !enrichment_enabled {
+        return Some((
+            "enrichment_disabled",
+            "cross-file reference enrichment is switched off for this daemon, so no language \
+             server was consulted"
+                .to_string(),
+        ));
+    }
+
+    let Some(readiness) = readiness else {
+        return Some((
+            "discovery_found_none",
+            "this daemon found no language server when it started, and it looks only at startup; \
+             the check of what this host can run has not finished"
+                .to_string(),
+        ));
+    };
+
+    // Discovery runs once, at startup. A server that is usable now cannot open
+    // a channel this daemon already declined to open, which is the state a
+    // restart repairs and the state the old note called a missing install.
+    // Stated as the two facts this process holds, never as when the server was
+    // installed, which nothing here watched.
+    if readiness
+        .values()
+        .any(|state| matches!(state, LanguageServerReadiness::Usable))
+    {
+        return Some((
+            "discovery_stale",
+            "a language server is usable now, but this daemon found none when it started and it \
+             looks only at startup"
+                .to_string(),
+        ));
+    }
+
+    let mut unusable: Vec<String> = readiness
+        .iter()
+        .filter_map(|(language, state)| match state {
+            LanguageServerReadiness::Unusable { reason } => Some(format!("{language}: {reason}")),
+            _ => None,
+        })
+        .collect();
+    // The readiness map is a hash map, so two broken servers would otherwise
+    // reorder between runs and hand the same host a different sentence each
+    // time. One broken TypeScript install marks both JavaScript and TypeScript,
+    // so that is the ordinary case rather than a corner of one.
+    unusable.sort();
+    if unusable.is_empty() {
+        // What this daemon holds is its own startup reading: discovery found
+        // nothing and the probe that followed resolved no binary either. Both
+        // used this process's PATH at this process's start, so neither can
+        // speak for the host now, and a sentence that did would be the same
+        // fabrication with a probe behind it. The repair is decided by the
+        // reader, who does know.
+        return Some((
+            "no_language_server",
+            "this daemon found no language server for any language it enriches, and it looks \
+             only at startup"
+                .to_string(),
+        ));
+    }
+    Some((
+        "language_server_unusable",
+        format!(
+            "a language server is installed but did not start ({}), so it enriches nothing until \
+             that is repaired",
+            unusable.join("; ")
+        ),
+    ))
 }
 
 /// GET /lsp/sweep/status, reporting how far the cold sweep has got.
@@ -11229,6 +11390,7 @@ async fn lsp_sweep_status(State(state): State<Arc<DaemonState>>) -> impl IntoRes
         // for one would otherwise wait out its whole budget for an event that
         // cannot happen.
         "enrichment_available": state.lsp_enrichment_tx.is_some(),
+        "enrichment_unavailable": enrichment_unavailable(&state),
     }))
 }
 
@@ -12491,6 +12653,189 @@ mod tests {
             serde_json::json!(true),
             "an undegraded daemon must still certify: {negative}"
         );
+    }
+
+    /// `kin init` used to assert "no language server is installed" from a
+    /// boolean that meant several different things. These are those things.
+    mod enrichment_unavailable_rows {
+        use super::super::enrichment_unavailable_reason;
+        use kin_core::reference_coverage::{LanguageServerReadiness, LanguageServerReadinessMap};
+        use kin_model::LanguageId;
+
+        fn readiness(rows: &[(LanguageId, LanguageServerReadiness)]) -> LanguageServerReadinessMap {
+            rows.iter().cloned().collect()
+        }
+
+        /// The positive control. A healthy daemon reports no cause at all,
+        /// because there is nothing to explain, and `kin init` prints no note.
+        #[test]
+        fn a_working_daemon_reports_no_cause() {
+            assert!(
+                enrichment_unavailable_reason(true, true, None).is_none(),
+                "an open channel means enrichment works, so there is no cause to report"
+            );
+        }
+
+        /// The row the old note was right about, which a fix must not lose.
+        ///
+        /// Stated as this daemon's own startup reading rather than as a fact
+        /// about the host. Discovery and the probe both ran once, on this
+        /// process's PATH, so neither establishes what is installed now, and
+        /// the ticket's own host is the case: a server sat on PATH while the
+        /// daemon that had started before it reported none.
+        #[test]
+        fn a_host_with_no_server_still_reports_a_missing_server() {
+            let (reason, detail) =
+                enrichment_unavailable_reason(false, true, Some(&readiness(&[])))
+                    .expect("no server is a cause");
+            assert_eq!(reason, "no_language_server");
+            assert!(
+                detail.contains("found no language server"),
+                "the row must still report the absence it measured: {detail}"
+            );
+            assert!(
+                !detail.contains("no language server is installed"),
+                "but not as a claim about the host, which this daemon never read: {detail}"
+            );
+        }
+
+        /// The row reached by the ordinary first-run sequence with no knob:
+        /// install Kin, run a command which starts a daemon, then install a
+        /// language server. The old note called this a missing install.
+        #[test]
+        fn a_server_installed_after_the_daemon_started_is_not_a_missing_install() {
+            let (reason, detail) = enrichment_unavailable_reason(
+                false,
+                true,
+                Some(&readiness(&[(
+                    LanguageId::TypeScript,
+                    LanguageServerReadiness::Usable,
+                )])),
+            )
+            .expect("a stale discovery is a cause");
+            assert_eq!(
+                reason, "discovery_stale",
+                "a usable server plus a closed channel is stale discovery, not an absent install"
+            );
+            assert!(
+                !detail.contains("no language server is installed"),
+                "this row must never claim the server is missing: {detail}"
+            );
+            // Both halves of what this process observed, and only those. When
+            // the server was installed is not one of them, so the sentence must
+            // not turn the pair into a timeline it never watched.
+            assert!(
+                detail.contains("usable now") && detail.contains("found none when it started"),
+                "the row must name both observations rather than infer a history: {detail}"
+            );
+        }
+
+        /// A deliberately disabled daemon, reached by `--storage gcs` or
+        /// `KIN_DAEMON_DISABLE_LSP`. Telling this operator to install a server
+        /// sends them to buy a tool they already own for a job nothing will run.
+        #[test]
+        fn a_disabled_daemon_does_not_blame_a_missing_server() {
+            let (reason, detail) = enrichment_unavailable_reason(false, false, None)
+                .expect("a disabled daemon is a cause");
+            assert_eq!(reason, "enrichment_disabled");
+            assert!(
+                !detail.contains("no language server is installed"),
+                "a disabled daemon must not be reported as a missing install: {detail}"
+            );
+        }
+
+        /// The probe is asynchronous, so a row has to hold before it lands.
+        ///
+        /// What this daemon observed is that startup discovery found nothing,
+        /// which is true whether the host is bare or gained a server since. So
+        /// the row reports that and says the check is unfinished, rather than
+        /// asserting an absent install, which would be the same fabrication in
+        /// a new place, or reporting nothing, which would leave a genuinely
+        /// bare host with no advice whenever `kin init` asked first.
+        #[test]
+        fn an_unfinished_probe_reports_the_startup_discovery_it_did_observe() {
+            let (reason, detail) = enrichment_unavailable_reason(false, true, None)
+                .expect("not yet established is itself a reportable state");
+            assert_eq!(reason, "discovery_found_none");
+            assert!(
+                detail.contains("found no language server when it started"),
+                "the row must name the observation this daemon actually holds: {detail}"
+            );
+            assert!(
+                !detail.contains("no language server is installed"),
+                "an unfinished check must not be reported as an absent server: {detail}"
+            );
+        }
+
+        /// Installed and unusable is its own row, because its repair is neither
+        /// an install nor a restart.
+        #[test]
+        fn an_installed_server_that_cannot_start_is_named_with_its_own_reason() {
+            let (reason, detail) = enrichment_unavailable_reason(
+                false,
+                true,
+                Some(&readiness(&[(
+                    LanguageId::JavaScript,
+                    LanguageServerReadiness::Unusable {
+                        reason: "Could not find a valid TypeScript installation".to_string(),
+                    },
+                )])),
+            )
+            .expect("an unusable server is a cause");
+            assert_eq!(reason, "language_server_unusable");
+            assert!(
+                detail.contains("Could not find a valid TypeScript installation"),
+                "the row must carry the server's own reason: {detail}"
+            );
+            assert!(
+                !detail.contains("no language server is installed"),
+                "a broken install must not be reported as an absent one: {detail}"
+            );
+        }
+
+        /// Two broken servers must read the same way every time.
+        ///
+        /// The readiness map is a hash map, and one broken TypeScript install
+        /// marks both JavaScript and TypeScript, so this is the ordinary shape
+        /// of the row above rather than a corner of it. Without the sort the
+        /// same host gets a differently ordered sentence between runs, which is
+        /// a message that varies while the world does not.
+        #[test]
+        fn two_unusable_servers_are_reported_in_a_stable_order() {
+            // A fresh map per round, because a hash map seeds itself once and
+            // then iterates the same way for its whole life. Reading one map
+            // repeatedly would agree with itself under any implementation at
+            // all, which is a check that cannot fail.
+            for round in 0..32 {
+                let rows = readiness(&[
+                    (
+                        LanguageId::TypeScript,
+                        LanguageServerReadiness::Unusable {
+                            reason: "ts is broken".to_string(),
+                        },
+                    ),
+                    (
+                        LanguageId::JavaScript,
+                        LanguageServerReadiness::Unusable {
+                            reason: "js is broken".to_string(),
+                        },
+                    ),
+                ]);
+                let (_, detail) = enrichment_unavailable_reason(false, true, Some(&rows))
+                    .expect("two unusable servers are a cause");
+                let js = detail
+                    .find("javascript: js is broken")
+                    .unwrap_or_else(|| panic!("round {round} lost the javascript row: {detail}"));
+                let ts = detail
+                    .find("typescript: ts is broken")
+                    .unwrap_or_else(|| panic!("round {round} lost the typescript row: {detail}"));
+                assert!(
+                    js < ts,
+                    "round {round} reported the same host in a different order, so this \
+                     sentence varies while the world does not: {detail}"
+                );
+            }
+        }
     }
 
     use super::*;
@@ -20327,6 +20672,165 @@ mod tests {
         }
     }
 
+    /// A commit performs a complete exact-tree admission, so it must leave the
+    /// durable record of one behind.
+    ///
+    /// The marker had two writers before this, the ambient reconcile tick and
+    /// `kin admit`, and a convert-then-commit session runs neither: the tick
+    /// stands its own round down for a commit already inside the daemon. So two
+    /// stores converted and committed by one binary ended in opposite freshness
+    /// states, one carrying a timestamp because an ambient tick happened to land
+    /// milliseconds before its commit took the coordination gate, and the other
+    /// reporting that no complete admission had ever been recorded for it.
+    ///
+    /// The absent read before the commit is the control. `test_state` opens a
+    /// store with no ambient loop and no marker, so a marker afterwards can only
+    /// have been written by the commit under test, and an assertion that passed
+    /// on a store that was already stamped would prove nothing.
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn a_commit_records_the_complete_admission_it_performed() {
+        use kin_core::last_admission::LastAdmissionRead;
+
+        let state = test_state();
+        assert!(
+            matches!(
+                kin_core::last_admission::read(&state.layout),
+                LastAdmissionRead::Absent
+            ),
+            "the fixture store must carry no marker, or a marker afterwards proves nothing"
+        );
+
+        let root = state.layout.working_dir();
+        std::fs::write(root.join("admitted.rs"), b"pub fn admitted() {}\n").unwrap();
+        let app = router(Arc::clone(&state));
+        let response = app
+            .oneshot(
+                Request::post("/commands/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "operation_id": kin_model::OperationId::new(),
+                            "timestamp": kin_model::Timestamp::now(),
+                            "author": "Test Author <test@example.invalid>",
+                            "message": "record the admission this commit performed"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+        let recorded = match kin_core::last_admission::read(&state.layout) {
+            LastAdmissionRead::Recorded(recorded) => recorded,
+            other => panic!(
+                "a successful commit must record the complete admission it performed, read {other:?}"
+            ),
+        };
+        assert_eq!(
+            recorded.tracked_artifacts,
+            state.graph.resolved_tree().len() as u64,
+            "the record must cover the tree the commit left behind, not a different count"
+        );
+        assert!(
+            recorded.age_seconds(chrono::Utc::now()) < 300,
+            "the record must be stamped by this commit rather than carried in from elsewhere"
+        );
+
+        // The in-memory probes carry the same fact, so `/health`, `kin doctor`
+        // and `kin admit` name a commit's admission instead of reporting that
+        // none has succeeded in this daemon's life.
+        assert!(
+            state
+                .background_work
+                .reconcile_report(std::time::Instant::now())
+                .last_admission_success_age_seconds
+                .is_some(),
+            "a commit's admission must reach the reconcile probes as a success"
+        );
+    }
+
+    /// A commit that never reached authority must not restamp the marker.
+    ///
+    /// The forced admission still runs on this path and still succeeds, but its
+    /// tree is deferred to a transaction that was refused, so recording a
+    /// complete admission here would claim freshness for a tree repository
+    /// authority never accepted. The failure direction is the safe one: an
+    /// unrefreshed marker reads as staler than the store is and never as
+    /// fresher.
+    ///
+    /// A second commit on an unchanged tree is the refusal with no mocking in
+    /// it. `refuse_a_successor_that_records_nothing` answers it 409 after the
+    /// admission has already run, which is exactly the ordering under test. An
+    /// empty workspace is not that case and was the first guess: the first
+    /// commit of a freshly initialized store is accepted, so a test written on
+    /// it asserts nothing about a refusal.
+    ///
+    /// The first commit's timestamp is the control. Asserting only that some
+    /// marker exists afterwards would pass on a build that restamped on every
+    /// request, which is the defect this guards.
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn a_commit_that_reaches_no_authority_records_no_admission() {
+        use kin_core::last_admission::LastAdmissionRead;
+
+        let state = test_state();
+        let root = state.layout.working_dir();
+        std::fs::write(root.join("committed.rs"), b"pub fn committed() {}\n").unwrap();
+
+        let commit = |body: &'static str| {
+            let app = router(Arc::clone(&state));
+            app.oneshot(
+                Request::post("/commands/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "operation_id": kin_model::OperationId::new(),
+                            "timestamp": kin_model::Timestamp::now(),
+                            "author": "Test Author <test@example.invalid>",
+                            "message": body
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+        };
+
+        let accepted = commit("record the first admission").await.unwrap();
+        assert_eq!(
+            accepted.status(),
+            StatusCode::OK,
+            "the first commit must be accepted, or there is no marker to leave alone"
+        );
+        let stamped = match kin_core::last_admission::read(&state.layout) {
+            LastAdmissionRead::Recorded(recorded) => recorded,
+            other => panic!("the accepted commit must record its admission, read {other:?}"),
+        };
+
+        let refused = commit("commit the same tree again").await.unwrap();
+        assert_eq!(
+            refused.status(),
+            StatusCode::CONFLICT,
+            "a second commit on an unchanged tree must be refused, or this test is not \
+             exercising a failed commit"
+        );
+
+        match kin_core::last_admission::read(&state.layout) {
+            LastAdmissionRead::Recorded(after) => assert_eq!(
+                after, stamped,
+                "a commit that reached no authority must leave the freshness record exactly as \
+                 the last complete admission left it"
+            ),
+            other => panic!("the refused commit must not have removed the record, read {other:?}"),
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn command_commit_preserves_complete_arbitrary_repository_tree() {
@@ -24623,6 +25127,302 @@ mod tests {
             !joined.contains("def handler"),
             "file body must not be served from disk: {joined}"
         );
+    }
+
+    /// The same spine for `kin search`, whose gate is NOT impact's.
+    ///
+    /// `semantic_search` declares no edge class and is language-scoped, so this
+    /// asserts the degradation reaches a surface gated on scope rather than on
+    /// cross-file coverage. A fix proven only on the reference readers would
+    /// leave this one silent, which is why the rollout falsifies one command per
+    /// gate shape rather than one per rung.
+    #[tokio::test]
+    async fn a_degraded_daemon_reaches_the_search_cli_through_the_route() {
+        let state = test_state();
+        state
+            .graph
+            .upsert_entity(&test_entity("present", "src/a.py"))
+            .unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        state
+            .embed_worker_failed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "query": "definitelyNoSuchSymbol" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let result: kin_cli::commands::search::DaemonSearchResponse =
+            serde_json::from_slice(&body).unwrap();
+
+        assert!(result.records.is_empty(), "the query must match nothing");
+        let qualifier = result.absence_qualifier.join(" ");
+        assert!(
+            qualifier.contains("Kin cannot rule out"),
+            "the route's envelope must carry the degradation into the rendered verdict; a \
+             thinner snapshot leaves this empty: {qualifier:?}"
+        );
+        assert!(
+            qualifier.contains("embed_worker_failed"),
+            "the line names the signal the verdict disclosed rather than inventing a cause: \
+             {qualifier:?}"
+        );
+        // And it must not fabricate a missing edge class: semantic_search reads
+        // none, so naming one would be gating on evidence it never gathers.
+        assert!(
+            !qualifier.contains("cross-file"),
+            "a scope-gated surface must not claim an edge class: {qualifier:?}"
+        );
+    }
+
+    /// The control that keeps the search qualifier from becoming noise: a query
+    /// that MATCHES says nothing extra, on the same degraded daemon.
+    ///
+    /// Without this the fix could stamp every search with a caveat and still
+    /// pass the case above, which is the FIR-2404 failure wearing its opposite
+    /// costume.
+    #[tokio::test]
+    async fn a_search_that_matches_stays_unqualified_even_when_degraded() {
+        let state = test_state();
+        state
+            .graph
+            .upsert_entity(&test_entity("findable", "src/a.py"))
+            .unwrap();
+        state.graph.flush_text_index().ok();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        state
+            .embed_worker_failed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "query": "findable" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let result: kin_cli::commands::search::DaemonSearchResponse =
+            serde_json::from_slice(&body).unwrap();
+
+        assert!(
+            !result.records.is_empty(),
+            "the query must match: {result:?}"
+        );
+        assert!(
+            result.absence_qualifier.is_empty(),
+            "a populated answer asserts no absence and must carry no qualifier: {:?}",
+            result.absence_qualifier
+        );
+    }
+
+    /// The same spine for `kin trace`, whose silence was TOTAL rather than bare.
+    ///
+    /// `kin impact` printed a wrong sentence; `kin trace` printed no dependency
+    /// section at all, so a reader could not tell a focal that reaches nothing
+    /// from one whose outbound edges this graph could never have held.
+    ///
+    /// Drives the DEFAULT (non-compact) invocation on purpose. The qualifier
+    /// first landed inside the compact arm, which left the mode a person
+    /// actually types as the only surface still silent, and every other trace
+    /// test in this file runs against a healthy daemon and would have passed
+    /// either way.
+    #[tokio::test]
+    async fn a_degraded_daemon_reaches_the_trace_cli_through_the_route() {
+        let state = test_state();
+        // Coverage healthy on purpose, so the degradation is the only reason
+        // left to refuse and the assertion cannot pass for the wrong cause.
+        let mut caller = test_entity("caller", "src/a.py");
+        let mut callee = test_entity("callee", "src/b.py");
+        let mut orphan = test_entity("orphan", "src/orphan.py");
+        for entity in [&mut caller, &mut callee, &mut orphan] {
+            install_trace_fixture_file(&state, entity);
+            state.graph.upsert_entity(entity).unwrap();
+        }
+        state
+            .graph
+            .upsert_relation(&kin_model::Relation {
+                id: kin_model::RelationId::new(),
+                kind: kin_model::RelationKind::Calls,
+                src: kin_model::GraphNodeId::Entity(caller.id),
+                dst: kin_model::GraphNodeId::Entity(callee.id),
+                confidence: 1.0,
+                origin: kin_model::RelationOrigin::Parsed,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        state
+            .embed_worker_failed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let rendered = trace_lines_through_route(&state, "orphan").await;
+
+        assert!(
+            rendered.contains("Kin cannot rule out dependencies it did not see"),
+            "the route's envelope must carry the degradation into a section that printed \
+             nothing at all before: {rendered}"
+        );
+        assert!(
+            rendered.contains("embed_worker_failed"),
+            "the line names the signal the verdict disclosed rather than inventing a cause: \
+             {rendered}"
+        );
+        // The direction is the whole point. A context pack carries no dependents
+        // group, so a trace that claimed them would be asserting a verdict about
+        // a set this command never walked.
+        assert!(
+            !rendered.contains("dependents"),
+            "trace walks outward and must not claim the inbound direction: {rendered}"
+        );
+        // And it must not fabricate a missing edge class: nothing here observed
+        // one, and naming one anyway is the fabrication this family exists to end.
+        assert!(
+            !rendered.contains("holds no cross-file"),
+            "no absent class was observed, so none may be claimed: {rendered}"
+        );
+    }
+
+    /// The control that keeps the trace qualifier from becoming noise: a focal
+    /// that DOES reach something says nothing extra, on the same degraded daemon.
+    ///
+    /// Without it the fix could stamp every trace with a caveat and still pass
+    /// the case above, which is the FIR-2404 failure wearing its opposite
+    /// costume.
+    #[tokio::test]
+    async fn a_trace_that_finds_dependencies_stays_unqualified_even_when_degraded() {
+        let state = test_state();
+        let mut caller = test_entity("caller", "src/a.py");
+        let mut callee = test_entity("callee", "src/b.py");
+        for entity in [&mut caller, &mut callee] {
+            install_trace_fixture_file(&state, entity);
+            state.graph.upsert_entity(entity).unwrap();
+        }
+        state
+            .graph
+            .upsert_relation(&kin_model::Relation {
+                id: kin_model::RelationId::new(),
+                kind: kin_model::RelationKind::Calls,
+                src: kin_model::GraphNodeId::Entity(caller.id),
+                dst: kin_model::GraphNodeId::Entity(callee.id),
+                confidence: 1.0,
+                origin: kin_model::RelationOrigin::Parsed,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        state
+            .embed_worker_failed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let rendered = trace_lines_through_route(&state, "caller").await;
+
+        // The control only means something if this focal really did reach
+        // something; otherwise it is the case above wearing a passing costume.
+        assert!(
+            rendered.contains("callee"),
+            "the focal must actually reach a dependency, or this control asserts nothing: \
+             {rendered}"
+        );
+        assert!(
+            !rendered.contains("Kin cannot rule out"),
+            "a walk that found dependencies asserts no absence and must carry no qualifier: \
+             {rendered}"
+        );
+    }
+
+    /// Put an entity's file into repository authority and the working copy.
+    ///
+    /// `/trace` resolves a repository authority binding before it renders, so a
+    /// graph-only fixture answers 500 and the assertions below never run.
+    fn install_trace_fixture_file(state: &Arc<DaemonState>, entity: &mut Entity) {
+        let path = entity
+            .file_origin
+            .as_ref()
+            .expect("trace fixture entities carry a file")
+            .0
+            .clone();
+        let source = format!("def {}():\n    return 1\n", entity.name);
+        install_repository_file(state, &path, source.as_bytes());
+        let working = state.layout.working_dir().join(&path);
+        std::fs::create_dir_all(working.parent().unwrap()).unwrap();
+        std::fs::write(&working, source.as_bytes()).unwrap();
+        // `test_entity` spans 0..0, which the route rejects against a file that
+        // has bytes. Left unfixed the route answers 500 and every assertion
+        // below never runs.
+        let span = entity
+            .span
+            .as_mut()
+            .expect("trace fixture entities carry a span");
+        span.end_byte = source.len();
+        span.end_line = 2;
+    }
+
+    /// Drive `/trace` in its DEFAULT rendering and return the lines it printed.
+    async fn trace_lines_through_route(state: &Arc<DaemonState>, entity: &str) -> String {
+        let response = router(Arc::clone(state))
+            .oneshot(
+                Request::post("/trace")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "entity": entity,
+                            "json": false,
+                            "compact": false,
+                            "budget": "8k",
+                            "max_lines": 20,
+                            "nearby_limit": 2,
+                            "transitive_limit": 1,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the route must answer, or every assertion below is vacuous: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let result: kin_cli::commands::trace::TraceResponse =
+            serde_json::from_slice(&body).unwrap();
+        result.lines.join("\n")
     }
 
     /// THE SPINE (FIR-2524, captain's rider). Drives the ROUTE, because that is
@@ -30203,10 +31003,32 @@ mod tests {
         );
         assert_eq!(cut["bodies_included"], json!(false));
         assert!(cut["bodies_omitted"].as_u64().unwrap_or(0) > 0);
+        // Compared against the UNBOUNDED run rather than against a literal
+        // `false`. This fixture walks six hops at `depth: 5`, so its last hop
+        // sits at the requested depth and was never expanded, which the walk
+        // now reports as `terminal: "bound_reached"` and counts in
+        // `truncated`. Asserting `false` here would assert that a depth bound
+        // goes unreported, which is the FIR-2542 defect wearing this test's
+        // name. What this test is about is narrower and still holds: dropping
+        // bodies must not move the flag in either direction.
         assert_eq!(
-            cut["truncated"],
-            json!(false),
-            "a chain that lost only bodies is not a truncated chain"
+            full["terminal_bound_steps"],
+            json!(1),
+            "the fixture must end at its depth bound, or the comparisons below hold for the \
+             uninteresting reason that both runs report nothing"
+        );
+        assert_eq!(
+            cut["truncated"], full["truncated"],
+            "a chain that lost only bodies is truncated exactly as much as it was before"
+        );
+        assert_eq!(
+            cut["steps_omitted"].as_u64().unwrap_or(0),
+            0,
+            "no edge was dropped, so nothing about the chain's own length changed"
+        );
+        assert_eq!(
+            cut["terminal_bound_steps"], full["terminal_bound_steps"],
+            "the depth bound is what this chain's truncation reports, and the budget did not touch it"
         );
         let disclosure = cut["degradations"]
             .as_array()

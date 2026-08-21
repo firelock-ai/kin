@@ -23,7 +23,7 @@ const ZSH_HOOK: &str = r#"# SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Firelock, LLC
 #
 # kin-vfs zsh integration — auto-activates the VFS overlay when entering
-# a Kin workspace (any directory tree containing .kin/).
+# a Kin repository (a directory whose .kin/ carries a repository manifest).
 #
 # Installed by: kin setup
 
@@ -56,20 +56,33 @@ _kin_vfs_path_within() {
     esac
 }
 
+# A `.kin` directory names a repository only when it carries the manifest
+# `kin init` writes there. The managed toolchain home ($KIN_HOME, default
+# $HOME/.kin) is a real `.kin` directory too, holding bin/, lib/, shell/ and
+# config/, so a walk that asks only whether `.kin` is a directory binds $HOME
+# itself as a projection root, and every path under it then belongs to a
+# projection no daemon serves. The kin-vfs shim admits a root on this same
+# file, so both halves answer the containment question the same way.
+_kin_vfs_is_repository() {
+    [[ -f "$1/.kin/manifest.json" ]]
+}
+
 _kin_vfs_scan_path() {
     local dir="$1"
     local boundary="$2"
     while true; do
-        # A Kin marker is authority only when it is a real local directory.
-        # During a session it may win over a same-directory .git marker only
-        # at the exact validated session root.
+        # A Kin marker is authority only when it is a real local directory
+        # holding a repository manifest. During a session it may win over a
+        # same-directory .git marker only at the exact validated session root.
         if [[ -e "$dir/.kin" || -L "$dir/.kin" ]]; then
             [[ -d "$dir/.kin" && ! -L "$dir/.kin" ]] || return 1
-            if [[ -n "$boundary" && "$dir" != "$boundary" ]]; then
-                return 1
+            if _kin_vfs_is_repository "$dir"; then
+                if [[ -n "$boundary" && "$dir" != "$boundary" ]]; then
+                    return 1
+                fi
+                printf '%s' "$dir"
+                return 0
             fi
-            printf '%s' "$dir"
-            return 0
         fi
         # Files, directories, and even broken symlinks are Git boundaries.
         if [[ -e "$dir/.git" || -L "$dir/.git" ]]; then
@@ -252,7 +265,7 @@ const BASH_HOOK: &str = r#"# SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Firelock, LLC
 #
 # kin-vfs bash integration — auto-activates the VFS overlay when entering
-# a Kin workspace (any directory tree containing .kin/).
+# a Kin repository (a directory whose .kin/ carries a repository manifest).
 #
 # Installed by: kin setup
 
@@ -290,20 +303,33 @@ _kin_vfs_path_within() {
     esac
 }
 
+# A `.kin` directory names a repository only when it carries the manifest
+# `kin init` writes there. The managed toolchain home ($KIN_HOME, default
+# $HOME/.kin) is a real `.kin` directory too, holding bin/, lib/, shell/ and
+# config/, so a walk that asks only whether `.kin` is a directory binds $HOME
+# itself as a projection root, and every path under it then belongs to a
+# projection no daemon serves. The kin-vfs shim admits a root on this same
+# file, so both halves answer the containment question the same way.
+_kin_vfs_is_repository() {
+    [ -f "$1/.kin/manifest.json" ]
+}
+
 _kin_vfs_scan_path() {
     local dir="$1"
     local boundary="$2"
     while :; do
-        # A Kin marker is authority only when it is a real local directory.
-        # During a session it may win over a same-directory .git marker only
-        # at the exact validated session root.
+        # A Kin marker is authority only when it is a real local directory
+        # holding a repository manifest. During a session it may win over a
+        # same-directory .git marker only at the exact validated session root.
         if [ -e "$dir/.kin" ] || [ -L "$dir/.kin" ]; then
             [ -d "$dir/.kin" ] && [ ! -L "$dir/.kin" ] || return 1
-            if [ -n "$boundary" ] && [ "$dir" != "$boundary" ]; then
-                return 1
+            if _kin_vfs_is_repository "$dir"; then
+                if [ -n "$boundary" ] && [ "$dir" != "$boundary" ]; then
+                    return 1
+                fi
+                printf '%s' "$dir"
+                return 0
             fi
-            printf '%s' "$dir"
-            return 0
         fi
         # Files, directories, and even broken symlinks are Git boundaries.
         if [ -e "$dir/.git" ] || [ -L "$dir/.git" ]; then
@@ -605,6 +631,22 @@ function Test-KinMarkerExists {
     }
 }
 
+# A `.kin` directory names a repository only when it carries the manifest
+# `kin init` writes there. The managed toolchain home ($KIN_HOME, default
+# $HOME/.kin) is a real `.kin` directory too, holding bin/, lib/, shell/ and
+# config/, so a walk that asks only whether `.kin` is a directory binds the
+# home directory itself as a projection root, and every path under it then
+# belongs to a projection no daemon serves. The kin-vfs shim admits a root on
+# this same file, so both halves answer the containment question the same way.
+function Test-KinRepository {
+    param([string]$Path)
+    try {
+        return [System.IO.File]::Exists((Join-Path (Join-Path $Path ".kin") "manifest.json"))
+    } catch {
+        return $false
+    }
+}
+
 function Find-KinWorkspaceOnPath {
     param([string]$StartDir, [string]$Boundary)
     $dir = $StartDir
@@ -620,10 +662,12 @@ function Find-KinWorkspaceOnPath {
                 (($kinItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) {
                 return $null
             }
-            if ($Boundary -and -not (Test-KinPathEqual -Left $dir -Right $Boundary)) {
-                return $null
+            if (Test-KinRepository -Path $dir) {
+                if ($Boundary -and -not (Test-KinPathEqual -Left $dir -Right $Boundary)) {
+                    return $null
+                }
+                return $dir
             }
-            return $dir
         }
         if (Test-KinMarkerExists -Path (Join-Path $dir ".git")) {
             return $null
@@ -798,17 +842,30 @@ function _kin_vfs_path_within
     test (string sub -s 1 -l "$prefix_length" -- "$candidate") = "$prefix"
 end
 
+# A `.kin` directory names a repository only when it carries the manifest
+# `kin init` writes there. The managed toolchain home ($KIN_HOME, default
+# $HOME/.kin) is a real `.kin` directory too, holding bin/, lib/, shell/ and
+# config/, so a walk that asks only whether `.kin` is a directory binds $HOME
+# itself as a projection root, and every path under it then belongs to a
+# projection no daemon serves. The kin-vfs shim admits a root on this same
+# file, so both halves answer the containment question the same way.
+function _kin_vfs_is_repository
+    test -f "$argv[1]/.kin/manifest.json"
+end
+
 function _kin_vfs_scan_path
     set -l dir $argv[1]
     set -l boundary $argv[2]
     while true
         if test -e "$dir/.kin"; or test -L "$dir/.kin"
             test -d "$dir/.kin"; and not test -L "$dir/.kin"; or return 1
-            if test -n "$boundary"; and test "$dir" != "$boundary"
-                return 1
+            if _kin_vfs_is_repository "$dir"
+                if test -n "$boundary"; and test "$dir" != "$boundary"
+                    return 1
+                end
+                printf '%s' "$dir"
+                return 0
             end
-            printf '%s' "$dir"
-            return 0
         end
         if test -e "$dir/.git"; or test -L "$dir/.git"
             return 1
@@ -11895,9 +11952,11 @@ async fn provision_language_servers_in_wizard(opts: &WizardOptions, interactive:
         opts.install_language_servers,
         interactive && !opts.install_language_servers,
     );
-    for line in apply_language_server_provisioning(&missing, consent).await {
+    let outcome = apply_language_server_provisioning(&missing, consent).await;
+    for line in &outcome.applied {
         println!("  {} {line}", style("✓").green());
     }
+    outcome.print_unfinished();
 }
 
 /// Get the notification identity working, and say so when it cannot be.
@@ -12680,17 +12739,159 @@ fn print_human_report(report: &crate::commands::health::HealthReport) {
         },
         style(summary.skipped).dim(),
     );
-    if report.healthy {
-        println!(
-            "{} First-run ready — no component is missing or misconfigured.",
-            style("✓").green()
-        );
+    let readiness = readiness_line(report);
+    let mark = if readiness.ready {
+        style("✓").green()
+    } else if readiness.severe {
+        style("✗").red()
     } else {
-        println!(
-            "{} Some checks need attention. Run `kin doctor --fix` to apply safe repairs.",
-            style("✗").red()
-        );
+        style("!").yellow()
+    };
+    println!("{mark} {}", readiness.sentence);
+}
+
+/// The closing readiness line, and how loudly to print it.
+struct ReadinessLine {
+    /// Whether the run may claim readiness at all.
+    ready: bool,
+    /// Whether the rows needing attention include a real failure rather than
+    /// expected first-run work. Only the mark depends on it.
+    severe: bool,
+    sentence: String,
+}
+
+/// Compose the closing line from the rows the table just printed.
+///
+/// It used to be read off `report.healthy` alone, which asks a narrower
+/// question than the table answers: `healthy` gates on Missing and
+/// Misconfigured, so a container run whose `Reference edge coverage` row read
+/// PENDING for want of a language server closed with "First-run ready" one line
+/// under its own "4 need attention" tally, and the repair that would have
+/// closed that row had failed in the same output (FIR-2547). The row knew; the
+/// summary did not read it. A reader who trusts the last line is entitled to
+/// have it agree with the rows above it, so claiming readiness now requires
+/// that nothing at all needs attention, and the line names what does.
+fn readiness_line(report: &crate::commands::health::HealthReport) -> ReadinessLine {
+    use crate::commands::health::HealthStatus;
+
+    /// How many rows the line names before it counts the rest.
+    const NAMED: usize = 4;
+
+    let summary = report.summary();
+    let waiting: Vec<&crate::commands::health::HealthCheck> = report
+        .checks
+        .iter()
+        .filter(|check| {
+            !matches!(
+                check.status,
+                HealthStatus::Healthy | HealthStatus::Unsupported
+            )
+        })
+        .collect();
+    if report.healthy && summary.attention == 0 && waiting.is_empty() {
+        return ReadinessLine {
+            ready: true,
+            severe: false,
+            sentence: "First-run ready — no component is missing or misconfigured.".to_string(),
+        };
     }
+    let severe = !report.healthy
+        || waiting.iter().any(|check| {
+            matches!(
+                check.status,
+                HealthStatus::Missing | HealthStatus::Misconfigured | HealthStatus::Degraded
+            )
+        });
+    let mut labels: Vec<String> = waiting
+        .iter()
+        .take(NAMED)
+        .map(|check| check.label.clone())
+        .collect();
+    if waiting.len() > NAMED {
+        labels.push(format!("and {} more", waiting.len() - NAMED));
+    }
+    let advice = if waiting.iter().any(|check| check.fixable) {
+        "Run `kin doctor --fix` to apply safe repairs."
+    } else {
+        "Each row above carries the fix it needs."
+    };
+    let sentence = if waiting.len() == 1 {
+        format!("1 check needs attention: {}. {advice}", labels.join(", "))
+    } else {
+        format!(
+            "{} checks need attention: {}. {advice}",
+            waiting.len(),
+            labels.join(", ")
+        )
+    };
+    ReadinessLine {
+        ready: false,
+        severe,
+        sentence,
+    }
+}
+
+/// A repair `kin doctor --fix` attempted and could not complete.
+struct UnfinishedRepair {
+    /// What Kin was trying to do, in the operator's terms.
+    what: String,
+    /// Why it did not happen, in the failing tool's own words where there were
+    /// any to keep.
+    reason: String,
+    /// The commands that close it by hand.
+    remediation: Vec<String>,
+    /// Whether the operator asked for this repair by name.
+    ///
+    /// Only these set the exit code. `--fix` also runs a set of best-effort
+    /// convergence repairs nobody asked for individually, and `kin update` runs
+    /// `kin setup doctor --fix` unattended as the last step of its chain
+    /// (`update::ChainStep::RepairConfigs`), where a VFS shim that could not be
+    /// re-downloaded on an offline host must not report an installed release as
+    /// a failed update. A requested repair is the opposite case: the operator
+    /// typed `--install-language-servers` or answered the prompt, and silence
+    /// about its failure is the defect FIR-2547 records.
+    requested: bool,
+}
+
+/// Print what could not be repaired, with the commands that close it.
+fn print_unfinished_repairs(unfinished: &[UnfinishedRepair]) {
+    if unfinished.is_empty() {
+        return;
+    }
+    println!();
+    println!("Repairs that did not complete:");
+    for repair in unfinished {
+        println!("  {} {}: {}", style("✗").red(), repair.what, repair.reason);
+        for line in &repair.remediation {
+            println!("      {line}");
+        }
+    }
+}
+
+/// The exit verdict for a `--fix` run.
+///
+/// Non-zero when a repair the operator asked for did not happen. The run has
+/// already printed what failed and what closes it; this is the half a script
+/// can read, and the half whose absence let a run that installed nothing close
+/// under a green tick.
+fn fix_verdict(unfinished: &[UnfinishedRepair]) -> Result<()> {
+    let requested: Vec<&UnfinishedRepair> = unfinished
+        .iter()
+        .filter(|repair| repair.requested)
+        .collect();
+    if requested.is_empty() {
+        return Ok(());
+    }
+    let names = requested
+        .iter()
+        .map(|repair| repair.what.clone())
+        .collect::<Vec<_>>()
+        .join(", ");
+    anyhow::bail!(
+        "{} requested repair{} did not complete: {names}",
+        requested.len(),
+        if requested.len() == 1 { "" } else { "s" }
+    )
 }
 
 /// Provision the language servers behind Kin's cross-file reference edges, and
@@ -12737,14 +12938,33 @@ async fn refresh_running_daemon_after_install(cwd: &std::path::Path) -> bool {
     }
 }
 
+/// What one provisioning pass applied, and what it could not.
+#[derive(Default)]
+struct ProvisioningOutcome {
+    applied: Vec<String>,
+    unfinished: Vec<UnfinishedRepair>,
+}
+
+impl ProvisioningOutcome {
+    /// Print the remedies for what did not happen, for surfaces with no
+    /// closing block of their own.
+    fn print_unfinished(&self) {
+        for repair in &self.unfinished {
+            for line in &repair.remediation {
+                println!("      {line}");
+            }
+        }
+    }
+}
+
 async fn apply_language_server_provisioning(
     missing: &[kin_model::LanguageId],
     consent: language_servers::InstallConsent,
-) -> Vec<String> {
+) -> ProvisioningOutcome {
     use language_servers::{InstallConsent, InstallOutcome};
 
     if missing.is_empty() {
-        return Vec::new();
+        return ProvisioningOutcome::default();
     }
 
     if consent == InstallConsent::Withheld {
@@ -12768,7 +12988,7 @@ async fn apply_language_server_provisioning(
             "      or re-run with --install-language-servers to have Kin run {}",
             if missing.len() == 1 { "it" } else { "them" }
         );
-        return Vec::new();
+        return ProvisioningOutcome::default();
     }
 
     let reports = language_servers::provision(
@@ -12791,8 +13011,10 @@ async fn apply_language_server_provisioning(
     );
 
     let mut applied = Vec::new();
+    let mut unfinished: Vec<UnfinishedRepair> = Vec::new();
     let mut installed_any = false;
     for report in reports {
+        let recipe = language_servers::recipe_for(report.language);
         match report.outcome {
             InstallOutcome::AlreadyPresent => {}
             InstallOutcome::Installed { command } => {
@@ -12805,28 +13027,65 @@ async fn apply_language_server_provisioning(
             // A zero exit that left the binary unreachable is reported as the
             // gap it still is. Counting it as applied is how a closed-looking
             // row keeps an open gap.
-            InstallOutcome::RanButStillMissing { command } => println!(
-                "  {} `{command}` succeeded but no {} server is on PATH; check that your npm \
-                 global prefix is on PATH",
-                style("✗").red(),
-                report.language
-            ),
-            InstallOutcome::Failed { command, reason } => println!(
-                "  {} could not install the {} language server: {reason} (`{command}`)",
-                style("✗").red(),
-                report.language
-            ),
+            InstallOutcome::RanButStillMissing { command } => {
+                println!(
+                    "  {} `{command}` succeeded but no {} server is on PATH",
+                    style("✗").red(),
+                    report.language
+                );
+                unfinished.push(UnfinishedRepair {
+                    what: format!("install the {} language server", report.language),
+                    reason: format!(
+                        "`{command}` reported success and no {} server is on PATH",
+                        report.language
+                    ),
+                    remediation: recipe
+                        .map(language_servers::unreachable_after_install_remediation)
+                        .unwrap_or_default(),
+                    requested: true,
+                });
+            }
+            InstallOutcome::Failed { command, reason } => {
+                println!(
+                    "  {} could not install the {} language server: {reason}",
+                    style("✗").red(),
+                    report.language
+                );
+                let remediation = recipe
+                    .map(|recipe| language_servers::install_failure_remediation(recipe, &reason))
+                    .unwrap_or_else(|| {
+                        vec![format!(
+                            "run `{command}` yourself to see the installer's own error"
+                        )]
+                    });
+                unfinished.push(UnfinishedRepair {
+                    what: format!("install the {} language server", report.language),
+                    reason,
+                    remediation,
+                    requested: true,
+                });
+            }
             InstallOutcome::Declined { command } => println!(
                 "  {} skipped the {} language server; run `{command}` to install it later",
                 style("-").dim(),
                 report.language
             ),
-            InstallOutcome::NoInstaller { program, command } => println!(
-                "  {} `{program}` is not installed, so Kin cannot run `{command}` to provision \
-                 the {} language server",
-                style("✗").red(),
-                report.language
-            ),
+            InstallOutcome::NoInstaller { program, command } => {
+                println!(
+                    "  {} `{program}` is not installed, so Kin cannot run `{command}` to \
+                     provision the {} language server",
+                    style("✗").red(),
+                    report.language
+                );
+                unfinished.push(UnfinishedRepair {
+                    what: format!("install the {} language server", report.language),
+                    reason: format!("`{program}` is not installed on this host"),
+                    remediation: vec![format!("install `{program}`, then run `{command}`")],
+                    // Consent was never asked for here, so only the flag makes
+                    // this a repair the operator requested.
+                    requested: consent == InstallConsent::Granted,
+                });
+            }
         }
     }
 
@@ -12852,6 +13111,15 @@ async fn apply_language_server_provisioning(
                     "  {} the {language} language server installed but did not start: {reason}",
                     style("✗").red(),
                 );
+                unfinished.push(UnfinishedRepair {
+                    what: format!("install a working {language} language server"),
+                    reason: format!("the server installed and refused to start: {reason}"),
+                    remediation: vec![format!(
+                        "the binary is on PATH and cannot serve {language}; the server's own \
+                         message above names what it could not find"
+                    )],
+                    requested: true,
+                });
             }
         }
         if !unusable {
@@ -12870,7 +13138,10 @@ async fn apply_language_server_provisioning(
             }
         }
     }
-    applied
+    ProvisioningOutcome {
+        applied,
+        unfinished,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -12893,6 +13164,10 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
     println!("Applying safe repairs...");
     println!();
     let mut applied: Vec<String> = Vec::new();
+    // Every repair below that fails records itself here, so the run closes
+    // with what it could not do and the commands that close it, rather than
+    // with a summary that never read its own attempts (FIR-2547).
+    let mut unfinished: Vec<UnfinishedRepair> = Vec::new();
 
     let registry_needs_fix = report.checks.iter().any(|c| {
         c.id == "registry_authority"
@@ -12909,10 +13184,23 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
                     ));
                 }
             }
-            Err(e) => println!(
-                "  {} registry permission repair refused: {e}",
-                style("✗").red()
-            ),
+            Err(e) => {
+                let reason = e.to_string();
+                println!(
+                    "  {} registry permission repair refused: {reason}",
+                    style("✗").red()
+                );
+                unfinished.push(UnfinishedRepair {
+                    what: "repair the registry authority permissions".to_string(),
+                    reason,
+                    remediation: vec![
+                        "fix the owner and mode of the path named above, then run `kin doctor \
+                         --fix` again"
+                            .to_string(),
+                    ],
+                    requested: false,
+                });
+            }
         }
     }
 
@@ -12926,7 +13214,23 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
             Ok(path) => {
                 applied.push(format!("reinstalled shell hook ({})", path.display()));
             }
-            Err(e) => println!("  {} shell hook reinstall failed: {e}", style("✗").red()),
+            Err(e) => {
+                let reason = e.to_string();
+                println!(
+                    "  {} shell hook reinstall failed: {reason}",
+                    style("✗").red()
+                );
+                unfinished.push(UnfinishedRepair {
+                    what: "reinstall the shell hook".to_string(),
+                    reason,
+                    remediation: vec![
+                        "run `kin setup` to write the shell hook, or add Kin's bin directory to \
+                         PATH by hand"
+                            .to_string(),
+                    ],
+                    requested: false,
+                });
+            }
         }
     }
 
@@ -12971,18 +13275,40 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
                         dest.display()
                     )),
                     Err(e) => {
+                        let reason = e.to_string();
                         println!(
-                            "  {} could not restore the VFS shim automatically: {e}",
+                            "  {} could not restore the VFS shim automatically: {reason}",
                             style("✗").red()
                         );
                         println!(
                             "      reinstall kin to restore it: \
                              curl -fsSL https://get.kinlab.dev/install | sh"
                         );
+                        unfinished.push(UnfinishedRepair {
+                            what: "restore the VFS shim".to_string(),
+                            reason,
+                            remediation: vec!["reinstall kin to restore it: curl -fsSL \
+                                 https://get.kinlab.dev/install | sh"
+                                .to_string()],
+                            requested: false,
+                        });
                     }
                 }
             }
-            Err(e) => println!("  {} VFS shim reinstall failed: {e}", style("✗").red()),
+            Err(e) => {
+                let reason = e.to_string();
+                println!("  {} VFS shim reinstall failed: {reason}", style("✗").red());
+                unfinished.push(UnfinishedRepair {
+                    what: "reinstall the VFS shim".to_string(),
+                    reason,
+                    remediation: vec![
+                        "reinstall kin to restore it: curl -fsSL https://get.kinlab.dev/install \
+                         | sh"
+                            .to_string(),
+                    ],
+                    requested: false,
+                });
+            }
         }
     }
 
@@ -12996,7 +13322,19 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
         match start_repo_daemon().await {
             Ok(Some(url)) => applied.push(format!("started kin-daemon ({url})")),
             Ok(None) => {}
-            Err(e) => println!("  {} kin-daemon start failed: {e}", style("✗").red()),
+            Err(e) => {
+                let reason = e.to_string();
+                println!("  {} kin-daemon start failed: {reason}", style("✗").red());
+                unfinished.push(UnfinishedRepair {
+                    what: "start the repository daemon".to_string(),
+                    reason,
+                    remediation: vec![
+                        "run `kin status` in the repository to see the daemon's own error"
+                            .to_string(),
+                    ],
+                    requested: false,
+                });
+            }
         }
     }
 
@@ -13034,9 +13372,9 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
                 install_language_servers,
                 !install_language_servers && is_tty(),
             );
-            for line in apply_language_server_provisioning(&missing, consent).await {
-                applied.push(line);
-            }
+            let outcome = apply_language_server_provisioning(&missing, consent).await;
+            applied.extend(outcome.applied);
+            unfinished.extend(outcome.unfinished);
         }
     }
 
@@ -13054,14 +13392,40 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
             applied.push(format!("cleaned {cleaned} stale daemon(s)"));
         }
         Ok(_) => {}
-        Err(e) => println!(
-            "  {} stale-daemon cleanup refused registry authority: {e}",
-            style("✗").red()
-        ),
+        Err(e) => {
+            let reason = e.to_string();
+            println!(
+                "  {} stale-daemon cleanup refused registry authority: {reason}",
+                style("✗").red()
+            );
+            unfinished.push(UnfinishedRepair {
+                what: "clean stale daemon records".to_string(),
+                reason,
+                remediation: vec![
+                    "run `kin registry authority --fix` to repair the registry, then run `kin \
+                     doctor --fix` again"
+                        .to_string(),
+                ],
+                requested: false,
+            });
+        }
     }
 
     if applied.is_empty() {
-        println!("  Nothing to repair automatically.");
+        // "Nothing to repair automatically" belongs to a run that found nothing
+        // to do. A run that attempted four repairs and failed all four printed
+        // it directly under its own four failure lines (FIR-2512), which is the
+        // same defect as the closing line that could not read its rows.
+        if unfinished.is_empty() {
+            println!("  Nothing to repair automatically.");
+        } else {
+            println!(
+                "  {} nothing was repaired; {} repair{} did not complete, listed below.",
+                style("✗").red(),
+                unfinished.len(),
+                if unfinished.len() == 1 { "" } else { "s" }
+            );
+        }
     } else {
         for line in &applied {
             println!("  {} {line}", style("✓").green());
@@ -13073,7 +13437,10 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
     let after = crate::commands::health::run_health_checks().await;
     if json {
         println!("{}", serde_json::to_string_pretty(&after)?);
-        return Ok(());
+        // The verdict still applies: a JSON caller reads the exit code, and a
+        // repair that did not happen is exactly what it would otherwise have to
+        // infer from a report that cannot see the attempt.
+        return fix_verdict(&unfinished);
     }
     println!("Re-running checks...");
     println!();
@@ -13097,7 +13464,9 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
         }
     }
 
-    Ok(())
+    print_unfinished_repairs(&unfinished);
+
+    fix_verdict(&unfinished)
 }
 
 /// Start the daemon for the repo containing the current directory, if any.
@@ -14520,6 +14889,145 @@ pub async fn uninstall(all: bool, dry_run: bool, force: bool, json: bool) -> Res
 #[cfg(test)]
 mod tests {
     use super::projection_mode_to_record;
+    use super::{fix_verdict, readiness_line, UnfinishedRepair};
+    use crate::commands::health::{HealthCheck, HealthReport, HealthStatus};
+
+    fn check(id: &str, label: &str, status: HealthStatus) -> HealthCheck {
+        HealthCheck {
+            id: id.to_string(),
+            label: label.to_string(),
+            status,
+            detail: String::new(),
+            platform_note: None,
+            fixable: false,
+            manual_fix: None,
+        }
+    }
+
+    /// The state the container run was actually in: `healthy` true, because
+    /// nothing was Missing or Misconfigured, while the coverage row read
+    /// PENDING because no language server was found and the repair meant to
+    /// install one had just failed. The closing line said "First-run ready"
+    /// under its own "4 need attention" tally (FIR-2547).
+    #[test]
+    fn a_pending_row_keeps_the_summary_from_claiming_first_run_ready() {
+        let report = HealthReport {
+            platform: "linux".to_string(),
+            checks: vec![
+                check("kin_binary", "Kin binary", HealthStatus::Healthy),
+                check(
+                    "reference_edge_coverage",
+                    "Reference edge coverage",
+                    HealthStatus::Pending,
+                ),
+            ],
+            healthy: true,
+        };
+        let line = readiness_line(&report);
+        assert!(
+            !line.ready,
+            "a report holding a row that needs attention must not claim readiness, got: {}",
+            line.sentence
+        );
+        assert!(
+            !line.sentence.contains("First-run ready"),
+            "a row that knows no language server was found must not close under a claim that \
+             nothing is missing: {}",
+            line.sentence
+        );
+        assert!(
+            line.sentence.contains("Reference edge coverage"),
+            "the line has to name the row it is refusing on: {}",
+            line.sentence
+        );
+        assert!(
+            !line.severe,
+            "pending work is not a failure, so the mark stays short of red: {}",
+            line.sentence
+        );
+    }
+
+    /// Positive control: a report with nothing needing attention still reads
+    /// ready, or the line would refuse every correct install.
+    #[test]
+    fn a_report_with_nothing_waiting_still_reads_first_run_ready() {
+        let report = HealthReport {
+            platform: "linux".to_string(),
+            checks: vec![
+                check("kin_binary", "Kin binary", HealthStatus::Healthy),
+                check(
+                    "vfs_projection",
+                    "VFS projection",
+                    HealthStatus::Unsupported,
+                ),
+            ],
+            healthy: true,
+        };
+        let line = readiness_line(&report);
+        assert!(line.ready, "{}", line.sentence);
+        assert!(
+            line.sentence.contains("First-run ready"),
+            "{}",
+            line.sentence
+        );
+    }
+
+    /// A real failure keeps the red mark and the repair route.
+    #[test]
+    fn a_missing_row_reads_as_severe_and_names_the_repair() {
+        let mut missing = check("shell_path", "Shell PATH", HealthStatus::Missing);
+        missing.fixable = true;
+        let report = HealthReport {
+            platform: "linux".to_string(),
+            checks: vec![
+                check("kin_binary", "Kin binary", HealthStatus::Healthy),
+                missing,
+            ],
+            healthy: false,
+        };
+        let line = readiness_line(&report);
+        assert!(!line.ready, "{}", line.sentence);
+        assert!(line.severe, "{}", line.sentence);
+        assert!(line.sentence.contains("Shell PATH"), "{}", line.sentence);
+        assert!(
+            line.sentence.contains("kin doctor --fix"),
+            "{}",
+            line.sentence
+        );
+    }
+
+    /// A repair the operator asked for and Kin could not make ends the run
+    /// non-zero. The run this comes from installed nothing and exited 0.
+    #[test]
+    fn a_requested_repair_that_did_not_complete_fails_the_run() {
+        let requested = UnfinishedRepair {
+            what: "install the python language server".to_string(),
+            reason: "`npm install -g pyright` exited with 243: npm error code EACCES".to_string(),
+            remediation: vec!["npm config set prefix \"$HOME/.npm-global\"".to_string()],
+            requested: true,
+        };
+        let error = fix_verdict(std::slice::from_ref(&requested))
+            .expect_err("a requested repair that did not happen must not exit 0");
+        let text = error.to_string();
+        assert!(
+            text.contains("install the python language server"),
+            "{text}"
+        );
+
+        // Two controls. Nothing unfinished is a clean run, and a best-effort
+        // convergence repair reports itself without failing the run, because
+        // `kin update` runs `kin setup doctor --fix` unattended as its last
+        // step and an offline shim fetch must not report the release as a
+        // failed update.
+        assert!(fix_verdict(&[]).is_ok());
+        let unrequested = UnfinishedRepair {
+            what: "restore the VFS shim".to_string(),
+            reason: "the release asset could not be fetched".to_string(),
+            remediation: Vec::new(),
+            requested: false,
+        };
+        assert!(fix_verdict(std::slice::from_ref(&unrequested)).is_ok());
+    }
 
     /// Setup must never record a mount mode it did not engage. The v0.5.41
     /// release install proof failed on all three non-Linux legs because a
@@ -15228,6 +15736,20 @@ wait
         assert!(BASH_HOOK.contains("else\n            _kin_vfs_refresh_preload"));
     }
 
+    /// Build the `.kin` a real repository carries: the directory plus the
+    /// manifest `kin init` writes into it. The hooks admit a projection root
+    /// only on that manifest, so a fixture that creates the directory alone is
+    /// the managed toolchain home's shape rather than a repository's.
+    #[cfg(unix)]
+    fn seed_repository_marker(root: &Path) {
+        fs::create_dir_all(root.join(".kin")).unwrap();
+        fs::write(
+            root.join(".kin").join("manifest.json"),
+            b"{\"repo_id\":\"00000000-0000-4000-8000-000000000000\"}",
+        )
+        .unwrap();
+    }
+
     /// FIR-2300 contract: a socket inode outlives the daemon that bound it, so
     /// `-S` may appear only as a pre-filter. Both the decision to start a
     /// daemon and the readiness poll must go through the
@@ -15399,6 +15921,50 @@ fi
     /// authority must surface as EIO from the shim, never as silent raw-disk
     /// reads, so the shell only ever decides whether to START a daemon and
     /// never whether the preload applies.
+    /// How long a scenario waits for a start the hook launched detached.
+    ///
+    /// Only how long a run that is going to fail spends proving it: the wait
+    /// below returns the instant the line lands, so a passing scenario never
+    /// spends this. Sized against a runner where the whole probe shell took ten
+    /// seconds rather than the three a quiet box takes.
+    #[cfg(unix)]
+    const DETACHED_START_BOUND: Duration = Duration::from_secs(30);
+
+    /// Start lines the stub has recorded so far.
+    #[cfg(unix)]
+    fn recorded_starts(start_log: &Path) -> usize {
+        fs::read_to_string(start_log)
+            .map(|log| log.lines().count())
+            .unwrap_or(0)
+    }
+
+    /// Wait for the starts a scenario expects, and return what the log holds.
+    ///
+    /// Every hook launches `kin-vfs start` detached, zsh with `&!` and the
+    /// others with a plain `&`, and none of them waits for it. `Command::output`
+    /// waits for the probe shell alone, so reading the log the moment it returns
+    /// reads a side effect of a process nothing synchronised with: on a loaded
+    /// host the shell's ten bounded retries expire and it exits before the
+    /// disowned grandchild has appended its line (FIR-2573).
+    ///
+    /// So wait on the observable rather than on the shell. This returns as soon
+    /// as the expected count is there and hands the count back either way, so
+    /// the caller's assertion still names the scenario and prints the call log.
+    /// A scenario expecting no start has nothing to wait for and is read
+    /// directly: a start that has not landed yet cannot fail that assertion, so
+    /// it has never been the flaky direction.
+    #[cfg(unix)]
+    fn starts_recorded_within_bound(start_log: &Path, expected: usize) -> usize {
+        let deadline = std::time::Instant::now() + DETACHED_START_BOUND;
+        loop {
+            let starts = recorded_starts(start_log);
+            if starts >= expected || std::time::Instant::now() >= deadline {
+                return starts;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn hook_liveness_guard_starts_on_stale_sockets_and_keeps_the_shim_unconditional() {
@@ -15408,7 +15974,7 @@ fi
         let root = fs::canonicalize(fixture.path()).unwrap();
 
         let ws = root.join("workspace");
-        fs::create_dir_all(ws.join(".kin")).unwrap();
+        seed_repository_marker(&ws);
         // A real stale socket: bind a listener, then drop it. The inode stays
         // behind, which is exactly the state `-S` misreads as a live daemon.
         let sock = ws.join(".kin/vfs.sock");
@@ -15559,10 +16125,12 @@ printf 'LD=[%s]\n' "$LD_PRELOAD"
                     "{hook_name}/{mode}: probe shell failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
                 );
 
+                let starts = if expected_starts == 0 {
+                    recorded_starts(&start_log)
+                } else {
+                    starts_recorded_within_bound(&start_log, expected_starts)
+                };
                 let calls_text = fs::read_to_string(&calls).unwrap_or_default();
-                let starts = fs::read_to_string(&start_log)
-                    .map(|s| s.lines().count())
-                    .unwrap_or(0);
                 assert_eq!(
                     starts, expected_starts,
                     "{hook_name}/{mode}: {why}\ncalls:\n{calls_text}\nstdout:\n{stdout}"
@@ -15608,7 +16176,7 @@ printf 'LD=[%s]\n' "$LD_PRELOAD"
         let root_path = root.path().join("root with spaces");
         fs::create_dir(&root_path).unwrap();
         let root_path = fs::canonicalize(root_path).unwrap();
-        fs::create_dir_all(root_path.join(".kin")).unwrap();
+        seed_repository_marker(&root_path);
 
         let nested_git = root_path.join("linked-worktree");
         let nested_start = nested_git.join("src/deep");
@@ -15621,7 +16189,7 @@ printf 'LD=[%s]\n' "$LD_PRELOAD"
 
         let nested_kin = root_path.join("kin-workspace");
         let local_start = nested_kin.join("src/deep");
-        fs::create_dir_all(nested_kin.join(".kin")).unwrap();
+        seed_repository_marker(&nested_kin);
         fs::create_dir_all(nested_kin.join(".git")).unwrap();
         fs::create_dir_all(&local_start).unwrap();
 
@@ -15631,7 +16199,7 @@ printf 'LD=[%s]\n' "$LD_PRELOAD"
 
         let session_repo = root_path.join("runs/session-repo");
         let session_repo_start = session_repo.join("src/deep");
-        fs::create_dir_all(session_repo.join(".kin")).unwrap();
+        seed_repository_marker(&session_repo);
         fs::create_dir_all(session_repo.join(".git")).unwrap();
         fs::create_dir_all(&session_repo_start).unwrap();
         let normalized_session_repo = root_path.join("runs/../runs/session-repo");
@@ -15639,12 +16207,12 @@ printf 'LD=[%s]\n' "$LD_PRELOAD"
         let nested_session = root_path.join("runs/session-with-nested-repo");
         let nested_session_repo = nested_session.join("nested");
         let nested_session_start = nested_session_repo.join("src/deep");
-        fs::create_dir_all(nested_session_repo.join(".kin")).unwrap();
+        seed_repository_marker(&nested_session_repo);
         fs::create_dir_all(&nested_session_start).unwrap();
 
         let aliased_session_target = root_path.join("runs/session-alias-target");
         let aliased_session_target_start = aliased_session_target.join("src/deep");
-        fs::create_dir_all(aliased_session_target.join(".kin")).unwrap();
+        seed_repository_marker(&aliased_session_target);
         fs::create_dir_all(aliased_session_target.join(".git")).unwrap();
         fs::create_dir_all(&aliased_session_target_start).unwrap();
         let aliased_session = root_path.join("session-alias");
@@ -15804,6 +16372,244 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
                 "{hook_name} crossed a Git or session boundary\nstdout: {}\nstderr: {}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    /// FIR-2552: the managed toolchain home is `.kin`-shaped, so a hook that
+    /// admits a projection root on the directory alone binds `$HOME` itself.
+    /// On the released 0.5.45 bytes that made every path under `$HOME` answer
+    /// EIO, because the shim owned a root no daemon served. The hook must walk
+    /// past the toolchain home, and must still bind a real repository under it.
+    ///
+    /// Driven through the installed hook in the real shell rather than through
+    /// `_kin_vfs_scan_path` alone, because what broke the container was the
+    /// variable the hook exported on source, not a helper's return code.
+    #[cfg(unix)]
+    #[test]
+    fn unix_installed_hooks_leave_a_toolchain_shaped_home_unbound() {
+        let root = tempfile::tempdir().unwrap();
+        let home = fs::canonicalize(root.path()).unwrap().join("home");
+        fs::create_dir_all(&home).unwrap();
+
+        // The managed toolchain home, in the shape `kin setup` provisions:
+        // a real `.kin` directory carrying bin/, lib/, shell/, config/ and
+        // registry.toml, and never a repository manifest.
+        let kin_home = home.join(".kin");
+        for dir in ["bin", "lib", "shell", "config"] {
+            fs::create_dir_all(kin_home.join(dir)).unwrap();
+        }
+        fs::write(kin_home.join("registry.toml"), b"# managed toolchain\n").unwrap();
+        let shim_name = if cfg!(target_os = "macos") {
+            "libkin_vfs_shim.dylib"
+        } else {
+            "libkin_vfs_shim.so"
+        };
+        let shim = kin_home.join("lib").join(shim_name);
+        fs::write(&shim, b"\x7fELF not a real object, only non-empty\n").unwrap();
+
+        // A real repository under that home, and a plain directory under it.
+        let repo = home.join("demo-repo");
+        let repo_start = repo.join("src/deep");
+        fs::create_dir_all(&repo_start).unwrap();
+        seed_repository_marker(&repo);
+        let plain = home.join("plain/sub");
+        fs::create_dir_all(&plain).unwrap();
+
+        let hooks = home.join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+
+        let posix_probe = r#"
+source "$KIN_TEST_HOOK" || { echo SOURCE_FAILED >&2; exit 97; }
+printf 'WORKSPACE=[%s]\n' "${KIN_VFS_WORKSPACE-}"
+printf 'DYLD=[%s]\n' "${DYLD_INSERT_LIBRARIES-}"
+printf 'LD=[%s]\n' "${LD_PRELOAD-}"
+"#;
+        let fish_probe = r#"
+source $KIN_TEST_HOOK; or begin; echo SOURCE_FAILED >&2; exit 97; end
+printf 'WORKSPACE=[%s]\n' "$KIN_VFS_WORKSPACE"
+printf 'DYLD=[%s]\n' "$DYLD_INSERT_LIBRARIES"
+printf 'LD=[%s]\n' "$LD_PRELOAD"
+"#;
+        let fish_path = [
+            "/opt/homebrew/bin/fish",
+            "/usr/local/bin/fish",
+            "/usr/bin/fish",
+            "/bin/fish",
+        ]
+        .into_iter()
+        .find(|candidate| Path::new(candidate).is_file());
+
+        let mut shells: Vec<(&str, &str, &str, &[&str], &str)> = vec![
+            (
+                "/bin/bash",
+                "kin-vfs.bash",
+                BASH_HOOK,
+                &["--noprofile", "--norc"][..],
+                posix_probe,
+            ),
+            (
+                "/bin/zsh",
+                "kin-vfs.zsh",
+                ZSH_HOOK,
+                &["-f"][..],
+                posix_probe,
+            ),
+        ];
+        if let Some(fish) = fish_path {
+            shells.push((fish, "kin-vfs.fish", FISH_HOOK, &[][..], fish_probe));
+        }
+
+        // (working directory, the root the hook must bind, why)
+        let cases: [(&Path, Option<&Path>, &str); 4] = [
+            (
+                home.as_path(),
+                None,
+                "the managed toolchain home is not a repository and must never be bound",
+            ),
+            (
+                plain.as_path(),
+                None,
+                "a plain directory under the toolchain home walks past it and binds nothing",
+            ),
+            (
+                repo.as_path(),
+                Some(repo.as_path()),
+                "a repository under the toolchain home still binds",
+            ),
+            (
+                repo_start.as_path(),
+                Some(repo.as_path()),
+                "a directory inside that repository binds the repository, not the home",
+            ),
+        ];
+
+        let mut shells_run = 0;
+        for (shell, hook_name, hook, flags, probe) in shells {
+            if !Path::new(shell).is_file() {
+                continue;
+            }
+            shells_run += 1;
+            let hook_path = hooks.join(hook_name);
+            fs::write(&hook_path, hook).unwrap();
+
+            for (cwd, expected, why) in cases {
+                let output = std::process::Command::new(shell)
+                    .args(flags)
+                    .arg("-c")
+                    .arg(probe)
+                    .current_dir(cwd)
+                    .env("PATH", "/usr/bin:/bin")
+                    .env("HOME", &home)
+                    .env("KIN_HOME", &kin_home)
+                    .env("KIN_TEST_HOOK", &hook_path)
+                    .env_remove("KIN_DIR")
+                    .env_remove("KIN_SESSION_DIR")
+                    .env_remove("KIN_VFS_DISABLE")
+                    .env_remove("KIN_VFS_WORKSPACE")
+                    .env_remove("KIN_VFS_SOCK")
+                    .env_remove("DYLD_INSERT_LIBRARIES")
+                    .env_remove("LD_PRELOAD")
+                    .output()
+                    .unwrap();
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    output.status.success(),
+                    "{hook_name} at {}: probe shell failed\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                    cwd.display()
+                );
+
+                let expected_line = match expected {
+                    Some(root) => format!("WORKSPACE=[{}]", root.display()),
+                    None => "WORKSPACE=[]".to_string(),
+                };
+                assert!(
+                    stdout.contains(&expected_line),
+                    "{hook_name} at {}: {why}\nexpected {expected_line}\nstdout:\n{stdout}",
+                    cwd.display()
+                );
+
+                // The preload follows the binding: nothing bound means nothing
+                // injected, so a home that is not a repository leaves every
+                // process in it on raw disk rather than under an unserved root.
+                let preload_line = if cfg!(target_os = "macos") {
+                    format!("DYLD=[{}]", shim.display())
+                } else {
+                    format!("LD=[{}]", shim.display())
+                };
+                let empty_preload = if cfg!(target_os = "macos") {
+                    "DYLD=[]"
+                } else {
+                    "LD=[]"
+                };
+                if expected.is_some() {
+                    assert!(
+                        stdout.contains(&preload_line),
+                        "{hook_name} at {}: a bound repository must still inject the shim\
+                         \nstdout:\n{stdout}",
+                        cwd.display()
+                    );
+                } else {
+                    assert!(
+                        stdout.contains(empty_preload),
+                        "{hook_name} at {}: an unbound directory must not inject the shim\
+                         \nstdout:\n{stdout}",
+                        cwd.display()
+                    );
+                }
+            }
+        }
+        assert!(
+            shells_run > 0,
+            "no POSIX shell was available, so this test proved nothing"
+        );
+    }
+
+    /// The text contract, so the four installed hooks cannot drift apart and so
+    /// the one this fleet has no host for is covered too. PowerShell is checked
+    /// here or nowhere.
+    #[test]
+    fn every_installed_hook_admits_a_root_only_on_the_repository_manifest() {
+        // (shell, hook, the predicate it must carry, the pre-fix adjacency it
+        // must no longer carry: the bare `.kin`-is-a-directory admission)
+        let contracts: [(&str, &str, &str, &str); 4] = [
+            (
+                "zsh",
+                ZSH_HOOK,
+                "_kin_vfs_is_repository() {\n    [[ -f \"$1/.kin/manifest.json\" ]]\n}",
+                "[[ -d \"$dir/.kin\" && ! -L \"$dir/.kin\" ]] || return 1\n            if [[ -n \"$boundary\"",
+            ),
+            (
+                "bash",
+                BASH_HOOK,
+                "_kin_vfs_is_repository() {\n    [ -f \"$1/.kin/manifest.json\" ]\n}",
+                "[ -d \"$dir/.kin\" ] && [ ! -L \"$dir/.kin\" ] || return 1\n            if [ -n \"$boundary\"",
+            ),
+            (
+                "fish",
+                FISH_HOOK,
+                "function _kin_vfs_is_repository\n    test -f \"$argv[1]/.kin/manifest.json\"\nend",
+                "test -d \"$dir/.kin\"; and not test -L \"$dir/.kin\"; or return 1\n            if test -n \"$boundary\"",
+            ),
+            (
+                "powershell",
+                POWERSHELL_HOOK,
+                "[System.IO.File]::Exists((Join-Path (Join-Path $Path \".kin\") \"manifest.json\"))",
+                "-ne 0)) {\n                return $null\n            }\n            if ($Boundary",
+            ),
+        ];
+        for (shell, hook, predicate, pre_fix) in contracts {
+            assert!(
+                hook.contains(predicate),
+                "the {shell} hook carries no repository-manifest predicate; \
+                 a `.kin` directory alone admits the managed toolchain home as a \
+                 projection root (FIR-2552)"
+            );
+            assert!(
+                !hook.contains(pre_fix),
+                "the {shell} hook still admits a root straight off the `.kin` directory test, \
+                 so the toolchain home binds again (FIR-2552)"
             );
         }
     }

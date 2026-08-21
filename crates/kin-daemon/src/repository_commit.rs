@@ -229,7 +229,7 @@ pub(crate) fn plan_session_workspace_admission(
 
     let authority = authority_context.open().map_err(DaemonError::Graph)?;
     let mut source_lengths = std::collections::BTreeMap::new();
-    let (shared_policy, _) = SharedAdmissionPolicy::derive_from_tree(
+    let (shared_policy, _) = SharedAdmissionPolicy::derive_from_tree_with_allowances(
         Some(&base.source_workspace.shared_admission_policy),
         desired_tree,
         |hash| {
@@ -248,6 +248,15 @@ pub(crate) fn plan_session_workspace_admission(
             })?;
             source_lengths.insert(hash, length);
             Ok(length)
+        },
+        |hash| {
+            read_publishable_source(blobs, &authority, hash)
+                .map(|source| source.body().to_vec())
+                .map_err(|error| {
+                    ModelError::InvalidOperation(format!(
+                        "{error}, while reading the approvals the exact session policy derives"
+                    ))
+                })
         },
     )?;
     let tree_hash = compute_resolved_tree_hash(desired_tree)?;
@@ -491,7 +500,7 @@ pub(crate) fn publish_workspace_tree(
 
     let tree_deltas = kin_core::exact_tree_correction(&workspace.tree, desired_tree)?;
     let mut source_lengths = std::collections::BTreeMap::new();
-    let (shared_policy, _) = SharedAdmissionPolicy::derive_from_tree(
+    let (shared_policy, _) = SharedAdmissionPolicy::derive_from_tree_with_allowances(
         Some(&workspace.shared_admission_policy),
         desired_tree,
         |hash| {
@@ -513,6 +522,15 @@ pub(crate) fn publish_workspace_tree(
             })?;
             source_lengths.insert(hash, length);
             Ok(length)
+        },
+        |hash| {
+            read_publishable_source(blobs, &authority, hash)
+                .map(|source| source.body().to_vec())
+                .map_err(|error| {
+                    ModelError::InvalidOperation(format!(
+                "{error}, while reading the approvals the admitted workspace policy derives"
+            ))
+                })
         },
     )?;
     let tree_hash = compute_resolved_tree_hash(desired_tree)?;
@@ -814,7 +832,7 @@ fn plan_native_commit_inner(
     let mut source_lengths = std::collections::BTreeMap::new();
     let (shared_policy, admission_policy_delta) =
         crate::mcp_commit::timed_commit_phase("plan_derive_admission_policy", || {
-            SharedAdmissionPolicy::derive_from_tree(
+            SharedAdmissionPolicy::derive_from_tree_with_allowances(
                 parent_policy.as_ref(),
                 &deltas.expected_tree,
                 |hash| {
@@ -834,6 +852,15 @@ fn plan_native_commit_inner(
                     })?;
                     source_lengths.insert(hash, length);
                     Ok(length)
+                },
+                |hash| {
+                    read_publishable_source(blobs, &authority, hash)
+                        .map(|source| source.body().to_vec())
+                        .map_err(|error| {
+                            ModelError::InvalidOperation(format!(
+                "{error}, while reading the approvals the graph-owned policy derives"
+            ))
+                        })
                 },
             )
         })?;
@@ -2503,5 +2530,223 @@ mod tests {
             "missing graph body must surface the typed blob absence, got {error:?}"
         );
         assert_eq!(reopen(&init).read_authority().roots().generation, 1);
+    }
+
+    /// A body the credential scanner blocks.
+    ///
+    /// Every test using it proves that claim on its own refusal arm rather than
+    /// assuming it. A fixture whose secret the scanner never flagged would let
+    /// the approval arm pass with the derivation site reverted and approvals
+    /// ignored, which is the shape of a check that cannot fail.
+    const BLOCKED_SECRET: &[u8] = b"API_TOKEN = \"sk-proj-abcd1234efgh5678ijkl\"\n";
+
+    /// The path the scanner names when it refuses [`BLOCKED_SECRET`].
+    const BLOCKED_PATH: &[u8] = b"notekeeper/client.py";
+
+    /// The bytes of a tracked approval set, in the format kin-model parses.
+    ///
+    /// Written out here rather than produced by the writer that ships in the
+    /// CLI, because a fixture generating the file with the code under test
+    /// could agree with itself while both drifted from the format the published
+    /// kin-model actually reads.
+    fn approval_file(path: &str, digest: Hash256, approver: &str) -> Vec<u8> {
+        format!(
+            "# approvals for this fixture\n\
+             kin-allowances 1\n\
+             {path}\t{digest}\tblob\t{approver}\tpinned by the test covering this derivation site\n"
+        )
+        .into_bytes()
+    }
+
+    fn blob_hash(artifact: &ResolvedArtifact) -> Hash256 {
+        match artifact.entry {
+            TreeEntry::Blob { hash, .. } => hash,
+            other => panic!("fixture artifact must be a blob, found {other:?}"),
+        }
+    }
+
+    /// The approvals a planned transition carries into authority.
+    fn planned_approvals(
+        transaction: &RepositoryTransaction,
+    ) -> Vec<kin_model::SensitiveArtifactAllowance> {
+        transaction
+            .workspace_mutation
+            .as_ref()
+            .expect("a workspace transition carries a workspace mutation")
+            .new_shared_admission_policy
+            .sensitive_allowances
+            .clone()
+    }
+
+    /// The graph-owned policy a native commit derives has to be derived through
+    /// the entry point that reads a tracked `.kin-allowances`, or an approval a
+    /// reviewer can see in the diff never reaches admission.
+    ///
+    /// Reverting `plan_native_commit_inner`'s derivation to `derive_from_tree`
+    /// fails the approved arm below, because the compatibility entry point
+    /// refuses by name the moment the tree carries approvals it cannot read.
+    /// The refused arm is what makes that meaningful: it proves this fixture's
+    /// body really is blocked, so the approved arm is passing because the
+    /// approval was read rather than because nothing was ever in the way.
+    #[test]
+    fn a_native_commit_derives_the_approvals_its_tree_carries() {
+        let refused = tempfile::tempdir().unwrap();
+        let init = kin_core::init(refused.path()).unwrap();
+        let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+        add_artifact(&graph, &blobs, BLOCKED_PATH, BLOCKED_SECRET, |hash| {
+            TreeEntry::blob(hash, false)
+        });
+        let plan = plan_native_commit(
+            &init.layout,
+            &graph,
+            &blobs,
+            OperationId::new(),
+            fixed_timestamp(),
+            AuthorId::new("credscan"),
+            "publish a secret with no approval".to_string(),
+        )
+        .unwrap();
+        let error = commit_native_plan(&init.layout, &blobs, plan).unwrap_err();
+        assert!(
+            error.to_string().contains("notekeeper/client.py"),
+            "this fixture's body must be one the scanner actually blocks, or the approved \
+             arm below proves nothing: {error}"
+        );
+
+        let approved = tempfile::tempdir().unwrap();
+        let init = kin_core::init(approved.path()).unwrap();
+        let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+        let secret = add_artifact(&graph, &blobs, BLOCKED_PATH, BLOCKED_SECRET, |hash| {
+            TreeEntry::blob(hash, false)
+        });
+        let approvals = approval_file(
+            "notekeeper/client.py",
+            blob_hash(&secret),
+            "credscan@firelock.ai",
+        );
+        add_artifact(&graph, &blobs, b".kin-allowances", &approvals, |hash| {
+            TreeEntry::blob(hash, false)
+        });
+
+        let plan = plan_native_commit(
+            &init.layout,
+            &graph,
+            &blobs,
+            OperationId::new(),
+            fixed_timestamp(),
+            AuthorId::new("credscan"),
+            "publish the secret beside the approval that clears it".to_string(),
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "planning a native commit whose tree carries .kin-allowances must derive its \
+                 approvals rather than refusing: {error}"
+            )
+        });
+        let approvals = planned_approvals(&plan.transaction);
+        assert_eq!(
+            approvals.len(),
+            1,
+            "the planned policy must carry the one approval the tree declares: {approvals:?}"
+        );
+        assert_eq!(approvals[0].path.as_utf8().unwrap(), "notekeeper/client.py");
+        assert_eq!(approvals[0].content_hash, blob_hash(&secret));
+
+        commit_native_plan(&init.layout, &blobs, plan).unwrap_or_else(|error| {
+            panic!("the approved secret must publish rather than being refused: {error}")
+        });
+
+        let authority = reopen(&init);
+        let lease = authority.read_authority();
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == init.workspace_id)
+            .unwrap();
+        assert_eq!(
+            workspace.shared_admission_policy.sensitive_allowances.len(),
+            1,
+            "the approval has to reach durable authority, not just the plan"
+        );
+    }
+
+    /// The same property for the workspace-admission derivation, which is the
+    /// site a dirty working tree reaches rather than a commit.
+    ///
+    /// Reverting `publish_workspace_tree`'s derivation fails the approved arm
+    /// here and leaves the commit test above untouched, which is what makes
+    /// these two separate tests rather than one.
+    #[test]
+    fn admitting_a_workspace_tree_derives_the_approvals_it_carries() {
+        let refused = tempfile::tempdir().unwrap();
+        let init = kin_core::init(refused.path()).unwrap();
+        let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+        let secret = add_artifact(&graph, &blobs, BLOCKED_PATH, BLOCKED_SECRET, |hash| {
+            TreeEntry::blob(hash, false)
+        });
+        let error = publish_workspace_tree(
+            &init.layout,
+            &blobs,
+            &ResolvedTree::from_artifacts([secret.clone()]).unwrap(),
+            OperationId::new(),
+            AuthorId::new("credscan"),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("notekeeper/client.py"),
+            "this fixture's body must be one the scanner actually blocks, or the approved \
+             arm below proves nothing: {error}"
+        );
+
+        let approved = tempfile::tempdir().unwrap();
+        let init = kin_core::init(approved.path()).unwrap();
+        let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+        let secret = add_artifact(&graph, &blobs, BLOCKED_PATH, BLOCKED_SECRET, |hash| {
+            TreeEntry::blob(hash, false)
+        });
+        let approvals = approval_file(
+            "notekeeper/client.py",
+            blob_hash(&secret),
+            "credscan@firelock.ai",
+        );
+        let allowance = add_artifact(&graph, &blobs, b".kin-allowances", &approvals, |hash| {
+            TreeEntry::blob(hash, false)
+        });
+
+        publish_workspace_tree(
+            &init.layout,
+            &blobs,
+            &ResolvedTree::from_artifacts([secret.clone(), allowance]).unwrap(),
+            OperationId::new(),
+            AuthorId::new("credscan"),
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "admitting a workspace tree carrying .kin-allowances must derive its approvals \
+                 rather than refusing: {error}"
+            )
+        })
+        .expect("the transition must advance authority");
+
+        let authority = reopen(&init);
+        let lease = authority.read_authority();
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == init.workspace_id)
+            .unwrap();
+        let carried = &workspace.shared_admission_policy.sensitive_allowances;
+        assert_eq!(
+            carried.len(),
+            1,
+            "the admitted workspace policy must carry the tree's one approval: {carried:?}"
+        );
+        assert_eq!(carried[0].content_hash, blob_hash(&secret));
     }
 }

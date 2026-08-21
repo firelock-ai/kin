@@ -207,3 +207,68 @@ fn the_conversion_phase_leaves_no_daemon_behind_when_it_exits_early() {
         }
     }
 }
+
+/// The daemon reports a cause and the CLI prints that cause, across a real
+/// process boundary.
+///
+/// Both sides carry unit tests and they share no code, so a daemon that stopped
+/// sending `enrichment_unavailable`, or renamed a row, would leave every one of
+/// them green while a user read the CLI's fallback sentence instead of a cause.
+/// This is the check that fails on that, which is why the fallback text is an
+/// assertion below rather than a comment.
+///
+/// `KIN_DAEMON_DISABLE_LSP` is the row driven here because it is the one this
+/// suite can reach on any host: it switches enrichment off in the daemon, so
+/// the channel is closed no matter what the machine running the test has
+/// installed. Restricting `PATH` instead was the first attempt and it does not
+/// hold, since the daemon reached a server anyway and swept.
+///
+/// `--storage gcs` reaches the same row through
+/// `storage_backend_graph_authority`, and it is the more common way to land
+/// here in production. The two share this code path entirely, so the operator
+/// who never touched an env variable gets what is asserted below.
+#[test]
+fn the_enrichment_note_carries_a_cause_the_daemon_reported() {
+    let root = tempdir().expect("temp root");
+    let repo = root.path().join("enrichment-off");
+    seed_linkable_git_repo(&repo);
+
+    let runtime = IsolatedDaemonRuntime::new(&repo);
+    let output = runtime
+        .process_command_for_test(env!("CARGO_BIN_EXE_kin"))
+        .arg("init")
+        .arg(&repo)
+        .env("KIN_DAEMON_DISABLE_LSP", "1")
+        .output()
+        .expect("run kin init");
+    assert!(
+        output.status.success(),
+        "init must succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    // The positive control. Without it every assertion below would pass on a
+    // run that printed no note at all, which is the same result a broken seam
+    // produces.
+    assert!(
+        stderr.contains("switched off for this daemon"),
+        "a daemon told not to enrich must say so in the note it causes: {stderr}"
+    );
+    assert!(
+        !stderr.contains("did not report why"),
+        "the daemon must send a cause this CLI recognises, so the fallback row must not \
+         appear: {stderr}"
+    );
+    assert!(
+        !stderr.contains("no language server is installed"),
+        "no row may assert what is installed on the reader's host, and this row least of all: \
+         nothing here looked at a language server: {stderr}"
+    );
+    assert!(
+        !stderr.contains("--install-language-servers"),
+        "installing a server changes nothing while enrichment is switched off, so the note \
+         must not prescribe it: {stderr}"
+    );
+}

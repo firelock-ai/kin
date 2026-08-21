@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (481 total, 332 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (483 total, 333 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -86,7 +86,9 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_VECTOR_SIMD` | bool | true | correctness | kin-vector NEON SIMD cosine-distance kernel on aarch64, on by default; only 0/false/no/off select the scalar reduction, and the two reduction orders differ in the last ULPs so distances and therefore ranking order can shift |
 | `KIN_VFS_BIN` | path | *(unset)* | operational | pin the `kin-vfs` projection driver Kin probes and runs, instead of searching beside the `kin` binary, in `~/.kin/bin`, and on PATH. When set it is the only candidate, so a pin naming a file that is not there reports an absent driver rather than resolving to another one. Use it to run a driver built with a mount feature without reordering PATH |
 | `KIN_VFS_DISABLE` | bool | false | correctness | kin-vfs interception kill switch: the literal 1 disables every projected read and write, default off |
+| `KIN_VFS_SOCK` | path | *(unset)* | operational | kin-vfs daemon socket the shim connects to; unset means the bound root's own `.kin/vfs.sock`. `kin vfs status` probes it with a connect rather than a file test, because a socket file outlives the daemon that bound it |
 | `KIN_VFS_STRICT` | bool | false | correctness | require graph-authoritative projection misses to fail loud when the daemon is unreachable instead of passing through to raw files |
+| `KIN_VFS_WORKSPACE` | path | *(unset)* | correctness | kin-vfs projection root, exported by the shell hook into every process it starts; the shim answers every path under it from the graph and refuses it when it cannot, so a root nothing serves fails every path under it. `kin vfs status` reads it to report which root is bound here. Set by the hook rather than by hand |
 | `KIN_WORKSPACE_DIR` | path | *(unset)* | operational | docker-entrypoint workspace override for both storage modes; unset uses /tmp/kin-workspace (backed by an emptyDir in k8s); set to /workspace to opt into a legacy mounted volume |
 | `KIN_WORKSPACE_ROOT` | path | *(unset)* | operational | workspace root override for orchestration commands |
 | `KIN_WRITE_VETO` | enum | warn | correctness | write-veto mode: 'warn' (default) annotates would-be vetoes into foreign-held scopes, 'enforce' rejects them with a 409, 'off' disables |

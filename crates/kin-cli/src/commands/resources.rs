@@ -35,6 +35,15 @@ pub struct EmbedRuntimeState {
     /// distinguish that from a first run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vector_index_discarded: Option<String>,
+    /// Why the last vector checkpoint was refused, while that refusal stands.
+    ///
+    /// The counterpart to `vector_index_discarded` at the other end of a
+    /// daemon's life. That one says coverage on disk was not loaded; this one
+    /// says coverage in memory was not written. Both produce the same shortfall
+    /// on the next open, and without this the second arrives with no cause
+    /// attached and reads as ordinary pending work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_vector_checkpoint: Option<String>,
     /// Whether this store's embedding coverage has ever been whole, as recorded
     /// by the daemon where the embedding queue drained. Partial coverage means
     /// something different before this has ever been true than after it.
@@ -51,8 +60,10 @@ pub struct EmbedRuntimeState {
     ///
     /// The weights are not shipped, so the first embed pass on a fresh machine
     /// spends several hundred megabytes of egress before it can record a single
-    /// unit. Without this the pass reports working with zero progress for the
-    /// whole download, which is indistinguishable from a wedged pass.
+    /// unit. `kin init` is what starts that pass on a repository with parseable
+    /// content, so the egress is usually paid there rather than on a later
+    /// `kin embed`. Without this the pass reports working with zero progress for
+    /// the whole download, which is indistinguishable from a wedged pass.
     #[serde(default)]
     pub model_fetch: crate::embed_model::EmbedModelFetch,
 }

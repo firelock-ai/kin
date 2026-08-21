@@ -155,6 +155,29 @@ impl ProjectionMode {
             }
         }
     }
+
+    /// What this mode cannot project, where that is a property of the mode
+    /// rather than of the host.
+    ///
+    /// The shim is injected through `LD_PRELOAD` and `DYLD_INSERT_LIBRARIES`,
+    /// which interpose libc and nothing else. A runtime that issues raw
+    /// syscalls goes straight past it: Node's libuv calls `statx` directly, so
+    /// inside a projected repository Node reads raw disk on the same path where
+    /// git, Python and the coreutils read graph truth (FIR-2572). No further
+    /// hook closes that, so the product says it rather than leaving a user to
+    /// find it. A mount has no such gap, because the kernel serves every
+    /// process on the host.
+    pub(crate) fn raw_syscall_note(self) -> Option<&'static str> {
+        match self {
+            Self::Shim => Some(
+                "Node is not projected in this mode: the shim interposes libc, and libuv issues \
+                 raw syscalls that no injected library can see, so Node reads raw disk here while \
+                 git, Python and the coreutils read graph truth. The nfs and fuse mounts project \
+                 every process on the host, Node included.",
+            ),
+            Self::Nfs | Self::Fuse | Self::ProjFs => None,
+        }
+    }
 }
 
 impl std::fmt::Display for ProjectionMode {
@@ -725,6 +748,170 @@ pub(crate) struct ShimPresence {
     pub engaged: bool,
 }
 
+/// The projection root this process is bound to, and whether anything serves
+/// it.
+///
+/// The shim answers every path under its bound root out of the graph and fails
+/// closed when it cannot, so a bound root with no daemon behind it returns EIO
+/// for every path under it, existing or not. A read of the repository cannot
+/// see that when the bound root does not contain the repository: the read never
+/// reaches the shim, the row reads healthy, and every path under the bound root
+/// is unreadable. That is the state a home directory bound as a projection root
+/// produced on a stock container (FIR-2552), and it is why this question is
+/// asked of the binding rather than of a directory listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ShimBinding {
+    /// No root is bound in this process, so the shim intercepts nothing.
+    Unbound,
+    /// A root is bound, named with the socket the shim is answered through.
+    Bound {
+        root: PathBuf,
+        socket: PathBuf,
+        /// Whether a connect to that socket was answered by a listener.
+        /// `NotApplicable` where the shim is not answered over a Unix socket.
+        listening: Tri,
+        /// What the connect actually did, in its own words.
+        detail: String,
+        /// Whether the path this report is about lies inside the bound root.
+        covers: bool,
+    },
+}
+
+impl ShimBinding {
+    /// Whether the graph is serving the path this report is about.
+    ///
+    /// False in every direction that leaves the caller on raw disk or on an
+    /// EIO: nothing bound, a root that does not contain this path, or a root
+    /// whose socket no listener answered.
+    pub(crate) fn projects(&self) -> bool {
+        match self {
+            Self::Unbound => false,
+            Self::Bound {
+                listening, covers, ..
+            } => *covers && *listening != Tri::No,
+        }
+    }
+
+    /// The literal probe result, in the words the surfaces print.
+    pub(crate) fn evidence(&self) -> String {
+        match self {
+            Self::Unbound => "no projection root is bound in this process: KIN_VFS_WORKSPACE is \
+                              unset, so nothing here is answered from the graph"
+                .to_string(),
+            Self::Bound {
+                root,
+                socket,
+                covers,
+                detail,
+                ..
+            } => {
+                if *covers {
+                    format!(
+                        "the projection root bound here is {}, its socket is {}, and {detail}",
+                        root.display(),
+                        socket.display()
+                    )
+                } else {
+                    format!(
+                        "the projection root bound here is {}, which does not contain this \
+                         directory, so this directory is read from raw disk; its socket is {} \
+                         and {detail}",
+                        root.display(),
+                        socket.display()
+                    )
+                }
+            }
+        }
+    }
+}
+
+/// Read the binding the shell hook exports into every process it starts.
+pub(crate) fn shim_binding_here(at: &Path) -> ShimBinding {
+    let workspace = std::env::var_os("KIN_VFS_WORKSPACE").map(PathBuf::from);
+    let socket = std::env::var_os("KIN_VFS_SOCK").map(PathBuf::from);
+    shim_binding_for(
+        workspace.as_deref(),
+        socket.as_deref(),
+        at,
+        socket_listening,
+    )
+}
+
+/// Pure over its inputs, so every case is testable without a process
+/// environment and without a daemon.
+pub(crate) fn shim_binding_for(
+    workspace: Option<&Path>,
+    socket: Option<&Path>,
+    at: &Path,
+    listening: impl Fn(&Path) -> (Tri, String),
+) -> ShimBinding {
+    let Some(root) = workspace.filter(|root| !root.as_os_str().is_empty()) else {
+        return ShimBinding::Unbound;
+    };
+    let socket = socket
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| root.join(".kin").join("vfs.sock"));
+    let (listening, detail) = listening(&socket);
+    ShimBinding::Bound {
+        covers: path_within(at, root),
+        listening,
+        detail,
+        root: root.to_path_buf(),
+        socket,
+    }
+}
+
+/// Whether `path` is `root` or sits under it.
+///
+/// Component-wise rather than textual, so a sibling that merely shares a byte
+/// prefix is rejected. Canonical forms are compared when both resolve, so a
+/// `/var` spelling beside a canonical `/private/var` still matches; a path that
+/// cannot be resolved falls back to the literal compare rather than reporting
+/// containment it never established.
+fn path_within(path: &Path, root: &Path) -> bool {
+    if path.starts_with(root) {
+        return true;
+    }
+    match (path.canonicalize(), root.canonicalize()) {
+        (Ok(path), Ok(root)) => path.starts_with(root),
+        _ => false,
+    }
+}
+
+/// Whether a listener answers `socket`, and what the attempt did.
+///
+/// A socket file outlives the daemon that bound it, so its presence proves
+/// nothing and only an accepted connect does. The hook's own guard says the
+/// same thing about `kin-vfs status`.
+#[cfg(unix)]
+fn socket_listening(socket: &Path) -> (Tri, String) {
+    match std::os::unix::net::UnixStream::connect(socket) {
+        Ok(_) => (Tri::Yes, "a daemon answered it".to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (
+            Tri::No,
+            "there is no socket there, so every path under that root fails EIO rather than \
+             falling back to disk"
+                .to_string(),
+        ),
+        Err(error) => (
+            Tri::No,
+            format!(
+                "nothing answered it: {error}; every path under that root fails EIO rather than \
+                 falling back to disk"
+            ),
+        ),
+    }
+}
+
+#[cfg(not(unix))]
+fn socket_listening(_socket: &Path) -> (Tri, String) {
+    (
+        Tri::NotApplicable,
+        "it was not probed: this platform does not answer the shim over a Unix socket".to_string(),
+    )
+}
+
 /// Read the shim's installed and engaged state.
 pub(crate) fn probe_shim(kin_home: &Path) -> ShimPresence {
     let path = kin_home.join("lib").join(shim_filename());
@@ -1259,6 +1446,7 @@ pub(crate) fn probe_live(
     mode: ProjectionMode,
     at: &Path,
     shim: &ShimPresence,
+    binding: &ShimBinding,
 ) -> LiveProjection {
     let mut evidence = Vec::new();
     let at = at.to_path_buf();
@@ -1319,8 +1507,18 @@ pub(crate) fn probe_live(
         }
     };
 
+    // What the shim is bound to, and whether a daemon is behind it. The read
+    // above cannot answer this: where the bound root does not contain this
+    // directory the read never reaches the shim at all, which is how a home
+    // directory bound as a projection root reported a healthy row while every
+    // path under it returned EIO (FIR-2552). Asked of the shim only, because a
+    // mount answers the same question with its own mounted and readable probes.
+    if mode == ProjectionMode::Shim {
+        evidence.push(binding.evidence());
+    }
+
     let mode_failed = match mode {
-        ProjectionMode::Shim => !shim.engaged || readable != Tri::Yes,
+        ProjectionMode::Shim => !shim.engaged || readable != Tri::Yes || !binding.projects(),
         ProjectionMode::Nfs | ProjectionMode::Fuse | ProjectionMode::ProjFs => {
             mounted != Tri::Yes || readable != Tri::Yes
         }
@@ -1482,7 +1680,8 @@ pub(crate) fn report_for(
     let recorded = recorded_mode(kin_home);
     let (intent, mode) = choose_mode(requested, recorded, &modes);
     let at = projected_path(&driver, mode, repo_root);
-    let mut live = probe_live(intent, mode, &at, &shim);
+    let binding = shim_binding_here(&at);
+    let mut live = probe_live(intent, mode, &at, &shim, &binding);
     if let Some(line) = driver_mount_report(&driver, mode) {
         live.evidence.push(line);
     }
@@ -1656,12 +1855,9 @@ pub async fn on(mode: Option<String>) -> Result<()> {
     let to_record = requested.or(recorded).unwrap_or(effective);
     record_mode(&kin_home, to_record)?;
 
-    let live = probe_live(
-        intent,
-        effective,
-        &projected_path(&driver, effective, &repo_root),
-        &shim,
-    );
+    let at = projected_path(&driver, effective, &repo_root);
+    let binding = shim_binding_here(&at);
+    let live = probe_live(intent, effective, &at, &shim, &binding);
     println!();
     print_live(&live);
     Ok(())
@@ -1765,12 +1961,30 @@ fn print_live(live: &LiveProjection) {
     } else {
         style("✓").green()
     };
-    println!("{mark} Projection in force: {}", live.row());
-    println!("  {}: {}", live.mode, live.mode.description());
-    println!("  files at {}", live.at.display());
-    for line in &live.evidence {
+    let mut lines = live_lines(live).into_iter();
+    let row = lines
+        .next()
+        .expect("live_lines always yields the row it is built around");
+    println!("{mark} {row}");
+    for line in lines {
         println!("  {line}");
     }
+}
+
+/// Every line the projection block prints, in order, with the row first and the
+/// rest indented under it.
+///
+/// Split out from the printing so what this surface says, and what it must not
+/// say, are both testable without running a command.
+fn live_lines(live: &LiveProjection) -> Vec<String> {
+    let mut lines = vec![
+        format!("Projection in force: {}", live.row()),
+        format!("{}: {}", live.mode, live.mode.description()),
+        format!("files at {}", live.at.display()),
+    ];
+    lines.extend(live.mode.raw_syscall_note().map(str::to_string));
+    lines.extend(live.evidence.iter().cloned());
+    lines
 }
 
 fn parse_requested(mode: Option<&str>) -> Result<Option<ProjectionMode>> {
@@ -2152,6 +2366,262 @@ Options:
         );
     }
 
+    /// FIR-2572: the shim cannot interpose a raw syscall, so Node reads raw
+    /// disk inside a projected repository while every libc caller does not.
+    /// The status block has to say so under the shim, and must not say it under
+    /// a mount, where the kernel serves every process.
+    #[test]
+    fn the_status_block_declares_the_shim_raw_syscall_gap_and_only_there() {
+        let shim_note = ProjectionMode::Shim
+            .raw_syscall_note()
+            .expect("the shim mode declares its raw-syscall gap");
+        assert!(
+            shim_note.contains("Node"),
+            "the note must name the runtime it is about: {shim_note}"
+        );
+        assert!(
+            shim_note.contains("nfs") && shim_note.contains("fuse"),
+            "the note must name the modes that do project Node: {shim_note}"
+        );
+        for mode in [
+            ProjectionMode::Nfs,
+            ProjectionMode::Fuse,
+            ProjectionMode::ProjFs,
+        ] {
+            assert_eq!(
+                mode.raw_syscall_note(),
+                None,
+                "{mode} is served by the kernel and projects every process, so it must not carry \
+                 the shim's gap"
+            );
+        }
+
+        let at = Path::new("/w/repo");
+        let shim = LiveProjection {
+            intent: ProjectionMode::Shim,
+            mode: ProjectionMode::Shim,
+            at: at.to_path_buf(),
+            mounted: Tri::NotApplicable,
+            readable: Tri::Yes,
+            writable: Tri::NotApplicable,
+            degraded: false,
+            evidence: vec!["fixture evidence".to_string()],
+        };
+        let printed = live_lines(&shim).join("\n");
+        assert!(
+            printed.contains(shim_note),
+            "the shim block must carry the note verbatim:\n{printed}"
+        );
+
+        let mount = LiveProjection {
+            intent: ProjectionMode::Fuse,
+            mode: ProjectionMode::Fuse,
+            mounted: Tri::Yes,
+            ..shim.clone()
+        };
+        let printed = live_lines(&mount).join("\n");
+        assert!(
+            !printed.contains("Node"),
+            "a mount projects Node, so its block must not carry the shim's gap:\n{printed}"
+        );
+        let nfs = LiveProjection {
+            intent: ProjectionMode::Nfs,
+            mode: ProjectionMode::Nfs,
+            ..mount.clone()
+        };
+        assert!(
+            !live_lines(&nfs).join("\n").contains("Node"),
+            "the nfs block must not carry the shim's gap"
+        );
+    }
+
+    /// A binding that covers `at` and is answered: what a working shim
+    /// projection looks like from this process.
+    fn served_binding(at: &Path) -> ShimBinding {
+        ShimBinding::Bound {
+            root: at.to_path_buf(),
+            socket: at.join(".kin").join("vfs.sock"),
+            listening: Tri::Yes,
+            detail: "a daemon answered its socket (fixture)".to_string(),
+            covers: true,
+        }
+    }
+
+    /// FIR-2552 in one function: the four bindings a shim process can be in,
+    /// and which of them mean the graph is actually answering.
+    #[test]
+    fn a_binding_projects_only_when_it_covers_this_path_and_something_answers() {
+        let answered = |_: &Path| (Tri::Yes, "a daemon answered (fixture)".to_string());
+        let silent = |_: &Path| (Tri::No, "nothing answered (fixture)".to_string());
+        let home = Path::new("/home/dev");
+        let repo = Path::new("/work/notekeeper");
+
+        assert!(
+            !shim_binding_for(None, None, repo, answered).projects(),
+            "an unbound process projects nothing, whatever is listening"
+        );
+
+        // The container's own shape: the hook bound $HOME, the repository is
+        // elsewhere, and reading the repository succeeds because the shim never
+        // sees it. That read is exactly what reported degraded=no.
+        let bound_home = shim_binding_for(Some(home), None, repo, silent);
+        assert!(
+            !bound_home.projects(),
+            "a root that does not contain this directory is not projecting it: {}",
+            bound_home.evidence()
+        );
+        assert!(
+            bound_home
+                .evidence()
+                .contains("does not contain this directory"),
+            "the row must name the mismatch: {}",
+            bound_home.evidence()
+        );
+
+        // The same root, with the caller inside it, and nothing serving it.
+        // Every path under it answers EIO, so the projection is not in force.
+        let unserved = shim_binding_for(Some(home), None, Path::new("/home/dev/src"), silent);
+        assert!(
+            !unserved.projects(),
+            "a bound root with no listener is not in force: {}",
+            unserved.evidence()
+        );
+        assert_eq!(
+            unserved,
+            ShimBinding::Bound {
+                root: home.to_path_buf(),
+                socket: Path::new("/home/dev/.kin/vfs.sock").to_path_buf(),
+                listening: Tri::No,
+                detail: "nothing answered (fixture)".to_string(),
+                covers: true,
+            },
+            "the default socket is the bound root's own, and the row carries it"
+        );
+
+        // And the one case that is genuinely in force.
+        let working = shim_binding_for(Some(home), None, Path::new("/home/dev/src"), answered);
+        assert!(working.projects(), "{}", working.evidence());
+
+        // An explicitly exported socket wins over the default, because that is
+        // what the hook exports and what the shim connects to.
+        let elsewhere = shim_binding_for(
+            Some(home),
+            Some(Path::new("/run/kin/vfs.sock")),
+            home,
+            answered,
+        );
+        assert!(
+            elsewhere.evidence().contains("/run/kin/vfs.sock"),
+            "the row must name the socket the shim would use: {}",
+            elsewhere.evidence()
+        );
+    }
+
+    /// The socket probe itself, against a real listener and a real absence.
+    /// A socket file outlives the daemon that bound it, so the file test and
+    /// the connect have to disagree here or the probe proves nothing.
+    #[cfg(unix)]
+    #[test]
+    fn only_an_answered_connect_counts_as_a_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("absent.sock");
+        let (verdict, detail) = socket_listening(&absent);
+        assert_eq!(verdict, Tri::No, "{detail}");
+        assert!(
+            detail.contains("there is no socket there"),
+            "an absent socket must say so: {detail}"
+        );
+
+        let live = dir.path().join("live.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&live).unwrap();
+        let (verdict, detail) = socket_listening(&live);
+        assert_eq!(verdict, Tri::Yes, "{detail}");
+        assert!(
+            detail.contains("a daemon answered it"),
+            "an answered connect must say so: {detail}"
+        );
+
+        // The stale socket: the inode is still there, the listener is gone.
+        drop(listener);
+        assert!(
+            live.exists(),
+            "the fixture must leave the socket file behind, or it is not the stale case"
+        );
+        let (verdict, detail) = socket_listening(&live);
+        assert_eq!(
+            verdict,
+            Tri::No,
+            "a socket file with nothing behind it must not read as a listener: {detail}"
+        );
+    }
+
+    /// The row `kin vfs status` prints in the FIR-2552 state, end to end
+    /// through the probe: the shim is injected, the repository reads fine off
+    /// raw disk, and the projection is still not in force.
+    #[test]
+    fn a_shim_bound_to_a_root_nothing_serves_is_not_in_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let repo = dir.path().join("work/notekeeper");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("a.rs"), b"fn main() {}").unwrap();
+
+        let engaged = ShimPresence {
+            path: home.join(".kin/lib").join(shim_filename()),
+            installed: true,
+            engaged: true,
+        };
+        let silent = |_: &Path| (Tri::No, "there is no socket there (fixture)".to_string());
+        let bound_home = shim_binding_for(Some(&home), None, &repo, silent);
+        let live = probe_live(
+            ProjectionMode::Shim,
+            ProjectionMode::Shim,
+            &repo,
+            &engaged,
+            &bound_home,
+        );
+
+        assert_eq!(
+            live.readable,
+            Tri::Yes,
+            "the repository still reads, which is exactly why the old row said healthy"
+        );
+        assert!(
+            live.degraded,
+            "a projection bound to a root that serves nothing is not in force: {}",
+            live.row()
+        );
+        assert!(
+            live.row().contains("degraded=yes"),
+            "the printed row must carry the verdict: {}",
+            live.row()
+        );
+        assert!(
+            live.evidence
+                .iter()
+                .any(|line| line.contains("does not contain this directory")),
+            "the row must say which root is bound and why it does not serve here: {:?}",
+            live.evidence
+        );
+
+        // The positive control: the same shim, the same repository, with the
+        // repository itself bound and answered. A fix that simply reports every
+        // shim as degraded has removed the surface rather than made it honest.
+        let served = probe_live(
+            ProjectionMode::Shim,
+            ProjectionMode::Shim,
+            &repo,
+            &engaged,
+            &served_binding(&repo),
+        );
+        assert!(
+            !served.degraded,
+            "a bound, answered repository is in force: {}",
+            served.row()
+        );
+    }
+
     /// The three fixtures the doctor row has to tell apart: everything present,
     /// no shim, and a mode whose mount is not there. Each must produce a
     /// different row.
@@ -2168,7 +2638,14 @@ Options:
             installed: true,
             engaged: true,
         };
-        let healthy = probe_live(ProjectionMode::Shim, ProjectionMode::Shim, &repo, &engaged);
+        let served = served_binding(&repo);
+        let healthy = probe_live(
+            ProjectionMode::Shim,
+            ProjectionMode::Shim,
+            &repo,
+            &engaged,
+            &served,
+        );
         assert_eq!(healthy.mounted, Tri::NotApplicable);
         assert_eq!(healthy.readable, Tri::Yes);
         assert_eq!(
@@ -2189,7 +2666,13 @@ Options:
             engaged: false,
             ..engaged.clone()
         };
-        let container = probe_live(ProjectionMode::Shim, ProjectionMode::Shim, &repo, &stripped);
+        let container = probe_live(
+            ProjectionMode::Shim,
+            ProjectionMode::Shim,
+            &repo,
+            &stripped,
+            &served,
+        );
         assert!(
             container.degraded,
             "a shim that is not engaged must read degraded: {}",
@@ -2219,6 +2702,7 @@ Options:
             ProjectionMode::Shim,
             &repo,
             &uninstalled,
+            &served,
         );
         assert!(
             bare.evidence
@@ -2239,7 +2723,13 @@ Options:
         // A mount mode whose mount point is not a mount: nothing is read or
         // written, and the row says so rather than describing the empty
         // directory underneath.
-        let unmounted = probe_live(ProjectionMode::Nfs, ProjectionMode::Nfs, &repo, &engaged);
+        let unmounted = probe_live(
+            ProjectionMode::Nfs,
+            ProjectionMode::Nfs,
+            &repo,
+            &engaged,
+            &served,
+        );
         assert_eq!(unmounted.mounted, Tri::No);
         assert_eq!(unmounted.readable, Tri::No);
         assert!(unmounted.degraded);
@@ -2255,7 +2745,13 @@ Options:
         assert_ne!(unmounted.row(), container.row());
 
         // A fallback names both modes.
-        let fell_back = probe_live(ProjectionMode::Nfs, ProjectionMode::Shim, &repo, &engaged);
+        let fell_back = probe_live(
+            ProjectionMode::Nfs,
+            ProjectionMode::Shim,
+            &repo,
+            &engaged,
+            &served,
+        );
         assert!(fell_back.degraded);
         assert!(fell_back
             .evidence

@@ -269,6 +269,91 @@ pub fn clear_open_transaction(kin_root: &Path) {
     let _ = fs::remove_file(kin_root.join(TRANSACTION_FILE_NAME));
 }
 
+/// File a client publishes an approaching commit into.
+pub const APPROACHING_COMMIT_FILE_NAME: &str = "commit.approaching";
+
+/// How long an announced commit stays worth standing an ambient tick down for.
+///
+/// The window covers one thing only: the gap between a client deciding to
+/// commit and its request reaching the daemon's handler, where the handler's own
+/// announcement takes over. That gap is dominated by daemon startup, because a
+/// client that has to start a daemon waits for the store to open before it can
+/// send anything, so the window is sized to a large store's open rather than to
+/// a request's round trip.
+///
+/// It is not the bound on how long admission can be held off. A tick stands
+/// down for a bounded number of consecutive rounds whatever this says, so a
+/// client killed between writing this marker and clearing it costs those rounds
+/// and nothing more.
+pub const APPROACHING_COMMIT_STALE_AFTER: Duration = Duration::from_secs(60);
+
+/// A commit that has started but has not reached the daemon yet.
+///
+/// The daemon cannot learn this any other way. A commit announces itself inside
+/// the handler it eventually reaches, and by then a cold daemon's first
+/// reconcile round has already decided whether to publish: the round and the
+/// request are racing, and the request is the one that has to wait for the store
+/// to open first. Writing the announcement to disk before the client does any
+/// of its own preparation is what lets a daemon that does not exist yet read it
+/// on the first round of its life.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ApproachingCommit {
+    /// The client that announced this commit. Carried so a reader can tell two
+    /// markers apart rather than to decide freshness, which is time-based:
+    /// asking whether a pid is alive answers about pid reuse as readily as
+    /// about the client.
+    pub pid: u32,
+    /// Unix seconds at which the client announced. Freshness is decided against
+    /// this.
+    pub announced_unix: u64,
+}
+
+impl ApproachingCommit {
+    /// Seconds since this commit announced itself, at `now_unix`.
+    pub fn age_secs(&self, now_unix: u64) -> u64 {
+        now_unix.saturating_sub(self.announced_unix)
+    }
+
+    /// Whether this announcement is recent enough to still be worth a stand
+    /// down.
+    pub fn is_fresh(&self, now_unix: u64) -> bool {
+        self.age_secs(now_unix) <= APPROACHING_COMMIT_STALE_AFTER.as_secs()
+    }
+}
+
+/// Announce an approaching commit for `kin_root`.
+///
+/// Best effort and atomic, for the same reason the transaction marker is: a
+/// reader must never see half a record. Best effort because an announcement
+/// that could not be written must never fail the commit it precedes; the cost
+/// of losing it is one redundant publication, which is exactly the cost of not
+/// having written it at all.
+pub fn write_approaching_commit(kin_root: &Path, record: &ApproachingCommit) {
+    let Ok(body) = serde_json::to_string(record) else {
+        return;
+    };
+    let announced = kin_root.join(format!("{APPROACHING_COMMIT_FILE_NAME}.tmp"));
+    if fs::write(&announced, body).is_ok()
+        && fs::rename(&announced, kin_root.join(APPROACHING_COMMIT_FILE_NAME)).is_err()
+    {
+        let _ = fs::remove_file(&announced);
+    }
+}
+
+/// Read the approaching-commit announcement for `kin_root`, if one is there.
+pub fn read_approaching_commit(kin_root: &Path) -> Option<ApproachingCommit> {
+    let raw = fs::read_to_string(kin_root.join(APPROACHING_COMMIT_FILE_NAME)).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Withdraw an approaching-commit announcement.
+///
+/// The client that wrote it calls this however its run ends, so an announcement
+/// never outlives the commit it was made for.
+pub fn clear_approaching_commit(kin_root: &Path) {
+    let _ = fs::remove_file(kin_root.join(APPROACHING_COMMIT_FILE_NAME));
+}
+
 /// File a daemon writes its own open cost into, for the next spawn to size an
 /// idle window against.
 pub const BOOT_COST_FILE_NAME: &str = "daemon-boot-cost.json";
@@ -2492,28 +2577,64 @@ fn process_group_containment(process_group: libc::pid_t) -> ProcessGroupContainm
         return ProcessGroupContainment::Empty;
     }
     match process_group_members(process_group) {
-        Ok(members) if members.is_empty() => {
-            // The group emptied between the two calls. Nothing remains to run.
-            ProcessGroupContainment::Empty
-        }
-        Ok(members) => {
-            for pid in members {
-                match process_has_exited(pid) {
-                    Ok(true) => {}
-                    Ok(false) => return ProcessGroupContainment::LiveMember { pid },
-                    Err(error) => {
-                        return ProcessGroupContainment::Indeterminate {
-                            detail: format!("classify member {pid}: {error}"),
-                        };
-                    }
-                }
-            }
-            ProcessGroupContainment::OnlyExited
-        }
+        Ok(members) => classify_process_group_members(&members),
         Err(error) => ProcessGroupContainment::Indeterminate {
             detail: format!("enumerate group members: {error}"),
         },
     }
+}
+
+/// Classify a member list that enumeration has already produced.
+///
+/// Split from the enumeration above so the gap between the two steps can be
+/// driven directly rather than only hoped for. The gap is real work: a member
+/// enumeration named can run to completion, and be collected, before
+/// classification reaches it, and what the classifier reads then is a pid with
+/// nothing behind it.
+#[cfg(unix)]
+fn classify_process_group_members(members: &[libc::pid_t]) -> ProcessGroupContainment {
+    if members.is_empty() {
+        // The group emptied between the two calls. Nothing remains to run.
+        return ProcessGroupContainment::Empty;
+    }
+    for &pid in members {
+        match process_has_exited(pid) {
+            Ok(true) => {}
+            Ok(false) => return ProcessGroupContainment::LiveMember { pid },
+            Err(error) => {
+                return ProcessGroupContainment::Indeterminate {
+                    detail: format!("classify member {pid}: {error}"),
+                };
+            }
+        }
+    }
+    ProcessGroupContainment::OnlyExited
+}
+
+/// Whether a failed member probe means the member is gone rather than
+/// unreadable.
+///
+/// A member can leave the process table between enumeration and
+/// classification, and the errno that reports it depends on which step of the
+/// probe the disappearance lands in. An entry that is already gone answers the
+/// open with ENOENT. An entry whose task is collected after the open answers
+/// the read with ESRCH, because Linux resolves `/proc/<pid>/stat` through
+/// `proc_single_show`, which looks the task up at read time; the same errno is
+/// what `kill(pid, 0)` reports for a pid with nothing behind it at all.
+///
+/// Both answers say the same thing, and it is the strongest form of the state
+/// containment exists to reach: no task remains behind that pid, so it holds no
+/// address space, executes no instructions, and cannot fork. Reporting it as
+/// unclassifiable failed a correct cleanup for reaching its goal a moment
+/// early.
+///
+/// Every other failure stays a failure. EPERM, EACCES and an unparseable entry
+/// mean the member could not be read, and an unreadable member is not a
+/// contained one; treating those as gone would be the silent pass this whole
+/// path exists to prevent.
+#[cfg(unix)]
+fn member_probe_failure_means_gone(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
 }
 
 /// `proc_listpids` selector for "processes in this process group".
@@ -2635,11 +2756,11 @@ fn process_has_exited(pid: libc::pid_t) -> std::io::Result<bool> {
         return Ok(true);
     }
     let signal_error = std::io::Error::last_os_error();
-    match signal_error.raw_os_error() {
-        // Gone from the table entirely.
-        Some(libc::ESRCH) => Ok(true),
-        _ => Err(signal_error),
+    // Gone from the table entirely, which is more than exited.
+    if member_probe_failure_means_gone(&signal_error) {
+        return Ok(true);
     }
+    Err(signal_error)
 }
 
 /// PIDs currently reported as members of a process group.
@@ -2677,8 +2798,10 @@ fn process_has_exited(pid: libc::pid_t) -> std::io::Result<bool> {
         Ok(stat) => parse_proc_stat_state(&stat)
             .map(|state| state == 'Z')
             .ok_or_else(|| std::io::Error::other(format!("unparseable /proc/{pid}/stat"))),
-        // Gone entirely, which is more than exited.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        // Gone entirely, which is more than exited. ENOENT is the open
+        // failing and ESRCH is the read failing, and this file can answer
+        // either way depending on when in the probe the member disappeared.
+        Err(error) if member_probe_failure_means_gone(&error) => Ok(true),
         Err(error) => Err(error),
     }
 }
@@ -4120,6 +4243,128 @@ mod tests {
         assert_eq!(
             process_group_containment(pgid),
             ProcessGroupContainment::Empty
+        );
+    }
+
+    #[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn a_member_that_exits_between_enumeration_and_classification_is_contained() {
+        // The hosted-runner failure, reproduced at the seam it happened on:
+        // enumeration named a live member, the member exited and was collected
+        // before classification reached it, and the classifier reported the
+        // group unreadable rather than contained.
+        let mut child = spawn_in_own_group("sleep", &["30"]);
+        let pgid = libc::pid_t::try_from(child.id()).expect("child pid fits pid_t");
+
+        let members = process_group_members(pgid).expect("enumerate the group");
+        assert!(
+            members.contains(&pgid),
+            "enumeration must see the live member, or this test races nothing: {members:?}"
+        );
+
+        // The whole gap, taken at once: the member stops running and its slot
+        // is collected, all before a single pid is classified.
+        child.kill().expect("stop the member");
+        child.wait().expect("collect the member");
+
+        assert_eq!(
+            classify_process_group_members(&members),
+            ProcessGroupContainment::OnlyExited,
+            "a member that vanished between the two steps is gone, which is contained"
+        );
+    }
+
+    #[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn a_member_that_outlives_the_classification_is_still_reported_live() {
+        // The control the case above needs. If treating a vanished member as
+        // contained degenerated into treating any hard-to-read member as
+        // contained, this is the assertion that would stop being true.
+        let mut child = spawn_in_own_group("sleep", &["30"]);
+        let pgid = libc::pid_t::try_from(child.id()).expect("child pid fits pid_t");
+
+        let members = process_group_members(pgid).expect("enumerate the group");
+        assert!(
+            members.contains(&pgid),
+            "enumeration must see the live member: {members:?}"
+        );
+
+        // Outlive a deadline of the settle's own order, then classify the same
+        // list. Nothing collected this member, so nothing may excuse it.
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            classify_process_group_members(&members),
+            ProcessGroupContainment::LiveMember { pid: pgid },
+            "a member that is still running must be reported, and named"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_gone_member_excuses_a_failed_probe() {
+        // The decision rule on its own, in both directions, because the two
+        // errnos that mean gone arrive from different steps of the probe and
+        // everything else has to keep failing.
+        assert!(
+            member_probe_failure_means_gone(&std::io::Error::from_raw_os_error(libc::ESRCH)),
+            "ESRCH is a pid with no task behind it"
+        );
+        assert!(
+            member_probe_failure_means_gone(&std::io::Error::from_raw_os_error(libc::ENOENT)),
+            "ENOENT is the entry already gone when the probe opened it"
+        );
+        assert!(
+            !member_probe_failure_means_gone(&std::io::Error::from_raw_os_error(libc::EPERM)),
+            "EPERM is a member this process may not read, which is not a contained one"
+        );
+        assert!(
+            !member_probe_failure_means_gone(&std::io::Error::from_raw_os_error(libc::EACCES)),
+            "EACCES is a member this process may not read, which is not a contained one"
+        );
+        assert!(
+            !member_probe_failure_means_gone(&std::io::Error::other("unparseable /proc/7/stat")),
+            "an entry that read but would not parse is unclassified, not gone"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stat_entry_read_after_its_task_is_collected_answers_esrch_and_reads_as_gone() {
+        // Why the ENOENT arm alone was not enough, proven against the kernel
+        // rather than argued. procfs resolves this file at READ time, so an
+        // open taken while the member lives and a read taken after the member
+        // is collected is the exact ordering the classifier hits, and it
+        // answers ESRCH while the directory it lives in is still there.
+        use std::io::Read as _;
+
+        let mut child = spawn_in_own_group("sleep", &["30"]);
+        let pid = libc::pid_t::try_from(child.id()).expect("child pid fits pid_t");
+        let mut entry = std::fs::File::open(format!("/proc/{pid}/stat"))
+            .expect("open the member's stat entry while it is live");
+
+        child.kill().expect("stop the member");
+        child.wait().expect("collect the member");
+
+        let mut buffer = String::new();
+        let error = entry
+            .read_to_string(&mut buffer)
+            .expect_err("a collected task cannot answer its own stat entry");
+        assert_eq!(
+            error.raw_os_error(),
+            Some(libc::ESRCH),
+            "procfs reports a collected task as ESRCH: {error}"
+        );
+        assert_ne!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "this errno is not the ENOENT a not-found arm catches: {error}"
+        );
+        assert!(
+            member_probe_failure_means_gone(&error),
+            "the read-time errno has to read as gone, or the classifier fails a reaped member"
         );
     }
 

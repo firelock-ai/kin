@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+pub mod absence_qualifier;
 pub mod admit;
 pub mod agent;
+pub mod allow;
 pub mod approvals;
 pub mod assistant;
 pub mod assistant_adapter;

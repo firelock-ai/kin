@@ -1494,21 +1494,36 @@ fn derive_policy(
     Option<kin_model::AdmissionPolicyDelta>,
 )> {
     let mut lengths: BTreeMap<Hash256, u64> = BTreeMap::new();
-    SharedAdmissionPolicy::derive_from_tree(Some(parent), tree, |hash| {
-        if let Some(length) = lengths.get(&hash) {
-            return Ok(*length);
-        }
-        let source = read_publishable_source(blobs, authority, hash).map_err(|error| {
-            ModelError::InvalidOperation(format!(
-                "{error}, while deriving the merged tree's admission policy"
-            ))
-        })?;
-        let length = u64::try_from(source.body().len()).map_err(|_| {
-            ModelError::InvalidOperation(format!("graph-owned admission source {hash} exceeds u64"))
-        })?;
-        lengths.insert(hash, length);
-        Ok(length)
-    })
+    SharedAdmissionPolicy::derive_from_tree_with_allowances(
+        Some(parent),
+        tree,
+        |hash| {
+            if let Some(length) = lengths.get(&hash) {
+                return Ok(*length);
+            }
+            let source = read_publishable_source(blobs, authority, hash).map_err(|error| {
+                ModelError::InvalidOperation(format!(
+                    "{error}, while deriving the merged tree's admission policy"
+                ))
+            })?;
+            let length = u64::try_from(source.body().len()).map_err(|_| {
+                ModelError::InvalidOperation(format!(
+                    "graph-owned admission source {hash} exceeds u64"
+                ))
+            })?;
+            lengths.insert(hash, length);
+            Ok(length)
+        },
+        |hash| {
+            read_publishable_source(blobs, authority, hash)
+                .map(|source| source.body().to_vec())
+                .map_err(|error| {
+                    ModelError::InvalidOperation(format!(
+                        "{error}, while reading the approvals the merged tree's policy derives"
+                    ))
+                })
+        },
+    )
     .context("derive exact admission policy for the merged tree")
 }
 
@@ -2371,6 +2386,75 @@ mod tests {
         assert!(
             format!("{error:#}").contains("absent from both ingestion staging and repository CAS"),
             "the refusal names both stores it consulted: {error:#}"
+        );
+    }
+
+    /// The merged tree's policy has to be derived through the entry point that
+    /// reads a tracked `.kin-allowances`, or an approval a reviewer accepted on
+    /// one side of a merge is dropped by the merge itself.
+    ///
+    /// Reverting this file's derivation to `derive_from_tree` fails here,
+    /// because the compatibility entry point refuses by name the moment the
+    /// tree carries approvals it cannot read. The two structural assertions
+    /// below are what stop this passing for the wrong reason: the approval must
+    /// land in `sensitive_allowances` and must NOT land in `sources`, because
+    /// the allowance file is an approval set rather than an exclusion rule, and
+    /// a derivation that treated it as an ordinary rule source would satisfy a
+    /// bare "the policy changed" check while approving nothing.
+    #[test]
+    fn a_merged_tree_derives_the_approvals_it_carries() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
+        let authority = authority(&init);
+
+        let secret = b"API_TOKEN = \"sk-proj-abcd1234efgh5678ijkl\"\n";
+        let secret_hash = Hash256::from_bytes(blobs.write(secret).unwrap().0);
+        let approvals = format!(
+            "# approvals for this fixture\n\
+             kin-allowances 1\n\
+             notekeeper/client.py\t{secret_hash}\tblob\tcredscan@firelock.ai\tpinned by the \
+             test covering this derivation site\n"
+        );
+        let approvals_hash = Hash256::from_bytes(blobs.write(approvals.as_bytes()).unwrap().0);
+
+        let tree = ResolvedTree::from_artifacts([
+            ResolvedArtifact::new(
+                ArtifactId::new(),
+                RepoPath::from_utf8("notekeeper/client.py").unwrap(),
+                TreeEntry::blob(secret_hash, false),
+            ),
+            ResolvedArtifact::new(
+                ArtifactId::new(),
+                RepoPath::from_utf8(".kin-allowances").unwrap(),
+                TreeEntry::blob(approvals_hash, false),
+            ),
+        ])
+        .unwrap();
+
+        let (policy, delta) = derive_policy(&blobs, &authority, &empty_policy(), &tree)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "a merged tree carrying .kin-allowances must derive its approvals rather \
+                     than refusing: {error:#}"
+                )
+            });
+
+        assert_eq!(
+            policy.sensitive_allowances.len(),
+            1,
+            "the merged policy must carry the tree's one approval: {:?}",
+            policy.sensitive_allowances
+        );
+        assert_eq!(policy.sensitive_allowances[0].content_hash, secret_hash);
+        assert!(
+            policy.sources.is_empty(),
+            "an approval set is not an exclusion rule source: {:?}",
+            policy.sources
+        );
+        assert!(
+            delta.is_some(),
+            "a tree that introduces approvals moves the policy, so the merge records a delta"
         );
     }
 }

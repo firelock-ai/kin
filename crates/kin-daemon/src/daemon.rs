@@ -635,6 +635,165 @@ async fn drain_embed_flush(
     }
 }
 
+/// Ceiling on the wait between retries of a refused vector checkpoint.
+const DEFERRED_CHECKPOINT_RETRY_MAX: Duration = Duration::from_secs(300);
+
+/// Everything the persistence task does on its way out.
+///
+/// A named function rather than the body of a `select!` arm, because both
+/// halves are durability decisions that have to be drivable by a test. The
+/// graph half was already load-bearing; the vector half below is the case the
+/// coverage regression was actually found in, and a wiring nothing exercises is
+/// how the first half of this fix would have shipped covering only a daemon
+/// nobody stops.
+///
+/// Runs under the persistence task's own shutdown budget
+/// (`KIN_DAEMON_SHUTDOWN_FLUSH_SECS`, five minutes by default), which exists
+/// because the graph flush here can need minutes on a real store.
+async fn run_shutdown_persistence(state: &Arc<DaemonState>) {
+    if state.is_dirty() {
+        if state.shutdown_flush_would_wipe_graph() {
+            // The in-memory graph collapsed to a small fraction of the last
+            // persisted entity count, almost certainly a transient wipe (e.g. an
+            // empty/bare checkout reconciled as all-deleted) rather than a real
+            // edit. Skip the final flush so the larger good snapshot survives;
+            // the daemon reloads it and re-reconciles against the filesystem on
+            // restart. (Graph-keyed, not embed-keyed: a stale vector index
+            // self-heals on load and never blocks this flush.)
+            warn!(
+                persisted = state
+                    .persisted_entity_count
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                current = state.graph.entity_count(),
+                "skipping final graph flush on shutdown — in-memory entity count collapsed vs on-disk snapshot; preserving the larger snapshot"
+            );
+        } else {
+            info!("final persistence flush on shutdown");
+            if let Err(e) = save_snapshot_blocking(Arc::clone(state)).await {
+                error!(error = %e, "shutdown save failed");
+            } else {
+                state.mark_clean();
+            }
+        }
+    }
+    retry_deferred_vector_checkpoint_at_shutdown(state).await;
+}
+
+/// Give a standing vector-checkpoint refusal its one attempt before the process
+/// ends.
+///
+/// The wake-tick retry covers a daemon that keeps running. This covers the case
+/// the regression was found in, where the process ENDED with a refusal standing
+/// and every vector embedded since the previous successful checkpoint went with
+/// it. Nothing else would have written them: the sidecar is not part of the
+/// graph flush above, so a clean shutdown published graph truth and left the
+/// vectors behind.
+///
+/// Unconditional and with no backoff, unlike the wake-tick retry, because
+/// shutdown has no next tick to defer to: the choice here is one attempt or
+/// lose the work. It costs one authority reopen, charged against the same
+/// budget the flush above already spends minutes of on a real store, and it
+/// costs an ordinary daemon nothing at all, because the first check returns at
+/// once when no refusal stands.
+///
+/// After the graph flush rather than before it, deliberately. Publishing
+/// advances the authority generation, which is exactly what closes the
+/// divergence a refusal is about, so this is the moment in shutdown when the
+/// checkpoint is most likely to be provable.
+async fn retry_deferred_vector_checkpoint_at_shutdown(state: &Arc<DaemonState>) {
+    if state.deferred_vector_checkpoint().is_none() {
+        return;
+    }
+    info!("retrying a refused vector checkpoint before shutdown");
+    let retry_state = Arc::clone(state);
+    match tokio::task::spawn_blocking(move || retry_state.retry_deferred_vector_checkpoint()).await
+    {
+        Ok(Some(Ok(pending))) => {
+            info!(
+                pending,
+                "checkpointed before shutdown the vector progress a refused checkpoint had left in memory"
+            );
+        }
+        Ok(Some(Err(error))) => {
+            // Loud, and named as loss rather than as a slow exit. This is the
+            // one path left where the vectors genuinely do not survive, and a
+            // reader has to be able to tell it from an untidy shutdown.
+            warn!(
+                error = %error,
+                "the vector checkpoint was still refused at shutdown; vectors embedded since the refusal are NOT durable and the next open re-derives them"
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            error!(error = %error, "shutdown vector checkpoint retry task panicked");
+        }
+    }
+}
+
+/// Re-attempt a vector checkpoint the daemon had to refuse, so the vectors it
+/// left in memory reach the sidecar instead of dying with the process.
+///
+/// A refusal means the live exact tree had moved away from committed workspace
+/// authority, which is what a commit in flight does to it, and it closes when
+/// that commit settles. The work therefore needs nothing but somewhere to be
+/// retried from. There was nowhere: the only caller of the checkpoint is the
+/// flush the worker runs after a batch embeds something, so a refusal on the
+/// last batch of a draining queue was the end of it, and everything embedded
+/// since the previous successful checkpoint was gone on the next open. This
+/// worker's wake tick is the one clock that keeps running with no batch to
+/// embed, which is exactly the case that was losing the work.
+///
+/// The backoff is not politeness. Proving the tree against authority costs a
+/// full reopen, linear in store size rather than in the batch, so a mismatch
+/// that does not close would otherwise reopen authority on every tick for as
+/// long as it lasts.
+async fn retry_deferred_vector_checkpoint(
+    state: &Arc<DaemonState>,
+    backoff: &mut Option<Duration>,
+    due: &mut Option<Instant>,
+    base: Duration,
+) {
+    if state.deferred_vector_checkpoint().is_none() {
+        *backoff = None;
+        *due = None;
+        return;
+    }
+    if due.is_some_and(|at| Instant::now() < at) {
+        return;
+    }
+    let retry_state = Arc::clone(state);
+    match tokio::task::spawn_blocking(move || retry_state.retry_deferred_vector_checkpoint()).await
+    {
+        Ok(Some(Ok(pending))) => {
+            *backoff = None;
+            *due = None;
+            info!(
+                pending,
+                "checkpointed the vector progress a refused checkpoint had left in memory"
+            );
+        }
+        Ok(Some(Err(error))) => {
+            let next = next_embed_error_backoff(*backoff, base, DEFERRED_CHECKPOINT_RETRY_MAX);
+            *backoff = Some(next);
+            *due = Some(Instant::now() + next);
+            warn!(
+                error = %error,
+                next_retry_s = next.as_secs(),
+                "vector checkpoint still refused; embedded vectors stay in memory until it lands"
+            );
+        }
+        // The record cleared under us, which is the ordinary outcome when the
+        // worker's own flush landed between the read above and this call.
+        Ok(None) => {
+            *backoff = None;
+            *due = None;
+        }
+        Err(error) => {
+            error!(error = %error, "deferred vector checkpoint retry task panicked");
+        }
+    }
+}
+
 // Shutdown-latency bound — how long the daemon may take to actually disappear.
 // Callers that budget for daemon cleanup (the merge-trust harness attests
 // against a 45s window) depend on this being bounded rather than generous, so
@@ -1517,6 +1676,78 @@ fn write_sweep_interruptions(state: &DaemonState, count: u32) {
     let _ = std::fs::write(sweep_interruption_path(state), count.to_string());
 }
 
+/// Where a sweep records that it has begun and not yet ended.
+///
+/// Everything a sweep says about itself is written after its last file: the
+/// publication, the resume marker, the interruption count and the completion
+/// line all live in the tail of the loop. The enrichment worker is a detached
+/// task that nothing joins, so a daemon whose process ends mid-sweep reaches
+/// none of them, and the store keeps no trace that a sweep ever ran. A killed
+/// sweep and a sweep that never started are then the same store, which is the
+/// half of this that made the loss permanent: nothing downstream can act on a
+/// fact nobody recorded.
+fn sweep_in_flight_path(state: &DaemonState) -> std::path::PathBuf {
+    state.layout.root().join("lsp-sweep-in-flight")
+}
+
+/// Record that a cold sweep has begun.
+fn sweep_started(state: &DaemonState) {
+    let _ = std::fs::write(sweep_in_flight_path(state), b"");
+}
+
+/// Record how a cold sweep ended, and that it ended at all.
+///
+/// One function because they are one fact. A sweep that reaches here has an
+/// outcome the count describes, and clearing the in-flight record is what makes
+/// the absence of an outcome mean something. Written apart, a future exit could
+/// clear the record without counting, and the store would call a killed sweep a
+/// finished one.
+///
+/// Returns the count it wrote, which is what the completion line reports.
+fn sweep_finished(state: &DaemonState, ended_early: bool, enriched: usize) -> u32 {
+    let counted = next_interruption_count(read_sweep_interruptions(state), ended_early, enriched);
+    write_sweep_interruptions(state, counted);
+    let _ = std::fs::remove_file(sweep_in_flight_path(state));
+    counted
+}
+
+/// What a starting daemon does about a cold sweep, given what this store
+/// records about the last one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SweepStartDecision {
+    /// Queue a cold sweep.
+    Queue,
+    /// Queue nothing: this store's last sweeps all died without enriching.
+    CircuitOpen { interruptions: u32 },
+}
+
+/// Settle the previous sweep, then decide about this one.
+///
+/// A sweep killed before its own tail is counted HERE, because it could not
+/// count itself. Nothing it did was published or marked, so its outcome is
+/// exactly an interruption that enriched nothing, and reading it at startup is
+/// the only place the fact is available. Taking the record also clears it, so
+/// one kill is counted once however many daemons follow it.
+fn decide_sweep_on_start(state: &DaemonState) -> SweepStartDecision {
+    let path = sweep_in_flight_path(state);
+    if path.exists() {
+        let _ = std::fs::remove_file(&path);
+        let counted = next_interruption_count(read_sweep_interruptions(state), true, 0);
+        write_sweep_interruptions(state, counted);
+        warn!(
+            consecutive_fruitless_interruptions = counted,
+            "the previous language-server sweep did not reach its own end, so it published \
+             nothing and recorded nothing; this start counts it and sweeps its files again"
+        );
+    }
+    let interruptions = read_sweep_interruptions(state);
+    if sweep_circuit_open(interruptions) {
+        SweepStartDecision::CircuitOpen { interruptions }
+    } else {
+        SweepStartDecision::Queue
+    }
+}
+
 /// Whether a finished sweep may record its files as enriched.
 ///
 /// Marking is safe when the sweep published, and also when it produced nothing
@@ -1740,8 +1971,144 @@ where
     }
 }
 
+/// How many relations one enrichment write to the graph carries at most.
+///
+/// A cold sweep hands its output to the graph one language-server query arm at
+/// a time, and every arm opens its own graph-authority mutation, invalidates
+/// the spine's cross-repo edges, and writes `vfs_version` to disk. On the
+/// psf/requests corpus a sweep enriches 37 files and derives about 4200
+/// relations, so a pass costs thousands of mutation batches for one logical
+/// unit of work.
+///
+/// Batching bounds two different quantities at once. The number of authority
+/// mutations a sweep opens becomes `ceil(relations / this)` rather than one per
+/// arm, and the buffer a pass holds between deriving a relation and writing it
+/// never exceeds this many, whatever one file yields. `src/requests/models.py`
+/// yields 1167 in a single file.
+const ENRICHMENT_WRITE_BATCH: usize = 256;
+
+/// Relations an enrichment pass has derived and has not yet written.
+///
+/// Bounded on purpose. [`PendingEnrichment::absorb`] hands every full batch to
+/// the caller's writer before it returns, so the undrained remainder is always
+/// smaller than one batch however many relations arrive at once. A pass that
+/// accumulated a whole file, or a whole sweep, would hold a structure whose
+/// size is a property of the repository being swept rather than of this code,
+/// which is the shape this type exists to refuse.
+#[derive(Default)]
+struct PendingEnrichment {
+    relations: Vec<kin_model::Relation>,
+}
+
+impl PendingEnrichment {
+    /// How many derived relations are waiting to be written.
+    fn len(&self) -> usize {
+        self.relations.len()
+    }
+
+    /// Take newly derived relations and write out every full batch.
+    ///
+    /// Returns what `write` reported installing, which is what the graph took
+    /// rather than what was offered it.
+    fn absorb<F>(&mut self, derived: Vec<kin_model::Relation>, mut write: F) -> usize
+    where
+        F: FnMut(&[kin_model::Relation]) -> usize,
+    {
+        self.relations.extend(derived);
+        let mut installed = 0usize;
+        while self.relations.len() >= ENRICHMENT_WRITE_BATCH {
+            let batch: Vec<kin_model::Relation> =
+                self.relations.drain(..ENRICHMENT_WRITE_BATCH).collect();
+            installed += write(&batch);
+        }
+        installed
+    }
+
+    /// Write the remainder, leaving the buffer empty.
+    ///
+    /// Called at the end of every file rather than at the end of the sweep, so
+    /// the relations a file produced reach the graph before the next file is
+    /// opened, and a sweep stopped between files has already written them.
+    fn flush<F>(&mut self, mut write: F) -> usize
+    where
+        F: FnMut(&[kin_model::Relation]) -> usize,
+    {
+        if self.relations.is_empty() {
+            return 0;
+        }
+        debug!(
+            tail = self.len(),
+            "writing the tail of this file's enrichment"
+        );
+        let batch = std::mem::take(&mut self.relations);
+        write(&batch)
+    }
+}
+
+/// The relations from `relations` this graph does not already hold in exactly
+/// this form.
+///
+/// A sweep killed before it published records nothing, so the next daemon
+/// sweeps the same files and derives the same relations again. Their ids are
+/// content-addressed from source, target and kind, so each one is a
+/// byte-identical rewrite of an edge the graph already carries.
+/// `upsert_relation` cannot tell the difference and pays the full price for
+/// every one: it removes the old edge and its indexes, reinserts them, records
+/// a delta remove beside a delta upsert, rebuilds both endpoints'
+/// relation-derived text fields by walking their whole edge lists, and then
+/// drops both endpoints' vectors and re-queues them for embedding. That last
+/// step is not merely wasted, it is destructive, because a re-sweep that
+/// changes nothing discards embeddings a completed backfill had produced.
+///
+/// The rewrite is therefore dropped before the graph is opened at all, which
+/// also means a converged re-sweep never marks the graph dirty and so never
+/// arms the whole-store publication that a dirty graph triggers.
+///
+/// Equality is the whole relation, so a re-derivation whose confidence,
+/// evidence, import source or origin changed is still written. An unreadable
+/// neighbourhood abandons the comparison and offers everything, which costs a
+/// rewrite and can never drop a relation wrongly.
+fn unheld_lsp_relations(
+    state: &DaemonState,
+    relations: &[kin_model::Relation],
+) -> Vec<kin_model::Relation> {
+    use kin_model::EntityStore;
+    let mut held: std::collections::HashMap<kin_model::RelationId, kin_model::Relation> =
+        std::collections::HashMap::new();
+    let mut fetched: std::collections::HashSet<kin_model::EntityId> =
+        std::collections::HashSet::new();
+    for relation in relations {
+        let kin_model::GraphNodeId::Entity(source) = relation.src else {
+            continue;
+        };
+        if !fetched.insert(source) {
+            continue;
+        }
+        let Ok(existing) = state.graph.get_all_relations_for_entity(&source) else {
+            return relations.to_vec();
+        };
+        for existing in existing {
+            held.insert(existing.id, existing);
+        }
+    }
+    relations
+        .iter()
+        .filter(|candidate| {
+            held.get(&candidate.id)
+                .is_none_or(|held| held != *candidate)
+        })
+        .cloned()
+        .collect()
+}
+
 fn install_lsp_relations(state: &DaemonState, relations: &[kin_model::Relation]) -> usize {
     if relations.is_empty() {
+        return 0;
+    }
+
+    let relations = unheld_lsp_relations(state, relations);
+    if relations.is_empty() {
+        debug!("every enrichment relation offered is already held in this form; nothing written");
         return 0;
     }
 
@@ -1749,7 +2116,7 @@ fn install_lsp_relations(state: &DaemonState, relations: &[kin_model::Relation])
     let graph_mutation = state.begin_graph_authority_mutation();
     let mut installed = 0usize;
     let mut refused = 0usize;
-    for relation in relations {
+    for relation in &relations {
         match state.graph.upsert_relation(relation) {
             Ok(_) => installed += 1,
             Err(error) => {
@@ -1783,18 +2150,21 @@ fn install_lsp_relations(state: &DaemonState, relations: &[kin_model::Relation])
 }
 
 /// Enrich a single entity with all available LSP relation types (calls, overrides,
-/// uses-type, references). Each query is capped at 5 seconds. Returns the total
-/// number of relations upserted into the graph.
+/// uses-type, references). Each query is capped at 5 seconds.
+///
+/// Returns what the language server answered rather than writing it. The
+/// caller owns the graph write, so one entity's four query arms no longer open
+/// four separate graph-authority mutations, and the payload each arm returned
+/// is dropped here once its relations have been extracted.
 async fn enrich_single_entity(
     server: &kin_lsp::lifecycle::LspServer,
     entity_ref: &kin_lsp::EntityRef,
     index: &kin_lsp::EntityIndex,
     root: &std::path::Path,
-    state: &DaemonState,
     documents: Option<kin_lsp::DocumentProvider<'_>>,
-) -> usize {
+) -> Vec<kin_model::Relation> {
     let timeout = std::time::Duration::from_secs(5);
-    let mut count = 0;
+    let mut derived: Vec<kin_model::Relation> = Vec::new();
 
     // Calls
     match tokio::time::timeout(
@@ -1804,7 +2174,7 @@ async fn enrich_single_entity(
     .await
     {
         Ok(Ok(relations)) => {
-            count += install_lsp_relations(state, &relations);
+            derived.extend(relations);
         }
         Ok(Err(e)) => {
             debug!(entity = %entity_ref.name, error = %e, "LSP calls enrichment failed");
@@ -1821,7 +2191,7 @@ async fn enrich_single_entity(
     )
     .await
     {
-        count += install_lsp_relations(state, &relations);
+        derived.extend(relations);
     }
 
     // UsesType
@@ -1831,7 +2201,7 @@ async fn enrich_single_entity(
     )
     .await
     {
-        count += install_lsp_relations(state, &relations);
+        derived.extend(relations);
     }
 
     // References
@@ -1841,10 +2211,10 @@ async fn enrich_single_entity(
     )
     .await
     {
-        count += install_lsp_relations(state, &relations);
+        derived.extend(relations);
     }
 
-    count
+    derived
 }
 
 /// Run the kin daemon. This is the main entry point.
@@ -1949,6 +2319,10 @@ pub async fn run_with_authority_on(
     // Set up LSP enrichment channel before wrapping state in Arc.
     let enrichment_enabled =
         should_enable_lsp_enrichment(config.lsp_enabled, state.filesystem_reconcile_disabled());
+    // Recorded so a caller can tell a deliberately disabled daemon from one that
+    // simply found no server. Those need opposite answers and the channel alone
+    // cannot separate them.
+    state.lsp_enrichment_enabled = enrichment_enabled;
     let lsp_rx = if enrichment_enabled {
         let discovered = kin_lsp::discovery::discover_servers();
         if enrichment_channel_opens(enrichment_enabled, discovered.len()) {
@@ -1997,18 +2371,21 @@ pub async fn run_with_authority_on(
         // fewer, not another. Queued on EVERY daemon start, this is the point
         // the marker-discard loop turns at: a sweep dies, the daemon restarts,
         // queues another, dies again. One stranger session logged 24 of them.
-        let interruptions = read_sweep_interruptions(&state);
-        if sweep_circuit_open(interruptions) {
-            warn!(
-                consecutive_fruitless_interruptions = interruptions,
-                limit = SWEEP_INTERRUPTION_LIMIT,
-                "not queueing an LSP sweep: this store's last sweeps all ended early without \
-                 enriching anything, so another would repeat what has been failing. Enrichment \
-                 stays at what is already durable; one sweep that completes clears this."
-            );
-        } else {
-            info!("queueing an LSP sweep so a graph with unenriched files converges");
-            state.queue_lsp_sweep();
+        match decide_sweep_on_start(&state) {
+            SweepStartDecision::CircuitOpen { interruptions } => {
+                warn!(
+                    consecutive_fruitless_interruptions = interruptions,
+                    limit = SWEEP_INTERRUPTION_LIMIT,
+                    "not queueing an LSP sweep: this store's last sweeps all ended early without \
+                     enriching anything, so another would repeat what has been failing. \
+                     Enrichment stays at what is already durable; one sweep that completes \
+                     clears this, and `kin daemon sweep` asks for one."
+                );
+            }
+            SweepStartDecision::Queue => {
+                info!("queueing an LSP sweep so a graph with unenriched files converges");
+                state.queue_lsp_sweep();
+            }
         }
     }
 
@@ -2379,31 +2756,7 @@ pub async fn run_with_authority_on(
             tokio::select! {
                 _ = tokio::time::sleep(current_interval) => {}
                 _ = persist_cancel.changed() => {
-                    if persist_state.is_dirty() {
-                        if persist_state.shutdown_flush_would_wipe_graph() {
-                            // The in-memory graph collapsed to a small fraction of
-                            // the last persisted entity count — almost certainly a
-                            // transient wipe (e.g. an empty/bare checkout
-                            // reconciled as all-deleted), not a real edit. Skip the
-                            // final flush so the larger good snapshot survives; the
-                            // daemon reloads it and re-reconciles against the
-                            // filesystem on restart. (Graph-keyed, not embed-keyed:
-                            // a stale vector index self-heals on load and never
-                            // blocks this flush.)
-                            warn!(
-                                persisted = persist_state.persisted_entity_count.load(std::sync::atomic::Ordering::SeqCst),
-                                current = persist_state.graph.entity_count(),
-                                "skipping final graph flush on shutdown — in-memory entity count collapsed vs on-disk snapshot; preserving the larger snapshot"
-                            );
-                        } else {
-                            info!("final persistence flush on shutdown");
-                            if let Err(e) = save_snapshot_blocking(Arc::clone(&persist_state)).await {
-                                error!(error = %e, "shutdown save failed");
-                            } else {
-                                persist_state.mark_clean();
-                            }
-                        }
-                    }
+                    run_shutdown_persistence(&persist_state).await;
                     break;
                 }
             }
@@ -2528,6 +2881,11 @@ pub async fn run_with_authority_on(
         // batch that embeds something, since progress makes the next gap a new
         // question.
         let mut backfilled_gap: Option<usize> = None;
+        // A refused vector checkpoint outlives the batch that hit it, so its
+        // retry schedule lives out here with the wake loop rather than inside
+        // the drain that produced the refusal.
+        let mut deferred_checkpoint_backoff: Option<Duration> = None;
+        let mut deferred_checkpoint_due: Option<Instant> = None;
         'wake: loop {
             // Between wakes this worker is genuinely doing nothing, so the
             // working stretch ends here. A wedged drain never reaches this
@@ -2550,6 +2908,19 @@ pub async fn run_with_authority_on(
             if embed_pass.halted() {
                 break;
             }
+
+            // Before anything this tick might embed, land what the last tick
+            // already embedded and could not checkpoint. A drained queue never
+            // reaches the flush below, so this is the only path that closes a
+            // refusal once there is nothing left to embed, which is the state
+            // the regression was found in.
+            retry_deferred_vector_checkpoint(
+                &embed_state,
+                &mut deferred_checkpoint_backoff,
+                &mut deferred_checkpoint_due,
+                embed_interval,
+            )
+            .await;
 
             // Drain the pending backlog continuously within this wake rather than
             // one batch per `embed_interval`. A fresh central-graph embed (or an
@@ -2884,6 +3255,11 @@ pub async fn run_with_authority_on(
     ));
 
     // Spawn the LSP enrichment worker (channel was set up before Arc::new).
+    // Held rather than dropped. This worker owns the cold sweep, and everything
+    // a sweep makes durable happens after its last file, so a shutdown that
+    // does not wait for it throws away the whole pass. See
+    // `drain_lsp_enrichment` below for what the waiting costs and when.
+    let mut lsp_handle: Option<tokio::task::JoinHandle<()>> = None;
     if let Some(mut lsp_rx) = lsp_rx {
         let mut lsp_cancel = cancel_rx.clone();
         let lsp_state = Arc::clone(&state);
@@ -2898,7 +3274,7 @@ pub async fn run_with_authority_on(
         // rebuild this pass is a real loop, so it has a checkpoint to read a
         // halt at and can be stopped rather than only disclosed.
         let lsp_pass = state.background_work.pass(crate::background_work::PASS_LSP);
-        let _lsp_handle = tokio::spawn(async move {
+        lsp_handle = Some(tokio::spawn(async move {
             info!("LSP enrichment worker started");
             let source_view = match lsp_state.graph_owned_source_view() {
                 Ok(view) => view,
@@ -2953,7 +3329,14 @@ pub async fn run_with_authority_on(
                     // started keeps accumulating and becomes observable.
                     lsp_pass.idle();
                     tokio::select! {
-                        Some(msg) = lsp_rx.recv() => msg,
+                        // Biased so shutdown wins over a queued message. Both
+                        // arms are ready at once whenever a sweep is waiting
+                        // when the cancel arrives, and an unbiased select picks
+                        // between them at random: half the time a daemon that
+                        // was asked to stop STARTS a sweep instead, and the
+                        // shutdown then waits out its drain budget on work
+                        // nobody can use.
+                        biased;
                         _ = lsp_cancel.changed() => {
                             for (lang, server) in servers {
                                 info!(language = %lang, "shutting down LSP server");
@@ -2962,6 +3345,7 @@ pub async fn run_with_authority_on(
                             info!("LSP enrichment worker shutting down");
                             break;
                         }
+                        Some(msg) = lsp_rx.recv() => msg,
                     }
                 };
                 lsp_pass.working(Instant::now());
@@ -3155,14 +3539,19 @@ pub async fn run_with_authority_on(
                             })
                             .collect();
 
+                        let mut pending = PendingEnrichment::default();
                         let mut total_relations = 0usize;
                         for entity_ref in &file_entities {
                             info!(entity = %entity_ref.name, "querying LSP for entity");
-                            total_relations += enrich_single_entity(
-                                server, entity_ref, &index, &lsp_root, &lsp_state, documents,
+                            let derived = enrich_single_entity(
+                                server, entity_ref, &index, &lsp_root, documents,
                             )
                             .await;
+                            total_relations += pending
+                                .absorb(derived, |batch| install_lsp_relations(&lsp_state, batch));
                         }
+                        total_relations +=
+                            pending.flush(|batch| install_lsp_relations(&lsp_state, batch));
 
                         if total_relations > 0 {
                             info!(
@@ -3188,6 +3577,10 @@ pub async fn run_with_authority_on(
 
                     LspEnrichmentMessage::Sweep => {
                         info!("LSP cold sweep started, enriching all entities");
+                        // Durable, and before any work, so a process that ends
+                        // between here and the tail leaves the store saying so.
+                        // First, because "any work" includes the probe below.
+                        sweep_started(&lsp_state);
                         // Re-probe here, not only at daemon start. Readiness
                         // taken once latches: a user who follows Kin's own
                         // advice and installs the server it just named leaves a
@@ -3300,6 +3693,23 @@ pub async fn run_with_authority_on(
                             // dares run is a sweep that never runs.
                             if file_already_enriched(&lsp_state, &file_id.0) {
                                 tally.already_enriched += 1;
+                                // Published here as well as on the enriching
+                                // arm, because `files_done` means a file the
+                                // sweep is done with and a skip is one. Stored
+                                // only there, a sweep over a converged store
+                                // reported `files_done=0 files_total=4` while
+                                // its own completion line said
+                                // `already_enriched=4`, and every waiter reads
+                                // the counter rather than the line: `kin init`
+                                // and `kin daemon sweep` both print "finished
+                                // without enriching any of the 4 files it
+                                // walked" over a repository that is fully
+                                // enriched. The alarm was the reporting, not
+                                // the store.
+                                lsp_state.lsp_sweep_files_done.store(
+                                    tally.files_processed() as u64,
+                                    std::sync::atomic::Ordering::SeqCst,
+                                );
                                 // Info, not debug. A skip and a zero are different
                                 // facts and both are findings, and a skip nobody can
                                 // see is how a predicate that dropped the three files
@@ -3450,17 +3860,32 @@ pub async fn run_with_authority_on(
                             )
                             .await;
 
-                            let mut file_relations =
-                                install_lsp_relations(&lsp_state, &file_result.relations);
+                            // One buffer for the whole file, drained in bounded
+                            // batches. What a file yields is a property of the
+                            // repository (1167 relations from one file on the
+                            // requests corpus), so the buffer bounds itself
+                            // rather than trusting the file to be small.
+                            let mut pending = PendingEnrichment::default();
+                            let mut file_relations = pending
+                                .absorb(file_result.relations, |batch| {
+                                    install_lsp_relations(&lsp_state, batch)
+                                });
 
                             // Also run per-entity call hierarchy for Calls relations
                             // (definition approach gives References, call hierarchy gives Calls).
                             for entity_ref in &file_entity_refs {
-                                file_relations += enrich_single_entity(
-                                    server, entity_ref, &index, &lsp_root, &lsp_state, documents,
+                                let derived = enrich_single_entity(
+                                    server, entity_ref, &index, &lsp_root, documents,
                                 )
                                 .await;
+                                file_relations += pending.absorb(derived, |batch| {
+                                    install_lsp_relations(&lsp_state, batch)
+                                });
                             }
+                            // Written before the file is closed, so the graph
+                            // holds this file's work before the next didOpen.
+                            file_relations +=
+                                pending.flush(|batch| install_lsp_relations(&lsp_state, batch));
 
                             // didClose to free LSP server memory.
                             let _ = server
@@ -3590,13 +4015,11 @@ pub async fn run_with_authority_on(
 
                         // The breaker's count moves on the sweep's own outcome,
                         // and is persisted because the loop it guards spans
-                        // daemon restarts rather than living inside one.
-                        let interruptions = next_interruption_count(
-                            read_sweep_interruptions(&lsp_state),
-                            tally.ended_early,
-                            tally.enriched,
-                        );
-                        write_sweep_interruptions(&lsp_state, interruptions);
+                        // daemon restarts rather than living inside one. The
+                        // same call clears the in-flight record, so reaching
+                        // here is what makes this sweep a finished one.
+                        let interruptions =
+                            sweep_finished(&lsp_state, tally.ended_early, tally.enriched);
 
                         // The marker records durability, so it is written here
                         // and only here, after the publication above settled it.
@@ -3681,7 +4104,7 @@ pub async fn run_with_authority_on(
                     } // end Sweep
                 } // end match
             }
-        });
+        }));
     }
 
     // Persistent daemons stay alive until SIGTERM/SIGINT, `kin eject`, or
@@ -3701,6 +4124,7 @@ pub async fn run_with_authority_on(
         idle_handle,
         persist_handle,
         supervisor_handle,
+        lsp_handle,
         cancel_tx,
     )
     .await;
@@ -3742,6 +4166,7 @@ async fn select_with_signals(
     mut idle_handle: tokio::task::JoinHandle<()>,
     persist_handle: tokio::task::JoinHandle<()>,
     supervisor_handle: tokio::task::JoinHandle<()>,
+    lsp_handle: Option<tokio::task::JoinHandle<()>>,
     cancel_tx: tokio::sync::watch::Sender<bool>,
 ) -> Result<()> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -3817,6 +4242,15 @@ async fn select_with_signals(
         }
     };
 
+    // Before `drain_handles`, and so before the final persistence flush that
+    // kin#994 gave its own budget and drains ahead of everything else. Order is
+    // the whole point twice over. A sweep publishes into the graph, so letting
+    // it finish first is what puts its relations in the flush rather than in the
+    // next daemon's re-derivation, and a flush that can legitimately run for
+    // minutes would otherwise spend the entire escalation grace before the sweep
+    // was ever asked to stop.
+    drain_lsp_enrichment(lsp_handle).await;
+
     drain_handles(
         (completed != CompletedTask::Reconciliation).then_some(loop_handle),
         (completed != CompletedTask::Api).then_some(api_handle),
@@ -3828,6 +4262,53 @@ async fn select_with_signals(
     )
     .await;
     result
+}
+
+/// Ceiling on how long a shutdown waits for an in-flight cold sweep to reach
+/// its own end.
+///
+/// A ceiling, not an amount of waiting. The enrichment worker's idle arm selects
+/// on the cancel signal, so a daemon with no sweep running joins immediately
+/// however large this is, and the budget is spent only when a sweep is actually
+/// mid-file. What it buys is the sweep's tail, which is where the publication,
+/// the resume marker, the interruption count and the completion line all live.
+/// Without it a shutdown lands between the first file and the last and the
+/// whole pass is lost: measured on a four-file Python store, a SIGTERM 327 ms
+/// into a sweep drained all seven other tasks by name, produced no completion
+/// line at all, and left the store carrying neither a resume marker nor an
+/// interruption count.
+///
+/// Derived from the escalation grace rather than written as a number, because
+/// the escalation watchdog is the real hard bound: it force-exits the process
+/// once the grace elapses, and a drain budget larger than that is a promise the
+/// process cannot keep. It would also be silent, since a force-exit runs no
+/// warning. Half, so the flush, the derived-CAS barrier and endpoint retirement
+/// still have the other half to finish in.
+fn lsp_drain_budget_from(escalation_grace: Duration) -> Duration {
+    escalation_grace / 2
+}
+
+fn lsp_drain_budget() -> Duration {
+    lsp_drain_budget_from(shutdown_escalation_grace())
+}
+
+/// Wait for the enrichment worker to finish what it was doing, under a ceiling.
+async fn drain_lsp_enrichment(handle: Option<tokio::task::JoinHandle<()>>) {
+    let Some(handle) = handle else {
+        return;
+    };
+    let budget = lsp_drain_budget();
+    match tokio::time::timeout(budget, handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            warn!(%error, "the LSP enrichment worker panicked during shutdown")
+        }
+        Err(_) => warn!(
+            budget_secs = budget.as_secs(),
+            "an LSP sweep did not reach its end within the shutdown budget; this store records \
+             it as in flight and the next daemon sweeps its files again"
+        ),
+    }
 }
 
 async fn drain_handles(
@@ -3967,6 +4448,7 @@ async fn select_with_signals(
     mut idle_handle: tokio::task::JoinHandle<()>,
     persist_handle: tokio::task::JoinHandle<()>,
     supervisor_handle: tokio::task::JoinHandle<()>,
+    lsp_handle: Option<tokio::task::JoinHandle<()>>,
     cancel_tx: tokio::sync::watch::Sender<bool>,
 ) -> Result<()> {
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -4033,6 +4515,15 @@ async fn select_with_signals(
             (CompletedTask::Signal, Ok(()))
         }
     };
+
+    // Before `drain_handles`, and so before the final persistence flush that
+    // kin#994 gave its own budget and drains ahead of everything else. Order is
+    // the whole point twice over. A sweep publishes into the graph, so letting
+    // it finish first is what puts its relations in the flush rather than in the
+    // next daemon's re-derivation, and a flush that can legitimately run for
+    // minutes would otherwise spend the entire escalation grace before the sweep
+    // was ever asked to stop.
+    drain_lsp_enrichment(lsp_handle).await;
 
     drain_handles(
         (completed != CompletedTask::Reconciliation).then_some(loop_handle),
@@ -5293,7 +5784,10 @@ mod tests {
 
 #[cfg(test)]
 mod enrichment_marker_tests {
-    use super::{file_already_enriched, load_lsp_enriched_marker, lsp_enriched_marker_path};
+    use super::{
+        file_already_enriched, install_lsp_relations, load_lsp_enriched_marker,
+        lsp_enriched_marker_path, PendingEnrichment, ENRICHMENT_WRITE_BATCH,
+    };
     use crate::state::DaemonState;
     use kin_model::EntityStore;
 
@@ -5396,6 +5890,406 @@ mod enrichment_marker_tests {
             "a graph that still holds language-server relations resumes rather than re-sweeping"
         );
         assert!(lsp_enriched_marker_path(&state).exists());
+    }
+
+    /// `count` distinct language-server relations out of one source entity.
+    ///
+    /// Distinct ids, because the property under test is how many relations the
+    /// buffer holds; a repeated id would be deduplicated by the graph and make
+    /// a growing buffer look bounded.
+    fn derived_relations(source: kin_model::EntityId, count: usize) -> Vec<kin_model::Relation> {
+        (0..count)
+            .map(|index| kin_model::Relation {
+                id: kin_model::RelationId::from_content(
+                    &source.to_string(),
+                    &format!("target-{index}"),
+                    "Calls",
+                ),
+                kind: kin_model::RelationKind::Calls,
+                src: kin_model::GraphNodeId::Entity(source),
+                dst: kin_model::GraphNodeId::Entity(kin_model::EntityId::new()),
+                confidence: 1.0,
+                origin: kin_model::RelationOrigin::Lsp,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            })
+            .collect()
+    }
+
+    /// The buffer between a language server's answer and the graph is bounded.
+    ///
+    /// This is the property the sweep needs and did not have. Its cost per pass
+    /// scales with the repository, not with anything this code chooses: one
+    /// file on the requests corpus yields 1167 relations, and a pass that held a
+    /// file, or a sweep, would hold a structure sized by the store being swept.
+    ///
+    /// The two assertions guard different things on purpose. The bound alone
+    /// would pass for a buffer that silently dropped its overflow, and the total
+    /// alone would pass for a buffer that held everything until the flush.
+    #[test]
+    fn an_enrichment_buffer_never_holds_more_than_one_write_batch() {
+        let source = kin_model::EntityId::new();
+        let mut pending = PendingEnrichment::default();
+        let mut written = 0usize;
+        // A file's shape: several entities, one of them answering with far more
+        // than a batch, and a remainder left over at the end.
+        let arms = [400usize, 900, 7, 1, 300];
+        for count in arms {
+            written += pending.absorb(derived_relations(source, count), |batch| batch.len());
+            assert!(
+                pending.len() < ENRICHMENT_WRITE_BATCH,
+                "after absorbing {count} relations the buffer still holds {}, which is a whole \
+                 answer rather than less than one batch of {ENRICHMENT_WRITE_BATCH}",
+                pending.len()
+            );
+        }
+        written += pending.flush(|batch| batch.len());
+        assert_eq!(
+            pending.len(),
+            0,
+            "the flush must leave nothing behind, or a file's tail never reaches the graph"
+        );
+        assert_eq!(
+            written,
+            arms.iter().sum::<usize>(),
+            "every relation offered to the buffer must reach the writer exactly once"
+        );
+    }
+
+    /// The bounded path writes exactly the relation set the unbounded one did,
+    /// and a re-derivation of that same set writes nothing at all.
+    ///
+    /// Completeness first, because a bound that loses relations is a worse
+    /// defect than the cost it removes. Then idempotence, which is the half
+    /// that matters on a store whose sweep keeps being killed: the ids are
+    /// content-addressed, so every re-sweep offers the graph the edges it
+    /// already holds, and `upsert_relation` answers a byte-identical rewrite by
+    /// dropping both endpoints' vectors and re-queueing them for embedding.
+    #[test]
+    fn the_bounded_path_writes_the_same_set_and_a_re_sweep_writes_nothing() {
+        let unbounded_repo = tempfile::tempdir().unwrap();
+        let unbounded =
+            DaemonState::open(kin_core::init(unbounded_repo.path()).unwrap().layout).unwrap();
+        let bounded_repo = tempfile::tempdir().unwrap();
+        let bounded =
+            DaemonState::open(kin_core::init(bounded_repo.path()).unwrap().layout).unwrap();
+
+        let source = entity("Session_send");
+        unbounded.graph.upsert_entity(&source).unwrap();
+        bounded.graph.upsert_entity(&source).unwrap();
+        let relations = derived_relations(source.id, 600);
+
+        // The unbounded path: every relation offered on its own, which is what
+        // one language-server query arm used to do.
+        let mut unbounded_installed = 0usize;
+        for relation in &relations {
+            unbounded_installed +=
+                install_lsp_relations(&unbounded, std::slice::from_ref(relation));
+        }
+
+        // The bounded path: the same relations through the buffer.
+        let mut pending = PendingEnrichment::default();
+        let mut bounded_installed = pending.absorb(relations.clone(), |batch| {
+            install_lsp_relations(&bounded, batch)
+        });
+        bounded_installed += pending.flush(|batch| install_lsp_relations(&bounded, batch));
+
+        assert_eq!(
+            bounded_installed, unbounded_installed,
+            "the bounded path must install exactly what the unbounded one installed"
+        );
+        let held = |state: &DaemonState| -> std::collections::BTreeSet<kin_model::RelationId> {
+            use kin_model::EntityStore;
+            state
+                .graph
+                .get_all_relations_for_entity(&source.id)
+                .unwrap()
+                .into_iter()
+                .map(|relation| relation.id)
+                .collect()
+        };
+        assert_eq!(
+            held(&bounded),
+            held(&unbounded),
+            "the two paths must leave the same relations in the graph"
+        );
+        assert_eq!(
+            held(&bounded).len(),
+            relations.len(),
+            "every derived relation must be published, not just counted"
+        );
+
+        // The re-sweep. Same relations, same ids, nothing changed.
+        let mut again = PendingEnrichment::default();
+        let mut rewritten = again.absorb(relations.clone(), |batch| {
+            install_lsp_relations(&bounded, batch)
+        });
+        rewritten += again.flush(|batch| install_lsp_relations(&bounded, batch));
+        assert_eq!(
+            rewritten, 0,
+            "a re-derivation of relations the graph already holds must write nothing, or every \
+             killed sweep discards the embeddings of every entity it touches"
+        );
+        assert_eq!(
+            held(&bounded).len(),
+            relations.len(),
+            "and writing nothing must not remove anything either"
+        );
+    }
+}
+
+/// The lifecycle a cold sweep has across daemon restarts, which is where this
+/// went wrong and where its unit tests never looked.
+///
+/// The tally tests below exercise a sweep's arithmetic in isolation, and six of
+/// them passed throughout while an interrupted sweep on a real store recorded
+/// nothing at all. Arithmetic was never the gap: the gap was that everything a
+/// sweep writes lives after its last file, and nobody modelled a process that
+/// ends before then. These tests model exactly that, by calling the same two
+/// functions the sweep calls and simply not calling the second one.
+#[cfg(test)]
+mod sweep_lifecycle_tests {
+    use super::{
+        decide_sweep_on_start, file_already_enriched, load_lsp_enriched_marker,
+        mark_files_enriched, read_sweep_interruptions, sweep_finished, sweep_in_flight_path,
+        sweep_started, SweepStartDecision, SWEEP_INTERRUPTION_LIMIT,
+    };
+    use crate::state::DaemonState;
+    use kin_model::EntityStore;
+
+    fn open_store(repo_dir: &std::path::Path) -> DaemonState {
+        let init = kin_core::init(repo_dir).unwrap();
+        DaemonState::open(init.layout).unwrap()
+    }
+
+    /// One language-server relation, so the resume marker is corroborated by the
+    /// graph and `load_lsp_enriched_marker` honors it. Without this a marker is
+    /// discarded by design, and the skip half of these tests would pass for a
+    /// reason that has nothing to do with what they check.
+    fn install_language_server_relation(state: &DaemonState) {
+        let mut entities = Vec::new();
+        for name in ["send", "adapter_send"] {
+            let entity = kin_model::Entity {
+                id: kin_model::EntityId::new(),
+                kind: kin_model::EntityKind::Function,
+                name: name.to_string(),
+                language: kin_model::LanguageId::Python,
+                fingerprint: kin_model::SemanticFingerprint {
+                    algorithm: kin_model::FingerprintAlgorithm::V1TreeSitter,
+                    ast_hash: kin_model::Hash256::from_bytes([1; 32]),
+                    signature_hash: kin_model::Hash256::from_bytes([2; 32]),
+                    behavior_hash: kin_model::Hash256::from_bytes([3; 32]),
+                    equivalence_hash: kin_model::Hash256::from_bytes([0; 32]),
+                    stability_score: 1.0,
+                },
+                file_origin: Some(kin_model::FilePathId::new("src/pkg/adapter.py")),
+                span: None,
+                signature: format!("def {name}()"),
+                visibility: kin_model::Visibility::Public,
+                role: kin_model::EntityRole::Source,
+                doc_summary: None,
+                metadata: kin_model::EntityMetadata::default(),
+                lineage_parent: None,
+                created_in: None,
+                superseded_by: None,
+            };
+            state.graph.upsert_entity(&entity).unwrap();
+            entities.push(entity);
+        }
+        state
+            .graph
+            .upsert_relation(&kin_model::Relation {
+                id: kin_model::RelationId::new(),
+                kind: kin_model::RelationKind::Calls,
+                src: kin_model::GraphNodeId::Entity(entities[0].id),
+                dst: kin_model::GraphNodeId::Entity(entities[1].id),
+                confidence: 1.0,
+                origin: kin_model::RelationOrigin::Lsp,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+    }
+
+    fn swept_files() -> Vec<String> {
+        vec![
+            "src/pkg/adapter.py".to_string(),
+            "src/pkg/auth.py".to_string(),
+            "src/pkg/models.py".to_string(),
+            "src/main.py".to_string(),
+        ]
+    }
+
+    /// The failure this ticket is about, as a lifecycle: a sweep starts, the
+    /// daemon's process ends before the sweep's tail, and a successor comes up.
+    ///
+    /// Observed on a four-file Python store at kin d4335ad0: a SIGTERM 327 ms
+    /// into a sweep drained all seven other daemon tasks by name, emitted no
+    /// completion line, and left the store carrying neither a resume marker nor
+    /// an interruption count. A kill nobody records is a kill nothing can act
+    /// on, which is why the breaker written for exactly this loop could not see
+    /// it.
+    #[test]
+    fn a_sweep_killed_before_its_tail_is_counted_once_and_the_successor_still_sweeps() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let state = open_store(repo_dir.path());
+
+        sweep_started(&state);
+        assert!(
+            sweep_in_flight_path(&state).exists(),
+            "a sweep must record that it began before it does any work, because the process \
+             can end at any point after this and nothing later runs"
+        );
+
+        // The daemon dies here. Nothing in the sweep's tail executes.
+        let decision = decide_sweep_on_start(&state);
+
+        assert_eq!(
+            decision,
+            SweepStartDecision::Queue,
+            "a daemon following an interrupted sweep must queue a cold sweep"
+        );
+        assert_eq!(
+            read_sweep_interruptions(&state),
+            1,
+            "the successor must count the killed sweep, because the sweep could not count \
+             itself; an uncounted kill is invisible to the breaker that exists for it"
+        );
+        assert!(
+            !sweep_in_flight_path(&state).exists(),
+            "and it must take the record rather than read it, so one kill is counted once \
+             however many daemons follow"
+        );
+
+        assert_eq!(
+            decide_sweep_on_start(&state),
+            SweepStartDecision::Queue,
+            "a second start after the same kill still sweeps"
+        );
+        assert_eq!(
+            read_sweep_interruptions(&state),
+            1,
+            "and does not count that one kill again"
+        );
+    }
+
+    /// A budget the process cannot spend is not a budget.
+    ///
+    /// The escalation watchdog force-exits once its grace elapses, and it runs
+    /// no warning on the way out, so a drain budget at or above that grace both
+    /// overstates what the shutdown waits and hides the overrun it promised to
+    /// report. The first version of this fix was written as a flat 30 seconds
+    /// against a 25-second grace, which is exactly that mistake.
+    #[test]
+    fn the_drain_budget_always_ends_before_the_force_exit_it_races() {
+        let grace = super::DEFAULT_SHUTDOWN_ESCALATION_GRACE;
+        assert!(
+            super::lsp_drain_budget_from(grace) < grace,
+            "the shutdown's wait for a sweep must end before the watchdog force-exits, or the \
+             budget describes a wait the process never performs"
+        );
+        // An operator who sets the grace very low gets a proportionally low
+        // budget rather than one that swallows the whole shutdown.
+        let tight = std::time::Duration::from_secs(2);
+        assert!(
+            super::lsp_drain_budget_from(tight) < tight,
+            "and it must stay under a grace an operator has tightened, which is the case a \
+             flat constant gets wrong"
+        );
+    }
+
+    /// The breaker still turns, so counting kills does not mint an endless loop.
+    #[test]
+    fn enough_killed_sweeps_open_the_circuit() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let state = open_store(repo_dir.path());
+
+        let mut decision = SweepStartDecision::Queue;
+        for _ in 0..SWEEP_INTERRUPTION_LIMIT {
+            sweep_started(&state);
+            decision = decide_sweep_on_start(&state);
+        }
+
+        assert_eq!(
+            decision,
+            SweepStartDecision::CircuitOpen {
+                interruptions: SWEEP_INTERRUPTION_LIMIT
+            },
+            "a store whose sweeps have all died without enriching anything must stop being \
+             handed another one"
+        );
+    }
+
+    /// The other direction, so the fix above is not simply "always call it
+    /// interrupted": a sweep that reached its own end is a finished sweep, and
+    /// the next daemon must not re-derive what it already made durable.
+    #[test]
+    fn a_completed_sweep_is_not_counted_as_an_interruption_and_its_files_are_not_re_swept() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let files = swept_files();
+
+        // The empty case is its own failure, ahead of everything below. With no
+        // files enriched, "no file is re-swept" is true of any code at all,
+        // including code with the skip deleted, so an empty list would make
+        // every assertion after this one vacuous.
+        assert!(
+            !files.is_empty(),
+            "this test proves files are not re-swept, so it needs files; an empty set makes \
+             the property trivially true and the test unable to fail"
+        );
+
+        let layout = kin_core::init(repo_dir.path()).unwrap().layout;
+        {
+            let state = DaemonState::open(layout.clone()).unwrap();
+
+            sweep_started(&state);
+            // The sweep's tail, in the order the sweep runs it.
+            mark_files_enriched(&state, &files);
+            let counted = sweep_finished(&state, false, files.len());
+
+            assert_eq!(
+                counted, 0,
+                "a sweep that finished must reset the interruption count"
+            );
+            assert!(
+                !sweep_in_flight_path(&state).exists(),
+                "and must leave no in-flight record, or the next start reads a finished sweep \
+                 as a killed one"
+            );
+        }
+
+        // A new daemon on the same store. Opened fresh rather than reused,
+        // because the skip below must come from the marker this store now
+        // carries, not from a set the first daemon left in memory.
+        let state = DaemonState::open(layout).unwrap();
+        // The relations the completed sweep published, which this daemon opened
+        // its graph on. They are what the marker is checked against: a marker
+        // the graph cannot corroborate is discarded by design, so without them
+        // the skip below would fail for a reason that is not this test's.
+        install_language_server_relation(&state);
+
+        assert_eq!(
+            decide_sweep_on_start(&state),
+            SweepStartDecision::Queue,
+            "the successor still queues a sweep, which is what keeps an unfinished graph \
+             converging"
+        );
+        assert_eq!(
+            read_sweep_interruptions(&state),
+            0,
+            "but a completed sweep must not be counted as an interruption by the next start"
+        );
+
+        load_lsp_enriched_marker(&state);
+        for file in &files {
+            assert!(
+                file_already_enriched(&state, file),
+                "the successor's sweep must skip {file}, which the completed sweep already \
+                 made durable"
+            );
+        }
     }
 }
 
@@ -5856,5 +6750,274 @@ mod sweep_tally_tests {
     fn a_sweep_over_no_files_is_not_blocked() {
         assert_eq!(SweepTally::default().blocked_reason(0), None);
         assert_eq!(SweepTally::default().unaccounted(0), 0);
+    }
+}
+
+/// The shutdown half of FIR-2497.
+///
+/// The wake-tick retry proves durability for a daemon that keeps running. The
+/// coverage regression was found on a daemon that STOPPED with a refusal
+/// standing, and nothing in the graph flush writes the vector sidecar, so a
+/// clean shutdown published graph truth and left the vectors in a process that
+/// was about to end. These tests drive the real shutdown arm rather than the
+/// helper beside it, because what has to hold is the wiring: a retry that
+/// exists and is never called from shutdown is the bug it was written to fix.
+#[cfg(all(test, feature = "embeddings"))]
+mod shutdown_vector_checkpoint_tests {
+    use super::{run_shutdown_persistence, DaemonState};
+    use kin_db::EntityStore;
+    use kin_model::{
+        ArtifactId, Entity, EntityKind, EntityMetadata, FilePathId, FingerprintAlgorithm, Hash256,
+        LanguageId, LocatedEntry, RepoPath, SemanticFingerprint, TreeDelta, TreeEntry, Visibility,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    const STAGED_VECTORS: usize = 3;
+
+    fn test_entity(name: &str) -> Entity {
+        Entity {
+            id: kin_model::EntityId::new(),
+            kind: EntityKind::Function,
+            name: name.to_string(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([1; 32]),
+                signature_hash: Hash256::from_bytes([2; 32]),
+                behavior_hash: Hash256::from_bytes([3; 32]),
+                equivalence_hash: Hash256::from_bytes([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(FilePathId::new("src/lib.rs")),
+            span: None,
+            signature: format!("fn {name}()"),
+            visibility: Visibility::Public,
+            role: kin_model::EntityRole::Source,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    /// Open a store, stage coverage the product's own counter can see, leave
+    /// nothing durable behind it, and force one authority-mismatch refusal by
+    /// moving the live tree inside the checkpoint's reopen window.
+    ///
+    /// Returns the state with a refusal standing and the divergence still open.
+    fn state_with_a_standing_refusal(
+        repo_dir: &std::path::Path,
+    ) -> (Arc<DaemonState>, ArtifactId, LocatedEntry) {
+        let init = kin_core::init(repo_dir).unwrap();
+        let vector_path = init.layout.kindb_vector_index_path();
+        let state = Arc::new(DaemonState::open(init.layout).expect("fixture store must open"));
+
+        let descriptor = kin_db::vector::IndexDescriptor {
+            model_id: Some("fixture-embedder-v1".to_string()),
+            graph_root: Some("fixture-root".to_string()),
+        };
+        let vectors = kin_db::VectorIndex::new(4).unwrap();
+        vectors.set_descriptor(descriptor.clone());
+        for slot in 0..STAGED_VECTORS {
+            let entity = test_entity(&format!("embedded_{slot}"));
+            state.graph.upsert_entity(&entity).unwrap();
+            let mut embedding = [0.0f32; 4];
+            embedding[slot] = 1.0;
+            vectors
+                .upsert_retrievable(kin_db::RetrievalKey::Entity(entity.id), &embedding)
+                .expect("the fixture index must accept a staged vector");
+        }
+        vectors.save(&vector_path).unwrap();
+        assert!(matches!(
+            state
+                .graph
+                .load_vector_index_compatible(&vector_path, &descriptor),
+            kin_db::vector::VectorIndexLoad::Loaded(STAGED_VECTORS)
+        ));
+        std::fs::remove_file(&vector_path).unwrap();
+        assert_eq!(
+            state.graph.embedding_status().indexed,
+            STAGED_VECTORS,
+            "the fixture must stage coverage the counter can see"
+        );
+
+        let arriving = ArtifactId::new();
+        let arrived = LocatedEntry::new(
+            RepoPath::from_utf8("src/arrived_during_reopen.rs").unwrap(),
+            TreeEntry::blob(Hash256::from_bytes([9u8; 32]), false),
+        );
+        let moving_graph = Arc::clone(&state.graph);
+        let moved = Arc::new(AtomicBool::new(false));
+        let arrived_seam = arrived.clone();
+        state.set_vector_checkpoint_reopen_test_hook(Some(Arc::new(move || {
+            // Once only: a seam that moved the tree on every reopen would model
+            // a repository nobody can ever checkpoint, not a commit that lands.
+            if moved.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            moving_graph
+                .apply_transaction_delta(&kin_model::TransactionDelta {
+                    tree_deltas: vec![TreeDelta::Added {
+                        artifact_id: arriving,
+                        new: arrived_seam.clone(),
+                    }],
+                    ..Default::default()
+                })
+                .expect("the live graph must accept the concurrent mutation under test");
+        })));
+        state
+            .flush_embed_progress()
+            .expect_err("a live tree that moved away from authority must be refused");
+        assert!(
+            state.deferred_vector_checkpoint().is_some(),
+            "the fixture must leave a refusal standing"
+        );
+        assert!(
+            !vector_path.exists(),
+            "the fixture must leave nothing durable behind the refusal"
+        );
+
+        (state, arriving, arrived)
+    }
+
+    /// Refusal standing, daemon shuts down cleanly, restart, count equals N.
+    ///
+    /// This is the arm the regression's own evidence asks for. Before the
+    /// shutdown retry, the sequence ended with the sidecar still holding its
+    /// older content and the process gone, which is why a store read
+    /// 2112/2112 on one daemon and 1770/2112 on the next.
+    ///
+    /// The restart is modelled by dropping the live index and re-reading the
+    /// sidecar through `load_vector_index_into_graph_if_valid`, the exact call
+    /// `DaemonState::load_validated_vector_index` makes at open. The drop is
+    /// load-bearing: without it the final count would come from the memory the
+    /// shutdown was supposed to be rescuing the vectors out of, and the test
+    /// could not fail.
+    #[tokio::test]
+    async fn a_refusal_standing_at_shutdown_is_checkpointed_and_survives_the_restart() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let (state, arriving, arrived) = state_with_a_standing_refusal(repo_dir.path());
+        let vector_path = state.layout.kindb_vector_index_path();
+
+        // The divergence closes, the way it closes in a real store once the
+        // commit that opened it has settled.
+        state
+            .graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                tree_deltas: vec![TreeDelta::Removed {
+                    artifact_id: arriving,
+                    old: arrived,
+                }],
+                ..Default::default()
+            })
+            .expect("the live graph must accept the settling transition");
+
+        run_shutdown_persistence(&state).await;
+
+        assert!(
+            vector_path.exists(),
+            "shutdown must land a standing refusal rather than end with the vectors in memory"
+        );
+        assert!(
+            state.deferred_vector_checkpoint().is_none(),
+            "a checkpoint that landed must retire the record it closed"
+        );
+
+        state.graph.reset_vector_index();
+        assert_eq!(
+            state.graph.embedding_status().indexed,
+            0,
+            "the control: with the live index dropped the count must come from disk alone"
+        );
+        assert!(
+            kin_db::SnapshotManager::load_vector_index_into_graph_if_valid(
+                state.graph.as_ref(),
+                &state.layout.kindb_snapshot_path(),
+                None,
+            )
+            .expect("the checkpointed sidecar must be readable"),
+            "the checkpointed sidecar must install through the daemon's own open-time path"
+        );
+        assert_eq!(
+            state.graph.embedding_status().indexed,
+            STAGED_VECTORS,
+            "a restart after a clean shutdown must read back every staged vector"
+        );
+    }
+
+    /// The budget kin#994 gave this arm is a ceiling, not an amount, and this
+    /// change must not turn it into one.
+    ///
+    /// An ordinary daemon has no refusal standing, so the shutdown retry has to
+    /// cost it nothing: no authority reopen, no sidecar write, no delay. A
+    /// version that retried unconditionally would pay a full reopen on every
+    /// clean exit, which is the overcorrection this must not become.
+    ///
+    /// The fixture stages a real attached index and then removes the sidecar,
+    /// which is what gives this test the ability to fail at all. An earlier
+    /// version opened a bare store with no index, so "no sidecar was written"
+    /// held whatever the code did, and the unconditional-retry sabotage passed
+    /// it cleanly. A control whose subject cannot act is not a control.
+    #[tokio::test]
+    async fn a_shutdown_with_no_refusal_standing_writes_no_sidecar() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let vector_path = init.layout.kindb_vector_index_path();
+        let state = Arc::new(DaemonState::open(init.layout).expect("fixture store must open"));
+
+        let descriptor = kin_db::vector::IndexDescriptor {
+            model_id: Some("fixture-embedder-v1".to_string()),
+            graph_root: Some("fixture-root".to_string()),
+        };
+        let vectors = kin_db::VectorIndex::new(4).unwrap();
+        vectors.set_descriptor(descriptor.clone());
+        for slot in 0..STAGED_VECTORS {
+            let entity = test_entity(&format!("embedded_{slot}"));
+            state.graph.upsert_entity(&entity).unwrap();
+            let mut embedding = [0.0f32; 4];
+            embedding[slot] = 1.0;
+            vectors
+                .upsert_retrievable(kin_db::RetrievalKey::Entity(entity.id), &embedding)
+                .expect("the fixture index must accept a staged vector");
+        }
+        vectors.save(&vector_path).unwrap();
+        assert!(matches!(
+            state
+                .graph
+                .load_vector_index_compatible(&vector_path, &descriptor),
+            kin_db::vector::VectorIndexLoad::Loaded(STAGED_VECTORS)
+        ));
+        // Removed so a write during shutdown is visible. The index stays
+        // attached, so there is real content a stray checkpoint would write,
+        // and an unconditional retry recreates this file.
+        std::fs::remove_file(&vector_path).unwrap();
+        assert!(
+            state.graph.embedding_status().indexed > 0,
+            "the fixture must hold coverage a stray checkpoint could write, or this control \
+             cannot fail"
+        );
+        assert!(
+            state.deferred_vector_checkpoint().is_none(),
+            "the control fixture must carry no refusal"
+        );
+
+        let started = std::time::Instant::now();
+        run_shutdown_persistence(&state).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            !vector_path.exists(),
+            "a shutdown with nothing refused must not checkpoint the vector sidecar at all"
+        );
+        assert!(
+            state.deferred_vector_checkpoint().is_none(),
+            "and must not invent a refusal"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "a shutdown with nothing refused must not pay for an authority reopen; took {elapsed:?}"
+        );
     }
 }

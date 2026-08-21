@@ -23,7 +23,9 @@
 //! download into a shared global prefix, and Kin does not spend a user's
 //! bandwidth or mutate their toolchain on a probe's say-so.
 
-use std::process::Command;
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use kin_model::LanguageId;
 
@@ -391,23 +393,267 @@ pub(crate) fn provision(
     reports
 }
 
-/// Run a recipe's install command, inheriting stdio so the operator sees the
-/// package manager's own progress rather than a spinner hiding it.
+/// Where a global npm install would land on this host, and whether this user
+/// can write there.
+///
+/// npm's own answer rather than a guess: `npm config get prefix` resolves the
+/// value the install will actually use, including one set by `npm config set
+/// prefix`, by `NPM_CONFIG_PREFIX`, or by a version manager.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NpmGlobalPrefix {
+    pub(crate) prefix: PathBuf,
+    pub(crate) install_dir: PathBuf,
+    pub(crate) writable: bool,
+}
+
+/// Where npm unpacks a global package under `prefix`.
+fn npm_global_install_dir(prefix: &Path) -> PathBuf {
+    if cfg!(windows) {
+        prefix.join("node_modules")
+    } else {
+        prefix.join("lib").join("node_modules")
+    }
+}
+
+/// Whether this process can create an entry in `dir`, or in the nearest
+/// existing ancestor npm would have to create it under.
+///
+/// Asked by trying, because the permission bits do not answer it: a directory
+/// can be group-writable through a group this user is not in, and an ACL or a
+/// read-only mount refuses a directory whose mode says yes.
+fn directory_is_writable(dir: &Path) -> bool {
+    let mut candidate = dir;
+    while !candidate.exists() {
+        match candidate.parent() {
+            Some(parent) => candidate = parent,
+            None => return false,
+        }
+    }
+    let probe = candidate.join(format!(".kin-install-probe-{}", std::process::id()));
+    match std::fs::create_dir(&probe) {
+        Ok(()) => {
+            let _ = std::fs::remove_dir(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Ask npm where its global prefix is, and whether this user owns it.
+fn npm_global_prefix() -> Option<NpmGlobalPrefix> {
+    let output = Command::new("npm")
+        .args(["config", "get", "prefix"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let answer = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if answer.is_empty() || answer == "undefined" || answer == "null" {
+        return None;
+    }
+    let prefix = PathBuf::from(answer);
+    let install_dir = npm_global_install_dir(&prefix);
+    let writable = directory_is_writable(&install_dir);
+    Some(NpmGlobalPrefix {
+        prefix,
+        install_dir,
+        writable,
+    })
+}
+
+/// The reason a global npm install cannot succeed, stated before it is tried.
+pub(crate) fn npm_prefix_blocker(prefix: &NpmGlobalPrefix) -> Option<String> {
+    if prefix.writable {
+        return None;
+    }
+    Some(format!(
+        "the global npm prefix {} is not writable by this user, so `npm install -g` cannot \
+         create {}",
+        prefix.prefix.display(),
+        prefix.install_dir.display()
+    ))
+}
+
+/// Why this install cannot succeed, known before it is attempted.
+///
+/// Only the npm recipes have one today, and it is the one a container hits:
+/// the Node base images set the global prefix to `/usr/local`, whose
+/// `lib/node_modules` is owned by root, and a Kin running as an unprivileged
+/// user cannot write there. Attempting it anyway spends the download and ends
+/// in npm's own EACCES trace, which reads as a Kin defect and names no remedy.
+fn install_blocker(recipe: &LanguageServerRecipe) -> Option<String> {
+    if recipe.program != "npm" {
+        return None;
+    }
+    npm_prefix_blocker(&npm_global_prefix()?)
+}
+
+/// How many of an installer's stderr lines are kept for the failure report.
+const MAX_RETAINED_INSTALLER_LINES: usize = 200;
+
+/// How many of an installer's own error lines a failure reason repeats.
+const MAX_REPORTED_INSTALLER_LINES: usize = 4;
+
+/// Whether a failure is the install location refusing this user.
+///
+/// Matched against the installer's own words as well as Kin's preflight
+/// sentence, because the two describe the same wall from opposite sides.
+pub(crate) fn is_permission_failure(reason: &str) -> bool {
+    const SIGNATURES: [&str; 6] = [
+        "eacces",
+        "eperm",
+        "permission denied",
+        "operation not permitted",
+        "not writable",
+        "access is denied",
+    ];
+    let lowered = reason.to_lowercase();
+    SIGNATURES
+        .iter()
+        .any(|signature| lowered.contains(signature))
+}
+
+/// The installer's own account of the failure, reduced to the lines naming it.
+///
+/// npm leads with the code, the syscall and the path, which is exactly the
+/// triple an operator needs and exactly what an exit code alone destroys. When
+/// nothing announces itself as an error the last lines stand in, because a
+/// reason that carries no words at all sends someone back to scroll a terminal.
+pub(crate) fn installer_error_summary(lines: &[String]) -> Option<String> {
+    let said: Vec<&str> = lines
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect();
+    let mut named: Vec<&str> = said
+        .iter()
+        .copied()
+        .filter(|line| line.to_lowercase().contains("error"))
+        .take(MAX_REPORTED_INSTALLER_LINES)
+        .collect();
+    if named.is_empty() {
+        named = said.iter().copied().rev().take(2).collect();
+        named.reverse();
+    }
+    if named.is_empty() {
+        return None;
+    }
+    Some(named.join("; "))
+}
+
+/// The failure reason for an installer that ran and exited non-zero.
+pub(crate) fn installer_failure_reason(
+    command: &str,
+    code: Option<i32>,
+    stderr_lines: &[String],
+) -> String {
+    let exit = code
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "a signal".to_string());
+    match installer_error_summary(stderr_lines) {
+        Some(said) => format!("`{command}` exited with {exit}: {said}"),
+        None => format!("`{command}` exited with {exit}"),
+    }
+}
+
+/// What to tell an operator whose install failed, chosen by the cause.
+///
+/// A permission failure has two real remedies and Kin can run neither: moving
+/// the prefix somewhere the user owns, or running the same command with the
+/// privileges the current prefix needs. Naming both is the whole value, because
+/// the container this was found in has no `sudo` at all and the first is the
+/// only one available there.
+pub(crate) fn install_failure_remediation(
+    recipe: &LanguageServerRecipe,
+    reason: &str,
+) -> Vec<String> {
+    let command = recipe.command_line();
+    if !is_permission_failure(reason) {
+        return vec![format!(
+            "run `{command}` yourself to see the installer's own error"
+        )];
+    }
+    if recipe.program != "npm" {
+        return vec![format!(
+            "the directory `{command}` writes to refuses this user; fix its permissions, then \
+             run the command again"
+        )];
+    }
+    vec![
+        "point npm at a prefix you own, then install again:".to_string(),
+        "    npm config set prefix \"$HOME/.npm-global\"".to_string(),
+        "    export PATH=\"$HOME/.npm-global/bin:$PATH\"".to_string(),
+        format!("    {command}"),
+        format!(
+            "or install into the current prefix with the privileges it requires: sudo {command}"
+        ),
+    ]
+}
+
+/// What to tell an operator whose install succeeded somewhere nothing reads.
+pub(crate) fn unreachable_after_install_remediation(recipe: &LanguageServerRecipe) -> Vec<String> {
+    let command = recipe.command_line();
+    if recipe.program == "npm" {
+        return vec![
+            format!(
+                "`{command}` reported success, so the package landed outside this shell's PATH"
+            ),
+            "`npm prefix -g` prints the prefix; add its `bin` subdirectory to PATH".to_string(),
+        ];
+    }
+    vec![format!(
+        "`{command}` reported success, so the binary landed outside this shell's PATH; add the \
+         directory {} installs into to PATH",
+        recipe.program
+    )]
+}
+
+/// Run a recipe's install command, streaming the installer's own output.
+///
+/// Two things happen here that a bare `status()` cannot do. The prefix is
+/// checked before the command runs, because `npm install -g` against a prefix
+/// this user cannot write ends in an EACCES trace that is npm's diagnostic
+/// rather than Kin's, and Kin can know the answer without spending the attempt.
+/// And stderr is teed rather than inherited, so the operator still reads the
+/// installer live while a failure keeps the installer's own words for the
+/// report at the end: a reason that says only "exited with 243" sends someone
+/// back to scroll a terminal for the cause (FIR-2547).
 pub(crate) fn run_install(recipe: &LanguageServerRecipe) -> Result<(), String> {
-    let status = Command::new(recipe.program)
+    if let Some(blocker) = install_blocker(recipe) {
+        return Err(blocker);
+    }
+    let mut child = Command::new(recipe.program)
         .args(recipe.args)
-        .status()
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|error| format!("could not run `{}`: {error}", recipe.command_line()))?;
+    let mut stderr_lines: Vec<String> = Vec::new();
+    if let Some(stderr) = child.stderr.take() {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            // Written rather than `eprintln!`, and the error dropped on
+            // purpose. Rust ignores SIGPIPE, so `eprintln!` panics when the
+            // reader has gone away, and the process exits 101. A caller who
+            // piped this run into `head` would then get a panic exit out of an
+            // install that completed, which is the same lie as the exit 0 this
+            // ticket is about, told in the other direction. An echoed progress
+            // line is not worth an exit code.
+            let _ = writeln!(std::io::stderr(), "{line}");
+            if stderr_lines.len() < MAX_RETAINED_INSTALLER_LINES {
+                stderr_lines.push(line);
+            }
+        }
+    }
+    let status = child
+        .wait()
+        .map_err(|error| format!("could not wait for `{}`: {error}", recipe.command_line()))?;
     if status.success() {
         Ok(())
     } else {
-        Err(format!(
-            "`{}` exited with {}",
-            recipe.command_line(),
-            status
-                .code()
-                .map(|code| code.to_string())
-                .unwrap_or_else(|| "a signal".to_string())
+        Err(installer_failure_reason(
+            &recipe.command_line(),
+            status.code(),
+            &stderr_lines,
         ))
     }
 }
@@ -535,6 +781,130 @@ mod tests {
                  TypeScript installation\" and exits."
             );
         }
+    }
+
+    /// The pin has to survive every line that quotes the command back.
+    ///
+    /// The remediation for a permission failure hands the operator the same
+    /// install to run under `sudo` or under a prefix they own, and a copy that
+    /// dropped the pin would walk them into TypeScript 7 by hand. It is
+    /// composed from the recipe rather than restated, and this is what holds
+    /// that composition to it.
+    #[test]
+    fn the_remediation_quotes_the_install_with_its_pin_intact() {
+        for language in [LanguageId::TypeScript, LanguageId::JavaScript] {
+            let recipe = recipe_for(language).expect("language must have a recipe");
+            let lines = install_failure_remediation(
+                recipe,
+                "npm error code EACCES: permission denied, mkdir '/usr/local/lib/node_modules'",
+            );
+            let quoting: Vec<&String> = lines
+                .iter()
+                .filter(|line| line.contains("npm install -g"))
+                .collect();
+            assert!(
+                !quoting.is_empty(),
+                "{language}: the permission remedy must hand back the install command"
+            );
+            for line in quoting {
+                assert!(
+                    line.contains("typescript@^5"),
+                    "{language}: a remedy quoting the install dropped the 5.x pin, which walks \
+                     the operator into the TypeScript 7 that ships no lib/tsserver.js: {line}"
+                );
+            }
+        }
+    }
+
+    /// An unwritable global prefix is Kin's finding, not npm's stack trace.
+    #[test]
+    fn an_unwritable_npm_prefix_is_named_before_the_install_runs() {
+        let refused = NpmGlobalPrefix {
+            prefix: PathBuf::from("/usr/local"),
+            install_dir: PathBuf::from("/usr/local/lib/node_modules"),
+            writable: false,
+        };
+        let blocker = npm_prefix_blocker(&refused)
+            .expect("a prefix this user cannot write must block the install");
+        assert!(blocker.contains("/usr/local"), "{blocker}");
+        assert!(blocker.contains("/usr/local/lib/node_modules"), "{blocker}");
+        assert!(is_permission_failure(&blocker), "{blocker}");
+
+        // Positive control: the same probe on a prefix the user owns must let
+        // the install proceed, or this check would refuse every host.
+        let owned = NpmGlobalPrefix {
+            prefix: PathBuf::from("/home/dev/.npm-global"),
+            install_dir: PathBuf::from("/home/dev/.npm-global/lib/node_modules"),
+            writable: true,
+        };
+        assert_eq!(npm_prefix_blocker(&owned), None);
+    }
+
+    /// A permission failure gets the two remedies that exist, and Kin can run
+    /// neither: a prefix the user owns, or the privileged command.
+    #[test]
+    fn a_permission_failure_names_a_prefix_the_user_owns_and_the_privileged_command() {
+        let recipe = recipe_for(LanguageId::Python).expect("python must have a recipe");
+        let lines = install_failure_remediation(
+            recipe,
+            "`npm install -g pyright` exited with 243: npm error code EACCES; npm error Error: \
+             EACCES: permission denied, mkdir '/usr/local/lib/node_modules/pyright'",
+        );
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("npm config set prefix"),
+            "the container that found this has no sudo at all, so the prefix move is the only \
+             remedy available there: {joined}"
+        );
+        assert!(joined.contains("sudo npm install -g pyright"), "{joined}");
+    }
+
+    /// A failure that is not about permissions must not be handed a permission
+    /// remedy, or the advice sends an operator to change a prefix that was
+    /// never the problem.
+    #[test]
+    fn a_failure_that_is_not_about_permissions_gets_no_permission_remedy() {
+        let recipe = recipe_for(LanguageId::Python).expect("python must have a recipe");
+        let lines = install_failure_remediation(
+            recipe,
+            "`npm install -g pyright` exited with 1: npm error code E404; npm error 404 Not Found",
+        );
+        let joined = lines.join("\n");
+        assert!(!joined.contains("npm config set prefix"), "{joined}");
+        assert!(!joined.contains("sudo"), "{joined}");
+        assert!(joined.contains("npm install -g pyright"), "{joined}");
+    }
+
+    /// The failure reason has to carry the installer's own words.
+    ///
+    /// An exit code alone is what sent the reader of the run this came from
+    /// back to scroll a terminal: 243 names nothing, while the code, the
+    /// syscall and the path name the whole cause.
+    #[test]
+    fn an_installer_failure_reason_carries_the_installers_own_words() {
+        let stderr: Vec<String> = [
+            "npm error code EACCES",
+            "npm error syscall mkdir",
+            "npm error path /usr/local/lib/node_modules/pyright",
+            "npm error errno -13",
+        ]
+        .iter()
+        .map(|line| (*line).to_string())
+        .collect();
+        let reason = installer_failure_reason("npm install -g pyright", Some(243), &stderr);
+        assert!(reason.contains("243"), "{reason}");
+        assert!(reason.contains("EACCES"), "{reason}");
+        assert!(
+            reason.contains("/usr/local/lib/node_modules/pyright"),
+            "{reason}"
+        );
+        assert!(is_permission_failure(&reason), "{reason}");
+
+        // An installer that said nothing recognisable still reports its exit,
+        // and must not invent an error it never printed.
+        let quiet = installer_failure_reason("npm install -g pyright", Some(1), &[]);
+        assert_eq!(quiet, "`npm install -g pyright` exited with 1");
+        assert!(!is_permission_failure(&quiet), "{quiet}");
     }
 
     /// One npm package serves both JavaScript and TypeScript, so the advice is

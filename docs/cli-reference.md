@@ -2369,7 +2369,7 @@ kin support [options]
 
 ### `kin daemon`
 
-Inspect and gracefully stop Kin daemons
+Inspect Kin daemons, stop them gracefully, or ask one to enrich
 
 ```
 kin daemon <subcommand>
@@ -2401,6 +2401,21 @@ kin daemon stop [options]
 | --- | --- | --- |
 | `--all` |  | Stop every worker daemon under this KIN_HOME, then the supervisor  The supervisor is machine-wide, so it can hold daemons from other managed homes. Those are skipped and named rather than stopped, and the supervisor itself is left running while any of them remain. Use --machine to stop every daemon on the box regardless of home. |
 | `--machine` |  | Widen --all to every daemon on this machine, whatever KIN_HOME it runs under |
+| `--json` |  | Emit machine-readable JSON |
+
+#### `kin daemon sweep`
+
+Ask this repository's daemon for a language-server enrichment sweep
+
+```
+kin daemon sweep [options]
+```
+
+The sweep derives the cross-file reference, override and type-use edges a single-file parse cannot, and it skips files the graph already holds server evidence for. `kin init` runs one and every daemon start queues one, so this is the surface for the case those did not finish: a sweep killed with its daemon, a store converted before a language server was installed, or a repository whose sweeps the daemon has stopped queueing because the last three all died without enriching anything. It prints the daemon's own answer, waits for the sweep by default, and fails loudly when no daemon answers or when the daemon has no language server to enrich with.
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--no-wait` |  | Return as soon as the sweep is queued, instead of waiting for it |
 | `--json` |  | Emit machine-readable JSON |
 
 ### `kin registry`

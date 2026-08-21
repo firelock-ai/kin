@@ -22,7 +22,7 @@ pub use change_shape::{
 };
 pub use diff::{
     compute_diff, diff_from_change, diff_from_changes, diff_from_entity_ids, diff_from_files,
-    EntityChange, EntityChangeKind, SemanticDiff,
+    is_semantic_modification, EntityChange, EntityChangeKind, SemanticDiff,
 };
 pub use error::ReviewError;
 pub use format::{
@@ -35,9 +35,9 @@ pub use inline::{
     CONSUMER_FANOUT_THRESHOLD,
 };
 pub use ranked_impact::{
-    rank_impact, rank_impact_at, CandidateLocation, ImpactBucket, PriorityScoreComponents,
-    RankedImpactCandidate, RankedImpactReport, RelationPathStep, StableEntityIdentity,
-    PRIORITY_SCORE_FORMULA, RANKED_IMPACT_SCHEMA_VERSION,
+    is_impact_relation, rank_impact, rank_impact_at, CandidateLocation, ImpactBucket,
+    PriorityScoreComponents, RankedImpactCandidate, RankedImpactReport, RelationPathStep,
+    StableEntityIdentity, IMPACT_MAX_DEPTH, PRIORITY_SCORE_FORMULA, RANKED_IMPACT_SCHEMA_VERSION,
 };
 pub use ref_graph::GraphAtRef;
 pub use release_gate::{

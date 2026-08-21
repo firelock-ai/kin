@@ -222,6 +222,15 @@ pub struct DaemonSearchResponse {
     /// searches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_coverage: Option<crate::commands::locate::SemanticCoverage>,
+    /// Why an empty result is not evidence the repository holds no such
+    /// declaration, or empty when the verdict certifies (FIR-2524).
+    ///
+    /// Carried as data rather than rendered at the source because this response
+    /// is structured and printed client-side, so the verdict is computed where
+    /// the graph and the daemon's substrate reading are and spoken where the
+    /// reader is.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub absence_qualifier: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -474,12 +483,47 @@ async fn run_daemon_search(
     client.search(request).await.context("daemon search failed")
 }
 
+/// The absence qualifier for a search that matched nothing.
+///
+/// `semantic_search` declares NO edge class and is language-scoped instead, so
+/// its gate reads the scope the extractor populated rather than cross-file
+/// coverage, and its honest sentence is about what the index admitted rather
+/// than about missing edges. Handing it the reference-coverage observation would
+/// gate it on evidence it never gathers.
+fn search_absence_qualifier(
+    graph: &kin_db::InMemoryGraph,
+    envelope: &kin_mcp::Envelope,
+) -> Vec<String> {
+    let scoped = match graph.query_entities(&kin_model::graph::EntityFilter::default()) {
+        Ok(scoped) => scoped,
+        // An unreadable scope is not an empty one. Saying nothing here is the
+        // conservative direction: the gate refuses on an unreported observation
+        // anyway, and inventing a scope count would be the fabrication this
+        // change exists to stop.
+        Err(_) => return Vec::new(),
+    };
+    let payload = serde_json::json!({
+        "results": [],
+        "total_matches": 0,
+        kin_mcp::EDGE_COVERAGE_KEY: kin_mcp::edge_coverage::observe_absence_scope(
+            &kin_mcp::edge_coverage::languages_of(&scoped),
+            Some(scoped.len()),
+        ),
+    });
+    crate::commands::absence_qualifier::qualify("semantic_search", &payload, envelope, "")
+}
+
 pub fn collect_daemon_search_response(
     graph: &kin_db::InMemoryGraph,
     request: &DaemonSearchRequest,
+    envelope: &kin_mcp::Envelope,
 ) -> Result<DaemonSearchResponse> {
     if request.semantic {
-        return collect_daemon_semantic_search_response(graph, request);
+        let mut response = collect_daemon_semantic_search_response(graph, request, envelope)?;
+        if response.records.is_empty() {
+            response.absence_qualifier = search_absence_qualifier(graph, envelope);
+        }
+        return Ok(response);
     }
 
     let results = collect_search_results(
@@ -499,6 +543,11 @@ pub fn collect_daemon_search_response(
         .iter()
         .map(|matched| record_to_daemon_record(&matched.record, matched.match_kind, matched.score))
         .collect::<Vec<_>>();
+    let absence_qualifier = if records.is_empty() {
+        search_absence_qualifier(graph, envelope)
+    } else {
+        Vec::new()
+    };
     Ok(DaemonSearchResponse {
         query: request.query.clone(),
         semantic: false,
@@ -506,6 +555,7 @@ pub fn collect_daemon_search_response(
         total_matches: records.len(),
         records,
         semantic_coverage: None,
+        absence_qualifier,
     })
 }
 
@@ -513,9 +563,11 @@ pub fn collect_daemon_search_response(
 fn collect_daemon_semantic_search_response(
     graph: &kin_db::InMemoryGraph,
     request: &DaemonSearchRequest,
+    envelope: &kin_mcp::Envelope,
 ) -> Result<DaemonSearchResponse> {
     let _ = graph;
     let _ = request;
+    let _ = envelope;
     anyhow::bail!("semantic search requires vector-enabled Kin embeddings")
 }
 
@@ -523,6 +575,7 @@ fn collect_daemon_semantic_search_response(
 fn collect_daemon_semantic_search_response(
     graph: &kin_db::InMemoryGraph,
     request: &DaemonSearchRequest,
+    envelope: &kin_mcp::Envelope,
 ) -> Result<DaemonSearchResponse> {
     let coverage = evaluate_semantic_coverage(graph)?;
     let limit = request.limit.unwrap_or(10);
@@ -537,6 +590,7 @@ fn collect_daemon_semantic_search_response(
                 body_limit: None,
                 ..request.clone()
             },
+            envelope,
         )?;
         response.semantic = true;
         response.text_fallback = true;
@@ -644,6 +698,11 @@ fn collect_daemon_semantic_search_response(
         }
     }
 
+    let absence_qualifier = if records.is_empty() {
+        search_absence_qualifier(graph, envelope)
+    } else {
+        Vec::new()
+    };
     Ok(DaemonSearchResponse {
         query: request.query.clone(),
         semantic: true,
@@ -651,6 +710,7 @@ fn collect_daemon_semantic_search_response(
         total_matches: records.len(),
         records,
         semantic_coverage: Some(coverage),
+        absence_qualifier,
     })
 }
 
@@ -1231,6 +1291,11 @@ fn render_daemon_search_response(
         } else {
             println!("No results matching '{}'", response.query);
         }
+        // The banner alone says a query matched nothing, never whether this index
+        // could have matched it (FIR-2524).
+        for line in &response.absence_qualifier {
+            println!("{line}");
+        }
         return Ok(());
     }
 
@@ -1501,6 +1566,17 @@ fn parse_language(s: &str) -> Option<LanguageId> {
 // rendering; graph-assigned IDs are path-derived for these in-test records, so
 // the deprecated path constructor is the correct fixture tool here.
 mod tests {
+    /// A daemon whose substrate is sound, so the FIR-2524 absence qualifier
+    /// answers on the scope observation rather than on the envelope.
+    fn healthy_search_envelope() -> kin_mcp::Envelope {
+        kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 2,
+            "graph_generation": 1,
+        }))
+    }
+
     use super::{
         enforce_precise_search_mode, looks_precise_name, parse_kinds, record_display_context,
         record_preview, SearchRecord,
@@ -1734,6 +1810,7 @@ mod tests {
                     show_body: false,
                     body_limit: None,
                 },
+                &healthy_search_envelope(),
             )
             .expect("search")
         };
@@ -1863,6 +1940,7 @@ mod tests {
         };
 
         let response = DaemonSearchResponse {
+            absence_qualifier: Vec::new(),
             query: "zzz_this_symbol_does_not_exist_anywhere_9f3a".into(),
             semantic: false,
             text_fallback: true,
