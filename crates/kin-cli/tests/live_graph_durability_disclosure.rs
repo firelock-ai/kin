@@ -65,11 +65,59 @@ const WATCHER_RECORD: &str = "started file watcher";
 /// into repository authority (`crates/kin-daemon/src/loop_runner.rs`).
 const ADMISSION_RECORD: &str = "admitted exact workspace tree into repository authority";
 
+/// The settle budget a quiet host needs, and the floor every busier host starts
+/// from.
+///
+/// Generous against the few hundred milliseconds this repository's four vectors
+/// take, so expiry on an idle box means the lock is never being yielded rather
+/// than that embedding was merely busy.
+const RETRY_BOUND_FLOOR: Duration = Duration::from_secs(30);
+
+/// The most the settle may stretch to, so a daemon that never yields the lock
+/// still fails inside a bounded pass.
+///
+/// The same 120 seconds [`ADMISSION_BOUND`] allows itself, for the same reason:
+/// the wait is event driven, so a passing run never spends it, and this is only
+/// how long a run that is going to fail spends proving it.
+const RETRY_BOUND_CEILING: Duration = Duration::from_secs(120);
+
 /// How long the fixture will keep repeating a session while `kin_graph_status`
-/// refuses to sample its counts. Generous against the few hundred milliseconds
-/// this repository's four vectors take, so expiry means the lock is never being
-/// yielded rather than that embedding was merely busy.
-const RETRY_BOUND: Duration = Duration::from_secs(30);
+/// refuses to sample its counts, scaled by how oversubscribed this host is.
+///
+/// A single fixed number was calibrated for an idle box and had no margin left
+/// on a busy one. Three solo runs of this case on an idle eighteen core
+/// workstation took 25.9, 29.0 and 27.7 seconds end to end against a settle
+/// bound of 30, so the case was already finishing inside a budget it had nearly
+/// spent. Under fleet co-load the same case ran 70.3 seconds and the settle
+/// burned all thirty of them without the daemon ever answering wrongly: it was
+/// asking to be retried while the embedding-work lock moved, which is its
+/// documented answer. The host read load average 136 on those eighteen cores at
+/// the time, on a pass whose slowest routine test took 413 seconds.
+///
+/// What the settle waits on is the daemon finishing embedding work, and that is
+/// CPU time competing with everything else on the host, so the budget tracks
+/// the competition. The floor stays what a quiet box needs, which keeps the
+/// discrimination this bound exists for: on an unloaded machine a daemon that
+/// never yields still fails in thirty seconds, exactly as before.
+fn retry_bound() -> Duration {
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    scaled_retry_bound(sysinfo::System::load_average().one, cores)
+}
+
+/// [`RETRY_BOUND_FLOOR`] stretched by run-queue depth per core.
+///
+/// Split from the reading above so the arithmetic can be driven with observed
+/// numbers rather than with whatever the box running the tests happens to
+/// report at that instant.
+fn scaled_retry_bound(run_queue_depth: f64, cores: usize) -> Duration {
+    let widest = RETRY_BOUND_CEILING.as_secs_f64() / RETRY_BOUND_FLOOR.as_secs_f64();
+    let stretch = run_queue_depth / cores.max(1) as f64;
+    // Platforms that do not publish a load average report zero, and a garbled
+    // reading is not a reason to change the budget, so anything that is not a
+    // finite number falls back to the floor rather than propagating.
+    let stretch = if stretch.is_finite() { stretch } else { 1.0 };
+    RETRY_BOUND_FLOOR.mul_f64(stretch.clamp(1.0, widest))
+}
 
 struct IsolatedDaemon {
     child: Option<common::RuntimeOwnedChild>,
@@ -492,7 +540,7 @@ fn asks_for_retry(payload: &serde_json::Value) -> bool {
 /// mask: a daemon that never yields the lock still fails, naming how many times
 /// it refused.
 fn settled_mcp_session(repo: &Path, home: &Path, port: u16) -> Vec<(u64, serde_json::Value)> {
-    let deadline = Instant::now() + RETRY_BOUND;
+    let deadline = Instant::now() + retry_bound();
     let mut refusals = 0_u32;
     loop {
         let session = run_mcp_session(repo, home, port);
@@ -660,4 +708,68 @@ fn mcp_status_and_locate_disclose_live_only_entities_and_then_stop_once_a_commit
     );
 
     daemon.stop();
+}
+
+#[test]
+fn a_quiet_host_keeps_the_settle_budget_the_fixed_bound_gave_it() {
+    // The property the stretch must not cost: on a box that is not fighting
+    // anyone, a daemon that never yields the lock still fails in thirty
+    // seconds. The stretch is for contention, so a host at or under its own
+    // core count gets nothing extra.
+    assert_eq!(
+        scaled_retry_bound(1.2, 18),
+        RETRY_BOUND_FLOOR,
+        "an idle host must keep paying exactly the old price"
+    );
+    assert_eq!(
+        scaled_retry_bound(18.0, 18),
+        RETRY_BOUND_FLOOR,
+        "a host busy up to its core count is not oversubscribed"
+    );
+}
+
+#[test]
+fn the_load_that_produced_the_failure_buys_a_budget_that_covers_it() {
+    // The reading taken when this case failed: load average 136.33 on eighteen
+    // cores, in a pass where the case itself ran 70.265 seconds and the settle
+    // spent all thirty of its seconds inside that.
+    let bound = scaled_retry_bound(136.33, 18);
+    assert_eq!(
+        bound, RETRY_BOUND_CEILING,
+        "seven times oversubscribed is past the widest stretch, so the ceiling applies"
+    );
+    assert!(
+        bound >= Duration::from_secs_f64(70.265),
+        "the budget has to cover what that run actually spent, and {bound:?} does not"
+    );
+}
+
+#[test]
+fn the_stretch_is_proportional_and_survives_a_host_that_reports_nothing() {
+    assert_eq!(
+        scaled_retry_bound(36.0, 18),
+        Duration::from_secs(60),
+        "twice oversubscribed buys twice the floor, not the ceiling"
+    );
+    assert_eq!(
+        scaled_retry_bound(0.0, 18),
+        RETRY_BOUND_FLOOR,
+        "a platform that publishes no load average must not shrink the budget"
+    );
+    assert_eq!(
+        scaled_retry_bound(f64::NAN, 18),
+        RETRY_BOUND_FLOOR,
+        "a garbled reading is not a reason to change the budget"
+    );
+    assert_eq!(
+        scaled_retry_bound(f64::INFINITY, 18),
+        RETRY_BOUND_FLOOR,
+        "an unbounded reading is garbled rather than evidence of load, and must not \
+         stretch anything"
+    );
+    assert_eq!(
+        scaled_retry_bound(4.0, 0),
+        RETRY_BOUND_CEILING,
+        "a host reporting no cores at all must not divide by zero"
+    );
 }
