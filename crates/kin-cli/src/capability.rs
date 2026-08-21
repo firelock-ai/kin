@@ -484,30 +484,6 @@ fn parse_v1_cpu_quota(quota_us: i64, period_us: i64) -> Option<usize> {
     Some(((quota_us as u64).div_ceil(period_us as u64) as usize).max(1))
 }
 
-/// Byte limit from a cgroup v2 `memory.max` value, or `None` for "max" /
-/// unparsable.
-#[cfg(any(target_os = "linux", test))]
-fn parse_v2_memory_max(contents: &str) -> Option<u64> {
-    let trimmed = contents.trim();
-    if trimmed == "max" {
-        return None;
-    }
-    trimmed.parse().ok()
-}
-
-/// Byte limit from a cgroup v1 `memory.limit_in_bytes`. An unconstrained group
-/// reports a huge page-aligned sentinel near `u64::MAX`; any value ≥ 1 PiB is
-/// that sentinel, not a real cap.
-#[cfg(any(target_os = "linux", test))]
-fn parse_v1_memory_limit(raw: u64) -> Option<u64> {
-    const ONE_PIB: u64 = 1 << 50;
-    if raw >= ONE_PIB {
-        None
-    } else {
-        Some(raw)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

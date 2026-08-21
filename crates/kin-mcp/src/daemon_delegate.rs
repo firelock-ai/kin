@@ -4610,4 +4610,32 @@ mod tests {
             "the reason nothing is attributed belongs in the message: {message}"
         );
     }
+
+    /// The `negative` envelope is attached by message wording: six named tools
+    /// whose error text contains "no entity" or "entity not found"
+    /// (`crate::negative::is_resolution_miss`). A sentence appended to a
+    /// daemon-loss error must therefore not speak that language, or a transport
+    /// failure would start carrying a resolution-miss verdict about an entity
+    /// nobody asked about.
+    #[test]
+    fn the_recorded_cause_never_speaks_the_negative_envelope_s_language() {
+        let record = memory_kill_record(4);
+        let unattributed = kin_daemon_spawn::DaemonKillRecord {
+            memory_kills: 0,
+            last_cause: kin_daemon_spawn::DaemonKillCause::Unattributed { signal: 9 },
+            limit_bytes: None,
+            ..memory_kill_record(2)
+        };
+        for record in [&record, &unattributed] {
+            for message in [
+                revival_failed_message("tool find_references", "url", "err", "err", Some(record)),
+                revived_retry_failed_message("tool find_references", "url", "err", Some(record)),
+                transport_dropped_message("MCP tool call", "err", Some(record)),
+            ] {
+                let lowered = message.to_ascii_lowercase();
+                assert!(!lowered.contains("no entity"), "{message}");
+                assert!(!lowered.contains("entity not found"), "{message}");
+            }
+        }
+    }
 }
