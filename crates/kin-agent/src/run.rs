@@ -4,7 +4,7 @@
 //! The agent loop.
 
 use crate::belt::{self, Belt, LocalTool, Route};
-use crate::mcp::{McpClient, ToolOutcome};
+use crate::mcp::{McpClient, McpError, McpTool, ToolOutcome};
 use crate::parse::{self, Turn};
 use crate::provider::{Provider, ProviderError, Usage};
 use crate::transcript::{now_iso, TranscriptWriter};
@@ -49,6 +49,55 @@ others.
 
 Work in small steps. Call one or two tools, read what came back, then decide. When you have \
 the answer, say it in plain text without calling a tool.";
+
+/// One attached graph server and the repository it serves.
+///
+/// A run holds one of these per repository. Everything that has to reach a particular
+/// graph goes through the server that owns the path, which is what keeps a two-repository
+/// run from committing one repository's change into the other's graph.
+struct Server {
+    /// `None` for a single-server run, whose tools keep the historical `mcp__kin__`
+    /// prefix. `Some(label)` once several are attached and they must be told apart.
+    label: Option<String>,
+    repo: std::path::PathBuf,
+    client: McpClient,
+    declared: Vec<McpTool>,
+    session: Option<String>,
+}
+
+impl Server {
+    /// How this server is named in the trace.
+    fn name(&self) -> String {
+        match &self.label {
+            None => "kin".to_string(),
+            Some(label) => format!("kin_{label}"),
+        }
+    }
+
+    /// Whether this server declares a tool by that exact name.
+    fn declares(&self, tool: &str) -> bool {
+        self.declared.iter().any(|declared| declared.name == tool)
+    }
+}
+
+/// What the model is told about paths once a run attaches several repositories.
+fn repo_path_note(repos: &[std::path::PathBuf]) -> String {
+    let primary = repos
+        .first()
+        .map(|repo| repo.display().to_string())
+        .unwrap_or_default();
+    let others: Vec<String> = repos
+        .iter()
+        .skip(1)
+        .map(|repo| repo.display().to_string())
+        .collect();
+    format!(
+        "This run has {} repositories attached. A relative path is read inside the primary \
+         repository at {primary}. To change a file in {}, give its absolute path.",
+        repos.len(),
+        others.join(" or ")
+    )
+}
 
 struct Counters {
     tool_calls: u32,
@@ -139,72 +188,106 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
     });
 
     // Connect to Kin first. A run that could not attach must be loud, not quietly scored.
-    let mut mcp = match McpClient::start(&config.mcp_command, &config.repo, config.mcp_timeout) {
-        Ok(client) => client,
-        Err(err) => {
-            let message = err.to_string();
-            writer.init(
-                &config.provider.model,
-                &config.repo,
-                &[],
-                "failed",
-                std::slice::from_ref(&message),
-                agent_meta,
-            )?;
-            return finish(
-                writer,
-                &config,
-                ExitStatus::McpError,
-                "the MCP server did not start",
-                &message,
-                counters,
-                started,
-                None,
-            );
-        }
-    };
+    // One server per repository, primary first, each spawned in the tree it serves.
+    let wanted = config.servers();
+    let multi = wanted.len() > 1;
+    let mut servers: Vec<Server> = Vec::new();
+    let mut taken: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for spec in &wanted {
+        let attach = |err: McpError| {
+            if multi {
+                format!("{err} (serving {})", spec.repo.display())
+            } else {
+                err.to_string()
+            }
+        };
+        let mut client = match McpClient::start(&spec.mcp_command, &spec.repo, config.mcp_timeout) {
+            Ok(client) => client,
+            Err(err) => {
+                let message = attach(err);
+                writer.init(
+                    &config.provider.model,
+                    &config.repo,
+                    &[],
+                    "failed",
+                    std::slice::from_ref(&message),
+                    agent_meta,
+                )?;
+                return finish(
+                    writer,
+                    &config,
+                    ExitStatus::McpError,
+                    "the MCP server did not start",
+                    &message,
+                    counters,
+                    started,
+                    None,
+                );
+            }
+        };
+        let declared = match client.list_tools() {
+            Ok(tools) => tools,
+            Err(err) => {
+                let message = attach(err);
+                writer.init(
+                    &config.provider.model,
+                    &config.repo,
+                    &[],
+                    "failed",
+                    std::slice::from_ref(&message),
+                    agent_meta,
+                )?;
+                return finish(
+                    writer,
+                    &config,
+                    ExitStatus::McpError,
+                    "the MCP server did not list its tools",
+                    &message,
+                    counters,
+                    started,
+                    None,
+                );
+            }
+        };
+        // A single-server run carries no label, so its tools keep the historical
+        // `mcp__kin__` prefix and its transcript stays what the analyzers already read.
+        let label = if multi {
+            let label = belt::server_label(&spec.repo, &taken);
+            taken.insert(label.clone());
+            Some(label)
+        } else {
+            None
+        };
+        servers.push(Server {
+            label,
+            repo: spec.repo.clone(),
+            client,
+            declared,
+            session: None,
+        });
+    }
 
-    let declared = match mcp.list_tools() {
-        Ok(tools) => tools,
-        Err(err) => {
-            let message = err.to_string();
-            writer.init(
-                &config.provider.model,
-                &config.repo,
-                &[],
-                "failed",
-                std::slice::from_ref(&message),
-                agent_meta,
-            )?;
-            return finish(
-                writer,
-                &config,
-                ExitStatus::McpError,
-                "the MCP server did not list its tools",
-                &message,
-                counters,
-                started,
-                None,
-            );
+    let mut kin_tools: Vec<belt::KinTool> = Vec::new();
+    for (index, server) in servers.iter().enumerate() {
+        let prefix = belt::tool_prefix(server.label.as_deref());
+        for tool in &server.declared {
+            if belt::is_harness_owned(&tool.name) {
+                continue;
+            }
+            kin_tools.push(belt::KinTool {
+                server: index,
+                bare: tool.name.clone(),
+                exposed: format!("{prefix}{}", tool.name),
+                description: tool.description.clone(),
+                schema: tool.input_schema.clone(),
+            });
         }
-    };
-
-    let server_tool_names: Vec<String> = declared.iter().map(|tool| tool.name.clone()).collect();
-    let exposed: Vec<_> = declared
-        .iter()
-        .filter(|tool| !belt::is_harness_owned(&tool.name))
-        .collect();
-    let belt = Belt::new(
-        exposed
-            .iter()
-            .map(|tool| (tool.name.clone(), tool.input_schema.clone()))
-            .collect(),
-    );
-    let descriptions: Vec<(String, String)> = exposed
-        .iter()
-        .map(|tool| (tool.name.clone(), tool.description.clone()))
-        .collect();
-    let specs = belt.to_specs(&descriptions);
+    }
+    let belt = Belt::new(kin_tools);
+    let repo_roots: Vec<std::path::PathBuf> =
+        servers.iter().map(|server| server.repo.clone()).collect();
+    let repo_note = multi.then(|| repo_path_note(&repo_roots));
+    let specs = belt.to_specs(repo_note.as_deref());
     let tool_names: Vec<String> = belt.names().iter().cloned().collect();
 
     writer.init(
@@ -218,15 +301,33 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
 
     let provider = Provider::new(config.provider.clone())?;
 
-    // Open a Kin session so every mutation this run makes names this agent rather than an
-    // anonymous file write. A server without the tool is not an error; it just means the
-    // provenance bracket is unavailable and the trace says so.
-    let kin_session = start_kin_session(&mut mcp, &config, &server_tool_names, &mut writer)?;
+    // Open a Kin session per server, so every mutation this run makes names this agent
+    // rather than an anonymous file write. A server without the tool is not an error; it
+    // just means the provenance bracket is unavailable there and the trace says so.
+    for server in servers.iter_mut() {
+        let session = start_kin_session(server, &config, &mut writer)?;
+        server.session = session;
+    }
 
-    let system_prompt = config
+    let mut system_prompt = config
         .system_prompt
         .clone()
         .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
+    // The repository roots are a fact about this run that the model cannot infer, and
+    // without them it cannot address the second repository at all, so the note is appended
+    // to an operator-supplied prompt as well as to the built-in one.
+    if let Some(note) = repo_note.as_deref() {
+        let roots = repo_roots
+            .iter()
+            .map(|repo| repo.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        system_prompt.push_str(&format!(
+            "\n\nThe repositories attached to this run are: {roots}. Each has its own Kin \
+             graph, and its tools carry that repository's own prefix, so read the tool names \
+             you were given and call the one belonging to the repository you mean. {note}"
+        ));
+    }
     let mut messages = vec![
         json!({ "role": "system", "content": system_prompt }),
         json!({ "role": "user", "content": config.task }),
@@ -397,13 +498,18 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                             }))?;
                             (message, true)
                         }
-                        Route::Kin(name) => {
+                        Route::Kin {
+                            server: server_index,
+                            tool: name,
+                        } => {
+                            let server_name = servers[server_index].name();
                             match check_arguments(&belt, &call.name, &call.arguments) {
                                 Err(problem) => {
                                     counters.repairs += 1;
                                     writer.trace(json!({
                                         "tool_use_id": call.id,
                                         "surface": "kin",
+                                        "server": server_name,
                                         "tool": name,
                                         "args": call.arguments,
                                         "policy": "repaired",
@@ -421,7 +527,9 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                                     )
                                 }
                                 Ok(()) => {
-                                    let outcome = mcp.call_tool(&name, &call.arguments);
+                                    let outcome = servers[server_index]
+                                        .client
+                                        .call_tool(&name, &call.arguments);
                                     match outcome {
                                         Err(err) => {
                                             // The server died or stopped answering. Nothing
@@ -429,6 +537,7 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                                             writer.trace(json!({
                                                 "tool_use_id": call.id,
                                                 "surface": "kin",
+                                                "server": server_name,
                                                 "tool": name,
                                                 "args": call.arguments,
                                                 "policy": "allowed",
@@ -463,6 +572,7 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                                             writer.trace(json!({
                                                 "tool_use_id": call.id,
                                                 "surface": "kin",
+                                                "server": server_name,
                                                 "tool": name,
                                                 "args": call.arguments,
                                                 "wall_ms": outcome.wall_ms as u64,
@@ -504,65 +614,105 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                                 Ok(()) => {
                                     counters.local_calls += 1;
                                     let started_call = Instant::now();
-                                    // The plan is made before the tool runs, because
-                                    // `write_file` is what makes a new path exist and
-                                    // afterwards nothing can tell a create from an
-                                    // overwrite.
-                                    let plan = plan_stage(&config.repo, tool, &call.arguments);
-                                    let mut bracket = begin_transaction(
-                                        &mut mcp,
-                                        kin_session.as_deref(),
-                                        &server_tool_names,
-                                        &call.arguments,
-                                        &plan,
-                                        &mut writer,
-                                    )?;
-                                    let outcome = match tool {
-                                        LocalTool::Edit => {
-                                            belt::run_edit(&config.repo, &call.arguments)
+                                    // Which repository owns the path decides which graph
+                                    // the change is staged into, so it is resolved before
+                                    // anything is written. A path that belongs to no
+                                    // attached repository runs nothing at all.
+                                    let raw_path = call
+                                        .arguments
+                                        .get("path")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("");
+                                    match belt::resolve_across_repos(&repo_roots, raw_path) {
+                                        Err(problem) => {
+                                            writer.trace(json!({
+                                                "tool_use_id": call.id,
+                                                "surface": "local",
+                                                "tool": call.name,
+                                                "args": redact_content(&call.arguments),
+                                                "policy": "allowed",
+                                                "call_shape": call.shape.as_str(),
+                                                "problem": problem,
+                                                "is_error": true,
+                                            }))?;
+                                            (problem, true)
                                         }
-                                        LocalTool::Write => {
-                                            belt::run_write(&config.repo, &call.arguments)
-                                        }
-                                    };
-                                    // Stage what the harness just did, inside the open
-                                    // bracket, so the commit below has something to
-                                    // publish. An empty transaction is refused by design.
-                                    let staged = if outcome.is_error {
-                                        false
-                                    } else {
-                                        stage_planned_operation(
-                                            &mut mcp,
-                                            &mut bracket,
-                                            kin_session.as_deref(),
-                                            &plan,
-                                            &mut writer,
-                                        )?
-                                    };
-                                    let provenance = close_transaction(
-                                        &mut mcp,
-                                        bracket,
-                                        !outcome.is_error && staged,
-                                        &mut writer,
-                                    )?;
-                                    if let Some(path) = outcome.changed.clone() {
-                                        if !counters.edits.contains(&path) {
-                                            counters.edits.push(path);
+                                        Ok((index, resolved)) => {
+                                            let repo = servers[index].repo.clone();
+                                            let session = servers[index].session.clone();
+                                            let server_name = servers[index].name();
+                                            // The plan is made before the tool runs,
+                                            // because `write_file` is what makes a new
+                                            // path exist and afterwards nothing can tell a
+                                            // create from an overwrite.
+                                            let plan = plan_stage(&repo, tool, &call.arguments);
+                                            let mut bracket = begin_transaction(
+                                                &mut servers[index],
+                                                session.as_deref(),
+                                                &call.arguments,
+                                                &plan,
+                                                &mut writer,
+                                            )?;
+                                            let outcome = match tool {
+                                                LocalTool::Edit => {
+                                                    belt::run_edit(&repo, &call.arguments)
+                                                }
+                                                LocalTool::Write => {
+                                                    belt::run_write(&repo, &call.arguments)
+                                                }
+                                            };
+                                            // Stage what the harness just did, inside the
+                                            // open bracket, so the commit below has
+                                            // something to publish. An empty transaction
+                                            // is refused by design.
+                                            let staged = if outcome.is_error {
+                                                false
+                                            } else {
+                                                stage_planned_operation(
+                                                    &mut servers[index],
+                                                    &mut bracket,
+                                                    session.as_deref(),
+                                                    &plan,
+                                                    &mut writer,
+                                                )?
+                                            };
+                                            let provenance = close_transaction(
+                                                &mut servers[index],
+                                                bracket,
+                                                !outcome.is_error && staged,
+                                                &mut writer,
+                                            )?;
+                                            if let Some(path) = outcome.changed.clone() {
+                                                // With several repositories attached the
+                                                // same relative path exists in more than
+                                                // one, so the record is absolute or it
+                                                // names nothing in particular.
+                                                let recorded = if multi {
+                                                    resolved.display().to_string()
+                                                } else {
+                                                    path
+                                                };
+                                                if !counters.edits.contains(&recorded) {
+                                                    counters.edits.push(recorded);
+                                                }
+                                            }
+                                            writer.trace(json!({
+                                                "tool_use_id": call.id,
+                                                "surface": "local",
+                                                "server": server_name,
+                                                "repo": repo.display().to_string(),
+                                                "tool": call.name,
+                                                "args": redact_content(&call.arguments),
+                                                "wall_ms": started_call.elapsed().as_millis() as u64,
+                                                "is_error": outcome.is_error,
+                                                "policy": "allowed",
+                                                "call_shape": call.shape.as_str(),
+                                                "changed": outcome.changed,
+                                                "provenance": provenance,
+                                            }))?;
+                                            (outcome.text, outcome.is_error)
                                         }
                                     }
-                                    writer.trace(json!({
-                                        "tool_use_id": call.id,
-                                        "surface": "local",
-                                        "tool": call.name,
-                                        "args": redact_content(&call.arguments),
-                                        "wall_ms": started_call.elapsed().as_millis() as u64,
-                                        "is_error": outcome.is_error,
-                                        "policy": "allowed",
-                                        "call_shape": call.shape.as_str(),
-                                        "changed": outcome.changed,
-                                        "provenance": provenance,
-                                    }))?;
-                                    (outcome.text, outcome.is_error)
                                 }
                             }
                         }
@@ -588,12 +738,9 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
         }
     }
 
-    end_kin_session(
-        &mut mcp,
-        kin_session.as_deref(),
-        &server_tool_names,
-        &mut writer,
-    )?;
+    for server in servers.iter_mut() {
+        end_kin_session(server, &mut writer)?;
+    }
     finish(
         writer,
         &config,
@@ -720,14 +867,15 @@ fn complete_with_retry(
 }
 
 fn start_kin_session(
-    mcp: &mut McpClient,
+    server: &mut Server,
     config: &AgentConfig,
-    server_tools: &[String],
     writer: &mut TranscriptWriter,
 ) -> anyhow::Result<Option<String>> {
-    if !server_tools.iter().any(|name| name == "kin_session_start") {
+    let server_name = server.name();
+    if !server.declares("kin_session_start") {
         writer.trace(json!({
             "surface": "policy",
+            "server": server_name,
             "policy": "allowed",
             "event": "session_unavailable",
             "detail": "the server does not expose kin_session_start; edits will carry no session provenance",
@@ -739,14 +887,15 @@ fn start_kin_session(
         "client_name": format!("kin-agent ({})", config.provider.model),
         "transport": "mcp",
         "pid": std::process::id(),
-        "cwd": config.repo.display().to_string(),
+        "cwd": server.repo.display().to_string(),
         "capabilities": { "can_read": true, "can_write": true, "can_commit": true },
     });
-    match mcp.call_tool("kin_session_start", &arguments) {
+    match server.client.call_tool("kin_session_start", &arguments) {
         Ok(outcome) => {
             let session = extract_id(&outcome, &["session_id", "id"]);
             writer.trace(json!({
                 "surface": "kin",
+                "server": server_name,
                 "tool": "kin_session_start",
                 "policy": "allowed",
                 "event": "session_start",
@@ -759,6 +908,7 @@ fn start_kin_session(
         Err(err) => {
             writer.trace(json!({
                 "surface": "kin",
+                "server": server_name,
                 "tool": "kin_session_start",
                 "policy": "allowed",
                 "event": "session_start",
@@ -770,21 +920,20 @@ fn start_kin_session(
     }
 }
 
-fn end_kin_session(
-    mcp: &mut McpClient,
-    session: Option<&str>,
-    server_tools: &[String],
-    writer: &mut TranscriptWriter,
-) -> anyhow::Result<()> {
-    let Some(session) = session else {
+fn end_kin_session(server: &mut Server, writer: &mut TranscriptWriter) -> anyhow::Result<()> {
+    let Some(session) = server.session.clone() else {
         return Ok(());
     };
-    if !server_tools.iter().any(|name| name == "kin_session_end") {
+    if !server.declares("kin_session_end") {
         return Ok(());
     }
-    let outcome = mcp.call_tool("kin_session_end", &json!({ "session_id": session }));
+    let server_name = server.name();
+    let outcome = server
+        .client
+        .call_tool("kin_session_end", &json!({ "session_id": session }));
     writer.trace(json!({
         "surface": "kin",
+        "server": server_name,
         "tool": "kin_session_end",
         "policy": "allowed",
         "event": "session_end",
@@ -888,9 +1037,8 @@ impl Bracket {
 }
 
 fn begin_transaction(
-    mcp: &mut McpClient,
+    server: &mut Server,
     session: Option<&str>,
-    server_tools: &[String],
     arguments: &Value,
     plan: &StagePlan,
     writer: &mut TranscriptWriter,
@@ -904,18 +1052,19 @@ fn begin_transaction(
         return Ok(Bracket::unopened("no Kin session was open"));
     };
     for required in ["kin_transaction_begin", "kin_transaction_stage"] {
-        if !server_tools.iter().any(|name| name == required) {
+        if !server.declares(required) {
             return Ok(Bracket::unopened(format!(
                 "the server does not expose {required}"
             )));
         }
     }
+    let server_name = server.name();
     let scope = arguments
         .get("path")
         .and_then(Value::as_str)
         .unwrap_or("repository")
         .to_string();
-    match mcp.call_tool(
+    match server.client.call_tool(
         "kin_transaction_begin",
         &json!({ "session_id": session, "scope": scope }),
     ) {
@@ -923,6 +1072,7 @@ fn begin_transaction(
             let transaction_id = extract_id(&outcome, &["transaction_id", "id"]);
             writer.trace(json!({
                 "surface": "kin",
+                "server": server_name,
                 "tool": "kin_transaction_begin",
                 "policy": "allowed",
                 "event": "transaction_begin",
@@ -942,6 +1092,7 @@ fn begin_transaction(
         Ok(outcome) => {
             writer.trace(json!({
                 "surface": "kin",
+                "server": server_name,
                 "tool": "kin_transaction_begin",
                 "policy": "allowed",
                 "event": "transaction_begin",
@@ -961,12 +1112,13 @@ fn begin_transaction(
 /// never opened, or a plan with nothing the stage surface admits, stages nothing and says
 /// so, which is what keeps the commit below from claiming a provenance it did not get.
 fn stage_planned_operation(
-    mcp: &mut McpClient,
+    server: &mut Server,
     bracket: &mut Bracket,
     session: Option<&str>,
     plan: &StagePlan,
     writer: &mut TranscriptWriter,
 ) -> anyhow::Result<bool> {
+    let server_name = server.name();
     let (Some(transaction_id), StagePlan::Create { target, body }) =
         (bracket.transaction_id.clone(), plan)
     else {
@@ -985,13 +1137,14 @@ fn stage_planned_operation(
     if let Some(session) = session {
         arguments["session_id"] = Value::String(session.to_string());
     }
-    let outcome = mcp.call_tool("kin_transaction_stage", &arguments);
+    let outcome = server.client.call_tool("kin_transaction_stage", &arguments);
     let (is_error, detail) = match &outcome {
         Ok(outcome) => (outcome.is_error, truncate(&outcome.text, 300)),
         Err(err) => (true, err.to_string()),
     };
     writer.trace(json!({
         "surface": "kin",
+        "server": server_name,
         "tool": "kin_transaction_stage",
         "policy": "allowed",
         "event": "transaction_stage",
@@ -1015,11 +1168,12 @@ fn stage_planned_operation(
 /// Close the bracket. The recorded provenance says what actually happened, including a
 /// refusal, so a run never claims a provenance it did not get.
 fn close_transaction(
-    mcp: &mut McpClient,
+    server: &mut Server,
     bracket: Bracket,
     succeeded: bool,
     writer: &mut TranscriptWriter,
 ) -> anyhow::Result<Value> {
+    let server_name = server.name();
     let Some(transaction_id) = bracket.transaction_id else {
         return Ok(json!({
             "bracketed": false,
@@ -1032,13 +1186,16 @@ fn close_transaction(
     } else {
         "kin_transaction_abort"
     };
-    let outcome = mcp.call_tool(tool, &json!({ "transaction_id": transaction_id }));
+    let outcome = server
+        .client
+        .call_tool(tool, &json!({ "transaction_id": transaction_id }));
     let (is_error, detail) = match &outcome {
         Ok(outcome) => (outcome.is_error, truncate(&outcome.text, 300)),
         Err(err) => (true, err.to_string()),
     };
     writer.trace(json!({
         "surface": "kin",
+        "server": server_name,
         "tool": tool,
         "policy": "allowed",
         "event": if succeeded { "transaction_commit" } else { "transaction_abort" },
