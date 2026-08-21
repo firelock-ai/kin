@@ -21995,6 +21995,93 @@ mod tests {
         lease.resolve_target_change_id(&target).unwrap()
     }
 
+    /// A rollback derives the policy for the tree it restores, and it has to
+    /// derive it through the entry point that reads a tracked `.kin-allowances`.
+    ///
+    /// Reverting `repository_rollback::plan_and_commit`'s derivation to
+    /// `derive_from_tree` fails here, because the compatibility entry point
+    /// refuses by name the moment the restored tree carries approvals it cannot
+    /// read. That is the shape this covers: an approval a reviewer accepted,
+    /// silently dropped by rolling back to the very change that carried it.
+    ///
+    /// The approval rides the FIRST change, because rollback derives from the
+    /// target tree rather than from the tree it is leaving. The approved body is
+    /// harmless for the same reason it is in the sealed-tree test: this asks
+    /// whether the derivation reads the approval, and approving a real secret
+    /// would pull in authority's separate rule about repository CAS ordering.
+    #[tokio::test]
+    async fn rolling_back_derives_the_approvals_the_restored_tree_carries() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let root = state.layout.working_dir().to_path_buf();
+        let app = router(Arc::clone(&state));
+
+        let approved_body = b"def normalize(term):\n    return term.strip()\n";
+        let approved_digest = Hash256::from_bytes(state.blobs.write(approved_body).unwrap().0);
+        std::fs::create_dir_all(root.join("notekeeper")).unwrap();
+        std::fs::write(root.join("notekeeper/client.py"), approved_body).unwrap();
+        let approvals = format!(
+            "# approvals for this fixture\n\
+             kin-allowances 1\n\
+             notekeeper/client.py\t{approved_digest}\tblob\tcredscan@firelock.ai\tpinned by \
+             the test covering the restored-tree derivation site\n"
+        );
+        std::fs::write(root.join(".kin-allowances"), approvals.as_bytes()).unwrap();
+        let restored = commit_through_api(
+            &app,
+            kin_model::OperationId::new(),
+            "publish a tree carrying an approval",
+        )
+        .await;
+
+        std::fs::write(root.join("notekeeper/client.py"), b"def normalize(term):\n    return term\n")
+            .unwrap();
+        let regression =
+            commit_through_api(&app, kin_model::OperationId::new(), "publish a regression").await;
+        assert_eq!(branch_change(&state), regression);
+
+        let (status, body) =
+            rollback_through_api(&app, kin_model::OperationId::new(), restored).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "rolling back to a tree carrying .kin-allowances must derive its approvals rather \
+             than refusing: {body}"
+        );
+        // A rollback publishes a NEW change that restores the old tree rather
+        // than moving the branch back onto the old id, so the branch must have
+        // left the regression without landing on `restored` itself.
+        let after = branch_change(&state);
+        assert_ne!(
+            after, regression,
+            "the rollback must move the branch off the regression"
+        );
+        assert_ne!(
+            after, restored,
+            "a rollback publishes a restoring change rather than re-pointing at the old one"
+        );
+
+        let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
+        let lease = authority.manager.read_authority();
+        let carried = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == authority.workspace_id)
+            .expect("the bound workspace survives the rollback")
+            .shared_admission_policy
+            .sensitive_allowances
+            .clone();
+        assert_eq!(
+            carried.len(),
+            1,
+            "the restored policy must carry the tree's one approval: {carried:?}"
+        );
+        assert_eq!(carried[0].content_hash, approved_digest);
+    }
+
     /// An operation id is matched before any history validation runs, and an
     /// ordinary commit publishes the same receipt shape a rollback does. Only
     /// the restored content separates them, so reusing a commit's operation id
