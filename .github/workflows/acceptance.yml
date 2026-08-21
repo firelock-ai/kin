@@ -77,6 +77,12 @@ jobs:
       - name: Falsify the brownfield verdict graders
         run: python3 scripts/acceptance/brownfield_repro.py --self-test
 
+      # The gate decides this job, so it gets the same treatment. Every rule it
+      # enforces is exercised against its inverse, including the ones that keep
+      # its allowance list from becoming a way to stop enforcing.
+      - name: Falsify the acceptance gate
+        run: python3 scripts/acceptance/gate.py --self-test
+
       - name: Install Rust toolchain
         uses: ./.github/actions/rust-toolchain
 
@@ -112,6 +118,20 @@ jobs:
       # says so per check instead of quietly passing.
       - name: Install language servers for the enrichment checks
         run: bash scripts/ci-install-language-servers.sh
+
+      # `kin commit` refuses to invent an author, and a hosted runner carries no
+      # git identity, so without this every magic-suite fixture that commits
+      # through kin fails to build and its checks report UNREADABLE. Run
+      # 32512404014 is what found it: seven of ten checks came back
+      # "kin commit failed ... Set your Git identity". The suites pass an
+      # identity to their own `git` invocations already; this is for the commits
+      # kin itself authors.
+      - name: Give the runner a git identity
+        run: |
+          set -euo pipefail
+          git config --global user.name 'Kin CI'
+          git config --global user.email 'ci@kinlab.ai'
+          git config --global --get user.email
 
       # The magic suite's virtual-environment check builds a real venv, and
       # Debian and Ubuntu ship `python3 -m venv` in a separate package. Probe by
@@ -227,30 +247,18 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      # The gate is its own step so the two suites both run and both upload even
-      # when the first one fails. A suite step never fails on its own.
+      # The gate is its own step so both suites run and both upload even when the
+      # first one fails, and it reads the reports rather than the exit codes.
+      # A suite's exit status is one lever with two settings, demand a clean
+      # sweep or demand nothing, and neither is right while one check is blocked
+      # on something outside the change under review. gate.py fails on any FAIL
+      # with no allowance possible, fails on any UNREADABLE that is not named
+      # here with a reason, and refuses an allowance that points at a check the
+      # report does not carry.
       - name: Gate on the acceptance suites
         if: always()
-        env:
-          MAGIC_RC: ${{ steps.magic.outputs.rc }}
-          BROWNFIELD_RC: ${{ steps.brownfield.outputs.rc }}
         run: |
-          set -uo pipefail
-          # An empty rc means the step never reached its own assignment, which is
-          # a failure to run rather than a pass. Refuse it rather than defaulting
-          # it to zero.
-          fail=0
-          for pair in "magic:${MAGIC_RC:-missing}" "brownfield:${BROWNFIELD_RC:-missing}"; do
-            name="${pair%%:*}"
-            rc="${pair##*:}"
-            if [ "$rc" = "missing" ]; then
-              echo "::error::the $name suite recorded no exit status, so it did not run to completion"
-              fail=1
-            elif [ "$rc" -ne 0 ]; then
-              echo "::error::the $name suite exited $rc"
-              fail=1
-            else
-              echo "$name suite passed"
-            fi
-          done
-          exit "$fail"
+          python3 scripts/acceptance/gate.py \
+            --report magic=acceptance/magic.json \
+            --report brownfield=acceptance/brownfield.json \
+            --allow-unreadable 'brownfield:4=the express app.handle walk returns truncated=True on ubuntu-latest against a debug build, so an absent edge cannot be told from a dropped one. Run 32512404014 reported it on the same express graph a release 0.5.44 build walked untruncated. FIR-2591 follow-up.'

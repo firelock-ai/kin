@@ -77,6 +77,26 @@ language server on PATH; without one its enrichment sweep never runs and those
 checks report UNREADABLE rather than a verdict. `scripts/ci-install-language-servers.sh`
 is what provides one on a hosted runner.
 
+## The gate
+
+`gate.py` decides the CI job. It reads the suites' JSON reports rather than their
+exit codes, because an exit code is one lever with two settings, demand a clean
+sweep or demand nothing, and neither is right while one check is blocked on
+something outside the change under review.
+
+A FAIL always fails the gate and no allowance can excuse it. An UNREADABLE fails
+too unless `--allow-unreadable SUITE:CHECK=REASON` names it, the reason is
+required, and every allowance prints on every run. Three rules keep that list
+from becoming a way to stop enforcing: an allowance naming a check the report
+does not carry is an error, because a pointer at nothing looks exactly like a
+satisfied allowance; an allowance on a check that now passes is announced as
+stale; and a missing or unparseable report is a failure, because a suite that
+wrote nothing did not pass.
+
+`gate.py --self-test` exercises every one of those rules against its inverse and
+needs no reports. The workflow runs it before the build, alongside the brownfield
+graders' self-test, so a gate that has stopped deciding is named in seconds.
+
 ## The umbrella copies
 
 These two files were ported on 2026-08-21 from `bin/kin-magic-repro` and
