@@ -246,8 +246,19 @@ export async function fetchEvidence(
 // shares no sha, no parent and no tree with the branch it flattened.
 //
 // Tags cut after the rekey point at the candidate itself and never reach this
-// function, because their direct key resolves. Release Recovery can still
-// re-run an older tag, which is why the bridge is kept rather than retired.
+// function, because their direct key resolves. Neither does a recovery re-run
+// of a pre-rekey tag, which is the reason this comment used to give and it was
+// wrong: a tag run resolves its workflows AND its scripts from the tag, so
+// re-running one executes that tag's own frozen release.yml and its own frozen
+// copy of this file. No edit here can reach it.
+//
+// What keeps the bridge is a rekeyed tag whose record went absent after the
+// fact. The evidence branch is append-only by construction and unprotected in
+// practice, so that is reachable, and the bound below turns it into a refusal
+// that names where the tag came from rather than only the file that was
+// missing. The promote gate compares the sha this returns against the sha it
+// is promoting, so a bridged answer can shape a refusal and can no longer
+// admit one.
 //
 // A commit with no originating pull request resolves to nothing and the caller
 // refuses it. That is the intended answer for a tag minted through a path the
@@ -332,11 +343,14 @@ export async function resolveCandidateSha(
 // tag mint knows the main commit it selected, and the promote gate knows the
 // commit the tag points at, which under the current scheme is the same object.
 //
-// RESOLVE_FROM_COMMIT is the bridge for tags cut before that scheme landed.
-// Those tags point at the squash of a version bump pull request, and a squash
-// shares no sha, no parent and no tree with the branch it flattened, so their
-// records sit under that pull request's head instead. Release Recovery can
-// still re-run such a tag, so the bridge stays.
+// RESOLVE_FROM_COMMIT is the bridge to a pull request head, which is the only
+// link that survives a squash: a squash shares no sha, no parent and no tree
+// with the branch it flattened. It is not what recovers a tag cut before the
+// rekey, because such a run resolves its workflows and its scripts from the
+// tag and never reaches this file. It stays because a tag whose direct record
+// went absent should refuse by naming where it came from, and because the
+// promote gate refuses anyway unless the sha returned here is the sha it
+// promotes.
 //
 // Order matters and so does what may trigger it. The direct key is tried first,
 // and only an ABSENT record falls through to the bridge. An unreadable record,

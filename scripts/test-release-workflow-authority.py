@@ -1066,6 +1066,46 @@ def swap_release_tag_step_order(release_tag: str) -> str:
     return replace_exactly_once(swapped, placeholder, write, "proof gate order")
 
 
+def swap_train_undraft_after_arm(release_train: str) -> str:
+    """Arm the bump pull request before un-drafting it, instead of after.
+
+    Both commands survive, so the presence checks still pass and the ordering
+    check is the only thing that can catch it. Ordering is the whole point
+    here: `gh pr merge --auto` registered against a draft pull request is not
+    taken by the merge queue, so un-drafting afterwards leaves auto-merge armed
+    on a pull request nothing will merge.
+    """
+
+    lines = release_train.splitlines(keepends=True)
+
+    def find(predicate, start, label):
+        for index in range(start, len(lines)):
+            if predicate(lines[index]):
+                return index
+        raise AssertionError(f"release train un-draft order mutation found no {label}")
+
+    undraft_start = find(
+        lambda line: ".isDraft" in line and line.lstrip().startswith("if ["),
+        0,
+        "draft-state branch",
+    )
+    undraft_end = find(
+        lambda line: line.strip() == "fi", undraft_start, "end of the draft-state branch"
+    ) + 1
+    arm_start = find(
+        lambda line: 'gh pr merge "$PR"' in line, undraft_end, "arm command"
+    )
+    arm_end = find(
+        lambda line: "--match-head-commit" in line, arm_start, "end of the arm command"
+    ) + 1
+    return "".join(
+        lines[:undraft_start]
+        + lines[undraft_end:arm_end]
+        + lines[undraft_start:undraft_end]
+        + lines[arm_end:]
+    )
+
+
 def write_node_validator_fixture_files(
     root: Path,
     files: dict[str, object],
@@ -7255,6 +7295,19 @@ def assert_release_proof_key_authority(
             "candidate it can still see",
         ),
         (
+            'if ! listing="$(gh api',
+            "test the status of the listing read, because a transport "
+            "failure, a GitHub error object and an empty evidence branch "
+            "otherwise print the same green no-op and only one of them means "
+            "there is nothing to release",
+        ),
+        (
+            '2>"$read_error"',
+            "keep the error text from the listing read, because a refusal "
+            "that cannot say what went wrong is one an operator has to "
+            "reproduce before they can act on it",
+        ),
+        (
             'echo "needed=false"',
             "stand down as a no-op when no candidate is proven, rather than "
             "declining or tagging one that is not",
@@ -7268,12 +7321,49 @@ def assert_release_proof_key_authority(
     reconcile = workflow_job_blocks(release_train).get("reconcile")
     if reconcile is None:
         raise AssertionError("release-train.yml no longer declares the reconcile job")
+
     if PROOF_GATE_POLICY in workflow_active_text(reconcile):
         raise AssertionError(
             "the release train must key nothing on the version bump branch's "
             "head; that key is what forced the fleet to freeze main for the "
             "length of every proof window, and the refusal now lives on the "
             "tag the mint writes"
+        )
+
+    # The removed proof step was the only code that ever drafted or un-drafted
+    # the bump pull request, and it drafted it while it held. The arm step now
+    # runs on drift alone, so without this a draft left behind by that step
+    # arms auto-merge on a pull request the merge queue never takes: the bump
+    # never lands, no candidate is ever provable, and the plan step's all-clear
+    # marker reports a healthy rail every fifteen minutes while nothing moves.
+    arm = "\n".join(
+        job_step_active_lines(
+            release_train, "reconcile", "name: Arm protected auto-merge"
+        )
+    )
+    for needle, duty in (
+        (
+            'gh pr ready "$PR"',
+            "un-draft the bump pull request before it arms auto-merge, "
+            "because the merge queue never takes a draft and nothing else "
+            "here un-drafts one any more",
+        ),
+        (
+            "--json headRefOid,isDraft",
+            "read the draft state in the same call that reads the head, so "
+            "the check costs no extra round trip and cannot go stale between "
+            "two of them",
+        ),
+    ):
+        if needle not in arm:
+            raise AssertionError(
+                f"the release train's arm step must {duty}: {needle}"
+            )
+    if arm.index('gh pr ready "$PR"') > arm.index('gh pr merge "$PR"'):
+        raise AssertionError(
+            "the release train must un-draft the bump pull request BEFORE it "
+            "arms auto-merge; arming first is what leaves a draft armed and "
+            "unmergeable while the rail reports itself clear"
         )
 
     promote = "\n".join(
@@ -7289,8 +7379,22 @@ def assert_release_proof_key_authority(
         ),
         (
             "RESOLVE_FROM_COMMIT: ${{ github.sha }}",
-            "keep the bridge for tags cut before that rekey, whose records sit "
-            "under the pull request head instead",
+            "keep the bridge, which is what makes a tag with no direct record "
+            "refuse by naming where it came from rather than only naming the "
+            "file that was missing",
+        ),
+        (
+            "process.stdout.write(result.sha)",
+            "read back the sha the gate verified rather than only its exit "
+            "status, because the exit status alone cannot say which commit "
+            "the evidence was about",
+        ),
+        (
+            'if [ "$proven" != "$CANDIDATE_SHA" ]',
+            "refuse when the sha the gate verified is not the sha it "
+            "promotes; the mint makes that comparison before it writes the "
+            "ref, and without it here a bridged answer flips a tag to Latest "
+            "on evidence about a different commit and a different tree",
         ),
     ):
         if needle not in promote:
@@ -8959,8 +9063,8 @@ def main() -> None:
         ),
     )
     expect_assertion(
-        "the promote gate stops bridging tags cut before the rekey",
-        "keep the bridge for tags cut before that rekey",
+        "the promote gate stops bridging a tag with no direct record",
+        "keep the bridge, which is what makes a tag with no direct record",
         lambda: assert_release_proof_key_authority(
             release_train,
             release_tag,
@@ -9016,6 +9120,97 @@ def main() -> None:
                 "if (!resolveFromCommit) {",
                 "proof gate absence-only bridge",
             ),
+        ),
+    )
+    expect_assertion(
+        "the mint reads the evidence listing without testing whether it read one",
+        "test the status of the listing read",
+        lambda: assert_release_proof_key_authority(
+            release_train,
+            replace_exactly_once(
+                release_tag,
+                'if ! listing="$(gh api',
+                'if listing="$(gh api',
+                "listing read status",
+            ),
+            release,
+            proof_gate,
+        ),
+    )
+    expect_assertion(
+        "the mint throws away why the evidence listing could not be read",
+        "keep the error text from the listing read",
+        lambda: assert_release_proof_key_authority(
+            release_train,
+            replace_exactly_once(
+                release_tag,
+                '"repos/${REPO}/git/trees/release-evidence?recursive=1" \\\n'
+                '              2>"$read_error")"; then',
+                '"repos/${REPO}/git/trees/release-evidence?recursive=1" \\\n'
+                '              2>/dev/null)"; then',
+                "listing read diagnostics",
+            ),
+            release,
+            proof_gate,
+        ),
+    )
+    expect_assertion(
+        "the train arms auto-merge without un-drafting the bump pull request",
+        "un-draft the bump pull request before it arms auto-merge",
+        lambda: assert_release_proof_key_authority(
+            replace_exactly_once(
+                release_train,
+                '            gh pr ready "$PR" --repo "$GITHUB_REPOSITORY"\n',
+                "",
+                "release train un-draft",
+            ),
+            release_tag,
+            release,
+            proof_gate,
+        ),
+    )
+    # The same regression as an ordering change rather than a deletion. Both
+    # commands survive, so only the ordering check can catch it, and arming
+    # first is not a smaller mistake: auto-merge registered against a draft is
+    # what leaves the rail reporting itself clear while nothing lands.
+    expect_assertion(
+        "the train un-drafts the bump pull request after it has already armed",
+        "must un-draft the bump pull request BEFORE it",
+        lambda: assert_release_proof_key_authority(
+            swap_train_undraft_after_arm(release_train),
+            release_tag,
+            release,
+            proof_gate,
+        ),
+    )
+    expect_assertion(
+        "the promote gate stops reading back the sha the gate verified",
+        "read back the sha the gate verified",
+        lambda: assert_release_proof_key_authority(
+            release_train,
+            release_tag,
+            replace_exactly_once(
+                release,
+                "process.stdout.write(result.sha);",
+                'process.stdout.write("verified");',
+                "promote gate sha readback",
+            ),
+            proof_gate,
+        ),
+    )
+    expect_assertion(
+        "the promote gate stops comparing the proven sha to the one it promotes",
+        "not the sha it promotes",
+        lambda: assert_release_proof_key_authority(
+            release_train,
+            release_tag,
+            replace_exactly_once(
+                release,
+                'if [ "$proven" != "$CANDIDATE_SHA" ]; then',
+                'if [ "$proven" = "never" ]; then',
+                "promote gate identity",
+            ),
+            proof_gate,
         ),
     )
 

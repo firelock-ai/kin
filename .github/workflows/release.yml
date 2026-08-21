@@ -2341,19 +2341,60 @@ jobs:
       # commit the proof loop recorded and tags that exact sha, so the direct key
       # resolves and this job asks about the same object the mint did.
       #
-      # RESOLVE_FROM_COMMIT stays beside it for the tags cut before that rekey.
-      # Those point at the squash of a version bump pull request, whose records
-      # sit under that pull request's head, and Release Recovery can still
-      # re-run one. The gate tries the direct key first and bridges only when
-      # the record is ABSENT; an unreadable record still fails closed. A commit
-      # no merged pull request produced resolves to nothing and is refused,
-      # which is the intended answer for a hand-pushed tag.
+      # RESOLVE_FROM_COMMIT stays beside it, and it is worth being exact about
+      # what it still buys, because the obvious answer is wrong. It is NOT that
+      # Release Recovery can re-run a tag cut before the rekey: a tag run
+      # resolves its workflows AND its scripts from the tag, so recovering such
+      # a tag re-runs that tag's own frozen copy of this job and of the gate,
+      # and never reaches this line. What it buys is the sentence a refusal
+      # carries. The gate tries the direct key first and bridges only when the
+      # record is ABSENT; an unreadable record still fails closed. A tag whose
+      # record went missing therefore refuses by naming the branch it came from
+      # rather than only the file it could not find, and a commit no merged
+      # pull request produced resolves to nothing and is refused, which is the
+      # intended answer for a hand-pushed tag.
+      #
+      # The identity check below is what the mint already makes before it
+      # writes the tag ref, mirrored here. Without it a bridged answer would
+      # promote a tag on evidence about a different commit and a different
+      # tree, which is exactly the approximation this rekey removes. With it,
+      # a bridged answer can only ever shape a refusal; it can no longer admit
+      # one.
       - name: Require proof-loop artifacts for the tagged candidate
         env:
           GH_TOKEN: ${{ github.token }}
           CANDIDATE_SHA: ${{ github.sha }}
           RESOLVE_FROM_COMMIT: ${{ github.sha }}
-        run: node scripts/check-release-proof-artifacts.mjs
+        run: |
+          set -euo pipefail
+          gate="${GITHUB_WORKSPACE}/scripts/check-release-proof-artifacts.mjs"
+          test -s "$gate"
+          # The gate's narration goes to stderr so stdout carries exactly the
+          # sha it verified and nothing the comparison below could mistake for
+          # one, and a refusal is reported as the sentence naming what was
+          # missing rather than as a stack trace.
+          proven="$(KIN_RELEASE_GATE="file://${gate}" \
+            node --input-type=module -e '
+              const { main } = await import(process.env.KIN_RELEASE_GATE);
+              try {
+                const result = await main({
+                  log: (line) => process.stderr.write(line + "\n"),
+                });
+                process.stdout.write(result.sha);
+              } catch (error) {
+                process.stderr.write("::error::" + error.message + "\n");
+                process.exit(1);
+              }
+            ')"
+          if ! printf '%s' "$proven" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::the release proof gate returned '${proven}', which is not a candidate sha"
+            exit 1
+          fi
+          if [ "$proven" != "$CANDIDATE_SHA" ]; then
+            echo "::error::the proof gate verified $proven but this job promotes $CANDIDATE_SHA; refusing to flip a tag to Latest on evidence about a different commit"
+            exit 1
+          fi
+          echo "release proof records verified for $CANDIDATE_SHA, the commit this job promotes"
 
       - name: Promote stable tag after public and npm proof
         if: ${{ !contains(github.ref_name, '-') }}

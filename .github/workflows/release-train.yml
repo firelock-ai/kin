@@ -750,11 +750,28 @@ jobs:
           PR: ${{ steps.pr.outputs.number }}
         run: |
           set -euo pipefail
-          head_sha="$(gh pr view "$PR" \
+          # The draft state is read in the same call that reads the head,
+          # because a draft pull request is not taken by the merge queue and
+          # nothing in this repository un-drafts this one any more. The removed
+          # proof step was the only code that ever touched it, and it drafted
+          # the pull request while it held. A pull request left in draft by that
+          # step, or by a hand, would arm auto-merge here, report success, and
+          # then never land, every fifteen minutes, while the plan step's
+          # all-clear marker said the rail was moving.
+          #
+          # A freshly opened bump pull request is never a draft, so this is a
+          # no-op on an ordinary cycle. Marking ready re-triggers nothing: ci.yml
+          # runs on `pull_request` without a draft filter, so the checks the
+          # queue waits on are already running.
+          state="$(gh pr view "$PR" \
             --repo "$GITHUB_REPOSITORY" \
-            --json headRefOid \
-            --jq .headRefOid)"
+            --json headRefOid,isDraft)"
+          head_sha="$(jq -r '.headRefOid' <<< "$state")"
           [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]]
+          if [ "$(jq -r '.isDraft' <<< "$state")" = true ]; then
+            echo "pull request #${PR} is a draft, which the merge queue never takes; marking it ready before arming auto-merge"
+            gh pr ready "$PR" --repo "$GITHUB_REPOSITORY"
+          fi
           gh pr merge "$PR" \
             --repo "$GITHUB_REPOSITORY" \
             --auto \

@@ -234,26 +234,47 @@ jobs:
             # truncated listing is the one reading that could hide a newer
             # proven candidate and silently ship an older one, so it refuses
             # instead of taking the subset it can see.
+            #
+            # An unreadable listing is not an empty one. This read used to
+            # discard both the error text and the exit status, so a transport
+            # failure, a GitHub error object and a genuinely empty evidence
+            # branch produced byte-identical green output and the mint no-opped
+            # on all three. Absence is a fact about the proof loop;
+            # unreadability is a fact about this read, and only one of them
+            # means there is nothing to release.
+            #
+            # It refuses rather than warning, for the same reason the
+            # truncation check below it does: a warning on a green run is the
+            # same silence this rekey exists to end. A false refusal costs one
+            # cycle and nothing else, because the mint reconciles every fifteen
+            # minutes and on every completed CI run, and it holds no state
+            # before this point. A false green costs every release until
+            # somebody happens to read a log line.
             proven="$RUNNER_TEMP/proven-candidates"
             : > "$proven"
-            listing="$(gh api \
+            read_error="$(mktemp)"
+            if ! listing="$(gh api \
               "repos/${REPO}/git/trees/release-evidence?recursive=1" \
-              2>/dev/null || true)"
-            if [ -n "$listing" ] && \
-               jq -e 'type == "object" and (.tree | type == "array")' \
-                 <<< "$listing" > /dev/null; then
-              if [ "$(jq -r '.truncated // false' <<< "$listing")" = true ]; then
-                echo "::error::the release-evidence listing is truncated, so a newer proven candidate could be invisible; refusing to select one"
-                exit 1
-              fi
-              jq -r '
-                [.tree[] | select(.type == "blob") | .path]
-                | map(capture("^evidence/(?<sha>[0-9a-f]{40})/(?<name>preflight\\.json|stranger\\.env)$"))
-                | group_by(.sha)
-                | map(select((map(.name) | unique | length) == 2) | .[0].sha)
-                | .[]
-              ' <<< "$listing" > "$proven"
+              2>"$read_error")"; then
+              echo "::error::could not read the release-evidence tree, so this mint cannot tell an unproven main from an unreadable listing; refusing to select a candidate: $(cat "$read_error")"
+              exit 1
             fi
+            if ! jq -e 'type == "object" and (.tree | type == "array")' \
+                 <<< "$listing" > /dev/null; then
+              echo "::error::the release-evidence listing is not a git tree object, so the mint cannot tell which candidates the proof loop published; refusing to select one"
+              exit 1
+            fi
+            if [ "$(jq -r '.truncated // false' <<< "$listing")" = true ]; then
+              echo "::error::the release-evidence listing is truncated, so a newer proven candidate could be invisible; refusing to select one"
+              exit 1
+            fi
+            jq -r '
+              [.tree[] | select(.type == "blob") | .path]
+              | map(capture("^evidence/(?<sha>[0-9a-f]{40})/(?<name>preflight\\.json|stranger\\.env)$"))
+              | group_by(.sha)
+              | map(select((map(.name) | unique | length) == 2) | .[0].sha)
+              | .[]
+            ' <<< "$listing" > "$proven"
             recorded="$(command grep -c '' "$proven" || true)"
             echo "proof loop has recorded ${recorded} fully-evidenced candidate(s)"
 
