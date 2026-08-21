@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Let the release train own a region of its PR body, not the whole message (#1011)
 - Read a member that exited mid-classification as contained, and scale the settle by load (#1012)
 - Document a registration and an install a stranger can actually run (#1014)
+- Report the enrichment cause kin init observed, not one derived from a boolean (#1003)
+- Say when kin trace and kin search cannot rule out what they did not see (#1004)
+- Retry a refused vector checkpoint instead of abandoning its vectors (#1006)
 
 
 ## [0.5.46] - 2026-08-21
