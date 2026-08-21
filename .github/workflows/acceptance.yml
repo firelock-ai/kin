@@ -101,6 +101,23 @@ jobs:
       - name: Install language servers for the enrichment checks
         run: bash scripts/ci-install-language-servers.sh
 
+      # The magic suite's virtual-environment check builds a real venv, and
+      # Debian and Ubuntu ship `python3 -m venv` in a separate package. Probe by
+      # creating one rather than by importing the module, because the module
+      # imports fine on an image whose ensurepip was split out and only the
+      # creation fails. A missing venv would otherwise surface as UNREADABLE on
+      # that one check, which is a red job blamed on the diff under review.
+      - name: Ensure python3 can create a virtual environment
+        run: |
+          set -euo pipefail
+          probe="$(mktemp -d)"
+          if ! python3 -m venv "$probe/env" >/dev/null 2>&1; then
+            scripts/ci-apt-install.sh python3-venv
+            python3 -m venv "$probe/env"
+          fi
+          rm -rf "$probe"
+          echo "python3 -m venv works"
+
       # The two upstream trees the brownfield suite pins, cached as depth-1
       # fetches plus the express node_modules the language server needs to
       # resolve require() targets. The key is derived from the pinned commits in
