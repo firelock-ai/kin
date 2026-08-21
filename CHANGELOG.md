@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.46] - 2026-08-21
+
+### Changed
+
+- Publish a sweep's enrichment once, and stop the background flush firing inside it (#992)
+
+
 ## [0.5.45] - 2026-08-20
 
 ### Changed
