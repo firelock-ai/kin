@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Publish a sweep's enrichment once, and stop the background flush firing inside it (#992)
+- Report which admission phase moved the init heap ceiling, not just that it moved (#995)
 
 
 ## [0.5.45] - 2026-08-20
