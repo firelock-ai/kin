@@ -151,6 +151,10 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           RAW_TAG: ${{ github.event.client_payload.tag }}
           RAW_SHA: ${{ github.event.client_payload.sha }}
+          # Reading the proof loop's published candidates needs no more than the
+          # read-only workflow token this job already declares.
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           git fetch origin \
@@ -198,18 +202,80 @@ jobs:
           import sys, tomllib
           print(tomllib.loads(sys.stdin.read())["workspace"]["package"]["version"])
           ')"
-            # Both scheduled reconciliation and workflow_run retries normalize
-            # to the first reviewed main commit carrying this version. A later
-            # green commit must never be swept into an already-prepared release.
-            candidate="$sha"
+            # The oldest reviewed main commit carrying this version, which is
+            # the squash of the version bump. It is not the release; it is the
+            # floor of the range that can be, because nothing before it carries
+            # the version this tag names.
+            earliest="$sha"
             while IFS= read -r commit; do
               version="$(git show "$commit:Cargo.toml" | python3 -c '
           import sys, tomllib
           print(tomllib.loads(sys.stdin.read())["workspace"]["package"]["version"])
           ')"
               [ "$version" = "$current_version" ] || break
-              candidate="$commit"
+              earliest="$commit"
             done < <(git log --first-parent --format=%H "$sha" -- Cargo.toml)
+
+            # The release is the NEWEST reviewed main commit in that range for
+            # which the proof loop published both records. This is what lets
+            # main keep moving through a proof window. The candidate used to be
+            # the head of the version bump branch, and the train rewrites that
+            # head every cycle it finds drift, so evidence published for it went
+            # invisible the moment main moved and the fleet had to freeze main
+            # for the whole window or release a sha nobody had proven. A main
+            # commit is immutable, so its records stay addressable no matter
+            # what lands afterwards, and what lands afterwards is simply the
+            # next release's drift.
+            #
+            # This listing PROPOSES a candidate. It never proves one. The gate
+            # below reads the two exact forty-hex keys under the selected sha
+            # and is the only thing that admits a release, so a listing that is
+            # wrong costs a loud refusal rather than an unproven tag. A
+            # truncated listing is the one reading that could hide a newer
+            # proven candidate and silently ship an older one, so it refuses
+            # instead of taking the subset it can see.
+            proven="$RUNNER_TEMP/proven-candidates"
+            : > "$proven"
+            listing="$(gh api \
+              "repos/${REPO}/git/trees/release-evidence?recursive=1" \
+              2>/dev/null || true)"
+            if [ -n "$listing" ] && \
+               jq -e 'type == "object" and (.tree | type == "array")' \
+                 <<< "$listing" > /dev/null; then
+              if [ "$(jq -r '.truncated // false' <<< "$listing")" = true ]; then
+                echo "::error::the release-evidence listing is truncated, so a newer proven candidate could be invisible; refusing to select one"
+                exit 1
+              fi
+              jq -r '
+                [.tree[] | select(.type == "blob") | .path]
+                | map(capture("^evidence/(?<sha>[0-9a-f]{40})/(?<name>preflight\\.json|stranger\\.env)$"))
+                | group_by(.sha)
+                | map(select((map(.name) | unique | length) == 2) | .[0].sha)
+                | .[]
+              ' <<< "$listing" > "$proven"
+            fi
+            recorded="$(command grep -c '' "$proven" || true)"
+            echo "proof loop has recorded ${recorded} fully-evidenced candidate(s)"
+
+            candidate=""
+            if [ -s "$proven" ]; then
+              while IFS= read -r commit; do
+                if command grep -qxF "$commit" "$proven"; then
+                  candidate="$commit"
+                  break
+                fi
+                [ "$commit" = "$earliest" ] && break
+              done < <(git log --first-parent --format=%H "$sha")
+            fi
+            if [ -z "$candidate" ]; then
+              # A no-op, not a decline. Declining means the mint could act and
+              # something is blocking it; this means there is nothing to act on
+              # yet, which is the same shape as an already-existing tag and is
+              # deliberately not escalated.
+              echo "::notice::no reviewed main commit carrying ${current_version} has release proof records yet; the mint has no candidate."
+              echo "needed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
             sha="$candidate"
           fi
 
@@ -1570,6 +1636,86 @@ jobs:
             exit 1
           fi
           echo "tag $TAG does not exist yet"
+
+      # The proof-loop refusal, on the artifact it is actually about.
+      #
+      # On 2026-08-20 the train merged its own bump kin#986, tagged v0.5.44 and
+      # promoted it to Latest with no preflight record for that candidate and no
+      # stranger run on its bytes. The gate that closed that hole lived in
+      # release-train.yml and held the version bump in draft, keyed on a branch
+      # head the train rewrites every cycle, which is what forced the fleet to
+      # freeze main for the length of every proof window. The refusal did not
+      # move because it was wrong. It moved because a tag run resolves its
+      # workflows from the tag and no fix landed later can repair it, so this,
+      # immediately before the ref is written, is the last place a release can
+      # still be refused for free. release.yml's finalize_release keeps the same
+      # refusal against promotion, so both decision points import one judge and
+      # cannot disagree about what counts as evidence while agreeing that they
+      # checked.
+      #
+      # Two assertions. The gate reads the two exact forty-hex keys under the
+      # candidate and refuses absence, an unreadable record, a failing verdict,
+      # a record about a different build, and a stranger run on bytes no
+      # preflight leg judged. Then the sha it verified is compared against the
+      # sha this job is about to tag. That comparison is the one that carries
+      # weight: selection above and verification here compute the candidate
+      # separately, and an edit that lets them drift apart refuses here rather
+      # than tagging a commit whose evidence is about another one.
+      #
+      # The tree diff after it is implied by that equality today and is written
+      # anyway, because the invariant this whole design rests on is "the tree
+      # that was proven is the tree that ships", and an invariant that lives
+      # only in a design document is one a later change can break silently.
+      # Do not read it as independent evidence; read it as the statement that
+      # fails first if the tag ever stops naming the candidate itself.
+      #
+      # The gate is read from protected main, not from the checked-out release
+      # commit, for the same reason the lane policy above is: the commit under
+      # judgement must not be able to lower the bar it is judged against.
+      - name: Require proof-loop artifacts for the release candidate
+        id: proof
+        if: >-
+          steps.resolve.outputs.needed == 'true' &&
+          steps.prior.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gate="$RUNNER_TEMP/check-release-proof-artifacts.mjs"
+          git show \
+            "refs/remotes/origin/main:scripts/check-release-proof-artifacts.mjs" \
+            > "$gate"
+          test -s "$gate"
+
+          # The gate's own narration goes to stderr so stdout carries exactly
+          # the sha it verified and nothing a later comparison could mistake
+          # for one. A throw exits non-zero and takes the step with it.
+          proven="$(KIN_RELEASE_GATE="file://${gate}" \
+            CANDIDATE_SHA="$SHA" \
+            GITHUB_REPOSITORY="$REPO" \
+            node --input-type=module -e '
+              const { main } = await import(process.env.KIN_RELEASE_GATE);
+              const result = await main({
+                log: (line) => process.stderr.write(`${line}\n`),
+              });
+              process.stdout.write(result.sha);
+            ')"
+          if ! printf '%s' "$proven" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::the release proof gate returned '${proven}', which is not a candidate sha"
+            exit 1
+          fi
+          if [ "$proven" != "$SHA" ]; then
+            echo "::error::the proof gate verified $proven but this job would tag $SHA; refusing to tag a commit whose evidence is about a different one"
+            exit 1
+          fi
+          delta="$(git diff --name-only "$proven" "$SHA")"
+          if [ -n "$delta" ]; then
+            echo "::error::the tagged tree is not the proven tree; these paths differ between $proven and $SHA:"
+            printf '%s\n' "$delta"
+            exit 1
+          fi
+          echo "release proof records verified for $SHA, and the tagged tree is the proven tree"
 
       - name: Mint kin-release-bot installation token
         id: app-token

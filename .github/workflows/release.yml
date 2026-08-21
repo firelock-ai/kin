@@ -2329,23 +2329,29 @@ jobs:
         with:
           persist-credentials: false
 
-      # The same evidence the release train requires before it merges a bump,
-      # required again here against the tag actually being promoted. The train's
-      # gate protects the path the train owns; this one protects every other
-      # path into Latest, because a tag reaches Latest through this job no
-      # matter how it was minted. On 2026-08-20 v0.5.44 reached Latest with no
-      # preflight record and no stranger run, and nothing in the train knew the
+      # The same evidence release-tag.yml requires before it writes the tag ref,
+      # required again here against the tag actually being promoted. The mint's
+      # gate protects the path the mint owns; this one protects every other path
+      # into Latest, because a tag reaches Latest through this job no matter how
+      # it was minted. On 2026-08-20 v0.5.44 reached Latest with no preflight
+      # record and no stranger run, and nothing in the release chain knew the
       # proof loop existed.
       #
-      # A squash mints a new commit, so a tag's own sha is never the sha the
-      # proof loop judged: v0.5.44's tag commit a4ffe620 is kin#986's squash,
-      # while the preflight for that line judged the release-next head. The
-      # resolver bridges that through the merged pull request. A commit no
-      # merged pull request produced resolves to nothing and is refused, which
-      # is the intended answer for a hand-pushed tag.
+      # The tagged commit IS the candidate now: the mint selects the newest main
+      # commit the proof loop recorded and tags that exact sha, so the direct key
+      # resolves and this job asks about the same object the mint did.
+      #
+      # RESOLVE_FROM_COMMIT stays beside it for the tags cut before that rekey.
+      # Those point at the squash of a version bump pull request, whose records
+      # sit under that pull request's head, and Release Recovery can still
+      # re-run one. The gate tries the direct key first and bridges only when
+      # the record is ABSENT; an unreadable record still fails closed. A commit
+      # no merged pull request produced resolves to nothing and is refused,
+      # which is the intended answer for a hand-pushed tag.
       - name: Require proof-loop artifacts for the tagged candidate
         env:
           GH_TOKEN: ${{ github.token }}
+          CANDIDATE_SHA: ${{ github.sha }}
           RESOLVE_FROM_COMMIT: ${{ github.sha }}
         run: node scripts/check-release-proof-artifacts.mjs
 

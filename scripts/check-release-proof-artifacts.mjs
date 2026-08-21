@@ -211,10 +211,16 @@ export async function fetchEvidence(
     );
   }
   if (response.status === 404) {
-    throw new Error(
+    const absent = new Error(
       `${path} does not exist on the ${EVIDENCE_REF} branch of ${repository}; ` +
       'the proof loop has not recorded this candidate, so it cannot be released',
     );
+    // Absence is the one condition a caller may act on differently, and the
+    // flag is what keeps that decision from being a string match on a message.
+    // Unreadability deliberately carries no flag: "we could not tell" must
+    // never widen a search.
+    absent.evidenceAbsent = true;
+    throw absent;
   }
   if (!response.ok) {
     throw new Error(
@@ -225,13 +231,18 @@ export async function fetchEvidence(
   return response.text();
 }
 
-// A squash merge mints a new commit, so the sha a tag points at is never the
-// sha the proof loop judged. Preflight runs on the release branch head, and the
-// tag lands on the squash of that branch onto main: v0.5.44's tag commit
-// a4ffe620 is kin#986's squash, while the preflight for that line judged the
-// release-next head. Resolving the originating pull request's head is what
-// connects the two, and it is the only link that survives a squash, because the
-// squash shares no sha, no parent and no tree with the branch it flattened.
+// The bridge for tags cut before the candidate became a main commit.
+//
+// Under that older scheme the proof loop judged the release branch head and the
+// tag landed on the squash of that branch onto main, so the two never shared a
+// sha: v0.5.44's tag commit a4ffe620 is kin#986's squash, while the preflight
+// for that line judged the release-next head. Resolving the originating pull
+// request's head is the only link that survives a squash, because the squash
+// shares no sha, no parent and no tree with the branch it flattened.
+//
+// Tags cut after the rekey point at the candidate itself and never reach this
+// function, because their direct key resolves. Release Recovery can still
+// re-run an older tag, which is why the bridge is kept rather than retired.
 //
 // A commit with no originating pull request resolves to nothing and the caller
 // refuses it. That is the intended answer for a tag minted through a path the
@@ -290,11 +301,55 @@ export async function resolveCandidateSha(
   return merged[0].head.sha;
 }
 
-// Two callers, one judge. CANDIDATE_SHA names the candidate directly, which is
-// what the release train has before it merges. RESOLVE_FROM_COMMIT names a
-// landed commit to bridge through its merged pull request, which is what the
-// promote gate has: by then the candidate has been squashed and its sha is
-// gone from history.
+// Find the candidate whose records this run is about, and read the first one.
+//
+// CANDIDATE_SHA names it directly, and that is what both live callers have: the
+// tag mint knows the main commit it selected, and the promote gate knows the
+// commit the tag points at, which under the current scheme is the same object.
+//
+// RESOLVE_FROM_COMMIT is the bridge for tags cut before that scheme landed.
+// Those tags point at the squash of a version bump pull request, and a squash
+// shares no sha, no parent and no tree with the branch it flattened, so their
+// records sit under that pull request's head instead. Release Recovery can
+// still re-run such a tag, so the bridge stays.
+//
+// Order matters and so does what may trigger it. The direct key is tried first,
+// and only an ABSENT record falls through to the bridge. An unreadable record,
+// a transport failure or a server error still fails closed right here, because
+// a check that widens its search when it cannot tell is a check that reports
+// success for the wrong reason.
+async function locateCandidate({ sha, resolveFromCommit, options, log }) {
+  if (sha) {
+    try {
+      return {
+        sha,
+        preflightText: await fetchEvidence(sha, PREFLIGHT_RECORD, options),
+      };
+    } catch (error) {
+      if (!error.evidenceAbsent || !resolveFromCommit) {
+        throw error;
+      }
+      log(
+        `No preflight record under ${sha}; bridging landed commit ` +
+        `${resolveFromCommit} through the pull request that produced it`,
+      );
+    }
+  }
+  if (!resolveFromCommit) {
+    throw new Error(
+      'no candidate given; set CANDIDATE_SHA, or RESOLVE_FROM_COMMIT to bridge ' +
+      'a landed commit through the pull request that produced it',
+    );
+  }
+  const bridged = await resolveCandidateSha(resolveFromCommit, options);
+  log(`Resolved candidate ${bridged} from landed commit ${resolveFromCommit}`);
+  return {
+    sha: bridged,
+    preflightText: await fetchEvidence(bridged, PREFLIGHT_RECORD, options),
+  };
+}
+
+// Two callers, one judge.
 export async function main({
   sha = process.env.CANDIDATE_SHA,
   resolveFromCommit = process.env.RESOLVE_FROM_COMMIT,
@@ -309,18 +364,14 @@ export async function main({
   const token = env.GH_TOKEN || env.GITHUB_TOKEN;
   const options = { repository, token, fetchImpl };
 
-  if (!sha && resolveFromCommit) {
-    sha = await resolveCandidateSha(resolveFromCommit, options);
-    log(`Resolved candidate ${sha} from landed commit ${resolveFromCommit}`);
-  }
-  if (!sha) {
-    throw new Error(
-      'no candidate given; set CANDIDATE_SHA, or RESOLVE_FROM_COMMIT to bridge ' +
-      'a landed commit through the pull request that produced it',
-    );
-  }
+  let preflightText;
+  ({ sha, preflightText } = await locateCandidate({
+    sha,
+    resolveFromCommit,
+    options,
+    log,
+  }));
 
-  const preflightText = await fetchEvidence(sha, PREFLIGHT_RECORD, options);
   let preflight;
   try {
     preflight = JSON.parse(preflightText);
