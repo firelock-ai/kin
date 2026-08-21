@@ -148,6 +148,31 @@ impl Host {
         .expect("write setup.toml");
     }
 
+    /// Run `kin vfs status` from `cwd`, with the binding a shell hook would
+    /// have exported into the process, and return what a user reads.
+    fn vfs_status_text(&self, cwd: &std::path::Path, workspace: Option<&std::path::Path>) -> String {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_kin"));
+        command
+            .env("KIN_HOME", &self.kin_home)
+            .env("HOME", &self.kin_home)
+            .env("KIN_VFS_BIN", self.bin.join("kin-vfs"))
+            .env_remove("KIN_VFS_SOCK")
+            .current_dir(cwd)
+            .args(["vfs", "status"]);
+        match workspace {
+            Some(root) => command.env("KIN_VFS_WORKSPACE", root),
+            None => command.env_remove("KIN_VFS_WORKSPACE"),
+        };
+        let output = command.output().expect("run kin vfs status");
+        assert!(
+            output.status.success(),
+            "kin vfs status failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
     fn vfs_status(&self) -> Value {
         let output = self.kin(&["vfs", "status", "--json"]);
         assert!(
@@ -448,5 +473,71 @@ fn a_recorded_mode_with_nothing_installed_never_reads_as_healthy() {
         after["healthy"],
         Value::Bool(false),
         "a machine with a configured, broken projection is not ready"
+    );
+}
+
+/// FIR-2552 and FIR-2554, as a user reads them. A shim bound to a root that
+/// does not hold this repository, or to one no daemon answers, must not report
+/// a projection in force, and the report must name the root and the socket it
+/// is talking about rather than a verdict alone.
+#[test]
+fn vfs_status_names_the_bound_root_and_refuses_to_call_an_unserved_one_in_force() {
+    let host = Host::new();
+    host.install_shim();
+    let repo = host.cwd.join("notekeeper");
+    std::fs::create_dir_all(repo.join(".kin")).expect("create repo");
+    std::fs::write(
+        repo.join(".kin").join("manifest.json"),
+        br#"{"repo_id":"00000000-0000-4000-8000-000000000000"}"#,
+    )
+    .expect("write manifest");
+    let elsewhere = host.cwd.join("home");
+    std::fs::create_dir_all(&elsewhere).expect("create home");
+
+    // The container's shape: the hook bound a directory that is not this
+    // repository, and nothing is serving it.
+    let mismatched = host.vfs_status_text(&repo, Some(&elsewhere));
+    assert!(
+        mismatched.contains(&format!("the projection root bound here is {}", elsewhere.display())),
+        "the report must name the root it is bound to:\n{mismatched}"
+    );
+    assert!(
+        mismatched.contains("does not contain this directory"),
+        "the report must say the bound root does not hold this repository:\n{mismatched}"
+    );
+    assert!(
+        mismatched.contains(&format!(
+            "its socket is {}",
+            elsewhere.join(".kin").join("vfs.sock").display()
+        )) && mismatched.contains("there is no socket there"),
+        "the report must name the socket it probed and what the probe found:\n{mismatched}"
+    );
+    assert!(
+        mismatched.contains("degraded=yes"),
+        "a root nothing serves is not a projection in force:\n{mismatched}"
+    );
+
+    // The control that keeps this from being a permanently pessimistic row:
+    // the same command, the repository itself bound, and a listener answering
+    // its socket. A socket file alone proves nothing, so the listener is real.
+    let socket = repo.join(".kin").join("vfs.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind fixture socket");
+    let served = host.vfs_status_text(&repo, Some(&repo));
+    assert!(
+        served.contains(&format!("its socket is {}", socket.display()))
+            && served.contains("a daemon answered it"),
+        "an answered connect must be reported as one, naming the socket:\n{served}"
+    );
+    for absent in ["does not contain this directory", "there is no socket there"] {
+        assert!(
+            !served.contains(absent),
+            "a bound, answered repository must not carry `{absent}`:\n{served}"
+        );
+    }
+
+    // FIR-2572: shim mode declares what it cannot project, in the same block.
+    assert!(
+        served.contains("Node is not projected in this mode"),
+        "shim mode must declare the raw-syscall gap:\n{served}"
     );
 }

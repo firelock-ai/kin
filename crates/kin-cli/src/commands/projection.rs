@@ -155,6 +155,29 @@ impl ProjectionMode {
             }
         }
     }
+
+    /// What this mode cannot project, where that is a property of the mode
+    /// rather than of the host.
+    ///
+    /// The shim is injected through `LD_PRELOAD` and `DYLD_INSERT_LIBRARIES`,
+    /// which interpose libc and nothing else. A runtime that issues raw
+    /// syscalls goes straight past it: Node's libuv calls `statx` directly, so
+    /// inside a projected repository Node reads raw disk on the same path where
+    /// git, Python and the coreutils read graph truth (FIR-2572). No further
+    /// hook closes that, so the product says it rather than leaving a user to
+    /// find it. A mount has no such gap, because the kernel serves every
+    /// process on the host.
+    pub(crate) fn raw_syscall_note(self) -> Option<&'static str> {
+        match self {
+            Self::Shim => Some(
+                "Node is not projected in this mode: the shim interposes libc, and libuv issues \
+                 raw syscalls that no injected library can see, so Node reads raw disk here while \
+                 git, Python and the coreutils read graph truth. The nfs and fuse mounts project \
+                 every process on the host, Node included.",
+            ),
+            Self::Nfs | Self::Fuse | Self::ProjFs => None,
+        }
+    }
 }
 
 impl std::fmt::Display for ProjectionMode {
@@ -777,20 +800,24 @@ impl ShimBinding {
                 .to_string(),
             Self::Bound {
                 root,
+                socket,
                 covers,
                 detail,
                 ..
             } => {
                 if *covers {
                     format!(
-                        "the projection root bound here is {}, and {detail}",
-                        root.display()
+                        "the projection root bound here is {}, its socket is {}, and {detail}",
+                        root.display(),
+                        socket.display()
                     )
                 } else {
                     format!(
                         "the projection root bound here is {}, which does not contain this \
-                         directory, so this directory is read from raw disk; {detail}",
-                        root.display()
+                         directory, so this directory is read from raw disk; its socket is {} \
+                         and {detail}",
+                        root.display(),
+                        socket.display()
                     )
                 }
             }
@@ -860,38 +887,28 @@ fn path_within(path: &Path, root: &Path) -> bool {
 #[cfg(unix)]
 fn socket_listening(socket: &Path) -> (Tri, String) {
     match std::os::unix::net::UnixStream::connect(socket) {
-        Ok(_) => (
-            Tri::Yes,
-            format!("a daemon answered its socket at {}", socket.display()),
-        ),
+        Ok(_) => (Tri::Yes, "a daemon answered it".to_string()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => (
             Tri::No,
-            format!(
-                "there is no socket at {}, so every path under that root fails EIO rather than \
-                 falling back to disk",
-                socket.display()
-            ),
+            "there is no socket there, so every path under that root fails EIO rather than \
+             falling back to disk"
+                .to_string(),
         ),
         Err(error) => (
             Tri::No,
             format!(
-                "nothing answered its socket at {}: {error}; every path under that root fails \
-                 EIO rather than falling back to disk",
-                socket.display()
+                "nothing answered it: {error}; every path under that root fails EIO rather than \
+                 falling back to disk"
             ),
         ),
     }
 }
 
 #[cfg(not(unix))]
-fn socket_listening(socket: &Path) -> (Tri, String) {
+fn socket_listening(_socket: &Path) -> (Tri, String) {
     (
         Tri::NotApplicable,
-        format!(
-            "its socket at {} was not probed: this platform does not answer the shim over a Unix \
-             socket",
-            socket.display()
-        ),
+        "it was not probed: this platform does not answer the shim over a Unix socket".to_string(),
     )
 }
 
@@ -1944,12 +1961,30 @@ fn print_live(live: &LiveProjection) {
     } else {
         style("✓").green()
     };
-    println!("{mark} Projection in force: {}", live.row());
-    println!("  {}: {}", live.mode, live.mode.description());
-    println!("  files at {}", live.at.display());
-    for line in &live.evidence {
+    let mut lines = live_lines(live).into_iter();
+    let row = lines
+        .next()
+        .expect("live_lines always yields the row it is built around");
+    println!("{mark} {row}");
+    for line in lines {
         println!("  {line}");
     }
+}
+
+/// Every line the projection block prints, in order, with the row first and the
+/// rest indented under it.
+///
+/// Split out from the printing so what this surface says, and what it must not
+/// say, are both testable without running a command.
+fn live_lines(live: &LiveProjection) -> Vec<String> {
+    let mut lines = vec![
+        format!("Projection in force: {}", live.row()),
+        format!("{}: {}", live.mode, live.mode.description()),
+        format!("files at {}", live.at.display()),
+    ];
+    lines.extend(live.mode.raw_syscall_note().map(str::to_string));
+    lines.extend(live.evidence.iter().cloned());
+    lines
 }
 
 fn parse_requested(mode: Option<&str>) -> Result<Option<ProjectionMode>> {
@@ -2331,6 +2366,75 @@ Options:
         );
     }
 
+    /// FIR-2572: the shim cannot interpose a raw syscall, so Node reads raw
+    /// disk inside a projected repository while every libc caller does not.
+    /// The status block has to say so under the shim, and must not say it under
+    /// a mount, where the kernel serves every process.
+    #[test]
+    fn the_status_block_declares_the_shim_raw_syscall_gap_and_only_there() {
+        let shim_note = ProjectionMode::Shim
+            .raw_syscall_note()
+            .expect("the shim mode declares its raw-syscall gap");
+        assert!(
+            shim_note.contains("Node"),
+            "the note must name the runtime it is about: {shim_note}"
+        );
+        assert!(
+            shim_note.contains("nfs") && shim_note.contains("fuse"),
+            "the note must name the modes that do project Node: {shim_note}"
+        );
+        for mode in [
+            ProjectionMode::Nfs,
+            ProjectionMode::Fuse,
+            ProjectionMode::ProjFs,
+        ] {
+            assert_eq!(
+                mode.raw_syscall_note(),
+                None,
+                "{mode} is served by the kernel and projects every process, so it must not carry \
+                 the shim's gap"
+            );
+        }
+
+        let at = Path::new("/w/repo");
+        let shim = LiveProjection {
+            intent: ProjectionMode::Shim,
+            mode: ProjectionMode::Shim,
+            at: at.to_path_buf(),
+            mounted: Tri::NotApplicable,
+            readable: Tri::Yes,
+            writable: Tri::NotApplicable,
+            degraded: false,
+            evidence: vec!["fixture evidence".to_string()],
+        };
+        let printed = live_lines(&shim).join("\n");
+        assert!(
+            printed.contains(shim_note),
+            "the shim block must carry the note verbatim:\n{printed}"
+        );
+
+        let mount = LiveProjection {
+            intent: ProjectionMode::Fuse,
+            mode: ProjectionMode::Fuse,
+            mounted: Tri::Yes,
+            ..shim.clone()
+        };
+        let printed = live_lines(&mount).join("\n");
+        assert!(
+            !printed.contains("Node"),
+            "a mount projects Node, so its block must not carry the shim's gap:\n{printed}"
+        );
+        let nfs = LiveProjection {
+            intent: ProjectionMode::Nfs,
+            mode: ProjectionMode::Nfs,
+            ..mount.clone()
+        };
+        assert!(
+            !live_lines(&nfs).join("\n").contains("Node"),
+            "the nfs block must not carry the shim's gap"
+        );
+    }
+
     /// A binding that covers `at` and is answered: what a working shim
     /// projection looks like from this process.
     fn served_binding(at: &Path) -> ShimBinding {
@@ -2422,7 +2526,7 @@ Options:
         let (verdict, detail) = socket_listening(&absent);
         assert_eq!(verdict, Tri::No, "{detail}");
         assert!(
-            detail.contains("there is no socket at"),
+            detail.contains("there is no socket there"),
             "an absent socket must say so: {detail}"
         );
 
@@ -2431,7 +2535,7 @@ Options:
         let (verdict, detail) = socket_listening(&live);
         assert_eq!(verdict, Tri::Yes, "{detail}");
         assert!(
-            detail.contains("a daemon answered"),
+            detail.contains("a daemon answered it"),
             "an answered connect must say so: {detail}"
         );
 
@@ -2466,12 +2570,7 @@ Options:
             installed: true,
             engaged: true,
         };
-        let silent = |_: &Path| {
-            (
-                Tri::No,
-                "there is no socket at /home/.kin/vfs.sock (fixture)".to_string(),
-            )
-        };
+        let silent = |_: &Path| (Tri::No, "there is no socket there (fixture)".to_string());
         let bound_home = shim_binding_for(Some(&home), None, &repo, silent);
         let live = probe_live(
             ProjectionMode::Shim,

@@ -49,6 +49,15 @@ binary, macOS SIP, or a static binary that never calls libc all leave that
 process reading raw disk. Nothing crashes when that happens, which is exactly
 why it needs to be reported rather than assumed.
 
+One gap is not about refusal at all. The shim interposes libc and nothing else,
+so a runtime that issues raw syscalls goes straight around it. Node is the one
+most people hit: libuv calls `statx` directly, so inside a projected repository
+Node reads raw disk on the same path where git, Python and the coreutils read
+graph truth. No further hook closes that, so `kin vfs status` prints the limit
+under `shim` rather than leaving you to find it. The `nfs` and `fuse` mounts
+have no such gap, because the kernel serves every process on the host. If your
+toolchain is Node, prefer a mount.
+
 Between the two mounts, each platform's native one comes first. macOS carries an
 NFS client in the base system while FUSE there needs FUSE-T or macFUSE
 installed. Linux carries libfuse far more widely than it carries a configured
