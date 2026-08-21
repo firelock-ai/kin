@@ -1201,10 +1201,19 @@ pub(crate) fn commit_native_plan_with_observed_target_tree(
     observed: &AdmittedWorkspaceTree,
 ) -> Result<NativeCommitResult> {
     if observed.previous_tree != plan.previous_tree {
+        // The recovery is named here because this is the first thing a wedged
+        // daemon says, and on its own the sentence above describes the mismatch
+        // without telling anyone what to do about it. A derived graph that has
+        // outrun repository authority is not cleared by admitting again, by
+        // committing again, or by editing the file: each of those plans out of
+        // the same graph tree and reaches the same refusal, wearing a different
+        // message every time.
         return Err(invalid(
             "the completed host walk was planned out of a different workspace tree than this \
              commit publishes from; a collapsed commit may not carry a tree transition no walk \
-             observed",
+             observed. The derived graph this daemon answers from is ahead of repository \
+             authority, and no later command clears that on its own: run `kin daemon stop` and \
+             then this command again",
         ));
     }
     if observed.desired_tree != plan.target_tree {
