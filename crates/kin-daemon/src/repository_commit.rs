@@ -229,7 +229,7 @@ pub(crate) fn plan_session_workspace_admission(
 
     let authority = authority_context.open().map_err(DaemonError::Graph)?;
     let mut source_lengths = std::collections::BTreeMap::new();
-    let (shared_policy, _) = SharedAdmissionPolicy::derive_from_tree(
+    let (shared_policy, _) = SharedAdmissionPolicy::derive_from_tree_with_allowances(
         Some(&base.source_workspace.shared_admission_policy),
         desired_tree,
         |hash| {
@@ -248,6 +248,15 @@ pub(crate) fn plan_session_workspace_admission(
             })?;
             source_lengths.insert(hash, length);
             Ok(length)
+        },
+        |hash| {
+            read_publishable_source(blobs, &authority, hash)
+                .map(|source| source.body().to_vec())
+                .map_err(|error| {
+                    ModelError::InvalidOperation(format!(
+                        "{error}, while reading the approvals the exact session policy derives"
+                    ))
+                })
         },
     )?;
     let tree_hash = compute_resolved_tree_hash(desired_tree)?;
@@ -491,7 +500,7 @@ pub(crate) fn publish_workspace_tree(
 
     let tree_deltas = kin_core::exact_tree_correction(&workspace.tree, desired_tree)?;
     let mut source_lengths = std::collections::BTreeMap::new();
-    let (shared_policy, _) = SharedAdmissionPolicy::derive_from_tree(
+    let (shared_policy, _) = SharedAdmissionPolicy::derive_from_tree_with_allowances(
         Some(&workspace.shared_admission_policy),
         desired_tree,
         |hash| {
@@ -513,6 +522,15 @@ pub(crate) fn publish_workspace_tree(
             })?;
             source_lengths.insert(hash, length);
             Ok(length)
+        },
+        |hash| {
+            read_publishable_source(blobs, &authority, hash)
+                .map(|source| source.body().to_vec())
+                .map_err(|error| {
+                    ModelError::InvalidOperation(format!(
+                "{error}, while reading the approvals the admitted workspace policy derives"
+            ))
+                })
         },
     )?;
     let tree_hash = compute_resolved_tree_hash(desired_tree)?;
@@ -814,7 +832,7 @@ fn plan_native_commit_inner(
     let mut source_lengths = std::collections::BTreeMap::new();
     let (shared_policy, admission_policy_delta) =
         crate::mcp_commit::timed_commit_phase("plan_derive_admission_policy", || {
-            SharedAdmissionPolicy::derive_from_tree(
+            SharedAdmissionPolicy::derive_from_tree_with_allowances(
                 parent_policy.as_ref(),
                 &deltas.expected_tree,
                 |hash| {
@@ -834,6 +852,15 @@ fn plan_native_commit_inner(
                     })?;
                     source_lengths.insert(hash, length);
                     Ok(length)
+                },
+                |hash| {
+                    read_publishable_source(blobs, &authority, hash)
+                        .map(|source| source.body().to_vec())
+                        .map_err(|error| {
+                            ModelError::InvalidOperation(format!(
+                "{error}, while reading the approvals the graph-owned policy derives"
+            ))
+                        })
                 },
             )
         })?;

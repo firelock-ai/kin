@@ -974,6 +974,20 @@ enum Command {
     /// a graph that fell behind its working tree and is waiting for churn that
     /// is not coming.
     Admit,
+    /// Approve one blocked sensitive artifact for publication
+    ///
+    /// Admission refuses untracked content that looks like a leaked credential
+    /// and names the path, digest, and entry kind an approval must carry. This
+    /// records exactly that triple in the tracked .kin-allowances file, so the
+    /// approval travels with the repository and a reviewer sees it in the diff.
+    /// Editing the artifact changes its digest and blocks it again.
+    Allow {
+        /// Path to the artifact admission blocked
+        path: String,
+        /// Why this artifact is safe to publish, read by whoever reviews it
+        #[arg(long)]
+        reason: String,
+    },
     /// Admit one exact disposable-session observation into repository-v6 authority
     Reconcile {
         /// Session ID (defaults to most recent session)
@@ -3552,6 +3566,7 @@ fn main() -> Result<()> {
                     commands::capabilities::require_ready("admit")?;
                     commands::admit::run().await
                 }
+                Command::Allow { path, reason } => commands::allow::run(path, reason).await,
                 Command::Reconcile {
                     session,
                     confirm_mass_deletion,

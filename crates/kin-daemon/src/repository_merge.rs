@@ -1494,21 +1494,36 @@ fn derive_policy(
     Option<kin_model::AdmissionPolicyDelta>,
 )> {
     let mut lengths: BTreeMap<Hash256, u64> = BTreeMap::new();
-    SharedAdmissionPolicy::derive_from_tree(Some(parent), tree, |hash| {
-        if let Some(length) = lengths.get(&hash) {
-            return Ok(*length);
-        }
-        let source = read_publishable_source(blobs, authority, hash).map_err(|error| {
-            ModelError::InvalidOperation(format!(
-                "{error}, while deriving the merged tree's admission policy"
-            ))
-        })?;
-        let length = u64::try_from(source.body().len()).map_err(|_| {
-            ModelError::InvalidOperation(format!("graph-owned admission source {hash} exceeds u64"))
-        })?;
-        lengths.insert(hash, length);
-        Ok(length)
-    })
+    SharedAdmissionPolicy::derive_from_tree_with_allowances(
+        Some(parent),
+        tree,
+        |hash| {
+            if let Some(length) = lengths.get(&hash) {
+                return Ok(*length);
+            }
+            let source = read_publishable_source(blobs, authority, hash).map_err(|error| {
+                ModelError::InvalidOperation(format!(
+                    "{error}, while deriving the merged tree's admission policy"
+                ))
+            })?;
+            let length = u64::try_from(source.body().len()).map_err(|_| {
+                ModelError::InvalidOperation(format!(
+                    "graph-owned admission source {hash} exceeds u64"
+                ))
+            })?;
+            lengths.insert(hash, length);
+            Ok(length)
+        },
+        |hash| {
+            read_publishable_source(blobs, authority, hash)
+                .map(|source| source.body().to_vec())
+                .map_err(|error| {
+                    ModelError::InvalidOperation(format!(
+                        "{error}, while reading the approvals the merged tree's policy derives"
+                    ))
+                })
+        },
+    )
     .context("derive exact admission policy for the merged tree")
 }
 
