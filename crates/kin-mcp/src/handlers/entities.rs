@@ -3233,7 +3233,21 @@ with the same class share no data; pass include_type_edges=true to walk through 
 the type is one this repository defines, which is a real flow for a field or a return. \
 `terminal_external_steps` and `terminal_annotation_steps` count them, kept apart because only \
 the second is recoverable by a parameter. Neither sets `truncated`: a boundary means the chain \
-ends there, not that you received less of one that exists.";
+ends there, not that you received less of one that exists. \
+Every other node the walk did not continue through also says why, in the same field. \
+`terminal: \"leaf\"` means the walk read that node's relations, the graph held no further \
+edge of the walked classes, and the coverage classes the answer rests on were observed \
+present, so the chain ends there. `terminal: \"bound_reached\"` means the node's relations \
+were never read, because the requested depth or a work budget stopped the walk first; raise \
+`depth` to open it. `terminal: \"coverage_gap\"` means the read was empty on a language whose \
+deciding coverage classes were absent or unmeasured, so the walk cannot tell a missing hop \
+from a graph that never held one; `edge_coverage` on the response names the classes and \
+`_kin.completeness` carries the same reading. The last two DO set `truncated`, and \
+`terminal_leaf_steps`, `terminal_bound_steps` and `terminal_coverage_gap_steps` count them. \
+`focal_terminal` says the same thing about the focal, which has no row in `chain`, so an \
+empty chain still states why it is empty. Read `truncated: false` as a claim only when no \
+step carries one of those two: it now means the walk received every hop the graph could \
+offer, rather than only that no cap fired.";
 
 /// One node of a trace walk, carrying the file and directory its fan-out is
 /// scored against.
