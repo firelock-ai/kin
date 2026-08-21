@@ -5229,4 +5229,59 @@ mod tests {
         assert!(!query_names_a_symbol("graph-native repo substrate"));
         assert!(!query_names_a_symbol(""));
     }
+
+    /// FIR-2542's second half. `edge_coverage_unreported` reached every
+    /// `trace_data_flow` response, complete ones included, because the daemon
+    /// route published no observation at all. A limit that is always set
+    /// distinguishes nothing, so the fix is the walk publishing what it
+    /// measured; this asserts the gate reacts to that and still refuses when
+    /// the measurement says the graph could not have answered.
+    #[test]
+    fn a_trace_that_publishes_its_coverage_stops_reporting_it_as_unreported() {
+        let chain = json!({
+            "chain": [{"step": 1, "terminal": "leaf"}],
+            "total_steps": 1,
+            "truncated": false,
+        });
+
+        // Before: no observation, so every walk carried the same limit.
+        let unreported =
+            absence_coverage_gap("trace_data_flow", &chain).expect("an unmeasured walk is unknown");
+        assert!(
+            unreported.starts_with("edge_coverage_unreported"),
+            "{unreported}"
+        );
+        assert!(edge_coverage_degradation_labels("trace_data_flow", &chain)
+            .contains(&"edge_coverage:unreported".to_string()));
+
+        // After: the walk publishes what it measured, and a graph that links
+        // calls across files leaves the gate with nothing to say.
+        let mut measured = chain.clone();
+        measured["edge_coverage"] = json!({
+            "scope": "language",
+            "language": "Python",
+            "requested_classes": ["calls", "imports", "references"],
+            "classes": {"calls": "present", "imports": "absent", "references": "absent"},
+            "reference_enrichment": "unknown",
+            "budget_exhausted": false,
+        });
+        assert_eq!(
+            absence_coverage_gap("trace_data_flow", &measured),
+            None,
+            "a complete walk over a linked graph must carry no coverage limit"
+        );
+        let labels = edge_coverage_degradation_labels("trace_data_flow", &measured);
+        assert!(
+            !labels.contains(&"edge_coverage:unreported".to_string()),
+            "the limit that distinguished nothing must be gone: {labels:?}"
+        );
+
+        // And the gate still fires on the graph shape it exists for, so the fix
+        // is not simply a way of never reporting a gap.
+        let mut unlinked = measured.clone();
+        unlinked["edge_coverage"]["classes"]["calls"] = json!("absent");
+        let gap = absence_coverage_gap("trace_data_flow", &unlinked)
+            .expect("a graph holding no cross-file calls cannot complete a call chain");
+        assert!(gap.starts_with("cross_file_edges_absent"), "{gap}");
+    }
 }
