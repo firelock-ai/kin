@@ -434,64 +434,23 @@ fn cgroup_cpu_quota() -> Option<usize> {
 
 /// Effective memory limit in bytes from a container memory cap, or `None` when
 /// unlimited, unset, unparsable, or off Linux.
-#[cfg(target_os = "linux")]
+///
+/// One reader for the whole product, in `kin_daemon_spawn`, because the process
+/// that records why a daemon died cannot depend on this crate and must decide
+/// from the same two numbers this tier is scored from.
 fn cgroup_memory_limit_bytes() -> Option<u64> {
-    if let Ok(contents) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
-        return parse_v2_memory_max(&contents);
-    }
-    let raw: u64 = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    parse_v1_memory_limit(raw)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn cgroup_memory_limit_bytes() -> Option<u64> {
-    None
+    kin_daemon_spawn::cgroup_memory().limit_bytes
 }
 
 /// How many times the kernel OOM-killed a process accounted to this cgroup, or
 /// `None` when no accounting is readable (off Linux, or neither hierarchy's
 /// file is present).
 ///
-/// Both hierarchies publish the counter under the same key, in different files:
-/// cgroup v2 in `memory.events`, v1 in `memory.oom_control`. The distinction
-/// that matters to a caller is `Some(0)` against `None`: the first is the
-/// kernel saying nothing was killed, the second is this process being unable
-/// to ask.
-#[cfg(target_os = "linux")]
+/// The distinction that matters to a caller is `Some(0)` against `None`: the
+/// first is the kernel saying nothing was killed, the second is this process
+/// being unable to ask.
 fn cgroup_oom_kill_count() -> Option<u64> {
-    for path in [
-        "/sys/fs/cgroup/memory.events",
-        "/sys/fs/cgroup/memory/memory.oom_control",
-    ] {
-        if let Ok(contents) = std::fs::read_to_string(path) {
-            if let Some(count) = parse_oom_kill_count(&contents) {
-                return Some(count);
-            }
-        }
-    }
-    None
-}
-
-#[cfg(not(target_os = "linux"))]
-fn cgroup_oom_kill_count() -> Option<u64> {
-    None
-}
-
-/// The `oom_kill` counter out of a cgroup key/value block, or `None` when the
-/// block carries no such key.
-#[cfg(any(target_os = "linux", test))]
-fn parse_oom_kill_count(contents: &str) -> Option<u64> {
-    contents.lines().find_map(|line| {
-        let mut fields = line.split_whitespace();
-        match (fields.next(), fields.next()) {
-            (Some("oom_kill"), Some(value)) => value.parse().ok(),
-            _ => None,
-        }
-    })
+    kin_daemon_spawn::cgroup_memory().oom_kills
 }
 
 /// Whole-core count for a cgroup v2 `cpu.max` value ("<quota> <period>" in µs,
@@ -523,30 +482,6 @@ fn parse_v1_cpu_quota(quota_us: i64, period_us: i64) -> Option<usize> {
         return None;
     }
     Some(((quota_us as u64).div_ceil(period_us as u64) as usize).max(1))
-}
-
-/// Byte limit from a cgroup v2 `memory.max` value, or `None` for "max" /
-/// unparsable.
-#[cfg(any(target_os = "linux", test))]
-fn parse_v2_memory_max(contents: &str) -> Option<u64> {
-    let trimmed = contents.trim();
-    if trimmed == "max" {
-        return None;
-    }
-    trimmed.parse().ok()
-}
-
-/// Byte limit from a cgroup v1 `memory.limit_in_bytes`. An unconstrained group
-/// reports a huge page-aligned sentinel near `u64::MAX`; any value ≥ 1 PiB is
-/// that sentinel, not a real cap.
-#[cfg(any(target_os = "linux", test))]
-fn parse_v1_memory_limit(raw: u64) -> Option<u64> {
-    const ONE_PIB: u64 = 1 << 50;
-    if raw >= ONE_PIB {
-        None
-    } else {
-        Some(raw)
-    }
 }
 
 #[cfg(test)]
@@ -618,35 +553,6 @@ mod tests {
         assert_eq!(parse_v1_cpu_quota(200000, 100000), Some(2));
         assert_eq!(parse_v1_cpu_quota(-1, 100000), None);
         assert_eq!(parse_v1_cpu_quota(0, 100000), None);
-    }
-
-    #[test]
-    fn v2_memory_max_parses_bytes_and_unlimited() {
-        assert_eq!(
-            parse_v2_memory_max("4294967296"),
-            Some(4 * 1024 * 1024 * 1024)
-        );
-        assert_eq!(parse_v2_memory_max("max"), None);
-    }
-
-    #[test]
-    fn oom_kill_count_is_read_from_either_cgroup_hierarchy() {
-        // cgroup v2 `memory.events`, which is where the 512 MB constrained
-        // profile's evidence came from.
-        assert_eq!(
-            parse_oom_kill_count("low 0\nhigh 0\nmax 3\noom 1\noom_kill 1\n"),
-            Some(1)
-        );
-        // cgroup v1 `memory.oom_control`, same key, different file.
-        assert_eq!(
-            parse_oom_kill_count("oom_kill_disable 0\nunder_oom 0\noom_kill 2\n"),
-            Some(2)
-        );
-        // A group that was never killed says so, which is not the same answer
-        // as a host that cannot be asked.
-        assert_eq!(parse_oom_kill_count("low 0\nhigh 0\nmax 0\noom 0\n"), None);
-        assert_eq!(parse_oom_kill_count("oom_kill 0\n"), Some(0));
-        assert_eq!(parse_oom_kill_count("oom_kill notanumber\n"), None);
     }
 
     /// A failed memory probe and a real one, both ways round. An 18-core host
@@ -744,14 +650,5 @@ mod tests {
         );
         assert_eq!(parse_meminfo_total_gb("MemFree: 100 kB\n"), None);
         assert_eq!(parse_meminfo_total_gb("MemTotal:       nope kB\n"), None);
-    }
-
-    #[test]
-    fn v1_memory_limit_rejects_unlimited_sentinel() {
-        assert_eq!(
-            parse_v1_memory_limit(4 * 1024 * 1024 * 1024),
-            Some(4 * 1024 * 1024 * 1024)
-        );
-        assert_eq!(parse_v1_memory_limit(0x7FFF_FFFF_FFFF_F000), None);
     }
 }
