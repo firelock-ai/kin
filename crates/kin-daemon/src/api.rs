@@ -4754,6 +4754,34 @@ async fn command_commit(
                 .background_work
                 .reconcile()
                 .clear_deferred_tree_wedge();
+            // The forced admission above is a complete exact-tree admission by
+            // every measure the freshness surfaces use, so it is recorded on the
+            // same probes and in the same durable marker the ambient reconcile
+            // tick and `kin admit` write. Leaving it out made a commit the one
+            // complete admission no surface could see.
+            //
+            // Recorded here rather than beside the admission because this is the
+            // point the admitted tree is durable. The admission defers its
+            // publication to this transaction, and a marker stamped before the
+            // transaction reached authority would claim a complete admission for
+            // a tree authority never accepted, on exactly the path where the
+            // commit fails and the deferred publication fails behind it.
+            //
+            // Without this the marker had two writers, the ambient tick and
+            // `kin admit`, and neither runs on a convert-then-commit session: the
+            // tick stands its own round down for a commit inside the daemon. So a
+            // store that had just been converted and committed to reported that
+            // no complete admission was recorded for it, minutes after one had
+            // completed, while a sibling store that happened to get an ambient
+            // tick milliseconds before its commit reported a healthy timestamp.
+            state
+                .background_work
+                .reconcile()
+                .record_admission_success(std::time::Instant::now());
+            crate::background_work::record_durable_admission(
+                &state.layout,
+                state.graph.resolved_tree().len() as u64,
+            );
             Ok(response)
         }
         Err(error) => {
@@ -20641,6 +20669,165 @@ mod tests {
                 "the commit path must not name the {phase} phase; captured {:?}",
                 captured.phases
             );
+        }
+    }
+
+    /// A commit performs a complete exact-tree admission, so it must leave the
+    /// durable record of one behind.
+    ///
+    /// The marker had two writers before this, the ambient reconcile tick and
+    /// `kin admit`, and a convert-then-commit session runs neither: the tick
+    /// stands its own round down for a commit already inside the daemon. So two
+    /// stores converted and committed by one binary ended in opposite freshness
+    /// states, one carrying a timestamp because an ambient tick happened to land
+    /// milliseconds before its commit took the coordination gate, and the other
+    /// reporting that no complete admission had ever been recorded for it.
+    ///
+    /// The absent read before the commit is the control. `test_state` opens a
+    /// store with no ambient loop and no marker, so a marker afterwards can only
+    /// have been written by the commit under test, and an assertion that passed
+    /// on a store that was already stamped would prove nothing.
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn a_commit_records_the_complete_admission_it_performed() {
+        use kin_core::last_admission::LastAdmissionRead;
+
+        let state = test_state();
+        assert!(
+            matches!(
+                kin_core::last_admission::read(&state.layout),
+                LastAdmissionRead::Absent
+            ),
+            "the fixture store must carry no marker, or a marker afterwards proves nothing"
+        );
+
+        let root = state.layout.working_dir();
+        std::fs::write(root.join("admitted.rs"), b"pub fn admitted() {}\n").unwrap();
+        let app = router(Arc::clone(&state));
+        let response = app
+            .oneshot(
+                Request::post("/commands/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "operation_id": kin_model::OperationId::new(),
+                            "timestamp": kin_model::Timestamp::now(),
+                            "author": "Test Author <test@example.invalid>",
+                            "message": "record the admission this commit performed"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+        let recorded = match kin_core::last_admission::read(&state.layout) {
+            LastAdmissionRead::Recorded(recorded) => recorded,
+            other => panic!(
+                "a successful commit must record the complete admission it performed, read {other:?}"
+            ),
+        };
+        assert_eq!(
+            recorded.tracked_artifacts,
+            state.graph.resolved_tree().len() as u64,
+            "the record must cover the tree the commit left behind, not a different count"
+        );
+        assert!(
+            recorded.age_seconds(chrono::Utc::now()) < 300,
+            "the record must be stamped by this commit rather than carried in from elsewhere"
+        );
+
+        // The in-memory probes carry the same fact, so `/health`, `kin doctor`
+        // and `kin admit` name a commit's admission instead of reporting that
+        // none has succeeded in this daemon's life.
+        assert!(
+            state
+                .background_work
+                .reconcile_report(std::time::Instant::now())
+                .last_admission_success_age_seconds
+                .is_some(),
+            "a commit's admission must reach the reconcile probes as a success"
+        );
+    }
+
+    /// A commit that never reached authority must not restamp the marker.
+    ///
+    /// The forced admission still runs on this path and still succeeds, but its
+    /// tree is deferred to a transaction that was refused, so recording a
+    /// complete admission here would claim freshness for a tree repository
+    /// authority never accepted. The failure direction is the safe one: an
+    /// unrefreshed marker reads as staler than the store is and never as
+    /// fresher.
+    ///
+    /// A second commit on an unchanged tree is the refusal with no mocking in
+    /// it. `refuse_a_successor_that_records_nothing` answers it 409 after the
+    /// admission has already run, which is exactly the ordering under test. An
+    /// empty workspace is not that case and was the first guess: the first
+    /// commit of a freshly initialized store is accepted, so a test written on
+    /// it asserts nothing about a refusal.
+    ///
+    /// The first commit's timestamp is the control. Asserting only that some
+    /// marker exists afterwards would pass on a build that restamped on every
+    /// request, which is the defect this guards.
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn a_commit_that_reaches_no_authority_records_no_admission() {
+        use kin_core::last_admission::LastAdmissionRead;
+
+        let state = test_state();
+        let root = state.layout.working_dir();
+        std::fs::write(root.join("committed.rs"), b"pub fn committed() {}\n").unwrap();
+
+        let commit = |body: &'static str| {
+            let app = router(Arc::clone(&state));
+            app.oneshot(
+                Request::post("/commands/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "operation_id": kin_model::OperationId::new(),
+                            "timestamp": kin_model::Timestamp::now(),
+                            "author": "Test Author <test@example.invalid>",
+                            "message": body
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+        };
+
+        let accepted = commit("record the first admission").await.unwrap();
+        assert_eq!(
+            accepted.status(),
+            StatusCode::OK,
+            "the first commit must be accepted, or there is no marker to leave alone"
+        );
+        let stamped = match kin_core::last_admission::read(&state.layout) {
+            LastAdmissionRead::Recorded(recorded) => recorded,
+            other => panic!("the accepted commit must record its admission, read {other:?}"),
+        };
+
+        let refused = commit("commit the same tree again").await.unwrap();
+        assert_eq!(
+            refused.status(),
+            StatusCode::CONFLICT,
+            "a second commit on an unchanged tree must be refused, or this test is not \
+             exercising a failed commit"
+        );
+
+        match kin_core::last_admission::read(&state.layout) {
+            LastAdmissionRead::Recorded(after) => assert_eq!(
+                after, stamped,
+                "a commit that reached no authority must leave the freshness record exactly as \
+                 the last complete admission left it"
+            ),
+            other => panic!("the refused commit must not have removed the record, read {other:?}"),
         }
     }
 
