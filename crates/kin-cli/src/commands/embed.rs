@@ -41,6 +41,31 @@ pub struct EmbedRequest {
     pub cap_batch_size: bool,
 }
 
+/// The store's own embedding coverage either side of one embed pass, sampled by
+/// the daemon that ran it.
+///
+/// A pass reports how much IT embedded. That number and the store's coverage
+/// are different facts, and a pass that arrives after the queue is already
+/// drained holds a zero for the first while the second reads whole. Printed
+/// under one heading the two are indistinguishable, which is the state a user
+/// runs `kin embed` to tell apart.
+///
+/// Both samples are taken inside `build_embed_response`, which runs holding
+/// `DaemonState::embedding_work`. That mutex serializes explicit `/embed`
+/// requests against the background embedding worker, so the worker cannot move
+/// coverage between the two reads: `indexed_before` is exactly the state this
+/// pass inherited and `indexed_after` is exactly the state it left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PassCoverage {
+    /// Retrievable objects already in the vector index when the pass started,
+    /// before it propagated, queued or embedded anything.
+    pub indexed_before: usize,
+    /// Retrievable objects in the vector index when the pass returned.
+    pub indexed_after: usize,
+    /// Retrievable objects that require an embedding, as the pass last read it.
+    pub total: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbedResult {
     pub total_entities: usize,
@@ -51,6 +76,15 @@ pub struct EmbedResult {
     pub pending_artifacts: usize,
     pub time_limited: bool,
     pub vector_index_path: String,
+    /// The store's coverage either side of this pass, or `None` from a daemon
+    /// that does not report it.
+    ///
+    /// Optional rather than defaulted to zeros on purpose: a daemon that never
+    /// measured coverage and a store holding nothing both deserialize to the
+    /// same three zeros, and a summary line built from those would state a
+    /// measurement nobody took. `None` renders no coverage claim at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<PassCoverage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +92,89 @@ pub struct EmbedResponse {
     pub result: EmbedResult,
     #[serde(default)]
     pub lines: Vec<String>,
+}
+
+/// The completion line for a run that ended with nothing pending.
+///
+/// The line this replaces was `Done. Full coverage: {embedded} entities,
+/// {embedded} artifacts embedded ...`, which put the run's own pass counter
+/// under a heading about the store. On the shipped v0.5.45 bytes a stranger ran
+/// it on a store whose coverage went from 3 of 51 to 51 of 51 across the call
+/// and read `Done. Full coverage: 0 entities, 0 artifacts embedded`. Both
+/// numbers were true and the sentence was unreadable: a run that found an empty
+/// queue and a run that silently failed to embed produce the same zero, and
+/// those are the two states the command is run to tell apart.
+///
+/// So the run's own work and the store's coverage are named as two facts, and
+/// which sentence a zero gets is decided by `coverage`, which the daemon
+/// measured, rather than by an assumption about who filled the store. This
+/// process cannot observe that: a store already whole at entry may have been
+/// filled by the background worker, by `kin init`, or by an earlier explicit
+/// pass, and nothing reaching here distinguishes them. What it can say, and
+/// does, is that the work was finished before this pass started.
+///
+/// `None` coverage comes from a daemon that does not report it. That arm states
+/// the run's own work and makes no claim about the store, because a claim built
+/// from numbers nobody sampled is the defect this function exists to remove.
+fn embed_completion_line(
+    embedded_entities: usize,
+    embedded_artifacts: usize,
+    passes: usize,
+    rate: f64,
+    coverage: Option<PassCoverage>,
+) -> String {
+    let embedded = embedded_entities + embedded_artifacts;
+    let Some(coverage) = coverage else {
+        return format!(
+            "Done. This run embedded {embedded_entities} entities and {embedded_artifacts} \
+             artifacts across {passes} pass(es) at {rate:.2} ent/s, and the daemon reports \
+             nothing pending. This daemon does not report the store's coverage, so no claim \
+             about it is made here"
+        );
+    };
+    let PassCoverage {
+        indexed_before,
+        indexed_after,
+        total,
+    } = coverage;
+    if total == 0 {
+        return "Done. This repository has no retrievable graph objects that require an \
+                embedding, so there was nothing to embed"
+            .to_string();
+    }
+    if embedded > 0 {
+        return format!(
+            "Done. This run embedded {embedded_entities} entities and {embedded_artifacts} \
+             artifacts across {passes} pass(es) at {rate:.2} ent/s, taking this store from \
+             {indexed_before}/{total} to {indexed_after}/{total} indexed"
+        );
+    }
+    if indexed_before >= total {
+        return format!(
+            "Done. Nothing to embed: this store was already fully covered at {indexed_before}/\
+             {total} indexed when this pass started, so the work was finished before it ran"
+        );
+    }
+    if indexed_after > indexed_before {
+        // Coverage moved while the pass held the embedding lock and its queue
+        // embedded nothing, which is `propagate_revision_vectors` reusing
+        // vectors from fingerprint-identical revisions. That IS this pass's
+        // work; crediting it to an absent worker would be the same error the
+        // old line made, pointed the other way.
+        return format!(
+            "Done. This run embedded nothing through the queue and still took this store from \
+             {indexed_before}/{total} to {indexed_after}/{total} indexed, by reusing vectors \
+             from content-identical revisions"
+        );
+    }
+    // Nothing pending, nothing embedded, and coverage below total: the queue
+    // and the coverage counters disagree about what is left. Report both rather
+    // than picking one, since neither is established here.
+    format!(
+        "Done. This run embedded nothing and the daemon reports nothing pending, but this store \
+         reads {indexed_after}/{total} indexed. Run `kin health` to see why coverage and the \
+         queue disagree"
+    )
 }
 
 /// Decide whether the embed loop should enqueue missing retrievable objects.
@@ -391,6 +508,11 @@ pub async fn run(
     let mut embedded_entities = 0usize;
     let mut embedded_artifacts = 0usize;
     let mut budget_stopped = false;
+    // The run's coverage span is the FIRST pass's entry reading and the LAST
+    // pass's exit reading. Taking both from the final pass would report the
+    // span of one pass under a heading about the run, which is the same class
+    // of error as reporting a pass counter as the store's coverage.
+    let mut first_pass_indexed_before: Option<usize> = None;
     let final_result = loop {
         pass += 1;
         let response = run_daemon_embed(
@@ -410,6 +532,9 @@ pub async fn run(
         let result = response.result;
         embedded_entities += result.embedded_entities;
         embedded_artifacts += result.embedded_artifacts;
+        if first_pass_indexed_before.is_none() {
+            first_pass_indexed_before = result.coverage.map(|c| c.indexed_before);
+        }
         let made_progress = result.embedded_entities + result.embedded_artifacts > 0;
 
         let elapsed = embed_started.elapsed().as_secs_f64();
@@ -438,18 +563,36 @@ pub async fn run(
     let pending = final_result.pending_entities + final_result.pending_artifacts;
     let elapsed = embed_started.elapsed().as_secs_f64();
     let rate = throughput_per_sec(embedded_entities + embedded_artifacts, elapsed);
+    // The run's span: where the first pass found this store, where the last one
+    // left it. Both halves have to be present, so a daemon that reported
+    // coverage on only some passes yields no span rather than a mixed one.
+    let run_coverage = match (first_pass_indexed_before, final_result.coverage) {
+        (Some(indexed_before), Some(last)) => Some(PassCoverage {
+            indexed_before,
+            ..last
+        }),
+        _ => None,
+    };
     if json {
         let aggregate = EmbedResult {
             embedded_entities,
             embedded_artifacts,
             time_limited: pending > 0,
+            coverage: run_coverage,
             ..final_result
         };
         println!("{}", serde_json::to_string_pretty(&aggregate)?);
     } else if pending == 0 {
         println!(
-            "Done. Full coverage: {} entities, {} artifacts embedded across {pass} pass(es) at {:.2} ent/s, index saved to {}",
-            embedded_entities, embedded_artifacts, rate, final_result.vector_index_path
+            "{}, index saved to {}",
+            embed_completion_line(
+                embedded_entities,
+                embedded_artifacts,
+                pass,
+                rate,
+                run_coverage,
+            ),
+            final_result.vector_index_path
         );
     } else if budget_stopped {
         println!(
@@ -525,10 +668,25 @@ pub fn build_embed_response(
                 pending_artifacts: 0,
                 time_limited: false,
                 vector_index_path: String::new(),
+                coverage: Some(PassCoverage {
+                    indexed_before: 0,
+                    indexed_after: 0,
+                    total: 0,
+                }),
             },
             lines: vec!["No retrievable graph objects found. Run `kin init` first.".to_string()],
         });
     }
+
+    // Sampled here, before this pass propagates, queues or embeds anything, so
+    // it reports the store this pass INHERITED. The reading taken further down
+    // for the queue decision is already post-propagation, and reusing it would
+    // credit this pass's own propagation to whatever ran before it.
+    //
+    // Nothing else can move coverage between this line and the exit sample: the
+    // caller holds `DaemonState::embedding_work`, which serializes explicit
+    // passes against the background embedding worker.
+    let coverage_before = graph.embedding_status();
 
     // Propagate vectors from fingerprint-identical previous revisions before
     // queueing, so identical-content revisions skip GPU inference entirely.
@@ -621,6 +779,7 @@ pub fn build_embed_response(
     let vi_path = crate::backend::vector_index_path(layout);
     let pending_entities = graph.pending_embeddings();
     let pending_artifacts = graph.pending_artifact_embeddings();
+    let coverage_after = graph.embedding_status();
     let result = EmbedResult {
         total_entities,
         embedded_entities: total_embedded_entities,
@@ -630,6 +789,11 @@ pub fn build_embed_response(
         pending_artifacts,
         time_limited,
         vector_index_path: vi_path.to_string_lossy().to_string(),
+        coverage: Some(PassCoverage {
+            indexed_before: coverage_before.indexed,
+            indexed_after: coverage_after.indexed,
+            total: coverage_after.total,
+        }),
     };
     let mut lines = Vec::new();
     if time_limited {
@@ -659,11 +823,11 @@ pub fn build_embed_response(
 #[cfg(test)]
 mod tests {
     use super::{
-        constrained_memory_notice, effective_batch_size, embed_pass_should_continue,
-        embed_resource_exhaustion, eta_suffix, format_duration_secs, resolve_total_budget,
-        should_queue_missing_embedding_pass, throughput_per_sec, EmbedResult, DEFAULT_BATCH_SIZE,
-        DEFAULT_CONSTRAINED_TOTAL_SECONDS, EMBED_MODEL_DOWNLOAD, EMBED_MODEL_ID,
-        RECOMMENDED_EMBED_MEMORY_BYTES,
+        constrained_memory_notice, effective_batch_size, embed_completion_line,
+        embed_pass_should_continue, embed_resource_exhaustion, eta_suffix, format_duration_secs,
+        resolve_total_budget, should_queue_missing_embedding_pass, throughput_per_sec, EmbedResult,
+        PassCoverage, DEFAULT_BATCH_SIZE, DEFAULT_CONSTRAINED_TOTAL_SECONDS, EMBED_MODEL_DOWNLOAD,
+        EMBED_MODEL_ID, RECOMMENDED_EMBED_MEMORY_BYTES,
     };
 
     fn result_with(pending_entities: usize, pending_artifacts: usize) -> EmbedResult {
@@ -676,7 +840,270 @@ mod tests {
             pending_artifacts,
             time_limited: false,
             vector_index_path: String::new(),
+            coverage: None,
         }
+    }
+
+    fn coverage(indexed_before: usize, indexed_after: usize, total: usize) -> Option<PassCoverage> {
+        Some(PassCoverage {
+            indexed_before,
+            indexed_after,
+            total,
+        })
+    }
+
+    /// The defect, driven with the stranger's own numbers.
+    ///
+    /// On the shipped v0.5.45 bytes a store went from 3 of 51 to 51 of 51 across
+    /// one `kin embed`, and the command reported `Done. Full coverage: 0
+    /// entities, 0 artifacts embedded`. The pass that printed it inherited a
+    /// store already at 51 of 51, so its own zero was correct and its heading
+    /// was not. Two properties have to hold at once: the store's coverage is
+    /// stated, and the run's zero never renders as the store's.
+    #[test]
+    fn a_pass_that_inherited_a_covered_store_says_the_work_predated_it() {
+        let line = embed_completion_line(0, 0, 1, 0.0, coverage(51, 51, 51));
+        assert!(
+            line.contains("51/51 indexed"),
+            "the store's own coverage has to be stated: {line}"
+        );
+        assert!(
+            line.contains("already fully covered")
+                && line.contains("the work was finished before it ran"),
+            "a zero has to say which of the two states this is: {line}"
+        );
+        assert!(
+            !line.contains("Full coverage: 0"),
+            "the run's own zero must never render as the store's coverage: {line}"
+        );
+    }
+
+    /// The control that lets the arm above fail: a run that did the work reports
+    /// its own count and the span it moved the store across, which is a
+    /// different sentence and carries different numbers.
+    #[test]
+    fn a_pass_that_embedded_reports_its_own_work_and_the_span_it_moved() {
+        let line = embed_completion_line(48, 2, 2, 12.5, coverage(3, 53, 53));
+        assert!(
+            line.contains("embedded 48 entities and 2 artifacts"),
+            "this run's own work is named: {line}"
+        );
+        assert!(
+            line.contains("3/53") && line.contains("53/53"),
+            "the coverage span it moved is named beside it: {line}"
+        );
+        assert!(
+            !line.contains("already fully covered"),
+            "a run that did the work must not report the store as pre-covered: {line}"
+        );
+    }
+
+    /// Coverage that moved while the queue embedded nothing is this pass's own
+    /// propagation of vectors from content-identical revisions, so it is
+    /// credited here rather than to whatever ran before. Without this arm the
+    /// span would be reported under the pre-covered sentence, which is false.
+    #[test]
+    fn coverage_that_moved_without_the_queue_is_credited_to_this_run() {
+        let line = embed_completion_line(0, 0, 1, 0.0, coverage(10, 51, 51));
+        assert!(
+            line.contains("10/51") && line.contains("51/51"),
+            "both ends of the span are named: {line}"
+        );
+        assert!(
+            line.contains("content-identical revisions"),
+            "the reader learns where the coverage came from: {line}"
+        );
+        assert!(
+            !line.contains("already fully covered"),
+            "a store that was not covered at entry must not be reported as covered: {line}"
+        );
+    }
+
+    /// A daemon that reports no coverage gets no coverage sentence. Defaulting
+    /// the three counters to zero would make an unmeasured store and an empty
+    /// one render identically, which is the defect this change removes wearing
+    /// a different costume.
+    #[test]
+    fn an_unreported_coverage_states_the_runs_work_and_claims_nothing_else() {
+        let line = embed_completion_line(7, 0, 1, 3.5, None);
+        assert!(
+            line.contains("embedded 7 entities"),
+            "the run's own work still renders: {line}"
+        );
+        assert!(
+            line.contains("does not report the store's coverage"),
+            "the absence of a measurement is stated, not filled in: {line}"
+        );
+        assert!(
+            !line.contains("0/0"),
+            "an unmeasured store must never render as a counted one: {line}"
+        );
+    }
+
+    /// The wiring, not the helper: a real pass has to PUBLISH the coverage the
+    /// sentence is built from.
+    ///
+    /// Every arm above drives `embed_completion_line` directly, and a
+    /// `build_embed_response` that never filled `coverage` would satisfy all of
+    /// them while every real run rendered the no-measurement sentence. That is
+    /// the same defect wearing the fix's clothes, and only a test that runs a
+    /// pass can tell the two apart.
+    ///
+    /// The store here is the one FIR-2556 is about: an explicit pass arriving at
+    /// a store somebody else already finished. It needs no embedder, because
+    /// with coverage whole there is nothing for either queue loop to process,
+    /// which is exactly why this case reaches a user as a zero.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn a_pass_publishes_the_store_coverage_its_summary_is_built_from() {
+        use super::EmbedRequest;
+        use kin_model::{
+            Entity, EntityMetadata, EntityStore, FingerprintAlgorithm, Hash256, LanguageId,
+            SemanticFingerprint, Visibility,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(temp.path()).unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+        for name in ["alpha_transform", "beta_reduce"] {
+            graph
+                .upsert_entity(&Entity {
+                    id: kin_model::EntityId::new(),
+                    kind: kin_model::EntityKind::Function,
+                    name: name.to_string(),
+                    language: LanguageId::Rust,
+                    fingerprint: SemanticFingerprint {
+                        algorithm: FingerprintAlgorithm::V1TreeSitter,
+                        ast_hash: Hash256::from_bytes([1; 32]),
+                        signature_hash: Hash256::from_bytes([2; 32]),
+                        behavior_hash: Hash256::from_bytes([3; 32]),
+                        equivalence_hash: Hash256::from_bytes([0; 32]),
+                        stability_score: 1.0,
+                    },
+                    file_origin: None,
+                    span: None,
+                    signature: format!("fn {name}()"),
+                    visibility: Visibility::Public,
+                    role: kin_model::EntityRole::Source,
+                    doc_summary: None,
+                    metadata: EntityMetadata::default(),
+                    lineage_parent: None,
+                    created_in: None,
+                    superseded_by: None,
+                })
+                .unwrap();
+        }
+
+        // Cover every retrievable key, which is what "somebody else finished
+        // this store" leaves behind.
+        let index = kin_db::VectorIndex::new(2).unwrap();
+        let snapshot = graph.to_snapshot();
+        for id in snapshot.entities.keys() {
+            index
+                .upsert_retrievable(kin_model::RetrievalKey::Entity(*id), &[1.0, 0.0])
+                .unwrap();
+        }
+        for revision in snapshot
+            .entity_revisions
+            .values()
+            .flat_map(|revisions| revisions.iter())
+        {
+            index
+                .upsert_retrievable(
+                    kin_model::RetrievalKey::EntityRevision(revision.revision_id),
+                    &[1.0, 0.0],
+                )
+                .unwrap();
+        }
+        let descriptor = kin_db::IndexDescriptor {
+            model_id: Some("embed-wiring-fixture@v1".to_string()),
+            graph_root: Some(hex::encode(graph.compute_root_hash())),
+        };
+        index.set_descriptor(descriptor.clone());
+        let sidecar = temp.path().join("wiring.kvec");
+        index.save(&sidecar).unwrap();
+        assert!(matches!(
+            graph.load_vector_index_compatible(&sidecar, &descriptor),
+            kin_db::VectorIndexLoad::Loaded(_)
+        ));
+
+        // Rebuild the graph from its own snapshot and carry the index across.
+        // `upsert_entity` enqueues every entity it admits, and nothing short of
+        // a real embedder drains that queue, so a graph built by upserting
+        // reads as fully indexed AND fully queued at once. A store a worker
+        // actually finished has an empty queue, and reconstructing from the
+        // snapshot is how this fixture reaches that state without an embedder.
+        let covered = kin_db::InMemoryGraph::from_snapshot(graph.to_snapshot()).unwrap();
+        covered.share_vector_index_from(&graph);
+
+        let status = covered.embedding_status();
+        assert!(
+            status.total > 0 && status.indexed == status.total && status.pending == 0,
+            "the fixture must be the already-covered store this case is about: {status:?}"
+        );
+
+        let response = super::build_embed_response(
+            &initialized.layout,
+            &covered,
+            &EmbedRequest {
+                batch_size: DEFAULT_BATCH_SIZE,
+                json: false,
+                max_seconds: Some(30),
+                rebuild: false,
+                cap_batch_size: true,
+            },
+            || Ok(()),
+            || false,
+        )
+        .unwrap();
+
+        let published = response
+            .result
+            .coverage
+            .expect("a pass must publish the coverage it measured");
+        assert_eq!(
+            (
+                published.indexed_before,
+                published.indexed_after,
+                published.total
+            ),
+            (status.indexed, status.indexed, status.total),
+            "the published span must be the store's own counters, not a placeholder"
+        );
+        assert_eq!(
+            response.result.embedded_entities + response.result.embedded_artifacts,
+            0,
+            "this pass embedded nothing, which is the zero the old line printed alone"
+        );
+
+        // End to end: what a user of this pass would actually read.
+        let line = embed_completion_line(
+            response.result.embedded_entities,
+            response.result.embedded_artifacts,
+            1,
+            0.0,
+            response.result.coverage,
+        );
+        assert!(
+            line.contains("already fully covered")
+                && line.contains(&format!("{}/{} indexed", status.indexed, status.total)),
+            "a real pass on a covered store must render the covered sentence: {line}"
+        );
+    }
+
+    /// The empty repository stays a correct fast no-op and says so in its own
+    /// words, rather than borrowing a coverage claim over a population of zero.
+    #[test]
+    fn an_empty_repository_reports_having_nothing_to_embed() {
+        let line = embed_completion_line(0, 0, 1, 0.0, coverage(0, 0, 0));
+        assert!(
+            line.contains("no retrievable graph objects"),
+            "the empty repository names its own case: {line}"
+        );
+        assert!(
+            !line.contains("already fully covered"),
+            "nothing was covered, so nothing may be reported as covered: {line}"
+        );
     }
 
     #[test]
