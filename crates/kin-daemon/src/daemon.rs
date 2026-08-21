@@ -3987,6 +3987,18 @@ pub async fn run_with_authority_on(
                         // durable what it actually completed, and the crash
                         // window narrows to a hard kill, which the resume marker
                         // already recovers by re-sweeping.
+                        // Taken before the publication below rather than
+                        // after it, so the census this store carries describes
+                        // the graph the snapshot is about to publish. The
+                        // sweep's relations are all in the live graph by here;
+                        // what remains is making them durable, and a census
+                        // recorded after that would be a second reading of the
+                        // same graph taken later for no gain.
+                        crate::background_work::record_relation_census(
+                            &lsp_state.layout,
+                            lsp_state.graph.as_ref(),
+                            kin_core::relation_census::CensusSource::Sweep,
+                        );
                         let published = if total_relations > 0 {
                             match save_snapshot_blocking(Arc::clone(&lsp_state)).await {
                                 Ok(()) => {
