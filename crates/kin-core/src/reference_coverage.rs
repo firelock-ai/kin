@@ -29,7 +29,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use kin_model::{Entity, EntityId, EntityStore, GraphNodeId, LanguageId, RelationKind};
+use kin_model::{Entity, EntityId, EntityKind, EntityStore, GraphNodeId, LanguageId, RelationKind};
 use serde::{Deserialize, Serialize};
 
 /// Languages this build can enrich with language-server evidence.
@@ -380,6 +380,61 @@ impl LanguageReferenceCoverage {
         }
     }
 }
+
+/// Whether this entity kind's INCOMING call edges are under-resolved by the
+/// linker, so an empty reference result for it is not an authoritative absence.
+///
+/// Receiver-method calls (`x.method()`) are linked by bare name while method
+/// entities are keyed by their qualified name, so a method's incoming `Calls`
+/// edges are frequently dropped. That is a fact about the linker rather than
+/// about any one surface, which is why it lives beside the other
+/// graph-completeness verdicts instead of at a caller.
+///
+/// It moved here because two surfaces over one graph answered opposite things
+/// about one entity (FIR-2550). The MCP negative envelope refused to certify
+/// `IngestReport.summary` as absent, naming this exact gap, while `kin
+/// dead-code` printed the same entity in a delete list under a bare "Found 7
+/// unreferenced entities". The rule was stated once, inside `kin-mcp`, and the
+/// CLI had no path to it. One statement, both readers.
+///
+/// Not gated on language, and deliberately so. The MCP gate is not, and a
+/// language condition on this copy alone would put the two surfaces back into
+/// disagreement on whichever languages the condition excluded, which is the
+/// failure this function exists to end. A language whose receiver calls all
+/// resolve produces no candidate rows to label, so the gate costs it nothing.
+pub fn kind_under_resolves_incoming_calls(kind: EntityKind) -> bool {
+    kind == EntityKind::Method
+}
+
+/// [`kind_under_resolves_incoming_calls`] for a payload that carries its kind
+/// as the serde name rather than as the enum.
+///
+/// Parses the name back into the kind instead of restating the match, so the
+/// JSON-shaped reader and the graph-shaped reader cannot drift apart. An
+/// unparseable name is not a method, because inventing a gate for a kind that
+/// was never reported would label rows on a payload shape nobody validated.
+pub fn kind_name_under_resolves_incoming_calls(kind_name: &str) -> bool {
+    serde_json::from_value::<EntityKind>(serde_json::Value::String(kind_name.to_ascii_lowercase()))
+        .is_ok_and(kind_under_resolves_incoming_calls)
+}
+
+/// The limiting factor a surface reports when [`kind_under_resolves_incoming_calls`]
+/// holds for the entity it answered about.
+///
+/// `subject` names what came back empty, so one sentence reads correctly for a
+/// reference list, a pack, a walk and a delete-list row. The wording is the
+/// wording `find_references` has published since FIR-2404 and is asserted
+/// verbatim by tests on both sides; changing it changes what a caller keys on.
+pub fn method_absence_limiting_factor(subject: &str) -> String {
+    format!(
+        "method_call_resolution_incomplete: receiver-method calls are linked by bare name and \
+         may be unresolved, so {subject} is not an authoritative absence for a method"
+    )
+}
+
+/// The bare label of [`method_absence_limiting_factor`], for a surface with room
+/// for a tag but not a sentence.
+pub const METHOD_ABSENCE_LIMITING_FACTOR: &str = "method_call_resolution_incomplete";
 
 fn percent(parsed: Option<u64>, resolved: u64) -> Option<u32> {
     let parsed = parsed?;
