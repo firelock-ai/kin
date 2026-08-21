@@ -619,6 +619,23 @@ fn build_graph_status_response(
             embeddings_line.push_str(&clause);
         }
     }
+    // Outside the pending gate on purpose, and the only clause here that is.
+    //
+    // Every clause above explains a shortfall the counters are already showing.
+    // This one explains a shortfall they are not: the daemon holds embedded
+    // vectors the sidecar does not, so the count beside it is true about this
+    // process and would not survive its exit. A drained queue reports zero
+    // pending in exactly that state, which is how the regression reached a
+    // reader as a complete store one minute and ordinary pending work the next.
+    // The clause says what is undurable, and does not promise a number: nothing
+    // on this path counts the vectors embedded since the refusal.
+    if let Some(reason) = embedding_runtime.deferred_vector_checkpoint.as_ref() {
+        embeddings_line.push_str(&format!(
+            "; the last vector checkpoint was refused ({reason}), so vectors embedded since then \
+             are in this daemon's memory rather than on disk and a restart re-derives them; the \
+             daemon retries the checkpoint until it lands"
+        ));
+    }
     lines.push(embeddings_line);
     // A census, not a queue, and the label has to say so.
     //
@@ -2277,6 +2294,148 @@ mod tests {
                 .any(|line| line == "Embeddings: 0/0 indexed (0 pending)"),
             "a store with nothing pending renders the plain measured line: {:?}",
             recovered.lines
+        );
+    }
+
+    /// A refused vector checkpoint has to reach the reader, and it has to reach
+    /// a reader whose counters look complete.
+    ///
+    /// Every other clause on this line explains a shortfall the counters are
+    /// already showing, so every other clause sits behind `pending > 0`. This
+    /// one explains a shortfall they are not showing: the daemon holds vectors
+    /// the sidecar does not, and a drained queue reports zero pending in
+    /// exactly that state. That is how the regression reached a reader as a
+    /// complete store at one reading and a store that had lost 342 vectors at
+    /// the next. Drive both counter shapes, because a clause that only fires
+    /// when something is already pending would miss the case it exists for.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn a_refused_vector_checkpoint_is_named_even_when_nothing_is_pending() {
+        const REFUSAL: &str = "refusing vector checkpoint at repository generation 1: live exact \
+                               tree does not match workspace authority";
+
+        // A store whose counters read complete: nothing pending, nothing to
+        // explain, and the plain line is what the existing tests pin here.
+        let (_drained_temp, drained_binding, drained_graph) = graph_validation_fixture();
+        let drained_control = build_graph_status_response(
+            &pinned(&drained_binding),
+            &drained_graph,
+            &Default::default(),
+            &crate::commands::resources::EmbedRuntimeState::default(),
+        )
+        .unwrap();
+        assert!(
+            drained_control
+                .lines
+                .iter()
+                .any(|line| line == "Embeddings: 0/0 indexed (0 pending)"),
+            "the control must be the clean-counter case this clause has to survive: {:?}",
+            drained_control.lines
+        );
+
+        let drained = build_graph_status_response(
+            &pinned(&drained_binding),
+            &drained_graph,
+            &Default::default(),
+            &crate::commands::resources::EmbedRuntimeState {
+                deferred_vector_checkpoint: Some(REFUSAL.to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let drained_line = drained
+            .lines
+            .iter()
+            .find(|line| line.starts_with("Embeddings:"))
+            .expect("the embeddings line still renders");
+        assert!(
+            drained_line.contains("the last vector checkpoint was refused"),
+            "a store reporting nothing pending must still disclose undurable coverage: \
+             {drained_line}"
+        );
+        assert!(
+            drained_line.contains(REFUSAL),
+            "the refusal's own cause is what tells a reader this is not ordinary pending work: \
+             {drained_line}"
+        );
+        assert!(
+            drained_line.contains("a restart re-derives them"),
+            "the consequence a reader acts on is what a restart costs: {drained_line}"
+        );
+
+        // And on a store that IS filling, the clause is appended to the existing
+        // chain rather than replacing it, so a reader keeps both facts.
+        let (_filling_temp, filling_binding, filling_graph) = graph_validation_fixture();
+        filling_graph
+            .upsert_entity(&test_entity("alpha_transform"))
+            .unwrap();
+        let filling_status = filling_graph.embedding_status();
+        assert!(
+            filling_status.pending > 0,
+            "the second fixture must actually have a backlog to explain"
+        );
+        let filling = build_graph_status_response(
+            &pinned(&filling_binding),
+            &filling_graph,
+            &Default::default(),
+            &crate::commands::resources::EmbedRuntimeState {
+                deferred_vector_checkpoint: Some(REFUSAL.to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let filling_line = filling
+            .lines
+            .iter()
+            .find(|line| line.starts_with("Embeddings:"))
+            .expect("the embeddings line still renders");
+        assert!(
+            filling_line.contains("the live graph carries no vector index"),
+            "the existing pending-gated chain must still run: {filling_line}"
+        );
+        assert!(
+            filling_line.contains("the last vector checkpoint was refused"),
+            "and the refusal must be appended beside it, not instead of it: {filling_line}"
+        );
+
+        // The no-noise control, and the reason it is an assertion rather than a
+        // reading of the code. A clause outside the pending gate runs on every
+        // render, including every store that has nothing wrong with it, so the
+        // only thing standing between this fix and a permanent new line on
+        // every `kin graph status` is that the field is `None`. Pin both lines
+        // byte for byte against the same fixture rendered with no refusal.
+        let filling_quiet = build_graph_status_response(
+            &pinned(&filling_binding),
+            &filling_graph,
+            &Default::default(),
+            &crate::commands::resources::EmbedRuntimeState::default(),
+        )
+        .unwrap();
+        let filling_quiet_line = filling_quiet
+            .lines
+            .iter()
+            .find(|line| line.starts_with("Embeddings:"))
+            .expect("the embeddings line still renders");
+        assert!(
+            !filling_quiet_line.contains("vector checkpoint"),
+            "a store with nothing refused must render exactly today's line: {filling_quiet_line}"
+        );
+        assert_eq!(
+            filling_quiet_line.as_str(),
+            filling_line
+                .split("; the last vector checkpoint was refused")
+                .next()
+                .expect("the refusal clause must be an append, so the prefix is today's line"),
+            "the clause must be a pure append: everything before it has to be byte-identical to \
+             what a store with nothing refused renders"
+        );
+        assert_eq!(
+            drained_control
+                .lines
+                .iter()
+                .find(|line| line.starts_with("Embeddings:")),
+            Some(&"Embeddings: 0/0 indexed (0 pending)".to_string()),
+            "and the drained control's line is today's, unchanged, to the byte"
         );
     }
 
