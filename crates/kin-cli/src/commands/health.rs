@@ -4232,6 +4232,7 @@ mod tests {
             reference_edge_coverage: Some(
                 kin_core::reference_coverage::ReferenceEdgeCoverage::default(),
             ),
+            relation_census: Some(census_pair(&[], &[], Vec::new())),
         }))
     }
 
@@ -4242,7 +4243,7 @@ mod tests {
     /// psf/requests store against 0.091 s on express, so a second fetch does not
     /// cost a little more, it roughly doubles the wall time of a doctor run on
     /// exactly the stores where an operator is most likely to be running doctor.
-    /// Three consumers here rather than the one the tree holds today, because the
+    /// Three consumers here rather than the two the tree holds today, because the
     /// cost this pins is the one a fourth row would add.
     #[tokio::test]
     async fn one_doctor_run_fetches_graph_status_once_however_many_rows_read_it() {
@@ -4319,18 +4320,22 @@ mod tests {
             ),
         ];
         for (status, expected) in unreadable {
-            let row = coverage_row_for_unread_graph(&status, &no_servers)
+            let coverage_row = coverage_row_for_unread_graph(&status, &no_servers)
                 .expect_err("an unread graph must produce a row rather than a response");
-            assert!(
-                !matches!(row.status, HealthStatus::Healthy),
-                "an unread graph must never render as healthy: {status:?} gave {:?}",
-                row.status
-            );
-            assert!(
-                row.detail.contains(expected),
-                "the row must name what happened: {status:?} gave {}",
-                row.detail
-            );
+            let census_row = relation_census_row_for_unread_graph(&status)
+                .expect_err("an unread graph must reach the census row too");
+            for row in [coverage_row, census_row] {
+                assert!(
+                    !matches!(row.status, HealthStatus::Healthy),
+                    "an unread graph must never render as healthy: {status:?} gave {:?}",
+                    row.status
+                );
+                assert!(
+                    row.detail.contains(expected),
+                    "the row must name what happened: {status:?} gave {}",
+                    row.detail
+                );
+            }
         }
 
         // And the readable case still yields the response, or the four arms
@@ -4338,7 +4343,11 @@ mod tests {
         // measurement.
         assert!(
             coverage_row_for_unread_graph(&answered_graph_status(), &no_servers).is_ok(),
-            "a graph the run did read must hand its response to the row"
+            "a graph the run did read must hand its response to the coverage row"
+        );
+        assert!(
+            relation_census_row_for_unread_graph(&answered_graph_status()).is_ok(),
+            "a graph the run did read must hand its response to the census row"
         );
     }
 
