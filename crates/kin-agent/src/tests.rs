@@ -266,7 +266,13 @@ fn harness_owned_tools_never_reach_the_model() {
     for name in [
         "kin_session_start",
         "kin_session_end",
+        "kin_session_heartbeat",
         "kin_transaction_begin",
+        // Stage and validate both need a transaction id, and begin is the only honest
+        // source of one. Exposing either without begin leaves a model nothing to do but
+        // invent an id.
+        "kin_transaction_stage",
+        "kin_transaction_validate",
         "kin_transaction_commit",
         "kin_transaction_abort",
     ] {
