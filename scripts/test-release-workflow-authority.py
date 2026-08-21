@@ -67,6 +67,10 @@ TAG_SELECTOR = ROOT / "scripts" / "select-admissible-release-tag.py"
 ABANDONED_TAGS_POLICY = "scripts/abandoned-release-tags.json"
 TAG_SELECTOR_POLICY = "scripts/select-admissible-release-tag.py"
 ASSERTION_REACHABILITY = ROOT / "scripts" / "test-assertion-reachability.py"
+RELEASE_TRAIN_BODY = ROOT / "scripts" / "release-train-body.mjs"
+RELEASE_TRAIN_BODY_POLICY = "scripts/release-train-body.mjs"
+RELEASE_TRAIN_BODY_BEGIN = "<!-- kin-release-train:begin -->"
+RELEASE_TRAIN_BODY_END = "<!-- kin-release-train:end -->"
 ASSERTION_REACHABILITY_POLICY = "scripts/test-assertion-reachability.py"
 GLIBC_FLOOR_GUARD = ROOT / "scripts" / "check-glibc-floor.mjs"
 GLIBC_FLOOR_GUARD_POLICY = "scripts/check-glibc-floor.mjs"
@@ -5183,6 +5187,56 @@ def assert_release_pr_author_identity(release_train: str) -> None:
         )
 
 
+def assert_release_pr_body_preserves_operator_text(
+    release_train: str, merge_script: str
+) -> None:
+    """The train may own a delimited region of the release body, nothing more.
+
+    This repository squashes with the pull-request body as the commit message,
+    and the merge queue mints that message when the entry is admitted, so the
+    release body is the release's permanent commit message rather than a
+    description of it. The train used to overwrite the whole body with its own
+    generic line on every reconcile cycle, which erased the disclosures the
+    release doctrine requires an operator to add, and a cycle landing between
+    that edit and queue admission would have shipped a release carrying none of
+    them. A captain-side polling guard covered the window once; a guard that
+    lives in a session can always be retired, so the preservation lives here.
+
+    Reading the merge from protected main is load bearing for the same reason
+    the proof gate's read is: a release branch that could carry its own body
+    merge could decide what its own commit message says.
+    """
+
+    step = workflow_step_source(
+        "release train", release_train, RELEASE_PR_STEP_ANCHOR
+    )
+    if '--body "' in step:
+        raise AssertionError(
+            "the release PR body must never be written from an inline literal: "
+            "that overwrite is what discarded the operator-authored release "
+            "disclosures the squash message has to carry"
+        )
+    for policy in (
+        f"{TRUSTED_POLICY_PREFIX}{RELEASE_TRAIN_BODY_POLICY}",
+        '--body-file "$initial_body"',
+        '--body-file "$next_body"',
+        '--json body',
+    ):
+        require(step, policy, "operator-preserving release PR body")
+    index = step.find(RELEASE_TRAIN_BODY_POLICY)
+    while index >= 0:
+        prefix = step[max(0, index - len(TRUSTED_POLICY_PREFIX)) : index]
+        if prefix != TRUSTED_POLICY_PREFIX:
+            raise AssertionError(
+                "the release PR body merge must be read from protected main. A "
+                "branch that carries its own body merge decides what its own "
+                "squash message says"
+            )
+        index = step.find(RELEASE_TRAIN_BODY_POLICY, index + 1)
+    for marker in (RELEASE_TRAIN_BODY_BEGIN, RELEASE_TRAIN_BODY_END):
+        require(merge_script, marker, "release PR body merge")
+
+
 def release_branch_allowlist(release_train: str) -> str:
     """Return the regex the train uses to admit its own generated branch."""
 
@@ -8298,6 +8352,64 @@ def main() -> None:
         "protected release PR opener is missing required policy: gh pr create",
         lambda: assert_release_pr_author_identity(
             release_train.replace("gh pr create \\", "gh pr view \\", 1)
+        ),
+    )
+    release_train_body = RELEASE_TRAIN_BODY.read_text(encoding="utf-8")
+    assert_release_pr_body_preserves_operator_text(release_train, release_train_body)
+    # The reverts this preservation has to survive, in the order they are
+    # reachable: the generic line going back to an inline overwrite, the merge
+    # moving off protected main and onto the branch under judgement, and the
+    # created body losing its file.
+    expect_assertion(
+        "the release PR body returns to an inline literal overwrite",
+        "must never be written from an inline literal",
+        lambda: assert_release_pr_body_preserves_operator_text(
+            release_train.replace(
+                '--body-file "$next_body"',
+                '--body "Automated, coalescing Kin release PR."',
+                1,
+            ),
+            release_train_body,
+        ),
+    )
+    expect_assertion(
+        "the release PR body merge stops being read from protected main",
+        f"is missing required policy: {TRUSTED_POLICY_PREFIX}"
+        f"{RELEASE_TRAIN_BODY_POLICY}",
+        lambda: assert_release_pr_body_preserves_operator_text(
+            release_train.replace(
+                f"{TRUSTED_POLICY_PREFIX}{RELEASE_TRAIN_BODY_POLICY}",
+                RELEASE_TRAIN_BODY_POLICY,
+                1,
+            ),
+            release_train_body,
+        ),
+    )
+    expect_assertion(
+        "a second body merge runs from the branch beside the trusted read",
+        "must be read from protected main",
+        lambda: assert_release_pr_body_preserves_operator_text(
+            release_train.replace(
+                'node "$merge_body"',
+                f"node {RELEASE_TRAIN_BODY_POLICY}",
+                1,
+            ),
+            release_train_body,
+        ),
+    )
+    expect_assertion(
+        "the created release PR body stops coming from the merged file",
+        'is missing required policy: --body-file "$initial_body"',
+        lambda: assert_release_pr_body_preserves_operator_text(
+            release_train.replace('--body-file "$initial_body"', "--body-file -", 1),
+            release_train_body,
+        ),
+    )
+    expect_assertion(
+        "the body merge loses the markers that delimit what the train owns",
+        f"is missing required policy: {RELEASE_TRAIN_BODY_BEGIN}",
+        lambda: assert_release_pr_body_preserves_operator_text(
+            release_train, release_train_body.replace(RELEASE_TRAIN_BODY_BEGIN, "")
         ),
     )
     assert_release_branch_allowlist_covers_generator(release_train)
