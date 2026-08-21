@@ -839,6 +839,141 @@ pub async fn stop(all: bool, machine: bool, json: bool) -> Result<()> {
     }
 }
 
+/// How long `kin daemon sweep` waits for a sweep before handing the repository
+/// back anyway.
+///
+/// The same budget `kin init` gives its own sweep, for the same reason: a
+/// language server can hang, and the sweep is resumable, so what this cuts
+/// short the next daemon start continues.
+const SWEEP_WAIT_BUDGET: Duration = Duration::from_secs(900);
+
+/// How often the wait re-reads sweep progress.
+const SWEEP_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Ask this repository's daemon for a language-server enrichment sweep, and by
+/// default wait for it. This is `kin daemon sweep`.
+///
+/// `POST /lsp/sweep` has existed since enrichment did, and until now nothing on
+/// the command line reached it. That mattered because the sweep is how a store
+/// gets its cross-file reference, override and type-use edges, and every other
+/// way of asking for one is implicit: `kin init` runs one, and a daemon queues
+/// one when it starts. A store whose sweep died with its daemon, or whose
+/// conversion ran before a language server was installed, therefore had a
+/// recovery path that existed in the daemon and could not be asked for.
+///
+/// Loud when no daemon answers, rather than quietly doing nothing: a command
+/// whose whole purpose is to make enrichment happen must never exit zero having
+/// enriched nothing.
+pub async fn sweep(no_wait: bool, json: bool) -> Result<()> {
+    let layout = crate::commands::require_repository_layout()?;
+    let base_url = crate::daemon_client::resolve_daemon_url(&layout)
+        .await?
+        .ok_or_else(|| crate::daemon_client::daemon_required_error("daemon sweep", &layout))?;
+    // FOR_LAYOUT, because the plain constructor resolves the bearer token from
+    // the PROCESS working directory. This command is about the repository the
+    // layout names, and its `.kin` is where that daemon's token lives.
+    let client = crate::daemon_client::DaemonClient::from_base_url_for_layout(base_url, &layout)?;
+
+    let queued = client
+        .queue_lsp_sweep()
+        .await
+        .context("ask the daemon for a language-server sweep")?;
+
+    // The daemon's own words, not a paraphrase. `status` distinguishes a sweep
+    // this call queued from one that was already running, and
+    // `enrichment_available` is false on a daemon that found no language
+    // server, which is a different problem with a different fix.
+    if json {
+        println!("{}", serde_json::to_string_pretty(&queued)?);
+    } else {
+        println!("daemon: {queued}");
+    }
+
+    if queued.get("enrichment_available").and_then(|v| v.as_bool()) == Some(false) {
+        bail!(
+            "this daemon found no language server, so it can produce no cross-file reference \
+             edges. Install one with `kin doctor --fix --install-language-servers`, then \
+             `kin daemon stop` and run this again."
+        );
+    }
+
+    if no_wait {
+        return Ok(());
+    }
+
+    let baseline = queued
+        .get("sweeps_completed")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    wait_for_sweep(&client, baseline, json).await
+}
+
+/// Poll the sweep to completion, or to the budget, reporting progress.
+async fn wait_for_sweep(
+    client: &crate::daemon_client::DaemonClient,
+    baseline: u64,
+    json: bool,
+) -> Result<()> {
+    let deadline = Instant::now() + SWEEP_WAIT_BUDGET;
+    let mut last_reported = 0u64;
+    loop {
+        tokio::time::sleep(SWEEP_POLL_INTERVAL).await;
+        let status = client
+            .lsp_sweep_status()
+            .await
+            .context("read language-server sweep progress")?;
+        let done = status
+            .get("files_done")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let total = status
+            .get("files_total")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if done > last_reported && !json {
+            last_reported = done;
+            println!("  enriched {done}/{total} files");
+        }
+        let completed = status
+            .get("sweeps_completed")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let running = status
+            .get("running")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        // Both, not either. The counter says a sweep ended; `running` says none
+        // is in flight now. Returning on the counter alone hands back a graph a
+        // later sweep is still mutating.
+        if completed > baseline && !running {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                let blocked = status
+                    .get("files_blocked")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                if done == 0 && total > 0 {
+                    println!(
+                        "sweep finished without enriching any of the {total} files it walked \
+                         ({blocked} blocked); see .kin/daemon.log for what stopped it"
+                    );
+                } else {
+                    println!("sweep complete ({done}/{total} files)");
+                }
+            }
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "the sweep did not finish within {}s and was left running; it resumes from \
+                 where it stopped on the next daemon start",
+                SWEEP_WAIT_BUDGET.as_secs()
+            );
+        }
+    }
+}
+
 /// A registered daemon that does not belong to the caller's managed home.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ForeignDaemon {
