@@ -638,6 +638,98 @@ async fn drain_embed_flush(
 /// Ceiling on the wait between retries of a refused vector checkpoint.
 const DEFERRED_CHECKPOINT_RETRY_MAX: Duration = Duration::from_secs(300);
 
+/// Everything the persistence task does on its way out.
+///
+/// A named function rather than the body of a `select!` arm, because both
+/// halves are durability decisions that have to be drivable by a test. The
+/// graph half was already load-bearing; the vector half below is the case the
+/// coverage regression was actually found in, and a wiring nothing exercises is
+/// how the first half of this fix would have shipped covering only a daemon
+/// nobody stops.
+///
+/// Runs under the persistence task's own shutdown budget
+/// (`KIN_DAEMON_SHUTDOWN_FLUSH_SECS`, five minutes by default), which exists
+/// because the graph flush here can need minutes on a real store.
+async fn run_shutdown_persistence(state: &Arc<DaemonState>) {
+    if state.is_dirty() {
+        if state.shutdown_flush_would_wipe_graph() {
+            // The in-memory graph collapsed to a small fraction of the last
+            // persisted entity count, almost certainly a transient wipe (e.g. an
+            // empty/bare checkout reconciled as all-deleted) rather than a real
+            // edit. Skip the final flush so the larger good snapshot survives;
+            // the daemon reloads it and re-reconciles against the filesystem on
+            // restart. (Graph-keyed, not embed-keyed: a stale vector index
+            // self-heals on load and never blocks this flush.)
+            warn!(
+                persisted = state
+                    .persisted_entity_count
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                current = state.graph.entity_count(),
+                "skipping final graph flush on shutdown — in-memory entity count collapsed vs on-disk snapshot; preserving the larger snapshot"
+            );
+        } else {
+            info!("final persistence flush on shutdown");
+            if let Err(e) = save_snapshot_blocking(Arc::clone(state)).await {
+                error!(error = %e, "shutdown save failed");
+            } else {
+                state.mark_clean();
+            }
+        }
+    }
+    retry_deferred_vector_checkpoint_at_shutdown(state).await;
+}
+
+/// Give a standing vector-checkpoint refusal its one attempt before the process
+/// ends.
+///
+/// The wake-tick retry covers a daemon that keeps running. This covers the case
+/// the regression was found in, where the process ENDED with a refusal standing
+/// and every vector embedded since the previous successful checkpoint went with
+/// it. Nothing else would have written them: the sidecar is not part of the
+/// graph flush above, so a clean shutdown published graph truth and left the
+/// vectors behind.
+///
+/// Unconditional and with no backoff, unlike the wake-tick retry, because
+/// shutdown has no next tick to defer to: the choice here is one attempt or
+/// lose the work. It costs one authority reopen, charged against the same
+/// budget the flush above already spends minutes of on a real store, and it
+/// costs an ordinary daemon nothing at all, because the first check returns at
+/// once when no refusal stands.
+///
+/// After the graph flush rather than before it, deliberately. Publishing
+/// advances the authority generation, which is exactly what closes the
+/// divergence a refusal is about, so this is the moment in shutdown when the
+/// checkpoint is most likely to be provable.
+async fn retry_deferred_vector_checkpoint_at_shutdown(state: &Arc<DaemonState>) {
+    if state.deferred_vector_checkpoint().is_none() {
+        return;
+    }
+    info!("retrying a refused vector checkpoint before shutdown");
+    let retry_state = Arc::clone(state);
+    match tokio::task::spawn_blocking(move || retry_state.retry_deferred_vector_checkpoint()).await
+    {
+        Ok(Some(Ok(pending))) => {
+            info!(
+                pending,
+                "checkpointed before shutdown the vector progress a refused checkpoint had left in memory"
+            );
+        }
+        Ok(Some(Err(error))) => {
+            // Loud, and named as loss rather than as a slow exit. This is the
+            // one path left where the vectors genuinely do not survive, and a
+            // reader has to be able to tell it from an untidy shutdown.
+            warn!(
+                error = %error,
+                "the vector checkpoint was still refused at shutdown; vectors embedded since the refusal are NOT durable and the next open re-derives them"
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            error!(error = %error, "shutdown vector checkpoint retry task panicked");
+        }
+    }
+}
+
 /// Re-attempt a vector checkpoint the daemon had to refuse, so the vectors it
 /// left in memory reach the sidecar instead of dying with the process.
 ///
@@ -2446,31 +2538,7 @@ pub async fn run_with_authority_on(
             tokio::select! {
                 _ = tokio::time::sleep(current_interval) => {}
                 _ = persist_cancel.changed() => {
-                    if persist_state.is_dirty() {
-                        if persist_state.shutdown_flush_would_wipe_graph() {
-                            // The in-memory graph collapsed to a small fraction of
-                            // the last persisted entity count — almost certainly a
-                            // transient wipe (e.g. an empty/bare checkout
-                            // reconciled as all-deleted), not a real edit. Skip the
-                            // final flush so the larger good snapshot survives; the
-                            // daemon reloads it and re-reconciles against the
-                            // filesystem on restart. (Graph-keyed, not embed-keyed:
-                            // a stale vector index self-heals on load and never
-                            // blocks this flush.)
-                            warn!(
-                                persisted = persist_state.persisted_entity_count.load(std::sync::atomic::Ordering::SeqCst),
-                                current = persist_state.graph.entity_count(),
-                                "skipping final graph flush on shutdown — in-memory entity count collapsed vs on-disk snapshot; preserving the larger snapshot"
-                            );
-                        } else {
-                            info!("final persistence flush on shutdown");
-                            if let Err(e) = save_snapshot_blocking(Arc::clone(&persist_state)).await {
-                                error!(error = %e, "shutdown save failed");
-                            } else {
-                                persist_state.mark_clean();
-                            }
-                        }
-                    }
+                    run_shutdown_persistence(&persist_state).await;
                     break;
                 }
             }
@@ -5941,5 +6009,242 @@ mod sweep_tally_tests {
     fn a_sweep_over_no_files_is_not_blocked() {
         assert_eq!(SweepTally::default().blocked_reason(0), None);
         assert_eq!(SweepTally::default().unaccounted(0), 0);
+    }
+}
+
+/// The shutdown half of FIR-2497.
+///
+/// The wake-tick retry proves durability for a daemon that keeps running. The
+/// coverage regression was found on a daemon that STOPPED with a refusal
+/// standing, and nothing in the graph flush writes the vector sidecar, so a
+/// clean shutdown published graph truth and left the vectors in a process that
+/// was about to end. These tests drive the real shutdown arm rather than the
+/// helper beside it, because what has to hold is the wiring: a retry that
+/// exists and is never called from shutdown is the bug it was written to fix.
+#[cfg(all(test, feature = "embeddings"))]
+mod shutdown_vector_checkpoint_tests {
+    use super::{run_shutdown_persistence, DaemonState};
+    use kin_db::EntityStore;
+    use kin_model::{
+        ArtifactId, Entity, EntityKind, EntityMetadata, FilePathId, FingerprintAlgorithm, Hash256,
+        LanguageId, LocatedEntry, RepoPath, SemanticFingerprint, TreeDelta, TreeEntry, Visibility,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    const STAGED_VECTORS: usize = 3;
+
+    fn test_entity(name: &str) -> Entity {
+        Entity {
+            id: kin_model::EntityId::new(),
+            kind: EntityKind::Function,
+            name: name.to_string(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([1; 32]),
+                signature_hash: Hash256::from_bytes([2; 32]),
+                behavior_hash: Hash256::from_bytes([3; 32]),
+                equivalence_hash: Hash256::from_bytes([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(FilePathId::new("src/lib.rs")),
+            span: None,
+            signature: format!("fn {name}()"),
+            visibility: Visibility::Public,
+            role: kin_model::EntityRole::Source,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    /// Open a store, stage coverage the product's own counter can see, leave
+    /// nothing durable behind it, and force one authority-mismatch refusal by
+    /// moving the live tree inside the checkpoint's reopen window.
+    ///
+    /// Returns the state with a refusal standing and the divergence still open.
+    fn state_with_a_standing_refusal(
+        repo_dir: &std::path::Path,
+    ) -> (Arc<DaemonState>, ArtifactId, LocatedEntry) {
+        let init = kin_core::init(repo_dir).unwrap();
+        let vector_path = init.layout.kindb_vector_index_path();
+        let state = Arc::new(DaemonState::open(init.layout).expect("fixture store must open"));
+
+        let descriptor = kin_db::vector::IndexDescriptor {
+            model_id: Some("fixture-embedder-v1".to_string()),
+            graph_root: Some("fixture-root".to_string()),
+        };
+        let vectors = kin_db::VectorIndex::new(4).unwrap();
+        vectors.set_descriptor(descriptor.clone());
+        for slot in 0..STAGED_VECTORS {
+            let entity = test_entity(&format!("embedded_{slot}"));
+            state.graph.upsert_entity(&entity).unwrap();
+            let mut embedding = [0.0f32; 4];
+            embedding[slot] = 1.0;
+            vectors
+                .upsert_retrievable(kin_db::RetrievalKey::Entity(entity.id), &embedding)
+                .expect("the fixture index must accept a staged vector");
+        }
+        vectors.save(&vector_path).unwrap();
+        assert!(matches!(
+            state
+                .graph
+                .load_vector_index_compatible(&vector_path, &descriptor),
+            kin_db::vector::VectorIndexLoad::Loaded(STAGED_VECTORS)
+        ));
+        std::fs::remove_file(&vector_path).unwrap();
+        assert_eq!(
+            state.graph.embedding_status().indexed,
+            STAGED_VECTORS,
+            "the fixture must stage coverage the counter can see"
+        );
+
+        let arriving = ArtifactId::new();
+        let arrived = LocatedEntry::new(
+            RepoPath::from_utf8("src/arrived_during_reopen.rs").unwrap(),
+            TreeEntry::blob(Hash256::from_bytes([9u8; 32]), false),
+        );
+        let moving_graph = Arc::clone(&state.graph);
+        let moved = Arc::new(AtomicBool::new(false));
+        let arrived_seam = arrived.clone();
+        state.set_vector_checkpoint_reopen_test_hook(Some(Arc::new(move || {
+            // Once only: a seam that moved the tree on every reopen would model
+            // a repository nobody can ever checkpoint, not a commit that lands.
+            if moved.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            moving_graph
+                .apply_transaction_delta(&kin_model::TransactionDelta {
+                    tree_deltas: vec![TreeDelta::Added {
+                        artifact_id: arriving,
+                        new: arrived_seam.clone(),
+                    }],
+                    ..Default::default()
+                })
+                .expect("the live graph must accept the concurrent mutation under test");
+        })));
+        state
+            .flush_embed_progress()
+            .expect_err("a live tree that moved away from authority must be refused");
+        assert!(
+            state.deferred_vector_checkpoint().is_some(),
+            "the fixture must leave a refusal standing"
+        );
+        assert!(
+            !vector_path.exists(),
+            "the fixture must leave nothing durable behind the refusal"
+        );
+
+        (state, arriving, arrived)
+    }
+
+    /// Refusal standing, daemon shuts down cleanly, restart, count equals N.
+    ///
+    /// This is the arm the regression's own evidence asks for. Before the
+    /// shutdown retry, the sequence ended with the sidecar still holding its
+    /// older content and the process gone, which is why a store read
+    /// 2112/2112 on one daemon and 1770/2112 on the next.
+    ///
+    /// The restart is modelled by dropping the live index and re-reading the
+    /// sidecar through `load_vector_index_into_graph_if_valid`, the exact call
+    /// `DaemonState::load_validated_vector_index` makes at open. The drop is
+    /// load-bearing: without it the final count would come from the memory the
+    /// shutdown was supposed to be rescuing the vectors out of, and the test
+    /// could not fail.
+    #[tokio::test]
+    async fn a_refusal_standing_at_shutdown_is_checkpointed_and_survives_the_restart() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let (state, arriving, arrived) = state_with_a_standing_refusal(repo_dir.path());
+        let vector_path = state.layout.kindb_vector_index_path();
+
+        // The divergence closes, the way it closes in a real store once the
+        // commit that opened it has settled.
+        state
+            .graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                tree_deltas: vec![TreeDelta::Removed {
+                    artifact_id: arriving,
+                    old: arrived,
+                }],
+                ..Default::default()
+            })
+            .expect("the live graph must accept the settling transition");
+
+        run_shutdown_persistence(&state).await;
+
+        assert!(
+            vector_path.exists(),
+            "shutdown must land a standing refusal rather than end with the vectors in memory"
+        );
+        assert!(
+            state.deferred_vector_checkpoint().is_none(),
+            "a checkpoint that landed must retire the record it closed"
+        );
+
+        state.graph.reset_vector_index();
+        assert_eq!(
+            state.graph.embedding_status().indexed,
+            0,
+            "the control: with the live index dropped the count must come from disk alone"
+        );
+        assert!(
+            kin_db::SnapshotManager::load_vector_index_into_graph_if_valid(
+                state.graph.as_ref(),
+                &state.layout.kindb_snapshot_path(),
+                None,
+            )
+            .expect("the checkpointed sidecar must be readable"),
+            "the checkpointed sidecar must install through the daemon's own open-time path"
+        );
+        assert_eq!(
+            state.graph.embedding_status().indexed,
+            STAGED_VECTORS,
+            "a restart after a clean shutdown must read back every staged vector"
+        );
+    }
+
+    /// The budget kin#994 gave this arm is a ceiling, not an amount, and this
+    /// change must not turn it into one.
+    ///
+    /// An ordinary daemon has no refusal standing, so the shutdown retry has to
+    /// cost it nothing: no authority reopen, no sidecar write, no delay. A
+    /// version that retried unconditionally would pay a full reopen on every
+    /// clean exit, which is the overcorrection this must not become.
+    #[tokio::test]
+    async fn a_shutdown_with_no_refusal_standing_writes_no_sidecar() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let vector_path = init.layout.kindb_vector_index_path();
+        let state = Arc::new(DaemonState::open(init.layout).expect("fixture store must open"));
+        state
+            .graph
+            .upsert_entity(&test_entity("untouched"))
+            .unwrap();
+        assert!(
+            state.deferred_vector_checkpoint().is_none(),
+            "the control fixture must carry no refusal"
+        );
+        let before = vector_path.exists();
+
+        let started = std::time::Instant::now();
+        run_shutdown_persistence(&state).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            vector_path.exists(),
+            before,
+            "a shutdown with nothing refused must not checkpoint the vector sidecar at all"
+        );
+        assert!(
+            state.deferred_vector_checkpoint().is_none(),
+            "and must not invent a refusal"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "a shutdown with nothing refused must not pay for an authority reopen; took {elapsed:?}"
+        );
     }
 }

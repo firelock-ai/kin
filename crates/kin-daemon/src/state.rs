@@ -6108,10 +6108,11 @@ mod tests {
         let init = kin_core::init(repo_dir.path()).unwrap();
         let state = test_state(init.layout, repo_dir.path());
 
-        // Stage completed work: a real index carrying vectors, attached to the
-        // live graph, with nothing durable behind it. Removing the file is what
-        // makes "did this checkpoint land" answerable by existence rather than
-        // by reading bytes the daemon has no API to compare.
+        // Stage completed work the product's own counter can see: vectors keyed
+        // to entities that are in graph truth, so `embedding_status().indexed`
+        // counts them rather than a raw index length that means nothing to a
+        // reader. Removing the sidecar afterwards is what makes "did this
+        // checkpoint land" answerable by existence.
         const STAGED_VECTORS: usize = 3;
         let vector_path = state.layout.kindb_vector_index_path();
         let descriptor = kin_db::vector::IndexDescriptor {
@@ -6121,10 +6122,12 @@ mod tests {
         let vectors = kin_db::VectorIndex::new(4).unwrap();
         vectors.set_descriptor(descriptor.clone());
         for slot in 0..STAGED_VECTORS {
+            let entity = test_entity(&format!("embedded_{slot}"), "src/lib.rs");
+            state.graph.upsert_entity(&entity).unwrap();
             let mut embedding = [0.0f32; 4];
             embedding[slot] = 1.0;
             vectors
-                .upsert(kin_model::EntityId::new(), &embedding)
+                .upsert_retrievable(kin_db::RetrievalKey::Entity(entity.id), &embedding)
                 .expect("the fixture index must accept a staged vector");
         }
         vectors.save(&vector_path).unwrap();
@@ -6135,10 +6138,11 @@ mod tests {
             kin_db::vector::VectorIndexLoad::Loaded(STAGED_VECTORS)
         ));
         std::fs::remove_file(&vector_path).unwrap();
+        let staged = state.graph.embedding_status();
         assert_eq!(
-            state.graph.vector_index_stats(),
-            Some((4, STAGED_VECTORS)),
-            "the live index must carry the staged vectors before anything is refused"
+            staged.indexed, STAGED_VECTORS,
+            "the counter every surface reads must see the staged coverage before anything is \
+             refused, or this test is about a number nobody renders"
         );
         assert!(
             state.deferred_vector_checkpoint().is_none(),
@@ -6197,8 +6201,8 @@ mod tests {
             "expected the authority-mismatch refusal, got: {deferred}"
         );
         assert_eq!(
-            state.graph.vector_index_stats(),
-            Some((4, STAGED_VECTORS)),
+            state.graph.embedding_status().indexed,
+            STAGED_VECTORS,
             "the refusal must not cost the vectors it declined to write"
         );
 
@@ -6228,9 +6232,35 @@ mod tests {
             "a checkpoint that landed must retire the record it closed"
         );
         assert_eq!(
-            state.graph.vector_index_stats(),
-            Some((4, STAGED_VECTORS)),
+            state.graph.embedding_status().indexed,
+            STAGED_VECTORS,
             "the staged vectors must still be indexed and counted after the whole lifecycle"
+        );
+
+        // And they are on disk rather than merely still in memory. Dropping the
+        // live index and re-reading the sidecar through the exact call
+        // `load_validated_vector_index` makes at open is what a restart does to
+        // this count, so the assertion after it is about bytes that survived
+        // rather than about a process that has not ended yet.
+        state.graph.reset_vector_index();
+        assert_eq!(
+            state.graph.embedding_status().indexed,
+            0,
+            "the control: with the live index dropped the count must come from disk alone"
+        );
+        assert!(
+            kin_db::SnapshotManager::load_vector_index_into_graph_if_valid(
+                state.graph.as_ref(),
+                &state.layout.kindb_snapshot_path(),
+                None,
+            )
+            .expect("the checkpointed sidecar must be readable"),
+            "the checkpointed sidecar must install through the daemon's own open-time path"
+        );
+        assert_eq!(
+            state.graph.embedding_status().indexed,
+            STAGED_VECTORS,
+            "a restart must read back every vector the retry checkpointed"
         );
 
         // And with nothing outstanding, the retry is a no-op rather than a

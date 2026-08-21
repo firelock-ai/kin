@@ -2397,6 +2397,46 @@ mod tests {
             filling_line.contains("the last vector checkpoint was refused"),
             "and the refusal must be appended beside it, not instead of it: {filling_line}"
         );
+
+        // The no-noise control, and the reason it is an assertion rather than a
+        // reading of the code. A clause outside the pending gate runs on every
+        // render, including every store that has nothing wrong with it, so the
+        // only thing standing between this fix and a permanent new line on
+        // every `kin graph status` is that the field is `None`. Pin both lines
+        // byte for byte against the same fixture rendered with no refusal.
+        let filling_quiet = build_graph_status_response(
+            &pinned(&filling_binding),
+            &filling_graph,
+            &Default::default(),
+            &crate::commands::resources::EmbedRuntimeState::default(),
+        )
+        .unwrap();
+        let filling_quiet_line = filling_quiet
+            .lines
+            .iter()
+            .find(|line| line.starts_with("Embeddings:"))
+            .expect("the embeddings line still renders");
+        assert!(
+            !filling_quiet_line.contains("vector checkpoint"),
+            "a store with nothing refused must render exactly today's line: {filling_quiet_line}"
+        );
+        assert_eq!(
+            filling_quiet_line.as_str(),
+            filling_line
+                .split("; the last vector checkpoint was refused")
+                .next()
+                .expect("the refusal clause must be an append, so the prefix is today's line"),
+            "the clause must be a pure append: everything before it has to be byte-identical to \
+             what a store with nothing refused renders"
+        );
+        assert_eq!(
+            drained_control
+                .lines
+                .iter()
+                .find(|line| line.starts_with("Embeddings:")),
+            Some(&"Embeddings: 0/0 indexed (0 pending)".to_string()),
+            "and the drained control's line is today's, unchanged, to the byte"
+        );
     }
 
     /// A first fill that is waiting on the model download says so beside the
