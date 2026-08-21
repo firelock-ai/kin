@@ -6213,29 +6213,61 @@ mod shutdown_vector_checkpoint_tests {
     /// cost it nothing: no authority reopen, no sidecar write, no delay. A
     /// version that retried unconditionally would pay a full reopen on every
     /// clean exit, which is the overcorrection this must not become.
+    ///
+    /// The fixture stages a real attached index and then removes the sidecar,
+    /// which is what gives this test the ability to fail at all. An earlier
+    /// version opened a bare store with no index, so "no sidecar was written"
+    /// held whatever the code did, and the unconditional-retry sabotage passed
+    /// it cleanly. A control whose subject cannot act is not a control.
     #[tokio::test]
     async fn a_shutdown_with_no_refusal_standing_writes_no_sidecar() {
         let repo_dir = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo_dir.path()).unwrap();
         let vector_path = init.layout.kindb_vector_index_path();
         let state = Arc::new(DaemonState::open(init.layout).expect("fixture store must open"));
-        state
-            .graph
-            .upsert_entity(&test_entity("untouched"))
-            .unwrap();
+
+        let descriptor = kin_db::vector::IndexDescriptor {
+            model_id: Some("fixture-embedder-v1".to_string()),
+            graph_root: Some("fixture-root".to_string()),
+        };
+        let vectors = kin_db::VectorIndex::new(4).unwrap();
+        vectors.set_descriptor(descriptor.clone());
+        for slot in 0..STAGED_VECTORS {
+            let entity = test_entity(&format!("embedded_{slot}"));
+            state.graph.upsert_entity(&entity).unwrap();
+            let mut embedding = [0.0f32; 4];
+            embedding[slot] = 1.0;
+            vectors
+                .upsert_retrievable(kin_db::RetrievalKey::Entity(entity.id), &embedding)
+                .expect("the fixture index must accept a staged vector");
+        }
+        vectors.save(&vector_path).unwrap();
+        assert!(matches!(
+            state
+                .graph
+                .load_vector_index_compatible(&vector_path, &descriptor),
+            kin_db::vector::VectorIndexLoad::Loaded(STAGED_VECTORS)
+        ));
+        // Removed so a write during shutdown is visible. The index stays
+        // attached, so there is real content a stray checkpoint would write,
+        // and an unconditional retry recreates this file.
+        std::fs::remove_file(&vector_path).unwrap();
+        assert!(
+            state.graph.embedding_status().indexed > 0,
+            "the fixture must hold coverage a stray checkpoint could write, or this control \
+             cannot fail"
+        );
         assert!(
             state.deferred_vector_checkpoint().is_none(),
             "the control fixture must carry no refusal"
         );
-        let before = vector_path.exists();
 
         let started = std::time::Instant::now();
         run_shutdown_persistence(&state).await;
         let elapsed = started.elapsed();
 
-        assert_eq!(
-            vector_path.exists(),
-            before,
+        assert!(
+            !vector_path.exists(),
             "a shutdown with nothing refused must not checkpoint the vector sidecar at all"
         );
         assert!(
