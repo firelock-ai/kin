@@ -1255,22 +1255,11 @@ async fn handle_tools_call_daemon(
                 daemon_delegate::daemon_unavailable_tool_result(&call_params.name).await,
                 Envelope::daemon_unreachable(),
             ),
-            // A delegate error that ends with the daemon gone is exactly the
-            // condition `daemon_unreachable` exists to state, and it was the
-            // one shape that never set it: the flag was reserved for the case
-            // where no daemon endpoint was ever resolved, so a session whose
-            // daemon was killed under it got an empty `degraded` object. A
-            // client cannot tell that apart from a healthy answer without
-            // parsing prose. Where the store has recorded why its daemons keep
-            // dying, that is stamped beside it.
             Err(error) => {
-                let gone = daemon_delegate::is_daemon_exited_error(&error);
-                let base = if gone {
-                    Envelope::daemon_unreachable()
-                        .with_recorded_daemon_kill(daemon_delegate::recorded_daemon_kill().as_ref())
-                } else {
-                    Envelope::daemon()
-                };
+                let base = envelope_for_delegate_error(
+                    &error,
+                    daemon_delegate::recorded_daemon_kill().as_ref(),
+                );
                 (ToolCallResult::error(error), base)
             }
         };
@@ -1296,6 +1285,30 @@ async fn handle_tools_call_daemon(
 
     let enveloped = envelope::finalize_bounded(result, base_env, &call_params.name, &budget);
     JsonRpcResponse::success(id, serde_json::to_value(&enveloped).unwrap_or_default())
+}
+
+/// The envelope for a delegate error, from the error itself.
+///
+/// A delegate error that ends with the daemon gone is exactly the condition
+/// `daemon_unreachable` exists to state, and it was the one shape that never
+/// set it: the flag was reserved for the case where no daemon endpoint was
+/// resolved at all, so a session whose daemon was killed under it received an
+/// empty `degraded` object, which a client cannot tell from a healthy answer
+/// without parsing prose. Where the store has recorded why its daemons keep
+/// dying, that is stamped beside it.
+///
+/// Every other delegate error is left alone. A live daemon rejecting a bad
+/// argument has not become unreachable, and a store's kill history is not a
+/// fact about that call.
+fn envelope_for_delegate_error(
+    error: &str,
+    record: Option<&kin_daemon_spawn::DaemonKillRecord>,
+) -> Envelope {
+    if daemon_delegate::is_daemon_exited_error(error) {
+        Envelope::daemon_unreachable().with_recorded_daemon_kill(record)
+    } else {
+        Envelope::daemon()
+    }
 }
 
 fn finalize_daemon_graph_status(result: ToolCallResult, base_env: Envelope) -> ToolCallResult {
@@ -3005,6 +3018,31 @@ mod tests {
         assert!(
             calls.lock().unwrap().is_empty(),
             "the binder must not run while the startup binding already bound"
+        );
+    }
+
+    /// The dead-daemon error is the shape that never set a degraded flag, and a
+    /// client cannot tell an empty `degraded` object from a healthy answer
+    /// without parsing prose. An ordinary tool error from a live daemon is left
+    /// exactly as it was.
+    #[test]
+    fn a_dead_daemon_error_is_stamped_unreachable_and_an_ordinary_one_is_not() {
+        let gone = envelope_for_delegate_error(
+            "repo daemon exited; restart required: tool find_references: daemon at \
+             http://127.0.0.1:32881 is not responding",
+            None,
+        );
+        assert_eq!(gone.degraded.daemon_unreachable, Some(true));
+
+        let ordinary = envelope_for_delegate_error("no entity named `HTTPAdapter.send`", None);
+        assert_eq!(
+            ordinary.degraded.daemon_unreachable, None,
+            "a live daemon rejecting a call has not become unreachable"
+        );
+        assert_eq!(
+            serde_json::to_value(&ordinary.degraded).unwrap(),
+            serde_json::json!({}),
+            "an ordinary tool error carries the same empty degraded object it always did"
         );
     }
 }

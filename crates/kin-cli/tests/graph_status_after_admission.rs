@@ -203,6 +203,14 @@ fn graph_status(
     binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
 ) -> kin_cli::commands::graph::GraphCommandResponse {
+    graph_status_at(binding, graph, None)
+}
+
+fn graph_status_at(
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    graph: &kin_db::InMemoryGraph,
+    kin_root: Option<&Path>,
+) -> kin_cli::commands::graph::GraphCommandResponse {
     execute_graph_command(
         &kin_cli::commands::repository_authority::RequestRepositoryAuthority::pinned(
             binding.clone(),
@@ -212,8 +220,72 @@ fn graph_status(
         &Default::default(),
         &Default::default(),
         &Default::default(),
+        kin_root,
     )
     .expect("run graph status")
+}
+
+/// A daemon killed by the memory limit leaves every counter in this report
+/// intact: the graph is fine, a replacement serves, and the kills that got it
+/// there are in no count on the page. Without the store's own record the report
+/// prints an all-clear over them, which is the exact shape of the false
+/// all-clear this row exists to kill.
+#[test]
+fn graph_status_reports_a_daemon_this_store_lost_to_the_memory_limit() {
+    let root = tempdir().expect("temp root");
+    let repo = root.path().join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    let admitted = admit(&repo);
+    let graph = workspace_query_graph(&admitted.binding);
+
+    let clean = graph_status(&admitted.binding, &graph);
+    assert!(
+        !clean.lines.iter().any(|line| line.contains("killed by")),
+        "the control says nothing about kills, or this test cannot fail: {}",
+        clean.lines.join("\n")
+    );
+
+    kin_daemon_spawn::write_daemon_kill_record(
+        admitted.layout.root(),
+        &kin_daemon_spawn::DaemonKillRecord {
+            kills: 4,
+            memory_kills: 4,
+            first_unix: 4_320,
+            last_unix: 4_800,
+            last_pid: Some(41),
+            last_cause: kin_daemon_spawn::DaemonKillCause::MemoryLimit {
+                kernel_oom_kills: 1,
+            },
+            limit_bytes: Some(12 * 1024 * 1024 * 1024),
+            last_rss_bytes: None,
+        },
+    );
+
+    let after = graph_status_at(&admitted.binding, &graph, Some(admitted.layout.root()));
+    let rendered = after.lines.join("\n");
+    assert!(
+        rendered.contains("killed by the memory limit 4 time(s) since 01:12Z"),
+        "the store's own record belongs on the page a reader is already on: {rendered}"
+    );
+    assert!(
+        rendered.contains("KIN_DAEMON_DISABLE_LSP=1 kin graph status"),
+        "the row carries a remediation the reader can perform: {rendered}"
+    );
+    // A warning rather than a notice, which is what makes it withhold the
+    // all-clear: `✓ No issues detected.` is printed only when the warning list
+    // is empty. This fixture already carries warnings of its own, so the row's
+    // own prefix is what proves which list it joined.
+    assert!(
+        after
+            .lines
+            .iter()
+            .any(|line| line.starts_with('⚠') && line.contains("killed by the memory limit")),
+        "the record is a warning, not a notice: {rendered}"
+    );
+    assert!(
+        after.error.is_none(),
+        "the row is a warning, so it must not turn `kin graph status` nonzero"
+    );
 }
 
 #[test]
@@ -330,6 +402,7 @@ fn graph_validate(
         &Default::default(),
         &Default::default(),
         &Default::default(),
+        None,
     )
     .expect("run graph validate")
 }

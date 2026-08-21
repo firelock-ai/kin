@@ -3527,6 +3527,7 @@ async fn command_graph(
             .reconcile_report(std::time::Instant::now()),
         &embedding_runtime,
         &census,
+        Some(state.layout.root()),
     )
     .map_err(internal_error)?;
     Ok(Json(response))
@@ -14404,6 +14405,7 @@ mod tests {
             &Default::default(),
             &runtime,
             &Default::default(),
+            Some(state.layout.root()),
         )
         .unwrap();
 

@@ -196,6 +196,7 @@ pub async fn run_health_checks() -> HealthReport {
     checks.push(check_background_work().await);
     checks.push(check_embedding_model().await);
     checks.push(check_commit_memory_headroom());
+    checks.push(check_daemon_kill_record());
     checks.push(check_retrieval_profile());
     checks.push(check_update_policy());
     checks.push(check_binary_assessment_load());
@@ -3515,6 +3516,51 @@ fn check_commit_memory_headroom() -> HealthCheck {
     };
     let footprint = crate::commands::store_footprint::StoreFootprint::measure(&layout);
     commit_memory_headroom_check_for(&footprint, &crate::capability::memory_evidence())
+}
+
+/// Whether a daemon serving this store was killed, and what killed it.
+///
+/// Every other row on this page describes a daemon that is running or one that
+/// is absent. A daemon that was killed leaves both readings intact: the store
+/// is fine, a replacement is serving, and the kills that got it there appear in
+/// no count anywhere on this page. The store's own record is the only thing
+/// that remembers them, and this is the row that reads it.
+///
+/// Advisory by construction: `Degraded` does not block readiness, because a
+/// machine too small for this repository is a fact about the machine and not a
+/// broken install.
+fn check_daemon_kill_record() -> HealthCheck {
+    const ID: &str = "daemon_kill_record";
+    const LABEL: &str = "Daemon kills";
+    let cwd = env::current_dir().unwrap_or_default();
+    let Some(layout) = kin_core::KinLayout::discover(&cwd) else {
+        return HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Unsupported,
+            "not in a Kin repository, so there is no store whose daemons could have been killed",
+        );
+    };
+    daemon_kill_record_check_for(kin_daemon_spawn::read_daemon_kill_record(layout.root()).as_ref())
+}
+
+/// Core of [`check_daemon_kill_record`] with the record as its input, so both
+/// branches are testable on any host and without a killed daemon.
+fn daemon_kill_record_check_for(
+    record: Option<&kin_daemon_spawn::DaemonKillRecord>,
+) -> HealthCheck {
+    const ID: &str = "daemon_kill_record";
+    const LABEL: &str = "Daemon kills";
+    let Some(record) = record else {
+        return HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Healthy,
+            "no daemon serving this store has been killed",
+        );
+    };
+    HealthCheck::new(ID, LABEL, HealthStatus::Degraded, record.cause_sentence())
+        .with_manual_fix(record.remediation())
 }
 
 /// Core of [`check_commit_memory_headroom`] with both readings as inputs, so
@@ -8132,6 +8178,51 @@ mod tests {
                 .contains("fetches the model from huggingface.co"),
             "the fetch is still named without a size: {}",
             check.detail
+        );
+    }
+
+    /// The row exists because every other row on the page reads healthy after a
+    /// kill: the store is fine and a replacement is serving. The record is the
+    /// only thing that remembers, and a store that has lost none must not grow
+    /// a row saying so ambiguously.
+    #[test]
+    fn the_daemon_kill_row_reports_a_record_and_stays_quiet_without_one() {
+        let quiet = daemon_kill_record_check_for(None);
+        assert!(matches!(quiet.status, HealthStatus::Healthy));
+        assert!(quiet.manual_fix.is_none());
+
+        let record = kin_daemon_spawn::DaemonKillRecord {
+            kills: 4,
+            memory_kills: 4,
+            first_unix: 4_320,
+            last_unix: 4_800,
+            last_pid: Some(41),
+            last_cause: kin_daemon_spawn::DaemonKillCause::MemoryLimit {
+                kernel_oom_kills: 1,
+            },
+            limit_bytes: Some(12 * 1024 * 1024 * 1024),
+            last_rss_bytes: None,
+        };
+        let reported = daemon_kill_record_check_for(Some(&record));
+        assert!(matches!(reported.status, HealthStatus::Degraded));
+        assert!(
+            reported
+                .detail
+                .contains("killed by the memory limit 4 time(s) since 01:12Z"),
+            "{}",
+            reported.detail
+        );
+        assert!(
+            reported
+                .manual_fix
+                .as_deref()
+                .is_some_and(|fix| fix.contains("KIN_DAEMON_DISABLE_LSP=1 kin graph status")),
+            "the fix line must name something the reader can do: {:?}",
+            reported.manual_fix
+        );
+        assert!(
+            !blocks_readiness(&reported),
+            "a machine too small for this repository is not a broken install"
         );
     }
 }

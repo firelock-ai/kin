@@ -2731,4 +2731,51 @@ mod tests {
         // degraded is always present.
         assert!(obj.contains_key("degraded"));
     }
+
+    fn kill_record(memory_kills: u64) -> kin_daemon_spawn::DaemonKillRecord {
+        kin_daemon_spawn::DaemonKillRecord {
+            kills: 4,
+            memory_kills,
+            first_unix: 4_320,
+            last_unix: 4_800,
+            last_pid: Some(41),
+            last_cause: if memory_kills > 0 {
+                kin_daemon_spawn::DaemonKillCause::MemoryLimit {
+                    kernel_oom_kills: 1,
+                }
+            } else {
+                kin_daemon_spawn::DaemonKillCause::Unattributed { signal: 9 }
+            },
+            limit_bytes: Some(12 * 1024 * 1024 * 1024),
+            last_rss_bytes: None,
+        }
+    }
+
+    /// Only the kernel's own attribution becomes a flag. A client keying on
+    /// `daemon_killed_by_memory` must never read it out of a host that
+    /// publishes no accounting and therefore never said memory at all.
+    #[test]
+    fn only_a_kernel_attributed_kill_is_stamped_on_the_envelope() {
+        let stamped = Envelope::daemon_unreachable().with_recorded_daemon_kill(Some(&kill_record(4)));
+        assert_eq!(stamped.degraded.daemon_killed_by_memory, Some(true));
+        assert!(stamped
+            .degraded
+            .active_labels()
+            .contains(&"daemon_killed_by_memory"));
+
+        let unattributed =
+            Envelope::daemon_unreachable().with_recorded_daemon_kill(Some(&kill_record(0)));
+        assert_eq!(
+            unattributed.degraded.daemon_killed_by_memory, None,
+            "a kill nothing attributed to memory claims nothing structurally"
+        );
+
+        let never_killed = Envelope::daemon_unreachable().with_recorded_daemon_kill(None);
+        assert_eq!(never_killed.degraded.daemon_killed_by_memory, None);
+        assert_eq!(
+            serde_json::to_value(&never_killed.degraded).unwrap(),
+            serde_json::json!({"daemon_unreachable": true}),
+            "a store with no record serializes exactly as it did"
+        );
+    }
 }

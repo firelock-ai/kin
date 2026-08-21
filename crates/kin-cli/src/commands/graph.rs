@@ -257,10 +257,18 @@ pub fn execute_graph_command(
     reconcile: &crate::commands::resources::ReconcileHealth,
     embedding_runtime: &crate::commands::resources::EmbedRuntimeState,
     census: &kin_core::relation_census::CensusContext,
+    kin_root: Option<&std::path::Path>,
 ) -> Result<GraphCommandResponse> {
     match request {
         GraphCommandRequest::Status => {
-            build_graph_status_response(authority, graph, reconcile, embedding_runtime, census)
+            build_graph_status_response(
+                authority,
+                graph,
+                reconcile,
+                embedding_runtime,
+                census,
+                kin_root,
+            )
         }
         GraphCommandRequest::Validate => build_graph_validate_response(authority, graph),
         GraphCommandRequest::Inspect { name } => build_graph_inspect_response(graph, name),
@@ -383,6 +391,7 @@ fn build_graph_status_response(
     reconcile: &crate::commands::resources::ReconcileHealth,
     embedding_runtime: &crate::commands::resources::EmbedRuntimeState,
     census: &kin_core::relation_census::CensusContext,
+    kin_root: Option<&std::path::Path>,
 ) -> Result<GraphCommandResponse> {
     // One sample for every embedding line in this response. The counter below
     // and the health warning used to sample coverage independently, and an
@@ -826,6 +835,14 @@ fn build_graph_status_response(
     // does; changing an exit code is a separate decision from killing a false
     // all-clear, and only the second is what this closes.
     warnings.extend(census_comparison.loss_lines());
+    // A daemon killed by the memory limit is invisible to every counter above
+    // it. The graph it left behind is intact and a replacement is serving, so a
+    // store whose daemon has been killed twenty-five times prints a clean
+    // report with an all-clear under it. The store's own record is the only
+    // thing that remembers, and this is the page a reader is already on.
+    if let Some(record) = kin_root.and_then(kin_daemon_spawn::read_daemon_kill_record) {
+        warnings.push(record.summary());
+    }
     if warnings.is_empty() && criticals.is_empty() {
         lines.push(String::new());
         lines.push("✓ No issues detected.".to_string());
@@ -1903,6 +1920,7 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
+            None,
         )
         .unwrap();
         assert!(
@@ -1926,6 +1944,7 @@ mod tests {
             },
             &Default::default(),
             &Default::default(),
+            None,
         )
         .unwrap();
         assert!(
@@ -1975,6 +1994,7 @@ mod tests {
             },
             &Default::default(),
             &Default::default(),
+            None,
         )
         .unwrap();
         assert!(
@@ -2018,6 +2038,7 @@ mod tests {
             },
             &Default::default(),
             &Default::default(),
+            None,
         )
         .unwrap();
         // The reconcile warning is the assertion that carries this test. The
@@ -2096,6 +2117,7 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
+            None,
         )
         .unwrap();
 
@@ -2157,6 +2179,7 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
+            None,
         )
         .unwrap();
 
@@ -2218,6 +2241,7 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
+            None,
         )
         .unwrap();
 
@@ -2273,6 +2297,7 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
+            None,
         )
         .unwrap();
 
@@ -2315,6 +2340,7 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
+            None,
         )
         .unwrap();
 
@@ -2528,6 +2554,7 @@ mod tests {
                 ..Default::default()
             },
             &Default::default(),
+            None,
         )
         .unwrap();
         let embeddings_line = no_sidecar
@@ -2579,6 +2606,7 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
+            None,
         )
         .unwrap();
         let first_fill_line = first_fill
@@ -2623,6 +2651,7 @@ mod tests {
                 ..Default::default()
             },
             &Default::default(),
+            None,
         )
         .unwrap();
         let embeddings_line = remote
@@ -2671,6 +2700,7 @@ mod tests {
                 ..Default::default()
             },
             &Default::default(),
+            None,
         )
         .unwrap();
         let embeddings_line = discarded
@@ -2718,6 +2748,7 @@ mod tests {
                 ..Default::default()
             },
             &Default::default(),
+            None,
         )
         .unwrap();
         assert!(
@@ -2905,6 +2936,7 @@ mod tests {
                 ..Default::default()
             },
             &Default::default(),
+            None,
         )
         .unwrap();
         let embeddings_line = downloading
@@ -2932,6 +2964,7 @@ mod tests {
                 ..Default::default()
             },
             &Default::default(),
+            None,
         )
         .unwrap();
         let cached_line = cached
@@ -2982,6 +3015,7 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
+            None,
         )
         .unwrap();
 
@@ -3022,6 +3056,7 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
+            None,
         )
         .unwrap();
 
@@ -4004,6 +4039,7 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
+            None,
         )
         .unwrap();
 
