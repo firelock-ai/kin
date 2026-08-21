@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Say why a trace walk stopped, per hop, and stop reporting coverage as unreported on complete walks (#1018)
 - Give kin dead-code the absence discipline the MCP surface applies (#1017)
 - Bump clap from 4.6.2 to 4.6.6 (#1019)
+- Bump serde_json from 1.0.150 to 1.0.151 (#1021)
 
 
 ## [0.5.46] - 2026-08-21
