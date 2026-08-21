@@ -28,6 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Give kin dead-code the absence discipline the MCP surface applies (#1017)
 - Bump clap from 4.6.2 to 4.6.6 (#1019)
 - Bump serde_json from 1.0.150 to 1.0.151 (#1021)
+- Give the auth credential test a per-process store instead of the host one (#1027)
+- Bind a projection root only when it is a Kin repository, and stop calling an unserved one in force (#1029)
+- Report the store's coverage beside an embed pass's own count (#1030)
+- Scope a review to the entities that changed, and pair same-name declarations by their own signature (#1031)
 
 
 ## [0.5.46] - 2026-08-21
