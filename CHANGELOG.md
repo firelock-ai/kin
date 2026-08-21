@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Report which admission phase moved the init heap ceiling, not just that it moved (#995)
 - Decompress the conversion closure once, and stop hashing a bootstrap transaction nothing reads (#1000)
 - Publish what a language server can do, not that its binary exists (#998)
+- Say when kin impact cannot rule out dependents, in the MCP verdict's own words (#999)
 
 
 ## [0.5.45] - 2026-08-20
