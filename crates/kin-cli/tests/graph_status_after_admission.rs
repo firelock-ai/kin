@@ -211,6 +211,7 @@ fn graph_status(
         &GraphCommandRequest::Status,
         &Default::default(),
         &Default::default(),
+        &Default::default(),
     )
     .expect("run graph status")
 }
@@ -263,6 +264,59 @@ fn graph_status_passes_on_a_healthy_freshly_admitted_repository() {
     );
 }
 
+/// The recorded census and the printed histogram must be the same measurement.
+///
+/// Two walks produce them: the status renderer counts relations while it also
+/// resolves cross-file endpoints, and `measure_relation_census` counts them on
+/// its own for the sweep and commit writers. If those ever disagree, every
+/// comparison this feature makes is against a number no surface displays, and
+/// the disagreement would present as movement rather than as a bug. This drives
+/// both over a real admitted repository rather than a fixture, so the agreement
+/// is asserted on relations an adapter actually produced.
+#[test]
+fn the_recorded_census_matches_the_histogram_status_prints() {
+    let root = tempdir().expect("temp root");
+    let repo = root.path().join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    let admitted = admit(&repo);
+    let graph = workspace_query_graph(&admitted.binding);
+
+    let measured =
+        kin_cli::commands::graph::measure_relation_census(&graph).expect("measure the census");
+    let response = graph_status(&admitted.binding, &graph);
+    let printed = response
+        .lines
+        .iter()
+        .find(|line| line.starts_with("Entity-to-entity relation kinds: "))
+        .expect("status prints the relation-kind histogram")
+        .trim_start_matches("Entity-to-entity relation kinds: ")
+        .to_string();
+
+    // Rendered as `Kind: N, Kind: N`, so the census is checked term by term
+    // rather than by reassembling the string in the same order.
+    let mut rendered: Vec<String> = printed
+        .split(", ")
+        .filter(|term| !term.is_empty())
+        .map(|term| term.to_string())
+        .collect();
+    rendered.sort();
+    let mut from_census: Vec<String> = measured
+        .iter()
+        .filter(|(_, count)| **count > 0)
+        .map(|(kind, count)| format!("{kind}: {count}"))
+        .collect();
+    from_census.sort();
+    assert_eq!(
+        rendered, from_census,
+        "the census the sweep and commit record is the histogram status prints"
+    );
+    assert!(
+        !from_census.is_empty(),
+        "an empty census would make this agreement trivially true: {}",
+        response.lines.join("\n")
+    );
+}
+
 fn graph_validate(
     binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
@@ -273,6 +327,7 @@ fn graph_validate(
         ),
         graph,
         &GraphCommandRequest::Validate,
+        &Default::default(),
         &Default::default(),
         &Default::default(),
     )

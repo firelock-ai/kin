@@ -396,6 +396,20 @@
       ]
     },
     {
+      "file": "crates/kin-core/src/relation_census.rs",
+      "reason": "Durable bookkeeping marker published beside the last-admission marker, not an answer authority. The excused bodies read and write .kin/kindb/relation-census, which records the relation-kind histogram as it stood when the graph's relations were last settled, so `kin graph status` can compare its own census to the previous one instead of printing an all-clear over a store that lost a whole relation kind. It is written only at the end of a completed enrichment sweep and at the end of a commit, never on a read path, and read only by the status and doctor surfaces. The record names no entity, carries no repository content, and cannot change what any query returns: a reader that lied in either direction would change only the wording of a health row, never a locate, search, context, trace, review, or xref answer. Publication is a temp-and-rename with an fsync of the staged file and then of the containing directory, the same shape last_admission.rs beside it and write_generation_marker in crates/kin-daemon/src/state.rs use for the authority head marker. Routing through a shared boundary helper instead was not available: kin-core exposes no public atomic-write path, and config.rs, registry.rs, last_admission.rs, and the daemon's state.rs each open-code their own. Function-scoped rather than whole-file so the rest of the module stays scanned, including the comparison rule, the movement classification, and the cause lookup, and so any newly added filesystem primitive here fails the guard until it is justified.",
+      "owner": "kin-core",
+      "expiration": "2026-12-31",
+      "allow_fn": [
+        "read",
+        "write",
+        {
+          "fn": "sync_directory_metadata",
+          "count": 2
+        }
+      ]
+    },
+    {
       "file": "crates/kin-daemon/src/loop_runner.rs",
       "reason": "Host event ingestion boundary. The excused bodies are the file watcher's admission path: reading a host file or symlink target and its mode so the change can be admitted into the graph as exact tree state, and comparing a host entry against what the graph already holds so an unchanged file is not re-admitted. Reading the working tree is the entire job of an ingestion boundary, and the result is written into graph truth rather than returned as an answer. The remaining two are repository binding, which precedes any graph consult: recognizing a bare git layout, and resolving a path relative to the bound root. The helper that canonicalized a host parent while preserving its leaf moved to kin-index, which is a declared ingestion boundary, so the watcher and this runner decide repository containment by one rule instead of two. The cfg-gated executable-bit helper is the pair that carries a count of two. Function-scoped so the rest of the runner stays scanned.",
       "owner": "kin-daemon",

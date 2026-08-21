@@ -665,6 +665,59 @@ pub fn record_durable_admission(layout: &kin_core::KinLayout, tracked_artifacts:
     kin_core::last_admission::record(layout, tracked_artifacts);
 }
 
+/// Persist the relation-kind census of `graph` for this store.
+///
+/// Called where the relation set was just settled: at the end of a completed
+/// enrichment sweep, and at the end of a commit that installed its change in
+/// the live graph. Those are the moments a process both changed the relations
+/// and knows it finished, which is what makes the record interpretable as a
+/// baseline rather than as a sample taken mid-flight.
+///
+/// Never called from a read path. `kin graph status` reads this record and does
+/// not write it: a census stamped on every reading would compare each reading
+/// against the one before it, so a store that lost a whole relation kind would
+/// announce the loss once and then report itself clean forever, which is a
+/// quieter version of the defect this record closes.
+///
+/// The causes recorded beside the counts are the correctness-relevant
+/// environment overrides active in THIS process, because this is the process
+/// that built the graph. Reading them at status time instead would report the
+/// environment of whoever happened to ask.
+///
+/// A measurement or write failure is logged and swallowed, and the direction of
+/// that failure is the safe one: an unwritten census leaves the previous,
+/// older one in place, so the next comparison spans a longer window and reports
+/// more movement rather than less. Turning it into a sweep or commit failure
+/// would fail work that actually succeeded.
+pub fn record_relation_census(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    source: kin_core::relation_census::CensusSource,
+) {
+    let kinds = match kin_cli::commands::graph::measure_relation_census(graph) {
+        Ok(kinds) => kinds,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "could not measure the relation census; the previous census stays in place and                  the next comparison spans a longer window"
+            );
+            return;
+        }
+    };
+    let recorded = kin_core::relation_census::RelationCensus::new(
+        chrono::Utc::now(),
+        source,
+        kinds,
+        kin_core::relation_census::known_causes(std::env::vars()),
+    );
+    if let Err(error) = kin_core::relation_census::write(layout, &recorded) {
+        tracing::warn!(
+            error = %error,
+            "could not persist the relation census; graph status will compare against the              previous one until a later pass rewrites it"
+        );
+    }
+}
+
 /// What the filesystem reconciliation loop has actually managed to admit.
 ///
 /// The loop already knew every fact here. It logged an admission failure at

@@ -2219,6 +2219,25 @@ fn finalize_committed_transaction(
             &carried_pending_files,
         )
     })?;
+    // The second commit path, recorded for the same reason the first one is.
+    // An agent that only ever writes through MCP would otherwise leave the
+    // store's census frozen at whatever the last CLI commit or sweep left, and
+    // every comparison after that would span a window nobody can date.
+    //
+    // Taken from the LIVE graph, unlike the durable entity count above, and the
+    // difference is deliberate. That count describes what authority carries, so
+    // reading it live would record entities an ambient admission added and this
+    // commit never published. A census is the baseline `kin graph status`
+    // compares against, and status answers from the live graph, so a census
+    // taken from authority would make every ambient admission read as movement
+    // this commit caused. `semantic_workspace_matches` ran just above, so the
+    // two views are level here either way; the live read is what keeps them
+    // level on every later path too.
+    crate::background_work::record_relation_census(
+        &state.layout,
+        state.graph.as_ref(),
+        kin_core::relation_census::CensusSource::Commit,
+    );
 
     let observed_generation = state.snapshot_generation.load(Ordering::SeqCst);
     if observed_generation < committed.receipt.generation {

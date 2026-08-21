@@ -35,6 +35,7 @@ pub mod ranking;
 pub mod ref_view;
 pub mod reference_coverage;
 pub mod registry;
+pub mod relation_census;
 pub mod repository_authority;
 pub mod resolver;
 pub mod shims;
