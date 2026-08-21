@@ -170,6 +170,34 @@ pub fn read(layout: &KinLayout) -> LastAdmissionRead {
     }
 }
 
+/// Stamp the marker now, for a complete exact-tree admission that has already
+/// completed and is durable.
+///
+/// The one writer every complete-admission path goes through, so freshness reads
+/// the same way whichever path admitted. Before this existed each caller decided
+/// for itself and most decided not to: the ambient reconcile tick and `kin admit`
+/// wrote the marker, while the commit endpoint, the stash endpoint and the Git
+/// conversion that creates the store all performed a complete admission and
+/// recorded none. That is how a store answered "no complete admission is
+/// recorded for this store" minutes after being converted and committed to.
+///
+/// A write failure is logged and swallowed. An admission that succeeded did
+/// succeed, and turning a marker-write failure into an admission failure would
+/// report an admitted tree as unadmitted, which is a worse lie than the one this
+/// marker fixes. The failure direction is also the safe one: an unwritten marker
+/// leaves the previous, older timestamp in place, so the store reads as staler
+/// than it is and never as fresher.
+pub fn record(layout: &KinLayout, tracked_artifacts: u64) {
+    let recorded = LastAdmission::new(Utc::now(), tracked_artifacts);
+    if let Err(error) = write(layout, &recorded) {
+        tracing::warn!(
+            error = %error,
+            "could not persist the last-admission marker; freshness surfaces will report the \
+             previous admission until the next pass rewrites it"
+        );
+    }
+}
+
 /// Write the durable marker for `layout`, atomically.
 ///
 /// Staged beside the target and renamed into place after an fsync, then the
