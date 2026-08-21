@@ -11895,9 +11895,11 @@ async fn provision_language_servers_in_wizard(opts: &WizardOptions, interactive:
         opts.install_language_servers,
         interactive && !opts.install_language_servers,
     );
-    for line in apply_language_server_provisioning(&missing, consent).await {
+    let outcome = apply_language_server_provisioning(&missing, consent).await;
+    for line in &outcome.applied {
         println!("  {} {line}", style("✓").green());
     }
+    outcome.print_unfinished();
 }
 
 /// Get the notification identity working, and say so when it cannot be.
@@ -12680,17 +12682,159 @@ fn print_human_report(report: &crate::commands::health::HealthReport) {
         },
         style(summary.skipped).dim(),
     );
-    if report.healthy {
-        println!(
-            "{} First-run ready — no component is missing or misconfigured.",
-            style("✓").green()
-        );
+    let readiness = readiness_line(report);
+    let mark = if readiness.ready {
+        style("✓").green()
+    } else if readiness.severe {
+        style("✗").red()
     } else {
-        println!(
-            "{} Some checks need attention. Run `kin doctor --fix` to apply safe repairs.",
-            style("✗").red()
-        );
+        style("!").yellow()
+    };
+    println!("{mark} {}", readiness.sentence);
+}
+
+/// The closing readiness line, and how loudly to print it.
+struct ReadinessLine {
+    /// Whether the run may claim readiness at all.
+    ready: bool,
+    /// Whether the rows needing attention include a real failure rather than
+    /// expected first-run work. Only the mark depends on it.
+    severe: bool,
+    sentence: String,
+}
+
+/// Compose the closing line from the rows the table just printed.
+///
+/// It used to be read off `report.healthy` alone, which asks a narrower
+/// question than the table answers: `healthy` gates on Missing and
+/// Misconfigured, so a container run whose `Reference edge coverage` row read
+/// PENDING for want of a language server closed with "First-run ready" one line
+/// under its own "4 need attention" tally, and the repair that would have
+/// closed that row had failed in the same output (FIR-2547). The row knew; the
+/// summary did not read it. A reader who trusts the last line is entitled to
+/// have it agree with the rows above it, so claiming readiness now requires
+/// that nothing at all needs attention, and the line names what does.
+fn readiness_line(report: &crate::commands::health::HealthReport) -> ReadinessLine {
+    use crate::commands::health::HealthStatus;
+
+    /// How many rows the line names before it counts the rest.
+    const NAMED: usize = 4;
+
+    let summary = report.summary();
+    let waiting: Vec<&crate::commands::health::HealthCheck> = report
+        .checks
+        .iter()
+        .filter(|check| {
+            !matches!(
+                check.status,
+                HealthStatus::Healthy | HealthStatus::Unsupported
+            )
+        })
+        .collect();
+    if report.healthy && summary.attention == 0 && waiting.is_empty() {
+        return ReadinessLine {
+            ready: true,
+            severe: false,
+            sentence: "First-run ready — no component is missing or misconfigured.".to_string(),
+        };
     }
+    let severe = !report.healthy
+        || waiting.iter().any(|check| {
+            matches!(
+                check.status,
+                HealthStatus::Missing | HealthStatus::Misconfigured | HealthStatus::Degraded
+            )
+        });
+    let mut labels: Vec<String> = waiting
+        .iter()
+        .take(NAMED)
+        .map(|check| check.label.clone())
+        .collect();
+    if waiting.len() > NAMED {
+        labels.push(format!("and {} more", waiting.len() - NAMED));
+    }
+    let advice = if waiting.iter().any(|check| check.fixable) {
+        "Run `kin doctor --fix` to apply safe repairs."
+    } else {
+        "Each row above carries the fix it needs."
+    };
+    let sentence = if waiting.len() == 1 {
+        format!("1 check needs attention: {}. {advice}", labels.join(", "))
+    } else {
+        format!(
+            "{} checks need attention: {}. {advice}",
+            waiting.len(),
+            labels.join(", ")
+        )
+    };
+    ReadinessLine {
+        ready: false,
+        severe,
+        sentence,
+    }
+}
+
+/// A repair `kin doctor --fix` attempted and could not complete.
+struct UnfinishedRepair {
+    /// What Kin was trying to do, in the operator's terms.
+    what: String,
+    /// Why it did not happen, in the failing tool's own words where there were
+    /// any to keep.
+    reason: String,
+    /// The commands that close it by hand.
+    remediation: Vec<String>,
+    /// Whether the operator asked for this repair by name.
+    ///
+    /// Only these set the exit code. `--fix` also runs a set of best-effort
+    /// convergence repairs nobody asked for individually, and `kin update` runs
+    /// `kin setup doctor --fix` unattended as the last step of its chain
+    /// (`update::ChainStep::RepairConfigs`), where a VFS shim that could not be
+    /// re-downloaded on an offline host must not report an installed release as
+    /// a failed update. A requested repair is the opposite case: the operator
+    /// typed `--install-language-servers` or answered the prompt, and silence
+    /// about its failure is the defect FIR-2547 records.
+    requested: bool,
+}
+
+/// Print what could not be repaired, with the commands that close it.
+fn print_unfinished_repairs(unfinished: &[UnfinishedRepair]) {
+    if unfinished.is_empty() {
+        return;
+    }
+    println!();
+    println!("Repairs that did not complete:");
+    for repair in unfinished {
+        println!("  {} {}: {}", style("✗").red(), repair.what, repair.reason);
+        for line in &repair.remediation {
+            println!("      {line}");
+        }
+    }
+}
+
+/// The exit verdict for a `--fix` run.
+///
+/// Non-zero when a repair the operator asked for did not happen. The run has
+/// already printed what failed and what closes it; this is the half a script
+/// can read, and the half whose absence let a run that installed nothing close
+/// under a green tick.
+fn fix_verdict(unfinished: &[UnfinishedRepair]) -> Result<()> {
+    let requested: Vec<&UnfinishedRepair> = unfinished
+        .iter()
+        .filter(|repair| repair.requested)
+        .collect();
+    if requested.is_empty() {
+        return Ok(());
+    }
+    let names = requested
+        .iter()
+        .map(|repair| repair.what.clone())
+        .collect::<Vec<_>>()
+        .join(", ");
+    anyhow::bail!(
+        "{} requested repair{} did not complete: {names}",
+        requested.len(),
+        if requested.len() == 1 { "" } else { "s" }
+    )
 }
 
 /// Provision the language servers behind Kin's cross-file reference edges, and
@@ -12737,14 +12881,33 @@ async fn refresh_running_daemon_after_install(cwd: &std::path::Path) -> bool {
     }
 }
 
+/// What one provisioning pass applied, and what it could not.
+#[derive(Default)]
+struct ProvisioningOutcome {
+    applied: Vec<String>,
+    unfinished: Vec<UnfinishedRepair>,
+}
+
+impl ProvisioningOutcome {
+    /// Print the remedies for what did not happen, for surfaces with no
+    /// closing block of their own.
+    fn print_unfinished(&self) {
+        for repair in &self.unfinished {
+            for line in &repair.remediation {
+                println!("      {line}");
+            }
+        }
+    }
+}
+
 async fn apply_language_server_provisioning(
     missing: &[kin_model::LanguageId],
     consent: language_servers::InstallConsent,
-) -> Vec<String> {
+) -> ProvisioningOutcome {
     use language_servers::{InstallConsent, InstallOutcome};
 
     if missing.is_empty() {
-        return Vec::new();
+        return ProvisioningOutcome::default();
     }
 
     if consent == InstallConsent::Withheld {
@@ -12768,7 +12931,7 @@ async fn apply_language_server_provisioning(
             "      or re-run with --install-language-servers to have Kin run {}",
             if missing.len() == 1 { "it" } else { "them" }
         );
-        return Vec::new();
+        return ProvisioningOutcome::default();
     }
 
     let reports = language_servers::provision(
@@ -12791,8 +12954,10 @@ async fn apply_language_server_provisioning(
     );
 
     let mut applied = Vec::new();
+    let mut unfinished: Vec<UnfinishedRepair> = Vec::new();
     let mut installed_any = false;
     for report in reports {
+        let recipe = language_servers::recipe_for(report.language);
         match report.outcome {
             InstallOutcome::AlreadyPresent => {}
             InstallOutcome::Installed { command } => {
@@ -12805,28 +12970,65 @@ async fn apply_language_server_provisioning(
             // A zero exit that left the binary unreachable is reported as the
             // gap it still is. Counting it as applied is how a closed-looking
             // row keeps an open gap.
-            InstallOutcome::RanButStillMissing { command } => println!(
-                "  {} `{command}` succeeded but no {} server is on PATH; check that your npm \
-                 global prefix is on PATH",
-                style("✗").red(),
-                report.language
-            ),
-            InstallOutcome::Failed { command, reason } => println!(
-                "  {} could not install the {} language server: {reason} (`{command}`)",
-                style("✗").red(),
-                report.language
-            ),
+            InstallOutcome::RanButStillMissing { command } => {
+                println!(
+                    "  {} `{command}` succeeded but no {} server is on PATH",
+                    style("✗").red(),
+                    report.language
+                );
+                unfinished.push(UnfinishedRepair {
+                    what: format!("install the {} language server", report.language),
+                    reason: format!(
+                        "`{command}` reported success and no {} server is on PATH",
+                        report.language
+                    ),
+                    remediation: recipe
+                        .map(language_servers::unreachable_after_install_remediation)
+                        .unwrap_or_default(),
+                    requested: true,
+                });
+            }
+            InstallOutcome::Failed { command, reason } => {
+                println!(
+                    "  {} could not install the {} language server: {reason}",
+                    style("✗").red(),
+                    report.language
+                );
+                let remediation = recipe
+                    .map(|recipe| language_servers::install_failure_remediation(recipe, &reason))
+                    .unwrap_or_else(|| {
+                        vec![format!(
+                            "run `{command}` yourself to see the installer's own error"
+                        )]
+                    });
+                unfinished.push(UnfinishedRepair {
+                    what: format!("install the {} language server", report.language),
+                    reason,
+                    remediation,
+                    requested: true,
+                });
+            }
             InstallOutcome::Declined { command } => println!(
                 "  {} skipped the {} language server; run `{command}` to install it later",
                 style("-").dim(),
                 report.language
             ),
-            InstallOutcome::NoInstaller { program, command } => println!(
-                "  {} `{program}` is not installed, so Kin cannot run `{command}` to provision \
-                 the {} language server",
-                style("✗").red(),
-                report.language
-            ),
+            InstallOutcome::NoInstaller { program, command } => {
+                println!(
+                    "  {} `{program}` is not installed, so Kin cannot run `{command}` to \
+                     provision the {} language server",
+                    style("✗").red(),
+                    report.language
+                );
+                unfinished.push(UnfinishedRepair {
+                    what: format!("install the {} language server", report.language),
+                    reason: format!("`{program}` is not installed on this host"),
+                    remediation: vec![format!("install `{program}`, then run `{command}`")],
+                    // Consent was never asked for here, so only the flag makes
+                    // this a repair the operator requested.
+                    requested: consent == InstallConsent::Granted,
+                });
+            }
         }
     }
 
@@ -12852,6 +13054,15 @@ async fn apply_language_server_provisioning(
                     "  {} the {language} language server installed but did not start: {reason}",
                     style("✗").red(),
                 );
+                unfinished.push(UnfinishedRepair {
+                    what: format!("install a working {language} language server"),
+                    reason: format!("the server installed and refused to start: {reason}"),
+                    remediation: vec![format!(
+                        "the binary is on PATH and cannot serve {language}; the server's own \
+                         message above names what it could not find"
+                    )],
+                    requested: true,
+                });
             }
         }
         if !unusable {
@@ -12870,7 +13081,10 @@ async fn apply_language_server_provisioning(
             }
         }
     }
-    applied
+    ProvisioningOutcome {
+        applied,
+        unfinished,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -12893,6 +13107,10 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
     println!("Applying safe repairs...");
     println!();
     let mut applied: Vec<String> = Vec::new();
+    // Every repair below that fails records itself here, so the run closes
+    // with what it could not do and the commands that close it, rather than
+    // with a summary that never read its own attempts (FIR-2547).
+    let mut unfinished: Vec<UnfinishedRepair> = Vec::new();
 
     let registry_needs_fix = report.checks.iter().any(|c| {
         c.id == "registry_authority"
@@ -12909,10 +13127,23 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
                     ));
                 }
             }
-            Err(e) => println!(
-                "  {} registry permission repair refused: {e}",
-                style("✗").red()
-            ),
+            Err(e) => {
+                let reason = e.to_string();
+                println!(
+                    "  {} registry permission repair refused: {reason}",
+                    style("✗").red()
+                );
+                unfinished.push(UnfinishedRepair {
+                    what: "repair the registry authority permissions".to_string(),
+                    reason,
+                    remediation: vec![
+                        "fix the owner and mode of the path named above, then run `kin doctor \
+                         --fix` again"
+                            .to_string(),
+                    ],
+                    requested: false,
+                });
+            }
         }
     }
 
@@ -12926,7 +13157,23 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
             Ok(path) => {
                 applied.push(format!("reinstalled shell hook ({})", path.display()));
             }
-            Err(e) => println!("  {} shell hook reinstall failed: {e}", style("✗").red()),
+            Err(e) => {
+                let reason = e.to_string();
+                println!(
+                    "  {} shell hook reinstall failed: {reason}",
+                    style("✗").red()
+                );
+                unfinished.push(UnfinishedRepair {
+                    what: "reinstall the shell hook".to_string(),
+                    reason,
+                    remediation: vec![
+                        "run `kin setup` to write the shell hook, or add Kin's bin directory to \
+                         PATH by hand"
+                            .to_string(),
+                    ],
+                    requested: false,
+                });
+            }
         }
     }
 
@@ -12971,18 +13218,40 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
                         dest.display()
                     )),
                     Err(e) => {
+                        let reason = e.to_string();
                         println!(
-                            "  {} could not restore the VFS shim automatically: {e}",
+                            "  {} could not restore the VFS shim automatically: {reason}",
                             style("✗").red()
                         );
                         println!(
                             "      reinstall kin to restore it: \
                              curl -fsSL https://get.kinlab.dev/install | sh"
                         );
+                        unfinished.push(UnfinishedRepair {
+                            what: "restore the VFS shim".to_string(),
+                            reason,
+                            remediation: vec!["reinstall kin to restore it: curl -fsSL \
+                                 https://get.kinlab.dev/install | sh"
+                                .to_string()],
+                            requested: false,
+                        });
                     }
                 }
             }
-            Err(e) => println!("  {} VFS shim reinstall failed: {e}", style("✗").red()),
+            Err(e) => {
+                let reason = e.to_string();
+                println!("  {} VFS shim reinstall failed: {reason}", style("✗").red());
+                unfinished.push(UnfinishedRepair {
+                    what: "reinstall the VFS shim".to_string(),
+                    reason,
+                    remediation: vec![
+                        "reinstall kin to restore it: curl -fsSL https://get.kinlab.dev/install \
+                         | sh"
+                            .to_string(),
+                    ],
+                    requested: false,
+                });
+            }
         }
     }
 
@@ -12996,7 +13265,19 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
         match start_repo_daemon().await {
             Ok(Some(url)) => applied.push(format!("started kin-daemon ({url})")),
             Ok(None) => {}
-            Err(e) => println!("  {} kin-daemon start failed: {e}", style("✗").red()),
+            Err(e) => {
+                let reason = e.to_string();
+                println!("  {} kin-daemon start failed: {reason}", style("✗").red());
+                unfinished.push(UnfinishedRepair {
+                    what: "start the repository daemon".to_string(),
+                    reason,
+                    remediation: vec![
+                        "run `kin status` in the repository to see the daemon's own error"
+                            .to_string(),
+                    ],
+                    requested: false,
+                });
+            }
         }
     }
 
@@ -13034,9 +13315,9 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
                 install_language_servers,
                 !install_language_servers && is_tty(),
             );
-            for line in apply_language_server_provisioning(&missing, consent).await {
-                applied.push(line);
-            }
+            let outcome = apply_language_server_provisioning(&missing, consent).await;
+            applied.extend(outcome.applied);
+            unfinished.extend(outcome.unfinished);
         }
     }
 
@@ -13054,14 +13335,40 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
             applied.push(format!("cleaned {cleaned} stale daemon(s)"));
         }
         Ok(_) => {}
-        Err(e) => println!(
-            "  {} stale-daemon cleanup refused registry authority: {e}",
-            style("✗").red()
-        ),
+        Err(e) => {
+            let reason = e.to_string();
+            println!(
+                "  {} stale-daemon cleanup refused registry authority: {reason}",
+                style("✗").red()
+            );
+            unfinished.push(UnfinishedRepair {
+                what: "clean stale daemon records".to_string(),
+                reason,
+                remediation: vec![
+                    "run `kin registry authority --fix` to repair the registry, then run `kin \
+                     doctor --fix` again"
+                        .to_string(),
+                ],
+                requested: false,
+            });
+        }
     }
 
     if applied.is_empty() {
-        println!("  Nothing to repair automatically.");
+        // "Nothing to repair automatically" belongs to a run that found nothing
+        // to do. A run that attempted four repairs and failed all four printed
+        // it directly under its own four failure lines (FIR-2512), which is the
+        // same defect as the closing line that could not read its rows.
+        if unfinished.is_empty() {
+            println!("  Nothing to repair automatically.");
+        } else {
+            println!(
+                "  {} nothing was repaired; {} repair{} did not complete, listed below.",
+                style("✗").red(),
+                unfinished.len(),
+                if unfinished.len() == 1 { "" } else { "s" }
+            );
+        }
     } else {
         for line in &applied {
             println!("  {} {line}", style("✓").green());
@@ -13073,7 +13380,10 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
     let after = crate::commands::health::run_health_checks().await;
     if json {
         println!("{}", serde_json::to_string_pretty(&after)?);
-        return Ok(());
+        // The verdict still applies: a JSON caller reads the exit code, and a
+        // repair that did not happen is exactly what it would otherwise have to
+        // infer from a report that cannot see the attempt.
+        return fix_verdict(&unfinished);
     }
     println!("Re-running checks...");
     println!();
@@ -13097,7 +13407,9 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
         }
     }
 
-    Ok(())
+    print_unfinished_repairs(&unfinished);
+
+    fix_verdict(&unfinished)
 }
 
 /// Start the daemon for the repo containing the current directory, if any.
@@ -14520,6 +14832,145 @@ pub async fn uninstall(all: bool, dry_run: bool, force: bool, json: bool) -> Res
 #[cfg(test)]
 mod tests {
     use super::projection_mode_to_record;
+    use super::{fix_verdict, readiness_line, UnfinishedRepair};
+    use crate::commands::health::{HealthCheck, HealthReport, HealthStatus};
+
+    fn check(id: &str, label: &str, status: HealthStatus) -> HealthCheck {
+        HealthCheck {
+            id: id.to_string(),
+            label: label.to_string(),
+            status,
+            detail: String::new(),
+            platform_note: None,
+            fixable: false,
+            manual_fix: None,
+        }
+    }
+
+    /// The state the container run was actually in: `healthy` true, because
+    /// nothing was Missing or Misconfigured, while the coverage row read
+    /// PENDING because no language server was found and the repair meant to
+    /// install one had just failed. The closing line said "First-run ready"
+    /// under its own "4 need attention" tally (FIR-2547).
+    #[test]
+    fn a_pending_row_keeps_the_summary_from_claiming_first_run_ready() {
+        let report = HealthReport {
+            platform: "linux".to_string(),
+            checks: vec![
+                check("kin_binary", "Kin binary", HealthStatus::Healthy),
+                check(
+                    "reference_edge_coverage",
+                    "Reference edge coverage",
+                    HealthStatus::Pending,
+                ),
+            ],
+            healthy: true,
+        };
+        let line = readiness_line(&report);
+        assert!(
+            !line.ready,
+            "a report holding a row that needs attention must not claim readiness, got: {}",
+            line.sentence
+        );
+        assert!(
+            !line.sentence.contains("First-run ready"),
+            "a row that knows no language server was found must not close under a claim that \
+             nothing is missing: {}",
+            line.sentence
+        );
+        assert!(
+            line.sentence.contains("Reference edge coverage"),
+            "the line has to name the row it is refusing on: {}",
+            line.sentence
+        );
+        assert!(
+            !line.severe,
+            "pending work is not a failure, so the mark stays short of red: {}",
+            line.sentence
+        );
+    }
+
+    /// Positive control: a report with nothing needing attention still reads
+    /// ready, or the line would refuse every correct install.
+    #[test]
+    fn a_report_with_nothing_waiting_still_reads_first_run_ready() {
+        let report = HealthReport {
+            platform: "linux".to_string(),
+            checks: vec![
+                check("kin_binary", "Kin binary", HealthStatus::Healthy),
+                check(
+                    "vfs_projection",
+                    "VFS projection",
+                    HealthStatus::Unsupported,
+                ),
+            ],
+            healthy: true,
+        };
+        let line = readiness_line(&report);
+        assert!(line.ready, "{}", line.sentence);
+        assert!(
+            line.sentence.contains("First-run ready"),
+            "{}",
+            line.sentence
+        );
+    }
+
+    /// A real failure keeps the red mark and the repair route.
+    #[test]
+    fn a_missing_row_reads_as_severe_and_names_the_repair() {
+        let mut missing = check("shell_path", "Shell PATH", HealthStatus::Missing);
+        missing.fixable = true;
+        let report = HealthReport {
+            platform: "linux".to_string(),
+            checks: vec![
+                check("kin_binary", "Kin binary", HealthStatus::Healthy),
+                missing,
+            ],
+            healthy: false,
+        };
+        let line = readiness_line(&report);
+        assert!(!line.ready, "{}", line.sentence);
+        assert!(line.severe, "{}", line.sentence);
+        assert!(line.sentence.contains("Shell PATH"), "{}", line.sentence);
+        assert!(
+            line.sentence.contains("kin doctor --fix"),
+            "{}",
+            line.sentence
+        );
+    }
+
+    /// A repair the operator asked for and Kin could not make ends the run
+    /// non-zero. The run this comes from installed nothing and exited 0.
+    #[test]
+    fn a_requested_repair_that_did_not_complete_fails_the_run() {
+        let requested = UnfinishedRepair {
+            what: "install the python language server".to_string(),
+            reason: "`npm install -g pyright` exited with 243: npm error code EACCES".to_string(),
+            remediation: vec!["npm config set prefix \"$HOME/.npm-global\"".to_string()],
+            requested: true,
+        };
+        let error = fix_verdict(std::slice::from_ref(&requested))
+            .expect_err("a requested repair that did not happen must not exit 0");
+        let text = error.to_string();
+        assert!(
+            text.contains("install the python language server"),
+            "{text}"
+        );
+
+        // Two controls. Nothing unfinished is a clean run, and a best-effort
+        // convergence repair reports itself without failing the run, because
+        // `kin update` runs `kin setup doctor --fix` unattended as its last
+        // step and an offline shim fetch must not report the release as a
+        // failed update.
+        assert!(fix_verdict(&[]).is_ok());
+        let unrequested = UnfinishedRepair {
+            what: "restore the VFS shim".to_string(),
+            reason: "the release asset could not be fetched".to_string(),
+            remediation: Vec::new(),
+            requested: false,
+        };
+        assert!(fix_verdict(std::slice::from_ref(&unrequested)).is_ok());
+    }
 
     /// Setup must never record a mount mode it did not engage. The v0.5.41
     /// release install proof failed on all three non-Linux legs because a
