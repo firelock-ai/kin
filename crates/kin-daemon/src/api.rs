@@ -11201,7 +11201,127 @@ async fn lsp_sweep(
         "status": if queued { "sweep_queued" } else { "sweep_already_running" },
         "sweeps_completed": queued_after,
         "enrichment_available": state.lsp_enrichment_tx.is_some(),
+        "enrichment_unavailable": enrichment_unavailable(&state),
     })))
+}
+
+/// Why enrichment is unavailable, when it is, and `None` when it is available.
+///
+/// `lsp_enrichment_tx.is_some()` collapses several different causes into one
+/// boolean, and every caller that read it alone had to invent a cause to
+/// explain it. `kin init` invented "no language server is installed", which is
+/// false on a deliberately disabled daemon and false again on a host that
+/// installed a server after this daemon started.
+///
+/// The distinctions matter because the repairs differ: installing a server,
+/// changing a config, restarting a daemon, or fixing a broken install are four
+/// different actions. When the readiness probe has not finished, this says so
+/// rather than guessing, because an unfinished check is not evidence of a
+/// missing server.
+fn enrichment_unavailable(state: &DaemonState) -> Option<serde_json::Value> {
+    let readiness = kin_mcp::edge_coverage::published_language_server_readiness();
+    enrichment_unavailable_reason(
+        state.lsp_enrichment_tx.is_some(),
+        state.lsp_enrichment_enabled,
+        readiness.as_ref(),
+    )
+    .map(|(reason, detail)| json!({ "reason": reason, "detail": detail }))
+}
+
+/// The decision behind [`enrichment_unavailable`], as a pure rule.
+///
+/// Split out so every row can be exercised without standing up a daemon. The
+/// rows are the point: they are the states one boolean used to hide.
+///
+/// One observation is available on every row below and is what they are built
+/// on: a closed channel on an enabled daemon means `discover_servers` returned
+/// nothing when this daemon started, because that is the only way
+/// `enrichment_channel_opens` refuses. The readiness probe then sharpens the
+/// cause when it has published, and until it does the startup observation
+/// stands on its own rather than waiting. That ordering matters because the
+/// probe is asynchronous: a rule that could only speak once it landed would
+/// leave a genuinely bare host with no install advice whenever `kin init` asked
+/// first.
+fn enrichment_unavailable_reason(
+    channel_open: bool,
+    enrichment_enabled: bool,
+    readiness: Option<&kin_core::reference_coverage::LanguageServerReadinessMap>,
+) -> Option<(&'static str, String)> {
+    use kin_core::reference_coverage::LanguageServerReadiness;
+
+    if channel_open {
+        return None;
+    }
+
+    if !enrichment_enabled {
+        return Some((
+            "enrichment_disabled",
+            "cross-file reference enrichment is switched off for this daemon, so no language \
+             server was consulted"
+                .to_string(),
+        ));
+    }
+
+    let Some(readiness) = readiness else {
+        return Some((
+            "discovery_found_none",
+            "this daemon found no language server when it started, and it looks only at startup; \
+             the check of what this host can run has not finished"
+                .to_string(),
+        ));
+    };
+
+    // Discovery runs once, at startup. A server that is usable now cannot open
+    // a channel this daemon already declined to open, which is the state a
+    // restart repairs and the state the old note called a missing install.
+    // Stated as the two facts this process holds, never as when the server was
+    // installed, which nothing here watched.
+    if readiness
+        .values()
+        .any(|state| matches!(state, LanguageServerReadiness::Usable))
+    {
+        return Some((
+            "discovery_stale",
+            "a language server is usable now, but this daemon found none when it started and it \
+             looks only at startup"
+                .to_string(),
+        ));
+    }
+
+    let mut unusable: Vec<String> = readiness
+        .iter()
+        .filter_map(|(language, state)| match state {
+            LanguageServerReadiness::Unusable { reason } => Some(format!("{language}: {reason}")),
+            _ => None,
+        })
+        .collect();
+    // The readiness map is a hash map, so two broken servers would otherwise
+    // reorder between runs and hand the same host a different sentence each
+    // time. One broken TypeScript install marks both JavaScript and TypeScript,
+    // so that is the ordinary case rather than a corner of one.
+    unusable.sort();
+    if unusable.is_empty() {
+        // What this daemon holds is its own startup reading: discovery found
+        // nothing and the probe that followed resolved no binary either. Both
+        // used this process's PATH at this process's start, so neither can
+        // speak for the host now, and a sentence that did would be the same
+        // fabrication with a probe behind it. The repair is decided by the
+        // reader, who does know.
+        return Some((
+            "no_language_server",
+            "this daemon found no language server for any language it enriches, and it looks \
+             only at startup"
+                .to_string(),
+        ));
+    }
+    Some((
+        "language_server_unusable",
+        format!(
+            "a language server is installed but did not start ({}), so it enriches nothing until \
+             that is repaired",
+            unusable.join("; ")
+        ),
+    ))
 }
 
 /// GET /lsp/sweep/status, reporting how far the cold sweep has got.
@@ -11229,6 +11349,7 @@ async fn lsp_sweep_status(State(state): State<Arc<DaemonState>>) -> impl IntoRes
         // for one would otherwise wait out its whole budget for an event that
         // cannot happen.
         "enrichment_available": state.lsp_enrichment_tx.is_some(),
+        "enrichment_unavailable": enrichment_unavailable(&state),
     }))
 }
 
@@ -12491,6 +12612,189 @@ mod tests {
             serde_json::json!(true),
             "an undegraded daemon must still certify: {negative}"
         );
+    }
+
+    /// `kin init` used to assert "no language server is installed" from a
+    /// boolean that meant several different things. These are those things.
+    mod enrichment_unavailable_rows {
+        use super::super::enrichment_unavailable_reason;
+        use kin_core::reference_coverage::{LanguageServerReadiness, LanguageServerReadinessMap};
+        use kin_model::LanguageId;
+
+        fn readiness(rows: &[(LanguageId, LanguageServerReadiness)]) -> LanguageServerReadinessMap {
+            rows.iter().cloned().collect()
+        }
+
+        /// The positive control. A healthy daemon reports no cause at all,
+        /// because there is nothing to explain, and `kin init` prints no note.
+        #[test]
+        fn a_working_daemon_reports_no_cause() {
+            assert!(
+                enrichment_unavailable_reason(true, true, None).is_none(),
+                "an open channel means enrichment works, so there is no cause to report"
+            );
+        }
+
+        /// The row the old note was right about, which a fix must not lose.
+        ///
+        /// Stated as this daemon's own startup reading rather than as a fact
+        /// about the host. Discovery and the probe both ran once, on this
+        /// process's PATH, so neither establishes what is installed now, and
+        /// the ticket's own host is the case: a server sat on PATH while the
+        /// daemon that had started before it reported none.
+        #[test]
+        fn a_host_with_no_server_still_reports_a_missing_server() {
+            let (reason, detail) =
+                enrichment_unavailable_reason(false, true, Some(&readiness(&[])))
+                    .expect("no server is a cause");
+            assert_eq!(reason, "no_language_server");
+            assert!(
+                detail.contains("found no language server"),
+                "the row must still report the absence it measured: {detail}"
+            );
+            assert!(
+                !detail.contains("no language server is installed"),
+                "but not as a claim about the host, which this daemon never read: {detail}"
+            );
+        }
+
+        /// The row reached by the ordinary first-run sequence with no knob:
+        /// install Kin, run a command which starts a daemon, then install a
+        /// language server. The old note called this a missing install.
+        #[test]
+        fn a_server_installed_after_the_daemon_started_is_not_a_missing_install() {
+            let (reason, detail) = enrichment_unavailable_reason(
+                false,
+                true,
+                Some(&readiness(&[(
+                    LanguageId::TypeScript,
+                    LanguageServerReadiness::Usable,
+                )])),
+            )
+            .expect("a stale discovery is a cause");
+            assert_eq!(
+                reason, "discovery_stale",
+                "a usable server plus a closed channel is stale discovery, not an absent install"
+            );
+            assert!(
+                !detail.contains("no language server is installed"),
+                "this row must never claim the server is missing: {detail}"
+            );
+            // Both halves of what this process observed, and only those. When
+            // the server was installed is not one of them, so the sentence must
+            // not turn the pair into a timeline it never watched.
+            assert!(
+                detail.contains("usable now") && detail.contains("found none when it started"),
+                "the row must name both observations rather than infer a history: {detail}"
+            );
+        }
+
+        /// A deliberately disabled daemon, reached by `--storage gcs` or
+        /// `KIN_DAEMON_DISABLE_LSP`. Telling this operator to install a server
+        /// sends them to buy a tool they already own for a job nothing will run.
+        #[test]
+        fn a_disabled_daemon_does_not_blame_a_missing_server() {
+            let (reason, detail) = enrichment_unavailable_reason(false, false, None)
+                .expect("a disabled daemon is a cause");
+            assert_eq!(reason, "enrichment_disabled");
+            assert!(
+                !detail.contains("no language server is installed"),
+                "a disabled daemon must not be reported as a missing install: {detail}"
+            );
+        }
+
+        /// The probe is asynchronous, so a row has to hold before it lands.
+        ///
+        /// What this daemon observed is that startup discovery found nothing,
+        /// which is true whether the host is bare or gained a server since. So
+        /// the row reports that and says the check is unfinished, rather than
+        /// asserting an absent install, which would be the same fabrication in
+        /// a new place, or reporting nothing, which would leave a genuinely
+        /// bare host with no advice whenever `kin init` asked first.
+        #[test]
+        fn an_unfinished_probe_reports_the_startup_discovery_it_did_observe() {
+            let (reason, detail) = enrichment_unavailable_reason(false, true, None)
+                .expect("not yet established is itself a reportable state");
+            assert_eq!(reason, "discovery_found_none");
+            assert!(
+                detail.contains("found no language server when it started"),
+                "the row must name the observation this daemon actually holds: {detail}"
+            );
+            assert!(
+                !detail.contains("no language server is installed"),
+                "an unfinished check must not be reported as an absent server: {detail}"
+            );
+        }
+
+        /// Installed and unusable is its own row, because its repair is neither
+        /// an install nor a restart.
+        #[test]
+        fn an_installed_server_that_cannot_start_is_named_with_its_own_reason() {
+            let (reason, detail) = enrichment_unavailable_reason(
+                false,
+                true,
+                Some(&readiness(&[(
+                    LanguageId::JavaScript,
+                    LanguageServerReadiness::Unusable {
+                        reason: "Could not find a valid TypeScript installation".to_string(),
+                    },
+                )])),
+            )
+            .expect("an unusable server is a cause");
+            assert_eq!(reason, "language_server_unusable");
+            assert!(
+                detail.contains("Could not find a valid TypeScript installation"),
+                "the row must carry the server's own reason: {detail}"
+            );
+            assert!(
+                !detail.contains("no language server is installed"),
+                "a broken install must not be reported as an absent one: {detail}"
+            );
+        }
+
+        /// Two broken servers must read the same way every time.
+        ///
+        /// The readiness map is a hash map, and one broken TypeScript install
+        /// marks both JavaScript and TypeScript, so this is the ordinary shape
+        /// of the row above rather than a corner of it. Without the sort the
+        /// same host gets a differently ordered sentence between runs, which is
+        /// a message that varies while the world does not.
+        #[test]
+        fn two_unusable_servers_are_reported_in_a_stable_order() {
+            // A fresh map per round, because a hash map seeds itself once and
+            // then iterates the same way for its whole life. Reading one map
+            // repeatedly would agree with itself under any implementation at
+            // all, which is a check that cannot fail.
+            for round in 0..32 {
+                let rows = readiness(&[
+                    (
+                        LanguageId::TypeScript,
+                        LanguageServerReadiness::Unusable {
+                            reason: "ts is broken".to_string(),
+                        },
+                    ),
+                    (
+                        LanguageId::JavaScript,
+                        LanguageServerReadiness::Unusable {
+                            reason: "js is broken".to_string(),
+                        },
+                    ),
+                ]);
+                let (_, detail) = enrichment_unavailable_reason(false, true, Some(&rows))
+                    .expect("two unusable servers are a cause");
+                let js = detail
+                    .find("javascript: js is broken")
+                    .unwrap_or_else(|| panic!("round {round} lost the javascript row: {detail}"));
+                let ts = detail
+                    .find("typescript: ts is broken")
+                    .unwrap_or_else(|| panic!("round {round} lost the typescript row: {detail}"));
+                assert!(
+                    js < ts,
+                    "round {round} reported the same host in a different order, so this \
+                     sentence varies while the world does not: {detail}"
+                );
+            }
+        }
     }
 
     use super::*;

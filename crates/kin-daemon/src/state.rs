@@ -1292,6 +1292,15 @@ pub struct DaemonState {
     /// Channel for LSP enrichment messages (incremental or sweep).
     /// None if LSP enrichment is disabled (no servers found).
     pub lsp_enrichment_tx: Option<tokio::sync::mpsc::Sender<LspEnrichmentMessage>>,
+    /// Whether enrichment was switched ON for this daemon at all, apart from
+    /// whether any server was then found.
+    ///
+    /// Kept because the channel being closed collapses three different causes
+    /// into one boolean, and a caller that reads only the channel cannot tell a
+    /// deliberately disabled daemon from a host with no server. `kin init` used
+    /// to assert the second whenever it saw the boolean, which was false on
+    /// every gcs-backed or KIN_DAEMON_DISABLE_LSP daemon.
+    pub lsp_enrichment_enabled: bool,
     /// How far the running cold sweep has got, and how many have finished.
     ///
     /// A sweep is asynchronous and takes minutes on a real repository, and until
@@ -2398,6 +2407,7 @@ impl DaemonState {
             idle_timeout_ms: AtomicU64::new(0),
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
+            lsp_enrichment_enabled: false,
             lsp_sweep_files_done: AtomicU64::new(0),
             lsp_sweep_files_total: AtomicU64::new(0),
             lsp_sweep_files_blocked: AtomicU64::new(0),
@@ -2627,6 +2637,7 @@ impl DaemonState {
             idle_timeout_ms: AtomicU64::new(0),
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
+            lsp_enrichment_enabled: false,
             lsp_sweep_files_done: AtomicU64::new(0),
             lsp_sweep_files_total: AtomicU64::new(0),
             lsp_sweep_files_blocked: AtomicU64::new(0),
