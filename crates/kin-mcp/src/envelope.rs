@@ -326,6 +326,13 @@ pub struct Degraded {
     /// repository the answer would be about.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_mismatch: Option<bool>,
+    /// A daemon serving this store was killed by the memory limit, and this
+    /// store's own record says so. Set only from the kernel's own accounting,
+    /// never from an inference about how much memory was in use, and never on a
+    /// host that publishes no accounting: on those the cause is reported in the
+    /// message and no flag claims it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_killed_by_memory: Option<bool>,
 }
 
 impl Degraded {
@@ -337,6 +344,7 @@ impl Degraded {
             self.mass_deletion_blocked,
             self.offline_fallback,
             self.workspace_mismatch,
+            self.daemon_killed_by_memory,
         ]
         .into_iter()
         .any(|flag| flag == Some(true))
@@ -361,6 +369,9 @@ impl Degraded {
         }
         if self.workspace_mismatch == Some(true) {
             labels.push("workspace_mismatch");
+        }
+        if self.daemon_killed_by_memory == Some(true) {
+            labels.push("daemon_killed_by_memory");
         }
         labels
     }
@@ -1301,6 +1312,24 @@ impl Envelope {
             ..GraphState::default()
         };
         self.degraded = Degraded::default();
+        self
+    }
+
+    /// Stamp what this store recorded about daemons of its own that were
+    /// killed.
+    ///
+    /// Only the memory attribution becomes a flag, and only when the kernel's
+    /// own counter made it. A kill this host could not attribute is reported in
+    /// the message the caller reads and claims nothing structurally, because a
+    /// client keying on a flag would read "killed by memory" out of a host that
+    /// never said so.
+    pub fn with_recorded_daemon_kill(
+        mut self,
+        record: Option<&kin_daemon_spawn::DaemonKillRecord>,
+    ) -> Self {
+        if record.is_some_and(|record| record.attributed_to_memory()) {
+            self.degraded.daemon_killed_by_memory = Some(true);
+        }
         self
     }
 

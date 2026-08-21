@@ -1255,7 +1255,24 @@ async fn handle_tools_call_daemon(
                 daemon_delegate::daemon_unavailable_tool_result(&call_params.name).await,
                 Envelope::daemon_unreachable(),
             ),
-            Err(error) => (ToolCallResult::error(error), Envelope::daemon()),
+            // A delegate error that ends with the daemon gone is exactly the
+            // condition `daemon_unreachable` exists to state, and it was the
+            // one shape that never set it: the flag was reserved for the case
+            // where no daemon endpoint was ever resolved, so a session whose
+            // daemon was killed under it got an empty `degraded` object. A
+            // client cannot tell that apart from a healthy answer without
+            // parsing prose. Where the store has recorded why its daemons keep
+            // dying, that is stamped beside it.
+            Err(error) => {
+                let gone = daemon_delegate::is_daemon_exited_error(&error);
+                let base = if gone {
+                    Envelope::daemon_unreachable()
+                        .with_recorded_daemon_kill(daemon_delegate::recorded_daemon_kill().as_ref())
+                } else {
+                    Envelope::daemon()
+                };
+                (ToolCallResult::error(error), base)
+            }
         };
 
     // `kin_graph_status` already reports the exact graph view selected by the
