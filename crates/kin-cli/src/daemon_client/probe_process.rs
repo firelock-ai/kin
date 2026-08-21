@@ -1322,6 +1322,40 @@ mod tests {
         );
     }
 
+    /// How long the `delayed-ready` worker withholds its PID marker.
+    ///
+    /// The whole point of the case below is that a runtime budget shorter than
+    /// this one must not expire while the worker is still silent, so this has
+    /// to stay comfortably above [`DELAYED_READY_RUNTIME_BUDGET`]. A sleep only
+    /// ever overshoots, so a loaded runner widens this gap rather than closing
+    /// it: the falsification direction cannot be lost to load.
+    const DELAYED_READY_SILENCE: Duration = Duration::from_secs(3);
+
+    /// What the `delayed-ready` worker still has to do once its PID is
+    /// readable.
+    ///
+    /// Load bearing rather than padding. With no work left after the marker,
+    /// the worker could exit before the parent's first post-readiness poll, and
+    /// a budget of zero would pass the case just as well as a correct one.
+    const DELAYED_READY_WORK_AFTER_READY: Duration = Duration::from_millis(250);
+
+    /// The runtime budget the case gives the worker once its PID is readable.
+    ///
+    /// Sized from what the worker actually does after publishing rather than
+    /// from a round number: eight times [`DELAYED_READY_WORK_AFTER_READY`], so
+    /// a runner that stretches a quarter-second sleep several fold still fits.
+    /// The predecessor was 400ms against 250ms of work, and that 150ms of
+    /// margin ejected kin#983 from the merge queue when the child finished at
+    /// 1.12s (FIR-2491).
+    const DELAYED_READY_RUNTIME_BUDGET: Duration = Duration::from_secs(2);
+
+    /// How long the case waits for the worker's PID to become readable.
+    ///
+    /// Only how long a run that is going to fail spends proving it, so it is
+    /// deliberately far above [`DELAYED_READY_SILENCE`] rather than tuned to
+    /// it.
+    const DELAYED_READY_READINESS_BOUND: Duration = Duration::from_secs(60);
+
     #[test]
     fn probe_worker() {
         let Ok(mode) = std::env::var(PROBE_WORKER_ENV) else {
@@ -1343,9 +1377,9 @@ mod tests {
         } else if mode == "delayed-ready" {
             let marker =
                 std::path::PathBuf::from(std::env::var_os(PROBE_DESCENDANT_MARKER_ENV).unwrap());
-            std::thread::sleep(Duration::from_millis(500));
+            std::thread::sleep(DELAYED_READY_SILENCE);
             publish_pid_marker(&marker).unwrap();
-            std::thread::sleep(Duration::from_millis(250));
+            std::thread::sleep(DELAYED_READY_WORK_AFTER_READY);
         } else if mode == "parent-owner" {
             let marker = std::env::var_os(PROBE_DESCENDANT_MARKER_ENV).unwrap();
             let mut nested_probe = Command::new(std::env::current_exe().unwrap());
@@ -1447,12 +1481,22 @@ mod tests {
             .env(PROBE_WORKER_ENV, "delayed-ready")
             .env(PROBE_DESCENDANT_MARKER_ENV, &marker);
 
+        // The property: the runtime budget is shorter than the worker's whole
+        // life and longer than the part of it that follows readiness, so a
+        // deadline anchored at spawn expires and one anchored at readiness does
+        // not. Both margins are multiples rather than the tens of milliseconds
+        // the fixed pair left (FIR-2491).
+        assert!(
+            DELAYED_READY_WORK_AFTER_READY < DELAYED_READY_RUNTIME_BUDGET
+                && DELAYED_READY_RUNTIME_BUDGET < DELAYED_READY_SILENCE,
+            "the case only discriminates while work < budget < silence"
+        );
         let output = output_finalized_with_timeout_and_limit_after_parseable_pid_ready(
             command,
             "delayed-ready daemon probe fixture",
             &marker,
-            Duration::from_secs(2),
-            Duration::from_millis(400),
+            DELAYED_READY_READINESS_BOUND,
+            DELAYED_READY_RUNTIME_BUDGET,
             MAX_CAPTURE_BYTES_PER_STREAM,
         )
         .unwrap();
