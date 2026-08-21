@@ -24736,6 +24736,190 @@ mod tests {
         );
     }
 
+    /// The same spine for `kin trace`, whose silence was TOTAL rather than bare.
+    ///
+    /// `kin impact` printed a wrong sentence; `kin trace` printed no dependency
+    /// section at all, so a reader could not tell a focal that reaches nothing
+    /// from one whose outbound edges this graph could never have held.
+    ///
+    /// Drives the DEFAULT (non-compact) invocation on purpose. The qualifier
+    /// first landed inside the compact arm, which left the mode a person
+    /// actually types as the only surface still silent, and every other trace
+    /// test in this file runs against a healthy daemon and would have passed
+    /// either way.
+    #[tokio::test]
+    async fn a_degraded_daemon_reaches_the_trace_cli_through_the_route() {
+        let state = test_state();
+        // Coverage healthy on purpose, so the degradation is the only reason
+        // left to refuse and the assertion cannot pass for the wrong cause.
+        let mut caller = test_entity("caller", "src/a.py");
+        let mut callee = test_entity("callee", "src/b.py");
+        let mut orphan = test_entity("orphan", "src/orphan.py");
+        for entity in [&mut caller, &mut callee, &mut orphan] {
+            install_trace_fixture_file(&state, entity);
+            state.graph.upsert_entity(entity).unwrap();
+        }
+        state
+            .graph
+            .upsert_relation(&kin_model::Relation {
+                id: kin_model::RelationId::new(),
+                kind: kin_model::RelationKind::Calls,
+                src: kin_model::GraphNodeId::Entity(caller.id),
+                dst: kin_model::GraphNodeId::Entity(callee.id),
+                confidence: 1.0,
+                origin: kin_model::RelationOrigin::Parsed,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        state
+            .embed_worker_failed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let rendered = trace_lines_through_route(&state, "orphan").await;
+
+        assert!(
+            rendered.contains("Kin cannot rule out dependencies it did not see"),
+            "the route's envelope must carry the degradation into a section that printed \
+             nothing at all before: {rendered}"
+        );
+        assert!(
+            rendered.contains("embed_worker_failed"),
+            "the line names the signal the verdict disclosed rather than inventing a cause: \
+             {rendered}"
+        );
+        // The direction is the whole point. A context pack carries no dependents
+        // group, so a trace that claimed them would be asserting a verdict about
+        // a set this command never walked.
+        assert!(
+            !rendered.contains("dependents"),
+            "trace walks outward and must not claim the inbound direction: {rendered}"
+        );
+        // And it must not fabricate a missing edge class: nothing here observed
+        // one, and naming one anyway is the fabrication this family exists to end.
+        assert!(
+            !rendered.contains("holds no cross-file"),
+            "no absent class was observed, so none may be claimed: {rendered}"
+        );
+    }
+
+    /// The control that keeps the trace qualifier from becoming noise: a focal
+    /// that DOES reach something says nothing extra, on the same degraded daemon.
+    ///
+    /// Without it the fix could stamp every trace with a caveat and still pass
+    /// the case above, which is the FIR-2404 failure wearing its opposite
+    /// costume.
+    #[tokio::test]
+    async fn a_trace_that_finds_dependencies_stays_unqualified_even_when_degraded() {
+        let state = test_state();
+        let mut caller = test_entity("caller", "src/a.py");
+        let mut callee = test_entity("callee", "src/b.py");
+        for entity in [&mut caller, &mut callee] {
+            install_trace_fixture_file(&state, entity);
+            state.graph.upsert_entity(entity).unwrap();
+        }
+        state
+            .graph
+            .upsert_relation(&kin_model::Relation {
+                id: kin_model::RelationId::new(),
+                kind: kin_model::RelationKind::Calls,
+                src: kin_model::GraphNodeId::Entity(caller.id),
+                dst: kin_model::GraphNodeId::Entity(callee.id),
+                confidence: 1.0,
+                origin: kin_model::RelationOrigin::Parsed,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        state
+            .embed_worker_failed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let rendered = trace_lines_through_route(&state, "caller").await;
+
+        // The control only means something if this focal really did reach
+        // something; otherwise it is the case above wearing a passing costume.
+        assert!(
+            rendered.contains("callee"),
+            "the focal must actually reach a dependency, or this control asserts nothing: \
+             {rendered}"
+        );
+        assert!(
+            !rendered.contains("Kin cannot rule out"),
+            "a walk that found dependencies asserts no absence and must carry no qualifier: \
+             {rendered}"
+        );
+    }
+
+    /// Put an entity's file into repository authority and the working copy.
+    ///
+    /// `/trace` resolves a repository authority binding before it renders, so a
+    /// graph-only fixture answers 500 and the assertions below never run.
+    fn install_trace_fixture_file(state: &Arc<DaemonState>, entity: &mut Entity) {
+        let path = entity
+            .file_origin
+            .as_ref()
+            .expect("trace fixture entities carry a file")
+            .0
+            .clone();
+        let source = format!("def {}():\n    return 1\n", entity.name);
+        install_repository_file(state, &path, source.as_bytes());
+        let working = state.layout.working_dir().join(&path);
+        std::fs::create_dir_all(working.parent().unwrap()).unwrap();
+        std::fs::write(&working, source.as_bytes()).unwrap();
+        // `test_entity` spans 0..0, which the route rejects against a file that
+        // has bytes. Left unfixed the route answers 500 and every assertion
+        // below never runs.
+        let span = entity.span.as_mut().expect("trace fixture entities carry a span");
+        span.end_byte = source.len();
+        span.end_line = 2;
+    }
+
+    /// Drive `/trace` in its DEFAULT rendering and return the lines it printed.
+    async fn trace_lines_through_route(state: &Arc<DaemonState>, entity: &str) -> String {
+        let response = router(Arc::clone(state))
+            .oneshot(
+                Request::post("/trace")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "entity": entity,
+                            "json": false,
+                            "compact": false,
+                            "budget": "8k",
+                            "max_lines": 20,
+                            "nearby_limit": 2,
+                            "transitive_limit": 1,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the route must answer, or every assertion below is vacuous: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let result: kin_cli::commands::trace::TraceResponse =
+            serde_json::from_slice(&body).unwrap();
+        result.lines.join("\n")
+    }
+
     /// THE SPINE (FIR-2524, captain's rider). Drives the ROUTE, because that is
     /// the only place the rejected wiring differs.
     ///
