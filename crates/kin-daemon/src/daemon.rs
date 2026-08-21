@@ -1740,8 +1740,144 @@ where
     }
 }
 
+/// How many relations one enrichment write to the graph carries at most.
+///
+/// A cold sweep hands its output to the graph one language-server query arm at
+/// a time, and every arm opens its own graph-authority mutation, invalidates
+/// the spine's cross-repo edges, and writes `vfs_version` to disk. On the
+/// psf/requests corpus a sweep enriches 37 files and derives about 4200
+/// relations, so a pass costs thousands of mutation batches for one logical
+/// unit of work.
+///
+/// Batching bounds two different quantities at once. The number of authority
+/// mutations a sweep opens becomes `ceil(relations / this)` rather than one per
+/// arm, and the buffer a pass holds between deriving a relation and writing it
+/// never exceeds this many, whatever one file yields. `src/requests/models.py`
+/// yields 1167 in a single file.
+const ENRICHMENT_WRITE_BATCH: usize = 256;
+
+/// Relations an enrichment pass has derived and has not yet written.
+///
+/// Bounded on purpose. [`PendingEnrichment::absorb`] hands every full batch to
+/// the caller's writer before it returns, so the undrained remainder is always
+/// smaller than one batch however many relations arrive at once. A pass that
+/// accumulated a whole file, or a whole sweep, would hold a structure whose
+/// size is a property of the repository being swept rather than of this code,
+/// which is the shape this type exists to refuse.
+#[derive(Default)]
+struct PendingEnrichment {
+    relations: Vec<kin_model::Relation>,
+}
+
+impl PendingEnrichment {
+    /// How many derived relations are waiting to be written.
+    fn len(&self) -> usize {
+        self.relations.len()
+    }
+
+    /// Take newly derived relations and write out every full batch.
+    ///
+    /// Returns what `write` reported installing, which is what the graph took
+    /// rather than what was offered it.
+    fn absorb<F>(&mut self, derived: Vec<kin_model::Relation>, mut write: F) -> usize
+    where
+        F: FnMut(&[kin_model::Relation]) -> usize,
+    {
+        self.relations.extend(derived);
+        let mut installed = 0usize;
+        while self.relations.len() >= ENRICHMENT_WRITE_BATCH {
+            let batch: Vec<kin_model::Relation> =
+                self.relations.drain(..ENRICHMENT_WRITE_BATCH).collect();
+            installed += write(&batch);
+        }
+        installed
+    }
+
+    /// Write the remainder, leaving the buffer empty.
+    ///
+    /// Called at the end of every file rather than at the end of the sweep, so
+    /// the relations a file produced reach the graph before the next file is
+    /// opened, and a sweep stopped between files has already written them.
+    fn flush<F>(&mut self, mut write: F) -> usize
+    where
+        F: FnMut(&[kin_model::Relation]) -> usize,
+    {
+        if self.relations.is_empty() {
+            return 0;
+        }
+        debug!(
+            tail = self.len(),
+            "writing the tail of this file's enrichment"
+        );
+        let batch = std::mem::take(&mut self.relations);
+        write(&batch)
+    }
+}
+
+/// The relations from `relations` this graph does not already hold in exactly
+/// this form.
+///
+/// A sweep killed before it published records nothing, so the next daemon
+/// sweeps the same files and derives the same relations again. Their ids are
+/// content-addressed from source, target and kind, so each one is a
+/// byte-identical rewrite of an edge the graph already carries.
+/// `upsert_relation` cannot tell the difference and pays the full price for
+/// every one: it removes the old edge and its indexes, reinserts them, records
+/// a delta remove beside a delta upsert, rebuilds both endpoints'
+/// relation-derived text fields by walking their whole edge lists, and then
+/// drops both endpoints' vectors and re-queues them for embedding. That last
+/// step is not merely wasted, it is destructive, because a re-sweep that
+/// changes nothing discards embeddings a completed backfill had produced.
+///
+/// The rewrite is therefore dropped before the graph is opened at all, which
+/// also means a converged re-sweep never marks the graph dirty and so never
+/// arms the whole-store publication that a dirty graph triggers.
+///
+/// Equality is the whole relation, so a re-derivation whose confidence,
+/// evidence, import source or origin changed is still written. An unreadable
+/// neighbourhood abandons the comparison and offers everything, which costs a
+/// rewrite and can never drop a relation wrongly.
+fn unheld_lsp_relations(
+    state: &DaemonState,
+    relations: &[kin_model::Relation],
+) -> Vec<kin_model::Relation> {
+    use kin_model::EntityStore;
+    let mut held: std::collections::HashMap<kin_model::RelationId, kin_model::Relation> =
+        std::collections::HashMap::new();
+    let mut fetched: std::collections::HashSet<kin_model::EntityId> =
+        std::collections::HashSet::new();
+    for relation in relations {
+        let kin_model::GraphNodeId::Entity(source) = relation.src else {
+            continue;
+        };
+        if !fetched.insert(source) {
+            continue;
+        }
+        let Ok(existing) = state.graph.get_all_relations_for_entity(&source) else {
+            return relations.to_vec();
+        };
+        for existing in existing {
+            held.insert(existing.id, existing);
+        }
+    }
+    relations
+        .iter()
+        .filter(|candidate| {
+            held.get(&candidate.id)
+                .is_none_or(|held| held != *candidate)
+        })
+        .cloned()
+        .collect()
+}
+
 fn install_lsp_relations(state: &DaemonState, relations: &[kin_model::Relation]) -> usize {
     if relations.is_empty() {
+        return 0;
+    }
+
+    let relations = unheld_lsp_relations(state, relations);
+    if relations.is_empty() {
+        debug!("every enrichment relation offered is already held in this form; nothing written");
         return 0;
     }
 
@@ -1749,7 +1885,7 @@ fn install_lsp_relations(state: &DaemonState, relations: &[kin_model::Relation])
     let graph_mutation = state.begin_graph_authority_mutation();
     let mut installed = 0usize;
     let mut refused = 0usize;
-    for relation in relations {
+    for relation in &relations {
         match state.graph.upsert_relation(relation) {
             Ok(_) => installed += 1,
             Err(error) => {
@@ -1783,18 +1919,21 @@ fn install_lsp_relations(state: &DaemonState, relations: &[kin_model::Relation])
 }
 
 /// Enrich a single entity with all available LSP relation types (calls, overrides,
-/// uses-type, references). Each query is capped at 5 seconds. Returns the total
-/// number of relations upserted into the graph.
+/// uses-type, references). Each query is capped at 5 seconds.
+///
+/// Returns what the language server answered rather than writing it. The
+/// caller owns the graph write, so one entity's four query arms no longer open
+/// four separate graph-authority mutations, and the payload each arm returned
+/// is dropped here once its relations have been extracted.
 async fn enrich_single_entity(
     server: &kin_lsp::lifecycle::LspServer,
     entity_ref: &kin_lsp::EntityRef,
     index: &kin_lsp::EntityIndex,
     root: &std::path::Path,
-    state: &DaemonState,
     documents: Option<kin_lsp::DocumentProvider<'_>>,
-) -> usize {
+) -> Vec<kin_model::Relation> {
     let timeout = std::time::Duration::from_secs(5);
-    let mut count = 0;
+    let mut derived: Vec<kin_model::Relation> = Vec::new();
 
     // Calls
     match tokio::time::timeout(
@@ -1804,7 +1943,7 @@ async fn enrich_single_entity(
     .await
     {
         Ok(Ok(relations)) => {
-            count += install_lsp_relations(state, &relations);
+            derived.extend(relations);
         }
         Ok(Err(e)) => {
             debug!(entity = %entity_ref.name, error = %e, "LSP calls enrichment failed");
@@ -1821,7 +1960,7 @@ async fn enrich_single_entity(
     )
     .await
     {
-        count += install_lsp_relations(state, &relations);
+        derived.extend(relations);
     }
 
     // UsesType
@@ -1831,7 +1970,7 @@ async fn enrich_single_entity(
     )
     .await
     {
-        count += install_lsp_relations(state, &relations);
+        derived.extend(relations);
     }
 
     // References
@@ -1841,10 +1980,10 @@ async fn enrich_single_entity(
     )
     .await
     {
-        count += install_lsp_relations(state, &relations);
+        derived.extend(relations);
     }
 
-    count
+    derived
 }
 
 /// Run the kin daemon. This is the main entry point.
@@ -3155,14 +3294,19 @@ pub async fn run_with_authority_on(
                             })
                             .collect();
 
+                        let mut pending = PendingEnrichment::default();
                         let mut total_relations = 0usize;
                         for entity_ref in &file_entities {
                             info!(entity = %entity_ref.name, "querying LSP for entity");
-                            total_relations += enrich_single_entity(
-                                server, entity_ref, &index, &lsp_root, &lsp_state, documents,
+                            let derived = enrich_single_entity(
+                                server, entity_ref, &index, &lsp_root, documents,
                             )
                             .await;
+                            total_relations += pending
+                                .absorb(derived, |batch| install_lsp_relations(&lsp_state, batch));
                         }
+                        total_relations +=
+                            pending.flush(|batch| install_lsp_relations(&lsp_state, batch));
 
                         if total_relations > 0 {
                             info!(
@@ -3450,17 +3594,32 @@ pub async fn run_with_authority_on(
                             )
                             .await;
 
-                            let mut file_relations =
-                                install_lsp_relations(&lsp_state, &file_result.relations);
+                            // One buffer for the whole file, drained in bounded
+                            // batches. What a file yields is a property of the
+                            // repository (1167 relations from one file on the
+                            // requests corpus), so the buffer bounds itself
+                            // rather than trusting the file to be small.
+                            let mut pending = PendingEnrichment::default();
+                            let mut file_relations = pending
+                                .absorb(file_result.relations, |batch| {
+                                    install_lsp_relations(&lsp_state, batch)
+                                });
 
                             // Also run per-entity call hierarchy for Calls relations
                             // (definition approach gives References, call hierarchy gives Calls).
                             for entity_ref in &file_entity_refs {
-                                file_relations += enrich_single_entity(
-                                    server, entity_ref, &index, &lsp_root, &lsp_state, documents,
+                                let derived = enrich_single_entity(
+                                    server, entity_ref, &index, &lsp_root, documents,
                                 )
                                 .await;
+                                file_relations += pending.absorb(derived, |batch| {
+                                    install_lsp_relations(&lsp_state, batch)
+                                });
                             }
+                            // Written before the file is closed, so the graph
+                            // holds this file's work before the next didOpen.
+                            file_relations +=
+                                pending.flush(|batch| install_lsp_relations(&lsp_state, batch));
 
                             // didClose to free LSP server memory.
                             let _ = server
@@ -5293,7 +5452,10 @@ mod tests {
 
 #[cfg(test)]
 mod enrichment_marker_tests {
-    use super::{file_already_enriched, load_lsp_enriched_marker, lsp_enriched_marker_path};
+    use super::{
+        file_already_enriched, install_lsp_relations, load_lsp_enriched_marker,
+        lsp_enriched_marker_path, PendingEnrichment, ENRICHMENT_WRITE_BATCH,
+    };
     use crate::state::DaemonState;
     use kin_model::EntityStore;
 
@@ -5396,6 +5558,152 @@ mod enrichment_marker_tests {
             "a graph that still holds language-server relations resumes rather than re-sweeping"
         );
         assert!(lsp_enriched_marker_path(&state).exists());
+    }
+
+    /// `count` distinct language-server relations out of one source entity.
+    ///
+    /// Distinct ids, because the property under test is how many relations the
+    /// buffer holds; a repeated id would be deduplicated by the graph and make
+    /// a growing buffer look bounded.
+    fn derived_relations(source: kin_model::EntityId, count: usize) -> Vec<kin_model::Relation> {
+        (0..count)
+            .map(|index| kin_model::Relation {
+                id: kin_model::RelationId::from_content(
+                    &source.to_string(),
+                    &format!("target-{index}"),
+                    "Calls",
+                ),
+                kind: kin_model::RelationKind::Calls,
+                src: kin_model::GraphNodeId::Entity(source),
+                dst: kin_model::GraphNodeId::Entity(kin_model::EntityId::new()),
+                confidence: 1.0,
+                origin: kin_model::RelationOrigin::Lsp,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            })
+            .collect()
+    }
+
+    /// The buffer between a language server's answer and the graph is bounded.
+    ///
+    /// This is the property the sweep needs and did not have. Its cost per pass
+    /// scales with the repository, not with anything this code chooses: one
+    /// file on the requests corpus yields 1167 relations, and a pass that held a
+    /// file, or a sweep, would hold a structure sized by the store being swept.
+    ///
+    /// The two assertions guard different things on purpose. The bound alone
+    /// would pass for a buffer that silently dropped its overflow, and the total
+    /// alone would pass for a buffer that held everything until the flush.
+    #[test]
+    fn an_enrichment_buffer_never_holds_more_than_one_write_batch() {
+        let source = kin_model::EntityId::new();
+        let mut pending = PendingEnrichment::default();
+        let mut written = 0usize;
+        // A file's shape: several entities, one of them answering with far more
+        // than a batch, and a remainder left over at the end.
+        let arms = [400usize, 900, 7, 1, 300];
+        for count in arms {
+            written += pending.absorb(derived_relations(source, count), |batch| batch.len());
+            assert!(
+                pending.len() < ENRICHMENT_WRITE_BATCH,
+                "after absorbing {count} relations the buffer still holds {}, which is a whole \
+                 answer rather than less than one batch of {ENRICHMENT_WRITE_BATCH}",
+                pending.len()
+            );
+        }
+        written += pending.flush(|batch| batch.len());
+        assert_eq!(
+            pending.len(),
+            0,
+            "the flush must leave nothing behind, or a file's tail never reaches the graph"
+        );
+        assert_eq!(
+            written,
+            arms.iter().sum::<usize>(),
+            "every relation offered to the buffer must reach the writer exactly once"
+        );
+    }
+
+    /// The bounded path writes exactly the relation set the unbounded one did,
+    /// and a re-derivation of that same set writes nothing at all.
+    ///
+    /// Completeness first, because a bound that loses relations is a worse
+    /// defect than the cost it removes. Then idempotence, which is the half
+    /// that matters on a store whose sweep keeps being killed: the ids are
+    /// content-addressed, so every re-sweep offers the graph the edges it
+    /// already holds, and `upsert_relation` answers a byte-identical rewrite by
+    /// dropping both endpoints' vectors and re-queueing them for embedding.
+    #[test]
+    fn the_bounded_path_writes_the_same_set_and_a_re_sweep_writes_nothing() {
+        let unbounded_repo = tempfile::tempdir().unwrap();
+        let unbounded =
+            DaemonState::open(kin_core::init(unbounded_repo.path()).unwrap().layout).unwrap();
+        let bounded_repo = tempfile::tempdir().unwrap();
+        let bounded =
+            DaemonState::open(kin_core::init(bounded_repo.path()).unwrap().layout).unwrap();
+
+        let source = entity("Session_send");
+        unbounded.graph.upsert_entity(&source).unwrap();
+        bounded.graph.upsert_entity(&source).unwrap();
+        let relations = derived_relations(source.id, 600);
+
+        // The unbounded path: every relation offered on its own, which is what
+        // one language-server query arm used to do.
+        let mut unbounded_installed = 0usize;
+        for relation in &relations {
+            unbounded_installed +=
+                install_lsp_relations(&unbounded, std::slice::from_ref(relation));
+        }
+
+        // The bounded path: the same relations through the buffer.
+        let mut pending = PendingEnrichment::default();
+        let mut bounded_installed = pending.absorb(relations.clone(), |batch| {
+            install_lsp_relations(&bounded, batch)
+        });
+        bounded_installed += pending.flush(|batch| install_lsp_relations(&bounded, batch));
+
+        assert_eq!(
+            bounded_installed, unbounded_installed,
+            "the bounded path must install exactly what the unbounded one installed"
+        );
+        let held = |state: &DaemonState| -> std::collections::BTreeSet<kin_model::RelationId> {
+            use kin_model::EntityStore;
+            state
+                .graph
+                .get_all_relations_for_entity(&source.id)
+                .unwrap()
+                .into_iter()
+                .map(|relation| relation.id)
+                .collect()
+        };
+        assert_eq!(
+            held(&bounded),
+            held(&unbounded),
+            "the two paths must leave the same relations in the graph"
+        );
+        assert_eq!(
+            held(&bounded).len(),
+            relations.len(),
+            "every derived relation must be published, not just counted"
+        );
+
+        // The re-sweep. Same relations, same ids, nothing changed.
+        let mut again = PendingEnrichment::default();
+        let mut rewritten = again.absorb(relations.clone(), |batch| {
+            install_lsp_relations(&bounded, batch)
+        });
+        rewritten += again.flush(|batch| install_lsp_relations(&bounded, batch));
+        assert_eq!(
+            rewritten, 0,
+            "a re-derivation of relations the graph already holds must write nothing, or every \
+             killed sweep discards the embeddings of every entity it touches"
+        );
+        assert_eq!(
+            held(&bounded).len(),
+            relations.len(),
+            "and writing nothing must not remove anything either"
+        );
     }
 }
 
