@@ -48,6 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Refuse to certify an absence over a coverage map that measured nothing (#1043)
 - Cover the sealed-tree and restored-tree allowance derivation sites with fixtures (#1045)
 - Retire projection readers after an admission rollback (#1046)
+- Name a vector salvage as lost coverage instead of pending work (#1047)
 
 
 ## [0.5.46] - 2026-08-21
