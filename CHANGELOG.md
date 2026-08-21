@@ -50,6 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Retire projection readers after an admission rollback (#1046)
 - Name a vector salvage as lost coverage instead of pending work (#1047)
 - Say when a repo daemon was killed by the memory limit, on the query path (#1025)
+- Arm the reconcile watch before publishing the endpoint, and stop certifying absence over a store the working copy has outrun (#1044)
 
 
 ## [0.5.46] - 2026-08-21
