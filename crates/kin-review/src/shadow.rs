@@ -2570,6 +2570,7 @@ mod tests {
                     head: None,
                     entity_changes,
                     relation_changes: vec![],
+                    ..SemanticDiff::default()
                 },
                 // One graph-known consumer per removed entity makes the
                 // per-entity contract-surface rule fire for each candidate.
@@ -3649,6 +3650,7 @@ mod tests {
                     },
                 ],
                 relation_changes: vec![],
+                ..SemanticDiff::default()
             },
             impact: ImpactReport {
                 entity_impacts: vec![EntityImpact {
@@ -3749,6 +3751,7 @@ mod tests {
                     },
                 }],
                 relation_changes: vec![],
+                ..SemanticDiff::default()
             },
             impact: ImpactReport {
                 entity_impacts: vec![EntityImpact {
@@ -4364,6 +4367,7 @@ mod tests {
                     kind: EntityChangeKind::Removed { old: None },
                 }],
                 relation_changes: vec![],
+                ..SemanticDiff::default()
             },
             impact: ImpactReport {
                 entity_impacts: vec![EntityImpact {
@@ -4469,6 +4473,7 @@ mod tests {
                     },
                 }],
                 relation_changes: vec![],
+                ..SemanticDiff::default()
             },
             impact: ImpactReport {
                 entity_impacts: vec![EntityImpact {

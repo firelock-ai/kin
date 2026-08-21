@@ -66,6 +66,42 @@ pub struct SemanticDiff {
     pub head: Option<SemanticChangeId>,
     pub entity_changes: Vec<EntityChange>,
     pub relation_changes: Vec<RelationChange>,
+    /// How many recorded modifications this range carried whose entity did not
+    /// change: same name, kind, signature, visibility, role, and fingerprint,
+    /// with only the span and the source-blob provenance advanced.
+    ///
+    /// They are excluded from `entity_changes` because a review that names them
+    /// is naming work nobody did, but the count is published rather than
+    /// dropped. It is the honest measure of how much of a stored change is
+    /// re-emission, and a reader who sees "Modified (1)" beside 60 suppressed
+    /// entries knows the storage layer touched the whole file while the review
+    /// found one edit.
+    #[serde(default)]
+    pub provenance_only_entity_changes: usize,
+}
+
+/// Whether a recorded modification changed what the entity IS, rather than only
+/// where it sits or which blob it was last read out of.
+///
+/// The reconciler stamps the touched file's blob hash onto every declaration in
+/// that file (`kin-reconcile/src/reconciler.rs`), and an edit that adds or
+/// removes bytes shifts the span of every declaration below it. Both are true
+/// provenance and the storage delta must carry them, because the workspace
+/// overlay is derived by whole-value difference and a payload held back there
+/// strands the workspace dirty forever. Neither is a change a reviewer can act
+/// on, so this is where the two meanings of "modified" separate.
+///
+/// The comparison normalizes the provenance fields onto the base value and then
+/// compares the whole entity, rather than listing the fields that count. A field
+/// added to `Entity` later is therefore treated as semantic until someone
+/// decides otherwise, which fails toward reporting a change rather than hiding
+/// one.
+pub fn is_semantic_modification(old: &Entity, new: &Entity) -> bool {
+    let mut normalized = new.clone();
+    normalized.span.clone_from(&old.span);
+    normalized.metadata.clone_from(&old.metadata);
+    normalized.created_in = old.created_in;
+    normalized != *old
 }
 
 impl SemanticDiff {
@@ -120,6 +156,63 @@ impl SemanticDiff {
     /// All entity IDs touched by this diff (added, modified, or removed).
     pub fn changed_entity_ids(&self) -> Vec<EntityId> {
         self.entity_changes.iter().map(|c| c.entity_id).collect()
+    }
+}
+
+/// Drop the modifications that only advanced provenance, returning how many
+/// were dropped so the caller can publish the count.
+fn split_provenance_only(changes: Vec<EntityChange>) -> (Vec<EntityChange>, usize) {
+    let before = changes.len();
+    let kept: Vec<EntityChange> = changes
+        .into_iter()
+        .filter(|change| match &change.kind {
+            EntityChangeKind::Modified { old, new } => is_semantic_modification(old, new),
+            EntityChangeKind::Added(_) | EntityChangeKind::Removed { .. } => true,
+        })
+        .collect();
+    let suppressed = before - kept.len();
+    (kept, suppressed)
+}
+
+/// Fold one `Modified` delta into the accumulated state for its entity.
+///
+/// The accumulated `old` stays the FIRST base-side payload the range recorded,
+/// never the latest delta's. Overwriting it collapsed `base..head` into
+/// `last_change..head`: an entity whose signature moved in the first change and
+/// whose blob provenance advanced in a later one would be compared against a
+/// base that already carried the new signature, and the range would report no
+/// change at all.
+fn fold_modified(
+    entity_states: &mut HashMap<EntityId, EntityChangeKind>,
+    old: &Entity,
+    new: &Entity,
+) {
+    let id = new.id;
+    match entity_states.get(&id) {
+        // Added in this range and then edited: still an addition from the
+        // range's point of view.
+        Some(EntityChangeKind::Added(_)) => {
+            entity_states.insert(id, EntityChangeKind::Added(new.clone()));
+        }
+        Some(EntityChangeKind::Modified { old: first, .. }) => {
+            let first = first.clone();
+            entity_states.insert(
+                id,
+                EntityChangeKind::Modified {
+                    old: first,
+                    new: new.clone(),
+                },
+            );
+        }
+        _ => {
+            entity_states.insert(
+                id,
+                EntityChangeKind::Modified {
+                    old: old.clone(),
+                    new: new.clone(),
+                },
+            );
+        }
     }
 }
 
@@ -201,23 +294,7 @@ pub fn compute_diff_scoped<G: GraphStore>(
                     }
                 }
                 EntityDelta::Modified { old, new } => {
-                    let id = new.id;
-                    match entity_states.get(&id) {
-                        Some(EntityChangeKind::Added(_)) => {
-                            // Was added in this range, now modified — still "added"
-                            // from the perspective of the overall diff
-                            entity_states.insert(id, EntityChangeKind::Added(new.clone()));
-                        }
-                        _ => {
-                            entity_states.insert(
-                                id,
-                                EntityChangeKind::Modified {
-                                    old: old.clone(),
-                                    new: new.clone(),
-                                },
-                            );
-                        }
-                    }
+                    fold_modified(&mut entity_states, old, new);
                 }
                 EntityDelta::Removed { old } => {
                     let id = old.id;
@@ -249,7 +326,9 @@ pub fn compute_diff_scoped<G: GraphStore>(
         .map(|(entity_id, kind)| EntityChange { entity_id, kind })
         .collect();
     entity_changes.sort_by_key(|change| change.entity_id);
+    let (entity_changes, provenance_only) = split_provenance_only(entity_changes);
     diff.entity_changes = entity_changes;
+    diff.provenance_only_entity_changes = provenance_only;
 
     // Accumulate relation deltas
     let mut relation_added: HashMap<RelationId, Relation> = HashMap::new();
@@ -317,6 +396,7 @@ pub fn diff_from_change(change: &SemanticChange) -> SemanticDiff {
         ..Default::default()
     };
 
+    let mut entity_changes = Vec::new();
     for delta in &change.entity_deltas {
         let (entity_id, kind) = match delta {
             EntityDelta::Added { new: e } => (e.id, EntityChangeKind::Added(e.clone())),
@@ -334,8 +414,11 @@ pub fn diff_from_change(change: &SemanticChange) -> SemanticDiff {
                 },
             ),
         };
-        diff.entity_changes.push(EntityChange { entity_id, kind });
+        entity_changes.push(EntityChange { entity_id, kind });
     }
+    let (entity_changes, provenance_only) = split_provenance_only(entity_changes);
+    diff.entity_changes = entity_changes;
+    diff.provenance_only_entity_changes = provenance_only;
 
     for delta in &change.relation_deltas {
         let kind = match delta {
@@ -379,22 +462,7 @@ pub fn diff_from_changes(changes: &[SemanticChange]) -> SemanticDiff {
                     entity_states.insert(id, EntityChangeKind::Added(entity.clone()));
                 }
                 EntityDelta::Modified { old, new } => {
-                    let id = new.id;
-                    match entity_states.get(&id) {
-                        Some(EntityChangeKind::Added(_)) => {
-                            // Was added earlier in this set — still "added"
-                            entity_states.insert(id, EntityChangeKind::Added(new.clone()));
-                        }
-                        _ => {
-                            entity_states.insert(
-                                id,
-                                EntityChangeKind::Modified {
-                                    old: old.clone(),
-                                    new: new.clone(),
-                                },
-                            );
-                        }
-                    }
+                    fold_modified(&mut entity_states, old, new);
                 }
                 EntityDelta::Removed { old } => match entity_states.get(&old.id) {
                     Some(EntityChangeKind::Added(_)) => {
@@ -420,7 +488,9 @@ pub fn diff_from_changes(changes: &[SemanticChange]) -> SemanticDiff {
         .map(|(entity_id, kind)| EntityChange { entity_id, kind })
         .collect();
     entity_changes.sort_by_key(|change| change.entity_id);
+    let (entity_changes, provenance_only) = split_provenance_only(entity_changes);
     diff.entity_changes = entity_changes;
+    diff.provenance_only_entity_changes = provenance_only;
 
     // Accumulate relation deltas
     let mut relation_added: HashMap<RelationId, Relation> = HashMap::new();
@@ -490,6 +560,12 @@ pub fn diff_from_changes(changes: &[SemanticChange]) -> SemanticDiff {
 /// This is the primary mechanism for "review from arbitrary user-specified
 /// change sets" — callers can hand-pick any set of entities and get a full
 /// review with impact analysis and risk scoring.
+///
+/// This constructor and [`diff_from_files`] are deliberately NOT filtered for
+/// provenance-only modifications, unlike the three range constructors above. A
+/// caller here named the entities or the files it wants described, so answering
+/// with silence about one of them would be dropping something that was asked for
+/// rather than declining to invent a finding.
 pub fn diff_from_entity_ids<G: GraphStore>(
     store: &G,
     entity_ids: &[EntityId],
@@ -588,7 +664,7 @@ mod tests {
     use kin_model::change::{EntityDelta, RelationDelta};
     use kin_model::entity::{
         Entity, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, SemanticFingerprint,
-        Visibility,
+        SourceSpan, Visibility,
     };
     use kin_model::ids::*;
     use kin_model::relation::{Relation, RelationKind, RelationOrigin};
@@ -1114,5 +1190,214 @@ mod tests {
 
         let diff = diff_from_changes(&[c1, c2]);
         assert!(diff.entity_changes.is_empty());
+    }
+    /// Build the change a re-emitted file produces: one entity really edited,
+    /// the rest carrying nothing but the file's new blob hash and a shifted
+    /// span.
+    fn reemitted_file_change(edited: usize, untouched: usize) -> SemanticChange {
+        let mut entity_deltas = Vec::new();
+
+        for index in 0..edited {
+            let old = test_entity(&format!("edited_{index}"));
+            let mut new = old.clone();
+            new.signature = format!("fn edited_{index}(extra: u32)");
+            new.fingerprint.signature_hash = Hash256::from_bytes([9; 32]);
+            entity_deltas.push(EntityDelta::Modified { old, new });
+        }
+
+        for index in 0..untouched {
+            let old = test_entity(&format!("untouched_{index}"));
+            let mut new = old.clone();
+            // Exactly what the reconciler stamps on every declaration in a
+            // touched file, and exactly what an added or removed byte above a
+            // declaration does to its span.
+            new.metadata.extra.insert(
+                "blob_hash".into(),
+                serde_json::Value::String("advanced-source-blob".into()),
+            );
+            new.span = Some(SourceSpan {
+                file: FilePathId::new("src/lib.rs"),
+                start_byte: 40,
+                end_byte: 80,
+                start_line: 4,
+                start_col: 0,
+                end_line: 6,
+                end_col: 1,
+            });
+            assert_ne!(old, new, "the fixture must move the payload");
+            assert_eq!(
+                old.fingerprint, new.fingerprint,
+                "the fixture must not move the semantic fingerprint"
+            );
+            entity_deltas.push(EntityDelta::Modified { old, new });
+        }
+
+        SemanticChange {
+            id: test_change_id(7),
+            parents: vec![test_change_id(6)],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "edit one line".into(),
+            entity_deltas,
+            relation_deltas: vec![],
+            tree_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
+        }
+    }
+
+    /// The headline of FIR-2479, at the layer that decides what a review says.
+    /// A one-line edit records a modification for every declaration in the
+    /// touched file, because the reconciler stamps that file's blob hash on all
+    /// of them and the storage delta must carry the whole payload. The review
+    /// must name the one entity that changed, and say how many records it set
+    /// aside rather than dropping them silently.
+    #[test]
+    fn a_reemitted_file_reports_only_the_entity_that_changed() {
+        let change = reemitted_file_change(1, 60);
+
+        let diff = diff_from_change(&change);
+
+        assert_eq!(
+            diff.entity_changes.len(),
+            1,
+            "only the edited entity may be reported, got {:#?}",
+            diff.entity_changes
+                .iter()
+                .map(|change| match &change.kind {
+                    EntityChangeKind::Modified { new, .. } => new.name.clone(),
+                    EntityChangeKind::Added(entity) => entity.name.clone(),
+                    EntityChangeKind::Removed { .. } => "<removed>".to_string(),
+                })
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            diff.provenance_only_entity_changes, 60,
+            "every suppressed record must be counted, not dropped"
+        );
+        let modified = diff.modified_entities();
+        assert_eq!(modified.len(), 1);
+        assert_eq!(modified[0].1.name, "edited_0");
+    }
+
+    /// The positive control, stated separately so the rule above cannot pass by
+    /// suppressing everything. Nothing but provenance moved, so nothing is
+    /// reported, and the count still says the file was re-emitted.
+    #[test]
+    fn a_file_whose_entities_only_moved_reports_no_modification_and_says_so() {
+        let change = reemitted_file_change(0, 3);
+
+        let diff = diff_from_change(&change);
+
+        assert!(
+            diff.entity_changes.is_empty(),
+            "a provenance-only change has nothing for a reviewer to act on"
+        );
+        assert_eq!(diff.provenance_only_entity_changes, 3);
+    }
+
+    /// A real edit followed by a later re-emission of the same file must survive
+    /// the range walk. The accumulated base-side payload has to stay the FIRST
+    /// one the range recorded: comparing against the latest delta's base would
+    /// compare the edited entity with itself and report no change at all.
+    #[test]
+    fn a_later_reemission_does_not_erase_an_earlier_edit_in_the_same_range() {
+        let old = test_entity("moved");
+        let mut edited = old.clone();
+        edited.signature = "fn moved(extra: u32)".into();
+        edited.fingerprint.signature_hash = Hash256::from_bytes([9; 32]);
+
+        let mut reemitted = edited.clone();
+        reemitted.metadata.extra.insert(
+            "blob_hash".into(),
+            serde_json::Value::String("advanced-source-blob".into()),
+        );
+        assert_ne!(edited, reemitted, "the fixture must move the payload");
+
+        let first = SemanticChange {
+            entity_deltas: vec![EntityDelta::Modified {
+                old: old.clone(),
+                new: edited.clone(),
+            }],
+            ..reemitted_file_change(0, 0)
+        };
+        let second = SemanticChange {
+            id: test_change_id(8),
+            parents: vec![test_change_id(7)],
+            entity_deltas: vec![EntityDelta::Modified {
+                old: edited,
+                new: reemitted.clone(),
+            }],
+            ..reemitted_file_change(0, 0)
+        };
+
+        let diff = diff_from_changes(&[first, second]);
+
+        let modified = diff.modified_entities();
+        assert_eq!(
+            modified.len(),
+            1,
+            "the range still changed this entity, so the range must report it"
+        );
+        assert_eq!(
+            modified[0].0.signature, "fn moved()",
+            "the reported base must be the range's base, not the last delta's"
+        );
+        assert_eq!(modified[0].1.signature, "fn moved(extra: u32)");
+        assert_eq!(diff.provenance_only_entity_changes, 0);
+    }
+
+    /// The classifier itself, driven in both directions on real fields rather
+    /// than inferred from the two rules above.
+    #[test]
+    fn semantic_modification_reads_content_and_ignores_placement() {
+        let base = test_entity("subject");
+
+        let mut moved = base.clone();
+        moved.span = Some(SourceSpan {
+            file: FilePathId::new("src/lib.rs"),
+            start_byte: 1,
+            end_byte: 2,
+            start_line: 9,
+            start_col: 0,
+            end_line: 9,
+            end_col: 1,
+        });
+        assert!(!is_semantic_modification(&base, &moved));
+
+        let mut reprovenanced = base.clone();
+        reprovenanced
+            .metadata
+            .extra
+            .insert("blob_hash".into(), serde_json::Value::String("x".into()));
+        assert!(!is_semantic_modification(&base, &reprovenanced));
+
+        let mut resigned = base.clone();
+        resigned.signature = "fn subject(flag: bool)".into();
+        assert!(is_semantic_modification(&base, &resigned));
+
+        let mut refingerprinted = base.clone();
+        refingerprinted.fingerprint.behavior_hash = Hash256::from_bytes([3; 32]);
+        assert!(is_semantic_modification(&base, &refingerprinted));
+
+        let mut renamed = base.clone();
+        renamed.name = "renamed".into();
+        assert!(is_semantic_modification(&base, &renamed));
+
+        let mut hidden = base.clone();
+        hidden.visibility = Visibility::Private;
+        assert!(is_semantic_modification(&base, &hidden));
+
+        let mut relocated = base.clone();
+        relocated.file_origin = Some(FilePathId::new("src/elsewhere.rs"));
+        assert!(
+            is_semantic_modification(&base, &relocated),
+            "a declaration that changed file is a move a reviewer must see"
+        );
     }
 }

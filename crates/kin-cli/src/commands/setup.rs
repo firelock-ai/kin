@@ -23,7 +23,7 @@ const ZSH_HOOK: &str = r#"# SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Firelock, LLC
 #
 # kin-vfs zsh integration — auto-activates the VFS overlay when entering
-# a Kin workspace (any directory tree containing .kin/).
+# a Kin repository (a directory whose .kin/ carries a repository manifest).
 #
 # Installed by: kin setup
 
@@ -56,20 +56,33 @@ _kin_vfs_path_within() {
     esac
 }
 
+# A `.kin` directory names a repository only when it carries the manifest
+# `kin init` writes there. The managed toolchain home ($KIN_HOME, default
+# $HOME/.kin) is a real `.kin` directory too, holding bin/, lib/, shell/ and
+# config/, so a walk that asks only whether `.kin` is a directory binds $HOME
+# itself as a projection root, and every path under it then belongs to a
+# projection no daemon serves. The kin-vfs shim admits a root on this same
+# file, so both halves answer the containment question the same way.
+_kin_vfs_is_repository() {
+    [[ -f "$1/.kin/manifest.json" ]]
+}
+
 _kin_vfs_scan_path() {
     local dir="$1"
     local boundary="$2"
     while true; do
-        # A Kin marker is authority only when it is a real local directory.
-        # During a session it may win over a same-directory .git marker only
-        # at the exact validated session root.
+        # A Kin marker is authority only when it is a real local directory
+        # holding a repository manifest. During a session it may win over a
+        # same-directory .git marker only at the exact validated session root.
         if [[ -e "$dir/.kin" || -L "$dir/.kin" ]]; then
             [[ -d "$dir/.kin" && ! -L "$dir/.kin" ]] || return 1
-            if [[ -n "$boundary" && "$dir" != "$boundary" ]]; then
-                return 1
+            if _kin_vfs_is_repository "$dir"; then
+                if [[ -n "$boundary" && "$dir" != "$boundary" ]]; then
+                    return 1
+                fi
+                printf '%s' "$dir"
+                return 0
             fi
-            printf '%s' "$dir"
-            return 0
         fi
         # Files, directories, and even broken symlinks are Git boundaries.
         if [[ -e "$dir/.git" || -L "$dir/.git" ]]; then
@@ -252,7 +265,7 @@ const BASH_HOOK: &str = r#"# SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Firelock, LLC
 #
 # kin-vfs bash integration — auto-activates the VFS overlay when entering
-# a Kin workspace (any directory tree containing .kin/).
+# a Kin repository (a directory whose .kin/ carries a repository manifest).
 #
 # Installed by: kin setup
 
@@ -290,20 +303,33 @@ _kin_vfs_path_within() {
     esac
 }
 
+# A `.kin` directory names a repository only when it carries the manifest
+# `kin init` writes there. The managed toolchain home ($KIN_HOME, default
+# $HOME/.kin) is a real `.kin` directory too, holding bin/, lib/, shell/ and
+# config/, so a walk that asks only whether `.kin` is a directory binds $HOME
+# itself as a projection root, and every path under it then belongs to a
+# projection no daemon serves. The kin-vfs shim admits a root on this same
+# file, so both halves answer the containment question the same way.
+_kin_vfs_is_repository() {
+    [ -f "$1/.kin/manifest.json" ]
+}
+
 _kin_vfs_scan_path() {
     local dir="$1"
     local boundary="$2"
     while :; do
-        # A Kin marker is authority only when it is a real local directory.
-        # During a session it may win over a same-directory .git marker only
-        # at the exact validated session root.
+        # A Kin marker is authority only when it is a real local directory
+        # holding a repository manifest. During a session it may win over a
+        # same-directory .git marker only at the exact validated session root.
         if [ -e "$dir/.kin" ] || [ -L "$dir/.kin" ]; then
             [ -d "$dir/.kin" ] && [ ! -L "$dir/.kin" ] || return 1
-            if [ -n "$boundary" ] && [ "$dir" != "$boundary" ]; then
-                return 1
+            if _kin_vfs_is_repository "$dir"; then
+                if [ -n "$boundary" ] && [ "$dir" != "$boundary" ]; then
+                    return 1
+                fi
+                printf '%s' "$dir"
+                return 0
             fi
-            printf '%s' "$dir"
-            return 0
         fi
         # Files, directories, and even broken symlinks are Git boundaries.
         if [ -e "$dir/.git" ] || [ -L "$dir/.git" ]; then
@@ -605,6 +631,22 @@ function Test-KinMarkerExists {
     }
 }
 
+# A `.kin` directory names a repository only when it carries the manifest
+# `kin init` writes there. The managed toolchain home ($KIN_HOME, default
+# $HOME/.kin) is a real `.kin` directory too, holding bin/, lib/, shell/ and
+# config/, so a walk that asks only whether `.kin` is a directory binds the
+# home directory itself as a projection root, and every path under it then
+# belongs to a projection no daemon serves. The kin-vfs shim admits a root on
+# this same file, so both halves answer the containment question the same way.
+function Test-KinRepository {
+    param([string]$Path)
+    try {
+        return [System.IO.File]::Exists((Join-Path (Join-Path $Path ".kin") "manifest.json"))
+    } catch {
+        return $false
+    }
+}
+
 function Find-KinWorkspaceOnPath {
     param([string]$StartDir, [string]$Boundary)
     $dir = $StartDir
@@ -620,10 +662,12 @@ function Find-KinWorkspaceOnPath {
                 (($kinItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) {
                 return $null
             }
-            if ($Boundary -and -not (Test-KinPathEqual -Left $dir -Right $Boundary)) {
-                return $null
+            if (Test-KinRepository -Path $dir) {
+                if ($Boundary -and -not (Test-KinPathEqual -Left $dir -Right $Boundary)) {
+                    return $null
+                }
+                return $dir
             }
-            return $dir
         }
         if (Test-KinMarkerExists -Path (Join-Path $dir ".git")) {
             return $null
@@ -798,17 +842,30 @@ function _kin_vfs_path_within
     test (string sub -s 1 -l "$prefix_length" -- "$candidate") = "$prefix"
 end
 
+# A `.kin` directory names a repository only when it carries the manifest
+# `kin init` writes there. The managed toolchain home ($KIN_HOME, default
+# $HOME/.kin) is a real `.kin` directory too, holding bin/, lib/, shell/ and
+# config/, so a walk that asks only whether `.kin` is a directory binds $HOME
+# itself as a projection root, and every path under it then belongs to a
+# projection no daemon serves. The kin-vfs shim admits a root on this same
+# file, so both halves answer the containment question the same way.
+function _kin_vfs_is_repository
+    test -f "$argv[1]/.kin/manifest.json"
+end
+
 function _kin_vfs_scan_path
     set -l dir $argv[1]
     set -l boundary $argv[2]
     while true
         if test -e "$dir/.kin"; or test -L "$dir/.kin"
             test -d "$dir/.kin"; and not test -L "$dir/.kin"; or return 1
-            if test -n "$boundary"; and test "$dir" != "$boundary"
-                return 1
+            if _kin_vfs_is_repository "$dir"
+                if test -n "$boundary"; and test "$dir" != "$boundary"
+                    return 1
+                end
+                printf '%s' "$dir"
+                return 0
             end
-            printf '%s' "$dir"
-            return 0
         end
         if test -e "$dir/.git"; or test -L "$dir/.git"
             return 1
@@ -15679,6 +15736,20 @@ wait
         assert!(BASH_HOOK.contains("else\n            _kin_vfs_refresh_preload"));
     }
 
+    /// Build the `.kin` a real repository carries: the directory plus the
+    /// manifest `kin init` writes into it. The hooks admit a projection root
+    /// only on that manifest, so a fixture that creates the directory alone is
+    /// the managed toolchain home's shape rather than a repository's.
+    #[cfg(unix)]
+    fn seed_repository_marker(root: &Path) {
+        fs::create_dir_all(root.join(".kin")).unwrap();
+        fs::write(
+            root.join(".kin").join("manifest.json"),
+            b"{\"repo_id\":\"00000000-0000-4000-8000-000000000000\"}",
+        )
+        .unwrap();
+    }
+
     /// FIR-2300 contract: a socket inode outlives the daemon that bound it, so
     /// `-S` may appear only as a pre-filter. Both the decision to start a
     /// daemon and the readiness poll must go through the
@@ -15859,7 +15930,7 @@ fi
         let root = fs::canonicalize(fixture.path()).unwrap();
 
         let ws = root.join("workspace");
-        fs::create_dir_all(ws.join(".kin")).unwrap();
+        seed_repository_marker(&ws);
         // A real stale socket: bind a listener, then drop it. The inode stays
         // behind, which is exactly the state `-S` misreads as a live daemon.
         let sock = ws.join(".kin/vfs.sock");
@@ -16059,7 +16130,7 @@ printf 'LD=[%s]\n' "$LD_PRELOAD"
         let root_path = root.path().join("root with spaces");
         fs::create_dir(&root_path).unwrap();
         let root_path = fs::canonicalize(root_path).unwrap();
-        fs::create_dir_all(root_path.join(".kin")).unwrap();
+        seed_repository_marker(&root_path);
 
         let nested_git = root_path.join("linked-worktree");
         let nested_start = nested_git.join("src/deep");
@@ -16072,7 +16143,7 @@ printf 'LD=[%s]\n' "$LD_PRELOAD"
 
         let nested_kin = root_path.join("kin-workspace");
         let local_start = nested_kin.join("src/deep");
-        fs::create_dir_all(nested_kin.join(".kin")).unwrap();
+        seed_repository_marker(&nested_kin);
         fs::create_dir_all(nested_kin.join(".git")).unwrap();
         fs::create_dir_all(&local_start).unwrap();
 
@@ -16082,7 +16153,7 @@ printf 'LD=[%s]\n' "$LD_PRELOAD"
 
         let session_repo = root_path.join("runs/session-repo");
         let session_repo_start = session_repo.join("src/deep");
-        fs::create_dir_all(session_repo.join(".kin")).unwrap();
+        seed_repository_marker(&session_repo);
         fs::create_dir_all(session_repo.join(".git")).unwrap();
         fs::create_dir_all(&session_repo_start).unwrap();
         let normalized_session_repo = root_path.join("runs/../runs/session-repo");
@@ -16090,12 +16161,12 @@ printf 'LD=[%s]\n' "$LD_PRELOAD"
         let nested_session = root_path.join("runs/session-with-nested-repo");
         let nested_session_repo = nested_session.join("nested");
         let nested_session_start = nested_session_repo.join("src/deep");
-        fs::create_dir_all(nested_session_repo.join(".kin")).unwrap();
+        seed_repository_marker(&nested_session_repo);
         fs::create_dir_all(&nested_session_start).unwrap();
 
         let aliased_session_target = root_path.join("runs/session-alias-target");
         let aliased_session_target_start = aliased_session_target.join("src/deep");
-        fs::create_dir_all(aliased_session_target.join(".kin")).unwrap();
+        seed_repository_marker(&aliased_session_target);
         fs::create_dir_all(aliased_session_target.join(".git")).unwrap();
         fs::create_dir_all(&aliased_session_target_start).unwrap();
         let aliased_session = root_path.join("session-alias");
@@ -16255,6 +16326,244 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
                 "{hook_name} crossed a Git or session boundary\nstdout: {}\nstderr: {}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    /// FIR-2552: the managed toolchain home is `.kin`-shaped, so a hook that
+    /// admits a projection root on the directory alone binds `$HOME` itself.
+    /// On the released 0.5.45 bytes that made every path under `$HOME` answer
+    /// EIO, because the shim owned a root no daemon served. The hook must walk
+    /// past the toolchain home, and must still bind a real repository under it.
+    ///
+    /// Driven through the installed hook in the real shell rather than through
+    /// `_kin_vfs_scan_path` alone, because what broke the container was the
+    /// variable the hook exported on source, not a helper's return code.
+    #[cfg(unix)]
+    #[test]
+    fn unix_installed_hooks_leave_a_toolchain_shaped_home_unbound() {
+        let root = tempfile::tempdir().unwrap();
+        let home = fs::canonicalize(root.path()).unwrap().join("home");
+        fs::create_dir_all(&home).unwrap();
+
+        // The managed toolchain home, in the shape `kin setup` provisions:
+        // a real `.kin` directory carrying bin/, lib/, shell/, config/ and
+        // registry.toml, and never a repository manifest.
+        let kin_home = home.join(".kin");
+        for dir in ["bin", "lib", "shell", "config"] {
+            fs::create_dir_all(kin_home.join(dir)).unwrap();
+        }
+        fs::write(kin_home.join("registry.toml"), b"# managed toolchain\n").unwrap();
+        let shim_name = if cfg!(target_os = "macos") {
+            "libkin_vfs_shim.dylib"
+        } else {
+            "libkin_vfs_shim.so"
+        };
+        let shim = kin_home.join("lib").join(shim_name);
+        fs::write(&shim, b"\x7fELF not a real object, only non-empty\n").unwrap();
+
+        // A real repository under that home, and a plain directory under it.
+        let repo = home.join("demo-repo");
+        let repo_start = repo.join("src/deep");
+        fs::create_dir_all(&repo_start).unwrap();
+        seed_repository_marker(&repo);
+        let plain = home.join("plain/sub");
+        fs::create_dir_all(&plain).unwrap();
+
+        let hooks = home.join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+
+        let posix_probe = r#"
+source "$KIN_TEST_HOOK" || { echo SOURCE_FAILED >&2; exit 97; }
+printf 'WORKSPACE=[%s]\n' "${KIN_VFS_WORKSPACE-}"
+printf 'DYLD=[%s]\n' "${DYLD_INSERT_LIBRARIES-}"
+printf 'LD=[%s]\n' "${LD_PRELOAD-}"
+"#;
+        let fish_probe = r#"
+source $KIN_TEST_HOOK; or begin; echo SOURCE_FAILED >&2; exit 97; end
+printf 'WORKSPACE=[%s]\n' "$KIN_VFS_WORKSPACE"
+printf 'DYLD=[%s]\n' "$DYLD_INSERT_LIBRARIES"
+printf 'LD=[%s]\n' "$LD_PRELOAD"
+"#;
+        let fish_path = [
+            "/opt/homebrew/bin/fish",
+            "/usr/local/bin/fish",
+            "/usr/bin/fish",
+            "/bin/fish",
+        ]
+        .into_iter()
+        .find(|candidate| Path::new(candidate).is_file());
+
+        let mut shells: Vec<(&str, &str, &str, &[&str], &str)> = vec![
+            (
+                "/bin/bash",
+                "kin-vfs.bash",
+                BASH_HOOK,
+                &["--noprofile", "--norc"][..],
+                posix_probe,
+            ),
+            (
+                "/bin/zsh",
+                "kin-vfs.zsh",
+                ZSH_HOOK,
+                &["-f"][..],
+                posix_probe,
+            ),
+        ];
+        if let Some(fish) = fish_path {
+            shells.push((fish, "kin-vfs.fish", FISH_HOOK, &[][..], fish_probe));
+        }
+
+        // (working directory, the root the hook must bind, why)
+        let cases: [(&Path, Option<&Path>, &str); 4] = [
+            (
+                home.as_path(),
+                None,
+                "the managed toolchain home is not a repository and must never be bound",
+            ),
+            (
+                plain.as_path(),
+                None,
+                "a plain directory under the toolchain home walks past it and binds nothing",
+            ),
+            (
+                repo.as_path(),
+                Some(repo.as_path()),
+                "a repository under the toolchain home still binds",
+            ),
+            (
+                repo_start.as_path(),
+                Some(repo.as_path()),
+                "a directory inside that repository binds the repository, not the home",
+            ),
+        ];
+
+        let mut shells_run = 0;
+        for (shell, hook_name, hook, flags, probe) in shells {
+            if !Path::new(shell).is_file() {
+                continue;
+            }
+            shells_run += 1;
+            let hook_path = hooks.join(hook_name);
+            fs::write(&hook_path, hook).unwrap();
+
+            for (cwd, expected, why) in cases {
+                let output = std::process::Command::new(shell)
+                    .args(flags)
+                    .arg("-c")
+                    .arg(probe)
+                    .current_dir(cwd)
+                    .env("PATH", "/usr/bin:/bin")
+                    .env("HOME", &home)
+                    .env("KIN_HOME", &kin_home)
+                    .env("KIN_TEST_HOOK", &hook_path)
+                    .env_remove("KIN_DIR")
+                    .env_remove("KIN_SESSION_DIR")
+                    .env_remove("KIN_VFS_DISABLE")
+                    .env_remove("KIN_VFS_WORKSPACE")
+                    .env_remove("KIN_VFS_SOCK")
+                    .env_remove("DYLD_INSERT_LIBRARIES")
+                    .env_remove("LD_PRELOAD")
+                    .output()
+                    .unwrap();
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    output.status.success(),
+                    "{hook_name} at {}: probe shell failed\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                    cwd.display()
+                );
+
+                let expected_line = match expected {
+                    Some(root) => format!("WORKSPACE=[{}]", root.display()),
+                    None => "WORKSPACE=[]".to_string(),
+                };
+                assert!(
+                    stdout.contains(&expected_line),
+                    "{hook_name} at {}: {why}\nexpected {expected_line}\nstdout:\n{stdout}",
+                    cwd.display()
+                );
+
+                // The preload follows the binding: nothing bound means nothing
+                // injected, so a home that is not a repository leaves every
+                // process in it on raw disk rather than under an unserved root.
+                let preload_line = if cfg!(target_os = "macos") {
+                    format!("DYLD=[{}]", shim.display())
+                } else {
+                    format!("LD=[{}]", shim.display())
+                };
+                let empty_preload = if cfg!(target_os = "macos") {
+                    "DYLD=[]"
+                } else {
+                    "LD=[]"
+                };
+                if expected.is_some() {
+                    assert!(
+                        stdout.contains(&preload_line),
+                        "{hook_name} at {}: a bound repository must still inject the shim\
+                         \nstdout:\n{stdout}",
+                        cwd.display()
+                    );
+                } else {
+                    assert!(
+                        stdout.contains(empty_preload),
+                        "{hook_name} at {}: an unbound directory must not inject the shim\
+                         \nstdout:\n{stdout}",
+                        cwd.display()
+                    );
+                }
+            }
+        }
+        assert!(
+            shells_run > 0,
+            "no POSIX shell was available, so this test proved nothing"
+        );
+    }
+
+    /// The text contract, so the four installed hooks cannot drift apart and so
+    /// the one this fleet has no host for is covered too. PowerShell is checked
+    /// here or nowhere.
+    #[test]
+    fn every_installed_hook_admits_a_root_only_on_the_repository_manifest() {
+        // (shell, hook, the predicate it must carry, the pre-fix adjacency it
+        // must no longer carry: the bare `.kin`-is-a-directory admission)
+        let contracts: [(&str, &str, &str, &str); 4] = [
+            (
+                "zsh",
+                ZSH_HOOK,
+                "_kin_vfs_is_repository() {\n    [[ -f \"$1/.kin/manifest.json\" ]]\n}",
+                "[[ -d \"$dir/.kin\" && ! -L \"$dir/.kin\" ]] || return 1\n            if [[ -n \"$boundary\"",
+            ),
+            (
+                "bash",
+                BASH_HOOK,
+                "_kin_vfs_is_repository() {\n    [ -f \"$1/.kin/manifest.json\" ]\n}",
+                "[ -d \"$dir/.kin\" ] && [ ! -L \"$dir/.kin\" ] || return 1\n            if [ -n \"$boundary\"",
+            ),
+            (
+                "fish",
+                FISH_HOOK,
+                "function _kin_vfs_is_repository\n    test -f \"$argv[1]/.kin/manifest.json\"\nend",
+                "test -d \"$dir/.kin\"; and not test -L \"$dir/.kin\"; or return 1\n            if test -n \"$boundary\"",
+            ),
+            (
+                "powershell",
+                POWERSHELL_HOOK,
+                "[System.IO.File]::Exists((Join-Path (Join-Path $Path \".kin\") \"manifest.json\"))",
+                "-ne 0)) {\n                return $null\n            }\n            if ($Boundary",
+            ),
+        ];
+        for (shell, hook, predicate, pre_fix) in contracts {
+            assert!(
+                hook.contains(predicate),
+                "the {shell} hook carries no repository-manifest predicate; \
+                 a `.kin` directory alone admits the managed toolchain home as a \
+                 projection root (FIR-2552)"
+            );
+            assert!(
+                !hook.contains(pre_fix),
+                "the {shell} hook still admits a root straight off the `.kin` directory test, \
+                 so the toolchain home binds again (FIR-2552)"
             );
         }
     }

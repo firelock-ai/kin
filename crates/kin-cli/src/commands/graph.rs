@@ -609,6 +609,37 @@ fn build_graph_status_response(
             if embedding_runtime.embedding_coverage_ever_complete {
                 embeddings_line.push_str(" and coverage has completed on this store before");
             }
+        } else if embedding_runtime.embedding_coverage_ever_complete {
+            // An index IS attached, coverage is short, and nothing above
+            // applies. Until this arm existed the line fell off the end of the
+            // chain and rendered bare, so a store that had lost ground read
+            // exactly like a store filling for the first time. The evidence is
+            // the rc0545c brown arm, which logged a per-key vector salvage at
+            // 00:35:35Z and then published `Embeddings: 1770/2112 indexed (342
+            // pending)` at 00:38:19Z with nothing beside it (FIR-2562).
+            //
+            // The arm above cannot cover this case: it is gated on no index
+            // being attached, and a salvage attaches one. The marker this reads
+            // is durable rather than latched in memory
+            // (`DaemonState::embedding_coverage_ever_complete`), so the daemon
+            // that opens after the drift still knows what an earlier daemon on
+            // this store finished, which is what makes the arm reachable in the
+            // very case it exists for.
+            //
+            // The claim stops where the evidence does. This says a fill
+            // finished here once and this shortfall is measured against it. It
+            // does NOT say what caused the shortfall, because a working copy
+            // that admitted new files and a sidecar that retired keys at open
+            // are indistinguishable from here. Naming the cause and its counts
+            // needs the salvage outcome kin-db already computes and discards at
+            // `kin-db crates/kin-db/src/storage/snapshot.rs:2117`, which
+            // `SnapshotManager::load_vector_index_into_graph_if_valid` collapses
+            // into a bare `Ok(true)`. That is the other half of FIR-2562 and it
+            // is a kin-db change, so no clause here may imply kin knows it.
+            embeddings_line.push_str(
+                "; coverage has completed on this store before, so this is a shortfall against a \
+                 fill that finished rather than a first fill",
+            );
         }
         // Appended after the chain rather than folded into it: every clause
         // above stays true while the model is arriving, and this names the one
@@ -2048,6 +2079,155 @@ mod tests {
                 .any(|line| line.contains("no relation in this graph crosses a file boundary")),
             "a graph that does cross files must not be told it cannot: {:?}",
             response.lines
+        );
+    }
+
+    /// Attach a vector index covering `covered` of this graph's retrievable
+    /// keys, so the store reads as measured and short at the same time.
+    ///
+    /// That pair is what a per-key salvage leaves behind and what no other
+    /// fixture here produces: the daemon installed an index, so coverage IS
+    /// measured, and it retired the keys current truth could not prove, so
+    /// coverage is short. A fixture with no index attached cannot reach the arm
+    /// under test, because the arm above it is gated on exactly that.
+    #[cfg(feature = "vector")]
+    fn attach_partial_vector_index(
+        graph: &kin_db::InMemoryGraph,
+        dir: &std::path::Path,
+        covered: usize,
+    ) {
+        let index = kin_db::VectorIndex::new(2).unwrap();
+        let snapshot = graph.to_snapshot();
+        let keys: Vec<kin_model::RetrievalKey> = snapshot
+            .entities
+            .keys()
+            .map(|id| kin_model::RetrievalKey::Entity(*id))
+            .chain(
+                snapshot
+                    .entity_revisions
+                    .values()
+                    .flat_map(|revisions| revisions.iter())
+                    .map(|revision| kin_model::RetrievalKey::EntityRevision(revision.revision_id)),
+            )
+            .collect();
+        assert!(
+            keys.len() > covered,
+            "the fixture must leave keys uncovered so the store reads short: {} keys, {covered} \
+             covered",
+            keys.len()
+        );
+        for key in keys.iter().take(covered) {
+            index.upsert_retrievable(*key, &[1.0, 0.0]).unwrap();
+        }
+        let descriptor = kin_db::IndexDescriptor {
+            model_id: Some("salvage-partial-coverage-fixture@v1".to_string()),
+            graph_root: Some(hex::encode(graph.compute_root_hash())),
+        };
+        index.set_descriptor(descriptor.clone());
+        let path = dir.join("partial.kvec");
+        index.save(&path).unwrap();
+        assert!(matches!(
+            graph.load_vector_index_compatible(&path, &descriptor),
+            kin_db::VectorIndexLoad::Loaded(_)
+        ));
+    }
+
+    /// A store whose coverage was whole once and is short now says so, and the
+    /// clause has to survive an index being attached.
+    ///
+    /// This is the rendering half of FIR-2562. A per-key vector salvage retires
+    /// what current graph truth cannot prove and installs the rest, so the
+    /// daemon records no discard and the graph carries a measured, partial
+    /// index. Every clause on this line was gated either on a recorded discard
+    /// or on NO index being attached, so a salvaged store fell off the end of
+    /// the chain and rendered bare: the rc0545c brown arm logged its salvage at
+    /// 00:35:35Z and published `Embeddings: 1770/2112 indexed (342 pending)` at
+    /// 00:38:19Z with nothing beside it, which is byte-for-byte the shape a
+    /// store filling for the first time prints.
+    ///
+    /// Both directions are driven, because the clause is only worth anything if
+    /// it separates the two stores it exists to separate. The store that never
+    /// finished a fill must render the same counters and no clause.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn a_measured_store_short_of_a_fill_it_once_finished_says_so() {
+        let (temp, binding, graph) = graph_validation_fixture();
+        for name in ["alpha_transform", "beta_reduce", "gamma_emit", "delta_fold"] {
+            graph.upsert_entity(&test_entity(name)).unwrap();
+        }
+        attach_partial_vector_index(&graph, temp.path(), 2);
+
+        // The fixture has to hold both properties at once or the arm under test
+        // is unreachable and every assertion below passes on the arm above it.
+        let status = graph.embedding_status();
+        assert!(
+            graph.vector_index_stats().is_some(),
+            "the fixture must carry an ATTACHED index, which is what a salvage leaves"
+        );
+        assert!(
+            status.pending > 0 && status.indexed > 0,
+            "the fixture must read measured and short: {status:?}"
+        );
+
+        let ever_complete = build_graph_status_response(
+            &pinned(&binding),
+            &graph,
+            &Default::default(),
+            &crate::commands::resources::EmbedRuntimeState {
+                vector_index_discarded: None,
+                embedding_coverage_ever_complete: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let ever_complete_line = ever_complete
+            .lines
+            .iter()
+            .find(|line| line.starts_with("Embeddings:"))
+            .expect("the embeddings line still renders");
+        assert!(
+            ever_complete_line.contains(
+                "a shortfall against a fill that finished rather than a \
+                 first fill"
+            ),
+            "a store that lost ground must not render as a first fill: {ever_complete_line}"
+        );
+        assert!(
+            !ever_complete_line.contains("the live graph carries no vector index"),
+            "an attached index must not be described as absent: {ever_complete_line}"
+        );
+        // The cause and its counts live in kin-db and are not plumbed yet, so
+        // nothing here may imply this line knows which of them applies.
+        for forbidden in ["salvage", "retired", "evicted", "vectors were dropped"] {
+            assert!(
+                !ever_complete_line.contains(forbidden),
+                "this line cannot name a cause kin does not receive ({forbidden}): \
+                 {ever_complete_line}"
+            );
+        }
+
+        let first_fill = build_graph_status_response(
+            &pinned(&binding),
+            &graph,
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
+        let first_fill_line = first_fill
+            .lines
+            .iter()
+            .find(|line| line.starts_with("Embeddings:"))
+            .expect("the embeddings line still renders");
+        assert!(
+            first_fill_line.contains(&format!(
+                "{}/{} indexed ({} pending)",
+                status.indexed, status.total, status.pending
+            )),
+            "the counters stay disclosed on both stores: {first_fill_line}"
+        );
+        assert!(
+            !first_fill_line.contains("a fill that finished"),
+            "a store that never finished a fill must not claim one: {first_fill_line}"
         );
     }
 
