@@ -135,6 +135,33 @@ impl AdmittedWorkspaceTree {
     }
 }
 
+/// The exact tree repository authority currently records for this workspace.
+///
+/// The derived graph's counterpart, and the answer `kin status` reports while
+/// `kin graph status` reports the graph's own. The two agreeing is the invariant
+/// a deferred admission is opened against and the one a failed commit has to
+/// restore. It lives here rather than beside its caller because the lease
+/// accessor it reads shares a method name with a filesystem probe, and this is
+/// the module where that accessor is already accounted for.
+pub(crate) fn authority_workspace_tree(
+    authority_context: &LocalRepositoryAuthorityContext,
+) -> Result<kin_model::ResolvedTree> {
+    let workspace_id = authority_context.workspace_id();
+    let authority = authority_context.open().map_err(DaemonError::Graph)?;
+    let lease = authority.read_authority();
+    lease
+        .metadata()
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.workspace_id == workspace_id)
+        .map(|workspace| workspace.tree.clone())
+        .ok_or_else(|| {
+            invalid(format!(
+                "repository authority has no local workspace {workspace_id}"
+            ))
+        })
+}
+
 /// Admit `desired_tree` for a test by taking a real host walk first.
 ///
 /// `CompleteScanToken` cannot be minted outside `kin-index`, so a test cannot
@@ -1201,10 +1228,19 @@ pub(crate) fn commit_native_plan_with_observed_target_tree(
     observed: &AdmittedWorkspaceTree,
 ) -> Result<NativeCommitResult> {
     if observed.previous_tree != plan.previous_tree {
+        // The recovery is named here because this is the first thing a wedged
+        // daemon says, and on its own the sentence above describes the mismatch
+        // without telling anyone what to do about it. A derived graph that has
+        // outrun repository authority is not cleared by admitting again, by
+        // committing again, or by editing the file: each of those plans out of
+        // the same graph tree and reaches the same refusal, wearing a different
+        // message every time.
         return Err(invalid(
             "the completed host walk was planned out of a different workspace tree than this \
              commit publishes from; a collapsed commit may not carry a tree transition no walk \
-             observed",
+             observed. The derived graph this daemon answers from is ahead of repository \
+             authority, and no later command clears that on its own: run `kin daemon stop` and \
+             then this command again",
         ));
     }
     if observed.desired_tree != plan.target_tree {
