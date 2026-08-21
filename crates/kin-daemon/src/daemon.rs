@@ -311,6 +311,90 @@ pub(crate) fn reset_vector_index_and_requeue_after_contention_for_test(
 /// for this language", and two surfaces outside the enrichment loop need that
 /// answer to agree with it: the provisioning advice that tells an operator what
 /// to install, and the proof that starts a real server against a fixture.
+/// Probe what each enrichable language's server can actually do, then publish
+/// it for the query paths.
+///
+/// Spawned rather than awaited. Probing means starting each server and running
+/// the initialize handshake, and four languages against the probe budget would
+/// add seconds to daemon startup in the healthy case and far more when a server
+/// hangs. Nothing waits on the answer: until it publishes, every observation
+/// reads the readiness as unknown, which already keeps the absence-trust gate
+/// silent and is the honest state for a daemon that has not finished looking.
+///
+/// Safe against the daemon's own enrichment path by construction, not by
+/// timing. The sweep decides what to start from `lsp_adapter_for` and its own
+/// `servers` map, and enrichment availability comes from `discover_servers`;
+/// neither reads the published verdict, so a probe still in flight cannot
+/// change what the daemon does. The publish is write-only here and consumed
+/// only by kin-mcp.
+///
+/// The probes run concurrently, so the worst case is one probe budget rather
+/// than one per language.
+fn spawn_language_server_readiness_probe(workspace_root: std::path::PathBuf) {
+    use kin_core::reference_coverage::{
+        LanguageServerReadiness, LanguageServerReadinessMap, ENRICHABLE_LANGUAGES,
+    };
+    use kin_lsp::registry::{ProviderGapReason, ProviderRegistry};
+
+    tokio::spawn(async move {
+        // One task per language so the probes overlap: the worst case is one
+        // probe budget rather than one per language.
+        let probes: Vec<_> = ENRICHABLE_LANGUAGES
+            .iter()
+            .copied()
+            .map(|language| {
+                let workspace_root = workspace_root.clone();
+                tokio::spawn(async move {
+                    let registry = ProviderRegistry::with_defaults();
+                    let initialization_options = lsp_adapter_for(language, &workspace_root)
+                        .and_then(|(_, _, init_opts)| init_opts);
+                    let readiness = match kin_lsp::lifecycle::probe_readiness(
+                        &registry,
+                        language,
+                        &workspace_root,
+                        initialization_options,
+                    )
+                    .await
+                    {
+                        Ok(_) => LanguageServerReadiness::Usable,
+                        Err(gap) => match gap.reason {
+                            ProviderGapReason::ServerUnusable { message } => {
+                                LanguageServerReadiness::Unusable { reason: message }
+                            }
+                            _ => LanguageServerReadiness::Absent,
+                        },
+                    };
+                    (language, readiness)
+                })
+            })
+            .collect();
+
+        let mut readiness = LanguageServerReadinessMap::new();
+        for probe in probes {
+            match probe.await {
+                Ok((language, state)) => {
+                    if let LanguageServerReadiness::Unusable { reason } = &state {
+                        warn!(
+                            %language,
+                            %reason,
+                            "a language server is installed but cannot start, so this \
+                             language's cross-file reference edges cannot be produced on \
+                             this host"
+                        );
+                    }
+                    readiness.insert(language, state);
+                }
+                // A probe task that panicked establishes nothing about its
+                // language, and recording it as Absent would be a claim this
+                // process did not earn. Leaving it out reads as unknown.
+                Err(error) => warn!(%error, "a language server readiness probe did not finish"),
+            }
+        }
+
+        kin_mcp::edge_coverage::publish_language_server_readiness(readiness);
+    });
+}
+
 pub fn lsp_adapter_for(
     language: kin_model::LanguageId,
     workspace_root: &std::path::Path,
@@ -1855,9 +1939,12 @@ pub async fn run_with_authority_on(
     // than re-sweeping a converged graph.
     load_lsp_enriched_marker(&state);
 
-    kin_mcp::edge_coverage::publish_installed_language_servers(
-        kin_core::reference_coverage::installed_language_servers(),
-    );
+    // The working directory as the layout already holds it. Deliberately not
+    // canonicalized: a readiness probe asks whether a server starts and
+    // completes a handshake, never resolving a file through this path, so the
+    // filesystem round trip would buy nothing and this is an authority-path
+    // crate where every such call has to earn itself.
+    spawn_language_server_readiness_probe(state.layout.working_dir().to_path_buf());
 
     // Set up LSP enrichment channel before wrapping state in Arc.
     let enrichment_enabled =
@@ -3101,6 +3188,18 @@ pub async fn run_with_authority_on(
 
                     LspEnrichmentMessage::Sweep => {
                         info!("LSP cold sweep started, enriching all entities");
+                        // Re-probe here, not only at daemon start. Readiness
+                        // taken once latches: a user who follows Kin's own
+                        // advice and installs the server it just named leaves a
+                        // long-lived daemon reporting that language unavailable
+                        // for the rest of its life, and the stale answer is an
+                        // input under an agent-facing verdict. A sweep is the
+                        // moment the daemon is about to want servers, so it is
+                        // the firing point that needs no new signal invented.
+                        // Same probe-then-publish as at start, and it overwrites
+                        // rather than merges, because a fresh answer supersedes
+                        // an old one wholesale.
+                        spawn_language_server_readiness_probe(lsp_root.clone());
                         lsp_state
                             .lsp_sweep_running
                             .store(true, std::sync::atomic::Ordering::SeqCst);
