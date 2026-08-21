@@ -275,4 +275,4 @@ jobs:
           python3 scripts/acceptance/gate.py \
             --report magic=acceptance/magic.json \
             --report brownfield=acceptance/brownfield.json \
-            --allow-unreadable 'brownfield:4=FIR-2593: the express app.handle walk came back truncated=True with clipped_steps=None on a debug build of main, so an absent edge could not be told from a dropped one. This job now builds release, which is what decides it; the moment the check passes this allowance announces itself stale and can go.'
+            --allow-unreadable 'brownfield:4=FIR-2593: the express app.handle walk comes back truncated=True with clipped_steps=None on ubuntu-latest, so an absent edge cannot be told from a dropped one. Build profile, product code from 0.5.44 through 0.5.46, and the pinned language-server versions are all ruled out; platform and code newer than 0.5.46 are still confounded. The moment the check passes this allowance announces itself stale and can go.'
