@@ -1147,7 +1147,155 @@ fn check_projection_mode() -> HealthCheck {
         &repo_root,
         None,
     );
-    projection_mode_check_for(&report, env::consts::OS)
+    let outside = probe_outside_repo(home_dir().ok().as_deref(), report.shim.engaged);
+    projection_mode_check_for(&report, env::consts::OS, &outside)
+}
+
+/// What a real syscall through the shim says about a path outside the
+/// repository.
+///
+/// The rest of this row measures the repository, which is the one place an
+/// engaged shim is certain to serve, and that is why it can be green in a shell
+/// where the user's version control does not run. Git reads
+/// `$HOME/.config/git/config` on every single command, so a shim that answers
+/// an error for paths under the home directory breaks `git status`, `git init`
+/// and `git config` in any directory at all while this row reports the
+/// projection healthy and doctor reports nothing needing attention. A health
+/// check that is green in the configuration where git is broken sends the
+/// user's suspicion somewhere else, which is worse than having no check.
+///
+/// So the answer is measured rather than assumed, and it is measured where the
+/// assumption breaks: outside the repository, with a real `read_dir` and a real
+/// `stat`, through whatever the loader has injected into this process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OutsideRepoProbe {
+    /// A syscall on a path under the home directory succeeded.
+    Served(String),
+    /// A syscall on a path under the home directory failed, and this is what it
+    /// said. The projection cannot be called healthy on this evidence.
+    Broken(String),
+    /// No syscall was taken, and this is why. Neutral by construction: an
+    /// unengaged shim, an unresolvable home, or a home with nothing in it says
+    /// nothing about the projection either way, and must not be allowed to turn
+    /// a healthy row red or a broken one green.
+    NotTaken(String),
+}
+
+impl OutsideRepoProbe {
+    /// The probe's own words, whatever the verdict, so any row can name the
+    /// evidence it rests on rather than asserting a result.
+    fn evidence(&self) -> &str {
+        match self {
+            Self::Served(text) | Self::Broken(text) | Self::NotTaken(text) => text,
+        }
+    }
+}
+
+/// Whether one entry's failed `lstat` is the projection answering.
+///
+/// A path that is simply not there is a race with whatever else is running on
+/// the machine rather than a projection failure, so it is not held against the
+/// shim. Every other error is the projection answering, and the EIO the
+/// container in FIR-2554 returned for everything under the home directory is
+/// one of them.
+///
+/// Pure over the kind because the racing case cannot be staged on a real
+/// filesystem: without this, that branch would be one nobody had ever executed.
+fn stat_failure_blames_the_projection(kind: std::io::ErrorKind) -> bool {
+    kind != std::io::ErrorKind::NotFound
+}
+
+/// How many entries of the home directory the probe will try before giving up.
+///
+/// One is enough on any healthy machine, and the budget exists only so a run of
+/// dangling symlinks at the front of the listing cannot end the probe early. It
+/// is small because a home directory that answers for none of its first few
+/// entries has told us what we needed either way.
+const PROBE_ENTRY_BUDGET: usize = 8;
+
+/// Take the probe. `home` is `None` when this process cannot resolve a home
+/// directory at all, which is a reason not to probe rather than a defect.
+///
+/// Pure over its two inputs so both the serving and the failing case are
+/// testable without a shim, a container, or a real `$HOME`.
+fn probe_outside_repo(home: Option<&Path>, shim_engaged: bool) -> OutsideRepoProbe {
+    if !shim_engaged {
+        return OutsideRepoProbe::NotTaken(
+            "the shim is not injected into this process, so there is nothing outside the \
+             repository to read through it"
+                .to_string(),
+        );
+    }
+    let Some(home) = home else {
+        return OutsideRepoProbe::NotTaken(
+            "no home directory could be resolved, so no path outside the repository was read"
+                .to_string(),
+        );
+    };
+    let entries = match std::fs::read_dir(home) {
+        Ok(entries) => entries,
+        Err(error) => {
+            return OutsideRepoProbe::Broken(format!(
+                "reading {} through the shim failed: {error}",
+                home.display()
+            ));
+        }
+    };
+    // Several entries rather than the first one, because which entry `read_dir`
+    // hands back first is arbitrary and one of them can be a dangling symlink or
+    // a file that vanished between the listing and the stat. Either would make
+    // one entry answer for the whole home directory, and a false red here is the
+    // exact trade FIR-2554 forbids: a row that is permanently pessimistic has
+    // replaced one wrong answer with another.
+    let mut absent = 0usize;
+    let mut listed = 0usize;
+    for entry in entries.take(PROBE_ENTRY_BUDGET) {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                return OutsideRepoProbe::Broken(format!(
+                    "listing {} through the shim failed: {error}",
+                    home.display()
+                ));
+            }
+        };
+        listed += 1;
+        let path = entry.path();
+        // `symlink_metadata`, not `metadata`: the question is whether the shim
+        // serves this path, and following a link would fold the link target's
+        // absence into the answer.
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => {
+                return OutsideRepoProbe::Served(format!(
+                    "read {} and stat of {} through the shim succeeded",
+                    home.display(),
+                    path.display()
+                ));
+            }
+            Err(error) if !stat_failure_blames_the_projection(error.kind()) => absent += 1,
+            Err(error) => {
+                return OutsideRepoProbe::Broken(format!(
+                    "stat of {} through the shim failed: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    // Nothing listed, or everything listed had gone by the time it was stat'd.
+    // Neither is a passing probe. Reporting either as Served would make this
+    // check unable to fail on exactly the machine it was written for.
+    if listed == 0 {
+        OutsideRepoProbe::NotTaken(format!(
+            "{} is empty, so there was nothing under it to read through the shim",
+            home.display()
+        ))
+    } else {
+        OutsideRepoProbe::NotTaken(format!(
+            "every one of the {absent} entries read from {} had gone by the time it was stat'd, \
+             so nothing outside the repository was measured",
+            home.display()
+        ))
+    }
 }
 
 /// Build the projection row from an already-probed report. Split out so all
@@ -1161,6 +1309,7 @@ fn check_projection_mode() -> HealthCheck {
 fn projection_mode_check_for(
     report: &crate::commands::projection::ProjectionReport,
     os: &str,
+    outside: &OutsideRepoProbe,
 ) -> HealthCheck {
     use crate::commands::projection::ProjectionMode;
 
@@ -1169,6 +1318,28 @@ fn projection_mode_check_for(
     let evidence = live.evidence.join("; ");
     let detail = format!("{row}; {evidence}");
     let any_available = report.modes.iter().any(|probe| probe.available);
+
+    // Before anything else, because a failing syscall outside the repository
+    // outranks every other reading this row can take. The repository probes can
+    // all be green while the shim answers errors for the home directory, and
+    // that combination is the one where `git status` exits 128 in any directory
+    // and doctor says nothing needs attention.
+    if let OutsideRepoProbe::Broken(evidence_outside) = outside {
+        return HealthCheck::new(
+            "projection_mode",
+            "Projection in force",
+            HealthStatus::Misconfigured,
+            format!(
+                "the projection is engaged but does not serve paths outside the repository, so \
+                 tools that read configuration from the home directory are broken in this shell; \
+                 git reads $HOME/.config/git/config on every command; {evidence_outside}; {detail}"
+            ),
+        )
+        .with_manual_fix(
+            "run `kin vfs off` to disengage the projection, or start a shell without the hook, \
+             and check that `git status` works before trusting this row again",
+        );
+    }
 
     // Nothing chosen and nothing installed is the installer's sanctioned
     // outcome, not a defect: the CLI and daemon answer from the graph without
@@ -1201,6 +1372,10 @@ fn projection_mode_check_for(
     }
 
     if !live.degraded {
+        // A green row names the probe it rests on, so a reader can tell a
+        // projection that was measured outside the repository from one that was
+        // only measured inside it.
+        let detail = format!("{detail}; {}", outside.evidence());
         return HealthCheck::new(
             "projection_mode",
             "Projection in force",
@@ -1261,7 +1436,15 @@ fn projection_mode_check_for(
     };
     HealthCheck::new("projection_mode", "Projection in force", status, detail).with_manual_fix(
         if advisory {
-            "start a new shell, or run `exec $SHELL -l`, so the hook injects the shim"
+            // Not `exec $SHELL -l`. A stock Debian `~/.bashrc` guards itself on
+            // interactivity (`case $- in *i*) ;; *) return;; esac`), not on
+            // login, so a login shell does not engage the hook there and the
+            // old advice named the wrong lever for that shell. And the shell
+            // this line asks the user to create is one no probe has been taken
+            // in, so it asks for the probe rather than promising the result.
+            "start a new interactive shell so the hook injects the shim, then run `kin doctor` \
+             again there: a login shell does not engage the hook where the shell's startup file \
+             only runs when interactive, and this row cannot speak for a shell it has not run in"
         } else {
             "run `kin vfs on` to engage a projection, or `kin vfs status` to see why none is \
              available here"
@@ -3984,7 +4167,14 @@ mod tests {
     fn projection_mode_check_for_macos(
         report: &crate::commands::projection::ProjectionReport,
     ) -> HealthCheck {
-        projection_mode_check_for(report, "macos")
+        projection_mode_check_for(report, "macos", &not_probed())
+    }
+
+    /// The neutral probe: no shim injected into this process, so nothing
+    /// outside the repository was read. Every fixture that predates the probe
+    /// uses it, which keeps their meaning exactly what it was.
+    fn not_probed() -> OutsideRepoProbe {
+        OutsideRepoProbe::NotTaken("fixture: no probe taken".to_string())
     }
 
     fn mode_probe(mode: ProjectionMode, available: bool) -> ModeProbe {
@@ -4145,10 +4335,13 @@ mod tests {
         );
         assert!(!matches!(check.status, HealthStatus::Healthy));
         assert!(!is_failing(&check.status));
-        assert!(check
-            .manual_fix
-            .as_deref()
-            .is_some_and(|fix| fix.contains("new shell")));
+        assert!(
+            check
+                .manual_fix
+                .as_deref()
+                .is_some_and(|fix| fix.contains("new interactive shell")),
+            "the fix must still point at a new shell, and say which kind: {check:?}"
+        );
     }
 
     /// The container case, at the row level. A driver the loader refuses
@@ -4247,7 +4440,7 @@ mod tests {
         );
 
         for os in ["macos", "linux"] {
-            let check = projection_mode_check_for(&bare, os);
+            let check = projection_mode_check_for(&bare, os, &not_probed());
             assert!(
                 matches!(check.status, HealthStatus::Unsupported),
                 "{os} keeps the sanctioned skip, got {:?}",
@@ -4256,7 +4449,7 @@ mod tests {
             assert!(!is_failing(&check.status));
         }
 
-        let windows = projection_mode_check_for(&bare, "windows");
+        let windows = projection_mode_check_for(&bare, "windows", &not_probed());
         assert!(
             !matches!(windows.status, HealthStatus::Unsupported),
             "Windows has no sanctioned skip, got {:?}",
@@ -4269,6 +4462,231 @@ mod tests {
                     .as_deref()
                     .is_none_or(|note| !note.contains("would need")),
             "Windows must not be told that nothing is missing: {windows:?}"
+        );
+    }
+
+    /// FIR-2554, stated as the stranger found it. Every probe the row takes
+    /// inside the repository is green, the shim is engaged, nothing reads
+    /// degraded, and in that same shell `git status` exits 128 because the shim
+    /// answers an error for `$HOME/.config/git/config`. The row must not be
+    /// healthy on evidence it never gathered.
+    #[test]
+    fn a_shim_that_fails_outside_the_repository_cannot_read_healthy() {
+        let mut healthy = report(
+            Some(ProjectionMode::Shim),
+            &[ProjectionMode::Shim],
+            live(
+                ProjectionMode::Shim,
+                ProjectionMode::Shim,
+                Tri::NotApplicable,
+                Tri::Yes,
+                false,
+            ),
+        );
+        healthy.shim.engaged = true;
+
+        // The control first: with the same report and no failing probe, this
+        // row is green. That is what makes the assertion below about the probe
+        // rather than about the fixture.
+        let green = projection_mode_check_for(&healthy, "macos", &not_probed());
+        assert!(
+            matches!(green.status, HealthStatus::Healthy),
+            "the fixture must be green without a failing probe, got {:?}",
+            green.status
+        );
+
+        let broken = OutsideRepoProbe::Broken(
+            "stat of /home/dev/.bashrc through the shim failed: Input/output error (os error 5)"
+                .to_string(),
+        );
+        let check = projection_mode_check_for(&healthy, "macos", &broken);
+        assert!(
+            is_failing(&check.status),
+            "a shim that cannot serve paths outside the repository must fail this row, got {:?}",
+            check.status
+        );
+        assert!(
+            check.detail.contains("Input/output error"),
+            "the row must carry the cause the probe reported: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("$HOME/.config/git/config"),
+            "the row must name why this breaks git: {}",
+            check.detail
+        );
+        assert!(
+            check
+                .manual_fix
+                .as_deref()
+                .is_some_and(|fix| fix.contains("kin vfs off")),
+            "the row must offer a way out: {check:?}"
+        );
+    }
+
+    /// The other direction, which the ticket names as its positive control: a
+    /// working shim on a working host still reaches green. A fix that made this
+    /// row permanently pessimistic would have traded a false green for a false
+    /// red, and this is the test that would not let it.
+    #[test]
+    fn a_shim_that_serves_outside_the_repository_still_reads_healthy() {
+        let mut healthy = report(
+            Some(ProjectionMode::Shim),
+            &[ProjectionMode::Shim],
+            live(
+                ProjectionMode::Shim,
+                ProjectionMode::Shim,
+                Tri::NotApplicable,
+                Tri::Yes,
+                false,
+            ),
+        );
+        healthy.shim.engaged = true;
+        let served = OutsideRepoProbe::Served(
+            "read /home/dev and stat of /home/dev/.bashrc through the \
+                                     shim succeeded"
+                .to_string(),
+        );
+        let check = projection_mode_check_for(&healthy, "macos", &served);
+        assert!(
+            matches!(check.status, HealthStatus::Healthy),
+            "a shim that serves outside the repository is healthy, got {:?}",
+            check.status
+        );
+        assert!(
+            check.detail.contains("through the shim succeeded"),
+            "a green row names the probe it rests on: {}",
+            check.detail
+        );
+    }
+
+    /// The probe itself, driven through every branch it has. A verdict set
+    /// nobody has proven reachable is a set of branches rather than a set of
+    /// verdicts, so each one is produced here from a real directory.
+    #[test]
+    fn the_outside_repository_probe_reaches_every_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Not engaged: nothing is taken, whatever the home holds.
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join(".bashrc"), "").unwrap();
+        assert!(matches!(
+            probe_outside_repo(Some(&home), false),
+            OutsideRepoProbe::NotTaken(_)
+        ));
+
+        // Engaged over a home with something in it: a real read and a real stat.
+        match probe_outside_repo(Some(&home), true) {
+            OutsideRepoProbe::Served(evidence) => {
+                assert!(evidence.contains(".bashrc"), "{evidence}");
+            }
+            other => panic!("a readable home must serve: {other:?}"),
+        }
+
+        // Engaged over a home that cannot be read at all: the failing verdict,
+        // which is the one the whole check exists for.
+        let gone = dir.path().join("no-such-home");
+        match probe_outside_repo(Some(&gone), true) {
+            OutsideRepoProbe::Broken(evidence) => {
+                assert!(evidence.contains("no-such-home"), "{evidence}");
+            }
+            other => panic!("an unreadable home must be broken: {other:?}"),
+        }
+
+        // Engaged over an empty home: nothing was read, so nothing is claimed.
+        // Reporting this as Served would make the check unable to fail on a
+        // machine whose home directory happens to be empty.
+        let empty = dir.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(matches!(
+            probe_outside_repo(Some(&empty), true),
+            OutsideRepoProbe::NotTaken(_)
+        ));
+
+        // Engaged over a home whose only entries are dangling symlinks. This is
+        // the false-red case: `metadata` follows the link, finds nothing, and
+        // would report a perfectly healthy machine as a broken projection. The
+        // probe stats the link itself, so the home still serves.
+        #[cfg(unix)]
+        {
+            let dangling = dir.path().join("dangling-home");
+            std::fs::create_dir_all(&dangling).unwrap();
+            std::os::unix::fs::symlink(
+                dir.path().join("target-that-is-not-there"),
+                dangling.join(".broken-link"),
+            )
+            .unwrap();
+            match probe_outside_repo(Some(&dangling), true) {
+                OutsideRepoProbe::Served(evidence) => {
+                    assert!(evidence.contains(".broken-link"), "{evidence}");
+                }
+                other => panic!("a dangling symlink is not a broken projection: {other:?}"),
+            }
+        }
+
+        // The racing entry, which no fixture can stage: an entry that read_dir
+        // returned and lstat then could not find. It must not be blamed on the
+        // projection, while every other error must be.
+        assert!(!stat_failure_blames_the_projection(
+            std::io::ErrorKind::NotFound
+        ));
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::Other,
+            std::io::ErrorKind::InvalidInput,
+        ] {
+            assert!(
+                stat_failure_blames_the_projection(kind),
+                "{kind:?} is the projection answering and must fail the row"
+            );
+        }
+
+        // No home resolvable: a reason not to probe, not a defect.
+        assert!(matches!(
+            probe_outside_repo(None, true),
+            OutsideRepoProbe::NotTaken(_)
+        ));
+    }
+
+    /// The STALE fix line is the delivery mechanism FIR-2554 describes: it is
+    /// what walks a user into the shell where git does not run. It must not
+    /// name a login shell, which does not engage the hook on a stock Debian
+    /// `~/.bashrc`, and it must ask for the check rather than promise the
+    /// result.
+    #[test]
+    fn the_stale_fix_line_names_interactivity_and_asks_for_a_recheck() {
+        let mut installed_not_engaged = report(
+            Some(ProjectionMode::Shim),
+            &[ProjectionMode::Shim],
+            live(
+                ProjectionMode::Shim,
+                ProjectionMode::Shim,
+                Tri::NotApplicable,
+                Tri::Yes,
+                true,
+            ),
+        );
+        installed_not_engaged.shim.engaged = false;
+        let check = projection_mode_check_for(&installed_not_engaged, "macos", &not_probed());
+        assert!(
+            matches!(check.status, HealthStatus::Stale),
+            "an installed shim that is not engaged is the advisory case, got {:?}",
+            check.status
+        );
+        let fix = check.manual_fix.as_deref().unwrap_or_default();
+        assert!(
+            !fix.contains("exec $SHELL -l"),
+            "the fix must not name a login shell, which does not engage the hook on a stock \
+             Debian ~/.bashrc: {fix}"
+        );
+        assert!(
+            fix.contains("interactive"),
+            "the fix must name the condition the hook actually needs: {fix}"
+        );
+        assert!(
+            fix.contains("kin doctor"),
+            "the fix must ask for the check in the shell it creates: {fix}"
         );
     }
 
