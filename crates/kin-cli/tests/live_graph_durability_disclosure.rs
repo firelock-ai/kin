@@ -960,13 +960,30 @@ fn a_file_written_while_no_daemon_watched_is_admitted_by_the_next_one() {
     let before_write = first.log_offset();
     fs::write(repo.join(UNCOMMITTED_PATH), UNCOMMITTED_SOURCE)
         .expect("write the watched source");
-    let watched = wait_for_live_growth(
+    wait_for_live_growth(
         &first,
         &repo,
         &home,
         first_port,
         durable_at_init,
         before_write,
+    );
+    // Committed before the restart, and the reason is the confound this fixture
+    // would otherwise measure instead. A daemon rebuilds the entity layer for
+    // uncommitted content from zero on the next open (FIR-2421), so a count
+    // taken across a restart mixes what the catch-up added with what the
+    // restart dropped. On the first run of this case those two happened to be
+    // three entities each and the count came back unchanged over a catch-up
+    // that had plainly worked.
+    stdout_of(
+        &kin_against_daemon(&repo, &home, first_port, &["commit", "-m", "link graph"]),
+        "kin commit",
+    );
+    let watched = live_entity_count(&repo, &home, first_port);
+    assert!(
+        watched > durable_at_init,
+        "the fixture needs the watched write recorded before the restart, got {watched} against \
+         {durable_at_init} at init"
     );
     first.stop();
 
@@ -987,12 +1004,41 @@ fn a_file_written_while_no_daemon_watched_is_admitted_by_the_next_one() {
         WATCHER_BOUND,
         "plan a startup catch-up over what changed while it was down",
     );
-    let caught_up = wait_for_live_growth(&second, &repo, &home, second_port, watched, 0);
-    assert!(
-        caught_up > watched,
-        "the graph has to carry the file written while nothing watched: {caught_up} against \
-         {watched} before it"
+    second.wait_for_record(
+        ADMISSION_RECORD,
+        0,
+        ADMISSION_BOUND,
+        "admit what the catch-up planned",
     );
+    // The reconciler's own record for that exact path: direct evidence that the
+    // entity layer took the file, separate from the count below, so a failure
+    // says which half broke.
+    second.wait_for_record(
+        "src/catch_up.rs",
+        0,
+        ADMISSION_BOUND,
+        "reconcile the file written while it was down",
+    );
+    // Read with the daemon's own log in the failure, because the two ways this
+    // can fail need different fixes: a catch-up that planned nothing is an
+    // ingestion defect, and one that planned the path and never derived its
+    // entities is an enrichment defect.
+    let deadline = Instant::now() + COUNT_SETTLE_BOUND;
+    let caught_up = loop {
+        let live = live_entity_count(&repo, &home, second_port);
+        if live > watched {
+            break live;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the graph has to carry the file written while nothing watched, but the live \
+             entity count stayed at {live} against {watched} before the restart. The second \
+             daemon's log:\n{}",
+            second.log_text()
+        );
+        thread::sleep(Duration::from_millis(200));
+    };
+    assert!(caught_up > watched);
 
     second.stop();
 }
