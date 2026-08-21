@@ -332,11 +332,11 @@ pub fn write_approaching_commit(kin_root: &Path, record: &ApproachingCommit) {
     let Ok(body) = serde_json::to_string(record) else {
         return;
     };
-    let tmp = kin_root.join(format!("{APPROACHING_COMMIT_FILE_NAME}.tmp"));
-    if fs::write(&tmp, body).is_ok()
-        && fs::rename(&tmp, kin_root.join(APPROACHING_COMMIT_FILE_NAME)).is_err()
+    let announced = kin_root.join(format!("{APPROACHING_COMMIT_FILE_NAME}.tmp"));
+    if fs::write(&announced, body).is_ok()
+        && fs::rename(&announced, kin_root.join(APPROACHING_COMMIT_FILE_NAME)).is_err()
     {
-        let _ = fs::remove_file(&tmp);
+        let _ = fs::remove_file(&announced);
     }
 }
 

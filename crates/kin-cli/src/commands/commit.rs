@@ -823,4 +823,38 @@ mod tests {
              stands down for a commit that is never coming"
         );
     }
+
+    /// The withdrawal has to survive the ways a commit ends badly, not only the
+    /// way it ends well.
+    ///
+    /// Attribution refusals, transport failures and panics all leave by
+    /// unwinding rather than by reaching the end of `run`, and every one of them
+    /// would otherwise leave an announcement behind for a commit that is never
+    /// coming. The expiry bounds what that costs, but the guard is what makes it
+    /// cost nothing.
+    #[test]
+    fn a_commit_that_fails_mid_run_still_withdraws_its_announcement() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().to_path_buf();
+
+        let failed = std::panic::catch_unwind(move || {
+            let _announced = CommitAnnouncement::announce(&root);
+            assert!(
+                kin_daemon_spawn::read_approaching_commit(&root).is_some(),
+                "the announcement is published before the failure below, which is what makes \
+                 the assertion after it mean anything"
+            );
+            panic!("a commit that fails after announcing itself");
+        });
+
+        assert!(
+            failed.is_err(),
+            "the control must actually fail, or this test proves nothing about failing"
+        );
+        assert!(
+            kin_daemon_spawn::read_approaching_commit(repo.path()).is_none(),
+            "unwinding through the guard withdraws the announcement, so a commit that died on \
+             its way to the daemon does not hold the next ambient tick down"
+        );
+    }
 }
