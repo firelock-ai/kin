@@ -269,6 +269,91 @@ pub fn clear_open_transaction(kin_root: &Path) {
     let _ = fs::remove_file(kin_root.join(TRANSACTION_FILE_NAME));
 }
 
+/// File a client publishes an approaching commit into.
+pub const APPROACHING_COMMIT_FILE_NAME: &str = "commit.approaching";
+
+/// How long an announced commit stays worth standing an ambient tick down for.
+///
+/// The window covers one thing only: the gap between a client deciding to
+/// commit and its request reaching the daemon's handler, where the handler's own
+/// announcement takes over. That gap is dominated by daemon startup, because a
+/// client that has to start a daemon waits for the store to open before it can
+/// send anything, so the window is sized to a large store's open rather than to
+/// a request's round trip.
+///
+/// It is not the bound on how long admission can be held off. A tick stands
+/// down for a bounded number of consecutive rounds whatever this says, so a
+/// client killed between writing this marker and clearing it costs those rounds
+/// and nothing more.
+pub const APPROACHING_COMMIT_STALE_AFTER: Duration = Duration::from_secs(60);
+
+/// A commit that has started but has not reached the daemon yet.
+///
+/// The daemon cannot learn this any other way. A commit announces itself inside
+/// the handler it eventually reaches, and by then a cold daemon's first
+/// reconcile round has already decided whether to publish: the round and the
+/// request are racing, and the request is the one that has to wait for the store
+/// to open first. Writing the announcement to disk before the client does any
+/// of its own preparation is what lets a daemon that does not exist yet read it
+/// on the first round of its life.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ApproachingCommit {
+    /// The client that announced this commit. Carried so a reader can tell two
+    /// markers apart rather than to decide freshness, which is time-based:
+    /// asking whether a pid is alive answers about pid reuse as readily as
+    /// about the client.
+    pub pid: u32,
+    /// Unix seconds at which the client announced. Freshness is decided against
+    /// this.
+    pub announced_unix: u64,
+}
+
+impl ApproachingCommit {
+    /// Seconds since this commit announced itself, at `now_unix`.
+    pub fn age_secs(&self, now_unix: u64) -> u64 {
+        now_unix.saturating_sub(self.announced_unix)
+    }
+
+    /// Whether this announcement is recent enough to still be worth a stand
+    /// down.
+    pub fn is_fresh(&self, now_unix: u64) -> bool {
+        self.age_secs(now_unix) <= APPROACHING_COMMIT_STALE_AFTER.as_secs()
+    }
+}
+
+/// Announce an approaching commit for `kin_root`.
+///
+/// Best effort and atomic, for the same reason the transaction marker is: a
+/// reader must never see half a record. Best effort because an announcement
+/// that could not be written must never fail the commit it precedes; the cost
+/// of losing it is one redundant publication, which is exactly the cost of not
+/// having written it at all.
+pub fn write_approaching_commit(kin_root: &Path, record: &ApproachingCommit) {
+    let Ok(body) = serde_json::to_string(record) else {
+        return;
+    };
+    let announced = kin_root.join(format!("{APPROACHING_COMMIT_FILE_NAME}.tmp"));
+    if fs::write(&announced, body).is_ok()
+        && fs::rename(&announced, kin_root.join(APPROACHING_COMMIT_FILE_NAME)).is_err()
+    {
+        let _ = fs::remove_file(&announced);
+    }
+}
+
+/// Read the approaching-commit announcement for `kin_root`, if one is there.
+pub fn read_approaching_commit(kin_root: &Path) -> Option<ApproachingCommit> {
+    let raw = fs::read_to_string(kin_root.join(APPROACHING_COMMIT_FILE_NAME)).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Withdraw an approaching-commit announcement.
+///
+/// The client that wrote it calls this however its run ends, so an announcement
+/// never outlives the commit it was made for.
+pub fn clear_approaching_commit(kin_root: &Path) {
+    let _ = fs::remove_file(kin_root.join(APPROACHING_COMMIT_FILE_NAME));
+}
+
 /// File a daemon writes its own open cost into, for the next spawn to size an
 /// idle window against.
 pub const BOOT_COST_FILE_NAME: &str = "daemon-boot-cost.json";
