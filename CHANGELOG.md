@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Decompress the conversion closure once, and stop hashing a bootstrap transaction nothing reads (#1000)
 - Publish what a language server can do, not that its binary exists (#998)
 - Say when kin impact cannot rule out dependents, in the MCP verdict's own words (#999)
+- Gate the release train on the proof loop's own records (#993)
 
 
 ## [0.5.45] - 2026-08-20
