@@ -144,6 +144,17 @@ export function judgePreflight(record, sha) {
 // means the stranger passed. Those two readings are one careless sentence apart
 // in a status update, and only one of them is true. Anyone quoting this gate as
 // evidence of a good release is quoting it wrong.
+//
+// It also never means the stranger ran EVERYTHING. Nothing below reads the
+// `arms` field, deliberately: a green-only run.env satisfies this function
+// exactly as a two-arm one does, because a gate that demanded every arm would
+// block every budget-constrained release, which is the deferred-instrument
+// problem arriving by another door. The consequence is that a release evidenced
+// by one arm carries less coverage than one evidenced by two, and this gate
+// cannot tell you which you are holding. Where that difference matters it goes
+// in the release note, not here. The two halves of this misreading are
+// neighbours and a reader will meet them together, so they are written
+// together.
 export function judgeStranger(env, sha, archives) {
   const where = evidencePath(sha, STRANGER_RECORD);
   const archive = env?.archive_sha256;
