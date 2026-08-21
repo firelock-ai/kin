@@ -216,6 +216,25 @@ pub fn path_within_root(path: &[u8], root: &[u8]) -> bool {
     path.starts_with(root) && (path.len() == root.len() || path.get(root.len()) == Some(&b'/'))
 }
 
+/// The file a Kin repository carries under its root to name itself, relative to
+/// that root.
+///
+/// A directory is not a repository merely because it holds a `.kin` entry. The
+/// Kin managed toolchain home is `$KIN_HOME` (default `$HOME/.kin`), a real
+/// directory holding `bin/`, `lib/`, `shell/` and `config/`, so any marker walk
+/// that asks only whether `.kin` is a directory binds the user's home as a
+/// projection root and every path under it becomes graph-owned.
+///
+/// This file is the discriminator, and it is already the daemon's: the endpoint
+/// reads it to bind repository and workspace identity before it constructs or
+/// sends any request, so a root without it cannot be served at all. Refusing to
+/// project such a root can only turn a failure into a pass-through; it can
+/// never disable a projection that would otherwise have worked.
+///
+/// Spelled with `/` so it composes with [`join_at_path`] on Unix and with
+/// `Path::join` on Windows, which accepts either separator.
+pub const REPOSITORY_IDENTITY_MARKER: &str = ".kin/manifest.json";
+
 /// Compose the atomic-write temp path the shim opens before letting a tool write
 /// to `target`; on `close` the temp is renamed onto `target`.
 ///
