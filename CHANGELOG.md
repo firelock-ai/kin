@@ -54,6 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bind a Python declared receiver to its class's own method when that class is in the calling file (#1048)
 - Stage what kin agent writes, so a run lands a commit (#1049)
 - Order the LSP cold sweep behind the embedding backfill on first boot (#1050)
+- Rank a public entity above its private helpers on a description query (#1051)
 
 
 ## [0.5.46] - 2026-08-21
