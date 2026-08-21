@@ -392,10 +392,14 @@ add_to_path() (
     ok "Added $KIN_BIN to PATH in $rc_file"
 )
 
+# zsh reads .zshenv on every launch and .zshrc only when interactive, so the
+# PATH line goes in .zshenv: a script, a Makefile, a launchd job or an agent
+# shelling out through a non-interactive zsh could not find kin at all when it
+# went in .zshrc, and .zshenv covers the interactive case as well.
 case "$OS" in
     macos)
-        if [ -f "$HOME/.zshrc" ] || [ "$(basename "$SHELL")" = "zsh" ]; then
-            add_to_path "$HOME/.zshrc"
+        if [ -f "$HOME/.zshrc" ] || [ -f "$HOME/.zshenv" ] || [ "$(basename "$SHELL")" = "zsh" ]; then
+            add_to_path "$HOME/.zshenv"
         fi
         if [ -f "$HOME/.bashrc" ]; then
             add_to_path "$HOME/.bashrc"
@@ -410,8 +414,8 @@ case "$OS" in
         if [ -f "$HOME/.bashrc" ]; then
             add_to_path "$HOME/.bashrc"
         fi
-        if [ -f "$HOME/.zshrc" ]; then
-            add_to_path "$HOME/.zshrc"
+        if [ -f "$HOME/.zshrc" ] || [ -f "$HOME/.zshenv" ]; then
+            add_to_path "$HOME/.zshenv"
         fi
         ;;
 esac

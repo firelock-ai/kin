@@ -1447,6 +1447,30 @@ pub(crate) fn shell_rc(shell: &str) -> Result<PathBuf> {
     }
 }
 
+/// Where this shell's PATH line belongs, which is not always where its hook
+/// belongs.
+///
+/// zsh reads `.zshenv` on every launch and `.zshrc` only when the shell is
+/// interactive, so a PATH line written to `.zshrc` alone leaves `kin` unfindable
+/// in a script, a Makefile, a `sh -c` from an editor, a launchd or systemd job,
+/// or an agent shelling out. Those are exactly the callers a semantic repo
+/// substrate is meant to serve.
+///
+/// The hook must not move with it. Sourcing the projection hook from `.zshenv`
+/// would inject the shim into every non-interactive shell, which is the opposite
+/// of what the hook's own exclusion wrappers exist for, so [`shell_rc`] keeps the
+/// hook in the interactive file and this decides the PATH line separately.
+///
+/// Every other shell reads one file for both, so this returns [`shell_rc`] for
+/// them, and the arms below mirror that function's exactly, including its
+/// treatment of an unrecognized shell as zsh.
+pub(crate) fn shell_path_rc(shell: &str) -> Result<PathBuf> {
+    match shell {
+        "bash" | "fish" | "powershell" => shell_rc(shell),
+        _ => Ok(home_dir()?.join(".zshenv")),
+    }
+}
+
 pub(crate) fn hook_filename(shell: &str) -> &'static str {
     match shell {
         "bash" => "kin-vfs.bash",
@@ -2386,37 +2410,79 @@ fn install_shell_hook(shell_name: &str) -> Result<(PathBuf, String)> {
 
     let source_line = rc_source_line(shell_name, &hook_file);
 
-    let rc_path = shell_rc(shell_name)?;
-    let rc_content = if rc_path.exists() {
-        fs::read_to_string(&rc_path)?
-    } else {
-        String::new()
-    };
+    for (rc_path, blocks) in rc_write_plan(shell_name)? {
+        let rc_content = if rc_path.exists() {
+            fs::read_to_string(&rc_path)?
+        } else {
+            String::new()
+        };
 
-    let update = plan_rc_update(
-        &rc_content,
-        shell_name,
-        &source_line,
-        &rc_path,
-        &bin_dir,
-        bin_dir.is_dir(),
-    );
-    for line in update.already_present.iter().chain(&update.skipped) {
-        println!("{line}");
-    }
-    if !update.applied.is_empty() {
-        if let Some(parent) = rc_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-        fs::write(&rc_path, &update.content)
-            .with_context(|| format!("failed to update {}", rc_path.display()))?;
-        for line in &update.applied {
+        let update = plan_rc_update(
+            &rc_content,
+            shell_name,
+            &source_line,
+            &rc_path,
+            &bin_dir,
+            bin_dir.is_dir(),
+            blocks,
+        );
+        for line in update.already_present.iter().chain(&update.skipped) {
             println!("{line}");
+        }
+        if !update.applied.is_empty() {
+            if let Some(parent) = rc_path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+            }
+            fs::write(&rc_path, &update.content)
+                .with_context(|| format!("failed to update {}", rc_path.display()))?;
+            for line in &update.applied {
+                println!("{line}");
+            }
         }
     }
 
     Ok((hook_file, source_line))
+}
+
+/// The files this shell's integration is written to, and what each one carries.
+///
+/// One entry for a shell that reads a single file, two for zsh, whose PATH line
+/// belongs in `.zshenv` so a non-interactive shell can find `kin` at all while
+/// the hook stays in `.zshrc` so the shim is not injected into one.
+fn rc_write_plan(shell_name: &str) -> Result<Vec<(PathBuf, RcBlocks)>> {
+    let hook_rc = shell_rc(shell_name)?;
+    let path_rc = shell_path_rc(shell_name)?;
+    if path_rc == hook_rc {
+        return Ok(vec![(hook_rc, RcBlocks::HookAndPath)]);
+    }
+    Ok(vec![
+        (hook_rc, RcBlocks::HookOnly),
+        (path_rc, RcBlocks::PathOnly),
+    ])
+}
+
+/// Which of the two blocks one rc file is responsible for.
+///
+/// A shell whose PATH line and hook line share a file gets both from one plan.
+/// zsh does not: its hook belongs in `.zshrc` and its PATH line in `.zshenv`,
+/// and a plan that wrote both to either file would leave the invariant broken in
+/// one direction or the other.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RcBlocks {
+    HookAndPath,
+    HookOnly,
+    PathOnly,
+}
+
+impl RcBlocks {
+    fn carries_hook(self) -> bool {
+        matches!(self, RcBlocks::HookAndPath | RcBlocks::HookOnly)
+    }
+
+    fn carries_path(self) -> bool {
+        matches!(self, RcBlocks::HookAndPath | RcBlocks::PathOnly)
+    }
 }
 
 /// The rc file Kin wants on disk, split from what it may say about it.
@@ -2442,6 +2508,7 @@ fn plan_rc_update(
     rc_path: &Path,
     bin_dir: &Path,
     bin_dir_present: bool,
+    blocks: RcBlocks,
 ) -> RcUpdate {
     let mut content = existing.to_string();
     let mut applied = Vec::new();
@@ -2455,17 +2522,21 @@ fn plan_rc_update(
         content.push_str(block);
     };
 
-    if existing.contains("kin-vfs") {
-        already_present.push(format!(
-            "  Shell rc already sources kin-vfs hook: {}",
-            rc_path.display()
-        ));
-    } else {
-        append(&mut content, &rc_integration_block(source_line));
-        applied.push(format!("  Appended to {}", rc_path.display()));
+    if blocks.carries_hook() {
+        if existing.contains("kin-vfs") {
+            already_present.push(format!(
+                "  Shell rc already sources kin-vfs hook: {}",
+                rc_path.display()
+            ));
+        } else {
+            append(&mut content, &rc_integration_block(source_line));
+            applied.push(format!("  Appended to {}", rc_path.display()));
+        }
     }
 
-    if rc_declares_kin_bin(existing, bin_dir) {
+    if !blocks.carries_path() {
+        // Nothing to say: this file is not where this shell's PATH line lives.
+    } else if rc_declares_kin_bin(existing, bin_dir) {
         already_present.push(format!(
             "  Shell rc already adds {} to PATH",
             bin_dir.display()
@@ -2483,8 +2554,9 @@ fn plan_rc_update(
     } else {
         append(&mut content, &rc_path_block(shell_name, bin_dir));
         applied.push(format!(
-            "  Added {} to PATH for new shell sessions",
-            bin_dir.display()
+            "  Added {} to PATH in {} for new shell sessions",
+            bin_dir.display(),
+            rc_path.display()
         ));
     }
 
@@ -12475,18 +12547,25 @@ fn record_setup_ledger(
                         ));
                     }
 
-                    let bin_dir = kin_home.join("bin");
-                    let path_block = rc_path_block(shell_name, &bin_dir);
-                    let path_present = fs::read_to_string(&rc_path)
-                        .map(|c| c.contains(&path_block))
-                        .unwrap_or(false);
-                    if path_present {
-                        ledger.record(LedgerEntry::appended(
-                            ArtifactKind::ShellPathLine,
-                            format!("{shell_name}-path"),
-                            rc_path,
-                            path_block,
-                        ));
+                    // The PATH line is recorded against the file it was
+                    // actually written to, which for zsh is `.zshenv` rather
+                    // than the file carrying the hook. Recording it against the
+                    // hook's file would leave uninstall excising a block from
+                    // one file while the real one stayed behind.
+                    if let Ok(path_rc) = shell_path_rc(shell_name) {
+                        let bin_dir = kin_home.join("bin");
+                        let path_block = rc_path_block(shell_name, &bin_dir);
+                        let path_present = fs::read_to_string(&path_rc)
+                            .map(|c| c.contains(&path_block))
+                            .unwrap_or(false);
+                        if path_present {
+                            ledger.record(LedgerEntry::appended(
+                                ArtifactKind::ShellPathLine,
+                                format!("{shell_name}-path"),
+                                path_rc,
+                                path_block,
+                            ));
+                        }
                     }
                 }
             }
@@ -13878,6 +13957,9 @@ fn validate_full_uninstall_root() -> Result<ValidatedInstallRoot> {
 fn legacy_shell_path_targets(home: &Path) -> Vec<(String, PathBuf)> {
     let mut targets = std::collections::BTreeSet::new();
     targets.insert(("zsh".to_string(), home.join(".zshrc")));
+    // zsh's PATH line lives here, so an uninstall that swept only `.zshrc`
+    // would leave the export behind pointing at a directory it had removed.
+    targets.insert(("zsh".to_string(), home.join(".zshenv")));
     targets.insert(("bash".to_string(), home.join(".bashrc")));
     targets.insert(("fish".to_string(), home.join(".config/fish/config.fish")));
     targets.insert((
@@ -17022,13 +17104,29 @@ printf 'LD=[%s]\n' "$LD_PRELOAD"
         let bin_dir = Path::new("/home/u/.kin/bin");
         let source_line = "source /home/u/.kin/shell/kin-vfs.zsh";
 
-        let fresh = plan_rc_update("", "zsh", source_line, rc_path, bin_dir, true);
+        let fresh = plan_rc_update(
+            "",
+            "bash",
+            source_line,
+            rc_path,
+            bin_dir,
+            true,
+            RcBlocks::HookAndPath,
+        );
         assert_eq!(fresh.applied.len(), 2, "{:?}", fresh.applied);
         assert!(fresh.already_present.is_empty());
         assert!(fresh.content.contains(source_line));
-        assert!(fresh.content.contains(&rc_path_line("zsh", bin_dir)));
+        assert!(fresh.content.contains(&rc_path_line("bash", bin_dir)));
 
-        let settled = plan_rc_update(&fresh.content, "zsh", source_line, rc_path, bin_dir, true);
+        let settled = plan_rc_update(
+            &fresh.content,
+            "bash",
+            source_line,
+            rc_path,
+            bin_dir,
+            true,
+            RcBlocks::HookAndPath,
+        );
         assert!(
             settled.applied.is_empty(),
             "nothing is written on a second run, so nothing may be claimed: {:?}",
@@ -17048,7 +17146,15 @@ printf 'LD=[%s]\n' "$LD_PRELOAD"
         let bin_dir = Path::new("/home/u/.kin/bin");
         let source_line = "source /home/u/.kin/shell/kin-vfs.bash";
 
-        let absent = plan_rc_update("", "bash", source_line, rc_path, bin_dir, false);
+        let absent = plan_rc_update(
+            "",
+            "bash",
+            source_line,
+            rc_path,
+            bin_dir,
+            false,
+            RcBlocks::HookAndPath,
+        );
         assert!(
             !absent.content.contains(".kin/bin"),
             "no PATH line may reference a directory that does not exist: {}",
@@ -17070,7 +17176,15 @@ printf 'LD=[%s]\n' "$LD_PRELOAD"
 
         // Falsification: the same rc on the layout that does populate the
         // directory still gets the line, so this is not a blanket removal.
-        let present = plan_rc_update("", "bash", source_line, rc_path, bin_dir, true);
+        let present = plan_rc_update(
+            "",
+            "bash",
+            source_line,
+            rc_path,
+            bin_dir,
+            true,
+            RcBlocks::HookAndPath,
+        );
         assert!(
             present.content.contains(&rc_path_line("bash", bin_dir)),
             "a provisioned ~/.kin/bin still earns its PATH line: {}",
@@ -17086,11 +17200,165 @@ printf 'LD=[%s]\n' "$LD_PRELOAD"
         let source_line = "source /home/u/.kin/shell/kin-vfs.bash";
 
         let hook_only = format!("{}\n", rc_integration_block(source_line));
-        let update = plan_rc_update(&hook_only, "bash", source_line, rc_path, bin_dir, true);
+        let update = plan_rc_update(
+            &hook_only,
+            "bash",
+            source_line,
+            rc_path,
+            bin_dir,
+            true,
+            RcBlocks::HookAndPath,
+        );
         assert_eq!(update.applied.len(), 1, "{:?}", update.applied);
         assert!(update.applied[0].contains("PATH"));
         assert_eq!(update.already_present.len(), 1);
         assert!(update.already_present[0].contains("already sources"));
+    }
+
+    /// zsh reads `.zshenv` on every launch and `.zshrc` only when the shell is
+    /// interactive, so the two blocks go to two files: the PATH line where a
+    /// script, a Makefile or an agent shelling out will read it, and the hook
+    /// where it will not be injected into one.
+    #[test]
+    fn zsh_writes_its_path_line_where_a_non_interactive_shell_reads_it() {
+        let plan = rc_write_plan("zsh").unwrap();
+        assert_eq!(plan.len(), 2, "{plan:?}");
+
+        let hook = plan
+            .iter()
+            .find(|(_, blocks)| *blocks == RcBlocks::HookOnly)
+            .expect("zsh writes a hook-only file");
+        assert_eq!(
+            hook.0.file_name().and_then(|name| name.to_str()),
+            Some(".zshrc"),
+            "the hook moved out of the interactive file, which would inject the \
+             shim into every non-interactive shell"
+        );
+
+        let path = plan
+            .iter()
+            .find(|(_, blocks)| *blocks == RcBlocks::PathOnly)
+            .expect("zsh writes a path-only file");
+        assert_eq!(
+            path.0.file_name().and_then(|name| name.to_str()),
+            Some(".zshenv"),
+            "the PATH line is back in a file only an interactive zsh reads, so a \
+             script or an agent cannot find kin at all"
+        );
+    }
+
+    /// Every other shell reads one file for both, and splitting them there would
+    /// write a second block nothing reads.
+    #[test]
+    fn a_shell_that_reads_one_file_still_gets_one_plan() {
+        for shell in ["bash", "fish", "powershell"] {
+            let plan = rc_write_plan(shell).unwrap();
+            assert_eq!(plan.len(), 1, "{shell}: {plan:?}");
+            assert_eq!(plan[0].1, RcBlocks::HookAndPath, "{shell}");
+            assert_eq!(plan[0].0, shell_rc(shell).unwrap(), "{shell}");
+        }
+    }
+
+    /// Each half of the plan writes its own block and nothing else. Without
+    /// this, a two-file shell would get the hook in both files or the PATH line
+    /// in neither, and the second failure looks exactly like the bug being
+    /// fixed.
+    #[test]
+    fn each_half_of_a_split_plan_writes_only_its_own_block() {
+        let bin_dir = Path::new("/home/u/.kin/bin");
+        let source_line = "source /home/u/.kin/shell/kin-vfs.zsh";
+
+        let hook_rc = Path::new("/home/u/.zshrc");
+        let hook = plan_rc_update(
+            "",
+            "zsh",
+            source_line,
+            hook_rc,
+            bin_dir,
+            true,
+            RcBlocks::HookOnly,
+        );
+        assert!(hook.content.contains(source_line));
+        assert!(
+            !hook.content.contains(&rc_path_line("zsh", bin_dir)),
+            "the interactive file took the PATH line as well: {}",
+            hook.content
+        );
+        assert_eq!(hook.applied.len(), 1, "{:?}", hook.applied);
+
+        let path_rc = Path::new("/home/u/.zshenv");
+        let path = plan_rc_update(
+            "",
+            "zsh",
+            source_line,
+            path_rc,
+            bin_dir,
+            true,
+            RcBlocks::PathOnly,
+        );
+        assert!(path.content.contains(&rc_path_line("zsh", bin_dir)));
+        assert!(
+            !path.content.contains(source_line),
+            "the always-read file took the hook, which injects the shim into \
+             every non-interactive shell: {}",
+            path.content
+        );
+        assert_eq!(path.applied.len(), 1, "{:?}", path.applied);
+    }
+
+    /// A PATH-only file that is missing the line is the whole defect, so the
+    /// plan must announce a write for it even when the hook file is already
+    /// settled. It also must stay quiet once the line is there, or every setup
+    /// run appends another export.
+    #[test]
+    fn the_path_only_half_settles_after_one_write() {
+        let bin_dir = Path::new("/home/u/.kin/bin");
+        let source_line = "source /home/u/.kin/shell/kin-vfs.zsh";
+        let path_rc = Path::new("/home/u/.zshenv");
+
+        let first = plan_rc_update(
+            "",
+            "zsh",
+            source_line,
+            path_rc,
+            bin_dir,
+            true,
+            RcBlocks::PathOnly,
+        );
+        assert_eq!(first.applied.len(), 1, "{:?}", first.applied);
+
+        let second = plan_rc_update(
+            &first.content,
+            "zsh",
+            source_line,
+            path_rc,
+            bin_dir,
+            true,
+            RcBlocks::PathOnly,
+        );
+        assert!(second.applied.is_empty(), "{:?}", second.applied);
+        assert_eq!(second.content, first.content);
+    }
+
+    /// Uninstall has to sweep the file the PATH line was actually written to.
+    /// Sweeping only `.zshrc` would leave an export behind pointing at a
+    /// directory the same run had just removed.
+    #[test]
+    fn uninstall_sweeps_the_file_zsh_reads_on_every_launch() {
+        let home = Path::new("/home/u");
+        let targets = legacy_shell_path_targets(home);
+        assert!(
+            targets
+                .iter()
+                .any(|(shell, path)| shell == "zsh" && path == &home.join(".zshenv")),
+            "{targets:?}"
+        );
+        assert!(
+            targets
+                .iter()
+                .any(|(shell, path)| shell == "zsh" && path == &home.join(".zshrc")),
+            "{targets:?}"
+        );
     }
 
     #[test]
@@ -18155,6 +18423,14 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         install_shell_hook("zsh").unwrap();
 
         let rc = fs::read_to_string(home.join(".zshrc")).unwrap();
+        let env_path = home.join(".zshenv");
+        let env_rc = fs::read_to_string(&env_path).unwrap_or_else(|error| {
+            panic!(
+                "setup wrote no {}, so a non-interactive zsh has no PATH line to \
+                 read: {error}",
+                env_path.display()
+            )
+        });
         let path_line = rc_path_line("zsh", &kin_home.join("bin"));
 
         assert_eq!(
@@ -18163,9 +18439,21 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
             "setup must not duplicate the shell hook source line"
         );
         assert_eq!(
-            rc.matches(&path_line).count(),
+            env_rc.matches(&path_line).count(),
             1,
-            "setup must not duplicate the Kin PATH line"
+            "setup must write the Kin PATH line to the file every zsh reads, exactly once"
+        );
+        assert_eq!(
+            rc.matches(&path_line).count(),
+            0,
+            "the PATH line stayed in the interactive-only file, where a script \
+             or an agent cannot see it"
+        );
+        assert_eq!(
+            env_rc.matches("kin-vfs.zsh").count(),
+            0,
+            "the hook reached the file every zsh reads, which injects the shim \
+             into every non-interactive shell"
         );
         assert!(
             fs::read_to_string(kin_home.join("shell").join("kin-vfs.zsh"))
