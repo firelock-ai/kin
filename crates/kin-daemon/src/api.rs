@@ -30203,10 +30203,32 @@ mod tests {
         );
         assert_eq!(cut["bodies_included"], json!(false));
         assert!(cut["bodies_omitted"].as_u64().unwrap_or(0) > 0);
+        // Compared against the UNBOUNDED run rather than against a literal
+        // `false`. This fixture walks six hops at `depth: 5`, so its last hop
+        // sits at the requested depth and was never expanded, which the walk
+        // now reports as `terminal: "bound_reached"` and counts in
+        // `truncated`. Asserting `false` here would assert that a depth bound
+        // goes unreported, which is the FIR-2542 defect wearing this test's
+        // name. What this test is about is narrower and still holds: dropping
+        // bodies must not move the flag in either direction.
         assert_eq!(
-            cut["truncated"],
-            json!(false),
-            "a chain that lost only bodies is not a truncated chain"
+            full["terminal_bound_steps"],
+            json!(1),
+            "the fixture must end at its depth bound, or the comparisons below hold for the \
+             uninteresting reason that both runs report nothing"
+        );
+        assert_eq!(
+            cut["truncated"], full["truncated"],
+            "a chain that lost only bodies is truncated exactly as much as it was before"
+        );
+        assert_eq!(
+            cut["steps_omitted"].as_u64().unwrap_or(0),
+            0,
+            "no edge was dropped, so nothing about the chain's own length changed"
+        );
+        assert_eq!(
+            cut["terminal_bound_steps"], full["terminal_bound_steps"],
+            "the depth bound is what this chain's truncation reports, and the budget did not touch it"
         );
         let disclosure = cut["degradations"]
             .as_array()
