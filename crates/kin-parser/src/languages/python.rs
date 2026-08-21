@@ -1351,15 +1351,13 @@ fn python_receiver_types(node: &tree_sitter::Node, source: &[u8]) -> PythonRecei
         let mut cursor = params.walk();
         for param in params.named_children(&mut cursor) {
             let (Some(name), Some(annotation)) = (
-                param
-                    .child_by_field_name("name")
-                    .and_then(|n| n.utf8_text(source).ok()),
+                python_parameter_name(&param, source),
                 param.child_by_field_name("type"),
             ) else {
                 continue;
             };
             if let Some(declared) = python_annotation_type_name(&annotation, source) {
-                types.insert(name.to_string(), declared);
+                types.insert(name, declared);
             }
         }
     }
@@ -1374,6 +1372,28 @@ fn python_receiver_types(node: &tree_sitter::Node, source: &[u8]) -> PythonRecei
         }
     }
     types
+}
+
+/// The name one parameter binds, for the two annotated shapes a receiver can
+/// arrive as.
+///
+/// `typed_default_parameter` carries a `name` field; `typed_parameter` does
+/// not, and holds its identifier as its first named child beside the `type`
+/// field. A splat parameter (`*args: T`) binds a tuple rather than a value of
+/// `T`, so its name is deliberately not returned.
+fn python_parameter_name(param: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+    if let Some(name) = param.child_by_field_name("name") {
+        return name.utf8_text(source).ok().map(str::to_string);
+    }
+    let first = param.named_child(0)?;
+    if first.kind() != "identifier" {
+        return None;
+    }
+    first
+        .utf8_text(source)
+        .ok()
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
 }
 
 /// The `class_definition` a method is written inside, if any.

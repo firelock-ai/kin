@@ -966,7 +966,7 @@ fn resolve_one_file(
                         locate_base_class(&file.file_path, owner, ctx)
                     {
                         if let Some(dst_id) =
-                            resolve_inherited_method(&owner_file, &owner_class, method, ctx)
+                            resolve_declared_method(&owner_file, &owner_class, method, ctx)
                         {
                             accumulate_relation(
                                 &mut resolved,
@@ -2564,6 +2564,54 @@ fn locate_base_class(
 /// cycle-guarded, and ends any branch whose base cannot be located
 /// ([`locate_base_class`]) — it never guesses. Kept in exact resolution parity
 /// with [`resolve_inherited_method_incremental`].
+/// The method `owner_class` itself declares, before any ancestor is consulted.
+///
+/// [`resolve_inherited_method`] deliberately starts at the class's bases: its
+/// caller has already given a same-file own method its win. A call bound
+/// through the receiver's declared type has had no such tier, because the owner
+/// is usually defined in another file, so it asks for the class's own method
+/// first and walks the hierarchy only when the class does not declare it.
+fn resolve_declared_method(owner_file: &str, owner_class: &str, method: &str, ctx: &LinkContext<'_>) -> Option<EntityId> {
+    receiver_method_keys(owner_class, method)
+        .iter()
+        .find_map(|key| {
+            ctx.entity_by_file_name
+                .get(&(owner_file, key.as_str()))
+                .copied()
+        })
+        .or_else(|| resolve_inherited_method(owner_file, owner_class, method, ctx))
+}
+
+/// The incremental mirror of [`resolve_declared_method`].
+fn resolve_declared_method_incremental(
+    owner_file: &str,
+    owner_class: &str,
+    method: &str,
+    linker: &IncrementalLinker,
+    import_map: &HashMap<&str, HashMap<&str, (&str, &str)>>,
+    class_bases: &HashMap<String, Vec<(String, Vec<String>)>>,
+) -> Option<EntityId> {
+    receiver_method_keys(owner_class, method)
+        .iter()
+        .find_map(|key| {
+            linker
+                .entity_by_file_name
+                .get(owner_file)
+                .and_then(|by_name| by_name.get(key.as_str()))
+                .copied()
+        })
+        .or_else(|| {
+            resolve_inherited_method_incremental(
+                owner_file,
+                owner_class,
+                method,
+                linker,
+                import_map,
+                class_bases,
+            )
+        })
+}
+
 fn resolve_inherited_method(
     src_file: &str,
     owner: &str,
@@ -5634,7 +5682,7 @@ fn resolve_one_file_incremental(
                     if let Some((owner_file, owner_class)) =
                         locate_base_class_incremental(&file.file_path, owner, linker, import_map)
                     {
-                        if let Some(dst_id) = resolve_inherited_method_incremental(
+                        if let Some(dst_id) = resolve_declared_method_incremental(
                             &owner_file,
                             &owner_class,
                             method,
