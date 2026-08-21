@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -30,6 +31,141 @@ use crate::error::{GitError, Result};
 
 #[cfg(unix)]
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+// How many times this process has decompressed a snapshot's whole object
+// closure.
+//
+// Counted because the cost is invisible from any one call site. Every caller
+// that wants the closure asks [`validate_snapshot`] for it, and that call
+// reads and verifies EVERY object body in the repository, so a conversion that
+// asked once per caller paid a whole-repository decompression per caller. On a 1,200-commit flask corpus that is 162.5 MiB decompressed
+// against 13 MB packed, per rebuild, and it was the dominant repeated wall
+// clock cost of `kin init` before anyone counted it.
+//
+// Per-thread rather than global, and that is what makes it usable as a test
+// assertion. A conversion is a sequential pipeline on one thread, so a
+// thread-local counts exactly the rebuilds its own caller provoked; a process
+// global would be polluted by any test running beside it, and `cargo test`
+// runs tests as threads in one process. Reading a delta around a call is
+// therefore exact here without serializing the suite or adding a dependency
+// to force it.
+std::thread_local! {
+    static CLOSURE_RECONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+
+    // The most recently decompressed closure, and the exact object set it was
+    // decompressed from.
+    //
+    // Capacity one on purpose. A conversion works one object set at a time and
+    // asks for it repeatedly, so one slot captures every repeat ask while
+    // bounding what is held: the flask corpus's closure is 162.5 MiB, and a
+    // cache that grew would trade the wall for a memory wall.
+    static CLOSURE_CACHE: std::cell::RefCell<Option<(ClosureKey, SharedObjectClosure)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// What a decompressed closure is a function of.
+///
+/// The object records themselves, which carry every object's identity, kind and
+/// CAS body hash. That is the entire input to the decompression below, which is
+/// what makes it sound as a cache key: two snapshots with equal records read
+/// the same bodies out of the same CAS and verify the same descriptors against
+/// them, so a hit cannot hand a caller a closure built from different objects.
+///
+/// Compared rather than hashed, so the match is exact rather than
+/// collision-resistant. Kin's import proofs are load-bearing and a closure that
+/// satisfied a proof by hash collision would be exactly the failure this key
+/// exists to make impossible. The comparison walks records without touching
+/// bodies, so it costs a pointer walk against the whole-repository read it
+/// avoids.
+///
+/// Keying on something coarser, the tree root for instance, would not have this
+/// property: two object sets can share a root and differ elsewhere, and a hit
+/// would then satisfy a proof with a closure the proof never covered.
+#[derive(PartialEq)]
+struct ClosureKey {
+    object_format: GitObjectFormat,
+    objects: Vec<ExternalObjectRecord>,
+}
+
+type ClosureBodies = BTreeMap<ExternalObjectId, Vec<u8>>;
+
+/// A decompressed object closure this process built and is still holding.
+///
+/// The skip this enables rests on one claim: these bytes were read from the
+/// CAS and checked against their descriptors BY THIS PROCESS, and have been
+/// held immutable since. A closure that outlived the process, or reached a
+/// thread that did not verify it, would be a different claim needing
+/// re-verification on load, and nothing here would notice the difference.
+///
+/// So the type refuses to become one. The field is private and the only
+/// constructor is [`decompressed_closure`]. The handle is [`Rc`], which is
+/// `!Send`, so it cannot cross a thread boundary. The cache holding it is a
+/// `thread_local`, so it cannot outlive the thread. Neither this type nor the
+/// cache entry carries a serialization impl.
+pub(crate) struct SharedObjectClosure(Rc<ClosureBodies>);
+
+const _: () = {
+    // Holds the handle to `Rc` at compile time. Swapping it for `Arc` would
+    // make the closure `Send`, and a verified-here closure that can be moved
+    // to a thread that did not verify it is no longer evidence of anything.
+    #[allow(dead_code)]
+    fn the_handle_stays_thread_bound(closure: &SharedObjectClosure) -> &Rc<ClosureBodies> {
+        &closure.0
+    }
+};
+
+impl Clone for SharedObjectClosure {
+    fn clone(&self) -> Self {
+        Self(Rc::clone(&self.0))
+    }
+}
+
+impl std::ops::Deref for SharedObjectClosure {
+    type Target = ClosureBodies;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// Whether a caller may be handed a closure this thread already decompressed.
+///
+/// The cache key covers the object DESCRIPTORS, not the state of the CAS they
+/// point at, so a hit asserts something the key cannot see: that the bodies are
+/// still there and still those bytes. Inside one conversion that holds, because
+/// nothing mutates the CAS underneath a pipeline that is only reading it.
+///
+/// It does not hold for every caller, and the difference is not a detail.
+/// `rehydrate_lossless_git_repository` documents that it preflights all CAS
+/// bodies before mutating the filesystem, so its contract INCLUDES proving the
+/// CAS can supply them right now. A shared closure would let it write an export
+/// from bytes it never re-read, and a deleted body would stop failing closed.
+/// It reads fresh.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClosureSharing {
+    /// Re-use this thread's closure when the object set is identical.
+    Shared,
+    /// Read every body from the CAS, whatever is cached.
+    ///
+    /// For callers whose contract is that the CAS holds these bodies NOW, which
+    /// only a read can establish.
+    Fresh,
+}
+
+fn closure_key(snapshot: &LosslessGitRepository) -> ClosureKey {
+    ClosureKey {
+        object_format: snapshot.object_format,
+        objects: snapshot.objects.clone(),
+    }
+}
+
+/// How many whole-closure decompressions this thread has performed.
+///
+/// Read it either side of a conversion and subtract. The number that matters is
+/// the delta, not the total.
+pub fn closure_reconstruction_count() -> usize {
+    CLOSURE_RECONSTRUCTIONS.with(std::cell::Cell::get)
+}
 
 #[cfg(all(unix, test))]
 std::thread_local! {
@@ -230,7 +366,12 @@ pub fn rehydrate_lossless_git_repository(
         ));
     }
     reject_existing_destination(output_path)?;
-    let bodies = validate_snapshot(snapshot, blob_store)?;
+    // Fresh, never shared. This function's contract is that every CAS body is
+    // preflighted before the filesystem is touched, and only a read establishes
+    // that the CAS still holds them. Handing it a closure decompressed earlier
+    // in this process would let an export be written from bytes nobody re-read,
+    // and a body deleted since would stop failing closed.
+    let bodies = validate_snapshot_with(snapshot, blob_store, ClosureSharing::Fresh)?;
 
     let parent = output_path.parent().ok_or_else(|| {
         GitError::InvalidSnapshot(format!(
@@ -631,10 +772,26 @@ fn gix_object_id(oid: GitObjectId) -> Result<gix::ObjectId> {
         .map_err(|error| GitError::InvalidSnapshot(format!("invalid Git object ID: {error}")))
 }
 
+/// Validate a snapshot and hand back its decompressed object closure.
+///
+/// The closure is returned SHARED rather than owned, because a conversion asks
+/// several times over the same objects and a per-caller copy of it is the same
+/// whole-repository cost this sharing exists to remove: on the flask corpus the
+/// map is 162.5 MiB. Callers read it; nobody mutates it.
 pub(crate) fn validate_snapshot(
     snapshot: &LosslessGitRepository,
     blob_store: &BlobStore,
-) -> Result<BTreeMap<ExternalObjectId, Vec<u8>>> {
+) -> Result<SharedObjectClosure> {
+    validate_snapshot_with(snapshot, blob_store, ClosureSharing::Shared)
+}
+
+/// [`validate_snapshot`], with the caller stating whether a shared closure is
+/// sound for what it is about to do.
+fn validate_snapshot_with(
+    snapshot: &LosslessGitRepository,
+    blob_store: &BlobStore,
+    sharing: ClosureSharing,
+) -> Result<SharedObjectClosure> {
     snapshot.refs.validate()?;
     for repository_ref in &snapshot.refs.refs {
         if repository_ref.repository_id != snapshot.repository_id {
@@ -645,6 +802,56 @@ pub(crate) fn validate_snapshot(
         }
     }
     validate_head_and_default(snapshot)?;
+
+    let bodies = decompressed_closure(snapshot, blob_store, sharing)?;
+
+    // Outside the shared closure on purpose. Reachability is a function of the
+    // refs and HEAD as well as the objects, and those are NOT part of the cache
+    // key, so two snapshots that share an object set can still disagree about
+    // what is reachable from it. Re-walking is cheap next to decompressing, and
+    // a proof that only ran on a cache miss would be a proof that stopped
+    // running.
+    validate_reachable_closure(snapshot, &bodies)?;
+    Ok(bodies)
+}
+
+/// The snapshot's object bodies, decompressed once per distinct object set.
+///
+/// A conversion asks for the same closure at every step, and each ask used to
+/// re-read and re-verify every object body in the repository. This returns the
+/// previous answer when the object set is byte-for-byte the one it was built
+/// from, and rebuilds otherwise.
+///
+/// What is shared is the DECOMPRESSION, never a verdict. The per-object
+/// descriptor check below runs on every body the first time that object set is
+/// seen, and a hit is only possible when the key covering every object ID, kind
+/// and CAS body hash matches, so a hit re-uses bodies that were verified
+/// against these exact descriptors and no others. Everything a proof actually
+/// asserts, the derived plan and the reachable closure, is recomputed by the
+/// caller either way.
+fn decompressed_closure(
+    snapshot: &LosslessGitRepository,
+    blob_store: &BlobStore,
+    sharing: ClosureSharing,
+) -> Result<SharedObjectClosure> {
+    let key = closure_key(snapshot);
+    if sharing == ClosureSharing::Shared {
+        if let Some(shared) = CLOSURE_CACHE.with(|cache| {
+            cache
+                .borrow()
+                .as_ref()
+                .filter(|(cached, _)| *cached == key)
+                .map(|(_, bodies)| bodies.clone())
+        }) {
+            return Ok(shared);
+        }
+    }
+
+    // Counted here rather than at the function entry, because a hit above costs
+    // nothing and everything before it is cheap ref arithmetic. The loop below
+    // is the whole-repository decompression this counter exists to make
+    // visible.
+    CLOSURE_RECONSTRUCTIONS.with(|count| count.set(count.get() + 1));
 
     let mut bodies = BTreeMap::new();
     let mut object_ids = BTreeSet::new();
@@ -676,8 +883,13 @@ pub(crate) fn validate_snapshot(
         }
     }
 
-    validate_reachable_closure(snapshot, &bodies)?;
-    Ok(bodies)
+    // Published only after every body passed, so a rejected object set leaves
+    // nothing behind for the next caller to hit.
+    let shared = SharedObjectClosure(Rc::new(bodies));
+    CLOSURE_CACHE.with(|cache| {
+        *cache.borrow_mut() = Some((key, shared.clone()));
+    });
+    Ok(shared)
 }
 
 fn validate_head_and_default(snapshot: &LosslessGitRepository) -> Result<()> {
@@ -2150,6 +2362,81 @@ mod tests {
             Err(GitError::Blob(_))
         ));
         assert!(!cas_output.exists());
+    }
+
+    #[test]
+    fn a_shared_closure_is_byte_identical_to_a_rebuild() {
+        let fixture = Fixture::simple();
+        let snapshot = capture_lossless_git_repository(
+            &fixture.repo,
+            RepositoryId::new("byte-identical").unwrap(),
+            &fixture.blob_store,
+        )
+        .unwrap();
+
+        let shared = validate_snapshot(&snapshot, &fixture.blob_store).unwrap();
+
+        let before = closure_reconstruction_count();
+        let fresh =
+            validate_snapshot_with(&snapshot, &fixture.blob_store, ClosureSharing::Fresh).unwrap();
+        // Without this the test could compare a cached closure against itself
+        // and pass no matter how stale the cache had become.
+        assert_eq!(
+            closure_reconstruction_count(),
+            before + 1,
+            "the control arm must actually re-read the CAS, or it controls nothing",
+        );
+
+        assert_eq!(
+            *shared, *fresh,
+            "a shared closure must be byte-identical to one rebuilt from the CAS",
+        );
+    }
+
+    #[test]
+    fn a_warm_shared_closure_never_satisfies_rehydrations_cas_proof() {
+        let fixture = Fixture::simple();
+        let snapshot = capture_lossless_git_repository(
+            &fixture.repo,
+            RepositoryId::new("warm-closure").unwrap(),
+            &fixture.blob_store,
+        )
+        .unwrap();
+
+        // Assert the cache is warm rather than assume it. A body deleted while
+        // the cache is cold gets re-read by any implementation, so that test
+        // passes whatever rehydration does and would stop guarding this
+        // boundary without ever failing.
+        let before = closure_reconstruction_count();
+        validate_snapshot(&snapshot, &fixture.blob_store).unwrap();
+        assert_eq!(
+            closure_reconstruction_count(),
+            before,
+            "a second shared validation of one object set must hit the cache",
+        );
+
+        fixture
+            .blob_store
+            .delete(&snapshot.objects[0].body_hash)
+            .unwrap();
+
+        // The shared closure is now stale in the only way it can be: the
+        // descriptors are untouched, so the key still matches, and it still
+        // hands out a body the CAS can no longer supply.
+        let served = validate_snapshot(&snapshot, &fixture.blob_store).unwrap();
+        assert!(
+            served.contains_key(&snapshot.objects[0].object),
+            "the shared closure must still hold the deleted body for this to prove anything",
+        );
+
+        // Rehydration reads fresh, so it fails closed on the CAS rather than
+        // exporting from bytes nobody re-read.
+        let output = fixture._root.path().join("warm-closure.git");
+        assert!(matches!(
+            rehydrate_lossless_git_repository(&snapshot, &fixture.blob_store, &output),
+            Err(GitError::Blob(kin_blobs::BlobError::NotFound { .. }))
+        ));
+        assert!(!output.exists());
     }
 
     #[test]

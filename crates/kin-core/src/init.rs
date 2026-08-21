@@ -307,9 +307,6 @@ impl PreparedRepositoryInit {
         transaction: RepositoryTransaction,
     ) -> Result<&RepositoryBootstrap> {
         verify_metadata_seal(&self.layout, &self.metadata_seal)?;
-        let transaction_hash = transaction
-            .transaction_hash()
-            .map_err(|error| KinError::Other(error.to_string()))?;
         let operation_id = transaction.operation_id;
         let repository_id = &self.repository_id;
         let workspace_id = self.workspace_id;
@@ -320,6 +317,17 @@ impl PreparedRepositoryInit {
         })?;
         match &mut self.bootstrap {
             Some(bootstrap) => {
+                // Hashed here rather than before the match, because only this arm
+                // reads it. `transaction_hash` canonicalizes by cloning the whole
+                // transaction, which carries every reachable external object and
+                // every change in history, so on a real repository it is the
+                // largest single allocation in the commit and it retains nothing.
+                // The first-commit arm below never used the value and paid for it
+                // on every init, and it also validated twice, once here and once
+                // in `validate_bootstrap_transaction`.
+                let transaction_hash = transaction
+                    .transaction_hash()
+                    .map_err(|error| KinError::Other(error.to_string()))?;
                 if bootstrap.receipt.transaction_hash != transaction_hash
                     || bootstrap.receipt.operation_id != operation_id
                 {
