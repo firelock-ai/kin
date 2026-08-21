@@ -1690,16 +1690,24 @@ jobs:
 
           # The gate's own narration goes to stderr so stdout carries exactly
           # the sha it verified and nothing a later comparison could mistake
-          # for one. A throw exits non-zero and takes the step with it.
+          # for one. A refusal is reported the way the gate's own command line
+          # reports it, because a stack trace buries the sentence that says
+          # which record was missing and an operator reading a blocked release
+          # needs that sentence first.
           proven="$(KIN_RELEASE_GATE="file://${gate}" \
             CANDIDATE_SHA="$SHA" \
             GITHUB_REPOSITORY="$REPO" \
             node --input-type=module -e '
               const { main } = await import(process.env.KIN_RELEASE_GATE);
-              const result = await main({
-                log: (line) => process.stderr.write(line + "\n"),
-              });
-              process.stdout.write(result.sha);
+              try {
+                const result = await main({
+                  log: (line) => process.stderr.write(line + "\n"),
+                });
+                process.stdout.write(result.sha);
+              } catch (error) {
+                process.stderr.write("::error::" + error.message + "\n");
+                process.exit(1);
+              }
             ')"
           if ! printf '%s' "$proven" | grep -Eq '^[0-9a-f]{40}$'; then
             echo "::error::the release proof gate returned '${proven}', which is not a candidate sha"
