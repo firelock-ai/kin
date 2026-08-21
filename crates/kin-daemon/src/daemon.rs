@@ -3808,14 +3808,10 @@ pub async fn run_with_authority_on(
         idle_handle,
         persist_handle,
         supervisor_handle,
+        lsp_handle,
         cancel_tx,
     )
     .await;
-
-    // Before the CAS barrier and before the endpoint files go, because an
-    // in-flight sweep still has a publication to make and it makes it through
-    // this state.
-    drain_lsp_enrichment(lsp_handle).await;
 
     // The derived ingestion CAS defers its directory barriers and commits them
     // on an explicit sync, on drop, or on a self-drain. This process ends in
@@ -3854,6 +3850,7 @@ async fn select_with_signals(
     mut idle_handle: tokio::task::JoinHandle<()>,
     persist_handle: tokio::task::JoinHandle<()>,
     supervisor_handle: tokio::task::JoinHandle<()>,
+    lsp_handle: Option<tokio::task::JoinHandle<()>>,
     cancel_tx: tokio::sync::watch::Sender<bool>,
 ) -> Result<()> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -3928,6 +3925,15 @@ async fn select_with_signals(
             (CompletedTask::Signal, Ok(()))
         }
     };
+
+    // Before `drain_handles`, and so before the final persistence flush that
+    // kin#994 gave its own budget and drains ahead of everything else. Order is
+    // the whole point twice over. A sweep publishes into the graph, so letting
+    // it finish first is what puts its relations in the flush rather than in the
+    // next daemon's re-derivation, and a flush that can legitimately run for
+    // minutes would otherwise spend the entire escalation grace before the sweep
+    // was ever asked to stop.
+    drain_lsp_enrichment(lsp_handle).await;
 
     drain_handles(
         (completed != CompletedTask::Reconciliation).then_some(loop_handle),
@@ -4126,6 +4132,7 @@ async fn select_with_signals(
     mut idle_handle: tokio::task::JoinHandle<()>,
     persist_handle: tokio::task::JoinHandle<()>,
     supervisor_handle: tokio::task::JoinHandle<()>,
+    lsp_handle: Option<tokio::task::JoinHandle<()>>,
     cancel_tx: tokio::sync::watch::Sender<bool>,
 ) -> Result<()> {
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -4192,6 +4199,15 @@ async fn select_with_signals(
             (CompletedTask::Signal, Ok(()))
         }
     };
+
+    // Before `drain_handles`, and so before the final persistence flush that
+    // kin#994 gave its own budget and drains ahead of everything else. Order is
+    // the whole point twice over. A sweep publishes into the graph, so letting
+    // it finish first is what puts its relations in the flush rather than in the
+    // next daemon's re-derivation, and a flush that can legitimately run for
+    // minutes would otherwise spend the entire escalation grace before the sweep
+    // was ever asked to stop.
+    drain_lsp_enrichment(lsp_handle).await;
 
     drain_handles(
         (completed != CompletedTask::Reconciliation).then_some(loop_handle),
