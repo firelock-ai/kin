@@ -4645,16 +4645,69 @@ async fn select_with_signals(
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        coverage_drain_verdict, drain_pending_flush, embed_work_outstanding,
+        await_watch_armed, coverage_drain_verdict, drain_pending_flush, embed_work_outstanding,
         format_singleton_contention, next_embed_error_backoff, parse_duration_secs,
         parse_owner_watch_pid, should_enable_lsp_enrichment, should_flush_now, shutdown_signalled,
         watched_process_is_alive, ControlPlane, CoverageDrainVerdict, DaemonConfig, DaemonState,
-        FlushSuppression, DEFAULT_RUNTIME_SHUTDOWN_GRACE, DEFAULT_SHUTDOWN_ESCALATION_GRACE,
-        RECON_IDLE,
+        FlushSuppression, WatchArming, DEFAULT_RUNTIME_SHUTDOWN_GRACE,
+        DEFAULT_SHUTDOWN_ESCALATION_GRACE, RECON_IDLE,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    /// FIR-2466. The healthy path: the loop reports its watcher and publication
+    /// proceeds.
+    ///
+    /// The arming is deliberately delayed rather than already sent. A future
+    /// that is ready on its first poll returns before any deadline applies, so a
+    /// version of this test with an instantly-ready signal stays green at a
+    /// one-nanosecond bound and can never tell waiting from not waiting.
+    #[tokio::test]
+    async fn a_reported_watch_releases_publication() {
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            let _ = armed_tx.send(());
+        });
+
+        assert_eq!(
+            await_watch_armed(armed_rx, Duration::from_secs(10)).await,
+            WatchArming::Armed,
+            "a watch reported inside the bound is what lets the endpoint be published"
+        );
+    }
+
+    /// A loop that ends before building a watcher releases publication too.
+    ///
+    /// Filesystem reconcile switched off, a bare checkout, or a watcher the host
+    /// refused all reach this. There is no watch coming, so waiting the bound
+    /// out would hold the endpoint back for nothing.
+    #[tokio::test]
+    async fn a_loop_that_ends_without_a_watch_releases_publication_at_once() {
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel::<()>();
+        drop(armed_tx);
+
+        assert_eq!(
+            await_watch_armed(armed_rx, Duration::from_secs(10)).await,
+            WatchArming::LoopGone
+        );
+    }
+
+    /// The bound is a ceiling on a wedged loop, not on a healthy one. An
+    /// endpoint that never appears is a daemon no client can reach, so the wait
+    /// expires into publication with the reason recorded.
+    #[tokio::test]
+    async fn a_loop_that_never_reports_stops_holding_publication_at_its_bound() {
+        // Held rather than dropped: dropping it is the LoopGone arm above, and
+        // this arm is the one where nothing happens at all.
+        let (_armed_tx, armed_rx) = tokio::sync::oneshot::channel::<()>();
+
+        assert_eq!(
+            await_watch_armed(armed_rx, Duration::from_millis(80)).await,
+            WatchArming::TimedOut
+        );
+    }
 
     #[test]
     fn default_embed_batch_is_backlog_friendly() {

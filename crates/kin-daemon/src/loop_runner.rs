@@ -6564,6 +6564,209 @@ mod tests {
             "no poll cadence may turn the grace into a stall"
         );
     }
+
+    /// FIR-2466. The daemon may not publish its endpoint on a promise the loop
+    /// never keeps, so the signal fires even when the loop never reaches its
+    /// watcher.
+    #[test]
+    fn a_watch_signal_fires_on_drop_when_the_loop_never_arms() {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        {
+            let _armed = WatchArmed::new(tx);
+        }
+        assert_eq!(
+            rx.try_recv(),
+            Ok(()),
+            "a dropped WatchArmed must release the daemon; a loop that ends before building a \
+             watcher would otherwise hold the endpoint back forever"
+        );
+    }
+
+    /// Arming is once. A second call after an explicit arm must not panic and
+    /// must not send again, because the receiver is a one-shot.
+    #[test]
+    fn a_watch_signal_arms_once_and_the_later_drop_is_silent() {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let mut armed = WatchArmed::new(tx);
+        armed.arm();
+        armed.arm();
+        drop(armed);
+        assert_eq!(rx.try_recv(), Ok(()), "the arm reaches the daemon");
+    }
+
+    /// A store that records no complete admission names no window, so the loop
+    /// falls back to admitting nothing at startup rather than proposing the
+    /// whole working copy.
+    #[test]
+    fn a_store_with_no_admission_marker_opens_no_catch_up_window() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        assert!(
+            matches!(
+                kin_core::last_admission::read(&state.layout),
+                kin_core::last_admission::LastAdmissionRead::Absent
+            ),
+            "the control this assertion rests on: a fresh store carries no marker"
+        );
+        assert_eq!(
+            startup_catch_up_window(&state),
+            None,
+            "with no lower bound the pass would propose the entire working copy, which is the \
+             sweep startup must never perform"
+        );
+    }
+
+    /// A recorded marker opens the window at its own instant, which is what
+    /// bounds the catch-up to the stretch nothing was watching.
+    #[test]
+    fn a_recorded_admission_marker_opens_the_window_at_its_own_instant() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let at = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        kin_core::last_admission::write(
+            &state.layout,
+            &kin_core::last_admission::LastAdmission::new(at, 7),
+        )
+        .unwrap();
+
+        assert_eq!(
+            startup_catch_up_window(&state),
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            "the window opens at the last complete admission, not at process start"
+        );
+    }
+
+    /// A marker stamped before the epoch clamps rather than wrapping. A wrap
+    /// would move the window to the far future, which loses every file.
+    #[test]
+    fn a_pre_epoch_marker_clamps_the_window_to_the_epoch() {
+        let before = chrono::DateTime::from_timestamp(-10, 0).unwrap();
+        assert_eq!(unix_instant(before), SystemTime::UNIX_EPOCH);
+        let after = chrono::DateTime::from_timestamp(5, 250_000_000).unwrap();
+        assert_eq!(
+            unix_instant(after),
+            SystemTime::UNIX_EPOCH + Duration::new(5, 250_000_000),
+            "the ordinary case is not clamped, which is the control for the arm above"
+        );
+    }
+
+    /// FIR-2499. The catch-up names what the host changed inside the window and
+    /// nothing older, and what it names is admissible by the ordinary ambient
+    /// path.
+    ///
+    /// Modification times are set outright rather than slept for, so the two
+    /// arms sit on either side of the window by construction instead of by
+    /// racing a filesystem's clock granularity.
+    #[test]
+    fn the_catch_up_names_host_paths_changed_inside_the_window_and_no_others() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+
+        let before = repo.path().join("settled.rs");
+        std::fs::write(&before, b"pub fn settled() -> u32 { 1 }\n").unwrap();
+        stamp_modified(&before, SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000));
+
+        let after = repo.path().join("written_while_nothing_watched.rs");
+        std::fs::write(&after, b"pub fn written() -> u32 { 2 }\n").unwrap();
+        stamp_modified(&after, SystemTime::UNIX_EPOCH + Duration::from_secs(3_000_000));
+
+        let window = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000);
+        let planned = plan_catch_up_events(&state, window).unwrap();
+        let named = event_paths(&planned);
+        // The plan speaks in the working directory the state is bound to, which
+        // the layout resolved; a tempdir path is the unresolved form of the
+        // same entry, so the two are compared by leaf.
+        let named = named
+            .iter()
+            .filter_map(|path| path.file_name())
+            .map(|leaf| leaf.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        let after_leaf = "written_while_nothing_watched.rs".to_string();
+        let before_leaf = "settled.rs".to_string();
+
+        assert!(
+            named.contains(&after_leaf),
+            "a file written after the last admission is exactly what nothing observed: {named:?}"
+        );
+        assert!(
+            !named.contains(&before_leaf),
+            "a file older than the window was already covered by that admission: {named:?}"
+        );
+
+        // What the catch-up plans has to be admissible by the path it feeds,
+        // or the plan is a list nothing acts on.
+        let admitted = admit_file_event_ambient(&state, &FileEvent::Changed(after)).unwrap();
+        assert!(
+            matches!(admitted, AdmittedFileEvent::Regular { .. }),
+            "the catch-up's own event must reach the tree: {admitted:?}"
+        );
+        assert!(
+            tree_entry(&state, "written_while_nothing_watched.rs").is_some(),
+            "the file the graph never met is what the catch-up exists to admit"
+        );
+    }
+
+    /// The rules the catch-up walk shares with the content walk. An ignored
+    /// path is excluded whatever its modification time says, so the catch-up
+    /// cannot admit what an ordinary tick would refuse.
+    #[test]
+    fn the_catch_up_skips_a_path_the_ignore_rules_exclude() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join(".kinignore"), b"secrets.rs\n").unwrap();
+        let state = open_test_state(&repo);
+
+        let ignored = repo.path().join("secrets.rs");
+        std::fs::write(&ignored, b"pub fn secret() -> u32 { 3 }\n").unwrap();
+        stamp_modified(&ignored, SystemTime::UNIX_EPOCH + Duration::from_secs(3_000_000));
+        let visible = repo.path().join("visible.rs");
+        std::fs::write(&visible, b"pub fn visible() -> u32 { 4 }\n").unwrap();
+        stamp_modified(&visible, SystemTime::UNIX_EPOCH + Duration::from_secs(3_000_000));
+
+        let window = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000);
+        let named = event_paths(&plan_catch_up_events(&state, window).unwrap())
+            .iter()
+            .filter_map(|path| path.file_name())
+            .map(|leaf| leaf.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert!(
+            named.contains(&"visible.rs".to_string()),
+            "the positive control: an ordinary path inside the window is named: {named:?}"
+        );
+        assert!(
+            !named.contains(&"secrets.rs".to_string()),
+            "the catch-up walks under the same rules a tick does: {named:?}"
+        );
+    }
+
+    /// The host paths a planned batch names.
+    fn event_paths(events: &[FileEvent]) -> Vec<PathBuf> {
+        events
+            .iter()
+            .map(|event| {
+                let (FileEvent::Changed(path) | FileEvent::Removed(path)) = event;
+                path.clone()
+            })
+            .collect()
+    }
+
+    /// Set a host entry's modification time outright.
+    ///
+    /// Both stamps are written because setting only one is refused on some
+    /// hosts, and the access time is not what any assertion here reads.
+    fn stamp_modified(path: &Path, at: SystemTime) {
+        let handle = std::fs::File::options().write(true).open(path).unwrap();
+        handle
+            .set_times(std::fs::FileTimes::new().set_accessed(at).set_modified(at))
+            .unwrap();
+        assert_eq!(
+            std::fs::symlink_metadata(path).unwrap().modified().unwrap(),
+            at,
+            "the stamp has to have applied, or every assertion resting on it is about the \
+             file's real age instead"
+        );
+    }
+
 }
 
 /// Decide whether a filesystem-sync tick's bulk deletions should be WITHHELD as

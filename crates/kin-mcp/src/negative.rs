@@ -3351,6 +3351,81 @@ mod tests {
         assert_eq!(negative["safe_to_conclude_absent"], json!(true));
     }
 
+    /// FIR-2499. An absence over a store the working copy has outrun is
+    /// unknown, not absent.
+    ///
+    /// The reported case: `semantic_search("build_match_query")` returned zero
+    /// rows with `safe_to_conclude_absent: true` while the function sat in a
+    /// 140-line module on disk that no admission had taken. The graph answered
+    /// correctly and the claim made from it was wrong, because the module was in
+    /// no index the query reads.
+    #[test]
+    fn an_absence_over_unadmitted_host_content_certifies_nothing() {
+        let payload = empty_search_page(resolvable_language_scope(Some(29)));
+
+        // The positive control first, so a failure below cannot be the payload
+        // simply never certifying.
+        let certified = negative_for("semantic_search", &payload, &structural_ready_envelope())
+            .expect("empty results yields a negative");
+        assert_eq!(
+            certified["safe_to_conclude_absent"],
+            json!(true),
+            "the control this test rests on: the same payload certifies when the store is level"
+        );
+
+        let negative = negative_for("semantic_search", &payload, &behind_envelope(1))
+            .expect("empty results yields a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert_eq!(negative["trust"], json!("inconclusive"));
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            reason.contains("graph_behind_working_tree"),
+            "the factor names the store being behind: {reason}"
+        );
+        assert!(
+            reason.contains("host path(s) on disk have never been admitted"),
+            "and says what that means for the claim: {reason}"
+        );
+    }
+
+    /// The scope of the gate. A populated answer asserts no absence, so a store
+    /// being behind is not a limit on it; applying it there would put a floor
+    /// under every answer on every working copy holding one untracked file.
+    #[test]
+    fn a_populated_answer_is_not_qualified_by_unadmitted_host_content() {
+        let mut payload = empty_search_page(resolvable_language_scope(Some(29)));
+        payload["results"] = json!([{ "entity_id": "e1", "name": "build_match_query" }]);
+        payload["total_matches"] = json!(1);
+
+        let level = negative_for("semantic_search", &payload, &structural_ready_envelope());
+        let behind = negative_for("semantic_search", &payload, &behind_envelope(1));
+        let reason_of = |value: &Option<Value>| {
+            value
+                .as_ref()
+                .and_then(|negative| negative["trust_reason"].as_str().map(str::to_string))
+        };
+        assert_eq!(
+            reason_of(&behind),
+            reason_of(&level),
+            "a populated answer reads the same either way; this gate speaks only about absences"
+        );
+    }
+
+    /// A daemon envelope that is otherwise authoritative over a store holding
+    /// host paths no admission has taken.
+    fn behind_envelope(unadmitted_paths: u64) -> Envelope {
+        Envelope::daemon().with_health(&json!({
+            "graph_loaded": true,
+            "initialized": true,
+            "graph_generation": 12,
+            "reconcile": {
+                "untracked_path_count": unadmitted_paths,
+                "untracked_paths_sample": ["notekeeper/search.py"],
+                "last_admission_success_at": "2026-08-20T13:00:00Z",
+            },
+        }))
+    }
+
     #[test]
     fn an_authoritative_absence_never_recites_a_coverage_it_did_not_rest_on() {
         // FIR-2430 contract item 3. The express envelope certified an absence in

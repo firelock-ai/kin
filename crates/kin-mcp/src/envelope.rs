@@ -2106,6 +2106,87 @@ mod tests {
             .is_none());
     }
 
+    /// FIR-2499. The pair that was wrong together: a store holding an
+    /// unadmitted module reported "0 uncommitted; durable repository authority
+    /// records everything answering here".
+    #[test]
+    fn a_store_holding_unadmitted_host_paths_never_reports_an_all_clear() {
+        let env = Envelope::daemon().with_health(&serde_json::json!({
+            "graph_entity_count": 51,
+            "durable_entity_count": 51,
+            "reconcile": {
+                "untracked_path_count": 1,
+                "untracked_paths_sample": ["notekeeper/search.py"],
+                "last_admission_success_at": "2026-08-20T13:00:00Z",
+            },
+        }));
+
+        let behind = env
+            .behind
+            .as_ref()
+            .expect("a reported untracked path is the store being behind");
+        assert_eq!(behind.unadmitted_paths, 1);
+        assert_eq!(behind.since.as_deref(), Some("2026-08-20T13:00:00Z"));
+        assert_eq!(behind.sample, vec!["notekeeper/search.py".to_string()]);
+
+        let durability = env.durability.expect("the counts still answer");
+        assert_eq!(
+            durability.live_entities,
+            Some(51),
+            "the counts were never the wrong part and are left exactly as observed"
+        );
+        assert!(
+            !durability.note.contains("records everything answering here"),
+            "the all-clear this reading cannot make: {}",
+            durability.note
+        );
+        assert!(
+            durability.note.contains("host path(s) on disk that no admission has taken"),
+            "the note has to name what it does not cover: {}",
+            durability.note
+        );
+    }
+
+    /// The control for the case above, and the one that keeps this from
+    /// qualifying every answer: a store with nothing unadmitted says so exactly
+    /// as before.
+    #[test]
+    fn a_store_with_nothing_unadmitted_keeps_its_recorded_reading() {
+        let env = Envelope::daemon().with_health(&serde_json::json!({
+            "graph_entity_count": 51,
+            "durable_entity_count": 51,
+            "reconcile": { "untracked_path_count": 0 },
+        }));
+
+        assert!(env.behind.is_none(), "nothing unadmitted is nothing to say");
+        let durability = env.durability.expect("the counts still answer");
+        assert_eq!(durability.state, "recorded");
+        assert!(
+            durability.note.contains("records everything answering here"),
+            "{}",
+            durability.note
+        );
+    }
+
+    /// A body carrying no reconcile reading at all says nothing here. Silence
+    /// is the absence of a reading, never a zero this envelope did not verify.
+    #[test]
+    fn a_health_body_with_no_reconcile_reading_makes_no_behind_claim() {
+        let env = Envelope::daemon().with_health(&serde_json::json!({
+            "graph_entity_count": 51,
+            "durable_entity_count": 51,
+        }));
+        assert!(env.behind.is_none());
+
+        // And a reconcile block that omits the count is the same answer, which
+        // is the arm that would otherwise read as zero.
+        let partial = Envelope::daemon().with_health(&serde_json::json!({
+            "graph_entity_count": 51,
+            "reconcile": { "skipped_events": 3 },
+        }));
+        assert!(partial.behind.is_none());
+    }
+
     #[test]
     fn with_health_missing_fields_stay_unknown() {
         // An empty/partial health body must not fabricate `false`/`0` values.
