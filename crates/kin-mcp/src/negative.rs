@@ -377,6 +377,13 @@ pub(crate) fn references_producible(payload: &Value) -> bool {
 /// The classes this answer's verdict actually rests on: [`load_bearing_classes`]
 /// plus `references` wherever this host could have produced it.
 ///
+/// Deliberately NOT public. `kin impact` needs to know which classes the gate
+/// rested on so it does not name one the gate never weighed, and it gets that by
+/// reading `_kin.completeness.decided_by`, the record this set produces, rather
+/// than by importing this function (FIR-2524). Reading the published record beats
+/// importing the producer: one of them can drift from the verdict and the other
+/// cannot.
+///
 /// One definition, because three consumers ask the same question and a fourth
 /// answer would only be somewhere for them to drift. [`absence_coverage_gap`]
 /// decides whether an absence may be certified, `deciding_classes_all_present`

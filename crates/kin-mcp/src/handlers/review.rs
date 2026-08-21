@@ -213,7 +213,12 @@ pub async fn handle_impact_analysis<G: GraphStore>(
 /// [`crate::negative::absence_cross_file_classes`] declares `impact_analysis`
 /// depends on. Declaring one set and observing another is how a gate comes to
 /// judge a class the answer never measured.
-const IMPACT_REFERENCE_KINDS: [kin_model::relation::RelationKind; 3] = [
+///
+/// Public because the CLI's `kin impact` renders the same verdict over the same
+/// classes (FIR-2524). Two consumers reading one declaration is the whole point;
+/// a second copy in `kin-cli` would be the drift this comment already warns
+/// about, arriving by the door it does not watch.
+pub const IMPACT_REFERENCE_KINDS: [kin_model::relation::RelationKind; 3] = [
     kin_model::relation::RelationKind::Calls,
     kin_model::relation::RelationKind::Imports,
     kin_model::relation::RelationKind::References,
