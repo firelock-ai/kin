@@ -44,6 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add the profiling layer to the logging stack instead of replacing it (#1042)
 - Decide the embedding class from the coverage counters, not from a conjunction (#1026)
 - Compare the relation census to the one this store last recorded (#1007)
+- Write the Kin PATH line where a non-interactive zsh reads it (#1037)
 
 
 ## [0.5.46] - 2026-08-21
