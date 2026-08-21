@@ -11,8 +11,10 @@
 # semantic_coverage.complete on every platform with nothing local having ever
 # asked the question."
 #
-# These suites take about two minutes each against a built binary, so there is no
-# reason for the question to wait for a tag. The scripts they run are owned by
+# Against a built binary the suites are minutes, not hours: measured locally on
+# 2026-08-21 against a kin built from main, the magic suite took 107 s and the
+# brownfield suite 351 s with a warm corpus cache. There is no reason for the
+# question to wait for a tag. The scripts they run are owned by
 # this repository (scripts/acceptance/), so the suite versions with the code it
 # tests rather than drifting against it in another checkout.
 #
