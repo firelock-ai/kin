@@ -6751,6 +6751,114 @@ mod tests {
         );
     }
 
+    /// FIR-2499. A path graph truth already tracks is projection drift, not
+    /// catch-up work, however recently the host touched it.
+    ///
+    /// Repository authority holds bytes for a tracked path, so a host edit to
+    /// one is what `kin doctor --drift` reports and `kin doctor --heal`
+    /// repairs. A catch-up that took it would advance the workspace over
+    /// graph-owned content at daemon start and empty the report an operator is
+    /// about to read. The untracked file beside it is the positive control:
+    /// same directory, same window, and it is still named.
+    #[test]
+    fn the_catch_up_leaves_a_tracked_path_to_the_drift_report() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+
+        let tracked = repo.path().join("tracked.rs");
+        std::fs::write(&tracked, b"pub fn tracked() -> u32 { 1 }\n").unwrap();
+        admit_file_event_ambient(&state, &FileEvent::Changed(tracked.clone())).unwrap();
+        assert!(
+            tree_entry(&state, "tracked.rs").is_some(),
+            "the fixture needs this path tracked before the window is opened"
+        );
+        std::fs::write(&tracked, b"pub fn tracked() -> u32 { 2 }\n").unwrap();
+        stamp_modified(
+            &tracked,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(3_000_000),
+        );
+
+        let untracked = repo.path().join("untracked.rs");
+        std::fs::write(&untracked, b"pub fn untracked() -> u32 { 3 }\n").unwrap();
+        stamp_modified(
+            &untracked,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(3_000_000),
+        );
+
+        let window = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000);
+        let named = event_paths(&plan_catch_up_events(&state, window).unwrap())
+            .iter()
+            .filter_map(|path| path.file_name())
+            .map(|leaf| leaf.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert!(
+            named.contains(&"untracked.rs".to_string()),
+            "the positive control: content the graph has never met is still named: {named:?}"
+        );
+        assert!(
+            !named.contains(&"tracked.rs".to_string()),
+            "a tracked path edited off-watch is drift for `kin doctor`, not a silent catch-up \
+             admission: {named:?}"
+        );
+    }
+
+    /// FIR-2499. A directory graph truth has never met is disclosed, not swept
+    /// in.
+    ///
+    /// A directory arriving whole is a clone, a move, an unpacked archive or a
+    /// renamed control directory, and a move restamps every entry it carries,
+    /// so modification times cannot tell that content from authored work.
+    /// Admitting one at daemon start is the working-copy sweep startup must
+    /// never perform. The file beside the tracked one is the positive control:
+    /// it sits where the graph already looks, so the window still reaches it.
+    #[test]
+    fn the_catch_up_declines_a_directory_the_graph_has_never_met() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+
+        let known = repo.path().join("known.rs");
+        std::fs::write(&known, b"pub fn known() -> u32 { 1 }\n").unwrap();
+        admit_file_event_ambient(&state, &FileEvent::Changed(known)).unwrap();
+        assert!(
+            tree_entry(&state, "known.rs").is_some(),
+            "the fixture needs the repository root to hold tracked content"
+        );
+
+        let beside = repo.path().join("beside_known.rs");
+        std::fs::write(&beside, b"pub fn beside() -> u32 { 2 }\n").unwrap();
+        stamp_modified(
+            &beside,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(3_000_000),
+        );
+
+        let arrived = repo.path().join("arrived_whole");
+        std::fs::create_dir_all(&arrived).unwrap();
+        let carried = arrived.join("carried.rs");
+        std::fs::write(&carried, b"pub fn carried() -> u32 { 3 }\n").unwrap();
+        stamp_modified(
+            &carried,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(3_000_000),
+        );
+
+        let window = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000);
+        let named = event_paths(&plan_catch_up_events(&state, window).unwrap())
+            .iter()
+            .filter_map(|path| path.file_name())
+            .map(|leaf| leaf.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert!(
+            named.contains(&"beside_known.rs".to_string()),
+            "the positive control: a new file where the graph already looks is named: {named:?}"
+        );
+        assert!(
+            !named.contains(&"carried.rs".to_string()),
+            "a directory the graph has never met is for the behind disclosure and `kin admit`, \
+             not for a startup sweep: {named:?}"
+        );
+    }
+
     /// The host paths a planned batch names.
     fn event_paths(events: &[FileEvent]) -> Vec<PathBuf> {
         events

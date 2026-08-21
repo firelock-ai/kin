@@ -869,7 +869,7 @@ pub fn scan_repository_preserving_graph_only<'a>(
         graph_only_paths,
         ScanMode::Content,
     )?;
-    scanner.walk(root, false)?;
+    scanner.walk(root, false, true)?;
     scanner.diagnostics.admitted_entries = scanner.entries.len();
     scanner.diagnostics.graph_only_entries_preserved = scanner.graph_only_paths.len();
     scanner.diagnostics.ignored_tracked_entries_unverified = scanner.unverified_ignored_paths.len();
@@ -951,7 +951,9 @@ enum ScanMode {
     /// Stat every admissible leaf and keep only the paths whose directory entry
     /// was last modified at or after this instant. Opens nothing, hashes
     /// nothing, and produces no completion proof, because it observed no
-    /// content and must never be mistaken for a walk that did.
+    /// content and must never be mistaken for a walk that did. Narrower than
+    /// [`ScanMode::Content`] by two rules: a tracked path is never kept, and
+    /// neither is a leaf inside a directory graph truth has never met.
     ModifiedSince(SystemTime),
 }
 
@@ -968,6 +970,15 @@ enum ScanMode {
 /// A leaf whose modification time will not read counts as modified. The window
 /// exists to find work the graph missed, so losing a file is the worse error;
 /// re-observing an unchanged path costs one admission that plans nothing.
+///
+/// What this names is bounded on both sides. Below, by `since`, so the pass is
+/// never a whole-working-copy sweep. Across, by two rules the content walk does
+/// not apply: a path graph truth already tracks stays projection drift for
+/// `kin doctor` to report and repair rather than being admitted from under it,
+/// and a leaf inside a directory graph truth has never met is left to the
+/// behind disclosure and to `kin admit`, because a directory arriving whole is
+/// a move or a clone and its entries carry fresh modification times whatever
+/// their content's age.
 ///
 /// A leaf that vanished between the directory read and the stat is left out. It
 /// is not there to admit, and if it comes back the watcher that is already
@@ -988,7 +999,7 @@ pub fn scan_repository_modified_since<'a>(
         graph_only_paths,
         ScanMode::ModifiedSince(since),
     )?;
-    scanner.walk(root, false)?;
+    scanner.walk(root, false, true)?;
     Ok(scanner.modified)
 }
 
@@ -1085,6 +1096,7 @@ impl Scanner<'_> {
         &mut self,
         directory: &Path,
         within_excluded_environment: bool,
+        directory_known_to_graph: bool,
     ) -> Result<(), IncompleteRepositoryScan> {
         self.diagnostics.directories_visited += 1;
         let entries = fs::read_dir(directory)
@@ -1148,6 +1160,7 @@ impl Scanner<'_> {
                 self.walk(
                     &host_path,
                     within_excluded_environment || excluded_environment,
+                    holds_tracked,
                 )?;
                 continue;
             }
@@ -1193,6 +1206,38 @@ impl Scanner<'_> {
             // content walk admits so this mode invents no membership of its
             // own: a special entry is not admissible either way.
             if let ScanMode::ModifiedSince(since) = self.mode {
+                // Two narrowings this mode applies and the content walk does
+                // not, because the two modes answer different questions. A
+                // content walk states what the working copy holds. This mode
+                // proposes what a daemon should re-observe after a stretch
+                // nobody watched, and a proposal is admitted with no operator
+                // in the loop, so it may only reach the population where
+                // admitting is the safe direction.
+                //
+                // A path graph truth already tracks is never proposed.
+                // Repository authority holds bytes for it, so a host edit to it
+                // is projection drift: `kin doctor --drift` reports it, `kin
+                // doctor --heal` restores it from authority and `kin admit`
+                // takes it, and each of those is a seam somebody chose.
+                // Proposing it here would instead advance the workspace over
+                // graph-owned content at daemon start, behind the back of the
+                // report an operator is about to read.
+                //
+                // A leaf inside a directory graph truth has never met is not
+                // proposed either. One file appearing beside files the graph
+                // already tracks is an edit to a part of the tree the graph
+                // knows; a directory nobody has ever admitted, arriving whole,
+                // is a clone, a move, an unpacked archive or a renamed control
+                // directory, and modification times cannot tell those from
+                // authored work because a move restamps every entry it carries.
+                // Admitting one silently at startup is the working-copy sweep
+                // startup must never perform. Nothing is lost by declining:
+                // that content is exactly what the behind disclosure counts and
+                // names, so it is announced rather than hidden, and `kin admit`
+                // is the seam that takes it.
+                if self.tracked_paths.contains(&repo_path) || !directory_known_to_graph {
+                    continue;
+                }
                 if file_type.is_file() || file_type.is_symlink() {
                     let modified =
                         host_entry_modified_since(&host_path, since).map_err(|error| {
