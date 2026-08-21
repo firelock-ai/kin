@@ -36,6 +36,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Wait on the observable in six load-flaky tests instead of on a fixed budget (#1033)
 - Refuse to bind the managed install root, and probe the shim outside the repository (#1035)
 - Cover three of the daemon allowance derivation sites with fixtures (#1036)
+- Move the kin registry pin to kin-vfs-core 0.4.13 and advance the kin-vfs release input (#1034)
+- Bind a Python method call through its receiver's declared type, and keep a module off its function's call edges (#1038)
 
 
 ## [0.5.46] - 2026-08-21
