@@ -2287,6 +2287,8 @@ mod tests {
             policy_excluded_sample: Vec::new(),
             entries: BTreeMap::new(),
             diagnostics: RepositoryScanDiagnostics::default(),
+            mode: ScanMode::Content,
+            modified: Vec::new(),
         };
 
         let error = scanner
@@ -2476,6 +2478,8 @@ mod tests {
             policy_excluded_sample: Vec::new(),
             entries: BTreeMap::new(),
             diagnostics: RepositoryScanDiagnostics::default(),
+            mode: ScanMode::Content,
+            modified: Vec::new(),
         };
 
         let error = scanner
