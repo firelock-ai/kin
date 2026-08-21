@@ -609,6 +609,18 @@ pub struct MergeTransactionRecord {
     pub hash: Hash256,
 }
 
+/// The identity-bearing projection of one [`MergeTransactionRecord`].
+///
+/// A mirror kept by hand: the record's fields, in the record's declaration
+/// order, minus `hash`, which is excluded because it is this very identity and
+/// including it would be self-referential.
+///
+/// The hash cannot police this list. A field the record grows and this list
+/// never gains stops participating, so two records differing only in it share
+/// one identity and every digest already on disk stays valid while that
+/// happens. A reorder here is invisible outright, because the identity encodes
+/// through `canonical_json_bytes`, whose object encoder sorts keys. Both are
+/// guarded by `merge_identity_mirrors_every_record_field_positionally`.
 #[derive(Serialize)]
 struct MergeTransactionIdentity<'a> {
     schema_version: u32,
@@ -698,19 +710,27 @@ impl MergeTransactionRecord {
     }
 
     pub fn identity_hash(&self) -> Result<Hash256> {
-        hash_canonical(
-            b"kin-merge-transaction-v1\0",
-            &MergeTransactionIdentity {
-                schema_version: self.schema_version,
-                repository_id: &self.repository_id,
-                workspace_id: self.workspace_id,
-                opened: &self.opened,
-                binding: &self.binding,
-                restore: &self.restore,
-                entries: &self.entries,
-                state: &self.state,
-            },
-        )
+        hash_canonical(b"kin-merge-transaction-v1\0", &self.identity_payload())
+    }
+
+    /// The exact payload [`Self::identity_hash`] hashes.
+    ///
+    /// Split out of the hash so a test can encode it positionally. The payload
+    /// is a mirror kept by hand and the hash is built by `canonical_json_bytes`,
+    /// whose object encoder sorts keys, so a hash comparison cannot see a field
+    /// this mirror dropped, gained or moved.
+    /// `merge_identity_mirrors_every_record_field_positionally` is that test.
+    fn identity_payload(&self) -> MergeTransactionIdentity<'_> {
+        MergeTransactionIdentity {
+            schema_version: self.schema_version,
+            repository_id: &self.repository_id,
+            workspace_id: self.workspace_id,
+            opened: &self.opened,
+            binding: &self.binding,
+            restore: &self.restore,
+            entries: &self.entries,
+            state: &self.state,
+        }
     }
 
     /// Entries no resolution has settled. This is what `kin conflicts` lists.
@@ -1173,6 +1193,161 @@ pub(crate) mod tests {
                 .unwrap();
         }
         settled
+    }
+
+    fn messagepack_array_len(bytes: &[u8]) -> usize {
+        match bytes {
+            [tag @ 0x90..=0x9f, ..] => usize::from(*tag & 0x0f),
+            [0xdc, high, low, ..] => usize::from(u16::from_be_bytes([*high, *low])),
+            [0xdd, a, b, c, d, ..] => {
+                usize::try_from(u32::from_be_bytes([*a, *b, *c, *d])).unwrap()
+            }
+            _ => panic!("expected a MessagePack array"),
+        }
+    }
+
+    /// Every field of a merge record either binds its identity or is a named
+    /// exclusion, and the mirror that carries them is diffed POSITIONALLY.
+    ///
+    /// `MergeTransactionIdentity` is a field list kept by hand against
+    /// `MergeTransactionRecord`, and the identity hash cannot police it. A
+    /// field the record grows and the mirror never gains stops participating,
+    /// so two records differing only in it share one identity while every
+    /// digest already on disk keeps verifying. A field the mirror reorders is
+    /// invisible outright, because the identity encodes through
+    /// `canonical_json_bytes`, whose object encoder sorts keys.
+    ///
+    /// The positional diff below catches order, element count and membership;
+    /// the field walk catches participation. Both are needed: a mirror that
+    /// dropped a field would be caught by either, but a mirror that merely
+    /// moved one is only caught by the first, and a record that grew a field
+    /// nobody bound is only caught by the second.
+    ///
+    /// It fails closed on a new field, because the record's own positional
+    /// arity is asserted equal to the number of cases. Each case also asserts
+    /// its mutation changed the record before judging the identity, so a case
+    /// that quietly did nothing cannot report its field as unbound.
+    #[test]
+    fn merge_identity_mirrors_every_record_field_positionally() {
+        /// Excluded from the identity on purpose, with the reason.
+        const EXCLUDED: [(&str, &str); 1] = [(
+            "hash",
+            "it is this identity, so binding it would be self-referential",
+        )];
+
+        let base = record();
+        let baseline = base.identity_hash().unwrap();
+
+        // Every field of MergeTransactionRecord, in declaration order.
+        #[allow(clippy::type_complexity)]
+        let cases: Vec<(&str, Box<dyn Fn(&mut MergeTransactionRecord)>)> = vec![
+            (
+                "schema_version",
+                Box::new(|record| record.schema_version += 1),
+            ),
+            (
+                "repository_id",
+                Box::new(|record| {
+                    record.repository_id = RepositoryId::new("other").unwrap();
+                }),
+            ),
+            (
+                "workspace_id",
+                Box::new(|record| {
+                    record.workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(10));
+                }),
+            ),
+            (
+                "opened",
+                Box::new(|record| record.opened.actor = AuthorId::new("other-merger")),
+            ),
+            (
+                "binding",
+                Box::new(|record| record.binding.base_change = change(0x04)),
+            ),
+            ("restore", Box::new(|record| record.restore.generation += 1)),
+            (
+                "entries",
+                Box::new(|record| {
+                    record.entries[0].label = Some("CHANGELOG.md".to_string());
+                }),
+            ),
+            (
+                "state",
+                Box::new(|record| {
+                    record.state = MergeTransactionState::Aborted {
+                        operation_id: OperationId::from_uuid(Uuid::from_u128(101)),
+                        actor: AuthorId::new("merger"),
+                        aborted_at: timestamp(1_700_000_200),
+                    };
+                }),
+            ),
+            (
+                "hash",
+                Box::new(|record| record.hash = Hash256::from_bytes([0x77; 32])),
+            ),
+        ];
+
+        let case_count = cases.len();
+        let encoded_fields = messagepack_array_len(&rmp_serde::to_vec(&base).unwrap());
+        assert_eq!(
+            encoded_fields, case_count,
+            "MergeTransactionRecord encodes {encoded_fields} fields but this test covers \
+             {case_count}. A field was added or removed; extend the table above, and decide \
+             whether the new field binds identity or joins EXCLUDED with a reason."
+        );
+
+        // The positional differential. The reference is built element by
+        // element from the record in the record's own declaration order, minus
+        // the exclusion, so a field the mirror moved, dropped or gained shows
+        // up here as a byte difference. The hash can show none of the three.
+        let payload = rmp_serde::to_vec(&base.identity_payload()).unwrap();
+        let reference = rmp_serde::to_vec(&(
+            &base.schema_version,
+            &base.repository_id,
+            &base.workspace_id,
+            &base.opened,
+            &base.binding,
+            &base.restore,
+            &base.entries,
+            &base.state,
+        ))
+        .unwrap();
+        assert_eq!(
+            payload, reference,
+            "MergeTransactionIdentity no longer mirrors MergeTransactionRecord element for \
+             element. Its identity hash sorts object keys, so it stayed green through whatever \
+             moved here."
+        );
+        assert_eq!(
+            messagepack_array_len(&payload),
+            case_count - EXCLUDED.len(),
+            "the identity payload's element count is not the record's minus its exclusions"
+        );
+
+        for (field, mutate) in cases {
+            let mut candidate = base.clone();
+            mutate(&mut candidate);
+            assert_ne!(
+                candidate, base,
+                "the `{field}` case did not change the record, so it proves nothing about whether \
+                 `{field}` binds identity"
+            );
+            let moved = candidate.identity_hash().unwrap() != baseline;
+            match EXCLUDED.iter().find(|(name, _)| *name == field) {
+                Some((_, reason)) => assert!(
+                    !moved,
+                    "`{field}` is excluded from the merge identity on purpose ({reason}) and has \
+                     started participating in it"
+                ),
+                None => assert!(
+                    moved,
+                    "`{field}` is a field of MergeTransactionRecord that does not participate in \
+                     its identity, so two records differing only in `{field}` share one identity. \
+                     Bind it in MergeTransactionIdentity, or add it to EXCLUDED with the reason."
+                ),
+            }
+        }
     }
 
     #[test]

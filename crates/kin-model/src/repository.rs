@@ -883,6 +883,23 @@ pub struct RepositoryOperationRecord {
     pub merge_transaction_delta: Option<MergeTransactionDelta>,
 }
 
+/// The identity-bearing projection of one [`RepositoryOperationRecord`].
+///
+/// This is a mirror kept by hand: it names the record's fields, in the record's
+/// declaration order, minus `roots_before` and `roots_after`, which are
+/// excluded because the ref-log root is itself part of those bundles and
+/// including them would make the identity circular.
+///
+/// A mirror kept by hand can drift in two ways, and the hash can see NEITHER.
+/// The record can grow a field this list never gains, in which case two records
+/// that differ only in that field collide on one identity. The list can be
+/// reordered, which is invisible because the identity encodes through
+/// `canonical_json_bytes`, whose object encoder sorts keys. Both are guarded by
+/// `operation_identity_mirrors_every_record_field_positionally`, which diffs
+/// this payload's positional encoding against a reference built from the record
+/// and then requires every record field to either move the identity or be one
+/// of the two named exclusions. `tests/persisted_schema.rs` holds the
+/// registration that refuses a new mirror arriving without such a test.
 #[derive(Serialize)]
 struct RepositoryOperationIdentity<'a> {
     operation_id: OperationId,
@@ -958,6 +975,16 @@ impl RepositoryOperationRecord {
     /// make the identity circular.
     pub fn identity_hash(&self) -> Result<Hash256> {
         self.validate()?;
+        let canonical = self.canonicalized();
+        hash_serialized(
+            b"kin-repository-operation-v4\0",
+            &canonical.identity_payload(),
+        )
+    }
+
+    /// A copy of this record with every collection this identity canonicalizes
+    /// put in its canonical order.
+    fn canonicalized(&self) -> Self {
         let mut canonical = self.clone();
         canonical
             .ref_mutations
@@ -966,22 +993,34 @@ impl RepositoryOperationRecord {
             workspace.tree_deltas.sort_by_key(TreeDelta::artifact_id);
             workspace.semantic_delta.sort_canonical();
         }
-        hash_serialized(
-            b"kin-repository-operation-v4\0",
-            &RepositoryOperationIdentity {
-                operation_id: canonical.operation_id,
-                repository_id: &canonical.repository_id,
-                transaction_hash: canonical.transaction_hash,
-                actor: &canonical.actor,
-                committed_at: &canonical.committed_at,
-                git_authority_delta: &canonical.git_authority_delta,
-                ref_mutations: &canonical.ref_mutations,
-                default_ref_mutation: &canonical.default_ref_mutation,
-                workspace_mutation: &canonical.workspace_mutation,
-                local_overlay_delta: &canonical.local_overlay_delta,
-                merge_transaction_delta: &canonical.merge_transaction_delta,
-            },
-        )
+        canonical
+    }
+
+    /// The exact payload [`Self::identity_hash`] hashes, over a canonicalized
+    /// record.
+    ///
+    /// Split out of the hash for the same reason
+    /// `reference_canonical_transaction` is split out of the transaction's
+    /// reference hash: the payload is a mirror written by hand, the hash is
+    /// built by `canonical_json_bytes`, and that encoder sorts object keys, so
+    /// a hash comparison cannot see a field this mirror dropped, gained or
+    /// moved. A test needs the payload itself to encode it positionally.
+    /// `operation_identity_mirrors_every_record_field_positionally` is that
+    /// test.
+    fn identity_payload(&self) -> RepositoryOperationIdentity<'_> {
+        RepositoryOperationIdentity {
+            operation_id: self.operation_id,
+            repository_id: &self.repository_id,
+            transaction_hash: self.transaction_hash,
+            actor: &self.actor,
+            committed_at: &self.committed_at,
+            git_authority_delta: &self.git_authority_delta,
+            ref_mutations: &self.ref_mutations,
+            default_ref_mutation: &self.default_ref_mutation,
+            workspace_mutation: &self.workspace_mutation,
+            local_overlay_delta: &self.local_overlay_delta,
+            merge_transaction_delta: &self.merge_transaction_delta,
+        }
     }
 }
 
@@ -2729,6 +2768,105 @@ mod tests {
         );
     }
 
+    /// The wire twin that decodes a workspace semantic delta must mirror the
+    /// derive that encodes it, element for element, with every collection
+    /// populated.
+    ///
+    /// `WorkspaceSemanticDelta` derives `Serialize` but hand-writes
+    /// `Deserialize` through `WorkspaceSemanticDeltaWire`, so the two field
+    /// lists are kept in step by hand. On the positional encoding a struct is
+    /// an array and position decides the mapping, so a wire twin whose fields
+    /// moved decodes each value into the wrong slot.
+    ///
+    /// `workspace_semantic_delta_persists_external_references_without_moving_legacy_wire`
+    /// already diffs the encoding against a hand-built reference, but it does
+    /// so on `WorkspaceSemanticDelta::default()`, where every collection is
+    /// empty. Two empty arrays are byte-identical, so swapping `entity_deltas`
+    /// and `relation_deltas` in either the type or its wire twin leaves that
+    /// assertion green: its empty input makes the invariant trivially true.
+    /// This drives the same rule with both collections populated and
+    /// distinguishable, which is the only form that can fail.
+    ///
+    /// Both tail states are covered, because `external_reference_deltas` skips
+    /// serialization when empty and therefore changes the array's arity.
+    #[test]
+    fn workspace_semantic_delta_wire_mirror_is_positionally_exact() {
+        let entity = semantic_entity(0x51, "encode");
+        let relation = crate::Relation {
+            id: crate::RelationId(Uuid::from_u128(0x52)),
+            kind: crate::RelationKind::Calls,
+            src: crate::GraphNodeId::Entity(entity.id),
+            dst: crate::GraphNodeId::Entity(EntityId(Uuid::from_u128(0x53))),
+            confidence: 1.0,
+            origin: crate::RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        let reference =
+            ExternalReference::new_resolved("npm-package-v1", "@mui/utils", "merge").unwrap();
+
+        for (label, tail, arity) in [
+            ("an empty external-reference tail", Vec::new(), 3_usize),
+            (
+                "a populated external-reference tail",
+                vec![ExternalReferenceDelta::Added { new: reference }],
+                4,
+            ),
+        ] {
+            let delta = WorkspaceSemanticDelta::new_with_external_references(
+                vec![EntityDelta::Added {
+                    new: entity.clone(),
+                }],
+                vec![RelationDelta::Added {
+                    new: relation.clone(),
+                }],
+                tail,
+            )
+            .unwrap();
+
+            // Every element carries a value, and no two carry the same one, so
+            // a field the wire twin moved lands in a slot whose type rejects it.
+            assert!(!delta.entity_deltas().is_empty());
+            assert!(!delta.relation_deltas().is_empty());
+
+            let encoded = rmp_serde::to_vec(&delta).unwrap();
+            assert_eq!(
+                messagepack_array_len(&encoded),
+                arity,
+                "the workspace semantic delta encodes the wrong number of elements with {label}"
+            );
+
+            let expected = if arity == 3 {
+                rmp_serde::to_vec(&(
+                    &delta.version,
+                    delta.entity_deltas(),
+                    delta.relation_deltas(),
+                ))
+                .unwrap()
+            } else {
+                rmp_serde::to_vec(&(
+                    &delta.version,
+                    delta.entity_deltas(),
+                    delta.relation_deltas(),
+                    delta.external_reference_deltas(),
+                ))
+                .unwrap()
+            };
+            assert_eq!(
+                encoded, expected,
+                "the workspace semantic delta's encoded element order moved with {label}, which \
+                 shifts every persisted record into the wrong slots"
+            );
+
+            let decoded: WorkspaceSemanticDelta = rmp_serde::from_slice(&encoded).unwrap();
+            assert_eq!(
+                decoded, delta,
+                "WorkspaceSemanticDeltaWire no longer mirrors the encoding it decodes with {label}"
+            );
+        }
+    }
+
     #[test]
     fn semantic_only_workspace_transition_is_durable_dirty_authority() {
         let repository_id = RepositoryId::new("repo").unwrap();
@@ -4006,6 +4144,281 @@ mod tests {
         equivalent.roots_before.history = root(0xa1);
         equivalent.roots_after.ref_log = root(0xa2);
         assert_eq!(equivalent.identity_hash().unwrap(), expected);
+    }
+
+    /// Every field of a repository operation record either binds its identity
+    /// or is a named exclusion, and the mirror that carries them is diffed
+    /// POSITIONALLY.
+    ///
+    /// `RepositoryOperationIdentity` is a field list kept by hand against
+    /// `RepositoryOperationRecord`. The hash cannot police it. A field the
+    /// record grows and the mirror never gains simply stops participating, so
+    /// two records differing only in it collide on one ref-log leaf identity,
+    /// and every existing digest stays valid while that happens. A field the
+    /// mirror reorders is invisible outright, because the identity encodes
+    /// through `canonical_json_bytes`, whose object encoder sorts keys.
+    ///
+    /// So this test does two things a hash comparison cannot. It diffs the
+    /// mirror's positional encoding against a reference built element by
+    /// element from the record, where order and element count are both
+    /// load-bearing. And it walks the record field by field, requiring each one
+    /// to move the identity unless it is one of the two exclusions named below.
+    ///
+    /// It fails closed on a new field: the record's own positional arity is
+    /// asserted equal to the number of cases, so a field added to the record
+    /// and not to the table stops this test rather than slipping past it. And
+    /// each case asserts its mutation actually changed the record before
+    /// judging the identity, because a mutation that quietly did nothing would
+    /// otherwise report the field as unbound.
+    #[test]
+    fn operation_identity_mirrors_every_record_field_positionally() {
+        /// Excluded from the identity on purpose, with the reason.
+        const EXCLUDED: [(&str, &str); 2] = [
+            (
+                "roots_before",
+                "the ref-log root is part of the bundle, so binding it is circular",
+            ),
+            (
+                "roots_after",
+                "the ref-log root is part of the bundle, so binding it is circular",
+            ),
+        ];
+
+        let repository_id = RepositoryId::new("repo").unwrap();
+        let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(9));
+        let (shared_policy, policy, local_overlay_delta) = admission_policy(workspace_id);
+        let mutation = create_workspace_mutation(
+            workspace_id,
+            shared_policy,
+            policy,
+            vec![add_artifact(
+                ArtifactId(Uuid::from_u128(10)),
+                b"compose.yaml".to_vec(),
+                0x41,
+                false,
+            )],
+        );
+        let target =
+            RefTarget::change(SemanticChangeId::from_hash(Hash256::from_bytes([0x81; 32])));
+        let ref_mutation = |name: &[u8], target: RefTarget| RefMutation {
+            name: RefName::branch(name).unwrap(),
+            expected: RefExpectation::MustNotExist,
+            new_target: Some(target),
+            policy: RefUpdatePolicy::FastForwardOnly,
+        };
+        let mut roots_after = roots();
+        roots_after.generation = roots().generation + 1;
+
+        let base = RepositoryOperationRecord {
+            operation_id: OperationId::from_uuid(Uuid::from_u128(41)),
+            repository_id: repository_id.clone(),
+            transaction_hash: Hash256::from_bytes([0x82; 32]),
+            actor: AuthorId::new("actor"),
+            committed_at: crate::Timestamp::from(
+                chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            git_authority_delta: None,
+            ref_mutations: vec![
+                ref_mutation(b"a", target.clone()),
+                ref_mutation(b"b", target.clone()),
+            ],
+            default_ref_mutation: Some(DefaultRefMutation {
+                expected: crate::DefaultRefExpectation::MustBeUnset,
+                new_default: Some(RefName::branch(b"a").unwrap()),
+            }),
+            workspace_mutation: Some(mutation),
+            local_overlay_delta: Some(local_overlay_delta),
+            roots_before: roots(),
+            roots_after,
+            merge_transaction_delta: Some(MergeTransactionDelta::open(
+                crate::merge::tests::sample_record(repository_id.clone(), workspace_id),
+            )),
+        };
+        base.validate().unwrap();
+        let baseline = base.identity_hash().unwrap();
+
+        // Every field of RepositoryOperationRecord, in declaration order.
+        #[allow(clippy::type_complexity)]
+        let cases: Vec<(&str, Box<dyn Fn(&mut RepositoryOperationRecord)>)> = vec![
+            (
+                "operation_id",
+                Box::new(|record| {
+                    record.operation_id = OperationId::from_uuid(Uuid::from_u128(42));
+                }),
+            ),
+            (
+                "repository_id",
+                Box::new(|record| {
+                    record.repository_id = RepositoryId::new("other").unwrap();
+                }),
+            ),
+            (
+                "transaction_hash",
+                Box::new(|record| {
+                    record.transaction_hash = Hash256::from_bytes([0x83; 32]);
+                }),
+            ),
+            (
+                "actor",
+                Box::new(|record| record.actor = AuthorId::new("other-actor")),
+            ),
+            (
+                "committed_at",
+                Box::new(|record| {
+                    record.committed_at = crate::Timestamp::from(
+                        chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:06Z")
+                            .unwrap()
+                            .with_timezone(&chrono::Utc),
+                    );
+                }),
+            ),
+            (
+                "git_authority_delta",
+                Box::new(|record| {
+                    let authority = blob_git_authority(record.repository_id.clone(), b"body");
+                    record.git_authority_delta =
+                        Some(GitExternalAuthorityDelta::initialize(authority));
+                }),
+            ),
+            (
+                "ref_mutations",
+                Box::new(|record| {
+                    record.ref_mutations[0].policy = RefUpdatePolicy::ForceWithLease;
+                }),
+            ),
+            (
+                "default_ref_mutation",
+                Box::new(|record| {
+                    record.default_ref_mutation = Some(DefaultRefMutation {
+                        expected: crate::DefaultRefExpectation::MustBeUnset,
+                        new_default: Some(RefName::branch(b"b").unwrap()),
+                    });
+                }),
+            ),
+            (
+                "workspace_mutation",
+                Box::new(|record| {
+                    let workspace_id = record.workspace_mutation.as_ref().unwrap().workspace_id;
+                    let (shared_policy, policy, _) = admission_policy(workspace_id);
+                    record.workspace_mutation = Some(create_workspace_mutation(
+                        workspace_id,
+                        shared_policy,
+                        policy,
+                        vec![add_artifact(
+                            ArtifactId(Uuid::from_u128(11)),
+                            b"Dockerfile".to_vec(),
+                            0x44,
+                            false,
+                        )],
+                    ));
+                }),
+            ),
+            (
+                "local_overlay_delta",
+                Box::new(|record| {
+                    let workspace_id = record.workspace_mutation.as_ref().unwrap().workspace_id;
+                    let overlay = FrozenLocalOverlay::new(
+                        workspace_id,
+                        0,
+                        AdmissionCase::FoldAscii,
+                        Vec::new(),
+                    )
+                    .unwrap();
+                    record.local_overlay_delta = Some(FrozenLocalOverlayDelta::initialize(overlay));
+                }),
+            ),
+            (
+                "roots_before",
+                Box::new(|record| record.roots_before.history = root(0xa1)),
+            ),
+            (
+                "roots_after",
+                Box::new(|record| record.roots_after.ref_log = root(0xa2)),
+            ),
+            (
+                "merge_transaction_delta",
+                Box::new(|record| {
+                    let existing = record
+                        .merge_transaction_delta
+                        .as_ref()
+                        .unwrap()
+                        .new
+                        .clone()
+                        .unwrap();
+                    record.merge_transaction_delta =
+                        Some(MergeTransactionDelta::drop_record(existing));
+                }),
+            ),
+        ];
+
+        let case_count = cases.len();
+        let canonical = base.canonicalized();
+        assert_eq!(
+            messagepack_array_len(&rmp_serde::to_vec(&canonical).unwrap()),
+            case_count,
+            "RepositoryOperationRecord encodes {} fields but this test covers {case_count}. A \
+             field was added or removed; extend the table above, and decide whether the new \
+             field binds identity or joins EXCLUDED with a reason.",
+            messagepack_array_len(&rmp_serde::to_vec(&canonical).unwrap())
+        );
+
+        // The positional differential. The reference is built element by
+        // element from the record in the record's own declaration order, minus
+        // the exclusions, so a field the mirror moved, dropped or gained shows
+        // up here as a byte difference. The hash cannot show any of the three.
+        let payload = rmp_serde::to_vec(&canonical.identity_payload()).unwrap();
+        let reference = rmp_serde::to_vec(&(
+            &canonical.operation_id,
+            &canonical.repository_id,
+            &canonical.transaction_hash,
+            &canonical.actor,
+            &canonical.committed_at,
+            &canonical.git_authority_delta,
+            &canonical.ref_mutations,
+            &canonical.default_ref_mutation,
+            &canonical.workspace_mutation,
+            &canonical.local_overlay_delta,
+            &canonical.merge_transaction_delta,
+        ))
+        .unwrap();
+        assert_eq!(
+            payload, reference,
+            "RepositoryOperationIdentity no longer mirrors RepositoryOperationRecord element for \
+             element. Its identity hash sorts object keys, so it stayed green through whatever \
+             moved here."
+        );
+        assert_eq!(
+            messagepack_array_len(&payload),
+            case_count - EXCLUDED.len(),
+            "the identity payload's element count is not the record's minus its exclusions"
+        );
+
+        for (field, mutate) in cases {
+            let mut candidate = base.clone();
+            mutate(&mut candidate);
+            assert_ne!(
+                candidate, base,
+                "the `{field}` case did not change the record, so it proves nothing about whether \
+                 `{field}` binds identity"
+            );
+            let moved = candidate.identity_hash().unwrap() != baseline;
+            match EXCLUDED.iter().find(|(name, _)| *name == field) {
+                Some((_, reason)) => assert!(
+                    !moved,
+                    "`{field}` is excluded from the operation identity on purpose ({reason}) and \
+                     has started participating in it"
+                ),
+                None => assert!(
+                    moved,
+                    "`{field}` is a field of RepositoryOperationRecord that does not participate \
+                     in its identity, so two records differing only in `{field}` share one \
+                     ref-log leaf identity. Bind it in RepositoryOperationIdentity, or add it to \
+                     EXCLUDED with the reason."
+                ),
+            }
+        }
     }
 
     #[test]

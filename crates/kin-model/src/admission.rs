@@ -815,6 +815,28 @@ pub struct EffectiveAdmissionPolicyStamp {
     pub local: LocalOverlayStamp,
 }
 
+/// Hash a payload for an admission identity.
+///
+/// This deliberately does NOT share `crate::identity::canonical_json_bytes`,
+/// and the difference is a contract rather than an accident. That encoder
+/// routes through a `serde_json::Value`, whose map normalizes object key order
+/// away, so identities built on it are blind to the order a serialization
+/// wrote its fields in. `serde_json::to_vec` streams the value instead, so a
+/// struct's fields reach the digest in declaration order and a reorder moves
+/// the hash.
+///
+/// The consequence is the useful half. The mirrors hashed here,
+/// [`SharedAdmissionPolicyIdentity`] and [`LocalOverlayIdentity`], are field
+/// lists kept by hand, and unlike the mirrors in `repository.rs` and `merge.rs`
+/// their order is already visible to any hash comparison over them. They owe no
+/// separate positional differential for that reason, which is what
+/// `tests/persisted_schema.rs` records against them. What a hash comparison
+/// still cannot see for either kind is a field the mirrored type grew and the
+/// mirror never gained; the subsequence check in that same file is what covers
+/// it.
+///
+/// `the_admission_identity_encoder_preserves_field_order` is what keeps this
+/// paragraph true rather than merely written down.
 fn hash_json(domain: &[u8], value: &impl Serialize) -> Result<Hash256> {
     let payload =
         serde_json::to_vec(value).map_err(|error| ModelError::Serialization(error.to_string()))?;
@@ -867,6 +889,86 @@ mod tests {
             approved_by: AuthorId::new("security"),
             reason: "intentional fixture".to_string(),
         }
+    }
+
+    /// The admission encoder sees field order, which is the opposite of what
+    /// the repository encoder does.
+    ///
+    /// Both contracts are deliberate and they live one module apart, so the
+    /// difference is worth a test rather than a comment. `hash_json` streams
+    /// through `serde_json::to_vec`, where a struct's fields reach the digest
+    /// in declaration order. `canonical_json_bytes` materializes a
+    /// `serde_json::Value` first, where they do not.
+    ///
+    /// This is what lets `tests/persisted_schema.rs` register the two mirrors
+    /// hashed here as needing no positional differential of their own: any hash
+    /// comparison over them already fails on a reorder. Route `hash_json`
+    /// through `canonical_json_bytes` and this test fails, which is the point.
+    ///
+    /// The two `assert_eq!` arms are the controls. Without them a hash that
+    /// simply differed every call would satisfy the inequality and read as a
+    /// pass.
+    #[test]
+    fn the_admission_identity_encoder_preserves_field_order() {
+        #[derive(Serialize)]
+        struct Declared {
+            alpha: u8,
+            beta: &'static str,
+        }
+        #[derive(Serialize)]
+        struct Reordered {
+            beta: &'static str,
+            alpha: u8,
+        }
+
+        let declared = hash_json(
+            b"kin-order-probe\0",
+            &Declared {
+                alpha: 7,
+                beta: "value",
+            },
+        )
+        .unwrap();
+        let reordered = hash_json(
+            b"kin-order-probe\0",
+            &Reordered {
+                beta: "value",
+                alpha: 7,
+            },
+        )
+        .unwrap();
+        assert_ne!(
+            declared, reordered,
+            "the admission identity encoder stopped seeing field order. Every mirror it hashes is \
+             registered in tests/persisted_schema.rs as needing no positional differential BECAUSE \
+             it sees order, so that registration is now wrong."
+        );
+
+        assert_eq!(
+            declared,
+            hash_json(
+                b"kin-order-probe\0",
+                &Declared {
+                    alpha: 7,
+                    beta: "value",
+                },
+            )
+            .unwrap(),
+            "the same payload hashed twice must give the same digest, or the inequality above is \
+             noise rather than order"
+        );
+        assert_ne!(
+            declared,
+            hash_json(
+                b"kin-other-probe\0",
+                &Declared {
+                    alpha: 7,
+                    beta: "value",
+                },
+            )
+            .unwrap(),
+            "the domain separator must participate in the digest"
+        );
     }
 
     #[test]

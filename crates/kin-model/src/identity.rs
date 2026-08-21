@@ -242,6 +242,57 @@ fn append_len_prefixed_hash_field(hasher: &mut Sha256, value: &[u8]) -> Result<(
     Ok(())
 }
 
+/// Encode a value into the canonical byte string every identity in this crate
+/// hashes.
+///
+/// # Object key order is deliberately not part of this contract
+///
+/// Two serializations that emit the same fields under the same names in
+/// different orders produce identical bytes here, so every identity derived
+/// through this function is blind to field order. That is a decision, and the
+/// reason lives in where the order is lost rather than in where it is sorted.
+/// `serde_json::to_value` builds a `serde_json::Map`, which is a `BTreeMap` in
+/// the default feature configuration, so the declaration order is already gone
+/// before the `Value::Object` arm of [`append_canonical_json`] ever runs.
+///
+/// That makes the `sort_by` in that arm a no-op in the default build, and it is
+/// kept anyway. `serde_json`'s `preserve_order` feature swaps the map for an
+/// `IndexMap`, Cargo unifies features across a whole build graph, and any crate
+/// in any consumer's dependency tree can turn it on. Without the sort, every
+/// identity this crate derives would then depend on which unrelated crates a
+/// consumer happens to build. Note what follows: the sort cannot be exercised
+/// in the default configuration, because a `BTreeMap` cannot present its keys
+/// out of order, so deleting it fails no test here. It is insurance, not
+/// covered behavior, and it is written down as such so it does not read as dead
+/// code to whoever finds it next.
+///
+/// Preserving order instead was considered and rejected. No format this crate
+/// persists reads these payloads back by name from this encoding, so order
+/// would buy nothing a positional differential does not buy better, and turning
+/// it on would rewrite every identity already on disk.
+///
+/// # What that costs, and who owes the difference
+///
+/// A differential that compares HASHES cannot see anything the hash
+/// deliberately normalizes away, and this one normalizes away field order. So a
+/// serialization written or mirrored by hand cannot be guarded by a hash
+/// comparison alone: swap two fields in a mirror type and every hash
+/// differential over it stays green. That was demonstrated by sabotage on
+/// [`crate::RepositoryTransaction`]'s canonicalization rather than reasoned
+/// about, and it is why FIR-2549 exists.
+///
+/// Every payload reaching this function whose serialization is hand-written, or
+/// mirrored field for field against another type, therefore owes a POSITIONAL
+/// differential in addition to its hash test: encode it through a
+/// non-human-readable serializer, where a struct is an ordered array and the
+/// element count is load-bearing, and diff those bytes against a reference
+/// built the other way. `rmp-serde` is what this crate uses for that.
+/// `tests/persisted_schema.rs` carries the registry that refuses a new
+/// hand-written serialization arriving without one.
+///
+/// Sequence order is a different question and IS preserved: the `Value::Array`
+/// arm encodes elements in the order it receives them. Collections whose order
+/// must not affect identity are sorted by their callers before they arrive.
 pub(crate) fn canonical_json_bytes(value: &impl serde::Serialize) -> Result<Vec<u8>> {
     let value = serde_json::to_value(value).map_err(serialization)?;
     let mut encoded = Vec::new();
@@ -485,6 +536,107 @@ mod tests {
             compute_semantic_change_id(&decoded).unwrap(),
             compute_semantic_change_id(&fixture).unwrap(),
             "an older positional change payload must keep its identity"
+        );
+    }
+
+    /// The canonical encoder cannot see the order of an object's fields.
+    ///
+    /// This is the contract stated on [`canonical_json_bytes`], made
+    /// falsifiable. Every identity in this crate is derived from these bytes,
+    /// so anyone who makes the encoder order-preserving moves every identity
+    /// already on disk, and this is the test that stops them silently.
+    ///
+    /// It is also the reason a hash differential is not enough for a
+    /// hand-written or mirrored serialization: the two structs below emit the
+    /// same field names in opposite orders and are byte-identical here, which
+    /// is exactly what a field swapped in a mirror type looks like to every
+    /// hash comparison in the crate.
+    ///
+    /// The three `assert_ne!` cases are the controls. Without them a broken
+    /// encoder that returned a constant, or ignored its input, would satisfy
+    /// the equality above and read as a pass.
+    #[test]
+    fn the_canonical_encoder_is_blind_to_object_field_order_and_to_nothing_else() {
+        #[derive(serde::Serialize)]
+        struct Declared {
+            alpha: u8,
+            beta: &'static str,
+        }
+        #[derive(serde::Serialize)]
+        struct Reordered {
+            beta: &'static str,
+            alpha: u8,
+        }
+        #[derive(serde::Serialize)]
+        struct Renamed {
+            alpha: u8,
+            gamma: &'static str,
+        }
+
+        let declared = canonical_json_bytes(&Declared {
+            alpha: 7,
+            beta: "value",
+        })
+        .unwrap();
+        let reordered = canonical_json_bytes(&Reordered {
+            beta: "value",
+            alpha: 7,
+        })
+        .unwrap();
+        assert_eq!(
+            declared, reordered,
+            "the canonical encoder started distinguishing field order, which rewrites every \
+             identity in this crate; read the contract on canonical_json_bytes before changing it"
+        );
+
+        assert_ne!(
+            declared,
+            canonical_json_bytes(&Declared {
+                alpha: 8,
+                beta: "value",
+            })
+            .unwrap(),
+            "the encoder ignored a field value"
+        );
+        assert_ne!(
+            declared,
+            canonical_json_bytes(&Renamed {
+                alpha: 7,
+                gamma: "value",
+            })
+            .unwrap(),
+            "the encoder ignored a field name"
+        );
+        assert_ne!(
+            canonical_json_bytes(&["first", "second"]).unwrap(),
+            canonical_json_bytes(&["second", "first"]).unwrap(),
+            "sequence order is part of the contract and must survive the encoder"
+        );
+
+        // The equality above cannot fail in the default feature
+        // configuration, because `serde_json::Map` is a `BTreeMap` there and
+        // cannot present its keys out of order in the first place. This is the
+        // arm that can: the exact bytes, built here by hand from the format
+        // `append_canonical_json` defines. Any change to that format fails
+        // here, including one that stopped sorting under `preserve_order`,
+        // where the map does keep insertion order.
+        let mut expected = vec![5_u8];
+        expected.extend_from_slice(&2_u64.to_le_bytes());
+        expected.extend_from_slice(&5_u64.to_le_bytes());
+        expected.extend_from_slice(b"alpha");
+        expected.push(2);
+        expected.extend_from_slice(&1_u64.to_le_bytes());
+        expected.extend_from_slice(b"7");
+        expected.extend_from_slice(&4_u64.to_le_bytes());
+        expected.extend_from_slice(b"beta");
+        expected.push(3);
+        expected.extend_from_slice(&5_u64.to_le_bytes());
+        expected.extend_from_slice(b"value");
+        assert_eq!(
+            declared, expected,
+            "the canonical byte format moved, which rewrites every identity this crate has ever \
+             written; `alpha` precedes `beta` here because keys are sorted, not because the \
+             struct declares them that way"
         );
     }
 
