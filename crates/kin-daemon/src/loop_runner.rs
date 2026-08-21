@@ -3701,7 +3701,15 @@ mod tests {
         // What a commit refused by the scanner does on its way out. The
         // publication restoring the deferred tree carries the same refused
         // artifact, so it is refused too and there is nothing left to publish.
+        let version_before = state.vfs_version.load(Ordering::SeqCst);
         publish_deferred_tree_after_failure(&state, &deferred);
+
+        assert!(
+            state.vfs_version.load(Ordering::SeqCst) > version_before,
+            "a reset that took artifacts out of the graph must retire the projection readers \
+             holding them and arm background persistence, or a restart reloads the graph that \
+             was ahead"
+        );
 
         assert_eq!(
             authority_generation(&state),
@@ -6477,6 +6485,12 @@ fn reset_derived_graph_to_authority_tree(state: &DaemonState) -> Result<Vec<Tree
         tree_deltas: deltas.clone(),
         ..TransactionDelta::default()
     })?;
+    // Every graph mutation bumps the counter, and this one removes artifacts a
+    // projection reader may already hold. Skipping it would leave a VFS client
+    // materializing a tree the graph has just given up, and would leave the
+    // reset out of background persistence, so a restart would reload the graph
+    // that was ahead.
+    state.bump_version();
     Ok(deltas)
 }
 
