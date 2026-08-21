@@ -8,7 +8,9 @@
 //! truth behind `kin setup status [--json]` and `kin doctor [--fix]`.
 
 use std::env;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
 use serde_json::Value;
 
@@ -183,7 +185,13 @@ pub async fn run_health_checks() -> HealthReport {
     checks.push(check_editor());
     checks.push(check_kinlab_connect());
     checks.push(check_semantic_query_readiness().await);
-    checks.push(check_reference_edge_coverage().await);
+    // One `graph status` for the whole run, handed to every row that reads graph
+    // truth. `kin graph status` is the slowest surface Kin has on a real store,
+    // and it was fetched per row, so each row answering from graph truth added a
+    // whole one to the wall time of a doctor run on exactly the stores where an
+    // operator is most likely to be running doctor because something is wrong.
+    let graph_status = RunGraphStatus::for_run();
+    checks.push(check_reference_edge_coverage(&graph_status).await);
     checks.push(check_background_work().await);
     checks.push(check_embedding_model().await);
     checks.push(check_commit_memory_headroom());
@@ -2611,10 +2619,7 @@ async fn check_background_work() -> HealthCheck {
 /// on a graph missing 16 imports and roughly 40 cross-file call edges, and
 /// `kin languages` listed the language as fully extracted, so every readiness
 /// signal pointed away from the gap.
-async fn check_reference_edge_coverage() -> HealthCheck {
-    const ID: &str = "reference_edge_coverage";
-    const LABEL: &str = "Reference edge coverage";
-
+async fn check_reference_edge_coverage(graph_status: &RunGraphStatus) -> HealthCheck {
     // Probed first, because it needs no daemon. Every branch below that cannot
     // read the graph still reports this half, so a repository whose daemon is
     // down does not silently lose the language-server signal that used to have
@@ -2625,56 +2630,15 @@ async fn check_reference_edge_coverage() -> HealthCheck {
     // looking for a problem somewhere else entirely.
     let readiness = crate::commands::language_servers::probe_language_server_readiness(&cwd).await;
     let missing_servers = missing_language_servers(&readiness);
-    let Some(layout) = kin_core::KinLayout::discover(&cwd) else {
-        return HealthCheck::new(
-            ID,
-            LABEL,
-            HealthStatus::Unsupported,
-            "n/a — not in a Kin repository",
-        );
-    };
-    let Some(daemon_url) = crate::daemon_client::resolve_daemon_url_if_running_async(&layout).await
-    else {
-        return coverage_unreadable(
-            HealthStatus::Unsupported,
-            "no daemon running for this repository, so relation-graph completeness cannot be \
-             read; a daemon starts on first use",
-            "run any `kin` command in the repo to auto-start the daemon",
-            &missing_servers,
-        );
-    };
-    let client = match crate::daemon_client::DaemonClient::from_base_url_for_layout(
-        daemon_url.clone(),
-        &layout,
-    ) {
-        Ok(client) => client,
-        Err(error) => {
-            return coverage_unreadable(
-                HealthStatus::Stale,
-                format!("daemon reachable ({daemon_url}), but its URL is invalid: {error}"),
-                "check the daemon URL recorded for this repository",
-                &missing_servers,
-            );
-        }
-    };
-    let response = match client
-        .graph_command(&crate::commands::graph::GraphCommandRequest::Status)
-        .await
-    {
+    // The run's one fetch. Every unreadable state is phrased by this row in its
+    // own words rather than reported once by the fetch, because a row that reads
+    // graph truth must never render the same whether the graph was healthy or
+    // unreadable.
+    let response = match coverage_row_for_unread_graph(graph_status.get().await, &missing_servers) {
         Ok(response) => response,
-        Err(error) => {
-            return coverage_unreadable(
-                HealthStatus::Stale,
-                format!(
-                    "daemon reachable ({daemon_url}), but relation-graph completeness is \
-                     unavailable: {error}"
-                ),
-                "run `kin graph status` and resolve the reported daemon error",
-                &missing_servers,
-            );
-        }
+        Err(row) => return row,
     };
-    let Some(coverage) = response.reference_edge_coverage else {
+    let Some(coverage) = response.reference_edge_coverage.as_ref() else {
         return coverage_unreadable(
             HealthStatus::Stale,
             "the daemon serving this repository does not report relation-graph completeness; it \
@@ -2683,7 +2647,154 @@ async fn check_reference_edge_coverage() -> HealthCheck {
             &missing_servers,
         );
     };
-    reference_edge_coverage_health(&coverage)
+    reference_edge_coverage_health(coverage)
+}
+
+/// This row's words for a graph status the run could not read, or the response
+/// when it could.
+///
+/// Split from the fetch and from the verdict so every cause has a rendering that
+/// is testable without a daemon, and so the property FIR-2560 must not lose stays
+/// checkable: a shared fetch carries its failure to each consumer rather than
+/// reporting it once, and no unreadable state renders as a healthy graph.
+fn coverage_row_for_unread_graph<'a>(
+    status: &'a GraphStatusForRun,
+    missing_servers: &[String],
+) -> Result<&'a crate::commands::graph::GraphCommandResponse, HealthCheck> {
+    const ID: &str = "reference_edge_coverage";
+    const LABEL: &str = "Reference edge coverage";
+
+    match status {
+        GraphStatusForRun::Answered(response) => Ok(response),
+        GraphStatusForRun::NotInRepository => Err(HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Unsupported,
+            "n/a — not in a Kin repository",
+        )),
+        GraphStatusForRun::NoDaemon => Err(coverage_unreadable(
+            HealthStatus::Unsupported,
+            "no daemon running for this repository, so relation-graph completeness cannot be \
+             read; a daemon starts on first use",
+            "run any `kin` command in the repo to auto-start the daemon",
+            missing_servers,
+        )),
+        GraphStatusForRun::DaemonUrlInvalid { daemon_url, error } => Err(coverage_unreadable(
+            HealthStatus::Stale,
+            format!("daemon reachable ({daemon_url}), but its URL is invalid: {error}"),
+            "check the daemon URL recorded for this repository",
+            missing_servers,
+        )),
+        GraphStatusForRun::Unavailable { daemon_url, error } => Err(coverage_unreadable(
+            HealthStatus::Stale,
+            format!(
+                "daemon reachable ({daemon_url}), but relation-graph completeness is unavailable: \
+                 {error}"
+            ),
+            "run `kin graph status` and resolve the reported daemon error",
+            missing_servers,
+        )),
+    }
+}
+
+/// What a doctor run's single `graph status` fetch produced.
+///
+/// The failure arms carry the cause rather than a rendered row. A shared fetch
+/// that reported its own failure once would leave every other row silent about a
+/// graph it could not read, and a row that goes quiet when the graph is
+/// unreadable is indistinguishable from one reporting a healthy graph. So each
+/// consumer phrases the same cause in the words its own row needs.
+#[derive(Debug)]
+pub(crate) enum GraphStatusForRun {
+    /// The daemon answered.
+    Answered(Box<crate::commands::graph::GraphCommandResponse>),
+    /// This process is not standing in a Kin repository, so nothing was fetched.
+    NotInRepository,
+    /// No daemon is running for this repository, so nothing was fetched.
+    NoDaemon,
+    /// A daemon is running and the URL recorded for it will not parse.
+    DaemonUrlInvalid { daemon_url: String, error: String },
+    /// The daemon was asked and did not answer.
+    Unavailable { daemon_url: String, error: String },
+}
+
+/// A future producing the run's graph status, boxed so the fetch can be
+/// substituted in tests.
+type GraphStatusFuture = Pin<Box<dyn Future<Output = GraphStatusForRun> + Send>>;
+
+/// The `graph status` a doctor run reads, fetched at most once however many rows
+/// consult it.
+///
+/// FIR-2416 measured `kin graph status` at 31.812 s on the rc0545c psf/requests
+/// store against 0.091 s on express. A second fetch therefore does not cost a
+/// little more, it roughly doubles the wall time of a doctor run, and the shape
+/// did not stop at two: every future row answering from graph truth added
+/// another whole fetch. Holding the answer here makes a new consumer free.
+///
+/// Lazy rather than eager so a run whose rows all short-circuit before reading
+/// graph truth still pays nothing, and so the fetch keeps its position in the
+/// run relative to the probes a row takes first.
+pub(crate) struct RunGraphStatus {
+    fetch: Box<dyn Fn() -> GraphStatusFuture + Send + Sync>,
+    once: tokio::sync::OnceCell<GraphStatusForRun>,
+}
+
+impl RunGraphStatus {
+    /// The real fetch, against the daemon serving the current directory.
+    pub(crate) fn for_run() -> Self {
+        Self::with_fetch(|| Box::pin(fetch_graph_status()))
+    }
+
+    fn with_fetch(fetch: impl Fn() -> GraphStatusFuture + Send + Sync + 'static) -> Self {
+        Self {
+            fetch: Box::new(fetch),
+            once: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// The run's graph status, fetching it on the first call and returning that
+    /// same answer to every later one.
+    pub(crate) async fn get(&self) -> &GraphStatusForRun {
+        self.once.get_or_init(|| (self.fetch)()).await
+    }
+}
+
+/// Take the run's one `graph status` round trip.
+///
+/// Every way this can fail to produce a response is a named variant rather than
+/// a message, so a consumer renders the cause in its own row's terms and no
+/// caller has to parse prose to tell "no daemon" from "the daemon refused".
+async fn fetch_graph_status() -> GraphStatusForRun {
+    let cwd = env::current_dir().unwrap_or_default();
+    let Some(layout) = kin_core::KinLayout::discover(&cwd) else {
+        return GraphStatusForRun::NotInRepository;
+    };
+    let Some(daemon_url) = crate::daemon_client::resolve_daemon_url_if_running_async(&layout).await
+    else {
+        return GraphStatusForRun::NoDaemon;
+    };
+    let client = match crate::daemon_client::DaemonClient::from_base_url_for_layout(
+        daemon_url.clone(),
+        &layout,
+    ) {
+        Ok(client) => client,
+        Err(error) => {
+            return GraphStatusForRun::DaemonUrlInvalid {
+                daemon_url,
+                error: error.to_string(),
+            };
+        }
+    };
+    match client
+        .graph_command(&crate::commands::graph::GraphCommandRequest::Status)
+        .await
+    {
+        Ok(response) => GraphStatusForRun::Answered(Box::new(response)),
+        Err(error) => GraphStatusForRun::Unavailable {
+            daemon_url,
+            error: error.to_string(),
+        },
+    }
 }
 
 /// The row for every state where the graph itself could not be read.
@@ -3903,6 +4014,125 @@ mod tests {
         let report = assemble_health_report("test".to_string(), vec![check]);
         assert!(report.healthy);
         assert_eq!(report.summary().attention, 1);
+    }
+
+    /// A healthy response for the fetch tests to hand back.
+    fn answered_graph_status() -> GraphStatusForRun {
+        GraphStatusForRun::Answered(Box::new(crate::commands::graph::GraphCommandResponse {
+            lines: vec!["graph status".to_string()],
+            error: None,
+            source: None,
+            reference_edge_coverage: Some(
+                kin_core::reference_coverage::ReferenceEdgeCoverage::default(),
+            ),
+        }))
+    }
+
+    /// FIR-2560. One `graph status` per doctor run, however many rows read it.
+    ///
+    /// `kin graph status` is the slowest surface Kin has on a real store, and it
+    /// was fetched per row: FIR-2416 measured 31.812 s on the rc0545c
+    /// psf/requests store against 0.091 s on express, so a second fetch does not
+    /// cost a little more, it roughly doubles the wall time of a doctor run on
+    /// exactly the stores where an operator is most likely to be running doctor.
+    /// Three consumers here rather than the one the tree holds today, because the
+    /// cost this pins is the one a fourth row would add.
+    #[tokio::test]
+    async fn one_doctor_run_fetches_graph_status_once_however_many_rows_read_it() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&fetches);
+        let status = RunGraphStatus::with_fetch(move || {
+            let counted = Arc::clone(&counted);
+            Box::pin(async move {
+                counted.fetch_add(1, Ordering::SeqCst);
+                answered_graph_status()
+            })
+        });
+
+        assert_eq!(
+            fetches.load(Ordering::SeqCst),
+            0,
+            "the fetch is lazy, so a run whose rows never read graph truth pays nothing"
+        );
+
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            seen.push(format!("{:?}", status.get().await));
+        }
+
+        assert_eq!(
+            fetches.load(Ordering::SeqCst),
+            1,
+            "three rows reading graph status must cost one daemon round trip, not three"
+        );
+        assert_eq!(
+            seen.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            1,
+            "and every row must see the same answer: {seen:?}"
+        );
+    }
+
+    /// The property the shared fetch must not cost. A graph the run could not
+    /// read reaches the row as its own unreadable state, rather than being
+    /// reported once by the fetch and leaving the row silent.
+    ///
+    /// A row that goes quiet when the graph is unreadable is indistinguishable
+    /// from one reporting a healthy graph, which is the failure the row exists to
+    /// end. So each cause is checked for a status that is not healthy and for
+    /// words naming what happened.
+    #[test]
+    fn an_unreadable_graph_reaches_the_row_rather_than_being_reported_once() {
+        let no_servers: Vec<String> = Vec::new();
+
+        let unreadable = [
+            (
+                GraphStatusForRun::NotInRepository,
+                "not in a Kin repository",
+            ),
+            (
+                GraphStatusForRun::NoDaemon,
+                "no daemon running for this repository",
+            ),
+            (
+                GraphStatusForRun::DaemonUrlInvalid {
+                    daemon_url: "http://127.0.0.1:0".to_string(),
+                    error: "invalid port".to_string(),
+                },
+                "its URL is invalid",
+            ),
+            (
+                GraphStatusForRun::Unavailable {
+                    daemon_url: "http://127.0.0.1:4242".to_string(),
+                    error: "connection refused".to_string(),
+                },
+                "unavailable",
+            ),
+        ];
+        for (status, expected) in unreadable {
+            let row = coverage_row_for_unread_graph(&status, &no_servers)
+                .expect_err("an unread graph must produce a row rather than a response");
+            assert!(
+                !matches!(row.status, HealthStatus::Healthy),
+                "an unread graph must never render as healthy: {status:?} gave {:?}",
+                row.status
+            );
+            assert!(
+                row.detail.contains(expected),
+                "the row must name what happened: {status:?} gave {}",
+                row.detail
+            );
+        }
+
+        // And the readable case still yields the response, or the four arms
+        // above would be the only outcome and the row could never report a
+        // measurement.
+        assert!(
+            coverage_row_for_unread_graph(&answered_graph_status(), &no_servers).is_ok(),
+            "a graph the run did read must hand its response to the row"
+        );
     }
 
     /// FIR-2370. Two rows about one graph teach an operator to skip both, so the

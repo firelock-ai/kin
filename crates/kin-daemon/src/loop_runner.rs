@@ -3533,23 +3533,21 @@ mod tests {
         .expect("it has to move authority, or the deferral below would still publish cleanly");
     }
 
-    /// The double failure, and the record that is the only account a status
-    /// surface gets of it.
+    /// The double failure, and the reset that ends it.
     ///
     /// A commit that fails publishes its deferred tree standalone on the way
-    /// out. When that publication fails too, the derived graph is left holding a
-    /// tree repository authority never accepted, every later admission is
-    /// refused against the mismatched tree, and only a restart clears it. It was
-    /// logged once at error level and named on no surface at all, so an operator
-    /// watching admissions refuse had nothing telling them the daemon itself was
-    /// what needed restarting.
+    /// out. When that publication fails too there is nothing left to publish, so
+    /// the derived graph is returned to the tree repository authority holds and
+    /// the next admission plans out of a tree the two agree on. Before that
+    /// reset the graph stayed ahead, every later admission was refused against
+    /// the mismatched tree, and only restarting the daemon cleared it.
     #[test]
     // Commit phases are emitted at debug level when they are fast, and the
     // level a `tracing` event is filtered by is a process-global hint. A test
     // that captures those events therefore cannot run beside one that emits
     // them, so every test on either side of that shares this group.
     #[serial_test::serial(commit_phase_capture)]
-    fn a_failed_restoring_publication_wedges_the_daemon_and_says_so() {
+    fn a_failed_restoring_publication_resets_the_graph_to_the_authority_tree() {
         let repo = tempfile::tempdir().unwrap();
         let state = open_test_state(&repo);
         std::fs::write(repo.path().join("base.rs"), b"pub fn base() -> u32 { 1 }\n").unwrap();
@@ -3585,45 +3583,183 @@ mod tests {
         publish_authority_tree_out_of_band(&state, kin_model::ResolvedTree::default());
         publish_deferred_tree_after_failure(&state, &deferred);
 
+        assert_eq!(
+            state.graph.resolved_tree(),
+            authority_workspace_tree(&state).unwrap(),
+            "a publication with nothing left to try must return the derived graph to the tree \
+             repository authority holds"
+        );
         let report = state.background_work.reconcile_report(Instant::now());
-        let wedge = report
-            .deferred_tree_wedge
-            .as_ref()
-            .expect("the double failure must reach the surfaces that answer for this daemon");
         assert!(
-            wedge.error.contains("repository authority moved"),
-            "the publication's own error is what names the cause: {wedge:?}"
+            report.deferred_tree_wedge.is_none(),
+            "a daemon whose graph agrees with authority again needs no restart: {:?}",
+            report.deferred_tree_wedge
         );
-        assert!(
-            wedge.at.is_some(),
-            "a wall-clock stamp is what lines this up against the daemon log"
-        );
-        let reasons = report.degraded_reasons();
-        assert!(
-            reasons.iter().any(|reason| {
-                reason.contains("restart required, commit deferral wedged")
-                    && reason.contains(&wedge.error)
-            }),
-            "a wedged daemon must name the restart and carry the error: {reasons:?}"
-        );
-        assert!(report.degraded(), "a wedged daemon is not a healthy one");
+        assert!(!report.degraded(), "{:?}", report.degraded_reasons());
 
-        // The state that reason describes is real rather than cosmetic. The
-        // graph holds a tree authority never accepted, so the next admission
-        // with anything to publish is refused against the mismatched tree, which
-        // is what an operator watches happen with no explanation attached.
+        // The reset is real rather than cosmetic. The next admission plans out
+        // of a tree authority accepts, so it publishes instead of being refused
+        // against a mismatch nobody could clear without restarting.
         std::fs::write(
             repo.path().join("later.rs"),
             b"pub fn later() -> u32 { 3 }\n",
         )
         .unwrap();
-        let refusal = exact_tree_admission(&state, None, TreePublication::Standalone)
-            .expect_err("a wedged daemon must refuse the next admission rather than publish it");
+        let admission = exact_tree_admission(&state, None, TreePublication::Standalone)
+            .expect("a reset daemon admits the next transition rather than refusing it");
         assert!(
-            refusal
-                .to_string()
-                .contains("not this workspace's authority tree"),
-            "the refusal must name the mismatch the wedge describes: {refusal}"
+            !admission.deltas.is_empty(),
+            "the working copy moved, so the admission must plan a transition"
+        );
+        assert_eq!(
+            state.graph.resolved_tree(),
+            authority_workspace_tree(&state).unwrap(),
+            "the admission that followed the reset left both trees agreeing"
+        );
+    }
+
+    /// FIR-2495. A refused admission must not leave the daemon holding a
+    /// workspace plan repository authority will reject forever.
+    ///
+    /// The credential scanner refuses untracked sensitive content inside the
+    /// repository transaction, so the commit carrying it fails and the
+    /// publication restoring its deferred tree carries the same artifact and
+    /// fails for the same reason. Publishing forward is the recovery that cannot
+    /// work here, and before the reset the derived graph stayed ahead of
+    /// authority for the life of the daemon: the next commit reported a tree
+    /// mismatch, `kin admit` reported that nothing had changed while authority
+    /// carried none of it, the commit after that reported a projection conflict
+    /// on a path that was simply there, and `kin status` and `kin graph status`
+    /// disagreed about the artifact count seconds apart.
+    #[tokio::test]
+    // Commit phases are emitted at debug level when they are fast, and the
+    // level a `tracing` event is filtered by is a process-global hint. A test
+    // that captures those events therefore cannot run beside one that emits
+    // them, so every test on either side of that shares this group.
+    #[serial_test::serial(commit_phase_capture)]
+    async fn a_scanner_refused_admission_rolls_back_so_the_next_commit_proceeds() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        std::fs::write(
+            repo.path().join("store.py"),
+            b"def store():\n    return 1\n",
+        )
+        .unwrap();
+        sync_filesystem_with_graph(&state).await.unwrap();
+        let baseline_generation = authority_generation(&state);
+        let baseline_tree = state.graph.resolved_tree();
+        assert_eq!(
+            baseline_tree,
+            authority_workspace_tree(&state).unwrap(),
+            "the fixture must start with the two trees agreeing"
+        );
+
+        // The stranger's situation: content the credential scanner refuses,
+        // written into the working copy and never tracked.
+        std::fs::write(
+            repo.path().join("search.py"),
+            b"def connect():\n    password = \"s3cret-notekeeper-value\"\n    return password\n",
+        )
+        .unwrap();
+
+        // The commit path. It admits the whole working copy and defers the tree
+        // transition to the transaction that publishes its change.
+        let deferred = sync_filesystem_with_graph_deferring_tree_publication(&state)
+            .await
+            .unwrap()
+            .expect("the commit seam defers its transition to the caller");
+        assert_eq!(
+            authority_generation(&state),
+            baseline_generation,
+            "nothing may be published while the deferral is open"
+        );
+        assert!(
+            state
+                .graph
+                .resolved_tree()
+                .artifact_at_path(&test_repo_path("search.py"))
+                .is_some(),
+            "the deferring admission advances the derived graph so the commit can plan against it"
+        );
+        assert!(
+            !entity_ids_for(&state, "search.py").is_empty(),
+            "the fixture needs the refused artifact enriched, or the eviction below proves nothing"
+        );
+
+        // Name the refusal the fixture rests on. A scanner that stopped
+        // refusing this content would leave the publication below succeeding,
+        // and every assertion after it would pass for the wrong reason, so the
+        // test says outright which refusal it is reproducing. This call changes
+        // nothing: a refused publication advances no authority generation.
+        let refusal = publish_exact_workspace_tree(&state, &deferred)
+            .expect_err("the credential scanner must refuse the artifact this fixture writes");
+        assert!(
+            refusal.to_string().contains("CredentialAssignment"),
+            "the fixture reproduces the credential scanner's refusal: {refusal}"
+        );
+
+        // What a commit refused by the scanner does on its way out. The
+        // publication restoring the deferred tree carries the same refused
+        // artifact, so it is refused too and there is nothing left to publish.
+        publish_deferred_tree_after_failure(&state, &deferred);
+
+        assert_eq!(
+            authority_generation(&state),
+            baseline_generation,
+            "a refused admission publishes no authority successor"
+        );
+        assert_eq!(
+            state.graph.resolved_tree(),
+            baseline_tree,
+            "a refused admission must roll the derived graph back to the pre-attempt tree"
+        );
+        assert_eq!(
+            state.graph.resolved_tree(),
+            authority_workspace_tree(&state).unwrap(),
+            "the two trees the status surfaces read must agree again"
+        );
+        assert!(
+            entity_ids_for(&state, "search.py").is_empty(),
+            "the rollback must take the enrichment derived from the artifact it removed"
+        );
+        let report = state.background_work.reconcile_report(Instant::now());
+        assert!(
+            report.deferred_tree_wedge.is_none(),
+            "a daemon that rolled back needs no restart: {:?}",
+            report.deferred_tree_wedge
+        );
+        assert!(!report.degraded(), "{:?}", report.degraded_reasons());
+
+        // The next ordinary commit proceeds. Removing the refused artifact is
+        // what a user does after reading the refusal, and before the rollback
+        // this is the point at which the daemon reported a projection conflict
+        // about a path that was simply there.
+        std::fs::remove_file(repo.path().join("search.py")).unwrap();
+        std::fs::write(
+            repo.path().join("later.py"),
+            b"def later():\n    return 3\n",
+        )
+        .unwrap();
+        sync_filesystem_with_graph(&state)
+            .await
+            .expect("a rolled-back daemon admits the next transition rather than refusing it");
+
+        assert_eq!(
+            authority_generation(&state) - baseline_generation,
+            1,
+            "the admission after the rollback publishes exactly one authority successor"
+        );
+        let after = state.graph.resolved_tree();
+        assert_eq!(
+            after,
+            authority_workspace_tree(&state).unwrap(),
+            "both status surfaces must report the same tree after the recovery"
+        );
+        assert!(
+            after
+                .artifact_at_path(&test_repo_path("later.py"))
+                .is_some(),
+            "the work that followed the refusal is what had to become committable"
         );
     }
 
@@ -3766,6 +3902,76 @@ mod tests {
         assert!(
             error.to_string().contains("no walk observed"),
             "the refusal must name what went wrong: {error}"
+        );
+    }
+
+    /// FIR-2495 ask 2. A daemon whose graph outran authority names the recovery.
+    ///
+    /// The reset above closes the route this fleet has actually seen, and a
+    /// reset that fails itself leaves the daemon in exactly this state. What the
+    /// user meets then is this refusal, and on its own it described a mismatch
+    /// without saying that restarting is what clears it, which is how four
+    /// consecutive errors named symptoms and none named the cause.
+    #[test]
+    // Commit phases are emitted at debug level when they are fast, and the
+    // level a `tracing` event is filtered by is a process-global hint. A test
+    // that captures those events therefore cannot run beside one that emits
+    // them, so every test on either side of that shares this group.
+    #[serial_test::serial(commit_phase_capture)]
+    fn a_commit_planned_out_of_a_stale_graph_tree_names_the_daemon_restart() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        std::fs::write(repo.path().join("base.rs"), b"pub fn base() -> u32 { 1 }\n").unwrap();
+        exact_tree_admission(&state, None, TreePublication::Standalone).unwrap();
+        std::fs::write(
+            repo.path().join("carried.rs"),
+            b"pub fn carried() -> u32 { 1 }\n",
+        )
+        .unwrap();
+        let admission =
+            exact_tree_admission(&state, None, TreePublication::DeferredToCaller).unwrap();
+        let deferred = admission
+            .deferred_tree
+            .expect("the admission defers its transition to this caller");
+
+        // Move repository authority under the open deferral, which is what
+        // leaves the walk's own prior tree and the plan's prior tree apart.
+        publish_authority_tree_out_of_band(&state, kin_model::ResolvedTree::default());
+
+        let authority_context =
+            crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
+                .unwrap();
+        let plan = crate::repository_commit::plan_native_commit(
+            &state.graph,
+            state.blobs.as_ref(),
+            &authority_context,
+            kin_model::OperationId::new(),
+            kin_model::Timestamp::now(),
+            kin_model::AuthorId::new("stale-graph-tree-test"),
+            "publish out of a tree authority no longer holds".to_string(),
+        )
+        .unwrap();
+
+        let error = crate::repository_commit::commit_native_plan_with_observed_target_tree(
+            &state.layout,
+            state.blobs.as_ref(),
+            &authority_context,
+            plan,
+            &deferred,
+        )
+        .expect_err("a plan whose prior tree is not the walk's prior tree must be refused");
+        let error = error.to_string();
+        assert!(
+            error.contains("planned out of a different workspace tree"),
+            "the refusal must still name the mismatch: {error}"
+        );
+        assert!(
+            error.contains("kin daemon stop"),
+            "the refusal must name the one command that clears this: {error}"
+        );
+        assert!(
+            error.contains("ahead of repository authority"),
+            "the refusal must name the state, not just the remedy: {error}"
         );
     }
 
@@ -6229,6 +6435,51 @@ async fn sync_filesystem_with_graph_publishing(
     }
 }
 
+/// The exact tree repository authority currently records for this workspace.
+///
+/// The derived graph's counterpart, and the answer `kin status` reports while
+/// `kin graph status` reports the graph's own. The two agreeing is the
+/// invariant a deferral is opened against and the one a failed commit has to
+/// restore.
+fn authority_workspace_tree(state: &DaemonState) -> Result<kin_model::ResolvedTree> {
+    let authority_context =
+        crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)?;
+    crate::repository_commit::authority_workspace_tree(&authority_context)
+}
+
+/// Return the derived graph to the exact tree repository authority holds.
+///
+/// The one reset that is correct whatever went wrong. Rolling the admitted
+/// deltas back would restore the tree the pass planned out of, which is right
+/// when authority stood still and wrong when it moved, and those two cases are
+/// indistinguishable from the deltas alone. Reading authority answers both: the
+/// graph is a derived view, so the state it must return to is whatever
+/// authority currently holds, not whatever it held a moment ago.
+///
+/// Enrichment for the artifacts this removes goes first, in the order every
+/// other tree removal uses, because kin-db refuses a transition that leaves an
+/// entity on a path the staged tree no longer carries. Enrichment for a path
+/// whose content this rolls back is left alone: the working copy still holds
+/// the newer bytes, so the next admission re-derives the same transition and
+/// re-enriches from them, and evicting it here would delete answers the store
+/// can still give.
+fn reset_derived_graph_to_authority_tree(state: &DaemonState) -> Result<Vec<TreeDelta>> {
+    let authority_tree = authority_workspace_tree(state)?;
+    let graph_tree = state.graph.resolved_tree();
+    if graph_tree == authority_tree {
+        return Ok(Vec::new());
+    }
+    let deltas = kin_core::exact_tree_correction(&graph_tree, &authority_tree)?;
+    evict_enrichment_for_removed_paths(state, &deltas)?;
+    state.graph.apply_transaction_delta(&TransactionDelta {
+        entity_deltas: Vec::new(),
+        relation_deltas: Vec::new(),
+        tree_deltas: deltas.clone(),
+        ..TransactionDelta::default()
+    })?;
+    Ok(deltas)
+}
+
 /// Close a deferral whose caller will never publish it.
 ///
 /// The derived graph already carries the admitted tree, so leaving it
@@ -6238,19 +6489,26 @@ async fn sync_filesystem_with_graph_publishing(
 /// ordering a standalone admission would have established, which is exactly
 /// the state a failed commit leaves behind today.
 ///
-/// This is the one path where publication itself can fail with nothing left to
-/// try. It is reported at error level rather than swallowed, and the failure a
-/// later admission raises stays loud, because a daemon whose graph outruns
-/// authority must be restarted to rebuild the graph rather than keep answering
-/// from it.
+/// Publishing forward is the first recovery and not the only one, because it
+/// cannot work when the reason the transaction was refused is a property of the
+/// tree itself. Untracked sensitive content is exactly that shape: the
+/// credential scanner refuses the artifact inside the repository transaction, so
+/// the standalone publication carrying the same artifact is refused for the same
+/// reason, and every retry after it is too. Rolling the derived graph back to
+/// what authority holds is the second recovery, and it always terminates: the
+/// tree it resets to is one repository authority has already accepted.
 ///
-/// The error log is not the whole disclosure. It is written once, at the moment
-/// of the failure, and every status surface afterwards showed a daemon whose
-/// admissions happened to be failing, which is what a wedged daemon and a merely
-/// unlucky one look like from the outside. The state is recorded on the
-/// reconcile probes as well, so `/health`, `/commands/resources`, `kin graph
-/// status`, `kin admit`, and `kin doctor` all name the restart rather than
-/// leaving a reader to infer it from a refusal.
+/// What the user sees turns on this. A daemon that rolls back answers the next
+/// commit with the refusal that actually stopped it, every time; a daemon that
+/// stays ahead answers with a tree mismatch, then an admission that reports
+/// nothing changed, then a projection conflict about a path that is simply
+/// there, none of which name the cause.
+///
+/// Only a rollback that fails as well leaves the daemon wedged, and that is
+/// still reported at error level and recorded on the reconcile probes, so
+/// `/health`, `/commands/resources`, `kin graph status`, `kin admit`, and
+/// `kin doctor` all name the restart rather than leaving a reader to infer it
+/// from a refusal.
 pub(crate) fn publish_deferred_tree_after_failure(
     state: &DaemonState,
     admitted: &crate::repository_commit::AdmittedWorkspaceTree,
@@ -6265,18 +6523,46 @@ pub(crate) fn publish_deferred_tree_after_failure(
                 .reconcile()
                 .clear_deferred_tree_wedge();
         }
-        Err(error) => {
-            error!(
-                error = %error,
-                "failed to publish the deferred exact workspace tree after the carrying transaction \
-                 did not reach authority; the derived graph is ahead of repository authority and this \
-                 daemon must be restarted before it can admit again"
-            );
-            state
-                .background_work
-                .reconcile()
-                .record_deferred_tree_wedge(&error, Instant::now());
-        }
+        Err(publication_error) => match reset_derived_graph_to_authority_tree(state) {
+            Ok(reverted) => {
+                warn!(
+                    error = %publication_error,
+                    reverted = reverted.len(),
+                    "the publication restoring a failed commit's deferred exact workspace tree was \
+                     refused, so the derived graph was reset to the tree repository authority holds; \
+                     the next admission plans out of that tree and reports the refusal that stopped \
+                     this one"
+                );
+                // The graph and authority agree again, which is the whole of
+                // what a wedge names. Clearing it here is what stops one refused
+                // admission reporting a restart nobody has to perform.
+                state
+                    .background_work
+                    .reconcile()
+                    .clear_deferred_tree_wedge();
+            }
+            Err(reset_error) => {
+                error!(
+                    error = %publication_error,
+                    reset_error = %reset_error,
+                    "failed to publish the deferred exact workspace tree after the carrying \
+                     transaction did not reach authority, and resetting the derived graph to the \
+                     tree repository authority holds failed too; the derived graph is ahead of \
+                     repository authority and this daemon must be restarted before it can admit \
+                     again"
+                );
+                state
+                    .background_work
+                    .reconcile()
+                    .record_deferred_tree_wedge(
+                        format!(
+                        "{publication_error}; resetting the derived graph to the authority tree \
+                         failed too: {reset_error}"
+                    ),
+                        Instant::now(),
+                    );
+            }
+        },
     }
 }
 
