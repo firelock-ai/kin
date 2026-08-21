@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.46] - 2026-08-21
+
+### Changed
+
+- Publish a sweep's enrichment once, and stop the background flush firing inside it (#992)
+- Report which admission phase moved the init heap ceiling, not just that it moved (#995)
+- Decompress the conversion closure once, and stop hashing a bootstrap transaction nothing reads (#1000)
+- Publish what a language server can do, not that its binary exists (#998)
+- Say when kin impact cannot rule out dependents, in the MCP verdict's own words (#999)
+- Gate the release train on the proof loop's own records (#993)
+- Give the final persistence flush its own shutdown budget, and name it when abandoned (#994)
+
+
 ## [0.5.45] - 2026-08-20
 
 ### Changed
