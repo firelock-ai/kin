@@ -823,6 +823,11 @@ fn exact_tree_admission(
         // itself, because its own admission is unbounded by any observation.
         // Nothing is lost by dropping this transition on the floor, and the
         // whole point is that the commit publishes once for both.
+        if publication == TreePublication::StandaloneUnlessACommitIsWaiting {
+            state
+                .pending_commits
+                .refresh_approaching(state.layout.root());
+        }
         let yields = publication == TreePublication::StandaloneUnlessACommitIsWaiting
             && state.pending_commits.any();
         if defer {
@@ -1703,12 +1708,20 @@ fn commit_yield_grace(state: &DaemonState, interval: Duration) -> Duration {
 
 /// Report whether this reconcile round should stand down for a commit.
 ///
-/// True when one is already inside the daemon, or when one arrives while this
-/// waits out [`commit_yield_grace`]. A commit admits the whole working copy
-/// itself and carries the resulting tree in the transaction that publishes its
-/// change, so a round that stands down loses no observation: its events stay
-/// queued, and the next round either finds them already admitted or admits them
-/// itself.
+/// True when one is already inside the daemon, when one has announced itself on
+/// disk and has not arrived yet, or when one arrives while this waits out
+/// [`commit_yield_grace`]. A commit admits the whole working copy itself and
+/// carries the resulting tree in the transaction that publishes its change, so a
+/// round that stands down loses no observation: its events stay queued, and the
+/// next round either finds them already admitted or admits them itself.
+///
+/// The on-disk announcement is what makes the first round of a cold daemon
+/// decidable. A commit that had to start this daemon reaches its handler only
+/// after the store has opened, so on a large store the round and the request are
+/// seconds apart and the round wins; widening the grace to cover that gap would
+/// spend the widened window on every round that has no commit coming, which is
+/// most of them. Reading an announcement the client already wrote costs nothing
+/// when there is none.
 ///
 /// The wait holds no lock. It happens before the round takes the coordination
 /// gate, so the commit it is waiting for is never waiting on it.
@@ -1725,6 +1738,16 @@ async fn wait_out_imminent_commit(
     let arrival = state.pending_commits.arrival();
     tokio::pin!(arrival);
     arrival.as_mut().enable();
+    // A commit that had to start this daemon cannot have announced itself
+    // inside it yet, so the on-disk announcement is read here too. This is the
+    // point of the whole hold-off on a cold process: the client wrote its
+    // announcement before it began waiting for the store to open, so it is
+    // already readable on the first round of this daemon's life, and the round
+    // stands down at once instead of waiting out a window sized against a
+    // deadline nobody measured.
+    state
+        .pending_commits
+        .refresh_approaching(state.layout.root());
     if state.pending_commits.any() {
         return true;
     }
@@ -1739,6 +1762,9 @@ async fn wait_out_imminent_commit(
     // Read again rather than assuming the wakeup was an arrival: a commit that
     // announced itself and finished inside the grace has already admitted this
     // working copy, and there is nothing left to stand down for.
+    state
+        .pending_commits
+        .refresh_approaching(state.layout.root());
     state.pending_commits.any()
 }
 
@@ -5955,6 +5981,115 @@ mod tests {
             "a commit that arrives inside the grace takes the round"
         );
         arriving.abort();
+    }
+
+    /// Write the announcement a client publishes before it does anything else,
+    /// aged by `age_secs` so a test can put one past its window without
+    /// sleeping through it.
+    fn announce_approaching_commit(state: &DaemonState, age_secs: u64) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_secs())
+            .unwrap_or(0);
+        kin_daemon_spawn::write_approaching_commit(
+            state.layout.root(),
+            &kin_daemon_spawn::ApproachingCommit {
+                pid: std::process::id(),
+                announced_unix: now.saturating_sub(age_secs),
+            },
+        );
+    }
+
+    /// The shape this defect was reopened on, in the order it actually happens.
+    ///
+    /// A client announces its commit, then waits for the store to open before it
+    /// can send anything, and only then does its handler announce inside the
+    /// daemon. On the run this was measured against, those two moments were
+    /// 5,175ms apart and the tick's decision fell between them. The round has to
+    /// stand down on the first of them, because the second one is not reachable
+    /// in time by any wait a quiet daemon could afford to take.
+    ///
+    /// The arrival below is deliberately later than the grace can wait, so a
+    /// round that could only see a commit already inside the daemon returns
+    /// false rather than merely returning slowly. Both halves are asserted: the
+    /// verdict, which cannot flake, and the moment it was reached.
+    #[tokio::test]
+    async fn a_round_stands_down_for_a_commit_that_announced_itself_before_it_could_arrive() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+
+        announce_approaching_commit(&state, 0);
+
+        let arriving = Arc::clone(&state);
+        let entering = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let _inside = arriving.pending_commits.announce();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        // A 200ms poll interval puts the grace at its one-second ceiling, which
+        // expires a full second before the commit above reaches the daemon.
+        let started = std::time::Instant::now();
+        let stood_down = wait_out_imminent_commit(&state, Duration::from_millis(200), 0).await;
+        let waited = started.elapsed();
+        entering.abort();
+
+        assert!(
+            stood_down,
+            "the announcement is readable before the round runs, so the round stands down for a \
+             commit that could not possibly have arrived yet"
+        );
+        assert!(
+            waited < Duration::from_millis(500),
+            "the round must stand down on the announcement it can already read rather than wait \
+             out the grace for an arrival two seconds away; it waited {waited:?}"
+        );
+    }
+
+    /// The announcement's own bound. A client killed between writing its
+    /// announcement and withdrawing it must not hold ambient admission off for
+    /// the rest of the daemon's life, so the announcement expires on its own.
+    #[tokio::test]
+    async fn an_announcement_older_than_its_window_no_longer_takes_the_round() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+
+        announce_approaching_commit(&state, 0);
+        assert!(
+            wait_out_imminent_commit(&state, Duration::from_millis(2), 0).await,
+            "a fresh announcement takes the round, which is the control the assertion below \
+             needs in order to mean anything"
+        );
+
+        announce_approaching_commit(
+            &state,
+            kin_daemon_spawn::APPROACHING_COMMIT_STALE_AFTER.as_secs() + 1,
+        );
+        assert!(
+            !wait_out_imminent_commit(&state, Duration::from_millis(2), 0).await,
+            "an announcement past its window is a client that is gone, and the round admits"
+        );
+    }
+
+    /// The announcement is withdrawn when the client's run ends, however it
+    /// ends, and the round stops standing down for it at once rather than at the
+    /// end of its window.
+    #[tokio::test]
+    async fn a_withdrawn_announcement_stops_taking_the_round() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+
+        announce_approaching_commit(&state, 0);
+        assert!(
+            wait_out_imminent_commit(&state, Duration::from_millis(2), 0).await,
+            "the announcement takes the round while the client is still on its way"
+        );
+
+        kin_daemon_spawn::clear_approaching_commit(state.layout.root());
+        assert!(
+            !wait_out_imminent_commit(&state, Duration::from_millis(2), 0).await,
+            "a withdrawn announcement leaves nothing to stand down for"
+        );
     }
 
     /// The starvation bound. A commit that is announcing itself is holding the

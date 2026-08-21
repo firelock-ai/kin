@@ -501,11 +501,26 @@ impl Completeness {
             }
         };
 
-        let (classes, decided_by, mut limits) = match substrate {
+        let (mut classes, mut decided_by, mut limits) = match substrate {
             CoverageSubstrate::Edges => edge_class_states(tool, payload, &edge_classes),
             CoverageSubstrate::Embeddings => embedding_class_states(envelope),
             CoverageSubstrate::Graph => graph_class_states(envelope),
         };
+
+        // A file enumeration is decided by that file's own parse state, which
+        // no store-level class can see. A completely loaded, fully embedded,
+        // undegraded graph holds no entities for a file no adapter parsed, so
+        // the `graph` class above reads `present` while the answer is empty for
+        // a reason that has nothing to do with the code.
+        if tool == crate::handlers::file_entities::TOOL_NAME {
+            merge_file_coverage_classes(
+                payload,
+                envelope,
+                &mut classes,
+                &mut decided_by,
+                &mut limits,
+            );
+        }
 
         // A walk that refused a type-annotation hop withheld something the
         // caller could have asked for, so it is named here. It is disclosure
@@ -711,6 +726,109 @@ fn graph_class_states(envelope: &Envelope) -> (Map<String, Value>, Vec<String>, 
     (classes, vec!["graph".to_string()], limits)
 }
 
+/// The file's own coverage classes, folded in beside the store's.
+///
+/// `file_parsed` decides, and it is the only one that does. `file_enriched` and
+/// `embeddings` are disclosed because a reader asks about them, but neither can
+/// make an enumeration short: enrichment adds edges between entities and
+/// embeddings add ranking, while the entity set of a file is fixed by what the
+/// adapter extracted. Naming a class that cannot have limited the answer as one
+/// that did is how a correct answer comes to read as uncertain.
+///
+/// `embeddings` is the store-grain reading on purpose and says so in its own
+/// name rather than pretending to a per-file number nothing measures. A complete
+/// store is a sound superset claim about this file; an incomplete one says
+/// nothing about it, which is `unknown` rather than `absent`.
+fn merge_file_coverage_classes(
+    payload: &Value,
+    envelope: &Envelope,
+    classes: &mut Map<String, Value>,
+    decided_by: &mut Vec<String>,
+    limits: &mut Vec<String>,
+) {
+    let coverage = payload
+        .get(crate::handlers::file_entities::FILE_COVERAGE_KEY)
+        .and_then(Value::as_object);
+
+    let parsed = match coverage
+        .and_then(|coverage| coverage.get("parsed"))
+        .and_then(Value::as_str)
+    {
+        Some("full") => STATE_PRESENT,
+        Some("absent") | Some("partial") | Some("failed") => STATE_ABSENT,
+        _ => STATE_UNKNOWN,
+    };
+    classes.insert("file_parsed".to_string(), json!(parsed));
+    decided_by.push("file_parsed".to_string());
+    if parsed != STATE_PRESENT {
+        limits.push(format!("file_parsed_{parsed}"));
+    }
+
+    let enriched = match coverage
+        .and_then(|coverage| coverage.get("enriched"))
+        .and_then(Value::as_str)
+    {
+        Some("present") => STATE_PRESENT,
+        Some("absent") => STATE_ABSENT,
+        _ => STATE_UNKNOWN,
+    };
+    classes.insert("file_enriched".to_string(), json!(enriched));
+
+    let embedded = match &envelope.semantic_coverage {
+        Some(coverage) if coverage.complete => STATE_PRESENT,
+        _ => STATE_UNKNOWN,
+    };
+    classes.insert("embeddings_store_wide".to_string(), json!(embedded));
+}
+
+/// A file enumeration's accounting: how many entities the file holds, and
+/// whether this response holds all of them.
+///
+/// `reported` is the whole-file total rather than the page length, because that
+/// is the number a caller asks the tool for. `exact` is false the moment the
+/// response is one page of several, so the total can be read as the file's count
+/// without the page being read as the file.
+fn file_entities_counted(payload: &Value) -> Option<Value> {
+    let reported = payload.get("total_in_file").and_then(Value::as_u64)?;
+    let coverage = payload
+        .get(crate::handlers::file_entities::FILE_COVERAGE_KEY)
+        .and_then(Value::as_object);
+    let certified = coverage
+        .and_then(|coverage| coverage.get("certifies_enumeration"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let whole_file = coverage
+        .and_then(|coverage| coverage.get("whole_file_in_response"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let shifted = payload
+        .get("enumeration_shifted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let parsed = coverage
+        .and_then(|coverage| coverage.get("parsed"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+
+    let mut counted = json!({
+        "unit": "entities_in_file",
+        "reported": reported,
+        "returned": payload.get("returned").and_then(Value::as_u64).unwrap_or(0),
+        "exact": certified,
+    });
+    // Named in the order a reader acts on. A file the adapter never parsed is
+    // the limiting factor whatever the paging did, because following every
+    // cursor to the end still assembles a set the extractor never produced.
+    if parsed != "full" {
+        counted["floor_reason"] = json!(format!("file_parsed_{parsed}"));
+    } else if shifted {
+        counted["floor_reason"] = json!("enumeration_shifted");
+    } else if !whole_file {
+        counted["floor_reason"] = json!("page_bounded");
+    }
+    Some(counted)
+}
+
 /// What this answer counted and whether the count is the whole set, lifted from
 /// the payload's own accounting.
 ///
@@ -719,6 +837,9 @@ fn graph_class_states(envelope: &Envelope) -> (Map<String, Value>, Vec<String>, 
 /// says whether the finer number is whole), and recomputing it in the envelope
 /// is how two counters come to disagree about one answer.
 fn counted_for(tool: &str, payload: &Value) -> Option<Value> {
+    if tool == crate::handlers::file_entities::TOOL_NAME {
+        return file_entities_counted(payload);
+    }
     let (unit, reported) = match tool {
         "find_references" => (
             payload

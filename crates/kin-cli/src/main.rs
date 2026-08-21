@@ -1139,7 +1139,7 @@ enum Command {
         #[command(subcommand)]
         action: Option<RegistryAction>,
     },
-    /// Inspect and gracefully stop Kin daemons
+    /// Inspect Kin daemons, stop them gracefully, or ask one to enrich
     Daemon {
         #[command(subcommand)]
         action: DaemonAction,
@@ -2233,6 +2233,19 @@ enum DaemonAction {
         /// Widen --all to every daemon on this machine, whatever KIN_HOME it runs under
         #[arg(long, requires = "all")]
         machine: bool,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Ask this repository's daemon for a language-server enrichment sweep
+    Sweep {
+        /// Return as soon as the sweep is queued, instead of waiting for it
+        ///
+        /// The sweep is background work, so a daemon this command started can
+        /// reach its idle timeout and stop while the sweep is still running.
+        /// Waiting is the default for that reason.
+        #[arg(long, default_value_t = false)]
+        no_wait: bool,
         /// Emit machine-readable JSON
         #[arg(long)]
         json: bool,
@@ -3629,6 +3642,9 @@ fn main() -> Result<()> {
                     DaemonAction::Status { json } => commands::daemon::status(json).await,
                     DaemonAction::Stop { all, machine, json } => {
                         commands::daemon::stop(all, machine, json).await
+                    }
+                    DaemonAction::Sweep { no_wait, json } => {
+                        commands::daemon::sweep(no_wait, json).await
                     }
                 },
                 Command::Doctor {
