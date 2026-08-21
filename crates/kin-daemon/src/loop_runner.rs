@@ -6444,20 +6444,7 @@ async fn sync_filesystem_with_graph_publishing(
 fn authority_workspace_tree(state: &DaemonState) -> Result<kin_model::ResolvedTree> {
     let authority_context =
         crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)?;
-    let workspace_id = authority_context.workspace_id();
-    let authority = authority_context.open().map_err(DaemonError::Graph)?;
-    let lease = authority.read_authority();
-    lease
-        .metadata()
-        .workspaces
-        .iter()
-        .find(|workspace| workspace.workspace_id == workspace_id)
-        .map(|workspace| workspace.tree.clone())
-        .ok_or_else(|| {
-            invalid_tree_transition(format!(
-                "repository authority has no local workspace {workspace_id}"
-            ))
-        })
+    crate::repository_commit::authority_workspace_tree(&authority_context)
 }
 
 /// Return the derived graph to the exact tree repository authority holds.
