@@ -3518,7 +3518,7 @@ async fn command_graph(
     // never saw.
     let census =
         kin_core::relation_census::CensusContext::for_layout(&state.layout, std::env::vars());
-    let response = kin_cli::commands::graph::execute_graph_command(
+    let response = kin_cli::commands::graph::execute_graph_command_for_store(
         &repository_authority,
         graph.as_ref(),
         &request,
@@ -14405,7 +14405,6 @@ mod tests {
             &Default::default(),
             &runtime,
             &Default::default(),
-            Some(state.layout.root()),
         )
         .unwrap();
 

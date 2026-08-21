@@ -257,19 +257,43 @@ pub fn execute_graph_command(
     reconcile: &crate::commands::resources::ReconcileHealth,
     embedding_runtime: &crate::commands::resources::EmbedRuntimeState,
     census: &kin_core::relation_census::CensusContext,
+) -> Result<GraphCommandResponse> {
+    execute_graph_command_for_store(
+        authority,
+        graph,
+        request,
+        reconcile,
+        embedding_runtime,
+        census,
+        None,
+    )
+}
+
+/// The same command, told which store on disk it is reporting about.
+///
+/// Separate from [`execute_graph_command`] rather than an extra parameter on it
+/// because the store is knowable only to a caller that holds the layout, which
+/// today is the daemon and nobody else. Every other caller, including this
+/// module's own tests, asks the same question about a graph it already has in
+/// hand and has no `.kin` directory to name.
+pub fn execute_graph_command_for_store(
+    authority: &super::repository_authority::RequestRepositoryAuthority,
+    graph: &kin_db::InMemoryGraph,
+    request: &GraphCommandRequest,
+    reconcile: &crate::commands::resources::ReconcileHealth,
+    embedding_runtime: &crate::commands::resources::EmbedRuntimeState,
+    census: &kin_core::relation_census::CensusContext,
     kin_root: Option<&std::path::Path>,
 ) -> Result<GraphCommandResponse> {
     match request {
-        GraphCommandRequest::Status => {
-            build_graph_status_response(
-                authority,
-                graph,
-                reconcile,
-                embedding_runtime,
-                census,
-                kin_root,
-            )
-        }
+        GraphCommandRequest::Status => build_graph_status_response_for_store(
+            authority,
+            graph,
+            reconcile,
+            embedding_runtime,
+            census,
+            kin_root,
+        ),
         GraphCommandRequest::Validate => build_graph_validate_response(authority, graph),
         GraphCommandRequest::Inspect { name } => build_graph_inspect_response(graph, name),
         GraphCommandRequest::Source { entity } => {
@@ -385,7 +409,31 @@ fn repository_coverage_line(files_with_entities: usize, admitted: usize) -> Stri
     )
 }
 
+/// The status renderer as every test asks for it, about a graph with no store
+/// named beside it.
+///
+/// A wrapper rather than a defaulted argument so a test that has no `.kin`
+/// directory keeps the spelling it had, and so the store-aware path is the one
+/// that has to say which store it means.
+#[cfg(test)]
 fn build_graph_status_response(
+    authority: &super::repository_authority::RequestRepositoryAuthority,
+    graph: &kin_db::InMemoryGraph,
+    reconcile: &crate::commands::resources::ReconcileHealth,
+    embedding_runtime: &crate::commands::resources::EmbedRuntimeState,
+    census: &kin_core::relation_census::CensusContext,
+) -> Result<GraphCommandResponse> {
+    build_graph_status_response_for_store(
+        authority,
+        graph,
+        reconcile,
+        embedding_runtime,
+        census,
+        None,
+    )
+}
+
+fn build_graph_status_response_for_store(
     authority: &super::repository_authority::RequestRepositoryAuthority,
     graph: &kin_db::InMemoryGraph,
     reconcile: &crate::commands::resources::ReconcileHealth,
@@ -1920,7 +1968,6 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
-            None,
         )
         .unwrap();
         assert!(
@@ -1944,7 +1991,6 @@ mod tests {
             },
             &Default::default(),
             &Default::default(),
-            None,
         )
         .unwrap();
         assert!(
@@ -1994,7 +2040,6 @@ mod tests {
             },
             &Default::default(),
             &Default::default(),
-            None,
         )
         .unwrap();
         assert!(
@@ -2038,7 +2083,6 @@ mod tests {
             },
             &Default::default(),
             &Default::default(),
-            None,
         )
         .unwrap();
         // The reconcile warning is the assertion that carries this test. The
@@ -2117,7 +2161,6 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
-            None,
         )
         .unwrap();
 
@@ -2179,7 +2222,6 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
-            None,
         )
         .unwrap();
 
@@ -2241,7 +2283,6 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
-            None,
         )
         .unwrap();
 
@@ -2297,7 +2338,6 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
-            None,
         )
         .unwrap();
 
@@ -2340,7 +2380,6 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
-            None,
         )
         .unwrap();
 
@@ -2554,7 +2593,6 @@ mod tests {
                 ..Default::default()
             },
             &Default::default(),
-            None,
         )
         .unwrap();
         let embeddings_line = no_sidecar
@@ -2606,7 +2644,6 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
-            None,
         )
         .unwrap();
         let first_fill_line = first_fill
@@ -2651,7 +2688,6 @@ mod tests {
                 ..Default::default()
             },
             &Default::default(),
-            None,
         )
         .unwrap();
         let embeddings_line = remote
@@ -2700,7 +2736,6 @@ mod tests {
                 ..Default::default()
             },
             &Default::default(),
-            None,
         )
         .unwrap();
         let embeddings_line = discarded
@@ -2748,7 +2783,6 @@ mod tests {
                 ..Default::default()
             },
             &Default::default(),
-            None,
         )
         .unwrap();
         assert!(
@@ -2795,7 +2829,6 @@ mod tests {
             &Default::default(),
             &crate::commands::resources::EmbedRuntimeState::default(),
             &Default::default(),
-            None,
         )
         .unwrap();
         assert!(
@@ -2816,7 +2849,6 @@ mod tests {
                 ..Default::default()
             },
             &Default::default(),
-            None,
         )
         .unwrap();
         let drained_line = drained
@@ -2859,7 +2891,6 @@ mod tests {
                 ..Default::default()
             },
             &Default::default(),
-            None,
         )
         .unwrap();
         let filling_line = filling
@@ -2888,7 +2919,6 @@ mod tests {
             &Default::default(),
             &crate::commands::resources::EmbedRuntimeState::default(),
             &Default::default(),
-            None,
         )
         .unwrap();
         let filling_quiet_line = filling_quiet
@@ -2940,7 +2970,6 @@ mod tests {
                 ..Default::default()
             },
             &Default::default(),
-            None,
         )
         .unwrap();
         let embeddings_line = downloading
@@ -2968,7 +2997,6 @@ mod tests {
                 ..Default::default()
             },
             &Default::default(),
-            None,
         )
         .unwrap();
         let cached_line = cached
@@ -3019,7 +3047,6 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
-            None,
         )
         .unwrap();
 
@@ -3060,7 +3087,6 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
-            None,
         )
         .unwrap();
 
@@ -4043,7 +4069,6 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
-            None,
         )
         .unwrap();
 

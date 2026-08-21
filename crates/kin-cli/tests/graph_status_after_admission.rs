@@ -16,7 +16,9 @@ use std::process::Stdio;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use kin_cli::commands::graph::{execute_graph_command, GraphCommandRequest};
+use kin_cli::commands::graph::{
+    execute_graph_command, execute_graph_command_for_store, GraphCommandRequest,
+};
 use kin_cli::commands::status::{self, SemanticEnrichmentPresence, SemanticEnrichmentView};
 use kin_model::{
     ArtifactKind, EntityStore, FilePathId, Hash256, OpaqueArtifact, StructuredArtifact,
@@ -211,7 +213,7 @@ fn graph_status_at(
     graph: &kin_db::InMemoryGraph,
     kin_root: Option<&Path>,
 ) -> kin_cli::commands::graph::GraphCommandResponse {
-    execute_graph_command(
+    execute_graph_command_for_store(
         &kin_cli::commands::repository_authority::RequestRepositoryAuthority::pinned(
             binding.clone(),
         ),
@@ -402,7 +404,6 @@ fn graph_validate(
         &Default::default(),
         &Default::default(),
         &Default::default(),
-        None,
     )
     .expect("run graph validate")
 }
