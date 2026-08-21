@@ -4597,7 +4597,10 @@ mod tests {
             "exited with signal: 9 (SIGKILL)",
             Some(&record),
         );
-        assert!(message.contains("killed by signal 9 2 time(s)"), "{message}");
+        assert!(
+            message.contains("killed by signal 9 2 time(s)"),
+            "{message}"
+        );
         assert!(
             !message.contains("killed by the memory limit"),
             "no counter said memory, so nothing may say memory: {message}"

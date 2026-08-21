@@ -2756,7 +2756,8 @@ mod tests {
     /// publishes no accounting and therefore never said memory at all.
     #[test]
     fn only_a_kernel_attributed_kill_is_stamped_on_the_envelope() {
-        let stamped = Envelope::daemon_unreachable().with_recorded_daemon_kill(Some(&kill_record(4)));
+        let stamped =
+            Envelope::daemon_unreachable().with_recorded_daemon_kill(Some(&kill_record(4)));
         assert_eq!(stamped.degraded.daemon_killed_by_memory, Some(true));
         assert!(stamped
             .degraded

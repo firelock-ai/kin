@@ -675,5 +675,4 @@ mod tests {
         assert_eq!(parse_meminfo_total_gb("MemFree: 100 kB\n"), None);
         assert_eq!(parse_meminfo_total_gb("MemTotal:       nope kB\n"), None);
     }
-
 }

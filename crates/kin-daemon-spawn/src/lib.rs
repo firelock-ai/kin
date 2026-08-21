@@ -7443,7 +7443,10 @@ mod tests {
         );
         assert!(sentence.contains("01:12Z"), "{sentence}");
         assert!(sentence.contains("cap 12.0 GiB"), "{sentence}");
-        assert!(sentence.contains("last resident set 12.0 GiB"), "{sentence}");
+        assert!(
+            sentence.contains("last resident set 12.0 GiB"),
+            "{sentence}"
+        );
     }
 
     /// A host that publishes no accounting says so in the same breath, instead
@@ -7513,9 +7516,8 @@ mod tests {
         let read_back = read_daemon_kill_record(dir.path()).expect("record is readable");
         assert_eq!(read_back, recorded);
 
-        let again =
-            record_daemon_kill(dir.path(), 42, libc::SIGKILL, counted(3), counted(4), None)
-                .expect("the second kill is recorded too");
+        let again = record_daemon_kill(dir.path(), 42, libc::SIGKILL, counted(3), counted(4), None)
+            .expect("the second kill is recorded too");
         assert_eq!(
             (again.kills, again.memory_kills),
             (2, 2),
