@@ -2471,7 +2471,9 @@ Options:
             bound_home.evidence()
         );
         assert!(
-            bound_home.evidence().contains("does not contain this directory"),
+            bound_home
+                .evidence()
+                .contains("does not contain this directory"),
             "the row must name the mismatch: {}",
             bound_home.evidence()
         );

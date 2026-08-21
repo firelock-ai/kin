@@ -150,7 +150,11 @@ impl Host {
 
     /// Run `kin vfs status` from `cwd`, with the binding a shell hook would
     /// have exported into the process, and return what a user reads.
-    fn vfs_status_text(&self, cwd: &std::path::Path, workspace: Option<&std::path::Path>) -> String {
+    fn vfs_status_text(
+        &self,
+        cwd: &std::path::Path,
+        workspace: Option<&std::path::Path>,
+    ) -> String {
         let mut command = Command::new(env!("CARGO_BIN_EXE_kin"));
         command
             .env("KIN_HOME", &self.kin_home)
@@ -498,7 +502,10 @@ fn vfs_status_names_the_bound_root_and_refuses_to_call_an_unserved_one_in_force(
     // repository, and nothing is serving it.
     let mismatched = host.vfs_status_text(&repo, Some(&elsewhere));
     assert!(
-        mismatched.contains(&format!("the projection root bound here is {}", elsewhere.display())),
+        mismatched.contains(&format!(
+            "the projection root bound here is {}",
+            elsewhere.display()
+        )),
         "the report must name the root it is bound to:\n{mismatched}"
     );
     assert!(
@@ -528,7 +535,10 @@ fn vfs_status_names_the_bound_root_and_refuses_to_call_an_unserved_one_in_force(
             && served.contains("a daemon answered it"),
         "an answered connect must be reported as one, naming the socket:\n{served}"
     );
-    for absent in ["does not contain this directory", "there is no socket there"] {
+    for absent in [
+        "does not contain this directory",
+        "there is no socket there",
+    ] {
         assert!(
             !served.contains(absent),
             "a bound, answered repository must not carry `{absent}`:\n{served}"
