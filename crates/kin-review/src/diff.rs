@@ -560,6 +560,12 @@ pub fn diff_from_changes(changes: &[SemanticChange]) -> SemanticDiff {
 /// This is the primary mechanism for "review from arbitrary user-specified
 /// change sets" — callers can hand-pick any set of entities and get a full
 /// review with impact analysis and risk scoring.
+///
+/// This constructor and [`diff_from_files`] are deliberately NOT filtered for
+/// provenance-only modifications, unlike the three range constructors above. A
+/// caller here named the entities or the files it wants described, so answering
+/// with silence about one of them would be dropping something that was asked for
+/// rather than declining to invent a finding.
 pub fn diff_from_entity_ids<G: GraphStore>(
     store: &G,
     entity_ids: &[EntityId],
