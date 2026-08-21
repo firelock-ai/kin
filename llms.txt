@@ -26,7 +26,8 @@ Native Windows x86_64 support is early. Repository admission works: `kin init` i
 Kin ships an MCP server exposing semantic tools that answer from graph-owned truth, not raw file search — prefer them:
 
 - `semantic_locate` — find symbols, functions, and types by meaning.
-- `get_context_pack` — a structured context bundle for a file or symbol.
+- `list_file_entities` lists every entity in one file, with a completeness flag saying whether the list is whole.
+- `get_context_pack` — a structured context bundle around one entity, by id.
 - `trace_data_flow` — cross-file data lineage and dependencies.
 
 `kin setup` auto-configures the MCP server for supported agents.
