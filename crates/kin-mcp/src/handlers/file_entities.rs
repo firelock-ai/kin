@@ -1031,6 +1031,56 @@ mod tests {
         );
     }
 
+    /// The negative registry keys this tool's spec on a `const` used as a match
+    /// pattern, and a `const` pattern that ever degrades to a fresh binding
+    /// matches EVERY tool from that arm onward and hands them all this spec.
+    ///
+    /// The assertions below are chosen so they CAN fail. A tool whose arm sits
+    /// earlier in the match is shadowed by its own arm and would keep its spec
+    /// under the bug, so proving anything with one is proving nothing: the two
+    /// probes here are a tool whose arm comes AFTER this one, and a tool with no
+    /// spec at all, which is the case a catch-all binding turns from `None` into
+    /// a confident file-enumeration negative about a response that has no file
+    /// in it.
+    #[test]
+    fn the_file_spec_does_not_swallow_other_tools() {
+        let envelope = structural_authoritative_envelope();
+
+        let empty_flow = serde_json::json!({ "chain": [], "total_steps": 0 });
+        let negative =
+            crate::negative::negative_for("trace_data_flow", &empty_flow, &envelope, &[])
+                .expect("trace_data_flow keeps its own negative");
+        assert_eq!(
+            negative["kind"],
+            serde_json::json!("no_flow"),
+            "the file-enumeration spec captured a tool declared after it: {negative}"
+        );
+
+        assert!(
+            crate::negative::negative_for(
+                "kin_work_create",
+                &serde_json::json!({ "entities": [] }),
+                &envelope,
+                &[],
+            )
+            .is_none(),
+            "a tool with no negative spec must synthesize no negative"
+        );
+
+        // Positive control: this tool still gets its own kind, so the two
+        // assertions above are about scoping rather than about a spec that
+        // never matches anything.
+        let store = InMemoryGraph::new();
+        admit(&store, FILE);
+        store
+            .upsert_file_layout(&layout_for(FILE, ParseCompleteness::Full, 0))
+            .unwrap();
+        let payload = call(&store, &[("path", serde_json::json!(FILE))]).unwrap();
+        let mine = crate::negative::negative_for(TOOL_NAME, &payload, &envelope, &[])
+            .expect("the file enumeration carries its own negative");
+        assert_eq!(mine["kind"], serde_json::json!("no_file_entities"));
+    }
+
     /// The completeness signal a caller reads instead of the row count. A page
     /// of a file reports its counts as a floor and names why.
     #[test]
