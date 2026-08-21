@@ -541,6 +541,100 @@ pub fn clear_daemon_kill_record(kin_root: &Path) {
     let _ = fs::remove_file(kin_root.join(KILL_RECORD_FILE_NAME));
 }
 
+/// The file a store keeps its consecutive-interruption tally in.
+///
+/// Named here rather than inside the daemon because the daemon is the only
+/// process that can write it and the only one that never needs to read it back
+/// for a person. Three surfaces outside the daemon do: `kin graph status`,
+/// `kin doctor`, and the MCP envelope. A second spelling of the same file in
+/// each of them is how the cgroup readers came to disagree before they were
+/// moved down here.
+pub const SWEEP_INTERRUPTION_FILE_NAME: &str = "lsp-sweep-interruptions";
+
+/// How many consecutive fruitless interrupted sweeps suspend the next one.
+///
+/// Three, not one. A single interrupted sweep is ordinary: a plain SIGTERM
+/// during shutdown ends one early, and reading that as a failing store would
+/// suspend enrichment on every clean stop.
+pub const SWEEP_INTERRUPTION_LIMIT: u32 = 3;
+
+/// Where `kin_root` keeps that tally.
+pub fn sweep_interruption_path(kin_root: &Path) -> PathBuf {
+    kin_root.join(SWEEP_INTERRUPTION_FILE_NAME)
+}
+
+/// The tally this store carries.
+///
+/// Zero for a store that has never recorded one, and zero for a record this
+/// process cannot read or parse. Both are the same answer on purpose: the
+/// tally exists to withhold a sweep, and an unreadable tally must never be the
+/// reason enrichment stops.
+pub fn read_sweep_interruptions(kin_root: &Path) -> u32 {
+    fs::read_to_string(sweep_interruption_path(kin_root))
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+/// Record the tally for this store.
+pub fn write_sweep_interruptions(kin_root: &Path, count: u32) {
+    let _ = fs::write(sweep_interruption_path(kin_root), count.to_string());
+}
+
+/// Whether the sweep circuit is open at this tally, so no sweep may be queued.
+pub fn sweep_circuit_open(consecutive_fruitless_interruptions: u32) -> bool {
+    consecutive_fruitless_interruptions >= SWEEP_INTERRUPTION_LIMIT
+}
+
+/// A store whose language-server enrichment has been switched off by the
+/// circuit, and the tally that switched it off.
+///
+/// A value rather than a bare count so every surface says the same sentence
+/// about it. The circuit closing is not an event anything publishes: the tally
+/// is reset by a sweep that completes, so a surface that cached this would keep
+/// reporting a suspension the store had already cleared. Every reader takes it
+/// fresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SuspendedSweep {
+    /// Consecutive sweeps that ended early having enriched nothing.
+    pub interruptions: u32,
+}
+
+impl SuspendedSweep {
+    /// What this store records, or `None` while the circuit is closed.
+    pub fn read(kin_root: &Path) -> Option<Self> {
+        let interruptions = read_sweep_interruptions(kin_root);
+        sweep_circuit_open(interruptions).then_some(Self { interruptions })
+    }
+
+    /// The fact alone, for a surface that carries its own remediation field.
+    ///
+    /// It says what stopped and what that costs, and it does not say when,
+    /// because the store records a count and no timestamp. Naming a time here
+    /// would be the one thing on this line a reader could not check.
+    pub fn cause_sentence(&self) -> String {
+        format!(
+            "language-server enrichment is suspended for this store: {} consecutive sweeps ended \
+             early without enriching anything, so cross-file relations stay at whatever is \
+             already durable instead of converging",
+            self.interruptions
+        )
+    }
+
+    /// What the reader can do about it.
+    pub fn remediation(&self) -> String {
+        "Run `kin daemon sweep` to ask for another pass; one sweep that completes clears this. \
+         If the sweeps are being killed rather than cancelled, give the machine or container \
+         more memory first, because another pass will end the way the last three did."
+            .to_string()
+    }
+
+    /// The whole thing on one line, for a surface that has only one line.
+    pub fn summary(&self) -> String {
+        format!("{}; run `kin daemon sweep` to retry", self.cause_sentence())
+    }
+}
+
 /// Unix seconds now, or zero when the clock is before the epoch.
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
@@ -7506,6 +7600,84 @@ mod tests {
     }
 
     #[cfg(unix)]
+    /// The circuit is a threshold, so the two readings that matter are the one
+    /// below it and the one at it. A test that only checks a large count cannot
+    /// tell a correct threshold from an off-by-one, and an off-by-one here
+    /// either suspends enrichment a sweep early or never suspends it at all.
+    #[test]
+    fn the_circuit_opens_at_the_limit_and_not_before() {
+        let dir = tempfile::tempdir().expect("temp store");
+        for below in 0..SWEEP_INTERRUPTION_LIMIT {
+            write_sweep_interruptions(dir.path(), below);
+            assert!(
+                SuspendedSweep::read(dir.path()).is_none(),
+                "{below} interruptions is under the limit of {SWEEP_INTERRUPTION_LIMIT}, so \
+                 enrichment is still running and nothing may say otherwise"
+            );
+        }
+        for at_or_above in [SWEEP_INTERRUPTION_LIMIT, SWEEP_INTERRUPTION_LIMIT + 9] {
+            write_sweep_interruptions(dir.path(), at_or_above);
+            assert_eq!(
+                SuspendedSweep::read(dir.path()),
+                Some(SuspendedSweep {
+                    interruptions: at_or_above
+                }),
+                "at {at_or_above} the daemon has stopped queueing sweeps and every surface \
+                 must be able to say so"
+            );
+        }
+    }
+
+    /// A store nobody has swept, and a tally this process cannot make sense of,
+    /// are the same answer on purpose. The tally only ever withholds a sweep,
+    /// so failing closed on an unreadable one would switch enrichment off for a
+    /// truncated write nobody could see.
+    #[test]
+    fn an_absent_or_unreadable_tally_never_reads_as_suspended() {
+        let dir = tempfile::tempdir().expect("temp store");
+        assert_eq!(read_sweep_interruptions(dir.path()), 0);
+        assert!(SuspendedSweep::read(dir.path()).is_none());
+
+        for junk in ["", "   ", "not a number", "-1", "3 sweeps"] {
+            fs::write(sweep_interruption_path(dir.path()), junk).expect("write tally");
+            assert_eq!(
+                read_sweep_interruptions(dir.path()),
+                0,
+                "an unreadable tally must not switch enrichment off: {junk:?}"
+            );
+            assert!(SuspendedSweep::read(dir.path()).is_none());
+        }
+    }
+
+    /// The sentence has one job on `kin graph status`, where it is the only
+    /// line: say how many, say what it costs, and say the command that undoes
+    /// it. It must not say WHEN, because the store records a count and no
+    /// timestamp, and a time on this line would be the one part of it a reader
+    /// could not check.
+    #[test]
+    fn the_suspension_sentence_names_the_count_the_cost_and_the_command() {
+        let suspended = SuspendedSweep { interruptions: 5 };
+        let summary = suspended.summary();
+        assert!(summary.contains('5'), "{summary}");
+        assert!(summary.contains("suspended"), "{summary}");
+        assert!(summary.contains("kin daemon sweep"), "{summary}");
+        assert!(
+            !summary.contains("last at") && !summary.contains('Z'),
+            "no timestamp is recorded, so none may be rendered: {summary}"
+        );
+        assert!(
+            suspended.remediation().contains("kin daemon sweep"),
+            "{}",
+            suspended.remediation()
+        );
+        assert!(
+            suspended.cause_sentence().contains('5')
+                && !suspended.cause_sentence().contains("kin daemon sweep"),
+            "the cause sentence is the fact alone, for a surface with its own fix field: {}",
+            suspended.cause_sentence()
+        );
+    }
+
     #[test]
     fn a_recorded_kill_round_trips_through_the_store() {
         let dir = tempfile::tempdir().unwrap();
