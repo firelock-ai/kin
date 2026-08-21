@@ -4536,12 +4536,175 @@ mod tests {
         );
     }
 
-    /// Write an executable stand-in for the projection driver.
+    /// How long a fixture waits for a file it just wrote to become executable.
+    ///
+    /// Generous against a loaded runner and far short of any real failure: the
+    /// only handle that can still be open is a copy this process forked, and
+    /// that copy is closed by the child's own exec microseconds later. A bound
+    /// this wide expiring means something holds the file open indefinitely,
+    /// which no fixture here does.
+    #[cfg(unix)]
+    const EXEC_READY_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Write an executable stand-in for the projection driver, and do not
+    /// return until the host will actually run it.
+    ///
+    /// `write_file` closes its own handle before this returns, and that is not
+    /// enough. A fork raised by another test thread between the open and the
+    /// close inherits a copy of the write descriptor, and the kernel refuses to
+    /// exec a file any process still holds open for writing: ETXTBSY, spelled
+    /// "Text file busy". The inherited copy dies at that child's own exec, so
+    /// the window is short and belongs entirely to the fixture, but it is wide
+    /// enough under load to have ejected two green pull requests from the merge
+    /// queue (FIR-2488, FIR-2457).
+    ///
+    /// Waiting for one successful exec is what closes the window rather than
+    /// widening a sleep. Nothing else writes these files, so once the kernel
+    /// has let the file run, no writer can appear again.
     #[cfg(unix)]
     fn write_driver(path: &Path, script: &str) {
         use std::os::unix::fs::PermissionsExt;
         write_file(path, script.as_bytes());
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        wait_until_executable(path);
+    }
+
+    /// Block until the host executes `path`, or fail naming what still refuses.
+    ///
+    /// Only ETXTBSY is waited out. Every other spawn error, and every exit
+    /// status, means the file ran or is broken for a reason no wait repairs,
+    /// so both return immediately.
+    #[cfg(unix)]
+    fn wait_until_executable(path: &Path) {
+        wait_until_executable_within(path, EXEC_READY_BOUND);
+    }
+
+    /// [`wait_until_executable`] with the bound named, so the guard below can
+    /// prove the wait expires without spending the real one.
+    #[cfg(unix)]
+    fn wait_until_executable_within(path: &Path, bound: std::time::Duration) {
+        let deadline = std::time::Instant::now() + bound;
+        let mut attempts = 0_u32;
+        loop {
+            let error = match std::process::Command::new(path)
+                .arg("--kin-fixture-exec-probe")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+            {
+                Ok(_) => return,
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::ExecutableFileBusy,
+                "{} could not be executed: {error}",
+                path.display()
+            );
+            attempts += 1;
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{} stayed text-busy across {attempts} exec attempts in {bound:?}",
+                path.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// The exec-readiness wait has to be able to see the condition it waits
+    /// for, or it is a sleep that always returns.
+    ///
+    /// The condition is a file some process still holds open for writing, which
+    /// is what a fork raised mid-write leaves behind. Linux refuses to exec such
+    /// a file with ETXTBSY and macOS does not refuse at all, measured on both:
+    /// `ubuntu:24.04` answers "Text file busy" and exit 126 while a descriptor
+    /// is held and exit 0 once it closes, and this workstation runs the file in
+    /// both states. So the refusing half of this guard asserts only where the
+    /// kernel produces the refusal, decided by asking rather than by target
+    /// name, and the returning half is asserted everywhere. That platform split
+    /// is also why the flake this wait removes never reproduced on a local
+    /// macOS gate and only ever ejected pull requests from Linux runs
+    /// (FIR-2488, FIR-2457).
+    #[test]
+    #[cfg(unix)]
+    fn the_exec_readiness_wait_sees_a_busy_file_and_stops_waiting_when_it_clears() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("stand-in");
+        write_file(&script, b"#!/bin/sh\nexit 0\n");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let handle = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&script)
+            .unwrap();
+        let refused_while_held = std::process::Command::new(&script)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .err()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::ExecutableFileBusy);
+
+        if refused_while_held {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {}));
+            let expired = std::panic::catch_unwind(|| {
+                wait_until_executable_within(&script, std::time::Duration::from_millis(200));
+            });
+            std::panic::set_hook(previous);
+            let payload = expired
+                .expect_err("a file this kernel refuses to exec must make the bounded wait expire");
+            let message = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                message.contains("stayed text-busy"),
+                "the expiry must name what it was waiting on, got {message:?}"
+            );
+        }
+
+        // Text-busy is the only failure worth waiting out. A wait that sat out
+        // its bound on every error would turn a fixture typo into a timeout
+        // instead of naming the missing file, so the discrimination is asserted
+        // rather than assumed.
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let started = std::time::Instant::now();
+        let missing = std::panic::catch_unwind(|| {
+            wait_until_executable_within(
+                &dir.path().join("no-such-stand-in"),
+                std::time::Duration::from_secs(30),
+            );
+        });
+        std::panic::set_hook(previous);
+        let payload = missing.expect_err("a path that is not there cannot become executable");
+        assert!(
+            payload
+                .downcast_ref::<String>()
+                .is_some_and(|message| message.contains("could not be executed")),
+            "an absent file must be reported, not waited out: {payload:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "an error that is not text-busy must fail at once, took {:?}",
+            started.elapsed()
+        );
+
+        drop(handle);
+        // Both worlds: with no writer left the wait returns rather than
+        // spending its bound, which is the half that keeps every fixture in
+        // this module cheap.
+        let cleared = std::time::Instant::now();
+        wait_until_executable_within(&script, EXEC_READY_BOUND);
+        assert!(
+            cleared.elapsed() < std::time::Duration::from_secs(5),
+            "a file nothing holds open must be executable at once, took {:?}",
+            cleared.elapsed()
+        );
     }
 
     /// A driver the loader refuses is not an absent driver. The linux-aarch64

@@ -109,6 +109,20 @@ fn retry_bound() -> Duration {
 /// Split from the reading above so the arithmetic can be driven with observed
 /// numbers rather than with whatever the box running the tests happens to
 /// report at that instant.
+/// The deadline a settle already under way should hold.
+///
+/// A load average is a one minute mean, so a host that saturates as a settle
+/// begins still reads quiet for the first samples of it, and a budget taken
+/// once at the start is the budget an idle box would have got. This takes the
+/// widest the host justifies while the settle runs. It only ever widens, so a
+/// reading that falls back cannot cut short a settle already in progress, and
+/// every candidate is measured from `started` against a bound already clamped
+/// to [`RETRY_BOUND_CEILING`], so no sequence of readings pushes the pass past
+/// the two minutes it was always bounded by.
+fn widened_settle_deadline(current: Instant, started: Instant, bound: Duration) -> Instant {
+    current.max(started + bound)
+}
+
 fn scaled_retry_bound(run_queue_depth: f64, cores: usize) -> Duration {
     let widest = RETRY_BOUND_CEILING.as_secs_f64() / RETRY_BOUND_FLOOR.as_secs_f64();
     let stretch = run_queue_depth / cores.max(1) as f64;
@@ -440,11 +454,21 @@ fn payload(session: &[(u64, serde_json::Value)], id: u64, what: &str) -> serde_j
 
 /// The live entity count the daemon reports, read through `kin graph status`
 /// so the poll below does not have to spawn a whole MCP session per tick.
-fn live_entity_count(repo: &Path, home: &Path, port: u16) -> u64 {
-    let text = stdout_of(
-        &kin_against_daemon(repo, home, port, &["graph", "status"]),
-        "kin graph status",
-    );
+///
+/// `None` while the command exits non-zero. It does that on a critical graph
+/// health issue, and one of those is transient by construction: authority
+/// admission binds the entity layer and facets are written per file after it,
+/// so a read taken between the two halves sees a derived tree that trails
+/// authority (`crates/kin-cli/src/commands/graph_health.rs:481`). That is the
+/// gap the poll below exists to cross, so a reading taken inside it is "not
+/// yet" rather than a failure. Its text still reaches the caller, which is what
+/// reports it when the bound expires.
+fn live_entity_count(repo: &Path, home: &Path, port: u16) -> (Option<u64>, std::process::Output) {
+    let output = kin_against_daemon(repo, home, port, &["graph", "status"]);
+    if !output.status.success() {
+        return (None, output);
+    }
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
     let line = text
         .lines()
         .find(|line| line.contains("Entities:"))
@@ -453,13 +477,14 @@ fn live_entity_count(repo: &Path, home: &Path, port: u16) -> u64 {
         .split("Entities:")
         .nth(1)
         .expect("the entity line carries a count");
-    after
+    let count = after
         .trim_start()
         .chars()
         .take_while(char::is_ascii_digit)
         .collect::<String>()
         .parse()
-        .unwrap_or_else(|_| panic!("could not read an entity count from {line:?}"))
+        .unwrap_or_else(|_| panic!("could not read an entity count from {line:?}"));
+    (Some(count), output)
 }
 
 /// Wait until ambient admission has taken the host write into the live graph.
@@ -499,18 +524,21 @@ fn wait_for_live_growth(
     // to hide a missing admission is the bug this test kept reporting.
     let deadline = Instant::now() + COUNT_SETTLE_BOUND;
     loop {
-        let live = live_entity_count(repo, home, port);
-        if live > above {
-            return live;
+        let (live, status) = live_entity_count(repo, home, port);
+        if live.is_some_and(|live| live > above) {
+            return live.expect("the reading above carried a count");
         }
+        // Printing the reading this loop actually took, rather than running the
+        // command again to explain itself: a second run answers about a later
+        // instant, and the helper that asserts on its exit status would panic
+        // there instead of reporting here.
         assert!(
             Instant::now() < deadline,
             "the daemon recorded admitting the host write, but the live entity count stayed at \
-             {live} against above={above}; graph status said:\n{}",
-            stdout_of(
-                &kin_against_daemon(repo, home, port, &["graph", "status"]),
-                "kin graph status"
-            )
+             {live:?} against above={above}; graph status exited {} and said:\n{}\n{}",
+            status.status,
+            String::from_utf8_lossy(&status.stdout),
+            String::from_utf8_lossy(&status.stderr)
         );
         thread::sleep(Duration::from_millis(100));
     }
@@ -540,7 +568,8 @@ fn asks_for_retry(payload: &serde_json::Value) -> bool {
 /// mask: a daemon that never yields the lock still fails, naming how many times
 /// it refused.
 fn settled_mcp_session(repo: &Path, home: &Path, port: u16) -> Vec<(u64, serde_json::Value)> {
-    let deadline = Instant::now() + retry_bound();
+    let started = Instant::now();
+    let mut deadline = started + retry_bound();
     let mut refusals = 0_u32;
     loop {
         let session = run_mcp_session(repo, home, port);
@@ -549,6 +578,14 @@ fn settled_mcp_session(repo: &Path, home: &Path, port: u16) -> Vec<(u64, serde_j
             return session;
         }
         refusals += 1;
+        // A load average is a one minute mean, so a host that saturates as this
+        // settle begins still reads quiet for the first samples of it and the
+        // budget taken at the start is the one an idle box would have got. Take
+        // the widest the host justifies while the settle runs instead. It only
+        // ever widens, and every candidate is already clamped to
+        // RETRY_BOUND_CEILING measured from `started`, so the pass stays
+        // bounded by the same two minutes it was before.
+        deadline = widened_settle_deadline(deadline, started, retry_bound());
         assert!(
             Instant::now() < deadline,
             "kin_graph_status refused {refusals} times without ever sampling its counts: {status}"
@@ -771,5 +808,44 @@ fn the_stretch_is_proportional_and_survives_a_host_that_reports_nothing() {
         scaled_retry_bound(4.0, 0),
         RETRY_BOUND_CEILING,
         "a host reporting no cores at all must not divide by zero"
+    );
+}
+
+#[test]
+fn a_settle_that_begins_quiet_and_turns_busy_gets_the_busy_budget() {
+    // Why the settle re-reads the host instead of budgeting once: a load
+    // average is a one minute mean, so a box that goes from idle to saturated
+    // at the instant this case starts reports an idle number for the first
+    // samples of the settle, and a budget taken once is the idle one for the
+    // whole run. The rule is to hold the widest budget the host justifies while
+    // the settle runs.
+    let started = Instant::now();
+    let quiet = widened_settle_deadline(started, started, scaled_retry_bound(1.0, 18));
+    assert_eq!(
+        quiet,
+        started + RETRY_BOUND_FLOOR,
+        "the first reading of an idle host is the floor"
+    );
+
+    let busy = widened_settle_deadline(quiet, started, scaled_retry_bound(136.33, 18));
+    assert_eq!(
+        busy,
+        started + RETRY_BOUND_CEILING,
+        "a saturation the first reading could not see still buys its budget"
+    );
+
+    // And only ever widens: a reading that falls back must not cut short a
+    // settle already under way, or the lag works in the other direction.
+    assert_eq!(
+        widened_settle_deadline(busy, started, scaled_retry_bound(1.0, 18)),
+        busy,
+        "a later quiet reading must not shorten a settle that already widened"
+    );
+
+    // Still bounded by the same ceiling the fixed pass had, measured from the
+    // instant the settle began.
+    assert!(
+        busy <= started + RETRY_BOUND_CEILING,
+        "no sequence of readings may push the settle past its ceiling"
     );
 }

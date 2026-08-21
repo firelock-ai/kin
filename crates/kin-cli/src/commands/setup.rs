@@ -15850,6 +15850,50 @@ fi
     /// authority must surface as EIO from the shim, never as silent raw-disk
     /// reads, so the shell only ever decides whether to START a daemon and
     /// never whether the preload applies.
+    /// How long a scenario waits for a start the hook launched detached.
+    ///
+    /// Only how long a run that is going to fail spends proving it: the wait
+    /// below returns the instant the line lands, so a passing scenario never
+    /// spends this. Sized against a runner where the whole probe shell took ten
+    /// seconds rather than the three a quiet box takes.
+    #[cfg(unix)]
+    const DETACHED_START_BOUND: Duration = Duration::from_secs(30);
+
+    /// Start lines the stub has recorded so far.
+    #[cfg(unix)]
+    fn recorded_starts(start_log: &Path) -> usize {
+        fs::read_to_string(start_log)
+            .map(|log| log.lines().count())
+            .unwrap_or(0)
+    }
+
+    /// Wait for the starts a scenario expects, and return what the log holds.
+    ///
+    /// Every hook launches `kin-vfs start` detached, zsh with `&!` and the
+    /// others with a plain `&`, and none of them waits for it. `Command::output`
+    /// waits for the probe shell alone, so reading the log the moment it returns
+    /// reads a side effect of a process nothing synchronised with: on a loaded
+    /// host the shell's ten bounded retries expire and it exits before the
+    /// disowned grandchild has appended its line (FIR-2573).
+    ///
+    /// So wait on the observable rather than on the shell. This returns as soon
+    /// as the expected count is there and hands the count back either way, so
+    /// the caller's assertion still names the scenario and prints the call log.
+    /// A scenario expecting no start has nothing to wait for and is read
+    /// directly: a start that has not landed yet cannot fail that assertion, so
+    /// it has never been the flaky direction.
+    #[cfg(unix)]
+    fn starts_recorded_within_bound(start_log: &Path, expected: usize) -> usize {
+        let deadline = std::time::Instant::now() + DETACHED_START_BOUND;
+        loop {
+            let starts = recorded_starts(start_log);
+            if starts >= expected || std::time::Instant::now() >= deadline {
+                return starts;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn hook_liveness_guard_starts_on_stale_sockets_and_keeps_the_shim_unconditional() {
@@ -16010,10 +16054,12 @@ printf 'LD=[%s]\n' "$LD_PRELOAD"
                     "{hook_name}/{mode}: probe shell failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
                 );
 
+                let starts = if expected_starts == 0 {
+                    recorded_starts(&start_log)
+                } else {
+                    starts_recorded_within_bound(&start_log, expected_starts)
+                };
                 let calls_text = fs::read_to_string(&calls).unwrap_or_default();
-                let starts = fs::read_to_string(&start_log)
-                    .map(|s| s.lines().count())
-                    .unwrap_or(0);
                 assert_eq!(
                     starts, expected_starts,
                     "{hook_name}/{mode}: {why}\ncalls:\n{calls_text}\nstdout:\n{stdout}"
