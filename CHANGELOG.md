@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Announce a commit to the reconcile loop before it can reach the daemon (#1010)
 - Give the sensitive-artifact refusal a command that performs the approval it names (#1016)
 - Say why a trace walk stopped, per hop, and stop reporting coverage as unreported on complete walks (#1018)
+- Give kin dead-code the absence discipline the MCP surface applies (#1017)
+- Bump clap from 4.6.2 to 4.6.6 (#1019)
 
 
 ## [0.5.46] - 2026-08-21
