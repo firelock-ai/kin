@@ -39,6 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Move the kin registry pin to kin-vfs-core 0.4.13 and advance the kin-vfs release input (#1034)
 - Bind a Python method call through its receiver's declared type, and keep a module off its function's call edges (#1038)
 - Admit single-word uppercase and call-bound Python module constants (#1039)
+- Record the complete admission init conversion and stash perform, and fetch doctor's graph status once per run (#1040)
+- Roll a refused admission back instead of leaving the derived graph ahead of authority (#1041)
 
 
 ## [0.5.46] - 2026-08-21
