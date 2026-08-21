@@ -36,6 +36,11 @@ export const EVIDENCE_REF = 'release-evidence';
 export const PREFLIGHT_SCHEMA = 'kin.release-preflight.v1';
 export const PREFLIGHT_RECORD = 'preflight.json';
 export const STRANGER_RECORD = 'stranger.env';
+// The release train's version bump branch, and the ONLY branch whose head ever
+// carried proof records. It bounds the bridge below. release-train.yml declares
+// the same literal, and the authority suite pins the two together so they
+// cannot drift into a bridge that resolves somewhere nothing was ever proven.
+export const BUMP_BRANCH = 'automation/release-next';
 
 const COMMIT_SHA = /^[0-9a-f]{40}$/;
 const ARCHIVE_SHA = /^[0-9a-f]{64}$/;
@@ -281,14 +286,34 @@ export async function resolveCandidateSha(
     );
   }
   const pulls = await response.json();
-  const merged = (Array.isArray(pulls) ? pulls : []).filter(
+  const produced = (Array.isArray(pulls) ? pulls : []).filter(
     (pull) => pull?.merge_commit_sha === commitSha && COMMIT_SHA.test(pull?.head?.sha ?? ''),
   );
+  // Bounded to the bump branch. Under the current scheme the tagged commit is
+  // the candidate, so a tag reaching this function is one whose direct record
+  // was absent, and every ordinary main commit is the squash of some feature
+  // pull request whose head never carried a record. Without this bound the
+  // bridge would happily answer about that head, which is a promote gate
+  // looking somewhere nothing was ever proven. Checked against every tag this
+  // bridge exists for: v0.5.44, v0.5.45 and v0.5.46 each resolve through a
+  // pull request from this branch.
+  const merged = produced.filter((pull) => pull?.head?.ref === BUMP_BRANCH);
   if (merged.length === 0) {
+    if (produced.length === 0) {
+      throw new Error(
+        `no merged pull request produced ${commitSha}, so there is no candidate ` +
+        'branch head whose proof records could be found; a tag minted outside ' +
+        'the release train carries no evidence by construction',
+      );
+    }
+    const refs = [
+      ...new Set(produced.map((pull) => pull?.head?.ref ?? '<none>')),
+    ].join(', ');
     throw new Error(
-      `no merged pull request produced ${commitSha}, so there is no candidate ` +
-      'branch head whose proof records could be found; a tag minted outside ' +
-      'the release train carries no evidence by construction',
+      `${commitSha} was produced by a pull request from ${refs}, not from ` +
+      `${BUMP_BRANCH}; only the release train's bump branch ever carried proof ` +
+      'records, so bridging anywhere else would answer about a build nobody ' +
+      'proved',
     );
   }
   if (merged.length > 1) {

@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  BUMP_BRANCH,
   EVIDENCE_REF,
   PREFLIGHT_RECORD,
   PREFLIGHT_SCHEMA,
@@ -349,7 +350,7 @@ test('resolveCandidateSha bridges a squash to the branch head that was proven', 
     fetchImpl: async (url) => {
       seen = url;
       return jsonOk([
-        { number: 986, merge_commit_sha: SHA, head: { sha: RC_HEAD } },
+        { number: 986, merge_commit_sha: SHA, head: { sha: RC_HEAD, ref: BUMP_BRANCH } },
       ]);
     },
   });
@@ -369,7 +370,7 @@ test('resolveCandidateSha refuses a commit no merged pull request produced', asy
     resolveCandidateSha(SHA, {
       repository: REPO,
       fetchImpl: async () =>
-        jsonOk([{ number: 1, merge_commit_sha: OTHER_SHA, head: { sha: RC_HEAD } }]),
+        jsonOk([{ number: 1, merge_commit_sha: OTHER_SHA, head: { sha: RC_HEAD, ref: BUMP_BRANCH } }]),
     }),
     /no merged pull request produced/,
   );
@@ -381,8 +382,8 @@ test('resolveCandidateSha refuses to guess between two claimants', async () => {
       repository: REPO,
       fetchImpl: async () =>
         jsonOk([
-          { number: 1, merge_commit_sha: SHA, head: { sha: RC_HEAD } },
-          { number: 2, merge_commit_sha: SHA, head: { sha: OTHER_SHA } },
+          { number: 1, merge_commit_sha: SHA, head: { sha: RC_HEAD, ref: BUMP_BRANCH } },
+          { number: 2, merge_commit_sha: SHA, head: { sha: OTHER_SHA, ref: BUMP_BRANCH } },
         ]),
     }),
     /claimed as the merge commit of more than one pull request \(#1, #2\)/,
@@ -408,6 +409,40 @@ test('resolveCandidateSha fails closed on transport and server failure', async (
   );
 });
 
+// The bridge exists for tags cut before the candidate became a main commit,
+// and every one of those resolves through the release train's bump branch:
+// checked against v0.5.44, v0.5.45 and v0.5.46, whose tag commits are the
+// squashes of kin#986, kin#991 and kin#1001, all from automation/release-next.
+// Under the current scheme an ordinary main commit is the squash of a feature
+// pull request whose head never carried a record, so bridging to it would send
+// the promote gate looking somewhere nothing was ever proven.
+test('resolveCandidateSha refuses to bridge outside the release train', async () => {
+  await assert.rejects(
+    resolveCandidateSha(SHA, {
+      repository: REPO,
+      fetchImpl: async () =>
+        jsonOk([
+          {
+            number: 1049,
+            merge_commit_sha: SHA,
+            head: { sha: RC_HEAD, ref: 'feature/some-ordinary-branch' },
+          },
+        ]),
+    }),
+    /not from automation\/release-next; only the release train's bump branch/,
+  );
+});
+
+test('resolveCandidateSha still separates absence from a wrong branch', async () => {
+  await assert.rejects(
+    resolveCandidateSha(SHA, {
+      repository: REPO,
+      fetchImpl: async () => jsonOk([]),
+    }),
+    /no merged pull request produced/,
+  );
+});
+
 test('resolveCandidateSha refuses a loose ref', async () => {
   await assert.rejects(
     resolveCandidateSha('main', { repository: REPO, fetchImpl: async () => jsonOk([]) }),
@@ -424,7 +459,7 @@ test('main bridges a landed commit to the candidate that was proven', async () =
     log: (line) => lines.push(line),
     fetchImpl: async (url) => {
       if (url.includes('/pulls')) {
-        return jsonOk([{ number: 986, merge_commit_sha: SHA, head: { sha: RC_HEAD } }]);
+        return jsonOk([{ number: 986, merge_commit_sha: SHA, head: { sha: RC_HEAD, ref: BUMP_BRANCH } }]);
       }
       if (url.includes(PREFLIGHT_RECORD)) {
         const record = preflightRecord();
@@ -489,7 +524,7 @@ test('main bridges when the direct key is absent and a commit is given', async (
     log: (line) => lines.push(line),
     fetchImpl: async (url) => {
       if (url.includes('/pulls')) {
-        return jsonOk([{ number: 986, merge_commit_sha: SHA, head: { sha: RC_HEAD } }]);
+        return jsonOk([{ number: 986, merge_commit_sha: SHA, head: { sha: RC_HEAD, ref: BUMP_BRANCH } }]);
       }
       if (url.includes(`evidence/${SHA}/`)) {
         return { ok: false, status: 404, statusText: 'Not Found' };
@@ -527,7 +562,7 @@ test('main never bridges past a record it could not read', async () => {
         fetchImpl: async (url) => {
           if (url.includes('/pulls')) {
             bridged = true;
-            return jsonOk([{ number: 986, merge_commit_sha: SHA, head: { sha: RC_HEAD } }]);
+            return jsonOk([{ number: 986, merge_commit_sha: SHA, head: { sha: RC_HEAD, ref: BUMP_BRANCH } }]);
           }
           return unreadable;
         },

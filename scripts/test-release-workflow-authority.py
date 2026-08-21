@@ -1027,6 +1027,27 @@ def replace_exactly_once(
     return source.replace(original, replacement, 1)
 
 
+def workflow_active_text(block: str) -> str:
+    """Comment-stripped workflow text, safe for a job whose steps run shell.
+
+    `active_lines` is the general helper, and it also strips C-style block
+    comments so a JavaScript heredoc cannot hide a no-op validator. A shell
+    glob opens one of those: `refs/tags/*` starts a match that runs to the next
+    `*/`, which on release-train.yml is `${policy##*/` eleven thousand
+    characters later, swallowing most of the reconcile job. A guard reading a
+    workflow through that rule is structurally unable to see anything in the
+    swallowed range, and an absence check reading it would report absence for a
+    step that is right there. YAML and shell both comment with `#` alone, so
+    that is all this strips.
+    """
+
+    return "\n".join(
+        line.strip()
+        for line in block.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    )
+
+
 def swap_release_tag_step_order(release_tag: str) -> str:
     """Move the release proof gate after the tag write it exists to gate.
 
@@ -7247,7 +7268,7 @@ def assert_release_proof_key_authority(
     reconcile = workflow_job_blocks(release_train).get("reconcile")
     if reconcile is None:
         raise AssertionError("release-train.yml no longer declares the reconcile job")
-    if PROOF_GATE_POLICY in "\n".join(active_lines(reconcile)):
+    if PROOF_GATE_POLICY in workflow_active_text(reconcile):
         raise AssertionError(
             "the release train must key nothing on the version bump branch's "
             "head; that key is what forced the fleet to freeze main for the "
@@ -7278,6 +7299,38 @@ def assert_release_proof_key_authority(
             )
 
     gate_source = "\n".join(active_lines(proof_gate))
+
+    # The bridge is the one path in the gate that can answer about a sha nobody
+    # named, so it is bounded to the branch that is the only place a record was
+    # ever published. The bound is read out of the release train rather than
+    # written down twice: renaming the bump branch there must fail here until
+    # the gate follows, because a bridge pointed at a branch that no longer
+    # exists resolves the head of whatever feature pull request produced the
+    # tagged commit, and that head never carried a record.
+    bump_branch = re.search(
+        r"^BRANCH: (\S+)$", workflow_active_text(reconcile), re.MULTILINE
+    )
+    if bump_branch is None:
+        raise AssertionError(
+            "release-train.yml no longer names the bump branch it writes, so "
+            "the proof gate's bridge cannot be bounded to it"
+        )
+    if f"export const BUMP_BRANCH = '{bump_branch.group(1)}';" not in gate_source:
+        raise AssertionError(
+            "the proof gate's bridge must be bounded to the same bump branch "
+            f"the release train writes ({bump_branch.group(1)})"
+        )
+    if (
+        "produced.filter((pull) => pull?.head?.ref === BUMP_BRANCH)"
+        not in gate_source
+    ):
+        raise AssertionError(
+            "the proof gate must apply the bump-branch bound when it bridges, "
+            "or a tag whose records were removed resolves the head of the "
+            "feature pull request that produced it and asks about a build "
+            "nobody proved"
+        )
+
     if "absent.evidenceAbsent = true" not in gate_source:
         raise AssertionError(
             "the proof gate must mark an absent record as absent, so a caller "
@@ -8867,6 +8920,29 @@ def main() -> None:
             proof_gate,
         ),
     )
+    # The same regression, planted where the general comment stripper cannot
+    # see it. `refs/tags/*` opens a C-style block comment for `active_lines`,
+    # which then swallows the next eleven thousand characters of the reconcile
+    # job, and this anchor sits inside that range. Reading the job through that
+    # rule reports absence for a step that is right there, so the guard uses a
+    # shell-safe reader and this proves it.
+    expect_assertion(
+        "the train keys a release on the bump branch head inside the "
+        "block-comment blind spot",
+        "must key nothing on the version bump branch's head",
+        lambda: assert_release_proof_key_authority(
+            replace_exactly_once(
+                release_train,
+                '          test -s "$abandoned"\n',
+                '          test -s "$abandoned"\n'
+                f'          git show "refs/remotes/origin/main:{PROOF_GATE_POLICY}" > gate\n',
+                "release train proof key, blind spot",
+            ),
+            release_tag,
+            release,
+            proof_gate,
+        ),
+    )
     expect_assertion(
         "the promote gate stops asking about the tagged commit itself",
         "ask about the tagged commit directly",
@@ -8894,6 +8970,36 @@ def main() -> None:
                 "",
                 "promote gate bridge",
             ),
+            proof_gate,
+        ),
+    )
+    expect_assertion(
+        "the proof gate's bridge stops being bounded to the bump branch",
+        "must apply the bump-branch bound when it bridges",
+        lambda: assert_release_proof_key_authority(
+            release_train,
+            release_tag,
+            release,
+            replace_exactly_once(
+                proof_gate,
+                "produced.filter((pull) => pull?.head?.ref === BUMP_BRANCH)",
+                "produced.filter((pull) => pull !== null)",
+                "proof gate bump-branch bound",
+            ),
+        ),
+    )
+    expect_assertion(
+        "the bump branch is renamed in the train and not in the gate",
+        "must be bounded to the same bump branch",
+        lambda: assert_release_proof_key_authority(
+            replace_exactly_once(
+                release_train,
+                "          BRANCH: automation/release-next\n",
+                "          BRANCH: automation/release-later\n",
+                "bump branch rename",
+            ),
+            release_tag,
+            release,
             proof_gate,
         ),
     )
