@@ -328,7 +328,7 @@ fn require_complete_prepared_embeddings(kin_dir: &Path) -> Result<()> {
         None,
     )
     .with_context(|| format!("validate prepared vector index {}", vector_path.display()))?;
-    if !loaded {
+    if !loaded.attached {
         bail!(
             "prepared vector index {} is missing or incompatible with its graph/model metadata",
             vector_path.display()

@@ -1063,6 +1063,50 @@ pub fn resolve_idle_timeout_floor(
 
 /// Shared daemon state. All mutable state is behind RwLock for
 /// concurrent access from the reconciliation loop and API handlers.
+/// What opening a store's vector sidecar did, as the surfaces need to report it.
+///
+/// Two independent facts rather than one enum, because they answer different
+/// questions and a reader needs both: `discarded` says an index was on disk and
+/// is NOT attached, `salvage` says one IS attached after retiring keys. At most
+/// one is ever set, but folding them into a single field would invite a caller
+/// to treat "no discard" as "nothing was lost", which is precisely the reading
+/// that made a salvaged store render as a first fill (FIR-2562).
+#[derive(Debug, Clone, Default)]
+struct VectorSidecarOpen {
+    discarded: Option<String>,
+    salvage: Option<crate::VectorSalvage>,
+}
+
+/// Read kin-db's sidecar load outcome as the salvage fact the surfaces report,
+/// or `None` when nothing was retired at open.
+///
+/// Only a stamp-drift salvage produces a record. An exact load can still drop
+/// orphaned generations, and reporting that as lost coverage would fire on
+/// ordinary re-inits; the ticket's whole point is that "loaded whole" and
+/// "loaded partially" have to stay distinguishable (FIR-2562).
+///
+/// The kept count is a subtraction rather than a field, because
+/// `vectors_loaded` is what the sidecar held BEFORE reconciliation ran, not
+/// what survived it (kin-db 0.7.49
+/// `crates/kin-db/src/storage/snapshot.rs:1460`). Passing it through as "kept"
+/// would print the sidecar's whole size beside a retired count already inside
+/// it, so a store that kept 1770 of 2112 would read as keeping 2112 and
+/// retiring 342 at the same time.
+fn salvage_from_sidecar_outcome(
+    outcome: &kin_db::VectorSidecarLoadOutcome,
+) -> Option<crate::VectorSalvage> {
+    matches!(
+        outcome.disposition,
+        kin_db::VectorSidecarDisposition::SalvagedAfterStampDrift
+    )
+    .then(|| crate::VectorSalvage {
+        kept: outcome
+            .vectors_loaded
+            .saturating_sub(outcome.vectors_dropped),
+        dropped: outcome.vectors_dropped,
+    })
+}
+
 pub struct DaemonState {
     pub layout: KinLayout,
     pub graph: Arc<kin_db::InMemoryGraph>,
@@ -1107,6 +1151,10 @@ pub struct DaemonState {
     /// `None` means either that the index loaded or that there was none to
     /// load, which are the two states that need no explanation.
     vector_index_discarded: Option<String>,
+    /// What a per-key salvage retired at open, when one happened. Separate from
+    /// the discard reason above because a salvage ATTACHES an index: the two
+    /// describe different stores and only one of them can be true at a time.
+    vector_index_salvage: Option<crate::VectorSalvage>,
     pub reconciler: RwLock<Reconciler>,
     /// Cached FileLayouts for all tracked files.
     /// Populated on init, updated on commits.
@@ -1715,18 +1763,24 @@ impl DaemonState {
     /// the pipeline (kin-db's embedding pipeline epoch), which every persisted
     /// sidecar already carries and every load already checks.
     ///
-    /// Returns `Some(reason)` when an index was on disk and was not installed,
-    /// so the caller can record and announce what was discarded. `None` means
-    /// the index loaded, or there was none to load.
+    /// Returns what the sidecar did, in the two facts the surfaces report: a
+    /// discard reason when an index was on disk and was not installed, and a
+    /// salvage record when one WAS installed after retiring keys.
+    ///
+    /// Those two are not alternatives and neither implies the other. A discard
+    /// leaves nothing attached and the counters read structurally zero. A
+    /// salvage attaches an index and the counters read partial, with no discard
+    /// to record, which is exactly the state that used to render identically to
+    /// a first fill (FIR-2562).
     fn load_validated_vector_index(
         layout: &KinLayout,
         graph: &kin_db::InMemoryGraph,
-    ) -> Option<String> {
+    ) -> VectorSidecarOpen {
         let snapshot_path = layout.kindb_snapshot_path();
         let vector_path = layout.kindb_vector_index_path();
         // Sampled BEFORE the load so a discard can be told apart from a repo
-        // that simply has no index yet. kin-db reports both as `Ok(false)`, and
-        // announcing the second would fire this on every fresh repository.
+        // that simply has no index yet. kin-db reports both as not attached,
+        // and announcing the second would fire this on every fresh repository.
         let had_persisted_index = vector_path.exists();
         let outcome = kin_db::SnapshotManager::load_vector_index_into_graph_if_valid(
             graph,
@@ -1734,12 +1788,37 @@ impl DaemonState {
             None,
         );
         let discarded = match outcome {
-            Ok(true) => {
-                debug!(path = %snapshot_path.display(), "loaded validated persisted vector index");
-                return None;
+            Ok(outcome) if outcome.attached => {
+                // Attached, so nothing was discarded. What matters now is
+                // whether it attached WHOLE or after retiring keys, because
+                // only the second explains a shortfall the counters are about
+                // to show. The counts come from kin-db's own reconcile rather
+                // than being recomputed here.
+                let salvage = salvage_from_sidecar_outcome(&outcome);
+                if let Some(record) = salvage {
+                    // Loud, because this is coverage a user had and no longer
+                    // has. The cause is stated as what was observed, a stamp
+                    // that drifted from graph authority, and no further cause
+                    // is asserted: an ordinary commit between flush and reopen
+                    // drifts the same stamp with nothing wrong.
+                    warn!(
+                        path = %vector_path.display(),
+                        kept = record.kept,
+                        dropped = record.dropped,
+                        "the persisted vector index no longer matched this repository's graph \
+                         authority, so it was salvaged per key rather than rebuilt; the retired \
+                         keys re-embed in the background"
+                    );
+                } else {
+                    debug!(path = %snapshot_path.display(), "loaded validated persisted vector index");
+                }
+                return VectorSidecarOpen {
+                    discarded: None,
+                    salvage,
+                };
             }
-            Ok(false) if !had_persisted_index => return None,
-            Ok(false) => format!(
+            Ok(_) if !had_persisted_index => return VectorSidecarOpen::default(),
+            Ok(_) => format!(
                 "the persisted vector index at {} no longer matches this repository's graph or \
                  embedding model, so it was not loaded",
                 vector_path.display()
@@ -1762,7 +1841,20 @@ impl DaemonState {
              vectors where they still apply. Run `kin health` to watch coverage recover, or \
              `kin embed` to force a rebuild now."
         );
-        Some(discarded)
+        VectorSidecarOpen {
+            discarded: Some(discarded),
+            salvage: None,
+        }
+    }
+
+    /// Why the persisted vector index retired coverage at open, when it did.
+    ///
+    /// Reported beside `vector_index_discarded` rather than folded into it,
+    /// because the two describe different stores: a discard leaves nothing
+    /// attached, a salvage leaves a partial index attached with no discard to
+    /// record. Collapsing them is the defect FIR-2562 names.
+    pub fn vector_index_salvage(&self) -> Option<crate::VectorSalvage> {
+        self.vector_index_salvage
     }
 
     /// Why the persisted vector index was not installed at open, when it was
@@ -2325,7 +2417,7 @@ impl DaemonState {
         // `from_snapshot_with_text_index` restores the text index but not the
         // vector sidecar, so without this the reopened repository reports every
         // entity as unembedded and re-derives an index it already has on disk.
-        let vector_index_discarded = phases.record("vector_index", || {
+        let sidecar_open = phases.record("vector_index", || {
             Self::load_validated_vector_index(&layout, graph.as_ref())
         });
 
@@ -2368,7 +2460,8 @@ impl DaemonState {
             graph,
             blobs: Arc::new(blobs),
             ingest_cas_hydration_gap: None,
-            vector_index_discarded,
+            vector_index_discarded: sidecar_open.discarded,
+            vector_index_salvage: sidecar_open.salvage,
             reconciler: RwLock::new(reconciler),
             projection: RwLock::new(ProjectionState::new()),
             coordinator,
@@ -2576,7 +2669,7 @@ impl DaemonState {
         // The backend path builds the graph via `from_snapshot_with_text_index`,
         // which does NOT load the vector-index sidecar — do the validated load
         // here (no-ops if no/stale sidecar).
-        let vector_index_discarded = Self::load_validated_vector_index(&layout, graph.as_ref());
+        let sidecar_open = Self::load_validated_vector_index(&layout, graph.as_ref());
         let mut reconciler = Reconciler::new(layout.working_dir().to_path_buf());
         reconciler.seed_lkg_entities_from_graph(graph.as_ref());
         reconciler.seed_cross_file_linker_from_graph(graph.as_ref());
@@ -2600,7 +2693,8 @@ impl DaemonState {
             graph: Arc::clone(&graph),
             blobs: Arc::new(blobs),
             ingest_cas_hydration_gap,
-            vector_index_discarded,
+            vector_index_discarded: sidecar_open.discarded,
+            vector_index_salvage: sidecar_open.salvage,
             reconciler: RwLock::new(reconciler),
             projection: RwLock::new(ProjectionState::new()),
             coordinator,
@@ -6265,7 +6359,8 @@ mod tests {
                 &state.layout.kindb_snapshot_path(),
                 None,
             )
-            .expect("the checkpointed sidecar must be readable"),
+            .expect("the checkpointed sidecar must be readable")
+            .attached,
             "the checkpointed sidecar must install through the daemon's own open-time path"
         );
         assert_eq!(
@@ -9582,7 +9677,7 @@ mod tests {
         let discarded = DaemonState::load_validated_vector_index(&layout, graph.as_ref());
 
         assert_eq!(
-            discarded, None,
+            discarded.discarded, None,
             "an index from another build is not a discard: {discarded:?}"
         );
         assert_eq!(
@@ -9615,7 +9710,9 @@ mod tests {
 
         let discarded = DaemonState::load_validated_vector_index(&layout, graph.as_ref());
 
-        let reason = discarded.expect("a refused sidecar must be announced, not dropped silently");
+        let reason = discarded
+            .discarded
+            .expect("a refused sidecar must be announced, not dropped silently");
         assert!(
             reason.contains("graph.kvec") && reason.contains("could not be read"),
             "the announcement must name what was discarded and why: {reason}"
@@ -9633,6 +9730,12 @@ mod tests {
     /// The whole-index refusal this test used to pin was the FIR-2325 defect;
     /// kin-db 0.7.24 replaced it with per-key salvage, and the corrupted-format
     /// case above still proves a real refusal stays loud.
+    ///
+    /// It now also pins the half FIR-2562 was about. "Not discarded" was the
+    /// only thing this path could say about a salvage, and a caller reading it
+    /// learned that an index attached and nothing else. A salvage has to arrive
+    /// as its own fact, with the counts kin-db already computed, or the
+    /// shortfall it leaves renders as a first fill.
     #[test]
     #[cfg(feature = "vector")]
     fn an_index_bound_to_drifted_graph_truth_is_salvaged_per_key() {
@@ -9644,13 +9747,26 @@ mod tests {
             .upsert_entity(&test_entity("added_after_the_index", "src/added.rs"))
             .unwrap();
 
-        let discarded = DaemonState::load_validated_vector_index(&layout, graph.as_ref());
+        let opened = DaemonState::load_validated_vector_index(&layout, graph.as_ref());
 
         assert_eq!(
-            discarded, None,
+            opened.discarded, None,
             "a salvageable sidecar must be reused, not announced as discarded"
         );
+        let salvage = opened
+            .salvage
+            .expect("a per-key salvage must reach the caller as a salvage, not as silence");
+        assert!(
+            salvage.kept > 0,
+            "the salvage must report what it kept, which is what makes it a salvage \
+             rather than a discard: {salvage:?}"
+        );
         let status = graph.embedding_status();
+        assert_eq!(
+            salvage.kept, status.indexed,
+            "the reported kept count must be the coverage actually attached: {salvage:?} \
+             against {status:?}"
+        );
         assert_eq!(
             status.indexed, 1,
             "the persisted vector whose entity truth is unchanged must survive the reopen"
@@ -9658,6 +9774,98 @@ mod tests {
         assert!(
             status.total >= 2,
             "graph truth must still owe a vector for the entity added after the index"
+        );
+    }
+
+    /// The control that makes the arm above capable of failing: an exact load
+    /// reports NO salvage.
+    ///
+    /// Loaded whole and loaded partially are different facts, and a reader that
+    /// cannot tell them apart is back where FIR-2562 started. Without this arm
+    /// a `load_validated_vector_index` that reported a salvage on every attach
+    /// would satisfy the test above completely.
+    #[test]
+    #[cfg(feature = "vector")]
+    fn an_index_that_still_matches_its_graph_reports_no_salvage() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let layout = KinLayout::new(repo_dir.path().join(".kin"));
+        let graph = store_with_persisted_vector_index(&layout, None);
+        as_reopened_by_the_daemon(graph.as_ref());
+        // No entity added, so graph truth has not moved and the stamp still
+        // matches. This is the same fixture as the salvage arm minus the one
+        // change that causes the drift.
+
+        let opened = DaemonState::load_validated_vector_index(&layout, graph.as_ref());
+
+        assert_eq!(
+            opened.discarded, None,
+            "an index that still matches its graph is not a discard"
+        );
+        assert_eq!(
+            opened.salvage, None,
+            "an exact load must not report a salvage: nothing was retired"
+        );
+        assert_eq!(
+            graph.embedding_status().indexed,
+            1,
+            "the control must actually have attached an index, or it proves nothing"
+        );
+    }
+
+    /// The kept count is what survived reconciliation, not what the sidecar
+    /// held before it ran.
+    ///
+    /// kin-db's `vectors_loaded` is sampled before the per-key reconcile
+    /// (`crates/kin-db/src/storage/snapshot.rs:1460` in 0.7.49), so the retired
+    /// count it reports beside it is already inside that number. Passing
+    /// `vectors_loaded` straight through as "kept" would have printed
+    /// `2112 vectors were kept and 342 were retired` for the store FIR-2562 was
+    /// filed on, which reads 1770/2112 indexed: two numbers that cannot both be
+    /// true, on the one line the ticket exists to make trustworthy.
+    ///
+    /// The store fixtures cannot catch this on their own. They install a single
+    /// vector and retire nothing, so kept and loaded are the same number there
+    /// and the subtraction is invisible. This drives the mapping directly with
+    /// a drop that is bigger than zero.
+    #[test]
+    fn a_salvage_reports_what_survived_reconciliation_not_what_the_sidecar_held() {
+        let salvaged = kin_db::VectorSidecarLoadOutcome {
+            attached: true,
+            vectors_loaded: 2112,
+            vectors_dropped: 342,
+            disposition: kin_db::VectorSidecarDisposition::SalvagedAfterStampDrift,
+            durable_coverage_before_load: true,
+        };
+
+        let record = salvage_from_sidecar_outcome(&salvaged)
+            .expect("a stamp-drift salvage is the case this record exists for");
+        assert_eq!(
+            record,
+            crate::VectorSalvage {
+                kept: 1770,
+                dropped: 342,
+            },
+            "kept must be the survivors, and kept plus retired must be the sidecar: {record:?}"
+        );
+
+        // An exact load reports no salvage even when it evicted orphaned
+        // generations, because a re-init dropping stale keys is not a store
+        // losing ground and rendering it as one would fire on ordinary work.
+        assert_eq!(
+            salvage_from_sidecar_outcome(&kin_db::VectorSidecarLoadOutcome {
+                attached: true,
+                vectors_loaded: 2112,
+                vectors_dropped: 7,
+                disposition: kin_db::VectorSidecarDisposition::LoadedExact,
+                durable_coverage_before_load: true,
+            }),
+            None,
+            "an exact load is not a salvage, whatever it pruned"
+        );
+        assert_eq!(
+            salvage_from_sidecar_outcome(&kin_db::VectorSidecarLoadOutcome::default()),
+            None,
+            "a store with no sidecar has retired nothing"
         );
     }
 
@@ -9673,10 +9881,14 @@ mod tests {
         std::fs::create_dir_all(layout.kindb_dir()).unwrap();
         let graph = kin_db::InMemoryGraph::new();
 
+        let opened = DaemonState::load_validated_vector_index(&layout, &graph);
         assert_eq!(
-            DaemonState::load_validated_vector_index(&layout, &graph),
-            None,
+            opened.discarded, None,
             "a repository that never had an index has had nothing discarded"
+        );
+        assert_eq!(
+            opened.salvage, None,
+            "and nothing was salvaged either, since there was nothing to salvage"
         );
     }
 

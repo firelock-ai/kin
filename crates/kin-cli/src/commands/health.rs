@@ -3107,6 +3107,31 @@ fn semantic_query_health_from_runtime(
     // repository whose finished index was thrown away at open. Only one of them
     // means work already paid for is being paid for again, so when the daemon
     // knows which it is, say so instead of leaving it to be inferred.
+    // Checked before the discard arm's `else`, because a salvage is the case
+    // neither arm below can describe. It attaches an index, so no discard is
+    // recorded and the first arm falls through; and it leaves a real shortfall
+    // against a fill that finished, so the "backlog is filling" arm would call
+    // a coverage loss healthy. Stale is the honest verdict: the surface is
+    // serving off less than it was.
+    if let Some(salvage) = runtime.vector_index_salvage {
+        return HealthCheck::new(
+            "semantic_query_readiness",
+            "Semantic query readiness",
+            HealthStatus::Stale,
+            format!(
+                "{detail}; the persisted vector index no longer matched this repository's graph \
+                 authority when the daemon opened, so it was salvaged per key: {} vectors were \
+                 kept and {} were retired. The daemon re-embeds the retired keys in the \
+                 background",
+                salvage.kept, salvage.dropped
+            ),
+        )
+        .with_manual_fix(
+            "allow daemon embedding to finish, or run `kin embed` to force it now; only the \
+             retired keys are re-derived",
+        );
+    }
+
     let Some(reason) = &runtime.vector_index_discarded else {
         // Nothing was discarded, so the remaining question is whether this
         // store has ever finished a fill. Before it has, partial coverage is a
@@ -6583,6 +6608,67 @@ mod tests {
         assert!(semantic.detail.contains("41/41 embeddings indexed"));
         assert!(!semantic.detail.contains("graph.kvec"));
         assert!(semantic.manual_fix.is_none());
+    }
+
+    /// A salvage is lost ground, and the arm that would otherwise catch it
+    /// calls the identical counters healthy.
+    ///
+    /// A per-key salvage attaches an index, so no discard is recorded, and it
+    /// happens on stores that HAVE finished a fill, so `ever_complete` holds.
+    /// Both of those steer the same counters to the Healthy top-up arm, which
+    /// is the correct verdict for a working copy admitting new files and the
+    /// wrong one for a store that just had coverage retired. The counts kin-db
+    /// now returns are what let this path tell them apart (FIR-2562).
+    #[cfg(feature = "vector")]
+    #[test]
+    fn semantic_query_readiness_calls_a_retired_coverage_stale_not_filling() {
+        // Identical to the top-up fixture below in every field that the
+        // healthy arm reads, so the verdict can only turn on the salvage.
+        let topping_up = crate::commands::resources::EmbedRuntimeState {
+            embeddings_indexed: 40,
+            embeddings_total: 41,
+            embeddings_pending: 1,
+            embedding_coverage_ever_complete: true,
+            ..Default::default()
+        };
+        let healthy = semantic_query_health_from_runtime("http://daemon", &topping_up);
+        assert!(
+            matches!(healthy.status, HealthStatus::Healthy),
+            "the control: these counters alone are a healthy top-up: {:?}",
+            healthy.status
+        );
+
+        let salvaged = crate::commands::resources::EmbedRuntimeState {
+            vector_index_salvage: Some(crate::commands::resources::VectorSalvage {
+                kept: 1770,
+                dropped: 342,
+            }),
+            ..topping_up.clone()
+        };
+        let stale = semantic_query_health_from_runtime("http://daemon", &salvaged);
+        assert!(
+            matches!(stale.status, HealthStatus::Stale),
+            "coverage retired at open is not a backlog filling: {:?}, {}",
+            stale.status,
+            stale.detail
+        );
+        assert!(
+            stale.detail.contains("1770") && stale.detail.contains("342"),
+            "both counts have to reach the reader: {}",
+            stale.detail
+        );
+        assert!(
+            !stale
+                .detail
+                .contains("coverage completed earlier and this backlog is filling"),
+            "the filling sentence must not survive beside a retirement: {}",
+            stale.detail
+        );
+        assert!(stale.manual_fix.is_some());
+        assert!(
+            !assemble_health_report("test".to_string(), vec![stale]).healthy,
+            "a retired coverage has to fail the aggregate, as a discard does"
+        );
     }
 
     #[cfg(feature = "vector")]

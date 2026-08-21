@@ -724,6 +724,18 @@ pub struct HealthResponse {
     /// and goes quiet once coverage is whole.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vector_index_discarded: Option<String>,
+    /// What a per-key salvage retired when this daemon opened, when one
+    /// happened. A value drives `status: "attention"`, exactly as a discard
+    /// does, because both mean this store is serving off less coverage than it
+    /// had.
+    ///
+    /// The field above cannot carry this. A salvage INSTALLS an index, so
+    /// nothing is discarded and the counters read measured and short, which is
+    /// byte-identical to a store filling for the first time. That is what let a
+    /// store publish `1770/2112 indexed (342 pending)` three minutes after
+    /// retiring 342 vectors, with every surface reporting `ok` (FIR-2562).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector_index_salvage: Option<kin_cli::commands::resources::VectorSalvage>,
     /// Effective filesystem-to-graph admission policy. This reports the frozen
     /// daemon state, including intrinsic storage-backend graph authority, not
     /// merely whether the opt-in environment variable was present.
@@ -2586,6 +2598,7 @@ async fn health(
         .load(std::sync::atomic::Ordering::Relaxed);
     let embed_persistence_unavailable = !state.can_persist_embed_progress_locally();
     let vector_index_discarded = state.vector_index_discarded().map(str::to_string);
+    let vector_index_salvage = state.vector_index_salvage();
     let coordination_event_persist_failures = state
         .coordination_event_persist_failures
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -2599,10 +2612,17 @@ async fn health(
     // is withholding a suspected mass-deletion wipe OR the embedding worker has
     // permanently stopped (embed-degraded), OR the configured storage backend
     // cannot durably persist vector progress, OR the persisted vector index was
-    // discarded at open and is being re-derived, OR coordination evidence could
-    // not be persisted, OR a background pass was stopped for spending the
-    // machine without advancing, OR the reconcile loop is failing to admit what
-    // it observes. The graph itself stays intact and served in all cases.
+    // discarded at open and is being re-derived, OR the index attached only
+    // after a per-key salvage retired coverage this store had, OR coordination
+    // evidence could not be persisted, OR a background pass was stopped for
+    // spending the machine without advancing, OR the reconcile loop is failing
+    // to admit what it observes. The graph itself stays intact and served in
+    // all cases.
+    //
+    // The salvage term is the one a client could not see. It reaches this
+    // verdict on its own rather than through the discard above, because a
+    // salvage records no discard: an index DID attach, and only the counts say
+    // how much of it survived.
     //
     // The reconcile term is the one that was missing. `reconciliation_status`
     // below reports whether a pass is running this instant, which a loop failing
@@ -2613,6 +2633,7 @@ async fn health(
         || embed_worker_failed
         || embed_persistence_unavailable
         || vector_index_discarded.is_some()
+        || vector_index_salvage.is_some()
         || coordination_event_persist_failures > 0
         || background_pass_stopped
         || reconcile_degraded
@@ -2651,6 +2672,7 @@ async fn health(
         embed_worker_failed,
         embed_persistence_unavailable,
         vector_index_discarded,
+        vector_index_salvage,
         filesystem_reconcile_disabled: state.filesystem_reconcile_disabled(),
         background_embed_deferred: !crate::daemon::auto_embed_enabled(),
         graph_generation: DaemonState::read_generation_marker(&state.layout),
@@ -3343,6 +3365,7 @@ async fn command_resources(
         hybrid_metrics: hybrid_metrics_runtime(),
         metal_profile: metal_profile_runtime(),
         vector_index_discarded: state.vector_index_discarded().map(str::to_string),
+        vector_index_salvage: state.vector_index_salvage(),
         deferred_vector_checkpoint: state.deferred_vector_checkpoint(),
         embedding_coverage_ever_complete: state.embedding_coverage_ever_complete(),
         embed_persistence_unavailable: !state.can_persist_embed_progress_locally(),
@@ -3446,6 +3469,7 @@ fn graph_status_embedding_runtime(
     }
     kin_cli::commands::resources::EmbedRuntimeState {
         vector_index_discarded: state.vector_index_discarded().map(str::to_string),
+        vector_index_salvage: state.vector_index_salvage(),
         deferred_vector_checkpoint: state.deferred_vector_checkpoint(),
         embedding_coverage_ever_complete: state.embedding_coverage_ever_complete(),
         embed_persistence_unavailable: !state.can_persist_embed_progress_locally(),
@@ -20232,6 +20256,101 @@ mod tests {
             !json.embed_worker_failed,
             "a discarded index is not a worker crash"
         );
+    }
+
+    /// A salvage is the state the discard field cannot report, and it has to
+    /// reach `/health` on its own.
+    ///
+    /// The store here is the shape the rc0545c brown arm was in: a sidecar
+    /// stamped against graph truth that then moved, so kin-db installs it and
+    /// reconciles per key rather than refusing it whole. Nothing is discarded,
+    /// so the field beside this one stays empty and the counters read measured
+    /// and short, which is exactly what a first fill looks like. Without this
+    /// the endpoint answers `ok` for a store that just lost coverage.
+    #[tokio::test]
+    #[cfg(feature = "vector")]
+    async fn health_surfaces_a_salvaged_vector_index_as_attention() {
+        install_test_registry_override();
+        let dir = std::env::temp_dir().join(format!("kin-daemon-kvec-salvage-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let layout = kin_core::init(&dir).unwrap().layout;
+
+        let snapshot_path = layout.kindb_snapshot_path();
+        {
+            let manager = kin_db::SnapshotManager::new(&snapshot_path);
+            let graph = manager.graph();
+            let entity = test_entity("salvage_survivor", "src/lib.rs");
+            graph.upsert_entity(&entity).unwrap();
+
+            let descriptor = kin_db::IndexDescriptor {
+                model_id: Some("fixture-model".to_string()),
+                graph_root: Some("fixture-root".to_string()),
+            };
+            let index = kin_db::VectorIndex::new(4).unwrap();
+            index.upsert(entity.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+            index.set_descriptor(descriptor.clone());
+            index.save(&layout.kindb_vector_index_path()).unwrap();
+            assert!(
+                matches!(
+                    graph.load_vector_index_compatible(
+                        &layout.kindb_vector_index_path(),
+                        &descriptor
+                    ),
+                    kin_db::VectorIndexLoad::Loaded(_)
+                ),
+                "the fixture index must install before the sidecar is stamped"
+            );
+            manager.save().unwrap();
+            kin_db::SnapshotManager::save_vector_index_for_graph(
+                &snapshot_path,
+                graph.as_ref(),
+                None,
+            )
+            .unwrap();
+
+            // Graph truth moves after the stamp and the sidecar is left alone,
+            // which is the drift. Saving the snapshot again persists the newer
+            // truth beside the older stamp, so the next open sees both.
+            graph
+                .upsert_entity(&test_entity("admitted_after_the_stamp", "src/added.rs"))
+                .unwrap();
+            manager.save().unwrap();
+        }
+
+        let state = Arc::new(DaemonState::open(layout).unwrap());
+        let salvage = state
+            .vector_index_salvage()
+            .expect("the fixture must reach kin-db's salvage path, or it proves nothing");
+        assert!(
+            state.vector_index_discarded().is_none(),
+            "a salvage records no discard, which is the whole reason it needs its own field"
+        );
+
+        let response = router(state)
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: HealthResponse = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            json.vector_index_salvage,
+            Some(salvage),
+            "the route must publish the counts the daemon recorded at open"
+        );
+        assert!(
+            json.vector_index_discarded.is_none(),
+            "and it must not invent a discard to explain them: {:?}",
+            json.vector_index_discarded
+        );
+        assert_eq!(
+            json.status, "attention",
+            "a store serving off less coverage than it had is not an `ok` steady state"
+        );
+        assert!(!json.embed_worker_failed, "a salvage is not a worker crash");
     }
 
     #[tokio::test]

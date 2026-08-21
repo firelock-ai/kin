@@ -658,6 +658,25 @@ fn build_graph_status_response(
                 "; the persisted vector index was not loaded when this daemon opened ({reason}); \
                  the daemon restores coverage in the background"
             ));
+        } else if let Some(salvage) = embedding_runtime.vector_index_salvage {
+            // The state FIR-2562 was filed for, and the reason the clause below
+            // it could never reach it: a per-key salvage INSTALLS an index, so
+            // no discard is recorded and `coverage_is_measured` holds. Before
+            // the counts existed on this side of the boundary the line could
+            // say only that a fill had finished here once. Now it can name the
+            // loss and its size.
+            //
+            // The cause is stated as what was observed, a sidecar whose stamp
+            // no longer matched graph authority, and nothing further is
+            // asserted. An ordinary commit between flush and reopen drifts the
+            // same stamp with nothing wrong, so naming a fault here would be an
+            // exemption doubling as a proof of its own cause.
+            embeddings_line.push_str(&format!(
+                "; when this daemon opened, the persisted vector index no longer matched this \
+                 repository's graph authority, so it was salvaged per key: {} vectors were kept \
+                 and {} were retired, and only the retired keys re-embed",
+                salvage.kept, salvage.dropped
+            ));
         } else if !coverage_is_measured {
             // No index is attached and the daemon recorded no discard at open,
             // so these zeros are structural rather than a measurement of a
@@ -692,14 +711,13 @@ fn build_graph_status_response(
             //
             // The claim stops where the evidence does. This says a fill
             // finished here once and this shortfall is measured against it. It
-            // does NOT say what caused the shortfall, because a working copy
-            // that admitted new files and a sidecar that retired keys at open
-            // are indistinguishable from here. Naming the cause and its counts
-            // needs the salvage outcome kin-db already computes and discards at
-            // `kin-db crates/kin-db/src/storage/snapshot.rs:2117`, which
-            // `SnapshotManager::load_vector_index_into_graph_if_valid` collapses
-            // into a bare `Ok(true)`. That is the other half of FIR-2562 and it
-            // is a kin-db change, so no clause here may imply kin knows it.
+            // does NOT say what caused the shortfall, and it still cannot: a
+            // working copy that admitted new files and a sidecar that retired
+            // keys at open both land here, and only the second is a loss. The
+            // arm above is where a loss gets named, and it is reached only when
+            // the daemon actually recorded a salvage. So this remains the
+            // honest wording for everything else, and no clause here may imply
+            // kin knows a cause it was not told.
             embeddings_line.push_str(
                 "; coverage has completed on this store before, so this is a shortfall against a \
                  fill that finished rather than a first fill",
@@ -2384,6 +2402,123 @@ mod tests {
             graph.load_vector_index_compatible(&path, &descriptor),
             kin_db::VectorIndexLoad::Loaded(_)
         ));
+    }
+
+    /// A store that had coverage retired at open says so, with both counts.
+    ///
+    /// This is FIR-2562's first ask, and it could not be answered from kin at
+    /// all until kin-db 0.7.47: the counts were computed on the salvage path
+    /// and thrown away when `load_vector_index_into_graph_if_valid` collapsed
+    /// its outcome into a bare `bool`. With `VectorSidecarLoadOutcome` carrying
+    /// them, a coverage LOSS renders as a loss with its size and its cause,
+    /// distinct from work not yet done.
+    ///
+    /// Three arms, because the clause is only worth anything if it separates
+    /// the stores it exists to separate: a salvaged store, the same store with
+    /// no salvage recorded, and a store that never finished a fill.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn a_store_whose_coverage_was_retired_at_open_names_the_loss_and_its_size() {
+        let (temp, binding, graph) = graph_validation_fixture();
+        for name in ["alpha_transform", "beta_reduce", "gamma_emit", "delta_fold"] {
+            graph.upsert_entity(&test_entity(name)).unwrap();
+        }
+        attach_partial_vector_index(&graph, temp.path(), 2);
+        let status = graph.embedding_status();
+        assert!(
+            graph.vector_index_stats().is_some() && status.pending > 0,
+            "the fixture must read measured and short, which is what a salvage leaves: {status:?}"
+        );
+
+        let salvaged = build_graph_status_response(
+            &pinned(&binding),
+            &graph,
+            &Default::default(),
+            &crate::commands::resources::EmbedRuntimeState {
+                vector_index_salvage: Some(crate::commands::resources::VectorSalvage {
+                    kept: 1770,
+                    dropped: 342,
+                }),
+                embedding_coverage_ever_complete: true,
+                ..Default::default()
+            },
+            &Default::default(),
+        )
+        .unwrap();
+        let salvaged_line = salvaged
+            .lines
+            .iter()
+            .find(|line| line.starts_with("Embeddings:"))
+            .expect("the embeddings line still renders");
+        assert!(
+            salvaged_line.contains("1770 vectors were kept")
+                && salvaged_line.contains("342 were retired"),
+            "both counts have to reach the reader: {salvaged_line}"
+        );
+        assert!(
+            salvaged_line.contains("salvaged per key"),
+            "the cause has to be named, not left to be inferred: {salvaged_line}"
+        );
+        assert!(
+            !salvaged_line.contains("shortfall against a fill that finished"),
+            "the cause-bearing clause must outrank the one that only knows a fill \
+             finished once: {salvaged_line}"
+        );
+
+        // Control one: the same store, same marker, no salvage recorded. The
+        // counts must vanish rather than persist from somewhere.
+        let no_salvage = build_graph_status_response(
+            &pinned(&binding),
+            &graph,
+            &Default::default(),
+            &crate::commands::resources::EmbedRuntimeState {
+                vector_index_salvage: None,
+                embedding_coverage_ever_complete: true,
+                ..Default::default()
+            },
+            &Default::default(),
+        )
+        .unwrap();
+        let no_salvage_line = no_salvage
+            .lines
+            .iter()
+            .find(|line| line.starts_with("Embeddings:"))
+            .expect("the embeddings line still renders");
+        assert!(
+            !no_salvage_line.contains("salvaged per key") && !no_salvage_line.contains("retired"),
+            "a store with no salvage recorded must claim none: {no_salvage_line}"
+        );
+        assert!(
+            no_salvage_line.contains("shortfall against a fill that finished"),
+            "and it falls back to what it does know: {no_salvage_line}"
+        );
+
+        // Control two: a store that never finished a fill gets neither clause.
+        let first_fill = build_graph_status_response(
+            &pinned(&binding),
+            &graph,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
+        let first_fill_line = first_fill
+            .lines
+            .iter()
+            .find(|line| line.starts_with("Embeddings:"))
+            .expect("the embeddings line still renders");
+        assert!(
+            !first_fill_line.contains("salvaged per key")
+                && !first_fill_line.contains("a fill that finished"),
+            "a first fill claims neither a salvage nor a completed fill: {first_fill_line}"
+        );
+        assert!(
+            first_fill_line.contains(&format!(
+                "{}/{} indexed ({} pending)",
+                status.indexed, status.total, status.pending
+            )),
+            "the counters stay disclosed on all three: {first_fill_line}"
+        );
     }
 
     /// A store whose coverage was whole once and is short now says so, and the
