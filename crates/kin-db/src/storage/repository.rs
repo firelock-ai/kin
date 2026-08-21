@@ -4126,12 +4126,38 @@ fn verify_native_change_admission<B: StorageBackend + ?Sized>(
     let native_changes = transaction
         .changes
         .iter()
-        .filter(|change| matches!(change.origin, kin_model::ChangeOrigin::Native));
+        .filter(|change| matches!(change.origin, kin_model::ChangeOrigin::Native))
+        .collect::<Vec<_>>();
+    // A transaction with no Native change reaches no lineage at all, which is
+    // what a Git import is: kin-git refuses a native-origin change inside a
+    // semantic Git import, so every change it commits is Git-origin.
+    if native_changes.is_empty() {
+        return Ok(());
+    }
+    // Every tree this loop reads comes out of one pass over the changes'
+    // shared first-parent lineage. Resolving them one at a time inside the
+    // loop below walked that lineage once per change AND once per parent, so
+    // an ordinary single-change commit re-derived the whole repository history
+    // twice and a multi-change Native transaction was quadratic in its own
+    // change count.
+    let mut lineage_targets = Vec::with_capacity(native_changes.len() * 2);
+    for change in &native_changes {
+        lineage_targets.push(change.id);
+        lineage_targets.extend(change.parents.iter().copied());
+    }
+    let resolved = replay.resolve_trees(&lineage_targets)?;
+    let resolved_tree = |change_id: &SemanticChangeId| -> Result<&ResolvedTree, KinDbError> {
+        resolved.get(change_id).ok_or_else(|| {
+            storage(format!(
+                "native admission resolved no tree for change {change_id}"
+            ))
+        })
+    };
     for change in native_changes {
-        let candidate = replay.resolve_tree(change.id)?;
+        let candidate = resolved_tree(&change.id)?;
         let mut parent_artifacts = BTreeSet::<ArtifactId>::new();
         for parent in &change.parents {
-            let parent_tree = replay.resolve_tree(*parent)?;
+            let parent_tree = resolved_tree(parent)?;
             parent_artifacts.extend(parent_tree.artifacts().map(|artifact| artifact.artifact_id));
         }
         for artifact in candidate.artifacts() {
@@ -4555,7 +4581,27 @@ impl<'a> SharedReplayGraph<'a> {
     }
 
     fn resolve_tree(&self, change_id: SemanticChangeId) -> Result<ResolvedTree, KinDbError> {
-        self.graph()?.resolve_tree_at(&change_id)
+        self.resolve_trees(&[change_id])?
+            .remove(&change_id)
+            .ok_or_else(|| {
+                storage(format!(
+                    "shared replay resolved no tree for change {change_id}"
+                ))
+            })
+    }
+
+    /// Resolve several changes' trees in one pass over their shared lineage.
+    ///
+    /// Asking for each tree separately re-walks the same first-parent history
+    /// once per request, so a caller holding `M` changes over a history of
+    /// depth `D` pays `M * D` steps for a fold that is `D` steps long. One
+    /// batch pays the lineage once and copies a tree only where one was asked
+    /// for.
+    fn resolve_trees(
+        &self,
+        change_ids: &[SemanticChangeId],
+    ) -> Result<BTreeMap<SemanticChangeId, ResolvedTree>, KinDbError> {
+        self.graph()?.resolve_trees_at(change_ids)
     }
 }
 
@@ -17677,5 +17723,347 @@ mod clockhalf_git_origin {
             });
             println!("    materializations={materializations}");
         }
+    }
+}
+
+/// The cost SHAPE of Native admission, asserted as a count.
+///
+/// `verify_native_change_admission` reads the tree at every Native change the
+/// transaction carries and the tree at each of that change's parents. Asking
+/// for each of those separately walks the whole first-parent lineage once per
+/// request, so an ordinary one-change commit re-derived the entire repository
+/// history twice and a transaction of `N` chained Native changes was quadratic
+/// in `N`. FIR-2569.
+///
+/// These assert lineage members entered, never milliseconds: the count is the
+/// property, and it holds on a loaded box where seconds do not.
+#[cfg(test)]
+mod native_admission_lineage {
+    use super::*;
+    use crate::storage::history_replay::take_lineage_steps;
+    use kin_model::{
+        compute_resolved_tree_hash, compute_semantic_change_id, AdmissionCase,
+        AdmissionPolicyDelta, ChangeOrigin, EffectiveAdmissionPolicyStamp, FrozenLocalOverlayDelta,
+        LocatedEntry, WorkspaceExpectation, WorkspaceMutation, WorkspaceSemanticDelta,
+        REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+    };
+    use sha2::{Digest, Sha256};
+    use uuid::Uuid;
+
+    /// Changes in the synthetic history. Small enough to stay a fast gate,
+    /// large enough that one pass and one pass per change cannot be confused:
+    /// the per-change shape costs CHANGES squared steps against CHANGES here.
+    const CHANGES: usize = 64;
+    /// Artifacts the head change publishes.
+    const FILES: usize = 4;
+
+    fn digest(body: &[u8]) -> Hash256 {
+        Hash256::from_bytes(Sha256::digest(body).into())
+    }
+
+    fn fixed_timestamp() -> Timestamp {
+        Timestamp(
+            chrono::DateTime::parse_from_rfc3339("2026-08-21T00:00:00Z")
+                .expect("fixed timestamp parses")
+                .with_timezone(&chrono::Utc),
+        )
+    }
+
+    fn repository() -> RepositoryId {
+        RepositoryId::new("native-admission-lineage").expect("repository id")
+    }
+
+    /// The tree the head change publishes, with the bodies behind it.
+    fn head_tree() -> (Vec<TreeDelta>, Vec<(Hash256, Vec<u8>)>) {
+        let mut deltas = Vec::with_capacity(FILES);
+        let mut blobs = Vec::with_capacity(FILES);
+        for file in 0..FILES {
+            let path = format!("src/module_{file}.rs");
+            let body = format!("pub fn kin_{file}() {{}}\n").into_bytes();
+            let hash = digest(&body);
+            deltas.push(TreeDelta::Added {
+                artifact_id: ArtifactId(Uuid::from_u128(9_000_000 + file as u128)),
+                new: LocatedEntry::new(
+                    RepoPath::from_bytes(path.into_bytes()).expect("synthetic path is valid"),
+                    TreeEntry::blob(hash, false),
+                ),
+            });
+            blobs.push((hash, body));
+        }
+        (deltas, blobs)
+    }
+
+    /// One Native change, content-addressed exactly as a real one is.
+    fn native_change(
+        index: usize,
+        parent: Option<SemanticChangeId>,
+        shared: &SharedAdmissionPolicy,
+        tree_deltas: Vec<TreeDelta>,
+    ) -> kin_model::SemanticChange {
+        let mut change = kin_model::SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: ChangeOrigin::Native,
+            parents: parent.into_iter().collect(),
+            timestamp: fixed_timestamp(),
+            author: AuthorId::new("native-admission-lineage"),
+            message: format!("synthetic native change {index}"),
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas,
+            admission_policy_delta: (parent.is_none())
+                .then(|| AdmissionPolicyDelta::initialize(shared.clone())),
+            external_reference_deltas: Vec::new(),
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+        };
+        change.id = compute_semantic_change_id(&change).expect("change id computes");
+        change
+    }
+
+    /// `CHANGES` chained Native changes, the head carrying `tree`.
+    fn chained_history(
+        shared: &SharedAdmissionPolicy,
+        tree: &[TreeDelta],
+    ) -> Vec<kin_model::SemanticChange> {
+        let mut chain = Vec::with_capacity(CHANGES);
+        let mut parent = None;
+        for index in 0..CHANGES {
+            let deltas = if index + 1 == CHANGES {
+                tree.to_vec()
+            } else {
+                Vec::new()
+            };
+            let change = native_change(index, parent, shared, deltas);
+            parent = Some(change.id);
+            chain.push(change);
+        }
+        chain
+    }
+
+    fn transaction_shell(
+        manager: &RepositoryAuthorityManager<crate::storage::backend::LocalFileBackend>,
+        operation: u128,
+        changes: Vec<kin_model::SemanticChange>,
+    ) -> RepositoryTransaction {
+        let lease = manager.read_authority();
+        let transaction = RepositoryTransaction {
+            schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: OperationId::from_uuid(Uuid::from_u128(operation)),
+            repository_id: repository(),
+            expected_generation: lease.generation(),
+            expected_roots: lease.roots().clone(),
+            actor: AuthorId::new("native-admission-lineage"),
+            reason: "native admission lineage fixture".to_string(),
+            external_objects: Vec::new(),
+            git_authority_delta: None,
+            changes,
+            aliases: Vec::new(),
+            ref_mutations: Vec::new(),
+            default_ref_mutation: None,
+            workspace_mutation: None,
+            local_overlay_delta: None,
+            merge_transaction_delta: None,
+            sealed_observation: None,
+        };
+        drop(lease);
+        transaction
+    }
+
+    struct Fixture {
+        _directory: tempfile::TempDir,
+        manager: RepositoryAuthorityManager<crate::storage::backend::LocalFileBackend>,
+        head: SemanticChangeId,
+    }
+
+    /// A committed history of `CHANGES` chained Native changes whose head
+    /// publishes `FILES` artifacts through a bound workspace.
+    ///
+    /// This is the only arrangement the v3 Native admission contract permits
+    /// for a multi-change transaction: exactly one change may introduce
+    /// artifacts, and the successor workspace must base on that change.
+    fn committed_history(with_workspace: bool) -> Fixture {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let backend = std::sync::Arc::new(crate::storage::backend::LocalFileBackend::new(
+            directory.path(),
+        ));
+        let manager =
+            RepositoryAuthorityManager::open(repository(), backend).expect("open fresh authority");
+
+        let shared = SharedAdmissionPolicy::empty(0);
+        let (tree_deltas, blobs) = if with_workspace {
+            head_tree()
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        for (hash, body) in &blobs {
+            manager.save_source_blob(*hash, body).expect("save blob");
+        }
+        let changes = chained_history(&shared, &tree_deltas);
+        let head = changes.last().expect("the chain has a head").id;
+        let mut transaction = transaction_shell(&manager, 1, changes);
+
+        if with_workspace {
+            let tree = ResolvedTree::default()
+                .apply(&tree_deltas)
+                .expect("the head tree applies");
+            let tree_hash = compute_resolved_tree_hash(&tree).expect("tree hash");
+            let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(30));
+            let overlay =
+                FrozenLocalOverlay::new(workspace_id, 0, AdmissionCase::Sensitive, Vec::new())
+                    .expect("frozen overlay");
+            let policy = EffectiveAdmissionPolicyStamp {
+                shared: shared.stamp(),
+                local: overlay.stamp(),
+            };
+            let main = RefName::branch(b"main").expect("branch name");
+            let target = RefTarget::change(head);
+            transaction.ref_mutations.push(RefMutation {
+                name: main.clone(),
+                expected: RefExpectation::MustNotExist,
+                new_target: Some(target.clone()),
+                policy: RefUpdatePolicy::FastForwardOnly,
+            });
+            transaction.default_ref_mutation = Some(DefaultRefMutation {
+                expected: DefaultRefExpectation::MustBeUnset,
+                new_default: Some(main.clone()),
+            });
+            transaction.workspace_mutation = Some(WorkspaceMutation {
+                workspace_id,
+                expected: WorkspaceExpectation::MustNotExist,
+                new_generation: 0,
+                new_head: WorkspaceHead::Symbolic { target: main },
+                new_base_target: Some(target),
+                new_base_tree_hash: Some(tree_hash),
+                tree_deltas,
+                new_tree_hash: tree_hash,
+                semantic_delta: WorkspaceSemanticDelta::default(),
+                new_shared_admission_policy: shared,
+                new_admission_policy: policy,
+            });
+            transaction.local_overlay_delta = Some(FrozenLocalOverlayDelta::initialize(overlay));
+        }
+
+        take_lineage_steps();
+        let receipt = manager
+            .commit_repository_transaction(transaction)
+            .expect("the synthetic history commits");
+        assert_eq!(receipt.generation, 1);
+
+        Fixture {
+            _directory: directory,
+            manager,
+            head,
+        }
+    }
+
+    /// One transaction of chained Native changes walks its lineage once.
+    ///
+    /// Three whole-history resolutions happen in this preparation and each is
+    /// one pass over the same chain: Native admission resolves every change in
+    /// the transaction and every parent of one, workspace admission resolves
+    /// the successor workspace's base, and workspace validation resolves that
+    /// base again for its tree hash. The last two are one walk each no matter
+    /// how many changes the transaction carries; only the first scales with
+    /// the transaction, and it is the one that used to scale by multiplying.
+    ///
+    /// Resolving each Native change and each parent separately would enter
+    /// `CHANGES * (CHANGES + 1)` members for the admission term alone.
+    #[test]
+    fn one_transaction_walks_its_native_lineage_once() {
+        let fixture = committed_history(true);
+        let steps = take_lineage_steps();
+        let native_admission = CHANGES;
+        let workspace_admission_base = CHANGES;
+        let workspace_state_base = CHANGES;
+        assert_eq!(
+            steps,
+            native_admission + workspace_admission_base + workspace_state_base,
+            "one preparation must enter this chain once per resolution, not once per change"
+        );
+        // The shape this replaces, stated so the assertion above cannot be
+        // read as an arbitrary constant.
+        let per_change_steps = CHANGES * (CHANGES + 1);
+        assert!(
+            per_change_steps > native_admission * 50,
+            "the fixture must separate one pass ({native_admission}) from per-change \
+             resolution ({per_change_steps}) by more than a constant"
+        );
+        drop(fixture);
+    }
+
+    /// An ordinary commit reads its history once, not once per resolved tree.
+    ///
+    /// This is the shape FIR-2569 is about: one Native change on top of an
+    /// existing history. Its own tree and its parent's tree share the whole
+    /// lineage, so one pass costs the history's depth plus the new change.
+    ///
+    /// The commit must also SUCCEED, and that is what proves the parent tree
+    /// is really being resolved: the head already carries `FILES` artifacts,
+    /// so a parent tree that came back empty would make every one of them read
+    /// as newly introduced and the transaction would be refused for having no
+    /// bound workspace admission context.
+    #[test]
+    fn an_ordinary_commit_reads_its_history_once() {
+        let fixture = committed_history(true);
+        let shared = SharedAdmissionPolicy::empty(0);
+        let follow_on = native_change(CHANGES, Some(fixture.head), &shared, Vec::new());
+        let transaction = transaction_shell(&fixture.manager, 2, vec![follow_on]);
+
+        take_lineage_steps();
+        let receipt = fixture
+            .manager
+            .commit_repository_transaction(transaction)
+            .expect("a follow-on Native change that introduces nothing must commit");
+        let steps = take_lineage_steps();
+
+        assert_eq!(receipt.generation, 2);
+        // Native admission enters the new change and its whole lineage once.
+        // The persisted workspace's base tree hash is the other resolution in
+        // this preparation, and it is one walk whatever the commit did.
+        let native_admission = CHANGES + 1;
+        let workspace_state_base = CHANGES;
+        assert_eq!(
+            steps,
+            native_admission + workspace_state_base,
+            "one commit must read the history once, not once for the change and again for its parent"
+        );
+    }
+
+    /// The refusal the resolution exists to raise still fires.
+    ///
+    /// A Native change that introduces artifacts with no workspace bound to it
+    /// is refused by name. This is the positive control for the count tests
+    /// above: it can only fire when the candidate tree and the parent tree
+    /// were both resolved, since the refusal is reached through the difference
+    /// between them.
+    #[test]
+    fn an_unbound_native_introduction_is_still_refused() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let backend = std::sync::Arc::new(crate::storage::backend::LocalFileBackend::new(
+            directory.path(),
+        ));
+        let manager =
+            RepositoryAuthorityManager::open(repository(), backend).expect("open fresh authority");
+
+        let shared = SharedAdmissionPolicy::empty(0);
+        let (tree_deltas, blobs) = head_tree();
+        for (hash, body) in &blobs {
+            manager.save_source_blob(*hash, body).expect("save blob");
+        }
+        let changes = chained_history(&shared, &tree_deltas);
+        // No workspace mutation, so the head's artifacts have nothing to
+        // publish them.
+        let transaction = transaction_shell(&manager, 3, changes);
+
+        let error = manager
+            .commit_repository_transaction(transaction)
+            .expect_err("an unbound Native introduction must be refused")
+            .to_string();
+        assert!(
+            error.contains("introduces artifacts without a bound workspace admission context"),
+            "the refusal must name the missing admission context: {error}"
+        );
     }
 }

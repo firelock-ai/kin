@@ -8836,6 +8836,31 @@ fn recall_staleness_rank(s: StalenessState) -> u8 {
 }
 
 impl InMemoryGraph {
+    /// Resolve the repository tree at every requested change in one pass.
+    ///
+    /// [`ChangeStore::resolve_tree_at`] answers for one head by walking that
+    /// head's whole first-parent lineage, taking the change-DAG lock once per
+    /// ancestor and cloning each ancestor with all of its deltas. A caller that
+    /// needs several trees over one history pays that walk once per tree, so a
+    /// transaction carrying `M` changes over a history of depth `D` costs
+    /// `M * D` change clones for what is one `D`-step fold.
+    ///
+    /// This takes the lock once, reads each lineage member by reference, and
+    /// resolves the union of the requested lineages in a single first-parent
+    /// forest walk. The trees it returns are the ones `resolve_tree_at` would
+    /// have returned, and every refusal is the same refusal at the same change.
+    ///
+    /// The method is intentionally inherent rather than part of `ChangeStore`:
+    /// a batch resolution over one shared lineage is a KinDB capability, while
+    /// generic stores keep using the portable one-head trait method.
+    pub(crate) fn resolve_trees_at(
+        &self,
+        targets: &[SemanticChangeId],
+    ) -> Result<std::collections::BTreeMap<SemanticChangeId, ResolvedTree>, KinDbError> {
+        let changes = self.changes.read();
+        crate::storage::history_replay::resolve_first_parent_trees(&changes.changes, targets)
+    }
+
     /// Register an ordered batch of semantic changes with one acquisition of
     /// the entity, change-DAG, and pending-delta locks.
     ///

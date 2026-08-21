@@ -391,8 +391,8 @@ enum Frame {
 /// The upward walk stops at the first already-collected change, so a shared
 /// trunk is walked once no matter how many targets name it. That is what keeps
 /// collection linear in the lineage rather than in targets times history.
-fn collect_first_parent_lineage(
-    changes: &HashMap<SemanticChangeId, SemanticChange>,
+fn collect_first_parent_lineage<S: LineageSource + ?Sized>(
+    changes: &S,
     targets: &[SemanticChangeId],
 ) -> Result<BTreeSet<SemanticChangeId>, KinDbError> {
     // Ordered, so the change a cycle refusal names is the same on every run.
@@ -403,22 +403,194 @@ fn collect_first_parent_lineage(
             if !lineage.insert(change_id) {
                 break;
             }
-            let change = changes
-                .get(&change_id)
-                .ok_or_else(|| ModelError::ChangeNotFound(change_id.to_string()))?;
+            let change = lineage_change(changes, &change_id)?;
             current = change.parents.first().copied();
         }
     }
     Ok(lineage)
 }
 
-fn lineage_change<'a>(
-    changes: &'a HashMap<SemanticChangeId, SemanticChange>,
+fn lineage_change<'a, S: LineageSource + ?Sized>(
+    changes: &'a S,
     change_id: &SemanticChangeId,
 ) -> Result<&'a SemanticChange, KinDbError> {
     changes
-        .get(change_id)
+        .lineage_change(change_id)
         .ok_or_else(|| ModelError::ChangeNotFound(change_id.to_string()).into())
+}
+
+/// A read-only change lookup for first-parent traversal.
+///
+/// The persisted snapshot and the live graph hold their change maps in
+/// different hash-map types, and both are walked by the same passes here.
+/// Naming the one operation a traversal performs keeps a single walk
+/// serving both instead of forcing either side to copy its map.
+pub(crate) trait LineageSource {
+    fn lineage_change(&self, change_id: &SemanticChangeId) -> Option<&SemanticChange>;
+}
+
+impl LineageSource for HashMap<SemanticChangeId, SemanticChange> {
+    fn lineage_change(&self, change_id: &SemanticChangeId) -> Option<&SemanticChange> {
+        self.get(change_id)
+    }
+}
+
+impl LineageSource for hashbrown::HashMap<SemanticChangeId, SemanticChange> {
+    fn lineage_change(&self, change_id: &SemanticChangeId) -> Option<&SemanticChange> {
+        self.get(change_id)
+    }
+}
+
+/// Resolve the exact repository tree at every target in one first-parent pass.
+///
+/// `ChangeStore::resolve_tree_at` resolves one head by collecting that head's
+/// whole first-parent lineage into an owned vector, cloning every ancestor
+/// change with all of its deltas, and folding the tree deltas over it. Asking
+/// it for `M` heads over a history of depth `D` therefore costs `M * D` change
+/// clones and `M * D` tree applications, and a caller that resolves a change
+/// and its parent pays that twice for the same lineage.
+///
+/// This walks the union of those lineages once, exactly as
+/// `validate_first_parent_history` walks the same forest for the replay proof,
+/// carrying one `ResolvedTree` forward and restoring it at the branch points
+/// where the forest divides. It reads each change through a borrow rather than
+/// cloning it, and it clones a tree only at the changes the caller asked for.
+///
+/// Exactness, which is what makes this substitutable rather than an
+/// approximation: `resolve_tree_at(head)` folds `ResolvedTree::default()`
+/// through the tree deltas of `head`'s first-parent lineage in root-to-head
+/// order, and a change's lineage is its first parent's lineage followed by the
+/// change itself. Entering a node here applies exactly that node's deltas to
+/// exactly its first parent's state, so the state at a node is the same fold
+/// over the same sequence. Every refusal is raised at the same node, with the
+/// same message, as the per-target resolution: a missing lineage member is
+/// `ChangeNotFound`, a first-parent cycle is the same `Conflict` text the
+/// replay walk uses, and a delta that does not apply is the same
+/// `invalid repository tree transition in change ...` the model raises.
+pub(crate) fn resolve_first_parent_trees<S: LineageSource + ?Sized>(
+    changes: &S,
+    targets: &[SemanticChangeId],
+) -> Result<BTreeMap<SemanticChangeId, ResolvedTree>, KinDbError> {
+    let wanted: BTreeSet<SemanticChangeId> = targets.iter().copied().collect();
+    let lineage = collect_first_parent_lineage(changes, targets)?;
+    let mut children: BTreeMap<SemanticChangeId, BTreeSet<SemanticChangeId>> = BTreeMap::new();
+    let mut roots = BTreeSet::new();
+    for change_id in &lineage {
+        let change = lineage_change(changes, change_id)?;
+        match change.parents.first() {
+            // Every first parent of a lineage member is itself a lineage
+            // member, so this edge always stays inside the walked forest.
+            Some(first_parent) => {
+                children
+                    .entry(*first_parent)
+                    .or_default()
+                    .insert(*change_id);
+            }
+            None => {
+                roots.insert(*change_id);
+            }
+        }
+    }
+
+    let mut frames: Vec<TreeFrame> = Vec::with_capacity(lineage.len().saturating_add(roots.len()));
+    for root in roots.iter().rev() {
+        // Each root begins from the empty tree, exactly as a per-target
+        // resolution of anything in that root's subtree would.
+        frames.push(TreeFrame::Enter(*root));
+        frames.push(TreeFrame::Restore(ResolvedTree::default()));
+    }
+    let mut visited = HashSet::with_capacity(lineage.len());
+    let mut trees = BTreeMap::new();
+    let mut state = ResolvedTree::default();
+    while let Some(frame) = frames.pop() {
+        match frame {
+            TreeFrame::Restore(tree) => state = tree,
+            TreeFrame::Enter(change_id) => {
+                if !visited.insert(change_id) {
+                    return Err(ModelError::Conflict(format!(
+                        "cycle in first-parent history at change {change_id}"
+                    ))
+                    .into());
+                }
+                let change = lineage_change(changes, &change_id)?;
+                state = state.apply(&change.tree_deltas).map_err(|error| {
+                    ModelError::Conflict(format!(
+                        "invalid repository tree transition in change {}: {error}",
+                        change.id
+                    ))
+                })?;
+                if wanted.contains(&change_id) {
+                    trees.insert(change_id, state.clone());
+                }
+                let Some(next) = children.get(&change_id) else {
+                    continue;
+                };
+                // The first child popped inherits this node's state directly;
+                // every later sibling needs it put back, so the branch point is
+                // the only place a tree is copied for the walk itself.
+                for (position, child) in next.iter().enumerate().rev() {
+                    frames.push(TreeFrame::Enter(*child));
+                    if position > 0 {
+                        frames.push(TreeFrame::Restore(state.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    if visited.len() != lineage.len() {
+        let change_id = lineage
+            .iter()
+            .find(|change_id| !visited.contains(change_id))
+            .expect("an unvisited lineage member exists when the counts differ");
+        return Err(ModelError::Conflict(format!(
+            "cycle in first-parent history at change {change_id}"
+        ))
+        .into());
+    }
+    // A target the walk never reached would silently hand the caller no tree
+    // where the per-target resolution would have raised, so say so instead.
+    if let Some(missing) = wanted
+        .iter()
+        .find(|change_id| !trees.contains_key(change_id))
+    {
+        return Err(storage(format!(
+            "first-parent tree resolution reached no state for change {missing}"
+        )));
+    }
+
+    #[cfg(test)]
+    record_lineage_steps(visited.len());
+
+    Ok(trees)
+}
+
+/// Whether to enter a lineage member or put a branch point's state back.
+enum TreeFrame {
+    Enter(SemanticChangeId),
+    Restore(ResolvedTree),
+}
+
+// Lineage members entered by every tree resolution on this thread, so a test
+// can assert the cost SHAPE of one whole verification rather than its seconds.
+// That shape is the whole point of the pass: resolving each target on its own
+// enters that target's entire lineage, so targets times depth, where one pass
+// over the union enters each member once. Production reads nothing from here;
+// the counter exists only under `cfg(test)`.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static LINEAGE_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_lineage_steps(steps: usize) {
+    LINEAGE_STEPS.with(|counter| counter.set(counter.get().saturating_add(steps)));
+}
+
+/// Zero the lineage-step counter and report what it held.
+#[cfg(test)]
+pub(crate) fn take_lineage_steps() -> usize {
+    LINEAGE_STEPS.with(|counter| counter.replace(0))
 }
 
 /// Apply or unwind one change's complete transition.
@@ -1649,6 +1821,250 @@ mod tests {
                     single_pass
                 ),
             }
+        }
+    }
+
+    /// The tree at every target, resolved one target at a time.
+    ///
+    /// This is exactly what `verify_native_change_admission` did before the
+    /// single pass: one `ChangeStore::resolve_tree_at` per change and one per
+    /// parent, each walking that head's whole first-parent lineage.
+    fn per_target_trees(
+        changes: &HashMap<SemanticChangeId, SemanticChange>,
+        targets: &[SemanticChangeId],
+    ) -> Result<BTreeMap<SemanticChangeId, ResolvedTree>, String> {
+        let store = LegacyReplayStore {
+            changes: changes.clone(),
+        };
+        let mut trees = BTreeMap::new();
+        for target in targets {
+            let tree = store
+                .resolve_tree_at(target)
+                .map_err(|error| error.to_string())?;
+            trees.insert(*target, tree);
+        }
+        Ok(trees)
+    }
+
+    /// A history whose every step moves the tree, forking at one change.
+    ///
+    /// Adds, updates and removals all appear, so the fold is exercised rather
+    /// than a chain of empty transitions, and the fork gives the walk a branch
+    /// point where it has to put the parent's state back before entering the
+    /// second child.
+    fn forking_tree_history() -> (
+        HashMap<SemanticChangeId, SemanticChange>,
+        Vec<SemanticChangeId>,
+    ) {
+        let (first, first_entry) = blob("src/first.rs", 0xf01, 0x41);
+        let (second, second_entry) = blob("src/second.rs", 0xf02, 0x42);
+        let (third, third_entry) = blob("src/third.rs", 0xf03, 0x43);
+        let revised_first = LocatedEntry::new(
+            first_entry.path.clone(),
+            TreeEntry::blob(Hash256::from_bytes([0x44; 32]), false),
+        );
+        let revised_third = LocatedEntry::new(
+            third_entry.path.clone(),
+            TreeEntry::blob(Hash256::from_bytes([0x45; 32]), false),
+        );
+
+        let root = change(
+            "add the first artifact",
+            ChangeSpec {
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id: first,
+                    new: first_entry.clone(),
+                }],
+                ..ChangeSpec::default()
+            },
+        );
+        let fork = change(
+            "revise the first artifact",
+            ChangeSpec {
+                parents: vec![root.id],
+                tree_deltas: vec![TreeDelta::Updated {
+                    artifact_id: first,
+                    old: first_entry.clone(),
+                    new: revised_first.clone(),
+                }],
+                ..ChangeSpec::default()
+            },
+        );
+        let left_add = change(
+            "add the second artifact",
+            ChangeSpec {
+                parents: vec![fork.id],
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id: second,
+                    new: second_entry,
+                }],
+                ..ChangeSpec::default()
+            },
+        );
+        let left_remove = change(
+            "remove the first artifact",
+            ChangeSpec {
+                parents: vec![left_add.id],
+                tree_deltas: vec![TreeDelta::Removed {
+                    artifact_id: first,
+                    old: revised_first,
+                }],
+                ..ChangeSpec::default()
+            },
+        );
+        let right_add = change(
+            "add the third artifact",
+            ChangeSpec {
+                parents: vec![fork.id],
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id: third,
+                    new: third_entry.clone(),
+                }],
+                ..ChangeSpec::default()
+            },
+        );
+        let right_revise = change(
+            "revise the third artifact",
+            ChangeSpec {
+                parents: vec![right_add.id],
+                tree_deltas: vec![TreeDelta::Updated {
+                    artifact_id: third,
+                    old: third_entry,
+                    new: revised_third,
+                }],
+                ..ChangeSpec::default()
+            },
+        );
+
+        history(vec![
+            root,
+            fork,
+            left_add,
+            left_remove,
+            right_add,
+            right_revise,
+        ])
+    }
+
+    /// The one pass must return the trees the per-target resolution returns.
+    ///
+    /// `ResolvedTree` compares by its identity and path indexes together, so
+    /// this is state equality rather than a spot check on a few artifacts.
+    #[test]
+    fn one_pass_tree_resolution_matches_the_per_target_resolution() {
+        for (label, (changes, targets)) in [
+            ("forking", forking_tree_history()),
+            ("deep trunk with tips", deep_history(24, 6)),
+        ] {
+            let expected = per_target_trees(&changes, &targets)
+                .unwrap_or_else(|error| panic!("{label} fixture must resolve per target: {error}"));
+            let resolved = resolve_first_parent_trees(&changes, &targets).unwrap_or_else(|error| {
+                panic!("{label} fixture must resolve in one pass: {error}")
+            });
+            assert_eq!(
+                resolved, expected,
+                "{label}: the single pass resolved a different state than the per-target walk"
+            );
+            // A fixture whose trees are all empty would satisfy the comparison
+            // above without ever exercising the fold.
+            assert!(
+                expected.values().any(|tree| !tree.is_empty()),
+                "{label}: the fixture must carry a non-empty tree somewhere"
+            );
+        }
+    }
+
+    /// The pass walks the lineage once, not once per requested tree.
+    ///
+    /// This is the cost shape FIR-2569 is about, asserted as a count so it
+    /// cannot flake on a loaded box the way seconds do.
+    #[test]
+    fn one_pass_tree_resolution_walks_the_lineage_once() {
+        const TRUNK: usize = 120;
+        const TIPS: usize = 8;
+
+        let (changes, targets) = deep_history(TRUNK, TIPS);
+        let lineage_members = TRUNK + 1 + TIPS;
+        assert_eq!(targets.len(), lineage_members);
+
+        take_lineage_steps();
+        resolve_first_parent_trees(&changes, &targets)
+            .expect("a deep history with many tips must resolve");
+        let single_pass_steps = take_lineage_steps();
+        assert_eq!(
+            single_pass_steps, lineage_members,
+            "one pass must enter each lineage member exactly once"
+        );
+
+        // The same trees, asked for one at a time: every trunk change walks its
+        // own depth and every tip walks the whole trunk again.
+        for target in &targets {
+            resolve_first_parent_trees(&changes, std::slice::from_ref(target))
+                .expect("each target resolves on its own");
+        }
+        let per_target_steps = take_lineage_steps();
+        let trunk_steps = (lineage_members - TIPS) * (lineage_members - TIPS + 1) / 2;
+        let tip_steps = TIPS * (lineage_members - TIPS + 1);
+        assert_eq!(
+            per_target_steps,
+            trunk_steps + tip_steps,
+            "the per-target walk must cost every target's own depth"
+        );
+        assert!(
+            per_target_steps > lineage_members * 50,
+            "the fixture must separate the two shapes by more than a constant: \
+             one pass {single_pass_steps}, per target {per_target_steps}"
+        );
+    }
+
+    /// A first-parent cycle is refused by the tree pass as well as the replay.
+    #[test]
+    fn one_pass_tree_resolution_refuses_a_first_parent_cycle() {
+        let (mut changes, _) = forking_tree_history();
+        let left = SemanticChangeId::from_hash(Hash256::from_bytes([0xc1; 32]));
+        let right = SemanticChangeId::from_hash(Hash256::from_bytes([0xc2; 32]));
+        for (id, parent) in [(left, right), (right, left)] {
+            let mut cyclic = change("cyclic", ChangeSpec::default());
+            cyclic.id = id;
+            cyclic.parents = vec![parent];
+            changes.insert(id, cyclic);
+        }
+        let targets = vec![left, right];
+
+        let per_target = per_target_trees(&changes, &targets)
+            .expect_err("the per-target resolution must refuse a first-parent cycle");
+        let single = resolve_first_parent_trees(&changes, &targets)
+            .expect_err("the single pass must refuse a first-parent cycle")
+            .to_string();
+        for (label, error) in [("per-target", per_target), ("single pass", single)] {
+            assert!(
+                error.contains("cycle in first-parent history"),
+                "{label} resolution refused a cycle for the wrong reason: {error}"
+            );
+        }
+    }
+
+    /// A missing first parent is refused by both, and named the same way.
+    #[test]
+    fn one_pass_tree_resolution_refuses_a_missing_first_parent() {
+        let (mut changes, targets) = forking_tree_history();
+        let orphaned = SemanticChangeId::from_hash(Hash256::from_bytes([0xd1; 32]));
+        let head = *targets.last().expect("the fixture has a head");
+        changes
+            .get_mut(&head)
+            .expect("the head is in the fixture")
+            .parents = vec![orphaned];
+
+        let per_target = per_target_trees(&changes, &[head])
+            .expect_err("the per-target resolution must refuse a missing first parent");
+        let single = resolve_first_parent_trees(&changes, &[head])
+            .expect_err("the single pass must refuse a missing first parent")
+            .to_string();
+        for (label, error) in [("per-target", per_target), ("single pass", single)] {
+            assert!(
+                error.contains(&orphaned.to_string()),
+                "{label} resolution must name the absent change: {error}"
+            );
         }
     }
 
