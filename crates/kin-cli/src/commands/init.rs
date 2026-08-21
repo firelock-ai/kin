@@ -282,6 +282,70 @@ async fn enrich_after_init(kin_root: &Path) {
     stop_conversion_daemon(borrowed_existing, kin_root).await;
 }
 
+/// The sentence `kin init` prints when a run produced no cross-file edges.
+///
+/// One argument per thing the daemon reported, and nothing read from this host,
+/// so what a user sees is decided entirely by what the daemon observed. This
+/// used to be one hardcoded sentence asserting "no language server is
+/// installed", which was false on a daemon with enrichment switched off and
+/// false again on a host that installed a server after the daemon started, and
+/// it prescribed an install that would have changed nothing in either case.
+///
+/// The repair travels with the cause rather than beside it. The old note was
+/// accidentally right about the cure, since its second step restarted the
+/// daemon, and that is the worst shape for a reader: following it works and
+/// believing it leaves them wrong about their own system.
+///
+/// An unrecognised reason keeps its own row instead of falling back to the
+/// missing-install sentence. A daemon older or newer than this CLI is exactly
+/// the case where guessing would reintroduce the defect.
+fn enrichment_unavailable_note(reason: &str, detail: Option<&str>) -> String {
+    // Both rows where the daemon looked at startup and found nothing share this
+    // repair, and they share it because the daemon cannot tell them apart: it
+    // read its own PATH once, at its own start, so whether this host has a
+    // server NOW is the reader's fact rather than the daemon's. Naming one
+    // repair would assert the state these rows exist to leave open, which is
+    // how the sentence this replaced came to send a user with a server
+    // installed off to install another.
+    const REPAIR: &str = "Run `kin doctor --fix --install-language-servers` if this host has \
+                          none, or `kin daemon stop` if one was installed after this daemon \
+                          started; the next command re-enriches this repository.";
+
+    match (reason, detail) {
+        ("no_language_server", Some(detail)) => format!(
+            "note: {detail}. Cross-file reference and override edges were not produced by this \
+             run. {REPAIR}"
+        ),
+        ("discovery_stale", Some(detail)) => format!(
+            "note: {detail}. Cross-file reference and override edges were not produced by this \
+             run. Run `kin daemon stop`; the next command re-enriches this repository."
+        ),
+        ("language_server_unusable", Some(detail)) => format!(
+            "note: {detail}. Cross-file reference and override edges were not produced. Repair \
+             the language server, then run `kin daemon stop`; the next command re-enriches this \
+             repository."
+        ),
+        ("enrichment_disabled", Some(detail)) => format!(
+            "note: {detail}. Cross-file reference and override edges were not produced by this \
+             run."
+        ),
+        // Startup discovery found nothing and the readiness probe has not
+        // landed either, so this row knows strictly less than
+        // `no_language_server` and says so in its detail. The repair is the
+        // same because the reader's question is the same.
+        ("discovery_found_none", Some(detail)) => format!(
+            "note: {detail}. Cross-file reference and override edges were not produced by this \
+             run. {REPAIR}"
+        ),
+        (_, detail) => format!(
+            "note: cross-file reference and override edges were not produced by this run, and \
+             this daemon did not report why ({}). Run `kin doctor` to see what its language \
+             servers can do.",
+            detail.unwrap_or("cause not established")
+        ),
+    }
+}
+
 async fn enrich_phase(kin_root: &Path, layout: &kin_core::KinLayout) {
     let url = match crate::daemon_client::ensure_daemon_running(kin_root).await {
         Ok(url) => url,
@@ -319,11 +383,21 @@ async fn enrich_phase(kin_root: &Path, layout: &kin_core::KinLayout) {
     // command that fixes it, beats waiting fifteen minutes for an event that
     // cannot happen.
     if queued.get("enrichment_available").and_then(|v| v.as_bool()) == Some(false) {
-        note!(
-            "note: no language server is installed, so cross-file reference and override edges \
-             were not produced. Run `kin doctor --fix --install-language-servers` to install one, \
-             then `kin daemon stop`; the next command re-enriches this repository."
-        );
+        // Report the cause the daemon OBSERVED, never a cause derived from the
+        // boolean. That boolean collapses several states, and this note used to
+        // assert the one it could not know, telling users with a language server
+        // installed that none was, and prescribing an install that would change
+        // nothing. The remedy is chosen by the same observed cause, so a reader
+        // who follows it is also right about why.
+        let observed = queued.get("enrichment_unavailable");
+        let reason = observed
+            .and_then(|value| value.get("reason"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown");
+        let detail = observed
+            .and_then(|value| value.get("detail"))
+            .and_then(|value| value.as_str());
+        note!("{}", enrichment_unavailable_note(reason, detail));
         return;
     }
     let baseline = queued
@@ -971,6 +1045,211 @@ fn initialized_raw_git_head(result: &kin_core::InitResult) -> Option<&kin_model:
 mod tests {
     use super::*;
     use crate::commands::status::SemanticEnrichmentView;
+
+    /// What `kin init` actually prints when a run produced no cross-file edges.
+    ///
+    /// The daemon-side rows are tested where they are decided. These test the
+    /// other half, the sentence a user reads, because the defect this replaced
+    /// lived in the sentence: the daemon computed the truth, logged the truth
+    /// to itself, and handed the reader a fabrication.
+    mod enrichment_unavailable_notes {
+        use super::super::enrichment_unavailable_note;
+
+        /// The claim the old note made unconditionally, and the one claim no
+        /// row may make.
+        ///
+        /// Not because absence is unmentionable: the absent row below says
+        /// plainly that this daemon found no server. It is that "is installed"
+        /// speaks for the host, and nothing in this process ever read the host.
+        /// Discovery and the readiness probe each ran once, on this process's
+        /// PATH, at this process's start, and the ticket's own machine is what
+        /// the difference costs: a server sat at /opt/homebrew/bin while the
+        /// daemon that started before it reported none.
+        const FABRICATION: &str = "no language server is installed";
+
+        /// Every row the daemon can send, so the rule below is checked against
+        /// all of them rather than the ones a reader thought of.
+        fn every_row() -> Vec<(&'static str, Option<&'static str>)> {
+            vec![
+                (
+                    "no_language_server",
+                    Some(
+                        "this daemon found no language server for any language it enriches, and \
+                         it looks only at startup",
+                    ),
+                ),
+                (
+                    "discovery_found_none",
+                    Some(
+                        "this daemon found no language server when it started, and it looks only \
+                         at startup; the check of what this host can run has not finished",
+                    ),
+                ),
+                (
+                    "discovery_stale",
+                    Some(
+                        "a language server is usable now, but this daemon found none when it \
+                         started and it looks only at startup",
+                    ),
+                ),
+                (
+                    "language_server_unusable",
+                    Some(
+                        "a language server is installed but did not start (javascript: Could not \
+                         find a valid TypeScript installation), so it enriches nothing until \
+                         that is repaired",
+                    ),
+                ),
+                (
+                    "enrichment_disabled",
+                    Some(
+                        "cross-file reference enrichment is switched off for this daemon, so no \
+                         language server was consulted",
+                    ),
+                ),
+                ("something_this_cli_predates", None),
+            ]
+        }
+
+        #[test]
+        fn no_row_tells_a_user_that_no_language_server_is_installed() {
+            for (reason, detail) in every_row() {
+                let note = enrichment_unavailable_note(reason, detail);
+                assert!(
+                    !note.contains(FABRICATION),
+                    "row `{reason}` asserts a fact about the host that no daemon reads. Report \
+                     what this daemon found, at its own start, and let the reader decide which \
+                     repair applies: {note}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_host_with_no_server_still_says_so_and_still_offers_the_install() {
+            let note = enrichment_unavailable_note(
+                "no_language_server",
+                Some(
+                    "this daemon found no language server for any language it enriches, and it \
+                     looks only at startup",
+                ),
+            );
+            assert!(
+                note.contains("found no language server"),
+                "the row the old note was right about must keep reporting the absence: {note}"
+            );
+            assert!(
+                note.contains("kin doctor --fix --install-language-servers"),
+                "and must keep offering the command that closes it: {note}"
+            );
+        }
+
+        #[test]
+        fn a_stale_discovery_names_a_restart_and_never_an_absent_install() {
+            let note = enrichment_unavailable_note(
+                "discovery_stale",
+                Some(
+                    "a language server is usable now, but this daemon found none when it \
+                     started and it looks only at startup",
+                ),
+            );
+            assert!(
+                !note.contains(FABRICATION),
+                "a host with a usable server must never be told it has none: {note}"
+            );
+            assert!(
+                note.contains("kin daemon stop"),
+                "the repair for a stale discovery is a restart: {note}"
+            );
+            assert!(
+                !note.contains("--install-language-servers"),
+                "and it is not an install, so that command must not appear: {note}"
+            );
+        }
+
+        /// Reached by `--storage gcs` or `KIN_DAEMON_DISABLE_LSP`. Telling this
+        /// operator to install a server sends them to buy a tool they own for a
+        /// job nothing will run.
+        #[test]
+        fn a_disabled_daemon_prescribes_nothing_about_language_servers() {
+            let note = enrichment_unavailable_note(
+                "enrichment_disabled",
+                Some(
+                    "cross-file reference enrichment is switched off for this daemon, so no \
+                     language server was consulted",
+                ),
+            );
+            assert!(
+                !note.contains(FABRICATION),
+                "a switched-off daemon is not a bare host: {note}"
+            );
+            assert!(
+                !note.contains("kin doctor --fix --install-language-servers")
+                    && !note.contains("kin daemon stop"),
+                "neither an install nor a restart changes a daemon told not to enrich: {note}"
+            );
+        }
+
+        /// Both rows that end in "this daemon found nothing at startup" name
+        /// both repairs, because the daemon cannot tell a bare host from one
+        /// that gained a server after it started, and naming one repair would
+        /// assert exactly the state it cannot see. This is the row the ticket's
+        /// own host lands on.
+        #[test]
+        fn a_startup_miss_offers_both_repairs_and_asserts_neither_cause() {
+            for reason in ["no_language_server", "discovery_found_none"] {
+                let (_, detail) = every_row()
+                    .into_iter()
+                    .find(|(row, _)| *row == reason)
+                    .expect("the row table covers every reason this CLI reads");
+                let note = enrichment_unavailable_note(reason, detail);
+                assert!(
+                    note.contains("kin doctor --fix --install-language-servers")
+                        && note.contains("kin daemon stop"),
+                    "row `{reason}` must name both repairs: {note}"
+                );
+                assert!(
+                    note.contains("if this host has none"),
+                    "row `{reason}` must offer the install on a condition rather than assert \
+                     it: {note}"
+                );
+            }
+        }
+
+        #[test]
+        fn an_installed_server_that_cannot_start_asks_for_a_repair() {
+            let note = enrichment_unavailable_note(
+                "language_server_unusable",
+                Some(
+                    "a language server is installed but did not start (javascript: Could not \
+                     find a valid TypeScript installation), so it enriches nothing until that \
+                     is repaired",
+                ),
+            );
+            assert!(
+                !note.contains(FABRICATION),
+                "a broken install is not an absent one: {note}"
+            );
+            assert!(
+                note.contains("Could not find a valid TypeScript installation"),
+                "the server's own message is the only text that names the repair: {note}"
+            );
+        }
+
+        /// A daemon older or newer than this CLI is exactly the case where
+        /// guessing would put the fabrication back.
+        #[test]
+        fn an_unrecognised_reason_reports_the_gap_rather_than_guessing() {
+            let note = enrichment_unavailable_note("something_this_cli_predates", None);
+            assert!(
+                !note.contains(FABRICATION),
+                "an unreadable cause must not become a missing install: {note}"
+            );
+            assert!(
+                note.contains("did not report why"),
+                "it must say the cause did not arrive: {note}"
+            );
+        }
+    }
 
     fn enrichment(
         presence: SemanticEnrichmentPresence,

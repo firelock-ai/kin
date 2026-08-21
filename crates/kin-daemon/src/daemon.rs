@@ -1949,6 +1949,10 @@ pub async fn run_with_authority_on(
     // Set up LSP enrichment channel before wrapping state in Arc.
     let enrichment_enabled =
         should_enable_lsp_enrichment(config.lsp_enabled, state.filesystem_reconcile_disabled());
+    // Recorded so a caller can tell a deliberately disabled daemon from one that
+    // simply found no server. Those need opposite answers and the channel alone
+    // cannot separate them.
+    state.lsp_enrichment_enabled = enrichment_enabled;
     let lsp_rx = if enrichment_enabled {
         let discovered = kin_lsp::discovery::discover_servers();
         if enrichment_channel_opens(enrichment_enabled, discovered.len()) {
