@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add list_file_entities, a graph-backed file entity enumeration with certifiable completeness (#1009)
 - Announce a commit to the reconcile loop before it can reach the daemon (#1010)
 - Give the sensitive-artifact refusal a command that performs the approval it names (#1016)
+- Say why a trace walk stopped, per hop, and stop reporting coverage as unreported on complete walks (#1018)
 
 
 ## [0.5.46] - 2026-08-21
