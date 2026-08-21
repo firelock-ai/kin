@@ -13332,7 +13332,7 @@ jobs:
         "always()",
         "needs.publish.result == 'success'",
         "uses: ./.github/workflows/install-proof.yml",
-        "expected_vfs_commit: 3ad20e675b58d227e3100ef0012ce048dbc1fc5a",
+        "expected_vfs_commit: e01e2e09793019c3157285cc780e5735914e37a9",
     ):
         require(install_proof_job, policy, "mandatory public install proof")
 
