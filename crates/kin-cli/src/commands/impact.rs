@@ -40,6 +40,17 @@ pub struct ImpactResponse {
     pub query: ImpactQuery,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ranked: Option<kin_review::RankedImpactReport>,
+    /// The absence verdict for an empty answer, in the fields `impact_analysis`
+    /// publishes over MCP.
+    ///
+    /// The text surface renders this verdict as a sentence and only when it
+    /// refuses, because a person reading a terminal does not need to be told an
+    /// answer is fine. A machine caller does: `ranked.candidates: []` with no
+    /// verdict beside it is the false clean at exit 0 this field exists to end,
+    /// and it is the same object the MCP surface serves rather than a second
+    /// opinion about it (FIR-2478, FIR-2524).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negative: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -138,6 +149,7 @@ pub async fn build_impact_response(
     let ResolvedEntities {
         mut matches,
         mut name_matches,
+        exact_name,
     } = resolve_entities(graph, request)?;
     let stable_order = |left: &kin_model::Entity, right: &kin_model::Entity| {
         kin_review::StableEntityIdentity::from_entity(left)
@@ -194,20 +206,23 @@ pub async fn build_impact_response(
             resolution: "not_found".to_string(),
             query,
             ranked: None,
+            negative: None,
         });
     }
 
-    if request.require_unique && matches.len() != 1 {
+    // Fail-closed resolution for structured callers, enforced here rather than
+    // in the resolver because only here is the name's own match set still
+    // visible. Both ways of failing to name one entity report `ambiguous` with
+    // the count and the candidate identities: the caller learns what to ask for
+    // next instead of being told the graph holds nothing (FIR-2478).
+    if request.require_unique && (matches.len() != 1 || !exact_name) {
         return Ok(ImpactResponse {
-            lines: vec![format!(
-                "Entity query '{}' is ambiguous ({} matches); add --file, --kind, and --signature qualifiers.",
-                request.entity,
-                matches.len()
-            )],
+            lines: ambiguous_resolution_guidance(&request.entity, exact_name, &matches),
             schema_version: IMPACT_RESPONSE_SCHEMA_VERSION.to_string(),
             resolution: "ambiguous".to_string(),
             query,
             ranked: None,
+            negative: None,
         });
     }
 
@@ -250,21 +265,34 @@ pub async fn build_impact_response(
         }
     }
 
+    // One depth for both walks. `rank_impact` bounds itself at
+    // `IMPACT_MAX_DEPTH` and says nothing about it, so a deeper request used to
+    // list entities in `lines` that the ranked report could never carry.
+    let depth = request.depth.min(kin_review::IMPACT_MAX_DEPTH);
+    if depth < request.depth {
+        lines.push(format!(
+            "  Note: impact is answered to a maximum of {depth} hops; --depth {} was reduced to {depth}.",
+            request.depth
+        ));
+    }
+
     // 1. Local Impact, grouped by traversal distance so a reader can tell the
     // direct callers from the transitive ripple. The walk below records the hop
     // at which each entity is first reached, so the count and every group are
     // read off one traversal of one graph state.
-    let local_impacted = downstream_impact_by_hop(graph, &target.id, request.depth)?;
+    let local_impacted = downstream_impact_by_hop(graph, &target.id, depth)?;
+    let mut negative = None;
     if local_impacted.is_empty() {
         lines.push("  No local downstream impact found.".to_string());
+        negative = impact_absence_verdict(graph, target, envelope);
         lines.extend(impact_absence_qualifier(graph, target, envelope));
         lines.extend(empty_impact_context(graph, target)?);
     } else {
         lines.push(format!(
             "  {} local entities impacted within {} hop{}:",
             local_impacted.len(),
-            request.depth,
-            if request.depth == 1 { "" } else { "s" }
+            depth,
+            if depth == 1 { "" } else { "s" }
         ));
         let mut current_hop = 0;
         for (hop, entity) in &local_impacted {
@@ -284,7 +312,7 @@ pub async fn build_impact_response(
     }
 
     let ranked = if request.require_unique {
-        Some(kin_review::rank_impact(graph, &target.id, request.depth)?)
+        Some(kin_review::rank_impact(graph, &target.id, depth)?)
     } else {
         None
     };
@@ -294,6 +322,7 @@ pub async fn build_impact_response(
         resolution: "resolved".to_string(),
         query,
         ranked,
+        negative,
     })
 }
 
@@ -345,6 +374,37 @@ const IMPACT_MEMBER_RELATION_KINDS: &[kin_model::RelationKind] = &[
     kin_model::RelationKind::Imports,
     kin_model::RelationKind::References,
 ];
+
+/// The absence verdict for an empty impact answer, as a structured object.
+///
+/// The same one gate the rendered sentence goes through, called with the same
+/// tool name and the same observation, so the field a machine reads and the
+/// line a person reads cannot disagree about one store. It is deliberately a
+/// second call to a pure function rather than a shared intermediate: the
+/// rendering is shared across CLI surfaces now (FIR-2524,
+/// [`crate::commands::absence_qualifier`]), and a renderer that also owned the
+/// machine field would put a wording change one edit away from changing what an
+/// agent is told.
+///
+/// Emitted whether or not the verdict refuses, unlike the sentence. Silence is
+/// a fine answer for a person and a missing field for a caller parsing the
+/// payload, and a missing field is the shape that reads as a clean bill.
+fn impact_absence_verdict(
+    graph: &kin_db::InMemoryGraph,
+    target: &kin_model::Entity,
+    envelope: &kin_mcp::Envelope,
+) -> Option<serde_json::Value> {
+    let coverage = kin_mcp::edge_coverage::observe_cross_file_reference_coverage_for_languages(
+        graph,
+        &[target.language],
+        &kin_mcp::handlers::review::IMPACT_REFERENCE_KINDS,
+    );
+    let payload = serde_json::json!({
+        "entity_impacts": [],
+        kin_mcp::EDGE_COVERAGE_KEY: coverage,
+    });
+    kin_mcp::negative::negative_for("impact_analysis", &payload, envelope, &[])
+}
 
 /// The absence qualifier for an empty impact answer.
 ///
@@ -443,10 +503,15 @@ fn empty_impact_context(
 /// time, so a concurrent write between two walks could leave the grouped
 /// listing disagreeing with the count printed above it.
 ///
-/// The edge set matches `GraphStore::get_downstream_impact`: entity-to-entity
-/// relations pointing at the entity being expanded, with the relation's source
-/// as the dependent. `impact_hop_walk_matches_graph_downstream_impact` pins
-/// that equivalence.
+/// The edge set is entity-to-entity relations pointing at the entity being
+/// expanded, with the relation's source as the dependent, kept only when
+/// [`kin_review::is_impact_relation`] says the edge carries impact. That
+/// predicate is the ranked report's own, imported rather than restated, so the
+/// two walks this command runs over one target cannot answer differently
+/// (FIR-2478). `impact_hop_walk_reaches_what_the_ranked_report_ranks` pins the
+/// agreement, and `impact_hop_walk_matches_the_impact_filtered_graph_walk` pins
+/// the remaining equivalence with `GraphStore::get_downstream_impact`, which
+/// applies no such filter and so is the wider set.
 /// The two graph reads the hop walk performs, named so a test can count them.
 trait ImpactWalkGraph {
     /// Entity-to-entity relations that point at `id`.
@@ -482,6 +547,13 @@ fn downstream_impact_by_hop<G: ImpactWalkGraph>(
         let mut next = Vec::new();
         for current in frontier {
             for relation in graph.inbound_relations(&current)? {
+                // One policy, both walks. Containment is the edge this exists to
+                // drop: without it a method's own containing class is reached at
+                // hop 1 and printed under "direct callers", and every sibling
+                // member the class contains follows at hop 2.
+                if !kin_review::is_impact_relation(relation.kind) {
+                    continue;
+                }
                 let Some(dependent) = relation.src.as_entity() else {
                     continue;
                 };
@@ -517,6 +589,11 @@ struct ResolvedEntities {
     matches: Vec<kin_model::Entity>,
     /// Before them: what the name alone resolves to.
     name_matches: Vec<kin_model::Entity>,
+    /// Whether the query is some entity's name exactly, rather than a fragment
+    /// of it. A structured caller resolves only on an exact name, so this is
+    /// what separates "the graph holds nothing by that name" from "the name you
+    /// gave is part of several entities' names".
+    exact_name: bool,
 }
 
 fn resolve_entities(
@@ -540,27 +617,31 @@ fn resolve_entities(
         // resolution it turns a repository's own `Error` or `Result` into an
         // ambiguous query answered with no analysis at all.
         matches.retain(|entity| !kin_index::is_external_reference_target(entity));
-        // The human surface preserves Kin's broad name matching. Structured
-        // callers explicitly opt into exact, fail-closed identity resolution.
-        if request.require_unique {
-            matches.retain(|entity| entity.name == request.entity);
-        } else {
-            // Broad matching is for discovery: "resolve" should still find
-            // resolve_binary. But when the query names an entity exactly,
-            // substring cousins (try_resolve_binary alongside resolve_binary)
-            // force an ambiguity note onto an unambiguous ask, so an
-            // exact-name hit narrows the set to the exact matches.
-            let exact: Vec<kin_model::Entity> = matches
-                .iter()
-                .filter(|entity| entity.name == request.entity)
-                .cloned()
-                .collect();
-            if !exact.is_empty() {
-                matches = exact;
-            }
+        // Broad matching is for discovery: "resolve" should still find
+        // resolve_binary. But when the query names an entity exactly, substring
+        // cousins (try_resolve_binary alongside resolve_binary) force an
+        // ambiguity note onto an unambiguous ask, so an exact-name hit narrows
+        // the set to the exact matches.
+        //
+        // One rule for both surfaces. A structured caller used to RETAIN the
+        // exact matches here instead, which empties the set for every name that
+        // resolves only inexactly: Python methods are named `HTTPAdapter.send`,
+        // so `kin impact send --json` retained nothing and was then reported as
+        // an entity the graph does not hold, with an empty candidate list,
+        // because the name snapshot below was taken after the retain (FIR-2478).
+        // Fail-closed resolution survives the move: it is enforced where it can
+        // still see what the name found, in `build_impact_response`.
+        let exact: Vec<kin_model::Entity> = matches
+            .iter()
+            .filter(|entity| entity.name == request.entity)
+            .cloned()
+            .collect();
+        if !exact.is_empty() {
+            matches = exact;
         }
         matches
     };
+    let exact_name = matches.iter().any(|entity| entity.name == request.entity);
     let name_matches = matches.clone();
     if let Some(file) = request.file.as_deref() {
         matches.retain(|entity| kin_review::StableEntityIdentity::from_entity(entity).file == file);
@@ -577,6 +658,7 @@ fn resolve_entities(
     Ok(ResolvedEntities {
         matches,
         name_matches,
+        exact_name,
     })
 }
 
@@ -667,6 +749,62 @@ fn qualifier_miss_guidance(
 /// analysis itself is keyed on graph identity, never on paths.
 fn entity_location(entity: &kin_model::Entity) -> Option<String> {
     crate::commands::declaration_neighbors::entity_location(entity)
+}
+
+/// The answer when a structured caller's query does not name exactly one
+/// entity.
+///
+/// Two ways of failing, one verdict, and the difference is in the sentence
+/// rather than in the `resolution` field. A query that IS an entity's name and
+/// hits several of them is disambiguated by qualifiers, which is what the
+/// original message said. A query that is only part of some entity's name is
+/// not helped by qualifiers at all: `--file` narrows a set the exact-name rule
+/// had already emptied, which is how `kin impact send --json
+/// --file src/requests/adapters.py` reported a repository's own transport
+/// contract as absent (FIR-2478). That case is answered by naming the
+/// identities, because the next command is a copy of one of these lines.
+fn ambiguous_resolution_guidance(
+    entity: &str,
+    exact_name: bool,
+    matches: &[kin_model::Entity],
+) -> Vec<String> {
+    if exact_name {
+        return vec![format!(
+            "Entity query '{}' is ambiguous ({} matches); add --file, --kind, and --signature qualifiers.",
+            entity,
+            matches.len()
+        )];
+    }
+    let mut lines = vec![format!(
+        "No entity is named '{}' exactly; it matches part of {} entit{} name{}:",
+        entity,
+        matches.len(),
+        if matches.len() == 1 { "y's" } else { "ies'" },
+        if matches.len() == 1 { "" } else { "s" }
+    )];
+    for candidate in matches
+        .iter()
+        .take(crate::commands::declaration_neighbors::MAX_LISTED)
+    {
+        lines.push(format!(
+            "  {} ({:?}) @ {}",
+            candidate.name,
+            candidate.kind,
+            entity_location(candidate).unwrap_or_else(|| "unknown".to_string())
+        ));
+    }
+    if let Some(more) = crate::commands::declaration_neighbors::and_more_suffix(
+        crate::commands::declaration_neighbors::MAX_LISTED,
+        matches.len(),
+    ) {
+        lines.push(format!("  {more}"));
+    }
+    lines.push(
+        "hint: re-run with one of the names above. Qualifiers narrow an ambiguous name; they \
+         cannot make a partial name exact."
+            .to_string(),
+    );
+    lines
 }
 
 /// Actionable guidance when `kin impact <symbol>` can't resolve the symbol in
@@ -1414,7 +1552,7 @@ mod tests {
     }
 
     #[test]
-    fn impact_hop_walk_matches_graph_downstream_impact() {
+    fn impact_hop_walk_matches_the_impact_filtered_graph_walk() {
         let graph = kin_db::InMemoryGraph::new();
         let target = entity("changed", "src/lib.rs");
         let direct = entity("direct_caller", "src/direct.rs");
@@ -1467,7 +1605,51 @@ mod tests {
             .collect();
         assert_eq!(
             walked_ids, authority_ids,
-            "hop walk must reach exactly what the graph's own downstream impact reaches"
+            "over impact edges alone, the hop walk must reach exactly what the graph's own \
+             downstream impact reaches"
+        );
+
+        // And where the two differ, the difference is the filter and only the
+        // filter. `get_downstream_impact` walks every inbound edge, so a
+        // containing declaration is downstream of its own member there and is
+        // not downstream of it here.
+        let container = entity("Container", "src/container.rs");
+        graph.upsert_entity(&container).unwrap();
+        graph
+            .upsert_relation(&Relation {
+                id: RelationId::from_content(
+                    &container.id.to_string(),
+                    &target.id.to_string(),
+                    "contains",
+                ),
+                kind: RelationKind::Contains,
+                src: GraphNodeId::Entity(container.id),
+                dst: GraphNodeId::Entity(target.id),
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+        let after: std::collections::BTreeSet<EntityId> =
+            downstream_impact_by_hop(&graph, &target.id, depth)
+                .unwrap()
+                .iter()
+                .map(|(_, entity)| entity.id)
+                .collect();
+        assert_eq!(
+            after, walked_ids,
+            "adding a containment edge must not add an impacted entity"
+        );
+        assert!(
+            graph
+                .get_downstream_impact(&target.id, depth)
+                .unwrap()
+                .iter()
+                .any(|entity| entity.id == container.id),
+            "control: the unfiltered graph walk does reach it, so the exclusion is this walk's \
+             filter rather than a missing edge"
         );
         assert!(
             !walked_ids.contains(&beyond.id),
@@ -1648,6 +1830,496 @@ mod tests {
                 "  2 hops:".to_string(),
                 "    - indirect_caller (Function) @ src/indirect.rs:31".to_string(),
             ]
+        );
+    }
+
+    fn relate(
+        graph: &kin_db::InMemoryGraph,
+        src: &Entity,
+        dst: &Entity,
+        kind: RelationKind,
+    ) -> Relation {
+        let relation = Relation {
+            id: RelationId::from_content(
+                &src.id.to_string(),
+                &dst.id.to_string(),
+                &format!("{kind:?}"),
+            ),
+            kind,
+            src: GraphNodeId::Entity(src.id),
+            dst: GraphNodeId::Entity(dst.id),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        graph.upsert_relation(&relation).unwrap();
+        relation
+    }
+
+    /// The names the grouped listing puts under a hop header, read back out of
+    /// the rendered lines so a test asserts on what a reader sees.
+    fn listed_names(lines: &[String]) -> Vec<String> {
+        lines
+            .iter()
+            .filter_map(|line| line.strip_prefix("    - "))
+            .filter_map(|row| row.split(" (").next())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// A method whose only inbound edge is its own containing class.
+    ///
+    /// The class contains the method; nothing calls it. Before the walks shared
+    /// one relation policy, this printed `Holder (Function)` under "1 hop
+    /// (direct callers)" of its own member, and from the class the walk reached
+    /// every sibling the class contains. Containment reported as a caller is
+    /// the mechanism behind the ten-versus-zero payload in FIR-2478.
+    #[tokio::test]
+    async fn a_containing_declaration_is_not_a_direct_caller_of_its_own_member() {
+        let graph = kin_db::InMemoryGraph::new();
+        let holder = entity("Holder", "src/holder.rs");
+        let member = entity("Holder.send", "src/holder.rs");
+        let sibling = entity("Holder.close", "src/holder.rs");
+        for e in [&holder, &member, &sibling] {
+            graph.upsert_entity(e).unwrap();
+        }
+        relate(&graph, &holder, &member, RelationKind::Contains);
+        relate(&graph, &holder, &sibling, RelationKind::Contains);
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let response = build_impact_response(
+            &layout,
+            &graph,
+            &ImpactRequest {
+                entity: "Holder.send".to_string(),
+                depth: 3,
+                file: None,
+                kind: None,
+                signature: None,
+                require_unique: true,
+            },
+            &healthy_test_envelope(),
+        )
+        .await
+        .unwrap();
+
+        let rendered = response.lines.join("\n");
+        assert!(
+            !rendered.contains("1 hop (direct callers)"),
+            "containment is not a call, so a member with only a containing class has no direct \
+             callers: {rendered}"
+        );
+        assert!(
+            rendered.contains("No local downstream impact found."),
+            "the honest answer for a member nothing uses: {rendered}"
+        );
+        assert!(
+            listed_names(&response.lines).is_empty(),
+            "no entity may be listed as impacted through containment: {rendered}"
+        );
+        assert_eq!(
+            response
+                .ranked
+                .as_ref()
+                .expect("structured callers get a ranked report")
+                .candidates
+                .len(),
+            0,
+            "the ranked walk already excluded containment; the listing must agree"
+        );
+    }
+
+    /// The defect in one assertion: one payload, one entity, two walks.
+    ///
+    /// The graph mixes an edge each walk treats differently. Before the fix the
+    /// listing counted the containing class and everything reachable through
+    /// it, while `ranked.candidates` carried only the impact edges, so a caller
+    /// reading the documented machine field and a reader reading the prose in
+    /// the same document got different answers at exit 0.
+    #[tokio::test]
+    async fn both_walks_in_one_payload_report_the_same_entities() {
+        let graph = kin_db::InMemoryGraph::new();
+        let base = entity("Base", "src/base.rs");
+        let contract = entity("Base.send", "src/base.rs");
+        let sibling = entity("Base.close", "src/base.rs");
+        let overrider = entity("Http.send", "src/http.rs");
+        let caller = entity("Session.send", "src/session.rs");
+        let cochanger = entity("changelog_entry", "src/changelog.rs");
+        for e in [&base, &contract, &sibling, &overrider, &caller, &cochanger] {
+            graph.upsert_entity(e).unwrap();
+        }
+        relate(&graph, &base, &contract, RelationKind::Contains);
+        relate(&graph, &base, &sibling, RelationKind::Contains);
+        relate(&graph, &overrider, &contract, RelationKind::Overrides);
+        relate(&graph, &caller, &overrider, RelationKind::Calls);
+        // Correlation, not causation: two entities that changed together in the
+        // same commits. The ranked walk never counted it and the listing did.
+        relate(&graph, &cochanger, &contract, RelationKind::CoChanges);
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let response = build_impact_response(
+            &layout,
+            &graph,
+            &ImpactRequest {
+                entity: "Base.send".to_string(),
+                depth: 3,
+                file: None,
+                kind: None,
+                signature: None,
+                require_unique: true,
+            },
+            &healthy_test_envelope(),
+        )
+        .await
+        .unwrap();
+
+        let ranked = response.ranked.as_ref().expect("ranked report");
+        let ranked_names: std::collections::BTreeSet<String> = ranked
+            .candidates
+            .iter()
+            .map(|candidate| candidate.identity.name.clone())
+            .collect();
+        let listed: std::collections::BTreeSet<String> =
+            listed_names(&response.lines).into_iter().collect();
+        assert_eq!(
+            listed, ranked_names,
+            "the two walks in one payload must reach the same entities; lines {:?} ranked {:?}",
+            listed, ranked_names
+        );
+        assert_eq!(
+            listed,
+            std::collections::BTreeSet::from(["Http.send".to_string(), "Session.send".to_string()]),
+            "only the impact edges reach anything: {:?}",
+            response.lines
+        );
+        assert!(
+            response
+                .lines
+                .iter()
+                .any(|line| line.contains(&format!("{} local entities", ranked.candidates.len()))),
+            "the printed count is the count of the same set: {:?}",
+            response.lines
+        );
+    }
+
+    /// A bare member name resolves to eleven declarations on the fixture that
+    /// filed this, and to three here. Either way it is not an absence.
+    ///
+    /// `--json` used to RETAIN the exact-name matches during resolution, which
+    /// empties the set for every language that qualifies member names, and the
+    /// candidate snapshot was taken after that retain, so the answer was
+    /// `not_found` with `match_count: 0`, an empty candidate list and advice to
+    /// check the spelling of a name the graph holds three times.
+    #[tokio::test]
+    async fn a_partial_member_name_is_ambiguous_with_candidates_never_not_found() {
+        let graph = kin_db::InMemoryGraph::new();
+        for e in [
+            &entity("Base.send", "src/base.rs"),
+            &entity("Http.send", "src/http.rs"),
+            &entity("Session.send", "src/session.rs"),
+        ] {
+            graph.upsert_entity(e).unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let response = build_impact_response(
+            &layout,
+            &graph,
+            &ImpactRequest {
+                entity: "send".to_string(),
+                depth: 3,
+                file: None,
+                kind: None,
+                signature: None,
+                require_unique: true,
+            },
+            &healthy_test_envelope(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            response.resolution, "ambiguous",
+            "a name the graph holds three times is not an absence: {:?}",
+            response.lines
+        );
+        assert_eq!(
+            response.query.match_count, 3,
+            "the count is what the name resolves to, not zero: {:?}",
+            response.query
+        );
+        assert_eq!(
+            response
+                .query
+                .name_candidates
+                .iter()
+                .map(|candidate| candidate.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Base.send", "Http.send", "Session.send"],
+            "the caller is told what it could have asked for: {:?}",
+            response.query.name_candidates
+        );
+        let rendered = response.lines.join("\n");
+        assert!(
+            !rendered.contains("not found") && !rendered.contains("check the spelling"),
+            "the graph holds the name, so it must not be reported as missing: {rendered}"
+        );
+    }
+
+    /// The remediation the text surface prints has to work when followed.
+    ///
+    /// "Use --json with --file/--kind/--signature for fail-closed resolution"
+    /// was unactionable: the qualifiers ran against a set the exact-name retain
+    /// had already emptied, so adding `--file` changed `not_found` into
+    /// `not_found`.
+    #[tokio::test]
+    async fn a_file_qualifier_narrows_a_partial_name_instead_of_emptying_it() {
+        let graph = kin_db::InMemoryGraph::new();
+        for e in [
+            &entity("Base.send", "src/adapters.rs"),
+            &entity("Http.send", "src/adapters.rs"),
+            &entity("Session.send", "src/session.rs"),
+        ] {
+            graph.upsert_entity(e).unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let response = build_impact_response(
+            &layout,
+            &graph,
+            &ImpactRequest {
+                entity: "send".to_string(),
+                depth: 3,
+                file: Some("src/adapters.rs".to_string()),
+                kind: None,
+                signature: None,
+                require_unique: true,
+            },
+            &healthy_test_envelope(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            response.resolution, "ambiguous",
+            "following the printed remedy must narrow the set, never empty it: {:?}",
+            response.lines
+        );
+        assert_eq!(
+            response.query.match_count, 2,
+            "the qualifier narrows the name's own matches to the two declared in that file: {:?}",
+            response.lines
+        );
+        let rendered = response.lines.join("\n");
+        assert!(
+            rendered.contains("Base.send") && rendered.contains("Http.send"),
+            "both declarations in scope are named: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Session.send"),
+            "the qualifier excluded the other file: {rendered}"
+        );
+    }
+
+    /// The control the ambiguity fix must not cost: an exact name still
+    /// resolves for a structured caller, and a partial name still never
+    /// resolves silently to a differently-named entity.
+    #[tokio::test]
+    async fn structured_resolution_answers_on_an_exact_name_and_refuses_a_partial_one() {
+        let graph = kin_db::InMemoryGraph::new();
+        let target = entity("Http.send", "src/http.rs");
+        let caller = entity("Session.send", "src/session.rs");
+        graph.upsert_entity(&target).unwrap();
+        graph.upsert_entity(&caller).unwrap();
+        calls(&graph, &caller, &target);
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let exact = build_impact_response(
+            &layout,
+            &graph,
+            &ImpactRequest {
+                entity: "Http.send".to_string(),
+                depth: 3,
+                file: None,
+                kind: None,
+                signature: None,
+                require_unique: true,
+            },
+            &healthy_test_envelope(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(exact.resolution, "resolved");
+        assert_eq!(exact.ranked.expect("ranked report").candidates.len(), 1);
+
+        // One partial match is still not an answer. Resolving it would hand a
+        // fail-closed caller a report about `Http.send` when it asked about
+        // `Http`, which is the failure mode `require_unique` exists to prevent.
+        let partial = build_impact_response(
+            &layout,
+            &graph,
+            &ImpactRequest {
+                entity: "Http".to_string(),
+                depth: 3,
+                file: None,
+                kind: None,
+                signature: None,
+                require_unique: true,
+            },
+            &healthy_test_envelope(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            partial.resolution, "ambiguous",
+            "a fragment of one name must not resolve to that entity: {:?}",
+            partial.lines
+        );
+        assert_eq!(partial.query.match_count, 1);
+    }
+
+    /// The empty answer has to carry its verdict where a machine reads it.
+    ///
+    /// The rendered sentence is silent when the verdict is authoritative, which
+    /// is right for a person and wrong for a caller parsing the payload: a
+    /// missing field reads as a clean bill. Both arms are asserted, because a
+    /// field that is always present and always refuses would pass the refusing
+    /// arm alone while stamping every empty result uncertain.
+    #[tokio::test]
+    async fn an_empty_answer_carries_the_same_verdict_in_prose_and_in_the_payload() {
+        let graph = kin_db::InMemoryGraph::new();
+        let target = entity("orphan", "src/orphan.rs");
+        let caller = entity("caller", "src/a.rs");
+        let callee = entity("callee", "src/b.rs");
+        for e in [&target, &caller, &callee] {
+            graph.upsert_entity(e).unwrap();
+        }
+        // Healthy cross-file coverage, so the only thing separating the two arms
+        // below is the daemon's own health.
+        calls(&graph, &caller, &callee);
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let request = ImpactRequest {
+            entity: "orphan".to_string(),
+            depth: 3,
+            file: None,
+            kind: None,
+            signature: None,
+            require_unique: true,
+        };
+
+        let healthy = build_impact_response(&layout, &graph, &request, &healthy_test_envelope())
+            .await
+            .unwrap();
+        let healthy_verdict = healthy
+            .negative
+            .as_ref()
+            .expect("an empty impact answer publishes its verdict");
+        assert_eq!(
+            healthy_verdict["safe_to_conclude_absent"],
+            serde_json::json!(true),
+            "a healthy store certifies this absence: {healthy_verdict}"
+        );
+        assert!(
+            !healthy.lines.join("\n").contains("cannot rule out"),
+            "a certified absence prints no refusal: {:?}",
+            healthy.lines
+        );
+
+        let degraded = kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 3,
+            "graph_generation": 1,
+            "embed_worker_failed": true,
+        }));
+        let refused = build_impact_response(&layout, &graph, &request, &degraded)
+            .await
+            .unwrap();
+        let refused_verdict = refused
+            .negative
+            .as_ref()
+            .expect("an empty impact answer publishes its verdict");
+        assert_eq!(
+            refused_verdict["safe_to_conclude_absent"],
+            serde_json::json!(false),
+            "a degraded daemon cannot certify: {refused_verdict}"
+        );
+        assert!(
+            refused.lines.join("\n").contains("Kin cannot rule out"),
+            "prose and payload must refuse together: {:?}",
+            refused.lines
+        );
+        // The payload's verdict is the MCP surface's own object, not a second
+        // opinion computed here.
+        let coverage = kin_mcp::edge_coverage::observe_cross_file_reference_coverage_for_languages(
+            &graph,
+            &[target.language],
+            &kin_mcp::handlers::review::IMPACT_REFERENCE_KINDS,
+        );
+        let payload = serde_json::json!({
+            "entity_impacts": [],
+            kin_mcp::EDGE_COVERAGE_KEY: coverage,
+        });
+        assert_eq!(
+            refused.negative,
+            kin_mcp::negative::negative_for("impact_analysis", &payload, &degraded, &[]),
+            "the field is the verdict `impact_analysis` publishes, byte for byte"
+        );
+    }
+
+    /// One bound, both walks. `rank_impact` stops at
+    /// [`kin_review::IMPACT_MAX_DEPTH`] whatever it is asked for, so a deeper
+    /// request used to list entities in the prose that the ranked report could
+    /// not carry, which is the same contradiction one hop further out.
+    #[tokio::test]
+    async fn a_request_deeper_than_the_bound_is_reduced_for_both_walks() {
+        let over = kin_review::IMPACT_MAX_DEPTH + 4;
+        let (graph, root) = chain_graph(over as usize + 2);
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let response = build_impact_response(
+            &layout,
+            &graph,
+            &ImpactRequest {
+                entity: root.name.clone(),
+                depth: over,
+                file: None,
+                kind: None,
+                signature: None,
+                require_unique: true,
+            },
+            &healthy_test_envelope(),
+        )
+        .await
+        .unwrap();
+
+        let ranked = response.ranked.as_ref().expect("ranked report");
+        assert_eq!(
+            listed_names(&response.lines).len(),
+            ranked.candidates.len(),
+            "one bound for both walks: {:?}",
+            response.lines
+        );
+        assert_eq!(
+            listed_names(&response.lines).len(),
+            kin_review::IMPACT_MAX_DEPTH as usize,
+            "a chain answers one entity per hop up to the bound: {:?}",
+            response.lines
+        );
+        let rendered = response.lines.join("\n");
+        assert!(
+            rendered.contains(&format!("--depth {over} was reduced")),
+            "the reduction is stated rather than applied silently: {rendered}"
         );
     }
 }

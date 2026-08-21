@@ -154,6 +154,15 @@ pub struct RankedImpactReport {
     pub candidates: Vec<RankedImpactCandidate>,
 }
 
+/// The deepest hop any impact walk answers at.
+///
+/// Public for the same reason [`is_impact_relation`] is: a caller that walks to
+/// its own bound while this report stops at 8 publishes two hop counts for one
+/// question. A bound rather than a preference, because the reachable set grows
+/// with the graph's branching factor and an unbounded walk on a large repository
+/// answers with the repository.
+pub const IMPACT_MAX_DEPTH: u32 = 8;
+
 /// Rank graph-native downstream impact from a live graph store.
 pub fn rank_impact<G: GraphStore>(
     store: &G,
@@ -178,7 +187,7 @@ pub fn rank_impact_at<I: ImpactGraph>(
         .get_entity(root)?
         .ok_or(ReviewError::EntityNotFound(*root))?;
     let root_identity = StableEntityIdentity::from_entity(&root_entity);
-    let bounded_depth = max_depth.min(8);
+    let bounded_depth = max_depth.min(IMPACT_MAX_DEPTH);
 
     #[derive(Clone)]
     struct Frontier {
@@ -321,7 +330,24 @@ fn relation_sort_key(relation: &Relation) -> (String, String, String) {
     )
 }
 
-fn is_impact_relation(kind: RelationKind) -> bool {
+/// Whether a relation carries impact: a change to its destination can break its
+/// source.
+///
+/// This is THE impact edge policy, and it is public so that every surface
+/// answering "what does changing this reach" filters by the same predicate. Two
+/// walks over one graph with two policies produce two answers about one entity,
+/// which is what `kin impact --json` shipped: the ranked report filtered here
+/// while the human listing walked every inbound edge, so a containing class was
+/// printed as a direct caller of its own method and the same payload carried a
+/// count of ten beside an empty candidate array (FIR-2478).
+///
+/// Containment is the load-bearing exclusion. A declaration contains its
+/// members, so counting that edge makes every method impacted by itself through
+/// its parent, and from the parent the walk reaches everything else the parent
+/// contains. Metadata and correlation edges are excluded for the same reason:
+/// `CoChanges` records that two entities moved together, which is not a claim
+/// that changing one breaks the other.
+pub fn is_impact_relation(kind: RelationKind) -> bool {
     matches!(
         kind,
         RelationKind::Extends
