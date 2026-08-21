@@ -1697,7 +1697,7 @@ jobs:
             node --input-type=module -e '
               const { main } = await import(process.env.KIN_RELEASE_GATE);
               const result = await main({
-                log: (line) => process.stderr.write(`${line}\n`),
+                log: (line) => process.stderr.write(line + "\n"),
               });
               process.stdout.write(result.sha);
             ')"

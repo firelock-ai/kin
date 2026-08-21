@@ -32,6 +32,8 @@ ADVISORY_SWEEP = WORKFLOWS / "advisory-sweep.yml"
 ADVISORY_SWEEP_SCRIPT = ROOT / "scripts" / "advisory-sweep.mjs"
 HOLD_ALARM = ROOT / "scripts" / "release-hold-alarm.mjs"
 HOLD_ALARM_POLICY = "scripts/release-hold-alarm.mjs"
+PROOF_GATE = ROOT / "scripts" / "check-release-proof-artifacts.mjs"
+PROOF_GATE_POLICY = "scripts/check-release-proof-artifacts.mjs"
 INSTALL_PROOF_CANARY = WORKFLOWS / "install-proof-canary.yml"
 CAPABILITY_CONTRACT = ROOT / "scripts" / "verify-capability-proof.mjs"
 CAPABILITY_CONTRACT_POLICY = "scripts/verify-capability-proof.mjs"
@@ -1023,6 +1025,24 @@ def replace_exactly_once(
             f"{original!r}"
         )
     return source.replace(original, replacement, 1)
+
+
+def swap_release_tag_step_order(release_tag: str) -> str:
+    """Move the release proof gate after the tag write it exists to gate.
+
+    Both step names survive the swap, so the count check still passes and the
+    ordering check is the only thing that can catch it. That is the point: a
+    gate that runs after the ref is written reads exactly like a gate.
+    """
+
+    gate = "      - name: Require proof-loop artifacts for the release candidate\n"
+    write = "      - name: Create release tag ref\n"
+    placeholder = "      - name: kin-order-swap-placeholder\n"
+    swapped = replace_exactly_once(
+        release_tag, gate, placeholder, "proof gate order"
+    )
+    swapped = replace_exactly_once(swapped, write, gate, "proof gate order")
+    return replace_exactly_once(swapped, placeholder, write, "proof gate order")
 
 
 def write_node_validator_fixture_files(
@@ -7130,6 +7150,147 @@ def assert_recovery_abandonment_stand_down(release_recovery: str) -> None:
             )
 
 
+def assert_release_proof_key_authority(
+    release_train: str,
+    release_tag: str,
+    release: str,
+    proof_gate: str,
+) -> None:
+    """Pin the release evidence to a commit nothing rewrites, and to the tag.
+
+    This guard did not exist while the thing it guards was load-bearing. The
+    FIR-2525 proof gate lived in release-train.yml keyed on the head of
+    automation/release-next, the train mints a new head on every cycle that
+    finds drift, and nothing in this file noticed either fact. Removing that
+    step outright left the whole suite green, which is how a release chain
+    acquires a rule that only a runbook sentence enforces.
+
+    What is pinned now is the arrangement that replaced it. The candidate is a
+    main commit, so nothing can rewrite it out from under its records; the mint
+    refuses to write the tag ref without them; the tag names the exact sha the
+    gate verified; and the train keys nothing on a branch head any more, which
+    is the property that lets main keep moving through a proof window.
+    """
+
+    mint = workflow_job_blocks(release_tag).get("mint-release-tag")
+    if mint is None:
+        raise AssertionError("release-tag.yml no longer declares the mint job")
+
+    gate_anchor = "- name: Require proof-loop artifacts for the release candidate"
+    tag_write_anchor = "- name: Create release tag ref"
+    for anchor in (gate_anchor, tag_write_anchor):
+        if mint.count(anchor) != 1:
+            raise AssertionError(
+                f"the mint must declare exactly one {anchor!r} step, so the "
+                "release proof gate has one reviewed place to live"
+            )
+    if mint.index(gate_anchor) > mint.index(tag_write_anchor):
+        raise AssertionError(
+            "the release proof gate must run before the tag ref is written; a "
+            "tag run resolves its workflows from the tag and can never be "
+            "repaired, so a gate after the write refuses nothing"
+        )
+
+    gate_step = "\n".join(
+        job_step_active_lines(release_tag, "mint-release-tag", gate_anchor)
+    )
+    for needle, duty in (
+        (
+            f'"refs/remotes/origin/main:{PROOF_GATE_POLICY}"',
+            "read the gate from protected main rather than from the commit "
+            "under judgement",
+        ),
+        (
+            'CANDIDATE_SHA="$SHA"',
+            "ask about the exact sha it is going to tag",
+        ),
+        (
+            'if [ "$proven" != "$SHA" ]',
+            "refuse when the sha the gate verified is not the sha it would tag",
+        ),
+        (
+            'git diff --name-only "$proven" "$SHA"',
+            "state that the tree it tags is the tree that was proven",
+        ),
+    ):
+        if needle not in gate_step:
+            raise AssertionError(
+                f"the release proof gate must {duty}: {needle}"
+            )
+
+    resolve = "\n".join(
+        job_step_active_lines(
+            release_tag, "mint-release-tag", "name: Resolve exact coherent release"
+        )
+    )
+    for needle, duty in (
+        (
+            "git/trees/release-evidence?recursive=1",
+            "select the candidate from the records the proof loop published",
+        ),
+        (
+            '.truncated // false',
+            "refuse a truncated listing rather than shipping the older "
+            "candidate it can still see",
+        ),
+        (
+            'echo "needed=false"',
+            "stand down as a no-op when no candidate is proven, rather than "
+            "declining or tagging one that is not",
+        ),
+    ):
+        if needle not in resolve:
+            raise AssertionError(
+                f"the mint's candidate selection must {duty}: {needle}"
+            )
+
+    reconcile = workflow_job_blocks(release_train).get("reconcile")
+    if reconcile is None:
+        raise AssertionError("release-train.yml no longer declares the reconcile job")
+    if PROOF_GATE_POLICY in "\n".join(active_lines(reconcile)):
+        raise AssertionError(
+            "the release train must key nothing on the version bump branch's "
+            "head; that key is what forced the fleet to freeze main for the "
+            "length of every proof window, and the refusal now lives on the "
+            "tag the mint writes"
+        )
+
+    promote = "\n".join(
+        job_step_active_lines(
+            release, "finalize_release", "name: Require proof-loop artifacts"
+        )
+    )
+    for needle, duty in (
+        (
+            "CANDIDATE_SHA: ${{ github.sha }}",
+            "ask about the tagged commit directly, because the mint now tags "
+            "the candidate itself",
+        ),
+        (
+            "RESOLVE_FROM_COMMIT: ${{ github.sha }}",
+            "keep the bridge for tags cut before that rekey, whose records sit "
+            "under the pull request head instead",
+        ),
+    ):
+        if needle not in promote:
+            raise AssertionError(
+                f"the promote gate must {duty}: {needle}"
+            )
+
+    gate_source = "\n".join(active_lines(proof_gate))
+    if "absent.evidenceAbsent = true" not in gate_source:
+        raise AssertionError(
+            "the proof gate must mark an absent record as absent, so a caller "
+            "deciding to bridge is not matching on an error message"
+        )
+    if "if (!error.evidenceAbsent || !resolveFromCommit)" not in gate_source:
+        raise AssertionError(
+            "the proof gate must bridge only when the direct record is ABSENT; "
+            "widening the search on an unreadable record is a check reporting "
+            "success for the wrong reason"
+        )
+
+
 def assert_release_hold_marker_contract(
     release_train: str,
     release_sentinel: str,
@@ -7900,6 +8061,7 @@ def main() -> None:
     sast = SAST.read_text(encoding="utf-8")
     advisory_sweep = ADVISORY_SWEEP.read_text(encoding="utf-8")
     hold_alarm = HOLD_ALARM.read_text(encoding="utf-8")
+    proof_gate = PROOF_GATE.read_text(encoding="utf-8")
     release_bot_doc = RELEASE_BOT_DOC.read_text(encoding="utf-8")
     install_proof = INSTALL_PROOF.read_text(encoding="utf-8")
     install_proof_canary = INSTALL_PROOF_CANARY.read_text(encoding="utf-8")
@@ -8619,6 +8781,135 @@ def main() -> None:
                 "          steps.record.outputs.abandoned != 'true'",
                 "          # steps.record.outputs.abandoned != 'true'",
             )
+        ),
+    )
+
+    # Where the release evidence is keyed decides whether main has to hold
+    # still. Keyed to a branch head the train rewrites, it did; keyed to a main
+    # commit and checked against the tag, it does not. Nothing pinned that
+    # before, so the whole arrangement is pinned here together with the refusal
+    # it carries.
+    assert_release_proof_key_authority(
+        release_train, release_tag, release, proof_gate
+    )
+    expect_assertion(
+        "the mint stops comparing the proven sha to the sha it tags",
+        "refuse when the sha the gate verified",
+        lambda: assert_release_proof_key_authority(
+            release_train,
+            replace_exactly_once(
+                release_tag,
+                'if [ "$proven" != "$SHA" ]; then',
+                'if [ "$proven" = "never" ]; then',
+                "proof gate identity",
+            ),
+            release,
+            proof_gate,
+        ),
+    )
+    expect_assertion(
+        "the mint stops stating that the tagged tree is the proven tree",
+        "state that the tree it tags is the tree that was proven",
+        lambda: assert_release_proof_key_authority(
+            release_train,
+            replace_exactly_once(
+                release_tag,
+                'delta="$(git diff --name-only "$proven" "$SHA")"',
+                'delta=""',
+                "proof gate tree identity",
+            ),
+            release,
+            proof_gate,
+        ),
+    )
+    expect_assertion(
+        "the proof gate runs after the tag ref it was supposed to gate",
+        "must run before the tag ref is written",
+        lambda: assert_release_proof_key_authority(
+            release_train,
+            swap_release_tag_step_order(release_tag),
+            release,
+            proof_gate,
+        ),
+    )
+    expect_assertion(
+        "the mint takes a truncated evidence listing at face value",
+        "refuse a truncated listing",
+        lambda: assert_release_proof_key_authority(
+            release_train,
+            replace_exactly_once(
+                release_tag,
+                "jq -r '.truncated // false' <<< \"$listing\"",
+                "jq -r 'false' <<< \"$listing\"",
+                "truncated listing refusal",
+            ),
+            release,
+            proof_gate,
+        ),
+    )
+    expect_assertion(
+        "the train keys a release on the version bump branch's head again",
+        "must key nothing on the version bump branch's head",
+        lambda: assert_release_proof_key_authority(
+            replace_exactly_once(
+                release_train,
+                "      - name: Arm protected auto-merge\n",
+                "      - name: Require proof-loop artifacts for the candidate\n"
+                "        run: |\n"
+                "          git show "
+                f'"refs/remotes/origin/main:{PROOF_GATE_POLICY}" > gate\n'
+                "\n"
+                "      - name: Arm protected auto-merge\n",
+                "release train proof key",
+            ),
+            release_tag,
+            release,
+            proof_gate,
+        ),
+    )
+    expect_assertion(
+        "the promote gate stops asking about the tagged commit itself",
+        "ask about the tagged commit directly",
+        lambda: assert_release_proof_key_authority(
+            release_train,
+            release_tag,
+            replace_exactly_once(
+                release,
+                "          CANDIDATE_SHA: ${{ github.sha }}\n",
+                "",
+                "promote gate direct key",
+            ),
+            proof_gate,
+        ),
+    )
+    expect_assertion(
+        "the promote gate stops bridging tags cut before the rekey",
+        "keep the bridge for tags cut before that rekey",
+        lambda: assert_release_proof_key_authority(
+            release_train,
+            release_tag,
+            replace_exactly_once(
+                release,
+                "          RESOLVE_FROM_COMMIT: ${{ github.sha }}\n",
+                "",
+                "promote gate bridge",
+            ),
+            proof_gate,
+        ),
+    )
+    expect_assertion(
+        "the proof gate bridges on a record it could not read",
+        "must bridge only when the direct record is ABSENT",
+        lambda: assert_release_proof_key_authority(
+            release_train,
+            release_tag,
+            release,
+            replace_exactly_once(
+                proof_gate,
+                "if (!error.evidenceAbsent || !resolveFromCommit) {",
+                "if (!resolveFromCommit) {",
+                "proof gate absence-only bridge",
+            ),
         ),
     )
 

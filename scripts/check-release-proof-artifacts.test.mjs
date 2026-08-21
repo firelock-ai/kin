@@ -446,3 +446,116 @@ test('main refuses when neither a candidate nor a commit to bridge is given', as
     /no candidate given/,
   );
 });
+
+// The promote gate passes both keys now that the mint tags the candidate
+// itself. The direct key is the answer, and the bridge must not even be asked:
+// a landed commit resolves through /pulls to the head of whatever feature pull
+// request produced it, which has no records and never did.
+test('main answers from the direct key without asking about pull requests', async () => {
+  const asked = [];
+  const result = await main({
+    sha: SHA,
+    resolveFromCommit: SHA,
+    repository: REPO,
+    env: {},
+    log: () => {},
+    fetchImpl: async (url) => {
+      asked.push(url);
+      if (url.includes(PREFLIGHT_RECORD)) {
+        return ok(JSON.stringify(preflightRecord()));
+      }
+      return ok(`archive_sha256=${ARCHIVE_A}\nfinished_at=2026-08-18T21:53:25Z\n`);
+    },
+  });
+  assert.equal(result.sha, SHA);
+  assert.equal(
+    asked.filter((url) => url.includes('/pulls')).length,
+    0,
+    'the direct key resolved, so nothing may bridge',
+  );
+});
+
+// A tag cut before the rekey points at the squash of a version bump pull
+// request, and its records sit under that pull request's head. Release
+// Recovery can still re-run one, so absence under the direct key falls
+// through to the bridge exactly once.
+test('main bridges when the direct key is absent and a commit is given', async () => {
+  const lines = [];
+  const result = await main({
+    sha: SHA,
+    resolveFromCommit: SHA,
+    repository: REPO,
+    env: {},
+    log: (line) => lines.push(line),
+    fetchImpl: async (url) => {
+      if (url.includes('/pulls')) {
+        return jsonOk([{ number: 986, merge_commit_sha: SHA, head: { sha: RC_HEAD } }]);
+      }
+      if (url.includes(`evidence/${SHA}/`)) {
+        return { ok: false, status: 404, statusText: 'Not Found' };
+      }
+      if (url.includes(PREFLIGHT_RECORD)) {
+        const record = preflightRecord();
+        record.legs.forEach((leg) => {
+          leg.result.expected.commit = RC_HEAD;
+        });
+        return ok(JSON.stringify(record));
+      }
+      return ok(`archive_sha256=${ARCHIVE_A}\nfinished_at=2026-08-18T21:53:25Z\n`);
+    },
+  });
+  assert.equal(result.sha, RC_HEAD);
+  assert.match(lines.join('\n'), new RegExp(`No preflight record under ${SHA}`));
+});
+
+// The bridge widens the search, so only a definite absence may trigger it. An
+// unreadable answer means we could not tell, and a check that widens when it
+// cannot tell is a check that reports success for the wrong reason.
+test('main never bridges past a record it could not read', async () => {
+  for (const unreadable of [
+    { ok: false, status: 500, statusText: 'Server Error' },
+    { ok: false, status: 403, statusText: 'Forbidden' },
+  ]) {
+    let bridged = false;
+    await assert.rejects(
+      main({
+        sha: SHA,
+        resolveFromCommit: SHA,
+        repository: REPO,
+        env: {},
+        log: () => {},
+        fetchImpl: async (url) => {
+          if (url.includes('/pulls')) {
+            bridged = true;
+            return jsonOk([{ number: 986, merge_commit_sha: SHA, head: { sha: RC_HEAD } }]);
+          }
+          return unreadable;
+        },
+      }),
+      new RegExp(`could not read .*HTTP ${unreadable.status}`),
+    );
+    assert.equal(bridged, false, 'an unreadable record must never widen the search');
+  }
+});
+
+// The mint passes the direct key alone, so absence there is terminal. Nothing
+// about a main commit's own pull request could name a proven candidate.
+test('main holds on absence when no commit to bridge from is given', async () => {
+  let bridged = false;
+  await assert.rejects(
+    main({
+      sha: SHA,
+      repository: REPO,
+      env: {},
+      log: () => {},
+      fetchImpl: async (url) => {
+        if (url.includes('/pulls')) {
+          bridged = true;
+        }
+        return { ok: false, status: 404, statusText: 'Not Found' };
+      },
+    }),
+    /the proof loop has not recorded this candidate/,
+  );
+  assert.equal(bridged, false);
+});
