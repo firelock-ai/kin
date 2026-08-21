@@ -3640,7 +3640,11 @@ mod tests {
     async fn a_scanner_refused_admission_rolls_back_so_the_next_commit_proceeds() {
         let repo = tempfile::tempdir().unwrap();
         let state = open_test_state(&repo);
-        std::fs::write(repo.path().join("store.py"), b"def store():\n    return 1\n").unwrap();
+        std::fs::write(
+            repo.path().join("store.py"),
+            b"def store():\n    return 1\n",
+        )
+        .unwrap();
         sync_filesystem_with_graph(&state).await.unwrap();
         let baseline_generation = authority_generation(&state);
         let baseline_tree = state.graph.resolved_tree();
@@ -3731,7 +3735,11 @@ mod tests {
         // this is the point at which the daemon reported a projection conflict
         // about a path that was simply there.
         std::fs::remove_file(repo.path().join("search.py")).unwrap();
-        std::fs::write(repo.path().join("later.py"), b"def later():\n    return 3\n").unwrap();
+        std::fs::write(
+            repo.path().join("later.py"),
+            b"def later():\n    return 3\n",
+        )
+        .unwrap();
         sync_filesystem_with_graph(&state)
             .await
             .expect("a rolled-back daemon admits the next transition rather than refusing it");
@@ -3748,7 +3756,9 @@ mod tests {
             "both status surfaces must report the same tree after the recovery"
         );
         assert!(
-            after.artifact_at_path(&test_repo_path("later.py")).is_some(),
+            after
+                .artifact_at_path(&test_repo_path("later.py"))
+                .is_some(),
             "the work that followed the refusal is what had to become committable"
         );
     }
@@ -6554,13 +6564,16 @@ pub(crate) fn publish_deferred_tree_after_failure(
                      repository authority and this daemon must be restarted before it can admit \
                      again"
                 );
-                state.background_work.reconcile().record_deferred_tree_wedge(
-                    format!(
+                state
+                    .background_work
+                    .reconcile()
+                    .record_deferred_tree_wedge(
+                        format!(
                         "{publication_error}; resetting the derived graph to the authority tree \
                          failed too: {reset_error}"
                     ),
-                    Instant::now(),
-                );
+                        Instant::now(),
+                    );
             }
         },
     }
