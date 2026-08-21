@@ -66,6 +66,42 @@ pub struct SemanticDiff {
     pub head: Option<SemanticChangeId>,
     pub entity_changes: Vec<EntityChange>,
     pub relation_changes: Vec<RelationChange>,
+    /// How many recorded modifications this range carried whose entity did not
+    /// change: same name, kind, signature, visibility, role, and fingerprint,
+    /// with only the span and the source-blob provenance advanced.
+    ///
+    /// They are excluded from `entity_changes` because a review that names them
+    /// is naming work nobody did, but the count is published rather than
+    /// dropped. It is the honest measure of how much of a stored change is
+    /// re-emission, and a reader who sees "Modified (1)" beside 60 suppressed
+    /// entries knows the storage layer touched the whole file while the review
+    /// found one edit.
+    #[serde(default)]
+    pub provenance_only_entity_changes: usize,
+}
+
+/// Whether a recorded modification changed what the entity IS, rather than only
+/// where it sits or which blob it was last read out of.
+///
+/// The reconciler stamps the touched file's blob hash onto every declaration in
+/// that file (`kin-reconcile/src/reconciler.rs`), and an edit that adds or
+/// removes bytes shifts the span of every declaration below it. Both are true
+/// provenance and the storage delta must carry them, because the workspace
+/// overlay is derived by whole-value difference and a payload held back there
+/// strands the workspace dirty forever. Neither is a change a reviewer can act
+/// on, so this is where the two meanings of "modified" separate.
+///
+/// The comparison normalizes the provenance fields onto the base value and then
+/// compares the whole entity, rather than listing the fields that count. A field
+/// added to `Entity` later is therefore treated as semantic until someone
+/// decides otherwise, which fails toward reporting a change rather than hiding
+/// one.
+pub fn is_semantic_modification(old: &Entity, new: &Entity) -> bool {
+    let mut normalized = new.clone();
+    normalized.span.clone_from(&old.span);
+    normalized.metadata.clone_from(&old.metadata);
+    normalized.created_in = old.created_in;
+    normalized != *old
 }
 
 impl SemanticDiff {
@@ -128,6 +164,63 @@ impl SemanticDiff {
 /// on this key to stay byte-identical across repeated runs. A relation id is
 /// unique to a single add-or-remove within one diff, so the id alone totally
 /// orders the set.
+/// Drop the modifications that only advanced provenance, returning how many
+/// were dropped so the caller can publish the count.
+fn split_provenance_only(changes: Vec<EntityChange>) -> (Vec<EntityChange>, usize) {
+    let before = changes.len();
+    let kept: Vec<EntityChange> = changes
+        .into_iter()
+        .filter(|change| match &change.kind {
+            EntityChangeKind::Modified { old, new } => is_semantic_modification(old, new),
+            EntityChangeKind::Added(_) | EntityChangeKind::Removed { .. } => true,
+        })
+        .collect();
+    let suppressed = before - kept.len();
+    (kept, suppressed)
+}
+
+/// Fold one `Modified` delta into the accumulated state for its entity.
+///
+/// The accumulated `old` stays the FIRST base-side payload the range recorded,
+/// never the latest delta's. Overwriting it collapsed `base..head` into
+/// `last_change..head`: an entity whose signature moved in the first change and
+/// whose blob provenance advanced in a later one would be compared against a
+/// base that already carried the new signature, and the range would report no
+/// change at all.
+fn fold_modified(
+    entity_states: &mut HashMap<EntityId, EntityChangeKind>,
+    old: &Entity,
+    new: &Entity,
+) {
+    let id = new.id;
+    match entity_states.get(&id) {
+        // Added in this range and then edited: still an addition from the
+        // range's point of view.
+        Some(EntityChangeKind::Added(_)) => {
+            entity_states.insert(id, EntityChangeKind::Added(new.clone()));
+        }
+        Some(EntityChangeKind::Modified { old: first, .. }) => {
+            let first = first.clone();
+            entity_states.insert(
+                id,
+                EntityChangeKind::Modified {
+                    old: first,
+                    new: new.clone(),
+                },
+            );
+        }
+        _ => {
+            entity_states.insert(
+                id,
+                EntityChangeKind::Modified {
+                    old: old.clone(),
+                    new: new.clone(),
+                },
+            );
+        }
+    }
+}
+
 fn relation_change_key(change: &RelationChange) -> String {
     match &change.kind {
         RelationChangeKind::Added(rel) => rel.id.to_string(),
@@ -201,23 +294,7 @@ pub fn compute_diff_scoped<G: GraphStore>(
                     }
                 }
                 EntityDelta::Modified { old, new } => {
-                    let id = new.id;
-                    match entity_states.get(&id) {
-                        Some(EntityChangeKind::Added(_)) => {
-                            // Was added in this range, now modified — still "added"
-                            // from the perspective of the overall diff
-                            entity_states.insert(id, EntityChangeKind::Added(new.clone()));
-                        }
-                        _ => {
-                            entity_states.insert(
-                                id,
-                                EntityChangeKind::Modified {
-                                    old: old.clone(),
-                                    new: new.clone(),
-                                },
-                            );
-                        }
-                    }
+                    fold_modified(&mut entity_states, old, new);
                 }
                 EntityDelta::Removed { old } => {
                     let id = old.id;
@@ -249,7 +326,9 @@ pub fn compute_diff_scoped<G: GraphStore>(
         .map(|(entity_id, kind)| EntityChange { entity_id, kind })
         .collect();
     entity_changes.sort_by_key(|change| change.entity_id);
+    let (entity_changes, provenance_only) = split_provenance_only(entity_changes);
     diff.entity_changes = entity_changes;
+    diff.provenance_only_entity_changes = provenance_only;
 
     // Accumulate relation deltas
     let mut relation_added: HashMap<RelationId, Relation> = HashMap::new();
@@ -317,6 +396,7 @@ pub fn diff_from_change(change: &SemanticChange) -> SemanticDiff {
         ..Default::default()
     };
 
+    let mut entity_changes = Vec::new();
     for delta in &change.entity_deltas {
         let (entity_id, kind) = match delta {
             EntityDelta::Added { new: e } => (e.id, EntityChangeKind::Added(e.clone())),
@@ -334,8 +414,11 @@ pub fn diff_from_change(change: &SemanticChange) -> SemanticDiff {
                 },
             ),
         };
-        diff.entity_changes.push(EntityChange { entity_id, kind });
+        entity_changes.push(EntityChange { entity_id, kind });
     }
+    let (entity_changes, provenance_only) = split_provenance_only(entity_changes);
+    diff.entity_changes = entity_changes;
+    diff.provenance_only_entity_changes = provenance_only;
 
     for delta in &change.relation_deltas {
         let kind = match delta {
@@ -379,22 +462,7 @@ pub fn diff_from_changes(changes: &[SemanticChange]) -> SemanticDiff {
                     entity_states.insert(id, EntityChangeKind::Added(entity.clone()));
                 }
                 EntityDelta::Modified { old, new } => {
-                    let id = new.id;
-                    match entity_states.get(&id) {
-                        Some(EntityChangeKind::Added(_)) => {
-                            // Was added earlier in this set — still "added"
-                            entity_states.insert(id, EntityChangeKind::Added(new.clone()));
-                        }
-                        _ => {
-                            entity_states.insert(
-                                id,
-                                EntityChangeKind::Modified {
-                                    old: old.clone(),
-                                    new: new.clone(),
-                                },
-                            );
-                        }
-                    }
+                    fold_modified(&mut entity_states, old, new);
                 }
                 EntityDelta::Removed { old } => match entity_states.get(&old.id) {
                     Some(EntityChangeKind::Added(_)) => {
@@ -420,7 +488,9 @@ pub fn diff_from_changes(changes: &[SemanticChange]) -> SemanticDiff {
         .map(|(entity_id, kind)| EntityChange { entity_id, kind })
         .collect();
     entity_changes.sort_by_key(|change| change.entity_id);
+    let (entity_changes, provenance_only) = split_provenance_only(entity_changes);
     diff.entity_changes = entity_changes;
+    diff.provenance_only_entity_changes = provenance_only;
 
     // Accumulate relation deltas
     let mut relation_added: HashMap<RelationId, Relation> = HashMap::new();

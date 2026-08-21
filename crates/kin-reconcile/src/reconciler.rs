@@ -652,13 +652,25 @@ impl Reconciler {
             // ordinary filesystem reconciliation continues to match by name
             // and kind as before.
             //
-            // Both passes skip an entity another parsed declaration already
+            // Every pass skips an entity another parsed declaration already
             // claimed, so the match is one-to-one. Identity is derived from the
             // declaration's start line, so an edit above a declaration retires
-            // the id the graph holds for it and drops it to the name-and-kind
-            // pass. A file that declares one name twice, which a cfg-gated pair
-            // does routinely, would otherwise collapse both halves onto
-            // whichever half the graph returned first.
+            // the id the graph holds for it and drops it to the passes below.
+            // A file that declares one name twice, which a cfg-gated pair and a
+            // Python `@overload` group both do routinely, would otherwise
+            // collapse both halves onto whichever half the graph returned
+            // first.
+            //
+            // Name and kind alone cannot tell one member of such a group from
+            // another, and `get_file_entities` returns graph-query order rather
+            // than declaration order, so a line-shifting edit anywhere above the
+            // group rotated its members onto each other: three declarations came
+            // back as three modifications reporting signature transitions none
+            // of them underwent, in mutually contradictory directions. The
+            // declaration's own signature is what distinguishes group members,
+            // so it is consulted before falling back to name and kind, and the
+            // fallback pairs by nearest declaration position rather than by
+            // whatever order the graph happened to return.
             let existing_match = existing
                 .iter()
                 .find(|entity| {
@@ -667,12 +679,11 @@ impl Reconciler {
                         && !claimed.contains(&entity.id)
                 })
                 .or_else(|| {
-                    existing.iter().find(|entity| {
-                        entity.name == new_entity.name
-                            && entity.kind == new_entity.kind
-                            && !claimed.contains(&entity.id)
+                    nearest_unclaimed(&existing, new_entity, &claimed, |candidate, parsed| {
+                        candidate.signature == parsed.signature
                     })
-                });
+                })
+                .or_else(|| nearest_unclaimed(&existing, new_entity, &claimed, |_, _| true));
 
             match existing_match {
                 Some(old) => {
@@ -1810,6 +1821,46 @@ fn validate_entity(entity: &Entity) -> Option<String> {
         return Some(format!("entity '{}' has an empty signature", entity.name));
     }
     None
+}
+
+/// Carry-forward candidate for one re-parsed declaration: the unclaimed
+/// existing entity of the same name and kind that `accept` admits and whose
+/// declaration sits nearest the parsed one.
+///
+/// Position breaks the tie rather than deciding the match, and it is the last
+/// word rather than the first. Graph query order is not declaration order, so
+/// the previous "first unclaimed candidate the graph returned" rule paired a
+/// same-name group's members arbitrarily; distance in the file is at least a
+/// property of the declarations themselves and orders them the way an author
+/// reading the diff would. An entity with no span sorts last and is compared
+/// by id, so the choice stays deterministic when nothing has a position.
+fn nearest_unclaimed<'a>(
+    existing: &'a [Entity],
+    parsed: &Entity,
+    claimed: &HashSet<EntityId>,
+    accept: impl Fn(&Entity, &Entity) -> bool,
+) -> Option<&'a Entity> {
+    let parsed_line = parsed.span.as_ref().map(|span| span.start_line);
+    existing
+        .iter()
+        .filter(|candidate| {
+            candidate.name == parsed.name
+                && candidate.kind == parsed.kind
+                && !claimed.contains(&candidate.id)
+                && accept(candidate, parsed)
+        })
+        .min_by_key(|candidate| {
+            let distance = match (candidate.span.as_ref().map(|span| span.start_line), parsed_line) {
+                (Some(candidate_line), Some(parsed_line)) => {
+                    Some(candidate_line.abs_diff(parsed_line))
+                }
+                _ => None,
+            };
+            // `None` sorts after every `Some`, which is what puts a spanless
+            // candidate last without a sentinel distance that a real span could
+            // reach.
+            (distance.is_none(), distance, candidate.id)
+        })
 }
 
 /// Collect all unique file origins from both entity sets.
