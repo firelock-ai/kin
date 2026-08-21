@@ -1688,10 +1688,10 @@ fn mark_files_enriched(state: &DaemonState, files: &[String]) {
 
 /// How many consecutive fruitless interrupted sweeps disable the next one.
 ///
-/// Three, not one. A single interrupted sweep is ordinary: a plain SIGTERM
-/// during shutdown ends a sweep early, and reading that as a failing store
-/// would trip the breaker on every clean stop.
-const SWEEP_INTERRUPTION_LIMIT: u32 = 3;
+/// Defined in `kin-daemon-spawn` rather than here, because the daemon is the
+/// only writer of this tally and three surfaces outside it now have to read the
+/// same rule to say the store is suspended. One definition or they drift.
+const SWEEP_INTERRUPTION_LIMIT: u32 = kin_daemon_spawn::SWEEP_INTERRUPTION_LIMIT;
 
 /// The count after a sweep that ended the way this tally describes.
 ///
@@ -1712,11 +1712,7 @@ fn next_interruption_count(previous: u32, ended_early: bool, enriched: usize) ->
 
 /// Whether the sweep circuit is open, so the next sweep must not be queued.
 fn sweep_circuit_open(consecutive_fruitless_interruptions: u32) -> bool {
-    consecutive_fruitless_interruptions >= SWEEP_INTERRUPTION_LIMIT
-}
-
-fn sweep_interruption_path(state: &DaemonState) -> std::path::PathBuf {
-    state.layout.root().join("lsp-sweep-interruptions")
+    kin_daemon_spawn::sweep_circuit_open(consecutive_fruitless_interruptions)
 }
 
 /// Read the consecutive-interruption count this store carries.
@@ -1725,15 +1721,16 @@ fn sweep_interruption_path(state: &DaemonState) -> std::path::PathBuf {
 /// RESTARTS: a sweep dies, the daemon comes back, queues another sweep at
 /// startup, and dies again. One stranger session did that 24 times. An
 /// in-memory counter resets on every start and can never see the pattern.
+///
+/// The read itself moved down to `kin-daemon-spawn` once the CLI and the MCP
+/// envelope had to answer the same question. This wrapper stays because every
+/// caller in this module holds a `DaemonState` rather than a root.
 fn read_sweep_interruptions(state: &DaemonState) -> u32 {
-    std::fs::read_to_string(sweep_interruption_path(state))
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u32>().ok())
-        .unwrap_or(0)
+    kin_daemon_spawn::read_sweep_interruptions(state.layout.root())
 }
 
 fn write_sweep_interruptions(state: &DaemonState, count: u32) {
-    let _ = std::fs::write(sweep_interruption_path(state), count.to_string());
+    kin_daemon_spawn::write_sweep_interruptions(state.layout.root(), count)
 }
 
 /// Where a sweep records that it has begun and not yet ended.

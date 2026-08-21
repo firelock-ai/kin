@@ -290,6 +290,64 @@ fn graph_status_reports_a_daemon_this_store_lost_to_the_memory_limit() {
     );
 }
 
+/// A suspended sweep is worse than invisible on this page: every counter above
+/// keeps reporting unenriched files as pending, so a store whose enrichment has
+/// been switched off looks exactly like one that is converging on its own. The
+/// tally the daemon keeps is the only thing that knows the difference.
+#[test]
+fn graph_status_reports_a_store_whose_enrichment_sweeps_are_suspended() {
+    let root = tempdir().expect("temp root");
+    let repo = root.path().join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    let admitted = admit(&repo);
+    let graph = workspace_query_graph(&admitted.binding);
+
+    // One under the limit is the control, and it is the one that makes this
+    // test able to fail: a renderer that printed the line unconditionally, or
+    // read the tally rather than the circuit, passes every other assertion.
+    kin_daemon_spawn::write_sweep_interruptions(
+        admitted.layout.root(),
+        kin_daemon_spawn::SWEEP_INTERRUPTION_LIMIT - 1,
+    );
+    let still_sweeping = graph_status_at(&admitted.binding, &graph, Some(admitted.layout.root()));
+    assert!(
+        !still_sweeping
+            .lines
+            .iter()
+            .any(|line| line.contains("enrichment is suspended")),
+        "a store still under the limit is still sweeping: {}",
+        still_sweeping.lines.join("\n")
+    );
+
+    kin_daemon_spawn::write_sweep_interruptions(
+        admitted.layout.root(),
+        kin_daemon_spawn::SWEEP_INTERRUPTION_LIMIT,
+    );
+    let after = graph_status_at(&admitted.binding, &graph, Some(admitted.layout.root()));
+    let rendered = after.lines.join("\n");
+    assert!(
+        rendered.contains("enrichment is suspended"),
+        "the store's own tally belongs on the page a reader is already on: {rendered}"
+    );
+    assert!(
+        rendered.contains("kin daemon sweep"),
+        "the line carries the command that undoes it: {rendered}"
+    );
+    // A warning rather than a notice is what withholds the all-clear, and the
+    // prefix is the only thing that proves which list it joined.
+    assert!(
+        after
+            .lines
+            .iter()
+            .any(|line| line.starts_with('⚠') && line.contains("enrichment is suspended")),
+        "the suspension is a warning, not a notice: {rendered}"
+    );
+    assert!(
+        after.error.is_none(),
+        "the line is a warning, so it must not turn `kin graph status` nonzero"
+    );
+}
+
 #[test]
 fn graph_status_passes_on_a_healthy_freshly_admitted_repository() {
     let root = tempdir().expect("temp root");
