@@ -18884,6 +18884,8 @@ mod tests {
             state.graph.resolved_tree().len() as u64,
             "the record must cover the tree the admission passed over"
         );
+    }
+
     /// The body the approval under test names.
     ///
     /// Deliberately harmless. This test asks one question, whether the sealed
