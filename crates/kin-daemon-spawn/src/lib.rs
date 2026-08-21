@@ -7599,7 +7599,6 @@ mod tests {
         assert_eq!(hhmm_utc(86_400 * 20_000 + 3_660), "01:01Z");
     }
 
-    #[cfg(unix)]
     /// The circuit is a threshold, so the two readings that matter are the one
     /// below it and the one at it. A test that only checks a large count cannot
     /// tell a correct threshold from an off-by-one, and an off-by-one here
@@ -7678,6 +7677,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_recorded_kill_round_trips_through_the_store() {
         let dir = tempfile::tempdir().unwrap();

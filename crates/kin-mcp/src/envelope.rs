@@ -3071,9 +3071,6 @@ mod tests {
         }
     }
 
-    /// Only the kernel's own attribution becomes a flag. A client keying on
-    /// `daemon_killed_by_memory` must never read it out of a host that
-    /// publishes no accounting and therefore never said memory at all.
     /// The flag is what separates a gap something is working on from a gap
     /// nothing is, and an agent certifying an absence reads the flag rather
     /// than the prose. A closed circuit must claim nothing at all, because a
@@ -3119,6 +3116,9 @@ mod tests {
         );
     }
 
+    /// Only the kernel's own attribution becomes a flag. A client keying on
+    /// `daemon_killed_by_memory` must never read it out of a host that
+    /// publishes no accounting and therefore never said memory at all.
     #[test]
     fn only_a_kernel_attributed_kill_is_stamped_on_the_envelope() {
         let stamped =
