@@ -67,3 +67,10 @@ KIN_SEARCH_SOAK_SECS
 KIN_VECTOR_BENCH_DIM
 KIN_VECTOR_BENCH_VECTORS
 KIN_VECTOR_BENCH_ITERS
+
+# kin-db storage/repository.rs: the two inputs to its FIR-2334 attribution
+# harness, a `#[cfg(test)] mod fir2334_attribution` whose only test is
+# `#[ignore]`d because it opens a multi-gigabyte on-disk store by hand. Nothing
+# in a kin process reads either name.
+KIN_FIR2334_STORE
+KIN_FIR2334_REPO
