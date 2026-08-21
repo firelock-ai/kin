@@ -12,13 +12,22 @@
 //! because a person reading a terminal is not parsing an envelope (captain's
 //! ruling, 2026-08-20).
 //!
-//! The tool name is load-bearing rather than decorative. `kin trace` builds a
-//! context pack, so it declares `get_context_pack` and NOT `trace_data_flow`,
-//! which describes a different walk; `kin search` declares `semantic_search`,
-//! which reads no edge class at all and is gated on the language scope instead.
-//! Naming the wrong one gates a command on a declaration describing evidence it
-//! never gathered, which is the failure `IMPACT_REFERENCE_KINDS` already warns
-//! about one level down.
+//! The tool name is load-bearing rather than decorative, and it is chosen to
+//! match the CLAIM the command makes rather than the code that built the answer.
+//! `kin impact` declares `impact_analysis`, whose absence is inbound. `kin trace`
+//! declares `trace_data_flow`, because every group a context pack carries runs
+//! OUTWARD from the focal; declaring `get_context_pack` instead would reach a
+//! gate whose field is `dependents`, a direction a `ContextPack` holds no group
+//! for at all. `kin search` declares `semantic_search`, which reads no edge class
+//! and is gated on the language scope instead. Naming the wrong one gates a
+//! command on a declaration describing evidence it never gathered, which is the
+//! failure `IMPACT_REFERENCE_KINDS` already warns about one level down.
+//!
+//! Two things then vary by tool and nothing else does: the noun the absence is
+//! OF ([`absence_subject`]) and the direction an absent edge class hides
+//! ([`absence_direction`]). Sharing one sentence across surfaces is how a shared
+//! renderer drifts, since the verdict stays right while the claim in front of
+//! the reader turns into a different one.
 //!
 //! Silence is the certified case. A graph whose enrichment delivered says
 //! nothing extra, which is the control that stops this degrading into stamping
@@ -91,6 +100,7 @@ pub fn qualify(
     // language-scoped path: `semantic_search` reads no edge class, so its
     // qualifier always renders from the disclosed signals.
     if missing.is_empty() {
+        let subject = absence_subject(tool);
         let disclosed = negative
             .get("degraded_signals")
             .and_then(serde_json::Value::as_array)
@@ -104,20 +114,22 @@ pub fn qualify(
             .filter(|disclosed| !disclosed.is_empty());
         return vec![match disclosed {
             Some(disclosed) => format!(
-                "{indent}Kin cannot rule out matches it did not see: this answer carries \
-                 [{disclosed}], so it may not reflect current truth."
+                "{indent}Kin cannot rule out {subject}: this answer carries [{disclosed}], so it \
+                 may not reflect current truth."
             ),
             None => format!(
-                "{indent}Kin cannot rule out matches it did not see: this answer's coverage \
-                 could not be established."
+                "{indent}Kin cannot rule out {subject}: this answer's coverage could not be \
+                 established."
             ),
         }];
     }
 
     let mut said = vec![format!(
-        "{indent}Kin cannot rule out dependents: this graph holds no cross-file {} edges for \
-         {language}, so a use reaching this entity from another file could not have been found.",
-        missing.join(" or ")
+        "{indent}Kin cannot rule out {}: this graph holds no cross-file {} edges for {language}, \
+         {}.",
+        absence_subject(tool),
+        missing.join(" or "),
+        absence_direction(tool)
     )];
     if !present.is_empty() {
         said.push(format!(
@@ -173,6 +185,47 @@ fn decided_by(
                 })
         })
         .unwrap_or_default()
+}
+
+/// What this tool's empty answer is an absence OF, in the reader's own terms.
+///
+/// Load-bearing rather than cosmetic, and it is the one thing sharing an
+/// implementation across surfaces gets wrong by default. `kin impact` and
+/// `kin trace` ask which code reaches an entity, so their absence is an absence
+/// of DEPENDENTS, which is the same noun the substrate's own retrieval spec uses
+/// for both (`no_dependents`, "nothing was found depending on the focal
+/// entity"). `kin search` asks whether the index admitted a declaration at all,
+/// so its absence is an absence of MATCHES.
+///
+/// One shared sentence would tell an impact reader about matches. The verdict
+/// behind it would still be right and the claim in front of them would not, and
+/// a surface that renders the wrong noun has drifted from its counterpart in the
+/// only place a person actually reads.
+fn absence_subject(tool: &str) -> &'static str {
+    match tool {
+        // Reads no edge class and is language-scoped instead, so what it could
+        // not rule out is an index match rather than a dependent.
+        "semantic_search" => "matches it did not see",
+        // Walks OUTWARD from the focal, so its empty answer is an absence of
+        // things this entity reaches rather than of things that reach it.
+        "trace_data_flow" => "dependencies it did not see",
+        _ => "dependents",
+    }
+}
+
+/// Why an absent cross-file class hides this tool's answer, in the direction
+/// that tool walked.
+///
+/// The inbound readers lose a use that reaches the focal; the outbound one loses
+/// a dependency the focal reaches. One sentence for both would state the wrong
+/// direction on one of them, which is the same drift `absence_subject` exists to
+/// stop, one clause later.
+fn absence_direction(tool: &str) -> &'static str {
+    match tool {
+        "trace_data_flow" => "so a dependency this entity reaches in another file could not have \
+                              been found",
+        _ => "so a use reaching this entity from another file could not have been found",
+    }
 }
 
 /// The edge class in the noun a sentence wants, since the observation keys are

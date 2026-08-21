@@ -492,7 +492,6 @@ async fn run_daemon_search(
 /// gate it on evidence it never gathers.
 fn search_absence_qualifier(
     graph: &kin_db::InMemoryGraph,
-    query: &str,
     envelope: &kin_mcp::Envelope,
 ) -> Vec<String> {
     let scoped = match graph.query_entities(&kin_model::graph::EntityFilter::default()) {
@@ -511,7 +510,6 @@ fn search_absence_qualifier(
             Some(scoped.len()),
         ),
     });
-    let _ = query;
     crate::commands::absence_qualifier::qualify("semantic_search", &payload, envelope, "")
 }
 
@@ -523,7 +521,7 @@ pub fn collect_daemon_search_response(
     if request.semantic {
         let mut response = collect_daemon_semantic_search_response(graph, request, envelope)?;
         if response.records.is_empty() {
-            response.absence_qualifier = search_absence_qualifier(graph, &request.query, envelope);
+            response.absence_qualifier = search_absence_qualifier(graph, envelope);
         }
         return Ok(response);
     }
@@ -546,7 +544,7 @@ pub fn collect_daemon_search_response(
         .map(|matched| record_to_daemon_record(&matched.record, matched.match_kind, matched.score))
         .collect::<Vec<_>>();
     let absence_qualifier = if records.is_empty() {
-        search_absence_qualifier(graph, &request.query, envelope)
+        search_absence_qualifier(graph, envelope)
     } else {
         Vec::new()
     };
@@ -699,7 +697,7 @@ fn collect_daemon_semantic_search_response(
     }
 
     let absence_qualifier = if records.is_empty() {
-        search_absence_qualifier(graph, &request.query, envelope)
+        search_absence_qualifier(graph, envelope)
     } else {
         Vec::new()
     };
