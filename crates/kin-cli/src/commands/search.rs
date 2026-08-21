@@ -90,6 +90,7 @@ fn evaluate_semantic_coverage(
     graph: &kin_db::InMemoryGraph,
 ) -> Result<crate::commands::locate::SemanticCoverage> {
     let status = graph.embedding_status();
+    let index_attached = crate::commands::locate::vector_index_attached(graph);
     let complete = embedding_status_complete(&status);
 
     if !complete && embedding_strict_mode() {
@@ -117,6 +118,26 @@ fn evaluate_semantic_coverage(
         total: status.total,
         pending: status.pending,
         complete,
+        // Search reads the same counters locate does and owes the same verdict.
+        // The index has to be proven attached before the counters mean
+        // anything: `embedding_status` answers zero indexed for every
+        // retrievable object on a graph with no index, and search was reporting
+        // that as a measured shortfall.
+        embedding_state: crate::commands::locate::EmbeddingState::observe(
+            true,
+            index_attached,
+            status.indexed,
+            status.total,
+            status.pending,
+        ),
+        limited_by: if !index_attached {
+            vec![crate::commands::locate::COVERAGE_LIMIT_VECTOR_INDEX_ABSENT.to_string()]
+        } else if complete {
+            Vec::new()
+        } else {
+            vec![crate::commands::locate::COVERAGE_LIMIT_EMBEDDINGS_INCOMPLETE.to_string()]
+        },
+        read_at: crate::commands::locate::coverage_read_at_now(),
         note,
         // Search does not run locate's source-text phase, so it observes no
         // bodies. Absent means unobserved, never "no gap".

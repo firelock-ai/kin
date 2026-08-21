@@ -13439,6 +13439,9 @@ mod tests {
             total: 10,
             pending: 0,
             complete: true,
+            embedding_state: kin_cli::commands::locate::EmbeddingState::Present,
+            limited_by: Vec::new(),
+            read_at: None,
             note: None,
             graph_bodies: None,
         };

@@ -126,6 +126,95 @@ pub struct RetrievalDegradation {
     pub remediation: String,
 }
 
+/// What the embedding substrate itself was observed to be for one query.
+///
+/// This is the one embedding verdict in the system. It is decided from the
+/// counters beside it and from whether an index was attached to take them, and
+/// from nothing else, so no surface has to re-derive a verdict from
+/// [`SemanticCoverage::complete`]. That flag is a CONJUNCTION over the substrate
+/// AND the population a query ranked over, and deriving an embedding verdict
+/// from it is how a `semantic_locate` envelope came to carry `indexed 2112,
+/// pending 0` beside `classes.embeddings: absent` in one response (FIR-2543):
+/// fifteen test-role paths had been withheld from ranking, which clears
+/// `complete` and says nothing at all about embeddings.
+///
+/// `Unknown` is a state, not a shade of `Absent`. `embedding_status` answers
+/// `indexed = 0` for every retrievable object when no vector index is attached,
+/// which is exactly the reading a never-embedded repository produces, so a
+/// verdict taken from the counters alone cannot tell a fully embedded store
+/// whose index was not loaded from one that was never embedded. The two have
+/// different remediations and only one of them is a real gap.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbeddingState {
+    /// Every eligible entity is indexed and nothing is queued, measured against
+    /// an index that was actually attached.
+    Present,
+    /// Some eligible entities are indexed and some are not.
+    Partial,
+    /// An attached index holds no embedding for any eligible entity.
+    Absent,
+    /// Nobody could say: no vector backend in this build, or no index attached
+    /// to take a reading from.
+    Unknown,
+}
+
+impl EmbeddingState {
+    /// The wire word, so a caller matching on the payload and a caller matching
+    /// on the type read the same vocabulary.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Present => "present",
+            Self::Partial => "partial",
+            Self::Absent => "absent",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Decide the state from an observation, at the one place that holds every
+    /// input it needs.
+    ///
+    /// Order matters and is deliberate. Both "nobody could say" checks run
+    /// before any counter is read, because a counter taken with no index behind
+    /// it is not a small number, it is not a number. That includes the
+    /// zero-eligible case: a graph with nothing retrievable and no index
+    /// attached is the shape that let a store report complete semantic coverage
+    /// over an empty graph (FIR-2215), and it is unknowable here rather than
+    /// whole.
+    pub fn observe(
+        supported: bool,
+        index_attached: bool,
+        indexed: usize,
+        total: usize,
+        pending: usize,
+    ) -> Self {
+        if !supported || !index_attached {
+            return Self::Unknown;
+        }
+        if total == 0 || (indexed >= total && pending == 0) {
+            return Self::Present;
+        }
+        if indexed == 0 {
+            return Self::Absent;
+        }
+        Self::Partial
+    }
+}
+
+/// Machine-stable reason [`SemanticCoverage::complete`] is false because this
+/// build ships no vector backend.
+pub const COVERAGE_LIMIT_VECTOR_SUPPORT_DISABLED: &str = "vector_support_disabled";
+/// Machine-stable reason `complete` is false because no index was attached.
+pub const COVERAGE_LIMIT_VECTOR_INDEX_ABSENT: &str = "vector_index_absent";
+/// Machine-stable reason `complete` is false because the index is unfinished.
+pub const COVERAGE_LIMIT_EMBEDDINGS_INCOMPLETE: &str = "embeddings_incomplete";
+/// Machine-stable reason `complete` is false because the role filter narrowed
+/// the population the counters were taken over.
+pub const COVERAGE_LIMIT_GRAPH_ROLE_FILTER: &str = "graph_role_filter";
+/// Machine-stable reason `complete` is false because graph-owned source bodies
+/// are missing for some paths.
+pub const COVERAGE_LIMIT_GRAPH_BODY_GAP: &str = "graph_body_gap";
+
 /// Honest, in-band report of how complete the embedding (semantic) signal was
 /// for a locate query. This is the trust-contract "per-signal degradation"
 /// property: a partial semantic index is surfaced, not hidden behind an opaque
@@ -159,6 +248,41 @@ pub struct SemanticCoverage {
     /// that cannot observe bodies as degraded. Read `graph_bodies.observed` to
     /// tell "no gap" from "not looked at"; they are different answers.
     pub complete: bool,
+    /// What the embedding substrate itself was observed to be, decided by
+    /// [`EmbeddingState::observe`] at the moment the counters above were taken.
+    ///
+    /// This is the field a surface reporting on EMBEDDINGS reads.
+    /// [`Self::complete`] answers a wider question and cannot be narrowed back
+    /// to this one, which is the defect FIR-2543 reported: an envelope carried
+    /// `indexed 2112, pending 0` and `classes.embeddings: absent` because a
+    /// consumer derived an embedding verdict from a flag a role filter had
+    /// already cleared.
+    ///
+    /// Older payloads predate the field. Absent deserializes to `Unknown`,
+    /// because a reader that cannot see the observation has not observed
+    /// anything, and guessing `Present` from the counters is the structural zero
+    /// wearing the opposite costume.
+    #[serde(default = "semantic_embedding_state_default")]
+    pub embedding_state: EmbeddingState,
+    /// Every machine-stable reason [`Self::complete`] is false, in the order
+    /// they were observed. Empty when coverage is complete.
+    ///
+    /// `complete` is one bit over several independent causes with different
+    /// remediations: an absent index, an unfinished index, a narrowed
+    /// population, missing source bodies. A caller told only that it is false
+    /// cannot tell which of them to act on, and every consumer that guessed
+    /// guessed "run `kin embed`".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub limited_by: Vec<String>,
+    /// When these counters were sampled, RFC 3339 in UTC.
+    ///
+    /// Two surfaces reporting different embedding counts in the same minute is
+    /// the normal state of a store with a backfill running, and it is
+    /// indistinguishable from a store where one of them is wrong unless each
+    /// reading says when it was taken. Absent on payloads minted before the
+    /// field existed; never fabricated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_at: Option<String>,
     /// Human-readable note describing the degraded state, present only when the
     /// semantic signal was partial. Lexical + graph signals still ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -272,6 +396,24 @@ impl GraphBodyCoverage {
 
 fn semantic_signal_supported_default() -> bool {
     true
+}
+
+/// A payload minted before [`SemanticCoverage::embedding_state`] existed carries
+/// no observation of the embedding substrate, so it deserializes to one that
+/// says so.
+fn semantic_embedding_state_default() -> EmbeddingState {
+    EmbeddingState::Unknown
+}
+
+/// The instant a coverage observation was taken, RFC 3339 in UTC with second
+/// resolution. Second resolution is enough for the question the field answers,
+/// which is whether two surfaces read the same store minutes apart.
+pub(crate) fn coverage_read_at_now() -> Option<String> {
+    Some(
+        chrono::Utc::now()
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            .to_string(),
+    )
 }
 
 impl LocateResult {
@@ -1520,7 +1662,7 @@ fn cross_encoder_load_target(model_id: &str, snapshot: Option<&std::path::Path>)
 /// `vector_index_stats()` is the call that separates them, and reading it is a
 /// lock and an `Option` map rather than a walk of graph truth.
 #[cfg(feature = "vector")]
-fn vector_index_attached(graph: &kin_db::InMemoryGraph) -> bool {
+pub(crate) fn vector_index_attached(graph: &kin_db::InMemoryGraph) -> bool {
     graph.vector_index_stats().is_some()
 }
 
@@ -1528,7 +1670,7 @@ fn vector_index_attached(graph: &kin_db::InMemoryGraph) -> bool {
 /// arm of the coverage report is what callers read in this build; this exists
 /// so the two arms share one call shape.
 #[cfg(not(feature = "vector"))]
-fn vector_index_attached(_graph: &kin_db::InMemoryGraph) -> bool {
+pub(crate) fn vector_index_attached(_graph: &kin_db::InMemoryGraph) -> bool {
     false
 }
 
@@ -1622,6 +1764,15 @@ fn coverage_from_status(
             total: status.total,
             pending: status.pending,
             complete: false,
+            embedding_state: EmbeddingState::observe(
+                false,
+                false,
+                status.indexed,
+                status.total,
+                status.pending,
+            ),
+            limited_by: vec![COVERAGE_LIMIT_VECTOR_SUPPORT_DISABLED.to_string()],
+            read_at: coverage_read_at_now(),
             note: Some(
                 "semantic vector ranking is unsupported in this build; lexical and graph signals remain available"
                     .to_string(),
@@ -1652,12 +1803,27 @@ fn coverage_from_status(
             embedding_status_summary(status)
         ))
         };
+        let mut limited_by = Vec::new();
+        if !index_attached {
+            limited_by.push(COVERAGE_LIMIT_VECTOR_INDEX_ABSENT.to_string());
+        } else if !embedding_status_complete(status) {
+            limited_by.push(COVERAGE_LIMIT_EMBEDDINGS_INCOMPLETE.to_string());
+        }
         SemanticCoverage {
             supported: true,
             indexed: status.indexed,
             total: status.total,
             pending: status.pending,
             complete,
+            embedding_state: EmbeddingState::observe(
+                true,
+                index_attached,
+                status.indexed,
+                status.total,
+                status.pending,
+            ),
+            limited_by,
+            read_at: coverage_read_at_now(),
             note,
             graph_bodies: None,
         }
@@ -1674,8 +1840,18 @@ impl SemanticCoverage {
     /// carries, and an already-present embedding note is kept rather than
     /// overwritten, since both causes can hold at once and the caller needs to
     /// know which remediation applies.
+    ///
+    /// [`Self::embedding_state`] is deliberately untouched here. Neither cause
+    /// below is an observation about embeddings: a withheld test path was never
+    /// ranked and a body-less path cannot be ranked, and both hold on stores
+    /// whose every eligible entity carries a vector. Each is recorded in
+    /// [`Self::limited_by`] instead, which is what lets a consumer say why
+    /// `complete` is false without inventing an embedding shortfall to explain
+    /// it (FIR-2543).
     pub fn with_graph_bodies(mut self, bodies: GraphBodyCoverage) -> Self {
         if bodies.withholds_tests() {
+            self.limited_by
+                .push(COVERAGE_LIMIT_GRAPH_ROLE_FILTER.to_string());
             // Completeness is a claim about the population the caller asked
             // about, and this one was narrowed before the counters were taken.
             // Saying `complete: true` over it is the defect: the caller cannot
@@ -1695,6 +1871,8 @@ impl SemanticCoverage {
         }
         if bodies.has_gap() {
             self.complete = false;
+            self.limited_by
+                .push(COVERAGE_LIMIT_GRAPH_BODY_GAP.to_string());
             let gap_note = format!(
                 "graph body gap: {} of {} graph-owned source paths carry no body, so entity \
                  ranking over them falls back to text matching; graph_bodies.sample names them.",
@@ -28143,6 +28321,9 @@ mod tests {
             total: 10,
             pending: 0,
             complete: true,
+            embedding_state: EmbeddingState::Present,
+            limited_by: Vec::new(),
+            read_at: None,
             note: None,
             graph_bodies: None,
         };
@@ -28157,6 +28338,9 @@ mod tests {
             total: 10,
             pending: 6,
             complete: false,
+            embedding_state: EmbeddingState::Partial,
+            limited_by: vec![COVERAGE_LIMIT_EMBEDDINGS_INCOMPLETE.to_string()],
+            read_at: None,
             note: Some("custom degradation note".to_string()),
             graph_bodies: None,
         };
@@ -28172,6 +28356,9 @@ mod tests {
             total: 10,
             pending: 6,
             complete: false,
+            embedding_state: EmbeddingState::Partial,
+            limited_by: vec![COVERAGE_LIMIT_EMBEDDINGS_INCOMPLETE.to_string()],
+            read_at: None,
             note: None,
             graph_bodies: None,
         };
@@ -28193,6 +28380,9 @@ mod tests {
             total: 1644,
             pending: 0,
             complete: true,
+            embedding_state: EmbeddingState::Present,
+            limited_by: Vec::new(),
+            read_at: None,
             note: None,
             graph_bodies: None,
         }
@@ -28324,6 +28514,9 @@ mod tests {
             total: 10,
             pending: 6,
             complete: false,
+            embedding_state: EmbeddingState::Partial,
+            limited_by: vec![COVERAGE_LIMIT_EMBEDDINGS_INCOMPLETE.to_string()],
+            read_at: None,
             note: Some("semantic signal partial: 4/10 embedded.".to_string()),
             graph_bodies: None,
         };
