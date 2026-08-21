@@ -1164,6 +1164,66 @@ async fn save_snapshot_blocking(state: Arc<DaemonState>) -> Result<()> {
 /// How often the owner-death watchdog checks whether the owning process is
 /// still alive. A `kill(pid, 0)` every couple of seconds is a single cheap
 /// syscall, so this is set for detection latency rather than to save work.
+/// How long endpoint publication waits for the reconcile loop's file watcher.
+///
+/// A ceiling, not an amount of waiting: the healthy path returns the instant the
+/// loop reports, and this only decides how long a wedged loop may hold the
+/// endpoint back. Registering a recursive watch is fast on the backends Kin
+/// uses, so reaching this bound means something is wrong rather than large.
+const WATCH_ARMING_BOUND: Duration = Duration::from_secs(30);
+
+/// How the wait for the reconcile loop's watch ended.
+///
+/// Three outcomes rather than a bool because they mean different things to an
+/// operator reading the log. Only `Armed` promises that a write landing after
+/// the endpoint appears will be observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WatchArming {
+    /// The loop reported its watcher. Publication is safe to proceed.
+    Armed,
+    /// The loop ended before reporting one, which is what a disabled
+    /// reconciler, a bare checkout or a refused watcher looks like from here.
+    /// There is no watch to wait for, so waiting longer buys nothing.
+    LoopGone,
+    /// The bound expired with the loop neither arming nor ending.
+    TimedOut,
+}
+
+/// Wait for the reconcile loop to report its file watcher, but never forever.
+///
+/// Publishing late beats not publishing: an endpoint that never appears is a
+/// daemon no client can reach, so the bound expires into publication with the
+/// reason recorded rather than into a refusal.
+pub(crate) async fn await_watch_armed(
+    armed: tokio::sync::oneshot::Receiver<()>,
+    bound: Duration,
+) -> WatchArming {
+    match tokio::time::timeout(bound, armed).await {
+        Ok(Ok(())) => WatchArming::Armed,
+        Ok(Err(_)) => WatchArming::LoopGone,
+        Err(_) => WatchArming::TimedOut,
+    }
+}
+
+/// Say what the wait produced, at the level each outcome deserves.
+fn announce_watch_arming(arming: WatchArming, bound: Duration) {
+    match arming {
+        WatchArming::Armed => {
+            debug!("the reconciliation watch is armed; publishing the daemon endpoint")
+        }
+        WatchArming::LoopGone => info!(
+            "the reconciliation loop ended before arming a watch, so this daemon observes no \
+             working-copy edits; publishing the endpoint so it stays reachable"
+        ),
+        WatchArming::TimedOut => warn!(
+            bound_s = bound.as_secs(),
+            "the reconciliation loop did not report a file watcher within its bound; publishing \
+             the endpoint anyway, so a host write landing now may go unobserved until an \
+             explicit admission seam takes it"
+        ),
+    }
+}
+
 const OWNER_WATCH_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Validate a raw `KIN_DAEMON_WATCH_PID` value into an owner PID this daemon may
@@ -2415,6 +2475,39 @@ pub async fn run_with_authority_on(
         }
     };
 
+    // Shutdown signal: when set to true, all loops exit.
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+    // Spawn the reconciliation loop BEFORE the endpoint is published, and wait
+    // for it to report its file watcher.
+    //
+    // Serving is not watching. The endpoint file is the readiness signal real
+    // clients key on, so a client that connects the moment it appears and
+    // writes immediately used to land in a window where the watcher did not yet
+    // exist: the write raised no event, startup replayed nothing, and the file
+    // stayed absent from the graph until some unrelated later touch of the same
+    // path (FIR-2466). Publishing after the watch closes that window by
+    // construction rather than by racing it.
+    //
+    // The wait is bounded and the signal fires on the loop's drop as well as on
+    // arming, so no early return, disabled loop, bare checkout, or refused
+    // watcher can leave this daemon unpublished.
+    let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
+    let loop_state = Arc::clone(&state);
+    let loop_config = config.loop_config.clone();
+    let loop_cancel = cancel_rx.clone();
+    let loop_handle = tokio::spawn(async move {
+        loop_runner::run_loop_armed(
+            loop_state,
+            loop_config,
+            loop_cancel,
+            Some(loop_runner::WatchArmed::new(armed_tx)),
+        )
+        .await
+    });
+    let arming = await_watch_armed(armed_rx, WATCH_ARMING_BOUND).await;
+    announce_watch_arming(arming, WATCH_ARMING_BOUND);
+
     // Publish PID and the actual bound port as one lifecycle-authorized
     // operation. Endpoint retirement takes the same authority, so no client can
     // delete a successor publication using a verdict about its predecessor.
@@ -2427,6 +2520,10 @@ pub async fn run_with_authority_on(
     // costs nothing here because it advertises nothing; only publication does.
     crate::lifecycle::publish_daemon_endpoint(state.layout.root(), bound_port)
         .map_err(DaemonError::Io)?;
+    // Recorded so the ordering above is readable off the daemon's own log
+    // rather than inferred from timings. A watcher record that does not precede
+    // this one is the regression.
+    info!(port = bound_port, "published the daemon endpoint");
 
     // Retire the readiness surface: the full API serves this socket from here.
     // Both handles accept from one listen queue, so there is no instant at which
@@ -2435,9 +2532,6 @@ pub async fn run_with_authority_on(
     if let Some(ready_tx) = warming_retired {
         let _ = ready_tx.send(true);
     }
-
-    // Shutdown signal: when set to true, all loops exit.
-    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
     info!(port = bound_port, "starting kin daemon");
 
@@ -2521,15 +2615,6 @@ pub async fn run_with_authority_on(
             warn!(error = %error, "failed to spawn owner-death watchdog");
         }
     }
-
-    // Spawn the reconciliation loop.
-    let loop_state = Arc::clone(&state);
-    let loop_config = config.loop_config.clone();
-    let loop_cancel = cancel_rx.clone();
-    let loop_handle =
-        tokio::spawn(
-            async move { loop_runner::run_loop(loop_state, loop_config, loop_cancel).await },
-        );
 
     // Spawn the API server on the pre-bound listener.
     let api_state = Arc::clone(&state);
@@ -4560,16 +4645,69 @@ async fn select_with_signals(
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        coverage_drain_verdict, drain_pending_flush, embed_work_outstanding,
+        await_watch_armed, coverage_drain_verdict, drain_pending_flush, embed_work_outstanding,
         format_singleton_contention, next_embed_error_backoff, parse_duration_secs,
         parse_owner_watch_pid, should_enable_lsp_enrichment, should_flush_now, shutdown_signalled,
         watched_process_is_alive, ControlPlane, CoverageDrainVerdict, DaemonConfig, DaemonState,
-        FlushSuppression, DEFAULT_RUNTIME_SHUTDOWN_GRACE, DEFAULT_SHUTDOWN_ESCALATION_GRACE,
-        RECON_IDLE,
+        FlushSuppression, WatchArming, DEFAULT_RUNTIME_SHUTDOWN_GRACE,
+        DEFAULT_SHUTDOWN_ESCALATION_GRACE, RECON_IDLE,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    /// FIR-2466. The healthy path: the loop reports its watcher and publication
+    /// proceeds.
+    ///
+    /// The arming is deliberately delayed rather than already sent. A future
+    /// that is ready on its first poll returns before any deadline applies, so a
+    /// version of this test with an instantly-ready signal stays green at a
+    /// one-nanosecond bound and can never tell waiting from not waiting.
+    #[tokio::test]
+    async fn a_reported_watch_releases_publication() {
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            let _ = armed_tx.send(());
+        });
+
+        assert_eq!(
+            await_watch_armed(armed_rx, Duration::from_secs(10)).await,
+            WatchArming::Armed,
+            "a watch reported inside the bound is what lets the endpoint be published"
+        );
+    }
+
+    /// A loop that ends before building a watcher releases publication too.
+    ///
+    /// Filesystem reconcile switched off, a bare checkout, or a watcher the host
+    /// refused all reach this. There is no watch coming, so waiting the bound
+    /// out would hold the endpoint back for nothing.
+    #[tokio::test]
+    async fn a_loop_that_ends_without_a_watch_releases_publication_at_once() {
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel::<()>();
+        drop(armed_tx);
+
+        assert_eq!(
+            await_watch_armed(armed_rx, Duration::from_secs(10)).await,
+            WatchArming::LoopGone
+        );
+    }
+
+    /// The bound is a ceiling on a wedged loop, not on a healthy one. An
+    /// endpoint that never appears is a daemon no client can reach, so the wait
+    /// expires into publication with the reason recorded.
+    #[tokio::test]
+    async fn a_loop_that_never_reports_stops_holding_publication_at_its_bound() {
+        // Held rather than dropped: dropping it is the LoopGone arm above, and
+        // this arm is the one where nothing happens at all.
+        let (_armed_tx, armed_rx) = tokio::sync::oneshot::channel::<()>();
+
+        assert_eq!(
+            await_watch_armed(armed_rx, Duration::from_millis(80)).await,
+            WatchArming::TimedOut
+        );
+    }
 
     #[test]
     fn default_embed_batch_is_backlog_friendly() {

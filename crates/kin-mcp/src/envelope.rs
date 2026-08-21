@@ -472,6 +472,107 @@ pub struct Durability {
     pub note: String,
 }
 
+/// How far graph truth is behind the working copy this daemon watches.
+///
+/// Two facts a reader has to have together. `unadmitted_paths` is how many host
+/// paths the daemon's most recent complete walk observed that repository
+/// authority does not carry and no observation covered; `since` is when a
+/// complete admission last succeeded. Either alone misleads. A count with no
+/// clock cannot say whether the store fell behind a second ago or a month ago,
+/// and a clock with no count cannot say whether anything is actually missing.
+///
+/// Present only when the store IS behind. An absent object is not a claim that
+/// it is current: a runtime that reported no reconcile reading has nothing to
+/// say here, and reporting a zero it never verified is the shape of wrong
+/// answer this object exists to stop.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GraphBehind {
+    /// Host paths on disk that no admission has taken.
+    pub unadmitted_paths: u64,
+    /// When a complete admission last succeeded, as the daemon reported it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    /// A bounded sample of the unadmitted paths, enough to recognize the file
+    /// you just wrote.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sample: Vec<String>,
+    /// One line an agent can act on without reading the counts.
+    pub note: String,
+}
+
+impl GraphBehind {
+    /// Read the two halves out of a daemon `/health` body.
+    ///
+    /// `None` when the body carries no reconcile reading at all, and `None`
+    /// again when it reports nothing unadmitted. The two are different facts and
+    /// both are correctly silent here: this object speaks only when the store is
+    /// behind, and the gates that consume it treat its silence as no reading
+    /// rather than as an all-clear.
+    pub fn from_health(health: &Value) -> Option<Self> {
+        let reconcile = health.get("reconcile")?;
+        let unadmitted_paths = reconcile.get("untracked_path_count")?.as_u64()?;
+        if unadmitted_paths == 0 {
+            return None;
+        }
+        let since = reconcile
+            .get("last_admission_success_at")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let sample = reconcile
+            .get("untracked_paths_sample")
+            .and_then(Value::as_array)
+            .map(|paths| {
+                paths
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let note = Self::describe(unadmitted_paths, since.as_deref());
+        Some(Self {
+            unadmitted_paths,
+            since,
+            sample,
+            note,
+        })
+    }
+
+    fn describe(unadmitted_paths: u64, since: Option<&str>) -> String {
+        let clock = match since {
+            Some(since) => format!("the last complete admission was at {since}"),
+            None => {
+                "this daemon has not reported when a complete admission last succeeded".to_string()
+            }
+        };
+        format!(
+            "{unadmitted_paths} host path(s) are on disk that graph truth does not carry, and \
+             {clock}. Answers here cover admitted content only. `kin admit` takes those paths \
+             now, and a commit takes them anyway."
+        )
+    }
+
+    /// The machine-stable reason an absence claim cannot be certified over this
+    /// store.
+    ///
+    /// A symbol defined only inside an unadmitted path is absent from every
+    /// index the query reads, so the answer is right about the graph and wrong
+    /// about the repository. That is the difference between "not there" and "not
+    /// admitted yet", and it is the whole of what this factor names.
+    pub fn limiting_factor(&self) -> String {
+        let clock = match self.since.as_deref() {
+            Some(since) => format!("the last complete admission was at {since}"),
+            None => "no complete admission has been reported".to_string(),
+        };
+        format!(
+            "graph_behind_working_tree: {} host path(s) on disk have never been admitted and \
+             {clock}, so an absence here cannot be told apart from content the graph has not \
+             taken yet",
+            self.unadmitted_paths
+        )
+    }
+}
+
 impl Durability {
     /// Derive the durability state from the two counts the daemon observed.
     ///
@@ -536,6 +637,31 @@ impl Durability {
                 }
             ),
         }
+    }
+
+    /// Restate this reading over a store the working copy has outrun.
+    ///
+    /// [`Self::observe`] compares two ENTITY counts, so it answers a question
+    /// about what a commit carries and is structurally unable to see a file no
+    /// admission has taken. A store holding unadmitted host paths therefore
+    /// reached `recorded` and said "durable repository authority records
+    /// everything answering here" over a repository holding a 140-line module
+    /// the graph had never met (FIR-2499). The counts are left exactly as
+    /// observed, because they were never the wrong part; what changes is the
+    /// claim made from them.
+    pub fn qualified_by(mut self, behind: &GraphBehind) -> Self {
+        let counts = match (self.live_entities, self.live_only_entities) {
+            (Some(live), Some(live_only)) => format!("{live} entities, {live_only} uncommitted"),
+            (Some(live), None) => format!("{live} entities"),
+            _ => "this graph".to_string(),
+        };
+        self.note = format!(
+            "{counts}, and {} host path(s) on disk that no admission has taken; this reading \
+             covers admitted content only. `kin admit` takes those paths now, and a commit takes \
+             them anyway.",
+            behind.unadmitted_paths
+        );
+        self
     }
 
     /// True when durable authority does not carry everything the answer read.
@@ -1193,6 +1319,18 @@ pub struct Envelope {
     /// saying `unknown` for a runtime that has no durable layer to compare to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub durability: Option<Durability>,
+    /// How far graph truth is behind the working copy, when the runtime
+    /// reported that it is behind at all.
+    ///
+    /// Beside `durability` rather than inside it because the two count
+    /// different things and can disagree. `durability` compares entity counts
+    /// and answers "is what answered here recorded"; this compares the graph to
+    /// the host and answers "is there content that never reached the graph at
+    /// all". A store can be perfectly durable and still be missing the file you
+    /// wrote a minute ago, which is exactly the pair FIR-2499 caught reporting
+    /// an all-clear.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behind: Option<GraphBehind>,
     /// Honest graph freshness context; omitted entirely when nothing is known.
     #[serde(default, skip_serializing_if = "GraphState::is_empty")]
     pub graph_state: GraphState,
@@ -1233,6 +1371,7 @@ impl Envelope {
             semantic_coverage: None,
             graph_as_of: None,
             durability: None,
+            behind: None,
             graph_state: GraphState::default(),
             degraded: Degraded {
                 offline_fallback: Some(true),
@@ -1254,6 +1393,7 @@ impl Envelope {
             semantic_coverage: None,
             graph_as_of: None,
             durability: None,
+            behind: None,
             graph_state: GraphState::default(),
             degraded: Degraded::default(),
             completeness: None,
@@ -1306,7 +1446,15 @@ impl Envelope {
             graph_body_gap_paths: None,
         });
         self.graph_as_of = None;
-        self.durability = Some(Durability::observe(entity_count, durable_entity_count));
+        let durability = Durability::observe(entity_count, durable_entity_count);
+        // Requalified rather than replaced. This runs on the graph-status path,
+        // which may set durability after `with_health` has already read the
+        // reconcile block, and a plain assignment there would restore the
+        // all-clear note that block exists to withdraw.
+        self.durability = Some(match self.behind.as_ref() {
+            Some(behind) => durability.qualified_by(behind),
+            None => durability,
+        });
         self.graph_state = GraphState {
             entity_count: Some(entity_count),
             ..GraphState::default()
@@ -1342,6 +1490,7 @@ impl Envelope {
             semantic_coverage: None,
             graph_as_of: None,
             durability: None,
+            behind: None,
             graph_state: GraphState::default(),
             degraded: Degraded {
                 daemon_unreachable: Some(true),
@@ -1368,6 +1517,7 @@ impl Envelope {
             semantic_coverage: None,
             graph_as_of: None,
             durability: None,
+            behind: None,
             graph_state: GraphState::default(),
             degraded: Degraded {
                 workspace_mismatch: Some(true),
@@ -1414,6 +1564,17 @@ impl Envelope {
                 live,
                 health.get("durable_entity_count").and_then(Value::as_u64),
             ));
+        }
+        // Read after the counts, and applied to them. The reconcile block is
+        // the only place a response can learn that the host holds content the
+        // graph never met, and without it every surface built from the counts
+        // above states an all-clear it did not verify.
+        self.behind = GraphBehind::from_health(health);
+        if let Some(behind) = self.behind.as_ref() {
+            self.durability = self
+                .durability
+                .take()
+                .map(|durability| durability.qualified_by(behind));
         }
         // The daemon `/health` `graph_generation` marker (monotonic snapshot
         // generation, bumped per committed snapshot) is a precise freshness
@@ -1973,6 +2134,132 @@ mod tests {
             .with_health(&serde_json::json!({ "graph_loaded": true }))
             .durability
             .is_none());
+    }
+
+    /// FIR-2499. The pair that was wrong together: a store holding an
+    /// unadmitted module reported "0 uncommitted; durable repository authority
+    /// records everything answering here".
+    #[test]
+    fn a_store_holding_unadmitted_host_paths_never_reports_an_all_clear() {
+        let env = Envelope::daemon().with_health(&serde_json::json!({
+            "graph_entity_count": 51,
+            "durable_entity_count": 51,
+            "reconcile": {
+                "untracked_path_count": 1,
+                "untracked_paths_sample": ["notekeeper/search.py"],
+                "last_admission_success_at": "2026-08-20T13:00:00Z",
+            },
+        }));
+
+        let behind = env
+            .behind
+            .as_ref()
+            .expect("a reported untracked path is the store being behind");
+        assert_eq!(behind.unadmitted_paths, 1);
+        assert_eq!(behind.since.as_deref(), Some("2026-08-20T13:00:00Z"));
+        assert_eq!(behind.sample, vec!["notekeeper/search.py".to_string()]);
+
+        let durability = env.durability.expect("the counts still answer");
+        assert_eq!(
+            durability.live_entities,
+            Some(51),
+            "the counts were never the wrong part and are left exactly as observed"
+        );
+        assert!(
+            !durability
+                .note
+                .contains("records everything answering here"),
+            "the all-clear this reading cannot make: {}",
+            durability.note
+        );
+        assert!(
+            durability
+                .note
+                .contains("host path(s) on disk that no admission has taken"),
+            "the note has to name what it does not cover: {}",
+            durability.note
+        );
+    }
+
+    /// FIR-2499. The graph-status path sets durability after `with_health` has
+    /// already read the reconcile block, so it has to requalify rather than
+    /// assign.
+    ///
+    /// This is the sibling of the case above and it needed its own: a plain
+    /// assignment here restores the all-clear the reconcile block exists to
+    /// withdraw, and every assertion on the `with_health` path stays green
+    /// while it does, because that path is not the one this call rewrites.
+    #[test]
+    fn a_graph_status_reading_over_a_behind_store_does_not_restore_the_all_clear() {
+        let env = Envelope::daemon()
+            .with_health(&serde_json::json!({
+                "graph_entity_count": 51,
+                "durable_entity_count": 51,
+                "reconcile": {
+                    "untracked_path_count": 2,
+                    "untracked_paths_sample": ["notekeeper/search.py"],
+                    "last_admission_success_at": "2026-08-20T13:00:00Z",
+                },
+            }))
+            .with_selected_graph_observation(51, 51, 0, 51, Some(51));
+
+        let durability = env.durability.expect("graph status reports the counts");
+        assert!(
+            !durability
+                .note
+                .contains("records everything answering here"),
+            "the graph-status reading restored an all-clear over a behind store: {}",
+            durability.note
+        );
+        assert!(
+            durability
+                .note
+                .contains("host path(s) on disk that no admission has taken"),
+            "the note has to keep naming what it does not cover: {}",
+            durability.note
+        );
+    }
+
+    /// The control for the case above, and the one that keeps this from
+    /// qualifying every answer: a store with nothing unadmitted says so exactly
+    /// as before.
+    #[test]
+    fn a_store_with_nothing_unadmitted_keeps_its_recorded_reading() {
+        let env = Envelope::daemon().with_health(&serde_json::json!({
+            "graph_entity_count": 51,
+            "durable_entity_count": 51,
+            "reconcile": { "untracked_path_count": 0 },
+        }));
+
+        assert!(env.behind.is_none(), "nothing unadmitted is nothing to say");
+        let durability = env.durability.expect("the counts still answer");
+        assert_eq!(durability.state, "recorded");
+        assert!(
+            durability
+                .note
+                .contains("records everything answering here"),
+            "{}",
+            durability.note
+        );
+    }
+
+    /// A body carrying no reconcile reading at all says nothing here. Silence
+    /// is the absence of a reading, never a zero this envelope did not verify.
+    #[test]
+    fn a_health_body_with_no_reconcile_reading_makes_no_behind_claim() {
+        let env = Envelope::daemon().with_health(&serde_json::json!({
+            "graph_entity_count": 51,
+            "durable_entity_count": 51,
+        }));
+        assert!(env.behind.is_none());
+
+        // And a reconcile block that omits the count is the same answer, which
+        // is the arm that would otherwise read as zero.
+        let partial = Envelope::daemon().with_health(&serde_json::json!({
+            "graph_entity_count": 51,
+            "reconcile": { "skipped_events": 3 },
+        }));
+        assert!(partial.behind.is_none());
     }
 
     #[test]

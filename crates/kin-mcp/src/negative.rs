@@ -1075,6 +1075,25 @@ pub(crate) fn edge_coverage_degradation_labels(tool: &str, payload: &Value) -> V
 /// `trust_reason` directly. Direct assignment is how a cross-repo topology note
 /// came to overwrite the reason an absence was actually limited by, leaving a
 /// correct verdict beside an unrelated explanation.
+/// Host content on disk that no admission has taken, which no absence claim can
+/// see past.
+///
+/// The store answered from graph truth, and graph truth does not carry these
+/// paths at all. A symbol defined only inside one of them is missing from every
+/// index the query reads, so the answer is right about the graph and wrong about
+/// the repository. That is how `semantic_search` returned
+/// `safe_to_conclude_absent: true` for a function sitting in a 140-line module
+/// on disk, with `durability` in the same payload reading "0 uncommitted"
+/// (FIR-2499).
+///
+/// Silence here is the absence of a reading, never an all-clear: the envelope
+/// carries this object only when the runtime reported that the store is behind,
+/// and a runtime that reported no reconcile block at all is already refused by
+/// the runtime gates above.
+fn unadmitted_host_content_gap(envelope: &Envelope) -> Option<String> {
+    Some(envelope.behind.as_ref()?.limiting_factor())
+}
+
 fn push_gap(trustworthy: &mut bool, trust_reason: &mut String, gap: String) {
     *trust_reason = if *trustworthy {
         gap
@@ -2003,6 +2022,17 @@ pub fn negative_for(
     // if it were.
     if let Some(gap) = absence_coverage_gap(tool, payload) {
         push_gap(&mut trustworthy, &mut trust_reason, gap);
+    }
+
+    // Scoped to answers that actually claim an absence, for the same reason the
+    // cross-repo gate below is. A store being behind bounds what "nothing is
+    // there" can mean; it says nothing about whether the rows a populated answer
+    // did return are real, and applying it there would put a floor under every
+    // answer on every working copy holding one untracked file.
+    if claims_absence {
+        if let Some(gap) = unadmitted_host_content_gap(envelope) {
+            push_gap(&mut trustworthy, &mut trust_reason, gap);
+        }
     }
 
     // Gaps the response carries that this function cannot observe from the
@@ -3319,6 +3349,86 @@ mod tests {
         let negative = negative_for("semantic_search", &populated, &structural_ready_envelope())
             .expect("empty results yields a negative");
         assert_eq!(negative["safe_to_conclude_absent"], json!(true));
+    }
+
+    /// FIR-2499. An absence over a store the working copy has outrun is
+    /// unknown, not absent.
+    ///
+    /// The reported case: `semantic_search("build_match_query")` returned zero
+    /// rows with `safe_to_conclude_absent: true` while the function sat in a
+    /// 140-line module on disk that no admission had taken. The graph answered
+    /// correctly and the claim made from it was wrong, because the module was in
+    /// no index the query reads.
+    #[test]
+    fn an_absence_over_unadmitted_host_content_certifies_nothing() {
+        // The scope carries a measured coverage class, which is what lets this
+        // payload certify at all. Without it the FIR-2496 refusal answers first
+        // and the control below asserts a certification no payload of this shape
+        // can make, which would leave this case unable to tell a working gate
+        // from a broken one.
+        let payload = empty_search_page(scope_with_a_measured_class(Some(29)));
+
+        // The positive control first, so a failure below cannot be the payload
+        // simply never certifying.
+        let certified = negative_for("semantic_search", &payload, &structural_ready_envelope())
+            .expect("empty results yields a negative");
+        assert_eq!(
+            certified["safe_to_conclude_absent"],
+            json!(true),
+            "the control this test rests on: the same payload certifies when the store is level"
+        );
+
+        let negative = negative_for("semantic_search", &payload, &behind_envelope(1))
+            .expect("empty results yields a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert_eq!(negative["trust"], json!("inconclusive"));
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            reason.contains("graph_behind_working_tree"),
+            "the factor names the store being behind: {reason}"
+        );
+        assert!(
+            reason.contains("host path(s) on disk have never been admitted"),
+            "and says what that means for the claim: {reason}"
+        );
+    }
+
+    /// The scope of the gate. A populated answer asserts no absence, so a store
+    /// being behind is not a limit on it; applying it there would put a floor
+    /// under every answer on every working copy holding one untracked file.
+    #[test]
+    fn a_populated_answer_is_not_qualified_by_unadmitted_host_content() {
+        let mut payload = empty_search_page(resolvable_language_scope(Some(29)));
+        payload["results"] = json!([{ "entity_id": "e1", "name": "build_match_query" }]);
+        payload["total_matches"] = json!(1);
+
+        let level = negative_for("semantic_search", &payload, &structural_ready_envelope());
+        let behind = negative_for("semantic_search", &payload, &behind_envelope(1));
+        let reason_of = |value: &Option<Value>| {
+            value
+                .as_ref()
+                .and_then(|negative| negative["trust_reason"].as_str().map(str::to_string))
+        };
+        assert_eq!(
+            reason_of(&behind),
+            reason_of(&level),
+            "a populated answer reads the same either way; this gate speaks only about absences"
+        );
+    }
+
+    /// A daemon envelope that is otherwise authoritative over a store holding
+    /// host paths no admission has taken.
+    fn behind_envelope(unadmitted_paths: u64) -> Envelope {
+        Envelope::daemon().with_health(&json!({
+            "graph_loaded": true,
+            "initialized": true,
+            "graph_generation": 12,
+            "reconcile": {
+                "untracked_path_count": unadmitted_paths,
+                "untracked_paths_sample": ["notekeeper/search.py"],
+                "last_admission_success_at": "2026-08-20T13:00:00Z",
+            },
+        }))
     }
 
     #[test]

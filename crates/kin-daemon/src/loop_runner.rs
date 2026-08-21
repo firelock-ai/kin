@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use kin_index::{
     FileClassification, FileClassifier, FileEvent, FileWatcher, IndexPipeline, IndexedAny,
@@ -1812,11 +1812,161 @@ async fn park_reconcile_loop(
 /// 4. Projects overlay mutations back to files (overlay -> file)
 ///
 /// The loop runs on a tokio task and shares state through `DaemonState`.
+/// The reconcile loop's one-shot promise that its file watcher exists.
+///
+/// Fired on arming, and fired again on drop if the loop never got that far.
+/// Drop-firing is the whole safety argument for making endpoint publication
+/// wait on it. A loop can end before it ever builds a watcher — filesystem
+/// reconcile switched off, a bare checkout, a watcher the host refused — and a
+/// daemon that waited on a signal none of those paths sends would never publish
+/// its endpoint at all, which is a worse failure than the unobserved window
+/// this exists to close.
+#[derive(Debug)]
+pub struct WatchArmed(Option<tokio::sync::oneshot::Sender<()>>);
+
+impl WatchArmed {
+    pub fn new(signal: tokio::sync::oneshot::Sender<()>) -> Self {
+        Self(Some(signal))
+    }
+
+    /// Report the watch, once. Later calls and the drop below do nothing.
+    fn arm(&mut self) {
+        if let Some(signal) = self.0.take() {
+            let _ = signal.send(());
+        }
+    }
+}
+
+impl Drop for WatchArmed {
+    fn drop(&mut self) {
+        self.arm();
+    }
+}
+
+/// When a startup catch-up should begin, or `None` when no window can be named.
+///
+/// The window opens at the last complete admission this store recorded, because
+/// that is the last moment anything is known to have observed the working copy.
+/// A file watcher only ever reports edits it was alive for, so everything the
+/// host did between one daemon's last admission and the next daemon's watch was
+/// seen by nobody, and nothing replays it. That stretch is the whole of the
+/// "graph is one commit behind the work" complaint, and it is not only a
+/// startup artifact: an idle timeout ends a daemon mid-session and the next
+/// command starts a fresh one.
+///
+/// A store with no marker gets no catch-up. Absent means either never admitted
+/// or admitted by a build older than the marker, and neither supplies a window;
+/// with no lower bound the pass would propose the entire working copy, which is
+/// exactly the sweep startup must not perform. An unreadable marker is the same
+/// answer said louder, so it is logged rather than silently treated as absent.
+fn startup_catch_up_window(state: &DaemonState) -> Option<SystemTime> {
+    match kin_core::last_admission::read(&state.layout) {
+        kin_core::last_admission::LastAdmissionRead::Recorded(recorded) => {
+            let since = unix_instant(recorded.at);
+            info!(
+                since = %recorded.at.to_rfc3339(),
+                "planning a startup catch-up over host paths modified since the last complete \
+                 admission"
+            );
+            Some(since)
+        }
+        kin_core::last_admission::LastAdmissionRead::Absent => {
+            debug!(
+                "no last-admission marker, so no catch-up window can be named; working-copy \
+                 divergence stays projection drift until an explicit seam admits it"
+            );
+            None
+        }
+        kin_core::last_admission::LastAdmissionRead::Unreadable(reason) => {
+            warn!(
+                reason = %reason,
+                "the last-admission marker will not parse, so no catch-up window can be named; \
+                 `kin admit` takes whatever the host changed while nothing was watching"
+            );
+            None
+        }
+    }
+}
+
+/// A UTC instant as a [`SystemTime`], for comparison against host modification
+/// times.
+///
+/// A marker stamped before the epoch clamps to the epoch rather than wrapping.
+/// No real store carries one, and a wrap would silently move the window to the
+/// far future, which is the direction that loses every file.
+fn unix_instant(at: chrono::DateTime<chrono::Utc>) -> SystemTime {
+    let seconds = at.timestamp();
+    if seconds < 0 {
+        return SystemTime::UNIX_EPOCH;
+    }
+    SystemTime::UNIX_EPOCH + Duration::new(seconds as u64, at.timestamp_subsec_nanos())
+}
+
+/// Host events for every path the working copy changed at or after `since`.
+///
+/// Stat-only: the walk that produces this opens nothing and hashes nothing, so
+/// a store whose host did not move since its last admission pays one traversal
+/// and returns an empty list. The events it does return go through the ordinary
+/// tick, so a catch-up path is admitted by the same bounded observation, the
+/// same policy filter and the same compare-and-swap as one the watcher saw.
+/// This plans no transition of its own and publishes nothing.
+///
+/// The bound is inclusive because filesystem modification times are coarse. A
+/// file written in the same second the marker was stamped is re-observed, and
+/// re-observing an unchanged path costs one admission that plans nothing.
+fn plan_catch_up_events(state: &DaemonState, since: SystemTime) -> Result<Vec<FileEvent>> {
+    let working_dir = state.layout.working_dir();
+    let (_, policy) = current_authority_admission(state)?;
+    let previous = state.graph.resolved_tree();
+    let tracked_paths = previous
+        .artifacts_by_path()
+        .map(|artifact| artifact.path.clone())
+        .collect::<Vec<_>>();
+    let graph_only_paths = crate::graph_only_members::members_of(&previous)?;
+    let ignore =
+        kin_index::RepositoryIgnore::load(working_dir).map_err(kin_index::IndexError::from)?;
+    let modified = kin_index::scan_repository_modified_since(
+        working_dir,
+        &ignore,
+        policy.as_ref(),
+        tracked_paths.iter(),
+        graph_only_paths.iter(),
+        since,
+    )
+    .map_err(kin_index::IndexError::from)?;
+    Ok(modified
+        .iter()
+        .filter_map(|path| kin_index::host_path_from_repo_path(working_dir, path).ok())
+        .map(FileEvent::Changed)
+        .collect())
+}
+
 pub async fn run_loop(
     state: Arc<DaemonState>,
     config: LoopConfig,
     cancel: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
+    run_loop_armed(state, config, cancel, None).await
+}
+
+/// Run the loop and report the moment its file watcher exists.
+///
+/// The daemon publishes `.kin/daemon.port` only after this fires, so a client
+/// that finds the endpoint is finding a daemon that is already observing the
+/// working copy. Before this signal existed the endpoint was published first
+/// and the loop was spawned afterwards, so a write landing in between raised no
+/// event and nothing ever replayed it: the graph simply never learned about
+/// that file (FIR-2466).
+pub async fn run_loop_armed(
+    state: Arc<DaemonState>,
+    config: LoopConfig,
+    cancel: tokio::sync::watch::Receiver<bool>,
+    armed: Option<WatchArmed>,
+) -> Result<()> {
+    // Held for the whole body so every early return below still releases the
+    // daemon, through `WatchArmed`'s drop rather than through a call each of
+    // those paths would have to remember.
+    let mut armed = armed;
     if state.filesystem_reconcile_disabled() {
         info!(
             env = DISABLE_FILESYSTEM_RECONCILE_ENV,
@@ -1842,6 +1992,16 @@ pub async fn run_loop(
     }
 
     let watcher = FileWatcher::new(working_dir).map_err(DaemonError::from)?;
+    // Read while the watcher is already reporting and before the endpoint can
+    // be published, so the catch-up window and the watch meet rather than leave
+    // a seam between them. Planning the pass itself is deliberately left to the
+    // first round: the window is fixed here, the walk is not on the path to
+    // publication, and a client finding the port is never waiting on a
+    // traversal.
+    let mut catch_up_owed = startup_catch_up_window(&state);
+    if let Some(armed) = armed.as_mut() {
+        armed.arm();
+    }
     let enrichment_pipeline = IndexPipeline::new();
     // The watcher's running total of host events it could not place inside this
     // repository, as this loop last disclosed it. Held so a standing count is
@@ -1854,16 +2014,21 @@ pub async fn run_loop(
         "reconciliation loop started"
     );
 
-    // Startup deliberately admits nothing. Repository authority is already
-    // complete when the daemon opens it, and the working copy is a derived
-    // view of that authority. Sweeping the working copy here would publish
-    // whatever bytes happen to sit on disk into the repository-v6 workspace
-    // before any command runs, so a command that spawned this daemon would
-    // observe ambiently ingested content as graph-owned workspace state.
-    // Working-copy content crosses the compare-and-swap only through live
-    // watcher-observed edits below and through explicit admission seams such
-    // as `/commands/commit`. Divergence introduced while no daemon was
-    // running stays projection drift until one of those seams admits it.
+    // Startup sweeps nothing. Repository authority is already complete when the
+    // daemon opens it, and the working copy is a derived view of that
+    // authority. Admitting whatever bytes happen to sit on disk would publish
+    // them into the repository-v6 workspace before any command runs, so a
+    // command that spawned this daemon would observe ambiently ingested content
+    // as graph-owned workspace state.
+    //
+    // The one exception is bounded by a clock rather than by taste. A file
+    // watcher reports only the edits it was alive for, so the stretch between
+    // one daemon's last complete admission and the next daemon's watch was
+    // observed by nobody and nothing replays it. `catch_up_owed` above names
+    // that stretch, and the first round below re-observes exactly the paths the
+    // host modified inside it. Everything older is untouched: it predates the
+    // last admission, which already covered it, and divergence with no window
+    // to place it in stays projection drift until an explicit seam admits it.
 
     let interval = Duration::from_millis(config.poll_interval_ms);
     let mut cancel = cancel;
@@ -1955,6 +2120,36 @@ pub async fn run_loop(
         }
 
         sweep_expired_intents(&state).await;
+
+        // The catch-up, owed once and taken on the first round that gets this
+        // far. Enqueued as ordinary host events rather than admitted here, so
+        // every one of them crosses authority through the same bounded
+        // observation, the same policy filter and the same compare-and-swap a
+        // watcher-observed edit does. A pass that fails is logged and dropped:
+        // it is a repair, and retrying it forever would spend a traversal per
+        // round on a store that already has an explicit seam for this.
+        if let Some(since) = catch_up_owed.take() {
+            match plan_catch_up_events(&state, since) {
+                Ok(events) if events.is_empty() => {
+                    debug!("no host path changed since the last complete admission");
+                }
+                Ok(events) => {
+                    info!(
+                        count = events.len(),
+                        "admitting host paths modified since the last complete admission"
+                    );
+                    enqueue_file_events(&mut pending_events, events);
+                }
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "could not plan the startup catch-up, so host content written while \
+                         nothing was watching stays unadmitted until `kin admit` or a commit \
+                         takes it"
+                    );
+                }
+            }
+        }
 
         // Collect retries first and real watcher notifications second. Dedup once per tick,
         // only when something new arrived; a real remove/recreate therefore supersedes a
@@ -6367,6 +6562,328 @@ mod tests {
         assert!(
             commit_yield_grace(&state, Duration::from_secs(60)) <= COMMIT_YIELD_GRACE_CEILING,
             "no poll cadence may turn the grace into a stall"
+        );
+    }
+
+    /// FIR-2466. The daemon may not publish its endpoint on a promise the loop
+    /// never keeps, so the signal fires even when the loop never reaches its
+    /// watcher.
+    #[test]
+    fn a_watch_signal_fires_on_drop_when_the_loop_never_arms() {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        {
+            let _armed = WatchArmed::new(tx);
+        }
+        assert_eq!(
+            rx.try_recv(),
+            Ok(()),
+            "a dropped WatchArmed must release the daemon; a loop that ends before building a \
+             watcher would otherwise hold the endpoint back forever"
+        );
+    }
+
+    /// Arming is once. A second call after an explicit arm must not panic and
+    /// must not send again, because the receiver is a one-shot.
+    #[test]
+    fn a_watch_signal_arms_once_and_the_later_drop_is_silent() {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let mut armed = WatchArmed::new(tx);
+        armed.arm();
+        armed.arm();
+        drop(armed);
+        assert_eq!(rx.try_recv(), Ok(()), "the arm reaches the daemon");
+    }
+
+    /// A store that records no complete admission names no window, so the loop
+    /// falls back to admitting nothing at startup rather than proposing the
+    /// whole working copy.
+    #[test]
+    fn a_store_with_no_admission_marker_opens_no_catch_up_window() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        assert!(
+            matches!(
+                kin_core::last_admission::read(&state.layout),
+                kin_core::last_admission::LastAdmissionRead::Absent
+            ),
+            "the control this assertion rests on: a fresh store carries no marker"
+        );
+        assert_eq!(
+            startup_catch_up_window(&state),
+            None,
+            "with no lower bound the pass would propose the entire working copy, which is the \
+             sweep startup must never perform"
+        );
+    }
+
+    /// A recorded marker opens the window at its own instant, which is what
+    /// bounds the catch-up to the stretch nothing was watching.
+    #[test]
+    fn a_recorded_admission_marker_opens_the_window_at_its_own_instant() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let at = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        kin_core::last_admission::write(
+            &state.layout,
+            &kin_core::last_admission::LastAdmission::new(at, 7),
+        )
+        .unwrap();
+
+        assert_eq!(
+            startup_catch_up_window(&state),
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            "the window opens at the last complete admission, not at process start"
+        );
+    }
+
+    /// A marker stamped before the epoch clamps rather than wrapping. A wrap
+    /// would move the window to the far future, which loses every file.
+    #[test]
+    fn a_pre_epoch_marker_clamps_the_window_to_the_epoch() {
+        let before = chrono::DateTime::from_timestamp(-10, 0).unwrap();
+        assert_eq!(unix_instant(before), SystemTime::UNIX_EPOCH);
+        let after = chrono::DateTime::from_timestamp(5, 250_000_000).unwrap();
+        assert_eq!(
+            unix_instant(after),
+            SystemTime::UNIX_EPOCH + Duration::new(5, 250_000_000),
+            "the ordinary case is not clamped, which is the control for the arm above"
+        );
+    }
+
+    /// FIR-2499. The catch-up names what the host changed inside the window and
+    /// nothing older, and what it names is admissible by the ordinary ambient
+    /// path.
+    ///
+    /// Modification times are set outright rather than slept for, so the two
+    /// arms sit on either side of the window by construction instead of by
+    /// racing a filesystem's clock granularity.
+    #[test]
+    fn the_catch_up_names_host_paths_changed_inside_the_window_and_no_others() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+
+        let before = repo.path().join("settled.rs");
+        std::fs::write(&before, b"pub fn settled() -> u32 { 1 }\n").unwrap();
+        stamp_modified(
+            &before,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000),
+        );
+
+        let after = repo.path().join("written_while_nothing_watched.rs");
+        std::fs::write(&after, b"pub fn written() -> u32 { 2 }\n").unwrap();
+        stamp_modified(
+            &after,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(3_000_000),
+        );
+
+        let window = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000);
+        let planned = plan_catch_up_events(&state, window).unwrap();
+        let named = event_paths(&planned);
+        // The plan speaks in the working directory the state is bound to, which
+        // the layout resolved; a tempdir path is the unresolved form of the
+        // same entry, so the two are compared by leaf.
+        let named = named
+            .iter()
+            .filter_map(|path| path.file_name())
+            .map(|leaf| leaf.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        let after_leaf = "written_while_nothing_watched.rs".to_string();
+        let before_leaf = "settled.rs".to_string();
+
+        assert!(
+            named.contains(&after_leaf),
+            "a file written after the last admission is exactly what nothing observed: {named:?}"
+        );
+        assert!(
+            !named.contains(&before_leaf),
+            "a file older than the window was already covered by that admission: {named:?}"
+        );
+
+        // What the catch-up plans has to be admissible by the path it feeds,
+        // or the plan is a list nothing acts on.
+        let admitted = admit_file_event_ambient(&state, &FileEvent::Changed(after)).unwrap();
+        assert!(
+            matches!(admitted, AdmittedFileEvent::Regular { .. }),
+            "the catch-up's own event must reach the tree: {admitted:?}"
+        );
+        assert!(
+            tree_entry(&state, "written_while_nothing_watched.rs").is_some(),
+            "the file the graph never met is what the catch-up exists to admit"
+        );
+    }
+
+    /// The rules the catch-up walk shares with the content walk. An ignored
+    /// path is excluded whatever its modification time says, so the catch-up
+    /// cannot admit what an ordinary tick would refuse.
+    #[test]
+    fn the_catch_up_skips_a_path_the_ignore_rules_exclude() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join(".kinignore"), b"secrets.rs\n").unwrap();
+        let state = open_test_state(&repo);
+
+        let ignored = repo.path().join("secrets.rs");
+        std::fs::write(&ignored, b"pub fn secret() -> u32 { 3 }\n").unwrap();
+        stamp_modified(
+            &ignored,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(3_000_000),
+        );
+        let visible = repo.path().join("visible.rs");
+        std::fs::write(&visible, b"pub fn visible() -> u32 { 4 }\n").unwrap();
+        stamp_modified(
+            &visible,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(3_000_000),
+        );
+
+        let window = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000);
+        let named = event_paths(&plan_catch_up_events(&state, window).unwrap())
+            .iter()
+            .filter_map(|path| path.file_name())
+            .map(|leaf| leaf.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert!(
+            named.contains(&"visible.rs".to_string()),
+            "the positive control: an ordinary path inside the window is named: {named:?}"
+        );
+        assert!(
+            !named.contains(&"secrets.rs".to_string()),
+            "the catch-up walks under the same rules a tick does: {named:?}"
+        );
+    }
+
+    /// FIR-2499. A path graph truth already tracks is projection drift, not
+    /// catch-up work, however recently the host touched it.
+    ///
+    /// Repository authority holds bytes for a tracked path, so a host edit to
+    /// one is what `kin doctor --drift` reports and `kin doctor --heal`
+    /// repairs. A catch-up that took it would advance the workspace over
+    /// graph-owned content at daemon start and empty the report an operator is
+    /// about to read. The untracked file beside it is the positive control:
+    /// same directory, same window, and it is still named.
+    #[test]
+    fn the_catch_up_leaves_a_tracked_path_to_the_drift_report() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+
+        let tracked = repo.path().join("tracked.rs");
+        std::fs::write(&tracked, b"pub fn tracked() -> u32 { 1 }\n").unwrap();
+        admit_file_event_ambient(&state, &FileEvent::Changed(tracked.clone())).unwrap();
+        assert!(
+            tree_entry(&state, "tracked.rs").is_some(),
+            "the fixture needs this path tracked before the window is opened"
+        );
+        std::fs::write(&tracked, b"pub fn tracked() -> u32 { 2 }\n").unwrap();
+        stamp_modified(
+            &tracked,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(3_000_000),
+        );
+
+        let untracked = repo.path().join("untracked.rs");
+        std::fs::write(&untracked, b"pub fn untracked() -> u32 { 3 }\n").unwrap();
+        stamp_modified(
+            &untracked,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(3_000_000),
+        );
+
+        let window = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000);
+        let named = event_paths(&plan_catch_up_events(&state, window).unwrap())
+            .iter()
+            .filter_map(|path| path.file_name())
+            .map(|leaf| leaf.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert!(
+            named.contains(&"untracked.rs".to_string()),
+            "the positive control: content the graph has never met is still named: {named:?}"
+        );
+        assert!(
+            !named.contains(&"tracked.rs".to_string()),
+            "a tracked path edited off-watch is drift for `kin doctor`, not a silent catch-up \
+             admission: {named:?}"
+        );
+    }
+
+    /// FIR-2499. A directory graph truth has never met is disclosed, not swept
+    /// in.
+    ///
+    /// A directory arriving whole is a clone, a move, an unpacked archive or a
+    /// renamed control directory, and a move restamps every entry it carries,
+    /// so modification times cannot tell that content from authored work.
+    /// Admitting one at daemon start is the working-copy sweep startup must
+    /// never perform. The file beside the tracked one is the positive control:
+    /// it sits where the graph already looks, so the window still reaches it.
+    #[test]
+    fn the_catch_up_declines_a_directory_the_graph_has_never_met() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+
+        let known = repo.path().join("known.rs");
+        std::fs::write(&known, b"pub fn known() -> u32 { 1 }\n").unwrap();
+        admit_file_event_ambient(&state, &FileEvent::Changed(known)).unwrap();
+        assert!(
+            tree_entry(&state, "known.rs").is_some(),
+            "the fixture needs the repository root to hold tracked content"
+        );
+
+        let beside = repo.path().join("beside_known.rs");
+        std::fs::write(&beside, b"pub fn beside() -> u32 { 2 }\n").unwrap();
+        stamp_modified(
+            &beside,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(3_000_000),
+        );
+
+        let arrived = repo.path().join("arrived_whole");
+        std::fs::create_dir_all(&arrived).unwrap();
+        let carried = arrived.join("carried.rs");
+        std::fs::write(&carried, b"pub fn carried() -> u32 { 3 }\n").unwrap();
+        stamp_modified(
+            &carried,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(3_000_000),
+        );
+
+        let window = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000);
+        let named = event_paths(&plan_catch_up_events(&state, window).unwrap())
+            .iter()
+            .filter_map(|path| path.file_name())
+            .map(|leaf| leaf.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert!(
+            named.contains(&"beside_known.rs".to_string()),
+            "the positive control: a new file where the graph already looks is named: {named:?}"
+        );
+        assert!(
+            !named.contains(&"carried.rs".to_string()),
+            "a directory the graph has never met is for the behind disclosure and `kin admit`, \
+             not for a startup sweep: {named:?}"
+        );
+    }
+
+    /// The host paths a planned batch names.
+    fn event_paths(events: &[FileEvent]) -> Vec<PathBuf> {
+        events
+            .iter()
+            .map(|event| {
+                let (FileEvent::Changed(path) | FileEvent::Removed(path)) = event;
+                path.clone()
+            })
+            .collect()
+    }
+
+    /// Set a host entry's modification time outright.
+    ///
+    /// Both stamps are written because setting only one is refused on some
+    /// hosts, and the access time is not what any assertion here reads.
+    fn stamp_modified(path: &Path, at: SystemTime) {
+        let handle = std::fs::File::options().write(true).open(path).unwrap();
+        handle
+            .set_times(std::fs::FileTimes::new().set_accessed(at).set_modified(at))
+            .unwrap();
+        assert_eq!(
+            std::fs::symlink_metadata(path).unwrap().modified().unwrap(),
+            at,
+            "the stamp has to have applied, or every assertion resting on it is about the \
+             file's real age instead"
         );
     }
 }
