@@ -141,6 +141,8 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "kin_transaction_begin", "description": "Begin a transaction.",
      "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "kin_transaction_stage", "description": "Stage transaction operations.",
+     "inputSchema": {"type": "object", "properties": {}}},
     {"name": "kin_transaction_commit", "description": "Commit a transaction.",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "kin_transaction_abort", "description": "Abort a transaction.",
@@ -174,6 +176,17 @@ def call(name, args):
         return payload({"ended": True, "_kin": ENVELOPE})
     if name == "kin_transaction_begin":
         return payload({"transaction_id": "txn-fixture-1", "_kin": ENVELOPE})
+    if name == "kin_transaction_stage":
+        # The daemon refuses a create whose path repository authority already tracks.
+        # TRACKED stands for the fixture graph's contents, so the refusal is the graph's
+        # answer rather than a look at the working tree.
+        TRACKED = ("src/greet.py", "README.md")
+        for op in args.get("operations", []):
+            if op.get("target") in TRACKED:
+                return payload({"error": "path " + op.get("target") + " is already tracked",
+                                "_kin": ENVELOPE}, is_error=True)
+        return payload({"staged": len(args.get("operations", [])),
+                        "transaction_id": "txn-fixture-1", "_kin": ENVELOPE})
     if name == "kin_transaction_commit":
         return payload({"committed": True, "transaction_id": "txn-fixture-1", "_kin": ENVELOPE})
     if name == "kin_transaction_abort":
@@ -338,7 +351,7 @@ fn mcp_log(path: &Path) -> Vec<Value> {
 }
 
 #[test]
-fn a_tool_call_reaches_kin_the_edit_is_bracketed_and_the_transcript_records_it() {
+fn a_tool_call_reaches_kin_and_an_in_place_edit_records_why_it_stages_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let repo = fixture_repo(dir.path());
     let out = dir.path().join("out");
@@ -389,8 +402,9 @@ fn a_tool_call_reaches_kin_the_edit_is_bracketed_and_the_transcript_records_it()
         "the docstring must be in the file: {edited}"
     );
 
-    // The call reached the graph server, and the edit was bracketed by a transaction
-    // under a session, in that order.
+    // The call reached the graph server. The edit itself opens no transaction: the stage
+    // surface has no shape keyed on a path for an in-place edit, and a transaction with
+    // nothing staged in it can only end in the daemon's refusal of an empty commit.
     let calls = mcp_log(&log);
     let names: Vec<&str> = calls
         .iter()
@@ -398,14 +412,8 @@ fn a_tool_call_reaches_kin_the_edit_is_bracketed_and_the_transcript_records_it()
         .collect();
     assert_eq!(
         names,
-        vec![
-            "kin_session_start",
-            "semantic_locate",
-            "kin_transaction_begin",
-            "kin_transaction_commit",
-            "kin_session_end"
-        ],
-        "the edit must be bracketed by begin/commit under a session"
+        vec!["kin_session_start", "semantic_locate", "kin_session_end"],
+        "an unstageable edit must not open a transaction it cannot stage into"
     );
     assert_eq!(calls[1]["args"]["query"], "greet");
 
@@ -461,10 +469,13 @@ fn a_tool_call_reaches_kin_the_edit_is_bracketed_and_the_transcript_records_it()
         .iter()
         .find(|row| row["surface"] == "local" && row["tool"] == "edit_file")
         .expect("the local edit is traced");
-    assert_eq!(edit["provenance"]["bracketed"], true);
-    assert_eq!(edit["provenance"]["transaction_id"], "txn-fixture-1");
-    assert_eq!(edit["provenance"]["closed_with"], "kin_transaction_commit");
-    assert_eq!(edit["provenance"]["closed_cleanly"], true);
+    assert_eq!(edit["provenance"]["bracketed"], false);
+    assert_eq!(edit["provenance"]["staged"], Value::Null);
+    let reason = edit["provenance"]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("entity uuid or an exact entity name"),
+        "the provenance must name why the edit could not be staged: {reason}"
+    );
     // The whole written body stays out of the trace row; the transcript already has it.
     assert!(edit["args"]["replace"]
         .as_str()
@@ -487,6 +498,172 @@ fn a_tool_call_reaches_kin_the_edit_is_bracketed_and_the_transcript_records_it()
     assert_eq!(
         requests[1]["messages"].as_array().unwrap().last().unwrap()["role"],
         "tool"
+    );
+}
+
+/// The end-to-end shape FIR-2586 is about: a new file the model writes is staged as the
+/// `create` operation and committed, so the run lands something rather than opening a
+/// transaction it never fills.
+#[test]
+fn a_new_file_is_staged_as_a_create_and_then_committed() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(dir.path());
+    let out = dir.path().join("out");
+    let server = write_fake_mcp_server(dir.path());
+    let log = dir.path().join("mcp-calls.jsonl");
+    let body = "def farewell(name):\n    return f\"bye {name}\"\n";
+
+    let endpoint = FakeEndpoint::start(vec![
+        completion(
+            "Writing the new module.",
+            Some(tool_call(
+                "c1",
+                "write_file",
+                json!({ "path": "src/farewell.py", "content": body }),
+            )),
+        ),
+        completion("src/farewell.py now holds farewell.", None),
+    ]);
+    let base_url = endpoint.base_url.clone();
+
+    let outcome = kin_agent::run(config(&repo, &out, &base_url, mcp_command(&server, &log)))
+        .expect("the run completes");
+    assert_eq!(outcome.status, ExitStatus::Success);
+
+    // The file landed on disk.
+    assert_eq!(
+        std::fs::read_to_string(repo.join("src/farewell.py")).unwrap(),
+        body
+    );
+
+    // The write was bracketed, staged, and committed, in that order.
+    let calls = mcp_log(&log);
+    let names: Vec<&str> = calls
+        .iter()
+        .map(|call| call["tool"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "kin_session_start",
+            "kin_transaction_begin",
+            "kin_transaction_stage",
+            "kin_transaction_commit",
+            "kin_session_end"
+        ],
+        "a new file must be staged inside the bracket before the commit"
+    );
+
+    // The staged operation is the FIR-2417 create shape: a repository-relative target and
+    // the full body, carried in the call rather than read off disk by the daemon.
+    let stage = calls
+        .iter()
+        .find(|call| call["tool"] == "kin_transaction_stage")
+        .expect("the create is staged");
+    assert_eq!(stage["args"]["transaction_id"], "txn-fixture-1");
+    assert_eq!(stage["args"]["session_id"], "sess-fixture-1");
+    let operations = stage["args"]["operations"].as_array().unwrap();
+    assert_eq!(operations.len(), 1);
+    assert_eq!(operations[0]["verb"], "create");
+    assert_eq!(operations[0]["target"], "src/farewell.py");
+    assert_eq!(operations[0]["body"], body);
+    assert!(operations[0]["description"]
+        .as_str()
+        .unwrap()
+        .contains("src/farewell.py"));
+
+    // The commit carries the daemon's own accepted answer into the trace, so the evidence
+    // is what the server said rather than the harness's summary of it.
+    let trace = read_jsonl(&outcome.trace_path);
+    let write = trace
+        .iter()
+        .find(|row| row["surface"] == "local" && row["tool"] == "write_file")
+        .expect("the local write is traced");
+    assert_eq!(write["provenance"]["bracketed"], true);
+    assert_eq!(write["provenance"]["staged"]["verb"], "create");
+    assert_eq!(write["provenance"]["staged"]["target"], "src/farewell.py");
+    assert_eq!(write["provenance"]["staged"]["accepted"], true);
+    assert_eq!(write["provenance"]["closed_with"], "kin_transaction_commit");
+    assert_eq!(write["provenance"]["closed_cleanly"], true);
+    let response = write["provenance"]["response"].as_str().unwrap();
+    assert!(
+        response.contains("committed"),
+        "the commit response must be the daemon's own: {response}"
+    );
+
+    // The stage call is traced in its own right, joinable with the transaction.
+    let staged = trace
+        .iter()
+        .find(|row| row["tool"] == "kin_transaction_stage")
+        .expect("the stage call is traced");
+    assert_eq!(staged["event"], "transaction_stage");
+    assert_eq!(staged["transaction_id"], "txn-fixture-1");
+    assert_eq!(staged["is_error"], false);
+    assert_eq!(staged["body_bytes"], body.len());
+}
+
+/// A `write_file` over a path the graph already tracks is refused by repository authority
+/// rather than by the harness looking at the disk, and the refusal aborts the transaction.
+#[test]
+fn a_write_over_a_tracked_path_is_refused_by_the_graph_and_aborts() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(dir.path());
+    let out = dir.path().join("out");
+    let server = write_fake_mcp_server(dir.path());
+    let log = dir.path().join("mcp-calls.jsonl");
+
+    let endpoint = FakeEndpoint::start(vec![
+        completion(
+            "Rewriting the readme.",
+            Some(tool_call(
+                "c1",
+                "write_file",
+                json!({ "path": "README.md", "content": "# rewritten\n" }),
+            )),
+        ),
+        completion("README.md rewritten.", None),
+    ]);
+    let base_url = endpoint.base_url.clone();
+
+    let outcome = kin_agent::run(config(&repo, &out, &base_url, mcp_command(&server, &log)))
+        .expect("the run completes");
+    assert_eq!(outcome.status, ExitStatus::Success);
+    assert_eq!(
+        std::fs::read_to_string(repo.join("README.md")).unwrap(),
+        "# rewritten\n"
+    );
+
+    // Repository authority refuses the create by name, so the transaction aborts rather
+    // than committing, and the harness never claims a provenance it did not get.
+    let calls = mcp_log(&log);
+    let names: Vec<&str> = calls
+        .iter()
+        .map(|call| call["tool"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "kin_session_start",
+            "kin_transaction_begin",
+            "kin_transaction_stage",
+            "kin_transaction_abort",
+            "kin_session_end"
+        ],
+        "a refused stage must abort rather than commit an empty transaction"
+    );
+
+    let trace = read_jsonl(&outcome.trace_path);
+    let write = trace
+        .iter()
+        .find(|row| row["surface"] == "local" && row["tool"] == "write_file")
+        .expect("the local write is traced");
+    assert_eq!(write["provenance"]["bracketed"], true);
+    assert_eq!(write["provenance"]["staged"]["accepted"], false);
+    assert_eq!(write["provenance"]["closed_with"], "kin_transaction_abort");
+    let detail = write["provenance"]["staged"]["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("already tracked"),
+        "the graph's refusal must survive into the provenance: {detail}"
     );
 }
 

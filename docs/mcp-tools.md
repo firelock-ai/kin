@@ -208,7 +208,13 @@ reported rather than served as a confident answer.
 *Tools:* `kin_transaction_begin`, `kin_transaction_stage`, `kin_transaction_validate`, `kin_transaction_commit`, `kin_transaction_abort`
 
 - **`kin_transaction_begin`**: Start a transaction context.
-- **`kin_transaction_stage`**: Stage entity changes to the transaction.
+- **`kin_transaction_stage`**: Stage changes to the transaction. Each staged operation is one of six disjoint shapes, and the verb decides which:
+  - `create` (or `add`/`insert`) with `target` set to a repository-relative path and `body` set to the file's complete source text admits a file the graph has never seen. It is the only operation that introduces a new file, and it refuses a path repository authority already tracks.
+  - `replace` (or `overwrite`) with `target` set to a repository-relative path and `body` set to the file's complete new source text rewrites a file the graph already tracks. This is the shape for what a local edit or write leaves you holding, a path and the file's new contents, and it needs no entity: Kin reparses the body, so entities the new text adds enter the graph, entities it drops leave it, and the rest keep their ids and their incoming edges. It refuses a path repository authority does not track, and it refuses a body byte-identical to the contents already tracked.
+  - `update` (or `modify`) with `target` set to an entity uuid or an unambiguous exact entity name, and `body` set to that entity's complete new source text, edits one entity in place. Prefer it when you are changing one function or class and you know which.
+  - `delete` (or `remove`) with `target` set to a repository-relative path and no body retires a tracked file, along with every entity derived from it and every edge incident to those entities.
+  - `rename` (or `move`) with `target` and `destination` both repository-relative paths relocates a tracked file. Entity ids, history, and incoming references survive the move.
+  - A structured entity or relation mutation carries an explicit `payload`, for callers that already hold Kin's own entity and relation objects.
 - **`kin_transaction_validate`**: Run constraints and validation against staged changes.
 - **`kin_transaction_commit` / `kin_transaction_abort`**: Commit changes to the branch head or discard them.
 

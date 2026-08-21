@@ -590,7 +590,13 @@ fn build_link_context<'a>(
             };
             known_files.insert(file_path);
             *entity_count_by_file.entry(file_path).or_insert(0) += 1;
-            entity_by_file_name.insert((file_path, &entity.name), entity.id);
+            let slot_free = entity_by_file_name
+                .get(&(file_path, entity.name.as_str()))
+                .and_then(|occupant| entity_kind_by_id.get(occupant))
+                .is_none_or(|occupant| file_name_slot_admits(entity.kind, *occupant));
+            if slot_free {
+                entity_by_file_name.insert((file_path, &entity.name), entity.id);
+            }
             entity_by_name
                 .entry(&*entity.name)
                 .or_default()
@@ -936,6 +942,32 @@ fn resolve_one_file(
                     .map(|id| is_class_like(ctx.entity_kind_by_id.get(id)))
                     .unwrap_or(false);
                 if owner_is_class {
+                    // (a2a) The owner half came from the receiver's DECLARED
+                    // type and that type names a class right here, so the
+                    // method the class declares is the destination the source
+                    // wrote down. The inheritance walk below starts at the
+                    // bases on the documented assumption that an earlier tier
+                    // already gave a same-file own method its win, and for a
+                    // receiver-typed call none did: tier (a) passes over the
+                    // same-file entity precisely because the receiver is an
+                    // object. Without this tier the call reaches nothing able
+                    // to look inside its own file — (b), (c) and (c4) are
+                    // skipped for an object receiver and (c2) drops same-file
+                    // candidates — and `ingest_directory(database: Database)`
+                    // calling `database.upsert_note()` in the file that
+                    // declares `Database` produced no edge at all.
+                    if rel.receiver.is_some() {
+                        if let Some(dst_id) =
+                            resolve_own_method(&file.file_path, owner, method, ctx)
+                        {
+                            accumulate_relation(
+                                &mut resolved,
+                                &mut relation_indices,
+                                make_relation(rel, src_id, dst_id, RECEIVER_TYPE_CONFIDENCE),
+                            );
+                            continue;
+                        }
+                    }
                     if let Some(dst_id) =
                         resolve_inherited_method(&file.file_path, owner, method, ctx)
                     {
@@ -946,6 +978,34 @@ fn resolve_one_file(
                         );
                         continue;
                     }
+                    dst_lookup = method;
+                } else if rel.receiver.is_some() {
+                    // (a2b) The owner half came from the receiver's DECLARED
+                    // type rather than from a path the caller wrote, so the
+                    // class it names is one the file imports or the repository
+                    // holds exactly one of, not necessarily one defined here.
+                    // `adapter.send(request)` under `adapter: HTTPAdapter`
+                    // binds to `HTTPAdapter.send`, which is the call
+                    // `find_references` counted as zero while the annotation
+                    // proving it sat in the graph.
+                    if let Some((owner_file, owner_class)) =
+                        locate_base_class(&file.file_path, owner, ctx)
+                    {
+                        if let Some(dst_id) =
+                            resolve_declared_method(&owner_file, &owner_class, method, ctx)
+                        {
+                            accumulate_relation(
+                                &mut resolved,
+                                &mut relation_indices,
+                                make_relation(rel, src_id, dst_id, RECEIVER_TYPE_CONFIDENCE),
+                            );
+                            continue;
+                        }
+                    }
+                    // The declared type names nothing this repository defines,
+                    // or defines no such method. The call keeps the bare leaf
+                    // it arrived with before the type was consulted, so the
+                    // disclaimed same-name path below runs exactly as it did.
                     dst_lookup = method;
                 }
             }
@@ -1021,6 +1081,8 @@ fn resolve_one_file(
             .filter(|(fp, _)| *fp != file.file_path.as_str())
             .map(|&(fp, id)| (fp, id))
             .collect();
+        let other_file_candidates =
+            drop_module_call_targets(rel.kind, other_file_candidates, &ctx.entity_kind_by_id);
 
         // (b3) Parser-pinned import resolution: the relation carries the module
         // its callee was imported from. A pinned callee must resolve inside
@@ -1845,6 +1907,15 @@ const QUALIFIED_SUFFIX_CONFIDENCE: f32 = 0.6;
 /// and well above the review-side strong-consumer floor, below an
 /// import-verified edge (0.95) because the base-class link itself may have been
 /// name-resolved.
+/// Confidence for a call bound through the receiver's declared type.
+///
+/// The type is written in the source the call sits in, the owner resolved to a
+/// class entity, and the method was selected inside that class or an ancestor
+/// of it, so nothing here is inferred from a name matching a name. It sits
+/// above the inherited-method walk, which infers the dispatch class, and below
+/// the same-file parser-certain edge.
+const RECEIVER_TYPE_CONFIDENCE: f32 = 0.95;
+
 const INHERITED_METHOD_CONFIDENCE: f32 = 0.85;
 
 /// Split a dotted `Owner.method` dst_name into its owner and method parts at
@@ -2374,6 +2445,23 @@ fn resolve_qualified_suffix_incremental(
 }
 
 /// Whether an entity id names a type that can anchor an inheritance walk.
+/// Whether an entity may take the `(file, name)` slot another entity holds.
+///
+/// A Python file's Module entity is named for the file stem, so `nk/search.py`
+/// containing `def search(...)` puts a Module and a Function on one
+/// `(file, name)` key. Inside a module that name binds to the function: Python
+/// binds no name for the module itself in the module's own namespace. Letting
+/// the Module take the slot parked every caller of `search` on the module node,
+/// left the function holding zero incoming edges, and made `kin dead-code`
+/// print the program's primary function as unreferenced.
+///
+/// So a Module never displaces a non-Module here, and a non-Module always
+/// displaces a Module. Two entities of any other kinds keep the prior
+/// last-one-wins behaviour.
+fn file_name_slot_admits(candidate: EntityKind, occupant: EntityKind) -> bool {
+    candidate != EntityKind::Module || occupant == EntityKind::Module
+}
+
 fn is_class_like(kind: Option<&EntityKind>) -> bool {
     matches!(
         kind,
@@ -2502,6 +2590,86 @@ fn locate_base_class(
 /// cycle-guarded, and ends any branch whose base cannot be located
 /// ([`locate_base_class`]) — it never guesses. Kept in exact resolution parity
 /// with [`resolve_inherited_method_incremental`].
+/// The method `owner_class` itself declares, before any ancestor is consulted.
+///
+/// [`resolve_inherited_method`] deliberately starts at the class's bases: its
+/// caller has already given a same-file own method its win. A call bound
+/// through the receiver's declared type has had no such tier, because tier (a)
+/// passes over the same-file entity whenever the receiver is an object, so it
+/// asks for the class's own method first and walks the hierarchy only when the
+/// class does not declare it.
+fn resolve_declared_method(
+    owner_file: &str,
+    owner_class: &str,
+    method: &str,
+    ctx: &LinkContext<'_>,
+) -> Option<EntityId> {
+    resolve_own_method(owner_file, owner_class, method, ctx)
+        .or_else(|| resolve_inherited_method(owner_file, owner_class, method, ctx))
+}
+
+/// The method entity `owner_class` declares under its own name in
+/// `owner_file`, with no ancestor consulted.
+///
+/// The lookup is keyed on the class-qualified entity name (`Class.method` or
+/// `Class::method`), so a free function in the same file that happens to share
+/// the method's leaf name is not a candidate here. That is what lets a
+/// receiver-typed call ask a same-file class for its own method without
+/// reopening the decoy tier (a) refuses.
+fn resolve_own_method(
+    owner_file: &str,
+    owner_class: &str,
+    method: &str,
+    ctx: &LinkContext<'_>,
+) -> Option<EntityId> {
+    receiver_method_keys(owner_class, method)
+        .iter()
+        .find_map(|key| {
+            ctx.entity_by_file_name
+                .get(&(owner_file, key.as_str()))
+                .copied()
+        })
+}
+
+/// The incremental mirror of [`resolve_declared_method`].
+fn resolve_declared_method_incremental(
+    owner_file: &str,
+    owner_class: &str,
+    method: &str,
+    linker: &IncrementalLinker,
+    import_map: &HashMap<&str, HashMap<&str, (&str, &str)>>,
+    class_bases: &HashMap<String, Vec<(String, Vec<String>)>>,
+) -> Option<EntityId> {
+    resolve_own_method_incremental(owner_file, owner_class, method, linker).or_else(|| {
+        resolve_inherited_method_incremental(
+            owner_file,
+            owner_class,
+            method,
+            linker,
+            import_map,
+            class_bases,
+        )
+    })
+}
+
+/// The incremental mirror of [`resolve_own_method`].
+fn resolve_own_method_incremental(
+    owner_file: &str,
+    owner_class: &str,
+    method: &str,
+    linker: &IncrementalLinker,
+) -> Option<EntityId> {
+    receiver_method_keys(owner_class, method)
+        .iter()
+        .find_map(|key| {
+            linker
+                .entity_by_file_name
+                .get(owner_file)
+                .and_then(|by_name| by_name.get(key.as_str()))
+                .copied()
+        })
+}
+
 fn resolve_inherited_method(
     src_file: &str,
     owner: &str,
@@ -3193,6 +3361,32 @@ fn rust_bare_call_may_reach_owned(
 ///
 /// Non-method candidates are left to the builtin and import tiers above; this
 /// filter only answers the receiver question.
+/// Drop the module entities a call can never reach.
+///
+/// A module is not callable in any language this indexes, and its Python entity
+/// is named for the file stem, so `nk/search.py` puts a Module named `search`
+/// in the same-name bucket as the function `def search(...)`. Leaving it there
+/// made the bucket hold two ids for one callable name, which the exact-name
+/// tier reads as an unresolvable ambiguity and the package-directory fallback
+/// reads as two candidates, so a caller writing `from nk.search import search`
+/// got no edge at all rather than the wrong one.
+///
+/// A `References` edge is left alone: `import nk.search` then passing
+/// `nk.search` as a value genuinely names the module.
+fn drop_module_call_targets<'a>(
+    kind: RelationKind,
+    candidates: Vec<(&'a str, EntityId)>,
+    kinds: &HashMap<EntityId, EntityKind>,
+) -> Vec<(&'a str, EntityId)> {
+    if kind != RelationKind::Calls {
+        return candidates;
+    }
+    candidates
+        .into_iter()
+        .filter(|(_, id)| kinds.get(id) != Some(&EntityKind::Module))
+        .collect()
+}
+
 fn drop_method_candidates<'a>(
     candidates: Vec<(&'a str, EntityId)>,
     kinds: &HashMap<EntityId, EntityKind>,
@@ -5085,8 +5279,14 @@ impl IncrementalLinker {
         let mut file_entities_list = Vec::new();
 
         for entity in entities {
-            file_entities_map.insert(entity.name.clone(), entity.id);
             self.entity_kind_by_id.insert(entity.id, entity.kind);
+            let slot_free = file_entities_map
+                .get(&entity.name)
+                .and_then(|occupant| self.entity_kind_by_id.get(occupant))
+                .is_none_or(|occupant| file_name_slot_admits(entity.kind, *occupant));
+            if slot_free {
+                file_entities_map.insert(entity.name.clone(), entity.id);
+            }
             self.entity_language_by_id
                 .insert(entity.id, entity.language);
             self.entity_role_by_id.insert(entity.id, entity.role);
@@ -5516,6 +5716,24 @@ fn resolve_one_file_incremental(
                     .map(|id| is_class_like(linker.entity_kind_by_id.get(id)))
                     .unwrap_or(false);
                 if owner_is_class {
+                    // (a2a) mirrors the batch linker: a receiver whose
+                    // declared type names a class in this very file binds to
+                    // that class's own method, which the bases-first walk
+                    // below never consults and no later tier can reach for an
+                    // object receiver. A live edit must resolve this call the
+                    // same way a cold index does.
+                    if rel.receiver.is_some() {
+                        if let Some(dst_id) =
+                            resolve_own_method_incremental(&file.file_path, owner, method, linker)
+                        {
+                            accumulate_relation(
+                                &mut resolved,
+                                &mut relation_indices,
+                                make_relation(rel, src_id, dst_id, RECEIVER_TYPE_CONFIDENCE),
+                            );
+                            continue;
+                        }
+                    }
                     if let Some(dst_id) = resolve_inherited_method_incremental(
                         &file.file_path,
                         owner,
@@ -5530,6 +5748,31 @@ fn resolve_one_file_incremental(
                             make_relation(rel, src_id, dst_id, INHERITED_METHOD_CONFIDENCE),
                         );
                         continue;
+                    }
+                    dst_lookup = method;
+                } else if rel.receiver.is_some() {
+                    // (a2b) mirrors the batch linker: an owner half that came
+                    // from the receiver's declared type resolves through the
+                    // class that type names, wherever the repository defines
+                    // it, and falls back to the bare leaf when it names none.
+                    if let Some((owner_file, owner_class)) =
+                        locate_base_class_incremental(&file.file_path, owner, linker, import_map)
+                    {
+                        if let Some(dst_id) = resolve_declared_method_incremental(
+                            &owner_file,
+                            &owner_class,
+                            method,
+                            linker,
+                            import_map,
+                            class_bases,
+                        ) {
+                            accumulate_relation(
+                                &mut resolved,
+                                &mut relation_indices,
+                                make_relation(rel, src_id, dst_id, RECEIVER_TYPE_CONFIDENCE),
+                            );
+                            continue;
+                        }
                     }
                     dst_lookup = method;
                 }
@@ -5603,6 +5846,8 @@ fn resolve_one_file_incremental(
                     .collect()
             })
             .unwrap_or_default();
+        let other_file_candidates =
+            drop_module_call_targets(rel.kind, other_file_candidates, &linker.entity_kind_by_id);
 
         // (b3) Parser-pinned import resolution — mirrors the batch linker:
         // a callee pinned to a module must resolve inside that module (or
@@ -11088,6 +11333,11 @@ void f();
         for (confidence, expected, tier) in [
             (1.0_f32, RelationResolution::TypeResolved, "same-file"),
             (0.95, RelationResolution::TypeResolved, "import-declared"),
+            (
+                RECEIVER_TYPE_CONFIDENCE,
+                RelationResolution::TypeResolved,
+                "declared receiver type",
+            ),
             (
                 INHERITED_METHOD_CONFIDENCE,
                 RelationResolution::TypeResolved,

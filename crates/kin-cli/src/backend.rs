@@ -254,15 +254,19 @@ fn load_vector_index_if_exists(snap: &kin_db::SnapshotManager, layout: &kin_core
         &snapshot_path,
         None,
     ) {
-        Ok(true) => {
+        Ok(outcome) if outcome.attached => {
             tracing::debug!(
                 path = %vector_index_path(layout).display(),
+                kept = outcome.vectors_loaded,
+                dropped = outcome.vectors_dropped,
+                disposition = ?outcome.disposition,
                 "loaded validated vector index from disk"
             );
         }
-        Ok(false) => {
+        Ok(outcome) => {
             tracing::debug!(
                 path = %vector_index_path(layout).display(),
+                disposition = ?outcome.disposition,
                 "no compatible vector index available"
             );
         }

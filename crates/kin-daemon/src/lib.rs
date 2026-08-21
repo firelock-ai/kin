@@ -151,6 +151,7 @@ pub use daemon::{
     DaemonConfig,
 };
 pub use error::{DaemonError, Result};
+pub use kin_cli::commands::resources::VectorSalvage;
 pub use lifecycle::{daemon_is_up, AutoStartError, MCP_IDLE_TIMEOUT_SECS};
 pub use loop_runner::LoopConfig;
 pub use session_registry::SessionCoordinator;

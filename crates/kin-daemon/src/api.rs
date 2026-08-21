@@ -724,6 +724,18 @@ pub struct HealthResponse {
     /// and goes quiet once coverage is whole.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vector_index_discarded: Option<String>,
+    /// What a per-key salvage retired when this daemon opened, when one
+    /// happened. A value drives `status: "attention"`, exactly as a discard
+    /// does, because both mean this store is serving off less coverage than it
+    /// had.
+    ///
+    /// The field above cannot carry this. A salvage INSTALLS an index, so
+    /// nothing is discarded and the counters read measured and short, which is
+    /// byte-identical to a store filling for the first time. That is what let a
+    /// store publish `1770/2112 indexed (342 pending)` three minutes after
+    /// retiring 342 vectors, with every surface reporting `ok` (FIR-2562).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector_index_salvage: Option<kin_cli::commands::resources::VectorSalvage>,
     /// Effective filesystem-to-graph admission policy. This reports the frozen
     /// daemon state, including intrinsic storage-backend graph authority, not
     /// merely whether the opt-in environment variable was present.
@@ -2586,6 +2598,7 @@ async fn health(
         .load(std::sync::atomic::Ordering::Relaxed);
     let embed_persistence_unavailable = !state.can_persist_embed_progress_locally();
     let vector_index_discarded = state.vector_index_discarded().map(str::to_string);
+    let vector_index_salvage = state.vector_index_salvage();
     let coordination_event_persist_failures = state
         .coordination_event_persist_failures
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -2599,10 +2612,17 @@ async fn health(
     // is withholding a suspected mass-deletion wipe OR the embedding worker has
     // permanently stopped (embed-degraded), OR the configured storage backend
     // cannot durably persist vector progress, OR the persisted vector index was
-    // discarded at open and is being re-derived, OR coordination evidence could
-    // not be persisted, OR a background pass was stopped for spending the
-    // machine without advancing, OR the reconcile loop is failing to admit what
-    // it observes. The graph itself stays intact and served in all cases.
+    // discarded at open and is being re-derived, OR the index attached only
+    // after a per-key salvage retired coverage this store had, OR coordination
+    // evidence could not be persisted, OR a background pass was stopped for
+    // spending the machine without advancing, OR the reconcile loop is failing
+    // to admit what it observes. The graph itself stays intact and served in
+    // all cases.
+    //
+    // The salvage term is the one a client could not see. It reaches this
+    // verdict on its own rather than through the discard above, because a
+    // salvage records no discard: an index DID attach, and only the counts say
+    // how much of it survived.
     //
     // The reconcile term is the one that was missing. `reconciliation_status`
     // below reports whether a pass is running this instant, which a loop failing
@@ -2613,6 +2633,7 @@ async fn health(
         || embed_worker_failed
         || embed_persistence_unavailable
         || vector_index_discarded.is_some()
+        || vector_index_salvage.is_some()
         || coordination_event_persist_failures > 0
         || background_pass_stopped
         || reconcile_degraded
@@ -2651,6 +2672,7 @@ async fn health(
         embed_worker_failed,
         embed_persistence_unavailable,
         vector_index_discarded,
+        vector_index_salvage,
         filesystem_reconcile_disabled: state.filesystem_reconcile_disabled(),
         background_embed_deferred: !crate::daemon::auto_embed_enabled(),
         graph_generation: DaemonState::read_generation_marker(&state.layout),
@@ -3343,6 +3365,7 @@ async fn command_resources(
         hybrid_metrics: hybrid_metrics_runtime(),
         metal_profile: metal_profile_runtime(),
         vector_index_discarded: state.vector_index_discarded().map(str::to_string),
+        vector_index_salvage: state.vector_index_salvage(),
         deferred_vector_checkpoint: state.deferred_vector_checkpoint(),
         embedding_coverage_ever_complete: state.embedding_coverage_ever_complete(),
         embed_persistence_unavailable: !state.can_persist_embed_progress_locally(),
@@ -3446,6 +3469,7 @@ fn graph_status_embedding_runtime(
     }
     kin_cli::commands::resources::EmbedRuntimeState {
         vector_index_discarded: state.vector_index_discarded().map(str::to_string),
+        vector_index_salvage: state.vector_index_salvage(),
         deferred_vector_checkpoint: state.deferred_vector_checkpoint(),
         embedding_coverage_ever_complete: state.embedding_coverage_ever_complete(),
         embed_persistence_unavailable: !state.can_persist_embed_progress_locally(),
@@ -3510,7 +3534,15 @@ async fn command_graph(
             }),
         );
     let embedding_runtime = graph_status_embedding_runtime(&state, &graph);
-    let response = kin_cli::commands::graph::execute_graph_command(
+    // Read here rather than inside the renderer, for the reason the freshness
+    // marker is read in the CLI: the record is a property of the store on disk,
+    // and the environment worth auditing is the DAEMON's, because the daemon is
+    // the process that built the graph being reported. Auditing the caller's
+    // environment would name a knob the reader's shell carries and the graph
+    // never saw.
+    let census =
+        kin_core::relation_census::CensusContext::for_layout(&state.layout, std::env::vars());
+    let response = kin_cli::commands::graph::execute_graph_command_for_store(
         &repository_authority,
         graph.as_ref(),
         &request,
@@ -3518,6 +3550,8 @@ async fn command_graph(
             .background_work
             .reconcile_report(std::time::Instant::now()),
         &embedding_runtime,
+        &census,
+        Some(state.layout.root()),
     )
     .map_err(internal_error)?;
     Ok(Json(response))
@@ -4120,6 +4154,26 @@ async fn command_stash(
     crate::loop_runner::sync_filesystem_with_graph_under_coordination(&state)
         .await
         .map_err(internal_error)?;
+    // That sync is a complete exact-tree admission publishing its tree standalone,
+    // so the admission is durable the moment it returns and is recorded here, on
+    // the same probes and in the same durable marker the ambient reconcile tick,
+    // `kin admit` and a commit write. Without it a user who sealed or restored a
+    // stash had just had their whole working copy admitted and `kin graph status`
+    // still answered that no complete admission was recorded for the store.
+    //
+    // Before the stash executes rather than after, and counted here, because this
+    // is the tree the admission published. The seal that follows returns the
+    // workspace to its base and writes that move as its own authority, which is
+    // the stash operating rather than a second admission; counting after it would
+    // record a tree no admission had passed over.
+    state
+        .background_work
+        .reconcile()
+        .record_admission_success(std::time::Instant::now());
+    crate::background_work::record_durable_admission(
+        &state.layout,
+        state.graph.resolved_tree().len() as u64,
+    );
     let response = crate::repository_stash::execute(&state, &request)?;
     Ok(Json(response))
 }
@@ -4920,6 +4974,16 @@ fn command_commit_after_admission(
     // live graph rather than from the plan, because a plan's `entity_count` is
     // the size of its delta and this is the size of the whole.
     state.record_durable_entity_count(graph.entity_count() as u64);
+    // The relation set just moved and the change is installed, so this is the
+    // baseline the next `kin graph status` compares against. Recorded after the
+    // install rather than from the plan, for the reason the entity count above
+    // is: a plan carries the size of its delta and this is a census of the
+    // whole graph.
+    crate::background_work::record_relation_census(
+        &state.layout,
+        graph,
+        kin_core::relation_census::CensusSource::Commit,
+    );
     state.bump_version();
     state.emit_event(DaemonEvent::GraphRootChanged {
         old_root_hash: None,
@@ -13439,6 +13503,9 @@ mod tests {
             total: 10,
             pending: 0,
             complete: true,
+            embedding_state: kin_cli::commands::locate::EmbeddingState::Present,
+            limited_by: Vec::new(),
+            read_at: None,
             note: None,
             graph_bodies: None,
         };
@@ -14361,6 +14428,7 @@ mod tests {
             &kin_cli::commands::graph::GraphCommandRequest::Status,
             &Default::default(),
             &runtime,
+            &Default::default(),
         )
         .unwrap();
 
@@ -18709,6 +18777,260 @@ mod tests {
         );
     }
 
+    /// A stash performs a complete exact-tree admission, so it must leave the
+    /// durable record of one behind.
+    ///
+    /// Seal and restore both decide against the exact workspace the host holds,
+    /// so the endpoint runs a complete-scan admission first and publishes its
+    /// tree standalone. Nothing recorded it, and the marker's two writers, the
+    /// ambient reconcile tick and `kin admit`, need not run on a store whose tick
+    /// is quiet. So a user who had just had their whole working copy admitted was
+    /// told that how far graph truth had fallen behind the repository was
+    /// unknown.
+    ///
+    /// The absent read before the request is the control, and the read-only
+    /// `list` beside it is the second one: `list` returns before the admission,
+    /// so a marker appearing there would mean the recording had attached to the
+    /// endpoint rather than to the admission.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stash_records_the_complete_admission_it_performed() {
+        use kin_core::last_admission::LastAdmissionRead;
+
+        let (state, _layout, repository, _main, _feature) =
+            universal_branch_test_state("stash-records-admission");
+
+        // The fixture converts a Git repository, and a clean conversion now
+        // records its own complete admission, so the control is the conversion's
+        // timestamp rather than an absent marker: whatever this stash writes has
+        // to be strictly later than what the store was born with.
+        let born_with = match kin_core::last_admission::read(&state.layout) {
+            LastAdmissionRead::Recorded(recorded) => recorded,
+            other => {
+                panic!("the conversion that built this fixture records a marker, read {other:?}")
+            }
+        };
+        assert!(
+            stash_entries(Arc::clone(&state)).await.is_empty(),
+            "the fixture starts with nothing sealed"
+        );
+        assert_eq!(
+            kin_core::last_admission::read(&state.layout),
+            LastAdmissionRead::Recorded(born_with.clone()),
+            "a read-only stash list returns before the admission, so it must record nothing"
+        );
+
+        // A modification to a tracked file, so the admitted tree holds the same
+        // paths the base does and the count is stable across the seal that
+        // follows.
+        std::fs::write(
+            repository.join("selected/compose.yaml"),
+            b"services:\n  api:\n    image: sealed\n",
+        )
+        .unwrap();
+        let tracked_before = state.graph.resolved_tree().len() as u64;
+
+        let (status, body) = post_stash_request(Arc::clone(&state), &stash_push()).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+        let recorded = match kin_core::last_admission::read(&state.layout) {
+            LastAdmissionRead::Recorded(recorded) => recorded,
+            other => {
+                panic!("a stash must record the complete admission it performed, read {other:?}")
+            }
+        };
+        assert_eq!(
+            recorded.tracked_artifacts, tracked_before,
+            "the record must cover the tree the admission passed over"
+        );
+        assert_eq!(
+            recorded.tracked_artifacts,
+            state.graph.resolved_tree().len() as u64,
+            "and the seal returned the workspace to a base holding the same paths"
+        );
+        assert!(
+            recorded.at > born_with.at,
+            "the record must be stamped by this stash rather than left as the conversion wrote \
+             it: {} against {}",
+            recorded.at.to_rfc3339(),
+            born_with.at.to_rfc3339()
+        );
+
+        // The in-memory probes carry the same fact, so `/health`, `kin doctor`
+        // and `kin admit` name the stash's admission instead of reporting that
+        // none has succeeded in this daemon's life.
+        assert!(
+            state
+                .background_work
+                .reconcile_report(std::time::Instant::now())
+                .last_admission_success_age_seconds
+                .is_some(),
+            "a stash's admission must reach the reconcile probes as a success"
+        );
+    }
+
+    /// A stash the seal itself refuses still records the admission that ran
+    /// before the refusal.
+    ///
+    /// This is where the stash path differs from the commit path and why the
+    /// recording sits where it does. A commit defers its admitted tree to its own
+    /// transaction, so nothing is durable until that transaction reaches
+    /// authority and a marker stamped earlier would claim a complete admission
+    /// for a tree authority never accepted. A stash publishes its tree standalone
+    /// before the seal is even attempted, so the admission is complete and
+    /// durable whatever the seal then answers, and withholding the marker would
+    /// report a store as staler than the daemon had just made it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refused_stash_still_records_the_admission_that_ran_before_it() {
+        use kin_core::last_admission::LastAdmissionRead;
+
+        let (state, _layout, _repository, _main, _feature) =
+            universal_branch_test_state("stash-refused-records-admission");
+
+        let born_with = match kin_core::last_admission::read(&state.layout) {
+            LastAdmissionRead::Recorded(recorded) => recorded,
+            other => {
+                panic!("the conversion that built this fixture records a marker, read {other:?}")
+            }
+        };
+
+        // A clean workspace has nothing to seal, so the endpoint admits the exact
+        // tree and then refuses.
+        let (status, body) = post_stash_request(Arc::clone(&state), &stash_push()).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            String::from_utf8_lossy(&body).contains("no graph-owned changes to seal"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let recorded = match kin_core::last_admission::read(&state.layout) {
+            LastAdmissionRead::Recorded(recorded) => recorded,
+            other => panic!(
+                "the admission published its tree standalone before the refusal, so it must be \
+                 recorded, read {other:?}"
+            ),
+        };
+        assert!(
+            recorded.at > born_with.at,
+            "the refused stash still admitted, so the marker must have moved past the one the \
+             conversion wrote: {} against {}",
+            recorded.at.to_rfc3339(),
+            born_with.at.to_rfc3339()
+        );
+        assert_eq!(
+            recorded.tracked_artifacts,
+            state.graph.resolved_tree().len() as u64,
+            "the record must cover the tree the admission passed over"
+        );
+    }
+
+    /// The body the approval under test names.
+    ///
+    /// Deliberately harmless. This test asks one question, whether the sealed
+    /// tree's derivation reads a tracked approval at all, and answering it does
+    /// not require the approval to be clearing a live refusal. Approving a real
+    /// secret would drag in authority's separate rule that an approved body must
+    /// already be in repository CAS before the transition that approves it, and
+    /// this test would then fail for a reason that has nothing to do with the
+    /// derivation site.
+    #[cfg(unix)]
+    const STASH_APPROVED_BODY: &[u8] = b"def normalize(term):\n    return term.strip()\n";
+
+    /// Sealing a workspace derives the policy for the sealed tree, and it has to
+    /// derive it through the entry point that reads a tracked `.kin-allowances`.
+    ///
+    /// Reverting `repository_stash::push`'s derivation to `derive_from_tree`
+    /// fails here, because the compatibility entry point refuses by name the
+    /// moment the sealed tree carries approvals it cannot read.
+    ///
+    /// Three details in this fixture are load-bearing and none is obvious.
+    /// The approval file is committed rather than left dirty, because stash
+    /// reads allowance bodies through `manager.load_source_blob`, which consults
+    /// repository CAS alone; a dirty approval file lives only in ingest CAS and
+    /// fails with "repository source CAS is missing", a refusal that looks
+    /// nothing like the one this test exists to provoke. The workspace has to be
+    /// dirty, because `push` refuses a clean one before it reaches the
+    /// derivation at all. And the request goes through the route rather than
+    /// straight into `execute`, because the route runs the complete-scan
+    /// admission first, which is what turns a working-copy write into workspace
+    /// dirtiness that authority can see.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sealing_a_workspace_derives_the_approvals_its_tree_carries() {
+        let state = committed_test_state();
+
+        // The approved artifact is committed first, so authority owns its body
+        // before any approval names its digest.
+        let approved_digest =
+            Hash256::from_bytes(state.blobs.write(STASH_APPROVED_BODY).unwrap().0);
+        install_repository_file(&state, "notekeeper/client.py", STASH_APPROVED_BODY);
+        install_working_copy_file(&state, "notekeeper/client.py", STASH_APPROVED_BODY, false);
+
+        let approvals = format!(
+            "# approvals for this fixture\n\
+             kin-allowances 1\n\
+             notekeeper/client.py\t{approved_digest}\tblob\tcredscan@firelock.ai\tpinned by \
+             the test covering the sealed-tree derivation site\n"
+        );
+        install_repository_file(&state, ".kin-allowances", approvals.as_bytes());
+        install_working_copy_file(&state, ".kin-allowances", approvals.as_bytes(), false);
+
+        // Dirty the workspace through the host, which is what the route's scan
+        // admits and what makes the workspace sealable.
+        std::fs::write(
+            state.layout.working_dir().join("scratch.txt"),
+            b"sealed while dirty\n",
+        )
+        .unwrap();
+
+        let request = kin_cli::commands::stash::StashRequest::Push {
+            message: Some("seal a workspace whose tree carries approvals".to_string()),
+            operation_id: kin_model::OperationId::new(),
+            timestamp: Timestamp::now(),
+            actor: AuthorId::new("credscan"),
+        };
+        let (status, body) = post_stash_request(Arc::clone(&state), &request).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "sealing a workspace whose tree carries .kin-allowances must derive its approvals \
+             rather than refusing: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let response: kin_cli::commands::stash::StashResponse =
+            serde_json::from_slice(&body).unwrap();
+        let sealed = response
+            .entry
+            .expect("a push reports the entry it sealed")
+            .change_id;
+
+        let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
+        let lease = authority.manager.read_authority();
+        let policy = lease
+            .metadata()
+            .admission_policies
+            .iter()
+            .find(|resolved| resolved.change_id == sealed)
+            .expect("the sealed change carries an admission-policy record")
+            .policy
+            .clone()
+            .expect("the sealed change's policy is resolved");
+        assert_eq!(
+            policy.sensitive_allowances.len(),
+            1,
+            "the sealed policy must carry the tree's one approval: {:?}",
+            policy.sensitive_allowances
+        );
+        assert_eq!(policy.sensitive_allowances[0].content_hash, approved_digest);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn command_checkout_projection_only_repairs_universal_bytes_and_replays_after_restart() {
@@ -20035,6 +20357,101 @@ mod tests {
             !json.embed_worker_failed,
             "a discarded index is not a worker crash"
         );
+    }
+
+    /// A salvage is the state the discard field cannot report, and it has to
+    /// reach `/health` on its own.
+    ///
+    /// The store here is the shape the rc0545c brown arm was in: a sidecar
+    /// stamped against graph truth that then moved, so kin-db installs it and
+    /// reconciles per key rather than refusing it whole. Nothing is discarded,
+    /// so the field beside this one stays empty and the counters read measured
+    /// and short, which is exactly what a first fill looks like. Without this
+    /// the endpoint answers `ok` for a store that just lost coverage.
+    #[tokio::test]
+    #[cfg(feature = "vector")]
+    async fn health_surfaces_a_salvaged_vector_index_as_attention() {
+        install_test_registry_override();
+        let dir = std::env::temp_dir().join(format!("kin-daemon-kvec-salvage-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let layout = kin_core::init(&dir).unwrap().layout;
+
+        let snapshot_path = layout.kindb_snapshot_path();
+        {
+            let manager = kin_db::SnapshotManager::new(&snapshot_path);
+            let graph = manager.graph();
+            let entity = test_entity("salvage_survivor", "src/lib.rs");
+            graph.upsert_entity(&entity).unwrap();
+
+            let descriptor = kin_db::IndexDescriptor {
+                model_id: Some("fixture-model".to_string()),
+                graph_root: Some("fixture-root".to_string()),
+            };
+            let index = kin_db::VectorIndex::new(4).unwrap();
+            index.upsert(entity.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+            index.set_descriptor(descriptor.clone());
+            index.save(&layout.kindb_vector_index_path()).unwrap();
+            assert!(
+                matches!(
+                    graph.load_vector_index_compatible(
+                        &layout.kindb_vector_index_path(),
+                        &descriptor
+                    ),
+                    kin_db::VectorIndexLoad::Loaded(_)
+                ),
+                "the fixture index must install before the sidecar is stamped"
+            );
+            manager.save().unwrap();
+            kin_db::SnapshotManager::save_vector_index_for_graph(
+                &snapshot_path,
+                graph.as_ref(),
+                None,
+            )
+            .unwrap();
+
+            // Graph truth moves after the stamp and the sidecar is left alone,
+            // which is the drift. Saving the snapshot again persists the newer
+            // truth beside the older stamp, so the next open sees both.
+            graph
+                .upsert_entity(&test_entity("admitted_after_the_stamp", "src/added.rs"))
+                .unwrap();
+            manager.save().unwrap();
+        }
+
+        let state = Arc::new(DaemonState::open(layout).unwrap());
+        let salvage = state
+            .vector_index_salvage()
+            .expect("the fixture must reach kin-db's salvage path, or it proves nothing");
+        assert!(
+            state.vector_index_discarded().is_none(),
+            "a salvage records no discard, which is the whole reason it needs its own field"
+        );
+
+        let response = router(state)
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: HealthResponse = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            json.vector_index_salvage,
+            Some(salvage),
+            "the route must publish the counts the daemon recorded at open"
+        );
+        assert!(
+            json.vector_index_discarded.is_none(),
+            "and it must not invent a discard to explain them: {:?}",
+            json.vector_index_discarded
+        );
+        assert_eq!(
+            json.status, "attention",
+            "a store serving off less coverage than it had is not an `ok` steady state"
+        );
+        assert!(!json.embed_worker_failed, "a salvage is not a worker crash");
     }
 
     #[tokio::test]
@@ -21718,6 +22135,96 @@ mod tests {
             .clone()
             .unwrap();
         lease.resolve_target_change_id(&target).unwrap()
+    }
+
+    /// A rollback derives the policy for the tree it restores, and it has to
+    /// derive it through the entry point that reads a tracked `.kin-allowances`.
+    ///
+    /// Reverting `repository_rollback::plan_and_commit`'s derivation to
+    /// `derive_from_tree` fails here, because the compatibility entry point
+    /// refuses by name the moment the restored tree carries approvals it cannot
+    /// read. That is the shape this covers: an approval a reviewer accepted,
+    /// silently dropped by rolling back to the very change that carried it.
+    ///
+    /// The approval rides the FIRST change, because rollback derives from the
+    /// target tree rather than from the tree it is leaving. The approved body is
+    /// harmless for the same reason it is in the sealed-tree test: this asks
+    /// whether the derivation reads the approval, and approving a real secret
+    /// would pull in authority's separate rule about repository CAS ordering.
+    #[tokio::test]
+    async fn rolling_back_derives_the_approvals_the_restored_tree_carries() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let root = state.layout.working_dir().to_path_buf();
+        let app = router(Arc::clone(&state));
+
+        let approved_body = b"def normalize(term):\n    return term.strip()\n";
+        let approved_digest = Hash256::from_bytes(state.blobs.write(approved_body).unwrap().0);
+        std::fs::create_dir_all(root.join("notekeeper")).unwrap();
+        std::fs::write(root.join("notekeeper/client.py"), approved_body).unwrap();
+        let approvals = format!(
+            "# approvals for this fixture\n\
+             kin-allowances 1\n\
+             notekeeper/client.py\t{approved_digest}\tblob\tcredscan@firelock.ai\tpinned by \
+             the test covering the restored-tree derivation site\n"
+        );
+        std::fs::write(root.join(".kin-allowances"), approvals.as_bytes()).unwrap();
+        let restored = commit_through_api(
+            &app,
+            kin_model::OperationId::new(),
+            "publish a tree carrying an approval",
+        )
+        .await;
+
+        std::fs::write(
+            root.join("notekeeper/client.py"),
+            b"def normalize(term):\n    return term\n",
+        )
+        .unwrap();
+        let regression =
+            commit_through_api(&app, kin_model::OperationId::new(), "publish a regression").await;
+        assert_eq!(branch_change(&state), regression);
+
+        let (status, body) =
+            rollback_through_api(&app, kin_model::OperationId::new(), restored).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "rolling back to a tree carrying .kin-allowances must derive its approvals rather \
+             than refusing: {body}"
+        );
+        // A rollback publishes a NEW change that restores the old tree rather
+        // than moving the branch back onto the old id, so the branch must have
+        // left the regression without landing on `restored` itself.
+        let after = branch_change(&state);
+        assert_ne!(
+            after, regression,
+            "the rollback must move the branch off the regression"
+        );
+        assert_ne!(
+            after, restored,
+            "a rollback publishes a restoring change rather than re-pointing at the old one"
+        );
+
+        let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
+        let lease = authority.manager.read_authority();
+        let carried = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == authority.workspace_id)
+            .expect("the bound workspace survives the rollback")
+            .shared_admission_policy
+            .sensitive_allowances
+            .clone();
+        assert_eq!(
+            carried.len(),
+            1,
+            "the restored policy must carry the tree's one approval: {carried:?}"
+        );
+        assert_eq!(carried[0].content_hash, approved_digest);
     }
 
     /// An operation id is matched before any history validation runs, and an

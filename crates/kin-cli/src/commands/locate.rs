@@ -126,6 +126,95 @@ pub struct RetrievalDegradation {
     pub remediation: String,
 }
 
+/// What the embedding substrate itself was observed to be for one query.
+///
+/// This is the one embedding verdict in the system. It is decided from the
+/// counters beside it and from whether an index was attached to take them, and
+/// from nothing else, so no surface has to re-derive a verdict from
+/// [`SemanticCoverage::complete`]. That flag is a CONJUNCTION over the substrate
+/// AND the population a query ranked over, and deriving an embedding verdict
+/// from it is how a `semantic_locate` envelope came to carry `indexed 2112,
+/// pending 0` beside `classes.embeddings: absent` in one response (FIR-2543):
+/// fifteen test-role paths had been withheld from ranking, which clears
+/// `complete` and says nothing at all about embeddings.
+///
+/// `Unknown` is a state, not a shade of `Absent`. `embedding_status` answers
+/// `indexed = 0` for every retrievable object when no vector index is attached,
+/// which is exactly the reading a never-embedded repository produces, so a
+/// verdict taken from the counters alone cannot tell a fully embedded store
+/// whose index was not loaded from one that was never embedded. The two have
+/// different remediations and only one of them is a real gap.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbeddingState {
+    /// Every eligible entity is indexed and nothing is queued, measured against
+    /// an index that was actually attached.
+    Present,
+    /// Some eligible entities are indexed and some are not.
+    Partial,
+    /// An attached index holds no embedding for any eligible entity.
+    Absent,
+    /// Nobody could say: no vector backend in this build, or no index attached
+    /// to take a reading from.
+    Unknown,
+}
+
+impl EmbeddingState {
+    /// The wire word, so a caller matching on the payload and a caller matching
+    /// on the type read the same vocabulary.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Present => "present",
+            Self::Partial => "partial",
+            Self::Absent => "absent",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Decide the state from an observation, at the one place that holds every
+    /// input it needs.
+    ///
+    /// Order matters and is deliberate. Both "nobody could say" checks run
+    /// before any counter is read, because a counter taken with no index behind
+    /// it is not a small number, it is not a number. That includes the
+    /// zero-eligible case: a graph with nothing retrievable and no index
+    /// attached is the shape that let a store report complete semantic coverage
+    /// over an empty graph (FIR-2215), and it is unknowable here rather than
+    /// whole.
+    pub fn observe(
+        supported: bool,
+        index_attached: bool,
+        indexed: usize,
+        total: usize,
+        pending: usize,
+    ) -> Self {
+        if !supported || !index_attached {
+            return Self::Unknown;
+        }
+        if total == 0 || (indexed >= total && pending == 0) {
+            return Self::Present;
+        }
+        if indexed == 0 {
+            return Self::Absent;
+        }
+        Self::Partial
+    }
+}
+
+/// Machine-stable reason [`SemanticCoverage::complete`] is false because this
+/// build ships no vector backend.
+pub const COVERAGE_LIMIT_VECTOR_SUPPORT_DISABLED: &str = "vector_support_disabled";
+/// Machine-stable reason `complete` is false because no index was attached.
+pub const COVERAGE_LIMIT_VECTOR_INDEX_ABSENT: &str = "vector_index_absent";
+/// Machine-stable reason `complete` is false because the index is unfinished.
+pub const COVERAGE_LIMIT_EMBEDDINGS_INCOMPLETE: &str = "embeddings_incomplete";
+/// Machine-stable reason `complete` is false because the role filter narrowed
+/// the population the counters were taken over.
+pub const COVERAGE_LIMIT_GRAPH_ROLE_FILTER: &str = "graph_role_filter";
+/// Machine-stable reason `complete` is false because graph-owned source bodies
+/// are missing for some paths.
+pub const COVERAGE_LIMIT_GRAPH_BODY_GAP: &str = "graph_body_gap";
+
 /// Honest, in-band report of how complete the embedding (semantic) signal was
 /// for a locate query. This is the trust-contract "per-signal degradation"
 /// property: a partial semantic index is surfaced, not hidden behind an opaque
@@ -159,6 +248,41 @@ pub struct SemanticCoverage {
     /// that cannot observe bodies as degraded. Read `graph_bodies.observed` to
     /// tell "no gap" from "not looked at"; they are different answers.
     pub complete: bool,
+    /// What the embedding substrate itself was observed to be, decided by
+    /// [`EmbeddingState::observe`] at the moment the counters above were taken.
+    ///
+    /// This is the field a surface reporting on EMBEDDINGS reads.
+    /// [`Self::complete`] answers a wider question and cannot be narrowed back
+    /// to this one, which is the defect FIR-2543 reported: an envelope carried
+    /// `indexed 2112, pending 0` and `classes.embeddings: absent` because a
+    /// consumer derived an embedding verdict from a flag a role filter had
+    /// already cleared.
+    ///
+    /// Older payloads predate the field. Absent deserializes to `Unknown`,
+    /// because a reader that cannot see the observation has not observed
+    /// anything, and guessing `Present` from the counters is the structural zero
+    /// wearing the opposite costume.
+    #[serde(default = "semantic_embedding_state_default")]
+    pub embedding_state: EmbeddingState,
+    /// Every machine-stable reason [`Self::complete`] is false, in the order
+    /// they were observed. Empty when coverage is complete.
+    ///
+    /// `complete` is one bit over several independent causes with different
+    /// remediations: an absent index, an unfinished index, a narrowed
+    /// population, missing source bodies. A caller told only that it is false
+    /// cannot tell which of them to act on, and every consumer that guessed
+    /// guessed "run `kin embed`".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub limited_by: Vec<String>,
+    /// When these counters were sampled, RFC 3339 in UTC.
+    ///
+    /// Two surfaces reporting different embedding counts in the same minute is
+    /// the normal state of a store with a backfill running, and it is
+    /// indistinguishable from a store where one of them is wrong unless each
+    /// reading says when it was taken. Absent on payloads minted before the
+    /// field existed; never fabricated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_at: Option<String>,
     /// Human-readable note describing the degraded state, present only when the
     /// semantic signal was partial. Lexical + graph signals still ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -272,6 +396,24 @@ impl GraphBodyCoverage {
 
 fn semantic_signal_supported_default() -> bool {
     true
+}
+
+/// A payload minted before [`SemanticCoverage::embedding_state`] existed carries
+/// no observation of the embedding substrate, so it deserializes to one that
+/// says so.
+fn semantic_embedding_state_default() -> EmbeddingState {
+    EmbeddingState::Unknown
+}
+
+/// The instant a coverage observation was taken, RFC 3339 in UTC with second
+/// resolution. Second resolution is enough for the question the field answers,
+/// which is whether two surfaces read the same store minutes apart.
+pub(crate) fn coverage_read_at_now() -> Option<String> {
+    Some(
+        chrono::Utc::now()
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            .to_string(),
+    )
 }
 
 impl LocateResult {
@@ -1520,7 +1662,7 @@ fn cross_encoder_load_target(model_id: &str, snapshot: Option<&std::path::Path>)
 /// `vector_index_stats()` is the call that separates them, and reading it is a
 /// lock and an `Option` map rather than a walk of graph truth.
 #[cfg(feature = "vector")]
-fn vector_index_attached(graph: &kin_db::InMemoryGraph) -> bool {
+pub(crate) fn vector_index_attached(graph: &kin_db::InMemoryGraph) -> bool {
     graph.vector_index_stats().is_some()
 }
 
@@ -1528,7 +1670,7 @@ fn vector_index_attached(graph: &kin_db::InMemoryGraph) -> bool {
 /// arm of the coverage report is what callers read in this build; this exists
 /// so the two arms share one call shape.
 #[cfg(not(feature = "vector"))]
-fn vector_index_attached(_graph: &kin_db::InMemoryGraph) -> bool {
+pub(crate) fn vector_index_attached(_graph: &kin_db::InMemoryGraph) -> bool {
     false
 }
 
@@ -1622,6 +1764,15 @@ fn coverage_from_status(
             total: status.total,
             pending: status.pending,
             complete: false,
+            embedding_state: EmbeddingState::observe(
+                false,
+                false,
+                status.indexed,
+                status.total,
+                status.pending,
+            ),
+            limited_by: vec![COVERAGE_LIMIT_VECTOR_SUPPORT_DISABLED.to_string()],
+            read_at: coverage_read_at_now(),
             note: Some(
                 "semantic vector ranking is unsupported in this build; lexical and graph signals remain available"
                     .to_string(),
@@ -1652,12 +1803,27 @@ fn coverage_from_status(
             embedding_status_summary(status)
         ))
         };
+        let mut limited_by = Vec::new();
+        if !index_attached {
+            limited_by.push(COVERAGE_LIMIT_VECTOR_INDEX_ABSENT.to_string());
+        } else if !embedding_status_complete(status) {
+            limited_by.push(COVERAGE_LIMIT_EMBEDDINGS_INCOMPLETE.to_string());
+        }
         SemanticCoverage {
             supported: true,
             indexed: status.indexed,
             total: status.total,
             pending: status.pending,
             complete,
+            embedding_state: EmbeddingState::observe(
+                true,
+                index_attached,
+                status.indexed,
+                status.total,
+                status.pending,
+            ),
+            limited_by,
+            read_at: coverage_read_at_now(),
             note,
             graph_bodies: None,
         }
@@ -1674,8 +1840,18 @@ impl SemanticCoverage {
     /// carries, and an already-present embedding note is kept rather than
     /// overwritten, since both causes can hold at once and the caller needs to
     /// know which remediation applies.
+    ///
+    /// [`Self::embedding_state`] is deliberately untouched here. Neither cause
+    /// below is an observation about embeddings: a withheld test path was never
+    /// ranked and a body-less path cannot be ranked, and both hold on stores
+    /// whose every eligible entity carries a vector. Each is recorded in
+    /// [`Self::limited_by`] instead, which is what lets a consumer say why
+    /// `complete` is false without inventing an embedding shortfall to explain
+    /// it (FIR-2543).
     pub fn with_graph_bodies(mut self, bodies: GraphBodyCoverage) -> Self {
         if bodies.withholds_tests() {
+            self.limited_by
+                .push(COVERAGE_LIMIT_GRAPH_ROLE_FILTER.to_string());
             // Completeness is a claim about the population the caller asked
             // about, and this one was narrowed before the counters were taken.
             // Saying `complete: true` over it is the defect: the caller cannot
@@ -1695,6 +1871,8 @@ impl SemanticCoverage {
         }
         if bodies.has_gap() {
             self.complete = false;
+            self.limited_by
+                .push(COVERAGE_LIMIT_GRAPH_BODY_GAP.to_string());
             let gap_note = format!(
                 "graph body gap: {} of {} graph-owned source paths carry no body, so entity \
                  ranking over them falls back to text matching; graph_bodies.sample names them.",
@@ -1878,8 +2056,10 @@ fn record_small_corpus_degradation(entity_count: usize, sink: &mut Vec<Retrieval
                  low or miss it"
             ),
             remediation: "at this size ask by exact entity or file name, or by a literal \
-                 string you expect in the code; description queries earn their accuracy as the \
-                 graph grows"
+                 string you expect in the code; a description you cannot name a symbol for \
+                 ranks better at granularity: \"file\", where the path heuristics still \
+                 separate candidates; description queries at entity granularity earn their \
+                 accuracy as the graph grows"
                 .to_string(),
         },
     );
@@ -1919,7 +2099,10 @@ fn record_capability_tier_degradation(
                     describe_disabled_signals(profile),
                 ),
                 remediation: "this tier was not derived from a reading of this host; set \
-                     KIN_LOCATE_PROFILE=performance|standard|minimal to state it explicitly"
+                     KIN_LOCATE_PROFILE=performance|standard|minimal to state it explicitly, \
+                     in the environment of the process that serves the query: the value is \
+                     read once at process start, so against a running daemon it takes effect \
+                     only after `kin daemon stop` and the next command"
                     .to_string(),
             },
         );
@@ -1939,8 +2122,13 @@ fn record_capability_tier_degradation(
                 describe_disabled_signals(profile),
             ),
             remediation:
-                "set KIN_LOCATE_PROFILE=performance to widen the multihop budget on this host, \
-                 or run on a host with >=8 cores and >=16GB RAM"
+                "set KIN_LOCATE_PROFILE=performance in the environment of the process that \
+                 serves the query, or run on a host with >=8 cores and >=16GB RAM. The value \
+                 is read once at process start, not per request, so exporting it in front of \
+                 a command reaches the CLI client and not a daemon already serving: run `kin \
+                 daemon stop` and let the next command start one that reads it. It widens the \
+                 graph multihop budget (depth, frontier, timeout) and nothing else, so a \
+                 query whose weakness is ranking rather than reach will not change"
                     .to_string(),
         },
     );
@@ -16931,6 +17119,112 @@ fn artifact_locate_entity(file: &LocateFileEntry, query: &str) -> LocateEntity {
     }
 }
 
+/// The surface class of an entity's OWN name, or `None` when the name reads as
+/// ordinary public API.
+///
+/// The entity-granularity twin of the path-keyed impl penalties
+/// ([`is_deep_impl_path`], `KIN_LOCATE_CLI_IMPL_PENALTY`,
+/// `KIN_LOCATE_PUBLIC_API_IMPL_PENALTY`). Those key on the FILE a hit lives in,
+/// which is why a description query answered at `granularity: "file"` ranks the
+/// module a reader wanted while the same query at entity granularity ranked its
+/// private helpers: nothing at entity granularity looked at the name at all, so
+/// a public `to_dot` and a module-private `_dot_escape` competed as equals.
+///
+/// The rule is a naming convention, not a visibility lookup, because the graph
+/// carries names for every language and visibility for only some. A leading
+/// underscore means internal in Python, C, JavaScript and Rust alike, and the
+/// languages that spell it differently simply do not match here rather than
+/// matching wrongly.
+///
+/// Dunder names are deliberately exempt. `__init__` and `__repr__` begin with an
+/// underscore and are a language protocol rather than a private surface, so
+/// demoting them would answer "how is this constructed" with everything except
+/// the constructor.
+fn entity_surface_class(name: &str, kind: &str) -> Option<&'static str> {
+    let tail = qualified_name_tail(name);
+    if tail.is_empty() {
+        return None;
+    }
+    let lower = tail.to_ascii_lowercase();
+    if kind == "test"
+        || lower.starts_with("test_")
+        || lower.ends_with("_test")
+        || lower.ends_with("_tests")
+        || lower == "tests"
+    {
+        return Some("test_support");
+    }
+    if tail.starts_with('_') && !(tail.starts_with("__") && tail.ends_with("__")) {
+        return Some("private_name");
+    }
+    None
+}
+
+/// Demote private and test-support entities on a query that did not name one.
+///
+/// Multiplicative, in the same family as the path-keyed impl penalties and with
+/// the same shape of knob (`KIN_LOCATE_ENTITY_SURFACE_PENALTY`, default 0.3,
+/// matching `KIN_LOCATE_PUBLIC_API_IMPL_PENALTY`). It demotes rather than
+/// filters: a private helper really is the answer sometimes, and the only store
+/// where it is the ONLY candidate is one where nothing else is left to outrank
+/// it.
+///
+/// Exact-name hits are exempt, which is the whole gate on "description-shaped".
+/// [`locate_exact_name_tier`] is already the single definition of "the query
+/// literally named this symbol", so a caller asking for `_dot_escape` by name
+/// gets it unpenalized and above every fused score, and the tier rather than a
+/// second predicate decides that. A description query has no token that IS an
+/// entity name, so every one of its hits lands here.
+///
+/// A knob outside `[0, 1)` is a no-op rather than an amplifier: this function's
+/// job is to demote, and a value above one would silently promote every private
+/// name in the store.
+fn apply_entity_surface_penalty(ranked: &mut [(usize, LocateEntity)]) {
+    let penalty = locate_env_f32("KIN_LOCATE_ENTITY_SURFACE_PENALTY", 0.3);
+    if !(0.0..1.0).contains(&penalty) {
+        return;
+    }
+    for (_, entity) in ranked.iter_mut() {
+        if locate_exact_name_tier(entity) > 0 {
+            continue;
+        }
+        if entity_surface_class(&entity.name, &entity.kind).is_some() {
+            entity.score *= penalty;
+        }
+    }
+}
+
+/// The global entity ordering: definitions first, then the exact-name tier
+/// ([`locate_exact_name_tier`]: a hit the query literally named cannot be outbid
+/// by fallback scale), then composite score desc, then owner graph mass for the
+/// exact-name ties fixed scores produce (the canonical definition over test
+/// doubles and forwarding impls; 0 for every non-name row, so nothing else
+/// moves), then the file's own rank, then name/id for a total deterministic
+/// order.
+///
+/// Extracted from [`build_entity_view`] so the ordering a test asserts on is the
+/// ordering the product runs, rather than a second copy that can come to
+/// disagree with it.
+fn order_locate_entities(
+    ranked: &mut [(usize, LocateEntity)],
+    owner_mass_of: impl Fn(&LocateEntity) -> usize,
+) {
+    ranked.sort_by(|(a_rank, a), (b_rank, b)| {
+        b.definition
+            .cmp(&a.definition)
+            .then_with(|| locate_exact_name_tier(b).cmp(&locate_exact_name_tier(a)))
+            .then_with(|| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| owner_mass_of(b).cmp(&owner_mass_of(a)))
+            .then_with(|| a_rank.cmp(b_rank))
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.identity_key().cmp(b.identity_key()))
+    });
+}
+
 pub fn build_entity_view(
     result: &mut LocateResult,
     held_authority: &kin_mcp::handlers::common::HeldSourceAuthority<'_, kin_db::InMemoryGraph>,
@@ -17054,33 +17348,16 @@ pub fn build_entity_view(
         }
     }
 
-    // Global rank: definitions first, then the exact-name tier
-    // ([`locate_exact_name_tier`]: a hit the query literally named cannot be
-    // outbid by fallback scale), then composite score desc, then owner graph
-    // mass for the exact-name ties fixed scores produce (the canonical
-    // definition over test doubles and forwarding impls; 0 for every non-name
-    // row, so nothing else moves), then the file's own rank, then name/id for
-    // a total deterministic order.
+    // Surface penalty before the ordering, because it moves the composite score
+    // the ordering then reads ([`apply_entity_surface_penalty`]).
+    apply_entity_surface_penalty(&mut ranked);
     let owner_mass_of = |entity: &LocateEntity| {
         name_owner_mass
             .get(entity.identity_key())
             .copied()
             .unwrap_or(0)
     };
-    ranked.sort_by(|(a_rank, a), (b_rank, b)| {
-        b.definition
-            .cmp(&a.definition)
-            .then_with(|| locate_exact_name_tier(b).cmp(&locate_exact_name_tier(a)))
-            .then_with(|| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .then_with(|| owner_mass_of(b).cmp(&owner_mass_of(a)))
-            .then_with(|| a_rank.cmp(b_rank))
-            .then_with(|| a.name.cmp(&b.name))
-            .then_with(|| a.identity_key().cmp(b.identity_key()))
-    });
+    order_locate_entities(&mut ranked, owner_mass_of);
 
     result.entities = ranked.into_iter().map(|(_, entity)| entity).collect();
 
@@ -17688,6 +17965,15 @@ mod tests {
             "the remediation must name the form that does work at this size: {}",
             entry.remediation
         );
+        // FIR-2582: and the granularity that works, which the stranger found by
+        // accident after the run had already gone wrong. The path heuristics
+        // that separate candidates live at file granularity, so a caller with a
+        // description and no symbol to name has somewhere to go besides grep.
+        assert!(
+            entry.remediation.contains("granularity: \"file\""),
+            "the remediation must name the granularity that ranks under the constant: {}",
+            entry.remediation
+        );
 
         // The control that makes the threshold mean something: a graph at the
         // constant discloses nothing, so this cannot be an entry every store
@@ -17774,6 +18060,235 @@ mod tests {
             &mut sink,
         );
         assert!(sink.is_empty());
+    }
+
+    /// FIR-2583. The tier remediation named `KIN_LOCATE_PROFILE` and stopped
+    /// there, so a reader exported it in front of a CLI call and nothing
+    /// changed: `CapabilityDetection::detect` reads the environment of the
+    /// process it runs in, and on a repo with a daemon up that process is the
+    /// daemon, which captured its environment when it started. The advice was
+    /// unreachable from where the reader stood. It now says where the value is
+    /// read, how to make a serving process read a new one, and what the tier
+    /// actually gates, so nobody restarts a daemon expecting a description
+    /// query to rank differently.
+    #[test]
+    fn the_capability_remediation_says_where_the_override_is_read_and_what_it_gates() {
+        // The stranger's own container: 5 cores of quota and 12 GiB, scored
+        // Standard, which is a sub-Performance tier and so discloses.
+        let mut sink = Vec::new();
+        record_capability_tier_degradation(
+            &CapabilityDetection {
+                profile: LocateProfile::Standard,
+                forced_by_env: false,
+                cores: Some(5),
+                memory: Some(crate::capability::HostMemory::Detected(12.0)),
+            },
+            &mut sink,
+        );
+        let entry = capability_entry(&sink);
+        assert_eq!(entry.reason, "standard");
+        for required in [
+            "KIN_LOCATE_PROFILE=performance",
+            "read once at process start",
+            "kin daemon stop",
+            "multihop budget",
+        ] {
+            assert!(
+                entry.remediation.contains(required),
+                "the remediation must say {required:?}, got: {}",
+                entry.remediation
+            );
+        }
+
+        // The misread-host entry names the same variable, so it carries the
+        // same reachability clause. Its own rule still holds: a host that was
+        // never read is not told to become a bigger host.
+        let mut misread = Vec::new();
+        record_capability_tier_degradation(
+            &CapabilityDetection {
+                profile: LocateProfile::Minimal,
+                forced_by_env: false,
+                cores: Some(18),
+                memory: Some(crate::capability::HostMemory::Undetected(
+                    "sysctlbyname(hw.memsize) failed".to_string(),
+                )),
+            },
+            &mut misread,
+        );
+        let misread_entry = capability_entry(&misread);
+        assert!(
+            misread_entry.remediation.contains("kin daemon stop"),
+            "the misread entry names the same variable and must say the same thing about \
+             reaching it: {}",
+            misread_entry.remediation
+        );
+        assert!(
+            !misread_entry.remediation.contains("run on a host"),
+            "a host that was never read must not be told to become a bigger host: {}",
+            misread_entry.remediation
+        );
+
+        // The control that keeps the strings above meaningful: a host on the
+        // full tier records no entry at all, so this is not text every result
+        // carries.
+        let mut performance = Vec::new();
+        record_capability_tier_degradation(
+            &CapabilityDetection {
+                profile: LocateProfile::Performance,
+                forced_by_env: false,
+                cores: Some(18),
+                memory: Some(crate::capability::HostMemory::Detected(128.0)),
+            },
+            &mut performance,
+        );
+        assert!(
+            performance.is_empty(),
+            "the full tier narrows nothing and must stay silent, got {performance:?}"
+        );
+    }
+
+    /// A ranked entity carrying the query's own classification, so the test
+    /// drives [`classify_locate_match`] rather than asserting a hand-set kind.
+    fn surface_hit(name: &str, kind: &str, score: f32, query: &str) -> LocateEntity {
+        LocateEntity {
+            entity_id: format!("id-{name}"),
+            id_space: LocateIdSpace::Entity,
+            artifact_path: None,
+            kind: kind.to_string(),
+            name: name.to_string(),
+            signature: format!("def {name}(...)"),
+            score,
+            definition: true,
+            span: Some([1, 9]),
+            body: None,
+            match_kind: Some(classify_locate_match(query, name, "text")),
+            provenance: LocateProvenance {
+                file: Some("linkgraph.py".to_string()),
+                origin: "text".to_string(),
+                cosine: Some(0.8),
+            },
+            matched_queries: Vec::new(),
+        }
+    }
+
+    /// Rank a small entity set exactly as `build_entity_view` does: the surface
+    /// penalty, then the shared ordering. Owner mass is 0 for every row, which
+    /// is what it reads for every non-name hit in production too.
+    fn surface_ranked(query: &str, hits: &[(&str, &str, f32)]) -> Vec<LocateEntity> {
+        let mut ranked: Vec<(usize, LocateEntity)> = hits
+            .iter()
+            .enumerate()
+            .map(|(rank, (name, kind, score))| (rank, surface_hit(name, kind, *score, query)))
+            .collect();
+        apply_entity_surface_penalty(&mut ranked);
+        order_locate_entities(&mut ranked, |_| 0);
+        ranked.into_iter().map(|(_, entity)| entity).collect()
+    }
+
+    fn surface_ranked_names(query: &str, hits: &[(&str, &str, f32)]) -> Vec<String> {
+        surface_ranked(query, hits)
+            .into_iter()
+            .map(|entity| entity.name)
+            .collect()
+    }
+
+    /// FIR-2582, the stranger's exact failure. On a five-module project a
+    /// description of the dot-export code returned `_dot_escape`, `_blank` and
+    /// `_clean_snippet` while `to_dot` was absent at rank 30 of 83: the private
+    /// helpers carried more lexical mass than the exported function, and
+    /// nothing at entity granularity looked at a name to tell them apart. The
+    /// same query at file granularity put the module first, because the impl
+    /// penalties there key on the path.
+    #[test]
+    fn a_description_ranks_the_public_entity_above_the_private_helpers() {
+        let hits = [
+            ("_dot_escape", "function", 1.0f32),
+            ("_blank", "function", 0.9f32),
+            ("to_dot", "function", 0.6f32),
+        ];
+
+        assert_eq!(
+            surface_ranked_names("render the graph as dot output for graphviz", &hits),
+            vec!["to_dot", "_dot_escape", "_blank"],
+            "a description query must rank the exported function above the private helpers \
+             it calls, even when they score higher on lexical mass"
+        );
+
+        // And the other half of the contract: naming a private symbol asks for
+        // it, so the penalty must not touch it. The exact-name tier already
+        // owns this case; the penalty stays out of its way rather than fighting
+        // it, which is why the exemption reads the tier instead of a second
+        // predicate.
+        let by_name = surface_ranked("_dot_escape", &hits);
+        assert_eq!(
+            by_name
+                .iter()
+                .map(|entity| entity.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["_dot_escape", "to_dot", "_blank"],
+            "a query that names a private helper exactly must still rank it first"
+        );
+        // The tier would put it first whether or not it was penalized, so the
+        // exemption is only visible in the score the caller reads back. Assert
+        // it, or removing the exemption changes what the surface reports and no
+        // test says a word.
+        assert_eq!(
+            by_name[0].score, 1.0,
+            "an exact-name hit must be reported at its own score, unpenalized"
+        );
+        assert_eq!(
+            by_name[2].score,
+            0.9 * 0.3,
+            "while a private helper the query did not name still carries the penalty"
+        );
+    }
+
+    /// The naming rule on its own, including the case that makes it a rule
+    /// about surfaces rather than about underscores.
+    #[test]
+    fn a_dunder_is_language_protocol_and_a_leading_underscore_is_private() {
+        assert_eq!(
+            entity_surface_class("_dot_escape", "function"),
+            Some("private_name")
+        );
+        assert_eq!(
+            entity_surface_class("LinkGraph._blank", "method"),
+            Some("private_name"),
+            "the rule reads the entity's own name, not the owner it hangs off"
+        );
+        assert_eq!(
+            entity_surface_class("_LinkRow__mangled", "method"),
+            Some("private_name")
+        );
+
+        // `__init__` opens with an underscore and is the answer to "how is this
+        // constructed". Demoting it would answer that with everything except
+        // the constructor.
+        assert_eq!(entity_surface_class("__init__", "method"), None);
+        assert_eq!(entity_surface_class("LinkRow.__repr__", "method"), None);
+
+        assert_eq!(
+            entity_surface_class("test_to_dot", "function"),
+            Some("test_support")
+        );
+        assert_eq!(
+            entity_surface_class("roundtrip_test", "function"),
+            Some("test_support")
+        );
+        assert_eq!(
+            entity_surface_class("to_dot", "test"),
+            Some("test_support"),
+            "the graph's own Test kind says it too, whatever the name reads like"
+        );
+
+        // Controls: ordinary public API must not match, or the rule demotes
+        // every candidate and orders nothing.
+        assert_eq!(entity_surface_class("to_dot", "function"), None);
+        assert_eq!(
+            entity_surface_class("LinkGraph.ingest_directory", "method"),
+            None
+        );
+        assert_eq!(entity_surface_class("", "function"), None);
     }
 
     fn native_change(
@@ -28143,6 +28658,9 @@ mod tests {
             total: 10,
             pending: 0,
             complete: true,
+            embedding_state: EmbeddingState::Present,
+            limited_by: Vec::new(),
+            read_at: None,
             note: None,
             graph_bodies: None,
         };
@@ -28157,6 +28675,9 @@ mod tests {
             total: 10,
             pending: 6,
             complete: false,
+            embedding_state: EmbeddingState::Partial,
+            limited_by: vec![COVERAGE_LIMIT_EMBEDDINGS_INCOMPLETE.to_string()],
+            read_at: None,
             note: Some("custom degradation note".to_string()),
             graph_bodies: None,
         };
@@ -28172,6 +28693,9 @@ mod tests {
             total: 10,
             pending: 6,
             complete: false,
+            embedding_state: EmbeddingState::Partial,
+            limited_by: vec![COVERAGE_LIMIT_EMBEDDINGS_INCOMPLETE.to_string()],
+            read_at: None,
             note: None,
             graph_bodies: None,
         };
@@ -28193,6 +28717,9 @@ mod tests {
             total: 1644,
             pending: 0,
             complete: true,
+            embedding_state: EmbeddingState::Present,
+            limited_by: Vec::new(),
+            read_at: None,
             note: None,
             graph_bodies: None,
         }
@@ -28324,6 +28851,9 @@ mod tests {
             total: 10,
             pending: 6,
             complete: false,
+            embedding_state: EmbeddingState::Partial,
+            limited_by: vec![COVERAGE_LIMIT_EMBEDDINGS_INCOMPLETE.to_string()],
+            read_at: None,
             note: Some("semantic signal partial: 4/10 embedded.".to_string()),
             graph_bodies: None,
         };

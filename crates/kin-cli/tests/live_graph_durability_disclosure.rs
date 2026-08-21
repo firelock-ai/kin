@@ -65,6 +65,16 @@ const WATCHER_RECORD: &str = "started file watcher";
 /// into repository authority (`crates/kin-daemon/src/loop_runner.rs`).
 const ADMISSION_RECORD: &str = "admitted exact workspace tree into repository authority";
 
+/// What the daemon logs immediately after it writes `.kin/daemon.port`
+/// (`crates/kin-daemon/src/daemon.rs`, the line after
+/// `publish_daemon_endpoint`).
+const ENDPOINT_RECORD: &str = "published the daemon endpoint";
+
+/// What the reconciliation loop logs when its startup catch-up finds host paths
+/// the working copy changed while nothing was watching
+/// (`crates/kin-daemon/src/loop_runner.rs`).
+const CATCH_UP_RECORD: &str = "admitting host paths modified since the last complete admission";
+
 /// The settle budget a quiet host needs, and the floor every busier host starts
 /// from.
 ///
@@ -195,6 +205,11 @@ impl IsolatedDaemon {
     /// written after this point and cannot match an older line.
     fn log_offset(&self) -> u64 {
         fs::metadata(&self.log).map(|meta| meta.len()).unwrap_or(0)
+    }
+
+    /// Everything this daemon has recorded so far.
+    fn log_text(&self) -> String {
+        fs::read_to_string(&self.log).unwrap_or_default()
     }
 
     /// Poll the daemon's log for `record`, considering only bytes at or after
@@ -544,6 +559,32 @@ fn wait_for_live_growth(
     }
 }
 
+/// The live entity count, waited out rather than sampled once.
+///
+/// `kin graph status` exits non-zero on a critical graph health issue, and one
+/// of those is transient by construction: authority admission binds the entity
+/// layer and facets are written per file after it, so a read taken between the
+/// two halves sees a derived tree that trails authority. A caller that wants a
+/// number rather than an event waits for one, and reports the command's own
+/// output when the bound expires instead of a bare `None`.
+fn settled_entity_count(repo: &Path, home: &Path, port: u16) -> u64 {
+    let deadline = Instant::now() + COUNT_SETTLE_BOUND;
+    loop {
+        let (live, status) = live_entity_count(repo, home, port);
+        if let Some(live) = live {
+            return live;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "graph status never reported an entity count: it exited {} and said:\n{}\n{}",
+            status.status,
+            String::from_utf8_lossy(&status.stdout),
+            String::from_utf8_lossy(&status.stderr)
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Whether `kin_graph_status` refused this call and asked to be repeated.
 ///
 /// `crates/kin-daemon/src/api.rs:2084` fails the call outright when the
@@ -601,6 +642,37 @@ fn durability(payload: &serde_json::Value) -> serde_json::Value {
         .get("durability")
         .unwrap_or_else(|| panic!("envelope carries no durability object: {payload}"))
         .clone()
+}
+
+/// The envelope's report of how far graph truth is behind the working copy.
+///
+/// Absent when the runtime reported nothing unadmitted, which is a different
+/// answer from a zero and is why this returns an option rather than a count.
+fn behind(payload: &serde_json::Value) -> Option<serde_json::Value> {
+    payload.get("_kin")?.get("behind").cloned()
+}
+
+/// Set a host entry's modification time outright.
+///
+/// Both stamps are written because setting only one is refused on some hosts,
+/// and the access time is not what any assertion here reads.
+fn stamp_modified(path: &Path, at: std::time::SystemTime) {
+    let handle = fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open the file to stamp it");
+    handle
+        .set_times(fs::FileTimes::new().set_accessed(at).set_modified(at))
+        .expect("stamp the modification time");
+    assert_eq!(
+        fs::symlink_metadata(path)
+            .expect("read back the stamped entry")
+            .modified()
+            .expect("the host publishes modification times"),
+        at,
+        "the stamp has to have applied, or every assertion resting on it is about the file's \
+         real age instead"
+    );
 }
 
 #[test]
@@ -848,4 +920,229 @@ fn a_settle_that_begins_quiet_and_turns_busy_gets_the_busy_budget() {
         busy <= started + RETRY_BOUND_CEILING,
         "no sequence of readings may push the settle past its ceiling"
     );
+}
+
+/// FIR-2466. The endpoint a client finds is a daemon that is already watching.
+///
+/// `.kin/daemon.port` is the readiness signal real clients key on, and the
+/// daemon used to publish it and spawn the reconciliation loop afterwards. The
+/// loop is what calls `FileWatcher::new`, and startup replays nothing, so a
+/// write landing between those two points raised no event and never reached the
+/// graph at all. The gap measured a few milliseconds on this host and the
+/// fixture that depended on losing that race lost it repeatedly.
+///
+/// Asserted on the ordering of the daemon's own records rather than on a write
+/// that has to win a race, so restoring the old order fails this outright
+/// instead of failing it sometimes.
+#[test]
+fn the_reconciliation_watch_is_armed_before_the_endpoint_is_published() {
+    let root = tempdir().expect("temp root");
+    let home = root.path().join("home");
+    let repo = root.path().join("repo");
+    fs::create_dir_all(&home).expect("create home");
+    fs::create_dir_all(&repo).expect("create repo");
+    let repo = repo.canonicalize().expect("resolve the repository path");
+    let home = home.canonicalize().expect("resolve the home path");
+    seed_repository(&repo);
+    stdout_of(&kin(&repo, &home, &["init", "."]), "kin init");
+
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let daemon_log = root.path().join("kin-daemon.log");
+    let mut daemon = IsolatedDaemon::spawn(&repo, &daemon_log, &runtime);
+    daemon.wait_until_serving(&repo.join(".kin"));
+    // Both records have to be present before their positions mean anything.
+    // The port file appears a moment before the line that reports it, so the
+    // wait above proves the publication happened and this proves it was logged.
+    daemon.wait_for_record(ENDPOINT_RECORD, 0, WATCHER_BOUND, "publish its endpoint");
+    daemon.wait_for_record(
+        WATCHER_RECORD,
+        0,
+        WATCHER_BOUND,
+        "register its file watcher",
+    );
+
+    let log = daemon.log_text();
+    let watch_at = log
+        .find(WATCHER_RECORD)
+        .unwrap_or_else(|| panic!("the daemon logged no watcher record:\n{log}"));
+    let publish_at = log
+        .find(ENDPOINT_RECORD)
+        .unwrap_or_else(|| panic!("the daemon logged no endpoint record:\n{log}"));
+    assert!(
+        watch_at < publish_at,
+        "the watch must exist before the endpoint advertises this daemon, but the watcher \
+         record is at byte {watch_at} and the publication record at {publish_at}; a client \
+         writing the instant the port appears would have that write observed by nobody. \
+         The log:\n{log}"
+    );
+
+    daemon.stop();
+}
+
+/// FIR-2499. A file written while no daemon was running reaches the graph
+/// without a commit.
+///
+/// The stranger's finding was that the graph is always one commit behind the
+/// work, and the mechanism is this: a watcher reports only edits it was alive
+/// for. An idle timeout ends a daemon mid-session, the next command starts a
+/// fresh one, and everything written in between was seen by nobody. Startup
+/// admitted nothing, so nothing ever replayed it and the file stayed invisible
+/// until a commit swept it in.
+///
+/// Written between two daemons deliberately: it is the only construction in
+/// which no watcher can have seen the write, so a pass here cannot be the
+/// watcher quietly doing the work.
+#[test]
+fn a_file_written_while_no_daemon_watched_is_admitted_by_the_next_one() {
+    let root = tempdir().expect("temp root");
+    let home = root.path().join("home");
+    let repo = root.path().join("repo");
+    fs::create_dir_all(&home).expect("create home");
+    fs::create_dir_all(&repo).expect("create repo");
+    let repo = repo.canonicalize().expect("resolve the repository path");
+    let home = home.canonicalize().expect("resolve the home path");
+    seed_repository(&repo);
+    let init = kin(&repo, &home, &["init", ".", "--json"]);
+    let init_payload: serde_json::Value =
+        serde_json::from_slice(&stdout_of(&init, "kin init").into_bytes())
+            .expect("init emits JSON");
+    let durable_at_init = init_payload["semantic_enrichment"]["entity_count"]
+        .as_u64()
+        .expect("init reports a durable entity count");
+
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let first_log = root.path().join("kin-daemon-first.log");
+    let mut first = IsolatedDaemon::spawn(&repo, &first_log, &runtime);
+    let first_port = first.wait_until_serving(&repo.join(".kin"));
+    first.wait_until_watching();
+
+    // One ordinary watched write, so this store records a complete admission
+    // and the catch-up below has a window to open at. Without a marker there is
+    // no lower bound and the pass correctly declines to run at all.
+    let before_write = first.log_offset();
+    fs::write(repo.join(UNCOMMITTED_PATH), UNCOMMITTED_SOURCE).expect("write the watched source");
+    wait_for_live_growth(
+        &first,
+        &repo,
+        &home,
+        first_port,
+        durable_at_init,
+        before_write,
+    );
+    // Committed before the restart, and the reason is the confound this fixture
+    // would otherwise measure instead. A daemon rebuilds the entity layer for
+    // uncommitted content from zero on the next open (FIR-2421), so a count
+    // taken across a restart mixes what the catch-up added with what the
+    // restart dropped. On the first run of this case those two happened to be
+    // three entities each and the count came back unchanged over a catch-up
+    // that had plainly worked.
+    stdout_of(
+        &kin_against_daemon(&repo, &home, first_port, &["commit", "-m", "link graph"]),
+        "kin commit",
+    );
+    let watched = settled_entity_count(&repo, &home, first_port);
+    assert!(
+        watched > durable_at_init,
+        "the fixture needs the watched write recorded before the restart, got {watched} against \
+         {durable_at_init} at init"
+    );
+    first.stop();
+
+    // The write nothing could see. No daemon is running, so no watcher exists
+    // to raise an event for it and nothing will replay one.
+    fs::write(
+        repo.join("src/catch_up.rs"),
+        b"pub fn build_catch_up() -> u32 {\n    5\n}\n\npub fn walk_catch_up() -> u32 {\n    build_catch_up() + 1\n}\n\npub fn render_catch_up() -> u32 {\n    walk_catch_up() + 1\n}\n",
+    )
+    .expect("write the unwatched source");
+
+    // And one the catch-up must NOT take: its modification time predates every
+    // admission this store has recorded, so the window does not cover it and
+    // nothing observed it arriving. The bound matters as much as the reach. A
+    // catch-up with no lower bound would sweep the whole working copy, which is
+    // exactly what startup must never do, so this file is both the control on
+    // that bound and the store's remaining behind-ness for the disclosure
+    // assertions below.
+    let stale = repo.join("src/stale_drift.rs");
+    fs::write(&stale, b"pub fn drifted() -> u32 {\n    9\n}\n").expect("write the stale source");
+    stamp_modified(
+        &stale,
+        std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000),
+    );
+
+    let second_log = root.path().join("kin-daemon-second.log");
+    let mut second = IsolatedDaemon::spawn(&repo, &second_log, &runtime);
+    let second_port = second.wait_until_serving(&repo.join(".kin"));
+    second.wait_for_record(
+        CATCH_UP_RECORD,
+        0,
+        WATCHER_BOUND,
+        "plan a startup catch-up over what changed while it was down",
+    );
+    second.wait_for_record(
+        ADMISSION_RECORD,
+        0,
+        ADMISSION_BOUND,
+        "admit what the catch-up planned",
+    );
+    // The reconciler's own record for that exact path: direct evidence that the
+    // entity layer took the file, separate from the count below, so a failure
+    // says which half broke.
+    second.wait_for_record(
+        "src/catch_up.rs",
+        0,
+        ADMISSION_BOUND,
+        "reconcile the file written while it was down",
+    );
+    // Read with the daemon's own log in the failure, because the two ways this
+    // can fail need different fixes: a catch-up that planned nothing is an
+    // ingestion defect, and one that planned the path and never derived its
+    // entities is an enrichment defect.
+    let deadline = Instant::now() + COUNT_SETTLE_BOUND;
+    let caught_up = loop {
+        let (live, status) = live_entity_count(&repo, &home, second_port);
+        if live.is_some_and(|live| live > watched) {
+            break live.expect("the reading above carried a count");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the graph has to carry the file written while nothing watched, but the live \
+             entity count stayed at {live:?} against {watched} before the restart; graph \
+             status exited {} and said:\n{}\nThe second daemon's log:\n{}",
+            status.status,
+            String::from_utf8_lossy(&status.stdout),
+            second.log_text()
+        );
+        thread::sleep(Duration::from_millis(200));
+    };
+    assert!(caught_up > watched);
+
+    // FIR-2499's other half, read off the real MCP surface rather than a
+    // hand-built health body. The store still holds one path no admission has
+    // taken, so every envelope has to say so and none may certify over it.
+    let session = settled_mcp_session(&repo, &home, second_port);
+    let locate = payload(&session, 3, "semantic_locate");
+    let behind = behind(&locate)
+        .unwrap_or_else(|| panic!("a store holding an unadmitted path must disclose it: {locate}"));
+    assert_eq!(
+        behind["unadmitted_paths"],
+        serde_json::json!(1),
+        "exactly the stale file is outstanding; the catch-up took the other one: {behind}"
+    );
+    assert!(
+        behind["note"]
+            .as_str()
+            .is_some_and(|note| note.contains("Answers here cover admitted content only")),
+        "the disclosure has to say what it means for an answer: {behind}"
+    );
+    let durability = durability(&locate);
+    assert!(
+        !durability["note"]
+            .as_str()
+            .is_some_and(|note| note.contains("records everything answering here")),
+        "durability may not report an all-clear over a repository holding an unadmitted \
+         module: {durability}"
+    );
+
+    second.stop();
 }

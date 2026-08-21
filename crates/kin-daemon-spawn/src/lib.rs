@@ -165,6 +165,414 @@ pub fn clear_daemon_death_note(kin_root: &Path) {
     let _ = fs::remove_file(kin_root.join(DEATH_FILE_NAME));
 }
 
+// ── Kills nobody explained ──────────────────────────────────────────────
+
+/// File the running record of unexplained daemon kills is kept in.
+///
+/// Deliberately not [`DEATH_FILE_NAME`]. A death note is written by whoever
+/// deliberately ended a daemon and is cleared as soon as a replacement comes
+/// up, because it explains one outage and must not be quoted for the next. A
+/// kill the kernel performs has no author to write a note, and the fact worth
+/// carrying about it is that it has now happened four times in twenty minutes,
+/// which a record cleared on every successful boot can never say.
+pub const KILL_RECORD_FILE_NAME: &str = "daemon.kills.json";
+
+/// What this process can read about the memory budget of the cgroup it runs in.
+///
+/// One reader for the whole product: the commit headroom check, the embed path
+/// and the daemon watch below all decide whether memory was the cause from
+/// these two numbers, so they cannot end up describing the same host
+/// differently. Both fields are optional for the same reason: `Some(0)` is the
+/// kernel saying nothing was killed, and `None` is this process being unable to
+/// ask.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CgroupMemory {
+    /// The container memory cap in bytes, or `None` when unlimited, unset,
+    /// unparsable, or off Linux.
+    pub limit_bytes: Option<u64>,
+    /// Kernel OOM kills accounted to this cgroup, or `None` when no accounting
+    /// is readable.
+    pub oom_kills: Option<u64>,
+}
+
+/// Read what this host will say about memory pressure right now.
+pub fn cgroup_memory() -> CgroupMemory {
+    CgroupMemory {
+        limit_bytes: cgroup_memory_limit_bytes(),
+        oom_kills: cgroup_oom_kill_count(),
+    }
+}
+
+/// Effective memory limit in bytes from a container memory cap, or `None` when
+/// unlimited, unset, unparsable, or off Linux.
+#[cfg(target_os = "linux")]
+fn cgroup_memory_limit_bytes() -> Option<u64> {
+    if let Ok(contents) = fs::read_to_string("/sys/fs/cgroup/memory.max") {
+        return parse_v2_memory_max(&contents);
+    }
+    let raw: u64 = fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    parse_v1_memory_limit(raw)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cgroup_memory_limit_bytes() -> Option<u64> {
+    None
+}
+
+/// How many times the kernel OOM-killed a process accounted to this cgroup, or
+/// `None` when no accounting is readable (off Linux, or neither hierarchy's
+/// file is present).
+///
+/// Both hierarchies publish the counter under the same key, in different files:
+/// cgroup v2 in `memory.events`, v1 in `memory.oom_control`.
+#[cfg(target_os = "linux")]
+fn cgroup_oom_kill_count() -> Option<u64> {
+    for path in [
+        "/sys/fs/cgroup/memory.events",
+        "/sys/fs/cgroup/memory/memory.oom_control",
+    ] {
+        if let Ok(contents) = fs::read_to_string(path) {
+            if let Some(count) = parse_oom_kill_count(&contents) {
+                return Some(count);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cgroup_oom_kill_count() -> Option<u64> {
+    None
+}
+
+/// The `oom_kill` counter out of a cgroup key/value block, or `None` when the
+/// block carries no such key.
+#[cfg(any(target_os = "linux", test))]
+fn parse_oom_kill_count(contents: &str) -> Option<u64> {
+    contents.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        match (fields.next(), fields.next()) {
+            (Some("oom_kill"), Some(value)) => value.parse().ok(),
+            _ => None,
+        }
+    })
+}
+
+/// Byte limit from a cgroup v2 `memory.max` value, or `None` for "max" /
+/// unparsable.
+#[cfg(any(target_os = "linux", test))]
+fn parse_v2_memory_max(contents: &str) -> Option<u64> {
+    let trimmed = contents.trim();
+    if trimmed == "max" {
+        return None;
+    }
+    trimmed.parse().ok()
+}
+
+/// Byte limit from a cgroup v1 `memory.limit_in_bytes`. An unconstrained group
+/// reports a huge page-aligned sentinel near `u64::MAX`; any value at or above
+/// 1 PiB is that sentinel, not a real cap.
+#[cfg(any(target_os = "linux", test))]
+fn parse_v1_memory_limit(raw: u64) -> Option<u64> {
+    const ONE_PIB: u64 = 1 << 50;
+    if raw >= ONE_PIB {
+        None
+    } else {
+        Some(raw)
+    }
+}
+
+/// How a daemon died, as far as the process watching it could tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DaemonKillCause {
+    /// The cgroup's own OOM counter advanced while this daemon was running and
+    /// the daemon died on the signal the OOM killer sends. This is the kernel's
+    /// statement rather than an inference from how much memory was in use.
+    MemoryLimit {
+        /// Kills the cgroup recorded between this daemon starting and dying.
+        kernel_oom_kills: u64,
+    },
+    /// A kill this host cannot attribute: no cgroup accounting is readable here
+    /// (every macOS host, and any Linux host whose files are absent), so the
+    /// signal is the whole of what is known.
+    Unattributed {
+        /// The signal the daemon died on.
+        signal: i32,
+    },
+}
+
+/// What one store knows about daemons of its own that were killed.
+///
+/// Accumulated rather than replaced. One kill is an incident and four in twenty
+/// minutes is a diagnosis, and only a record that survives the successful boots
+/// between them can tell the two apart.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DaemonKillRecord {
+    /// Kills recorded for this store, of any cause.
+    pub kills: u64,
+    /// How many of them the kernel's own counter attributed to memory.
+    pub memory_kills: u64,
+    /// Unix seconds at the first recorded kill.
+    pub first_unix: u64,
+    /// Unix seconds at the most recent one.
+    pub last_unix: u64,
+    /// The daemon that died most recently.
+    pub last_pid: Option<u32>,
+    /// What killed it.
+    pub last_cause: DaemonKillCause,
+    /// The memory cap in force when it died, when this host publishes one.
+    pub limit_bytes: Option<u64>,
+    /// The last resident set the dead daemon published, when it published one.
+    /// Absent is absent: a daemon reported as using nothing would be a
+    /// measurement a reader acts on, and it would be wrong.
+    pub last_rss_bytes: Option<u64>,
+}
+
+impl DaemonKillRecord {
+    /// Whether the kernel's own accounting attributed any of these to memory.
+    pub fn attributed_to_memory(&self) -> bool {
+        self.memory_kills > 0
+    }
+
+    /// What happened, in one clause a caller can read without parsing anything.
+    ///
+    /// Says exactly what the record holds and no more. A count of kills is a
+    /// fact about this store's history; it is not a claim about the cause of
+    /// the request that just failed, and the wording keeps those apart.
+    pub fn cause_sentence(&self) -> String {
+        let since = hhmm_utc(self.first_unix);
+        let opening = match (self.memory_kills, self.kills, self.last_cause) {
+            (0, kills, DaemonKillCause::Unattributed { signal }) => format!(
+                "the daemon for this store was killed by signal {signal} {kills} time(s) since \
+                 {since}, and this host publishes no memory accounting, so nothing here \
+                 attributes that to memory"
+            ),
+            (memory, kills, _) if memory == kills => format!(
+                "the daemon for this store was killed by the memory limit {kills} time(s) since \
+                 {since}"
+            ),
+            (memory, kills, _) => format!(
+                "the daemon for this store was killed {kills} time(s) since {since}, {memory} of \
+                 them by the memory limit"
+            ),
+        };
+        let mut sentence = opening;
+        if let Some(limit) = self.limit_bytes {
+            sentence.push_str(&format!("; cap {}", human_bytes(limit)));
+        }
+        if let Some(rss) = self.last_rss_bytes {
+            sentence.push_str(&format!("; last resident set {}", human_bytes(rss)));
+        }
+        sentence
+    }
+
+    /// What the caller can do about it, in actions the caller can perform.
+    ///
+    /// Every option here is available to an agent inside an MCP session or to
+    /// whoever runs the CLI. Restarting the MCP server is deliberately not one
+    /// of them: the process that would have to be restarted is the one serving
+    /// the session asking, and nobody inside that session owns it.
+    pub fn remediation(&self) -> String {
+        let more_memory = match self.limit_bytes {
+            Some(limit) => format!(
+                "give this container or machine more than the {} it has now",
+                human_bytes(limit)
+            ),
+            None => "run this repository on a machine with more memory".to_string(),
+        };
+        format!(
+            "To recover: {more_memory}, or start a daemon yourself with the enrichment sweep off \
+             (`{DISABLE_ENRICHMENT_ENV}=1 kin graph status` in this repository) and retry this \
+             call. `kin doctor` reports this store's memory headroom, and `kin daemon status` \
+             reports what is running now."
+        )
+    }
+
+    /// The cause and the remediation as one sentence-complete line, for a
+    /// message that ends with it.
+    pub fn summary(&self) -> String {
+        let mut cause = self.cause_sentence();
+        if let Some(first) = cause.get(..1) {
+            cause.replace_range(..1, &first.to_uppercase());
+        }
+        format!("{cause}. {}", self.remediation())
+    }
+}
+
+/// The environment switch that turns the daemon's LSP enrichment off.
+///
+/// Named here rather than spelled into each message so the remediation cannot
+/// drift from the switch `kin-daemon` actually reads.
+pub const DISABLE_ENRICHMENT_ENV: &str = "KIN_DAEMON_DISABLE_LSP";
+
+/// Signals a deliberate shutdown path sends, which are therefore never recorded
+/// as unexplained.
+///
+/// `kin daemon stop` and the supervisor's reaper both end a daemon with
+/// SIGTERM, and the reaper says so in a death note first. Recording those would
+/// fill the record with kills that already have an author and leave the next
+/// reader unable to see the ones that do not.
+#[cfg(unix)]
+fn is_unexplained_kill_signal(signal: i32) -> bool {
+    !matches!(signal, libc::SIGTERM | libc::SIGINT | libc::SIGHUP)
+}
+
+/// No caller here produces a signal off unix, so nothing reaches this. It
+/// exists so the recording entry point is one function on every platform rather
+/// than a shape that compiles differently per target.
+#[cfg(not(unix))]
+fn is_unexplained_kill_signal(_signal: i32) -> bool {
+    true
+}
+
+/// Record a daemon kill against the store it served, and report what the store
+/// now knows.
+///
+/// `before` is the cgroup reading taken before that daemon was started and
+/// `after` the reading taken when it was found dead. Memory is attributed only
+/// when the kernel's own counter moved between the two, which is the kernel
+/// stating it killed something here rather than this code inferring it from how
+/// much memory was in use. Off Linux both readings are empty, the signal is all
+/// that gets recorded, and the record says so: on a host that publishes no
+/// accounting, "not attributed" is the honest answer and "not memory" is not.
+///
+/// Nothing is recorded for a normal exit, for a deliberate shutdown signal, or
+/// for a daemon whose death already has an author in [`DaemonDeathNote`]. A
+/// daemon that stopped because it was idle is not a casualty, and a record of
+/// it would be quoted at the next unrelated failure.
+pub fn record_daemon_kill(
+    kin_root: &Path,
+    pid: u32,
+    signal: i32,
+    before: CgroupMemory,
+    after: CgroupMemory,
+    rss_bytes: Option<u64>,
+) -> Option<DaemonKillRecord> {
+    if !is_unexplained_kill_signal(signal) {
+        return None;
+    }
+    if read_daemon_death_note(kin_root).is_some_and(|note| note.pid == pid) {
+        return None;
+    }
+    let fresh = fresh_kill(pid, signal, before, after, rss_bytes, unix_now());
+    let record = accumulate_kill(read_daemon_kill_record(kin_root), fresh);
+    write_daemon_kill_record(kin_root, &record);
+    Some(record)
+}
+
+/// The record one kill produces on its own, before anything earlier is folded
+/// in.
+fn fresh_kill(
+    pid: u32,
+    signal: i32,
+    before: CgroupMemory,
+    after: CgroupMemory,
+    rss_bytes: Option<u64>,
+    at_unix: u64,
+) -> DaemonKillRecord {
+    let kernel_oom_kills = match (before.oom_kills, after.oom_kills) {
+        (Some(before), Some(after)) if after > before => Some(after - before),
+        // A reading taken only after the fact cannot say the counter moved for
+        // THIS daemon, so it is not evidence and is not treated as any.
+        _ => None,
+    };
+    let (last_cause, memory_kills) = match kernel_oom_kills {
+        Some(kernel_oom_kills) => (DaemonKillCause::MemoryLimit { kernel_oom_kills }, 1),
+        None => (DaemonKillCause::Unattributed { signal }, 0),
+    };
+    DaemonKillRecord {
+        kills: 1,
+        memory_kills,
+        first_unix: at_unix,
+        last_unix: at_unix,
+        last_pid: Some(pid),
+        last_cause,
+        limit_bytes: after.limit_bytes.or(before.limit_bytes),
+        last_rss_bytes: rss_bytes,
+    }
+}
+
+/// Fold one fresh kill into whatever this store had already recorded.
+fn accumulate_kill(
+    previous: Option<DaemonKillRecord>,
+    fresh: DaemonKillRecord,
+) -> DaemonKillRecord {
+    let Some(previous) = previous else {
+        return fresh;
+    };
+    DaemonKillRecord {
+        kills: previous.kills.saturating_add(fresh.kills),
+        memory_kills: previous.memory_kills.saturating_add(fresh.memory_kills),
+        first_unix: previous.first_unix.min(fresh.first_unix),
+        ..fresh
+    }
+}
+
+/// Publish the kill record for `kin_root`.
+///
+/// Best effort and atomic: a reader must never see half a record, and a record
+/// that could not be written must never stop the death it describes from being
+/// reported some other way.
+pub fn write_daemon_kill_record(kin_root: &Path, record: &DaemonKillRecord) {
+    let Ok(body) = serde_json::to_string(record) else {
+        return;
+    };
+    let tmp = kin_root.join(format!("{KILL_RECORD_FILE_NAME}.tmp"));
+    if fs::write(&tmp, body).is_ok()
+        && fs::rename(&tmp, kin_root.join(KILL_RECORD_FILE_NAME)).is_err()
+    {
+        let _ = fs::remove_file(&tmp);
+    }
+}
+
+/// Read the kill record for `kin_root`, if one is there.
+pub fn read_daemon_kill_record(kin_root: &Path) -> Option<DaemonKillRecord> {
+    let raw = fs::read_to_string(kin_root.join(KILL_RECORD_FILE_NAME)).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Retire the kill record for `kin_root`.
+pub fn clear_daemon_kill_record(kin_root: &Path) {
+    let _ = fs::remove_file(kin_root.join(KILL_RECORD_FILE_NAME));
+}
+
+/// Unix seconds now, or zero when the clock is before the epoch.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default()
+}
+
+/// A unix timestamp as the wall clock reads it in UTC.
+///
+/// Rendered by arithmetic rather than by a calendar crate because only the time
+/// of day is wanted and the seconds themselves stay in the record for anything
+/// that needs the date.
+fn hhmm_utc(unix: u64) -> String {
+    let seconds_of_day = unix % 86_400;
+    format!(
+        "{:02}:{:02}Z",
+        seconds_of_day / 3_600,
+        (seconds_of_day % 3_600) / 60
+    )
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const MIB: u64 = 1024 * 1024;
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else {
+        format!("{} MiB", bytes / MIB)
+    }
+}
+
 /// File a daemon publishes its open write transaction into.
 pub const TRANSACTION_FILE_NAME: &str = "daemon.transaction";
 
@@ -3558,6 +3966,87 @@ pub fn terminate_if_proven_dead(
 /// exited. Cheap: `try_wait` is one `waitpid(WNOHANG)` per adopted handle.
 const DETACHED_DAEMON_REAP_POLL: Duration = Duration::from_millis(250);
 
+/// What a process that starts a daemon has to know before it starts one, so it
+/// can say afterwards why the daemon died.
+///
+/// The cgroup counter is sampled BEFORE the spawn on purpose. A counter read
+/// only after a death cannot say whether the kill it counts was this daemon's
+/// or something else's an hour earlier, and reporting it as this daemon's would
+/// be exactly the confident wrong answer this record exists to replace.
+///
+/// Both fields are read only by the `#[cfg(unix)]` recording path, and a struct
+/// whose fields are never read is dead code under `-D warnings`, which is how
+/// the Windows leg goes red for a change that compiles everywhere else.
+#[derive(Debug, Clone)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub struct DaemonWatch {
+    kin_root: PathBuf,
+    before: CgroupMemory,
+}
+
+impl DaemonWatch {
+    /// Start watching, from the moment before a daemon is spawned.
+    pub fn begin(kin_root: &Path) -> Self {
+        Self {
+            kin_root: kin_root.to_path_buf(),
+            before: cgroup_memory(),
+        }
+    }
+
+    /// Record the death of the daemon this watch was opened for, and report
+    /// what the store now knows.
+    ///
+    /// `None` when there is nothing to record: a clean exit, a deliberate
+    /// shutdown signal, or a death that already has an author.
+    #[cfg(unix)]
+    pub fn record_exit(
+        &self,
+        pid: u32,
+        status: &std::process::ExitStatus,
+    ) -> Option<DaemonKillRecord> {
+        use std::os::unix::process::ExitStatusExt;
+        let signal = status.signal()?;
+        record_daemon_kill(
+            &self.kin_root,
+            pid,
+            signal,
+            self.before,
+            cgroup_memory(),
+            self.last_published_rss(pid),
+        )
+    }
+
+    #[cfg(not(unix))]
+    pub fn record_exit(
+        &self,
+        _pid: u32,
+        _status: &std::process::ExitStatus,
+    ) -> Option<DaemonKillRecord> {
+        None
+    }
+
+    /// The last resident set the dead daemon published, when it published one.
+    ///
+    /// The open-transaction marker is the only memory figure that survives a
+    /// SIGKILL, and a daemon publishes one only while it holds a write open. A
+    /// daemon killed answering queries published none, so this is absent more
+    /// often than not, and absent is what gets recorded.
+    #[cfg(unix)]
+    fn last_published_rss(&self, pid: u32) -> Option<u64> {
+        let open = read_open_transaction(&self.kin_root)?;
+        if open.pid != pid {
+            return None;
+        }
+        open.peak_rss_bytes.max(open.rss_bytes)
+    }
+}
+
+/// A daemon handed to the reaper, with whatever can say why it died.
+struct AdoptedDaemon {
+    child: std::process::Child,
+    watch: Option<DaemonWatch>,
+}
+
 /// Hand a started, detached daemon to a reaper that waits on it.
 ///
 /// Every spawn path here calls `setsid`, and every spawn path then relies on
@@ -3581,20 +4070,38 @@ const DETACHED_DAEMON_REAP_POLL: Duration = Duration::from_millis(250);
 /// Failing to start the thread is not fatal — the handle is dropped, which is
 /// exactly the behavior every caller had before.
 pub fn adopt_detached_daemon_child(child: std::process::Child) {
+    adopt_daemon_child(AdoptedDaemon { child, watch: None });
+}
+
+/// Hand a started, detached daemon to the reaper together with the watch that
+/// can say why it died.
+///
+/// The reaper is where a kill is observed for free: it already waits on every
+/// daemon this process started, for as long as that daemon serves, so it sees
+/// the exit status of one killed mid-request as readily as one killed during
+/// startup. Nothing else in either spawn path is still watching by then.
+pub fn adopt_watched_daemon_child(child: std::process::Child, watch: DaemonWatch) {
+    adopt_daemon_child(AdoptedDaemon {
+        child,
+        watch: Some(watch),
+    });
+}
+
+fn adopt_daemon_child(daemon: AdoptedDaemon) {
     let Some(reaper) = detached_daemon_reaper() else {
         return;
     };
-    let _ = reaper.send(child);
+    let _ = reaper.send(daemon);
 }
 
 /// The process-wide sender for [`adopt_detached_daemon_child`], started on first
 /// use. `None` once thread creation has failed, so a failed start is not retried
 /// per spawn.
-fn detached_daemon_reaper() -> Option<std::sync::mpsc::Sender<std::process::Child>> {
-    static REAPER: OnceLock<Option<std::sync::mpsc::Sender<std::process::Child>>> = OnceLock::new();
+fn detached_daemon_reaper() -> Option<std::sync::mpsc::Sender<AdoptedDaemon>> {
+    static REAPER: OnceLock<Option<std::sync::mpsc::Sender<AdoptedDaemon>>> = OnceLock::new();
     REAPER
         .get_or_init(|| {
-            let (sender, receiver) = std::sync::mpsc::channel::<std::process::Child>();
+            let (sender, receiver) = std::sync::mpsc::channel::<AdoptedDaemon>();
             std::thread::Builder::new()
                 .name("kin-detached-daemon-reaper".to_string())
                 .spawn(move || detached_daemon_reaper_loop(receiver))
@@ -3610,19 +4117,28 @@ fn detached_daemon_reaper() -> Option<std::sync::mpsc::Sender<std::process::Chil
 /// on `Err(_)` (nobody can wait on it any more, most often because something
 /// else already did). `Ok(None)` means still running, which for a healthy daemon
 /// is the case for as long as it serves.
-fn detached_daemon_reaper_loop(receiver: std::sync::mpsc::Receiver<std::process::Child>) {
-    let mut adopted: Vec<std::process::Child> = Vec::new();
+fn detached_daemon_reaper_loop(receiver: std::sync::mpsc::Receiver<AdoptedDaemon>) {
+    let mut adopted: Vec<AdoptedDaemon> = Vec::new();
     loop {
         match receiver.recv_timeout(DETACHED_DAEMON_REAP_POLL) {
-            Ok(child) => adopted.push(child),
+            Ok(daemon) => adopted.push(daemon),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) if adopted.is_empty() => return,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
         }
-        while let Ok(child) = receiver.try_recv() {
-            adopted.push(child);
+        while let Ok(daemon) = receiver.try_recv() {
+            adopted.push(daemon);
         }
-        adopted.retain_mut(|child| matches!(child.try_wait(), Ok(None)));
+        adopted.retain_mut(|daemon| match daemon.child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(status)) => {
+                if let Some(watch) = &daemon.watch {
+                    watch.record_exit(daemon.child.id(), &status);
+                }
+                false
+            }
+            Err(_) => false,
+        });
     }
 }
 
@@ -6767,6 +7283,333 @@ mod tests {
             daemon_startup_patience(read_boot_cost(dir.path()).map(|c| c.total_ms), None),
             Duration::from_secs(800),
             "a measured store raises the wait to a multiple of its own open"
+        );
+    }
+
+    // ── Kills nobody explained ──────────────────────────────────────────
+
+    #[test]
+    fn v2_memory_max_parses_bytes_and_unlimited() {
+        assert_eq!(
+            parse_v2_memory_max("4294967296"),
+            Some(4 * 1024 * 1024 * 1024)
+        );
+        assert_eq!(parse_v2_memory_max("max"), None);
+    }
+
+    #[test]
+    fn v1_memory_limit_rejects_unlimited_sentinel() {
+        assert_eq!(
+            parse_v1_memory_limit(4 * 1024 * 1024 * 1024),
+            Some(4 * 1024 * 1024 * 1024)
+        );
+        assert_eq!(parse_v1_memory_limit(0x7FFF_FFFF_FFFF_F000), None);
+    }
+
+    #[test]
+    fn oom_kill_count_is_read_from_either_cgroup_hierarchy() {
+        // cgroup v2 `memory.events`, which is where a container's evidence
+        // comes from.
+        assert_eq!(
+            parse_oom_kill_count("low 0\nhigh 0\nmax 3\noom 1\noom_kill 1\n"),
+            Some(1)
+        );
+        // cgroup v1 `memory.oom_control`, same key, different file.
+        assert_eq!(
+            parse_oom_kill_count("oom_kill_disable 0\nunder_oom 0\noom_kill 2\n"),
+            Some(2)
+        );
+        // A group that was never killed says so, which is not the same answer
+        // as a host that cannot be asked.
+        assert_eq!(parse_oom_kill_count("low 0\nhigh 0\nmax 0\noom 0\n"), None);
+        assert_eq!(parse_oom_kill_count("oom_kill 0\n"), Some(0));
+        assert_eq!(parse_oom_kill_count("oom_kill notanumber\n"), None);
+    }
+
+    const TWELVE_GIB: u64 = 12 * 1024 * 1024 * 1024;
+
+    fn counted(oom_kills: u64) -> CgroupMemory {
+        CgroupMemory {
+            limit_bytes: Some(TWELVE_GIB),
+            oom_kills: Some(oom_kills),
+        }
+    }
+
+    /// The whole attribution rule, in both directions. A counter that moved
+    /// while this daemon ran is the kernel saying it killed something here; a
+    /// counter that did not move is not, and neither is a host that cannot be
+    /// asked.
+    #[test]
+    fn memory_is_attributed_only_when_the_kernel_counter_moved() {
+        let moved = fresh_kill(41, 9, counted(2), counted(3), None, 1_000);
+        assert_eq!(
+            moved.last_cause,
+            DaemonKillCause::MemoryLimit {
+                kernel_oom_kills: 1
+            }
+        );
+        assert_eq!(moved.memory_kills, 1);
+
+        let still = fresh_kill(41, 9, counted(2), counted(2), None, 1_000);
+        assert_eq!(
+            still.last_cause,
+            DaemonKillCause::Unattributed { signal: 9 },
+            "a counter that did not move attributes nothing"
+        );
+        assert_eq!(still.memory_kills, 0);
+
+        let unreadable = fresh_kill(
+            41,
+            9,
+            CgroupMemory::default(),
+            CgroupMemory::default(),
+            None,
+            1_000,
+        );
+        assert_eq!(
+            unreadable.last_cause,
+            DaemonKillCause::Unattributed { signal: 9 },
+            "a host with no accounting attributes nothing"
+        );
+    }
+
+    /// A reading taken only after the death cannot say the kill it counts was
+    /// this daemon's, so it is not treated as evidence at all.
+    #[test]
+    fn a_counter_read_only_after_the_death_attributes_nothing() {
+        let after_only = fresh_kill(
+            41,
+            9,
+            CgroupMemory {
+                limit_bytes: Some(TWELVE_GIB),
+                oom_kills: None,
+            },
+            counted(7),
+            None,
+            1_000,
+        );
+        assert_eq!(
+            after_only.last_cause,
+            DaemonKillCause::Unattributed { signal: 9 }
+        );
+        assert_eq!(after_only.memory_kills, 0);
+        assert_eq!(
+            after_only.limit_bytes,
+            Some(TWELVE_GIB),
+            "the cap is still worth reporting even when the cause is not"
+        );
+    }
+
+    /// One kill is an incident and four are a diagnosis. The record keeps the
+    /// first time it saw one, so the sentence can say how long this has been
+    /// going on.
+    #[test]
+    fn kills_accumulate_and_keep_the_first_time() {
+        let first = fresh_kill(41, 9, counted(2), counted(3), None, 1_000);
+        let second = fresh_kill(42, 9, counted(3), counted(4), Some(999), 2_000);
+        let folded = accumulate_kill(Some(first), second);
+        assert_eq!(folded.kills, 2);
+        assert_eq!(folded.memory_kills, 2);
+        assert_eq!(folded.first_unix, 1_000);
+        assert_eq!(folded.last_unix, 2_000);
+        assert_eq!(folded.last_pid, Some(42));
+        assert_eq!(folded.last_rss_bytes, Some(999));
+    }
+
+    /// A store that has been killed for two different reasons reports both
+    /// counts rather than promoting the memory one to the whole total.
+    #[test]
+    fn a_mixed_record_does_not_call_every_kill_a_memory_kill() {
+        let unattributed = fresh_kill(41, 9, counted(2), counted(2), None, 1_000);
+        let memory = fresh_kill(42, 9, counted(2), counted(3), None, 2_000);
+        let folded = accumulate_kill(Some(unattributed), memory);
+        assert_eq!((folded.kills, folded.memory_kills), (2, 1));
+        let sentence = folded.cause_sentence();
+        assert!(
+            sentence.contains("killed 2 time(s)") && sentence.contains("1 of them by the memory"),
+            "mixed record must report both counts: {sentence}"
+        );
+    }
+
+    /// The sentence a caller reads: the count, when it started, the cap, and
+    /// the last resident set, with no cause the host did not state.
+    #[test]
+    fn the_sentence_names_memory_the_cap_and_the_time() {
+        let record = fresh_kill(41, 9, counted(2), counted(3), Some(TWELVE_GIB - 5), 4_320);
+        let sentence = record.cause_sentence();
+        assert!(
+            sentence.contains("killed by the memory limit 1 time(s)"),
+            "{sentence}"
+        );
+        assert!(sentence.contains("01:12Z"), "{sentence}");
+        assert!(sentence.contains("cap 12.0 GiB"), "{sentence}");
+        assert!(
+            sentence.contains("last resident set 12.0 GiB"),
+            "{sentence}"
+        );
+    }
+
+    /// A host that publishes no accounting says so in the same breath, instead
+    /// of leaving a reader to assume memory or to assume not-memory.
+    #[test]
+    fn an_unattributed_kill_says_the_host_could_not_be_asked() {
+        let record = fresh_kill(
+            41,
+            9,
+            CgroupMemory::default(),
+            CgroupMemory::default(),
+            None,
+            4_320,
+        );
+        let sentence = record.cause_sentence();
+        assert!(sentence.contains("killed by signal 9"), "{sentence}");
+        assert!(
+            sentence.contains("no memory accounting"),
+            "an unattributed kill must not read as a memory kill: {sentence}"
+        );
+        assert!(
+            !record.attributed_to_memory(),
+            "nothing here attributed it to memory"
+        );
+    }
+
+    /// Every action in the remediation is one the caller can perform, and the
+    /// one it replaces is not. An MCP client does not own the server process it
+    /// is talking to, so telling it to restart that process is telling it
+    /// nothing.
+    #[test]
+    fn the_remediation_is_performable_and_names_the_real_switch() {
+        let record = fresh_kill(41, 9, counted(2), counted(3), None, 4_320);
+        let remediation = record.remediation();
+        assert!(
+            remediation.contains("KIN_DAEMON_DISABLE_LSP=1 kin graph status"),
+            "{remediation}"
+        );
+        assert!(remediation.contains("12.0 GiB"), "{remediation}");
+        assert!(
+            !remediation.contains("kin mcp start"),
+            "the remediation must not name a process the caller does not own: {remediation}"
+        );
+        assert!(
+            record.summary().starts_with("The daemon for this store"),
+            "the summary ends a message, so it starts a sentence: {}",
+            record.summary()
+        );
+    }
+
+    #[test]
+    fn a_time_of_day_is_rendered_in_utc() {
+        assert_eq!(hhmm_utc(0), "00:00Z");
+        assert_eq!(hhmm_utc(4_320), "01:12Z");
+        assert_eq!(hhmm_utc(86_399), "23:59Z");
+        assert_eq!(hhmm_utc(86_400 * 20_000 + 3_660), "01:01Z");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_recorded_kill_round_trips_through_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorded =
+            record_daemon_kill(dir.path(), 41, libc::SIGKILL, counted(2), counted(3), None)
+                .expect("a SIGKILL with a moved counter is recorded");
+        assert_eq!(recorded.kills, 1);
+        let read_back = read_daemon_kill_record(dir.path()).expect("record is readable");
+        assert_eq!(read_back, recorded);
+
+        let again = record_daemon_kill(dir.path(), 42, libc::SIGKILL, counted(3), counted(4), None)
+            .expect("the second kill is recorded too");
+        assert_eq!(
+            (again.kills, again.memory_kills),
+            (2, 2),
+            "a second kill accumulates onto the first rather than replacing it"
+        );
+
+        clear_daemon_kill_record(dir.path());
+        assert!(read_daemon_kill_record(dir.path()).is_none());
+    }
+
+    /// A deliberate shutdown is not an unexplained kill. `kin daemon stop` and
+    /// the supervisor's reaper both end a daemon with SIGTERM, and a record of
+    /// those would bury the kills that have no author.
+    #[cfg(unix)]
+    #[test]
+    fn a_deliberate_shutdown_signal_records_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            record_daemon_kill(dir.path(), 41, libc::SIGTERM, counted(2), counted(3), None)
+                .is_none()
+        );
+        assert!(read_daemon_kill_record(dir.path()).is_none());
+        // The control: the same store, the same counter movement, one signal
+        // apart.
+        assert!(
+            record_daemon_kill(dir.path(), 41, libc::SIGKILL, counted(2), counted(3), None)
+                .is_some()
+        );
+    }
+
+    /// A death that already has an author is that author's to explain. The
+    /// reaper SIGKILLs a daemon that ignored its SIGTERM, and recording that as
+    /// unexplained would blame memory for a shutdown somebody asked for.
+    #[cfg(unix)]
+    #[test]
+    fn a_kill_with_a_death_note_is_left_to_its_author() {
+        let dir = tempfile::tempdir().unwrap();
+        write_daemon_death_note(
+            dir.path(),
+            &DaemonDeathNote {
+                pid: 41,
+                killed_by: "kin-supervisor-reaper".to_string(),
+                reason: "reaping misbehaving repo daemon".to_string(),
+                in_flight: None,
+                at: "2026-08-21T01:12:00Z".to_string(),
+            },
+        );
+        assert!(
+            record_daemon_kill(dir.path(), 41, libc::SIGKILL, counted(2), counted(3), None)
+                .is_none(),
+            "the pid the note names is not recorded as unexplained"
+        );
+        assert!(
+            record_daemon_kill(dir.path(), 42, libc::SIGKILL, counted(2), counted(3), None)
+                .is_some(),
+            "a different pid is still unexplained, so the note shields only its own"
+        );
+    }
+
+    /// The resident set comes from the marker only when the marker is about the
+    /// daemon that died. A leftover from an earlier daemon is a number for
+    /// somebody else's process.
+    #[cfg(unix)]
+    #[test]
+    fn a_resident_set_is_taken_only_from_the_dead_daemon_s_own_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        write_open_transaction(
+            dir.path(),
+            &OpenTransaction {
+                pid: 41,
+                operation: "commit".to_string(),
+                phase: None,
+                elapsed_secs: 3,
+                phase_elapsed_secs: 3,
+                beat_unix: 1_000,
+                rss_bytes: Some(700),
+                peak_rss_bytes: Some(900),
+            },
+        );
+        let watch = DaemonWatch {
+            kin_root: dir.path().to_path_buf(),
+            before: counted(2),
+        };
+        assert_eq!(
+            watch.last_published_rss(41),
+            Some(900),
+            "the high-water mark is the answer to how close it came"
+        );
+        assert_eq!(
+            watch.last_published_rss(42),
+            None,
+            "a marker naming another pid is not this daemon's memory"
         );
     }
 }

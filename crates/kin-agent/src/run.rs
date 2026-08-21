@@ -35,10 +35,17 @@ When a Kin result is empty, read what Kin says about that emptiness. If it repor
 absence cannot be trusted, the honest answer is that you do not know, and you should say \
 what the gap is. Never turn an untrusted absence into a claim that something does not exist.
 
-To change code, use edit_file for a surgical change to an existing file and write_file for \
-a new one. Read the exact current text through Kin first so your edit matches byte for byte. \
-Your edits are recorded through Kin's transaction tools, so the change carries provenance \
-naming this agent.
+To change code, use edit_file for a surgical change to an existing file and write_file to \
+create a new one. Read the exact current text through Kin first so your edit matches byte \
+for byte. You never open, stage or commit a transaction yourself, and those tools are not \
+on your belt on purpose. The harness does it around every call you make: a file you create \
+with write_file is staged as Kin's create operation, carrying the repository-relative path \
+and the full body, and committed with provenance naming this agent. An edit to a file Kin \
+already tracks lands in the working tree and is recorded in this run's trace, and the \
+harness does not yet admit that edit to the graph in the same step.
+
+Your tools are the mcp__kin__ ones named above plus edit_file and write_file. You have no \
+others.
 
 Work in small steps. Call one or two tools, read what came back, then decide. When you have \
 the answer, say it in plain text without calling a tool.";
@@ -497,11 +504,17 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                                 Ok(()) => {
                                     counters.local_calls += 1;
                                     let started_call = Instant::now();
-                                    let bracket = begin_transaction(
+                                    // The plan is made before the tool runs, because
+                                    // `write_file` is what makes a new path exist and
+                                    // afterwards nothing can tell a create from an
+                                    // overwrite.
+                                    let plan = plan_stage(&config.repo, tool, &call.arguments);
+                                    let mut bracket = begin_transaction(
                                         &mut mcp,
                                         kin_session.as_deref(),
                                         &server_tool_names,
                                         &call.arguments,
+                                        &plan,
                                         &mut writer,
                                     )?;
                                     let outcome = match tool {
@@ -512,10 +525,24 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                                             belt::run_write(&config.repo, &call.arguments)
                                         }
                                     };
+                                    // Stage what the harness just did, inside the open
+                                    // bracket, so the commit below has something to
+                                    // publish. An empty transaction is refused by design.
+                                    let staged = if outcome.is_error {
+                                        false
+                                    } else {
+                                        stage_planned_operation(
+                                            &mut mcp,
+                                            &mut bracket,
+                                            kin_session.as_deref(),
+                                            &plan,
+                                            &mut writer,
+                                        )?
+                                    };
                                     let provenance = close_transaction(
                                         &mut mcp,
                                         bracket,
-                                        !outcome.is_error,
+                                        !outcome.is_error && staged,
                                         &mut writer,
                                     )?;
                                     if let Some(path) = outcome.changed.clone() {
@@ -767,10 +794,97 @@ fn end_kin_session(
     Ok(())
 }
 
+/// What the harness will stage inside the bracket for one local tool call.
+///
+/// `kin_transaction_stage` admits five disjoint shapes (`crates/kin-mcp/src/tools.rs`),
+/// and exactly one of them is keyed on a repository-relative path plus a body: the new
+/// source file, verb `create`. The in-place edit shape resolves its target against
+/// repository authority as an entity uuid or an exact entity name
+/// (`kin_mcp::handlers::sessions::resolve_target_entity`), which a text splice does not
+/// know, so the harness plans nothing for an edit rather than staging a shape the daemon
+/// would refuse at commit. A transaction with nothing in it is refused too, by design, so
+/// an unstageable call opens no transaction at all and the trace says why.
+enum StagePlan {
+    /// Admit the file at this repository-relative path with this body. Repository
+    /// authority refuses it by name if it already tracks the path.
+    Create { target: String, body: String },
+    /// Nothing the stage surface admits fits this call, and this is the reason.
+    Unstageable { reason: String },
+}
+
+/// Decide what to stage for one local tool call.
+///
+/// Whether the path is new is repository authority's question, not the filesystem's, and
+/// the two answers differ: a path can sit on disk untracked, or be tracked with nothing on
+/// disk yet. So the harness plans the create and lets the daemon refuse it by name if the
+/// graph already holds that path, which is the rule `create` documents. Probing the disk
+/// here would put a filesystem heuristic on the runtime path to answer a question the
+/// graph owns.
+fn plan_stage(repo: &Path, tool: LocalTool, arguments: &Value) -> StagePlan {
+    let raw_path = arguments.get("path").and_then(Value::as_str).unwrap_or("");
+    match tool {
+        LocalTool::Edit => StagePlan::Unstageable {
+            reason: "an in-place edit has no stage shape keyed on a path; the update \
+                     operation names an entity uuid or an exact entity name"
+                .into(),
+        },
+        LocalTool::Write => {
+            let content = arguments
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if content.trim().is_empty() {
+                return StagePlan::Unstageable {
+                    reason: "the create operation requires a non-empty body".into(),
+                };
+            }
+            let path = match belt::resolve_in_repo(repo, raw_path) {
+                Ok(path) => path,
+                Err(problem) => return StagePlan::Unstageable { reason: problem },
+            };
+            match repository_relative(repo, &path) {
+                Some(target) => StagePlan::Create {
+                    target,
+                    body: content.to_string(),
+                },
+                None => StagePlan::Unstageable {
+                    reason: "the path did not reduce to a repository-relative target".into(),
+                },
+            }
+        }
+    }
+}
+
+/// The repository-relative form of a resolved path, with `/` separators on every platform
+/// because that is what repository authority stores.
+fn repository_relative(repo: &Path, resolved: &Path) -> Option<String> {
+    let relative = resolved.strip_prefix(repo).ok()?;
+    let parts: Vec<String> = relative
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
 /// An open provenance bracket around one local edit.
 struct Bracket {
     transaction_id: Option<String>,
     reason: Option<String>,
+    /// What the harness staged into this transaction, and whether the server took it.
+    staged: Option<Value>,
+}
+
+impl Bracket {
+    fn unopened(reason: impl Into<String>) -> Self {
+        Bracket {
+            transaction_id: None,
+            reason: Some(reason.into()),
+            staged: None,
+        }
+    }
 }
 
 fn begin_transaction(
@@ -778,22 +892,23 @@ fn begin_transaction(
     session: Option<&str>,
     server_tools: &[String],
     arguments: &Value,
+    plan: &StagePlan,
     writer: &mut TranscriptWriter,
 ) -> anyhow::Result<Bracket> {
+    // A transaction the harness cannot stage into can only end in the daemon's refusal of
+    // an empty commit, so it is not opened. The reason travels into the provenance record.
+    if let StagePlan::Unstageable { reason } = plan {
+        return Ok(Bracket::unopened(reason.clone()));
+    }
     let Some(session) = session else {
-        return Ok(Bracket {
-            transaction_id: None,
-            reason: Some("no Kin session was open".into()),
-        });
+        return Ok(Bracket::unopened("no Kin session was open"));
     };
-    if !server_tools
-        .iter()
-        .any(|name| name == "kin_transaction_begin")
-    {
-        return Ok(Bracket {
-            transaction_id: None,
-            reason: Some("the server does not expose kin_transaction_begin".into()),
-        });
+    for required in ["kin_transaction_begin", "kin_transaction_stage"] {
+        if !server_tools.iter().any(|name| name == required) {
+            return Ok(Bracket::unopened(format!(
+                "the server does not expose {required}"
+            )));
+        }
     }
     let scope = arguments
         .get("path")
@@ -821,6 +936,7 @@ fn begin_transaction(
                     .is_none()
                     .then(|| "the server returned no transaction id".to_string()),
                 transaction_id,
+                staged: None,
             })
         }
         Ok(outcome) => {
@@ -833,16 +949,67 @@ fn begin_transaction(
                 "is_error": true,
                 "detail": truncate(&outcome.text, 300),
             }))?;
-            Ok(Bracket {
-                transaction_id: None,
-                reason: Some(truncate(&outcome.text, 200)),
-            })
+            Ok(Bracket::unopened(truncate(&outcome.text, 200)))
         }
-        Err(err) => Ok(Bracket {
-            transaction_id: None,
-            reason: Some(err.to_string()),
-        }),
+        Err(err) => Ok(Bracket::unopened(err.to_string())),
     }
+}
+
+/// Stage the operation the harness just performed, inside the open bracket.
+///
+/// Returns whether the transaction now holds something committable. A bracket that was
+/// never opened, or a plan with nothing the stage surface admits, stages nothing and says
+/// so, which is what keeps the commit below from claiming a provenance it did not get.
+fn stage_planned_operation(
+    mcp: &mut McpClient,
+    bracket: &mut Bracket,
+    session: Option<&str>,
+    plan: &StagePlan,
+    writer: &mut TranscriptWriter,
+) -> anyhow::Result<bool> {
+    let (Some(transaction_id), StagePlan::Create { target, body }) =
+        (bracket.transaction_id.clone(), plan)
+    else {
+        return Ok(false);
+    };
+    let operation = json!({
+        "verb": "create",
+        "target": target,
+        "body": body,
+        "description": format!("kin agent created {target}"),
+    });
+    let mut arguments = json!({
+        "transaction_id": transaction_id,
+        "operations": [operation],
+    });
+    if let Some(session) = session {
+        arguments["session_id"] = Value::String(session.to_string());
+    }
+    let outcome = mcp.call_tool("kin_transaction_stage", &arguments);
+    let (is_error, detail) = match &outcome {
+        Ok(outcome) => (outcome.is_error, truncate(&outcome.text, 300)),
+        Err(err) => (true, err.to_string()),
+    };
+    writer.trace(json!({
+        "surface": "kin",
+        "tool": "kin_transaction_stage",
+        "policy": "allowed",
+        "event": "transaction_stage",
+        "transaction_id": transaction_id,
+        "verb": "create",
+        "target": target,
+        "body_bytes": body.len(),
+        "is_error": is_error,
+        "detail": detail,
+    }))?;
+    bracket.staged = Some(json!({
+        "verb": "create",
+        "target": target,
+        "body_bytes": body.len(),
+        "accepted": !is_error,
+        "detail": if is_error { Value::String(detail) } else { Value::Null },
+    }));
+    Ok(!is_error)
 }
 
 /// Close the bracket. The recorded provenance says what actually happened, including a
@@ -856,6 +1023,7 @@ fn close_transaction(
     let Some(transaction_id) = bracket.transaction_id else {
         return Ok(json!({
             "bracketed": false,
+            "staged": bracket.staged,
             "reason": bracket.reason,
         }));
     };
@@ -880,9 +1048,13 @@ fn close_transaction(
     }))?;
     Ok(json!({
         "bracketed": true,
+        "staged": bracket.staged,
         "transaction_id": transaction_id,
         "closed_with": tool,
         "closed_cleanly": !is_error,
+        // The server's own answer to the close, kept whether it accepted or refused, so a
+        // run's evidence is what the daemon said rather than the harness's summary of it.
+        "response": detail.clone(),
         "detail": if is_error { Value::String(detail) } else { Value::Null },
     }))
 }

@@ -409,6 +409,13 @@ impl LocalOutcome {
 ///
 /// Session and transaction lifecycle is the harness's job, so exposing those tools would
 /// let the model open a second session or commit a transaction the harness is holding.
+///
+/// `kin_transaction_stage` and `kin_transaction_validate` belong on this list for a
+/// sharper reason than tidiness. Both require a transaction id, and `kin_transaction_begin`
+/// is the only way to get one honestly. A model holding stage without begin cannot obtain
+/// an id at all, so its only remaining move is to invent one, which is what an observed
+/// local-model run did before the harness staged on its own behalf. Hiding the whole set
+/// is what makes the harness the single writer.
 pub fn is_harness_owned(name: &str) -> bool {
     matches!(
         name,
@@ -416,6 +423,8 @@ pub fn is_harness_owned(name: &str) -> bool {
             | "kin_session_end"
             | "kin_session_heartbeat"
             | "kin_transaction_begin"
+            | "kin_transaction_stage"
+            | "kin_transaction_validate"
             | "kin_transaction_commit"
             | "kin_transaction_abort"
     )

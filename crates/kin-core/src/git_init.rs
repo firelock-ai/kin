@@ -328,6 +328,12 @@ fn init_from_git_with_hooks(
     };
 
     let workspace_seed = admitted.workspace_seed.clone();
+    // Counted here because the seed is consumed by the bootstrap transaction
+    // below. This is the committed tree the publication admits, and it is the
+    // count the durable freshness marker is stamped with at the tail of this
+    // function, so the marker's coverage is the publication's own rather than a
+    // number read back off a reopened store.
+    let admitted_tracked_artifacts = workspace_seed.base_tree.len() as u64;
     let workspace_policy = admitted.workspace_policy().clone();
     let workspace_base_change_id = admitted.workspace_base_change_id();
 
@@ -469,6 +475,24 @@ fn init_from_git_with_hooks(
     result
         .workspace_divergence
         .clone_from(&source_proof.workspace_divergence);
+
+    // A conversion is a complete exact-tree admission, so it records one, through
+    // the same writer the ambient reconcile tick, `kin admit`, a commit and a
+    // stash write. Without this a freshly converted store answered `kin graph
+    // status` with "no complete admission is recorded for this store", which told
+    // a user to run `kin admit` to redo the work the conversion had just done.
+    //
+    // Only when the source held nothing the committed state does not. Init admits
+    // the committed Git tree, and the divergence above is exactly what the
+    // worktree carries beyond it; the daemon admits that as workspace state on its
+    // first run. Stamping unconditionally would claim a complete admission of a
+    // working copy that was never admitted, which is the false freshness this
+    // marker exists to prevent, reached through the one door where the admitted
+    // tree is legitimately not the tree the repository holds. A dirty conversion
+    // has no complete admission of its working copy yet and keeps saying so.
+    if result.workspace_divergence.is_empty() {
+        crate::last_admission::record(&result.layout, admitted_tracked_artifacts);
+    }
 
     info!(
         path = %source.display(),
@@ -1227,6 +1251,101 @@ mod tests {
         );
         assert!(source.join("init.log").exists());
         assert_no_staging_directories(root.path());
+    }
+
+    /// A conversion admits the complete exact reachable Git repository, so it
+    /// must leave the durable record of one behind.
+    ///
+    /// Without this the marker had two writers, the ambient reconcile tick and
+    /// `kin admit`, and a store that had just been converted answered `kin graph
+    /// status` with "no complete admission is recorded for this store", telling a
+    /// user to run `kin admit` to redo the work the conversion had just done.
+    ///
+    /// The absent read before the conversion is the control. A published `.kin`
+    /// is what the marker lives inside, so before the conversion there is no
+    /// store to read at all, and the count is what makes the assertion say more
+    /// than "some file appeared": it has to be the tree the publication admitted.
+    #[test]
+    fn a_clean_conversion_records_the_complete_admission_it_performed() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        initialize_git(&source);
+        std::fs::write(source.join("README.md"), b"exact source\n").unwrap();
+        std::fs::write(source.join("kept.txt"), b"committed\n").unwrap();
+        git(&source, ["add", "--all"]);
+        git(&source, ["commit", "-m", "initial"]);
+
+        assert!(
+            !source.join(".kin").exists(),
+            "the marker lives inside the published store, so there must be none before the \
+             conversion or a marker afterwards proves nothing"
+        );
+
+        let result = init_from_git(&source).unwrap();
+        assert!(
+            result.workspace_divergence.is_empty(),
+            "this fixture is the clean case: {:?}",
+            result.workspace_divergence
+        );
+
+        let recorded = match crate::last_admission::read(&result.layout) {
+            crate::last_admission::LastAdmissionRead::Recorded(recorded) => recorded,
+            other => panic!(
+                "a clean conversion must record the complete admission it performed, read \
+                 {other:?}"
+            ),
+        };
+        assert_eq!(
+            recorded.tracked_artifacts, 2,
+            "the record must cover the two files the publication admitted"
+        );
+        assert!(
+            recorded.age_seconds(chrono::Utc::now()) < 300,
+            "the record must be stamped by this conversion rather than carried in from elsewhere"
+        );
+    }
+
+    /// A conversion of a worked-in checkout must NOT record one.
+    ///
+    /// Init admits the committed Git tree while the worktree keeps everything
+    /// the commit does not carry, and the daemon admits that as workspace state
+    /// on its first run. So the admitted tree is genuinely not the tree the
+    /// repository holds, and a marker here would claim a complete admission of a
+    /// working copy nothing had admitted, which is the false freshness the marker
+    /// exists to prevent. Unknown is the honest answer until something admits the
+    /// working copy.
+    #[test]
+    fn a_conversion_with_an_uncommitted_change_records_no_admission() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        initialize_git(&source);
+        std::fs::write(source.join("README.md"), b"exact source\n").unwrap();
+        std::fs::write(source.join("kept.txt"), b"committed\n").unwrap();
+        git(&source, ["add", "--all"]);
+        git(&source, ["commit", "-m", "initial"]);
+        // One modification to a tracked file, which is the smallest thing that
+        // makes the admitted committed tree differ from the working copy.
+        std::fs::write(source.join("README.md"), b"edited after the commit\n").unwrap();
+
+        let result = init_from_git(&source).unwrap();
+        assert!(
+            !result.workspace_divergence.is_empty(),
+            "this fixture is the dirty case, or the assertion below is about nothing"
+        );
+
+        let read_back = crate::last_admission::read(&result.layout);
+        assert!(
+            matches!(read_back, crate::last_admission::LastAdmissionRead::Absent),
+            "a conversion whose working copy diverges from the tree it admitted must record no \
+             complete admission, read {read_back:?}"
+        );
+        assert!(
+            read_back.describe(chrono::Utc::now()).contains("unknown"),
+            "and the surface must say so rather than going quiet: {}",
+            read_back.describe(chrono::Utc::now())
+        );
     }
 
     /// An init killed mid-capture leaves neither `.kin` nor a capture directory.

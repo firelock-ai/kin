@@ -16,7 +16,9 @@ use std::process::Stdio;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use kin_cli::commands::graph::{execute_graph_command, GraphCommandRequest};
+use kin_cli::commands::graph::{
+    execute_graph_command, execute_graph_command_for_store, GraphCommandRequest,
+};
 use kin_cli::commands::status::{self, SemanticEnrichmentPresence, SemanticEnrichmentView};
 use kin_model::{
     ArtifactKind, EntityStore, FilePathId, Hash256, OpaqueArtifact, StructuredArtifact,
@@ -203,7 +205,15 @@ fn graph_status(
     binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
 ) -> kin_cli::commands::graph::GraphCommandResponse {
-    execute_graph_command(
+    graph_status_at(binding, graph, None)
+}
+
+fn graph_status_at(
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    graph: &kin_db::InMemoryGraph,
+    kin_root: Option<&Path>,
+) -> kin_cli::commands::graph::GraphCommandResponse {
+    execute_graph_command_for_store(
         &kin_cli::commands::repository_authority::RequestRepositoryAuthority::pinned(
             binding.clone(),
         ),
@@ -211,8 +221,73 @@ fn graph_status(
         &GraphCommandRequest::Status,
         &Default::default(),
         &Default::default(),
+        &Default::default(),
+        kin_root,
     )
     .expect("run graph status")
+}
+
+/// A daemon killed by the memory limit leaves every counter in this report
+/// intact: the graph is fine, a replacement serves, and the kills that got it
+/// there are in no count on the page. Without the store's own record the report
+/// prints an all-clear over them, which is the exact shape of the false
+/// all-clear this row exists to kill.
+#[test]
+fn graph_status_reports_a_daemon_this_store_lost_to_the_memory_limit() {
+    let root = tempdir().expect("temp root");
+    let repo = root.path().join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    let admitted = admit(&repo);
+    let graph = workspace_query_graph(&admitted.binding);
+
+    let clean = graph_status(&admitted.binding, &graph);
+    assert!(
+        !clean.lines.iter().any(|line| line.contains("killed by")),
+        "the control says nothing about kills, or this test cannot fail: {}",
+        clean.lines.join("\n")
+    );
+
+    kin_daemon_spawn::write_daemon_kill_record(
+        admitted.layout.root(),
+        &kin_daemon_spawn::DaemonKillRecord {
+            kills: 4,
+            memory_kills: 4,
+            first_unix: 4_320,
+            last_unix: 4_800,
+            last_pid: Some(41),
+            last_cause: kin_daemon_spawn::DaemonKillCause::MemoryLimit {
+                kernel_oom_kills: 1,
+            },
+            limit_bytes: Some(12 * 1024 * 1024 * 1024),
+            last_rss_bytes: None,
+        },
+    );
+
+    let after = graph_status_at(&admitted.binding, &graph, Some(admitted.layout.root()));
+    let rendered = after.lines.join("\n");
+    assert!(
+        rendered.contains("killed by the memory limit 4 time(s) since 01:12Z"),
+        "the store's own record belongs on the page a reader is already on: {rendered}"
+    );
+    assert!(
+        rendered.contains("KIN_DAEMON_DISABLE_LSP=1 kin graph status"),
+        "the row carries a remediation the reader can perform: {rendered}"
+    );
+    // A warning rather than a notice, which is what makes it withhold the
+    // all-clear: `✓ No issues detected.` is printed only when the warning list
+    // is empty. This fixture already carries warnings of its own, so the row's
+    // own prefix is what proves which list it joined.
+    assert!(
+        after
+            .lines
+            .iter()
+            .any(|line| line.starts_with('⚠') && line.contains("killed by the memory limit")),
+        "the record is a warning, not a notice: {rendered}"
+    );
+    assert!(
+        after.error.is_none(),
+        "the row is a warning, so it must not turn `kin graph status` nonzero"
+    );
 }
 
 #[test]
@@ -263,6 +338,59 @@ fn graph_status_passes_on_a_healthy_freshly_admitted_repository() {
     );
 }
 
+/// The recorded census and the printed histogram must be the same measurement.
+///
+/// Two walks produce them: the status renderer counts relations while it also
+/// resolves cross-file endpoints, and `measure_relation_census` counts them on
+/// its own for the sweep and commit writers. If those ever disagree, every
+/// comparison this feature makes is against a number no surface displays, and
+/// the disagreement would present as movement rather than as a bug. This drives
+/// both over a real admitted repository rather than a fixture, so the agreement
+/// is asserted on relations an adapter actually produced.
+#[test]
+fn the_recorded_census_matches_the_histogram_status_prints() {
+    let root = tempdir().expect("temp root");
+    let repo = root.path().join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    let admitted = admit(&repo);
+    let graph = workspace_query_graph(&admitted.binding);
+
+    let measured =
+        kin_cli::commands::graph::measure_relation_census(&graph).expect("measure the census");
+    let response = graph_status(&admitted.binding, &graph);
+    let printed = response
+        .lines
+        .iter()
+        .find(|line| line.starts_with("Entity-to-entity relation kinds: "))
+        .expect("status prints the relation-kind histogram")
+        .trim_start_matches("Entity-to-entity relation kinds: ")
+        .to_string();
+
+    // Rendered as `Kind: N, Kind: N`, so the census is checked term by term
+    // rather than by reassembling the string in the same order.
+    let mut rendered: Vec<String> = printed
+        .split(", ")
+        .filter(|term| !term.is_empty())
+        .map(|term| term.to_string())
+        .collect();
+    rendered.sort();
+    let mut from_census: Vec<String> = measured
+        .iter()
+        .filter(|(_, count)| **count > 0)
+        .map(|(kind, count)| format!("{kind}: {count}"))
+        .collect();
+    from_census.sort();
+    assert_eq!(
+        rendered, from_census,
+        "the census the sweep and commit record is the histogram status prints"
+    );
+    assert!(
+        !from_census.is_empty(),
+        "an empty census would make this agreement trivially true: {}",
+        response.lines.join("\n")
+    );
+}
+
 fn graph_validate(
     binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
@@ -273,6 +401,7 @@ fn graph_validate(
         ),
         graph,
         &GraphCommandRequest::Validate,
+        &Default::default(),
         &Default::default(),
         &Default::default(),
     )
@@ -722,6 +851,100 @@ fn init_status_and_graph_status_use_their_real_durable_and_live_routes() {
     assert!(graph_stdout.contains("Entities:"), "{graph_stdout}");
     assert!(
         graph_stdout.contains("Entity-to-entity relations:"),
+        "{graph_stdout}"
+    );
+}
+
+/// FIR-2559 end to end, through the shipped binaries. A store the product has
+/// just converted reports the admission that conversion performed, rather than
+/// telling its owner that how far graph truth has fallen behind is unknown.
+///
+/// `--no-enrich` is load-bearing rather than a speed-up: it is what keeps the
+/// conversion the only thing that could have written the marker. The enrichment
+/// phase starts a daemon, whose ambient reconcile tick is one of the two writers
+/// that existed before this, so a marker read after it would be evidence about
+/// the tick instead. The read below therefore happens with no daemon in this
+/// fixture's life at all.
+///
+/// The rendered line is asserted afterwards, once a daemon is serving, because
+/// that is the sentence a user actually reads.
+#[test]
+fn a_converted_store_reports_its_admission_rather_than_unknown_freshness() {
+    let root = tempdir().expect("temp root");
+    let home = root.path().join("home");
+    let repo = root.path().join("repo");
+    fs::create_dir_all(&home).expect("create home");
+    fs::create_dir_all(&repo).expect("create repo");
+    seed_repository(&repo);
+
+    let init = Command::new(env!("CARGO_BIN_EXE_kin"))
+        .args(["init", ".", "--json", "--no-enrich"])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env_remove("KIN_DAEMON_URL")
+        .current_dir(&repo)
+        .output()
+        .expect("run production kin init route");
+    assert!(
+        init.status.success(),
+        "init stdout={} stderr={}",
+        String::from_utf8_lossy(&init.stdout),
+        String::from_utf8_lossy(&init.stderr)
+    );
+    assert!(
+        !repo.join(".kin/daemon.port").exists(),
+        "no daemon ran for this store, so the marker below can only be the conversion's"
+    );
+
+    let layout = kin_core::KinLayout::discover(&repo).expect("the conversion published a store");
+    let freshness = kin_core::last_admission::read(&layout);
+    let recorded = match &freshness {
+        kin_core::last_admission::LastAdmissionRead::Recorded(recorded) => recorded,
+        other => panic!("a converted store must record its complete admission, read {other:?}"),
+    };
+    assert_eq!(
+        recorded.tracked_artifacts, 3,
+        "the record must cover the three files this repository commits"
+    );
+
+    let line = freshness.describe(chrono::Utc::now());
+    assert!(
+        line.contains("last complete admission"),
+        "the freshness surface must name the admission: {line}"
+    );
+    assert!(
+        !line.contains("unknown"),
+        "and must not report unknown freshness on a store converted a moment ago: {line}"
+    );
+
+    // The same fact through the shipped `kin graph status` route, which is where
+    // a user meets it.
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let mut daemon = IsolatedDaemon::spawn(&repo, &runtime);
+    let port = daemon.wait_until_serving(&repo.join(".kin"));
+    let graph_status = Command::new(env!("CARGO_BIN_EXE_kin"))
+        .args(["graph", "status"])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("KIN_DAEMON_URL", format!("http://127.0.0.1:{port}"))
+        .current_dir(&repo)
+        .output()
+        .expect("run production kin graph status route");
+    daemon.stop();
+
+    assert!(
+        graph_status.status.success(),
+        "graph status stdout={} stderr={}",
+        String::from_utf8_lossy(&graph_status.stdout),
+        String::from_utf8_lossy(&graph_status.stderr)
+    );
+    let graph_stdout = String::from_utf8_lossy(&graph_status.stdout);
+    assert!(
+        graph_stdout.contains("graph truth: last complete admission"),
+        "{graph_stdout}"
+    );
+    assert!(
+        !graph_stdout.contains("no complete admission is recorded"),
         "{graph_stdout}"
     );
 }

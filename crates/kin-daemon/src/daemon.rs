@@ -1164,6 +1164,66 @@ async fn save_snapshot_blocking(state: Arc<DaemonState>) -> Result<()> {
 /// How often the owner-death watchdog checks whether the owning process is
 /// still alive. A `kill(pid, 0)` every couple of seconds is a single cheap
 /// syscall, so this is set for detection latency rather than to save work.
+/// How long endpoint publication waits for the reconcile loop's file watcher.
+///
+/// A ceiling, not an amount of waiting: the healthy path returns the instant the
+/// loop reports, and this only decides how long a wedged loop may hold the
+/// endpoint back. Registering a recursive watch is fast on the backends Kin
+/// uses, so reaching this bound means something is wrong rather than large.
+const WATCH_ARMING_BOUND: Duration = Duration::from_secs(30);
+
+/// How the wait for the reconcile loop's watch ended.
+///
+/// Three outcomes rather than a bool because they mean different things to an
+/// operator reading the log. Only `Armed` promises that a write landing after
+/// the endpoint appears will be observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WatchArming {
+    /// The loop reported its watcher. Publication is safe to proceed.
+    Armed,
+    /// The loop ended before reporting one, which is what a disabled
+    /// reconciler, a bare checkout or a refused watcher looks like from here.
+    /// There is no watch to wait for, so waiting longer buys nothing.
+    LoopGone,
+    /// The bound expired with the loop neither arming nor ending.
+    TimedOut,
+}
+
+/// Wait for the reconcile loop to report its file watcher, but never forever.
+///
+/// Publishing late beats not publishing: an endpoint that never appears is a
+/// daemon no client can reach, so the bound expires into publication with the
+/// reason recorded rather than into a refusal.
+pub(crate) async fn await_watch_armed(
+    armed: tokio::sync::oneshot::Receiver<()>,
+    bound: Duration,
+) -> WatchArming {
+    match tokio::time::timeout(bound, armed).await {
+        Ok(Ok(())) => WatchArming::Armed,
+        Ok(Err(_)) => WatchArming::LoopGone,
+        Err(_) => WatchArming::TimedOut,
+    }
+}
+
+/// Say what the wait produced, at the level each outcome deserves.
+fn announce_watch_arming(arming: WatchArming, bound: Duration) {
+    match arming {
+        WatchArming::Armed => {
+            debug!("the reconciliation watch is armed; publishing the daemon endpoint")
+        }
+        WatchArming::LoopGone => info!(
+            "the reconciliation loop ended before arming a watch, so this daemon observes no \
+             working-copy edits; publishing the endpoint so it stays reachable"
+        ),
+        WatchArming::TimedOut => warn!(
+            bound_s = bound.as_secs(),
+            "the reconciliation loop did not report a file watcher within its bound; publishing \
+             the endpoint anyway, so a host write landing now may go unobserved until an \
+             explicit admission seam takes it"
+        ),
+    }
+}
+
 const OWNER_WATCH_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Validate a raw `KIN_DAEMON_WATCH_PID` value into an owner PID this daemon may
@@ -1756,6 +1816,424 @@ fn decide_sweep_on_start(state: &DaemonState) -> SweepStartDecision {
 /// stays unmarked and is swept again.
 fn sweep_marker_is_durable(total_relations: usize, published: bool) -> bool {
     total_relations == 0 || published
+}
+
+/// How long a cold sweep waits for the embedding backfill before starting
+/// anyway.
+///
+/// A ceiling on the ordering rather than an amount of waiting: a backfill that
+/// drains in ninety seconds holds the sweep for ninety seconds, and only one
+/// still working past this bound loses its exclusivity. Ten minutes because the
+/// backfill this was written for took about five on the store it was measured
+/// on, and a bound shorter than the work it orders would order nothing. The
+/// sweep starting late is a slower convergence; the two running together is a
+/// daemon that dies and loses both.
+const SWEEP_BACKFILL_WAIT_BOUND: Duration = Duration::from_secs(600);
+
+/// How long the backfill may hold the sweep back while making no progress.
+///
+/// The wait bound alone is not enough. A backfill wedged on a refused vector
+/// checkpoint neither drains nor errors, so without this the sweep would spend
+/// the whole ten minutes waiting on a count that was never going to move.
+/// Progress is a fall in the pending count, so a backfill that is landing
+/// batches resets this on every one of them and is never cut short by it.
+const SWEEP_BACKFILL_STALL_BOUND: Duration = Duration::from_secs(90);
+
+/// How often the gate re-reads the store's pending-embedding count.
+const SWEEP_BACKFILL_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Why the cold sweep was released to start, which is what the gate logs.
+///
+/// Five outcomes rather than a bool because an operator reading the daemon log
+/// needs to tell a sweep that waited its turn from one that gave up on a
+/// backfill going nowhere. The first two are the fast paths that keep an
+/// already-embedded store behaving exactly as it did before this gate existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SweepStartReason {
+    /// The store had nothing left to embed, so there was nothing to wait for.
+    NothingPending,
+    /// No worker will drain a backlog on this boot, so waiting would never end.
+    BackfillNotRunning,
+    /// The backfill finished while the sweep waited.
+    BackfillDrained,
+    /// The backfill stopped making progress for the stall bound.
+    BackfillStalled,
+    /// The backfill was still working when the whole wait bound expired.
+    WaitBoundExpired,
+}
+
+impl SweepStartReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            SweepStartReason::NothingPending => "nothing-pending",
+            SweepStartReason::BackfillNotRunning => "backfill-not-running",
+            SweepStartReason::BackfillDrained => "backfill-drained",
+            SweepStartReason::BackfillStalled => "backfill-stalled",
+            SweepStartReason::WaitBoundExpired => "wait-bound-expired",
+        }
+    }
+}
+
+/// What the gate does on one look at the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SweepGateStep {
+    /// Keep holding the sweep back.
+    Wait,
+    /// Release the sweep, for this reason.
+    Start(SweepStartReason),
+}
+
+/// One look at the embedding backfill, in the terms the gate decides on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BackfillLook {
+    /// Whether any worker will drain a backlog on this boot. False when an
+    /// operator opted out, and false when the graph authority has no durable
+    /// vector-sidecar contract to persist progress into.
+    running: bool,
+    /// Entities and artifacts the vector index still lacks vectors for.
+    pending: usize,
+    /// Whether the gate has already held the sweep back at least once. What
+    /// separates a store that arrived converged from one that drained while
+    /// the sweep waited, which read the same without it.
+    held: bool,
+    /// How long the gate has been holding the sweep back.
+    waited: Duration,
+    /// How long since the pending count last fell.
+    since_progress: Duration,
+}
+
+/// Whether the sweep may start yet, given what the backfill is doing.
+///
+/// Pure, and separate from the loop that calls it, because the rule is what
+/// this change is about and a rule embedded in an async loop with two clocks
+/// can only be tested by waiting out its bounds.
+fn sweep_gate_step(
+    look: BackfillLook,
+    wait_bound: Duration,
+    stall_bound: Duration,
+) -> SweepGateStep {
+    if look.pending == 0 {
+        return SweepGateStep::Start(if look.held {
+            SweepStartReason::BackfillDrained
+        } else {
+            SweepStartReason::NothingPending
+        });
+    }
+    if !look.running {
+        return SweepGateStep::Start(SweepStartReason::BackfillNotRunning);
+    }
+    if look.waited >= wait_bound {
+        return SweepGateStep::Start(SweepStartReason::WaitBoundExpired);
+    }
+    if look.since_progress >= stall_bound {
+        return SweepGateStep::Start(SweepStartReason::BackfillStalled);
+    }
+    SweepGateStep::Wait
+}
+
+/// Hold a cold sweep until the embedding backfill has had the process to
+/// itself, and report why it was released.
+///
+/// Both passes used to be peer spawns with nothing ordering them, and on a
+/// full-history store in a memory-capped container that is what killed the
+/// daemon: the sweep reopens repository authority and rebuilds the graph from
+/// snapshot while the backfill holds a batch of vectors, and neither is small.
+/// The backfill goes first because it checkpoints durably as it goes, so a kill
+/// costs it the batch in flight rather than the pass; everything the sweep
+/// makes durable happens after its last file, so a kill costs the sweep all of
+/// it.
+///
+/// The bounds are parameters so the loop itself can be tested rather than only
+/// the rule it applies; production passes the constants above.
+async fn await_backfill_before_sweep<F>(
+    running: bool,
+    mut pending: F,
+    wait_bound: Duration,
+    stall_bound: Duration,
+    poll: Duration,
+) -> SweepStartReason
+where
+    F: FnMut() -> usize,
+{
+    let started = Instant::now();
+    let mut last_progress = started;
+    let mut lowest = usize::MAX;
+    let mut held = false;
+    loop {
+        let current = pending();
+        if current < lowest {
+            lowest = current;
+            last_progress = Instant::now();
+        }
+        let now = Instant::now();
+        let look = BackfillLook {
+            running,
+            pending: current,
+            held,
+            waited: now.duration_since(started),
+            since_progress: now.duration_since(last_progress),
+        };
+        match sweep_gate_step(look, wait_bound, stall_bound) {
+            SweepGateStep::Start(reason) => return reason,
+            SweepGateStep::Wait => {
+                held = true;
+                tokio::time::sleep(poll).await;
+            }
+        }
+    }
+}
+
+/// The ordering between the cold sweep and the embedding backfill, which is
+/// what FIR-2493 is about.
+///
+/// Both used to be peer spawns, and the tally tests further down passed
+/// throughout while a first boot ran them together. Arithmetic was never the
+/// gap. These tests drive the gate's own loop with a synthetic pending count
+/// and small bounds, so the rule is exercised rather than the constants.
+#[cfg(test)]
+mod sweep_backfill_gate_tests {
+    use super::{
+        await_backfill_before_sweep, sweep_gate_step, BackfillLook, SweepGateStep,
+        SweepStartReason, SWEEP_BACKFILL_POLL_INTERVAL, SWEEP_BACKFILL_STALL_BOUND,
+        SWEEP_BACKFILL_WAIT_BOUND,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// The gate returns the reason the daemon then logs, so asserting on the
+    /// returned reason asserts on the log line's content: the `info!` at the
+    /// gate's call site takes `reason.as_str()` and nothing else decides it.
+    fn reason_is_logged(reason: SweepStartReason) -> &'static str {
+        reason.as_str()
+    }
+
+    /// A store with work left to embed holds the sweep, and the sweep starts
+    /// once the backfill has drained.
+    ///
+    /// The count starts above zero on purpose. A source that began at zero
+    /// would make "the sweep waited" trivially true of any code at all,
+    /// including code with the gate deleted, and the test could not fail.
+    #[tokio::test]
+    async fn pending_embeddings_hold_the_sweep_until_the_backfill_drains() {
+        let pending = Arc::new(AtomicUsize::new(3));
+        let looks = Arc::new(AtomicUsize::new(0));
+        let source = Arc::clone(&pending);
+        let counter = Arc::clone(&looks);
+
+        // One entity embedded per look, so the backfill is unmistakably working
+        // and the gate has to hold through three of them.
+        let reason = await_backfill_before_sweep(
+            true,
+            move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let seen = source.load(Ordering::SeqCst);
+                source.store(seen.saturating_sub(1), Ordering::SeqCst);
+                seen
+            },
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            Duration::from_millis(1),
+        )
+        .await;
+
+        assert_eq!(
+            reason,
+            SweepStartReason::BackfillDrained,
+            "a sweep released after waiting must say so; `NothingPending` here would mean the \
+             gate let it start beside a backfill that still had work"
+        );
+        assert_eq!(
+            looks.load(Ordering::SeqCst),
+            4,
+            "three looks with work pending and a fourth that found the backfill drained"
+        );
+        assert_eq!(
+            pending.load(Ordering::SeqCst),
+            0,
+            "and the backfill really did drain, rather than the gate giving up on it"
+        );
+        assert_eq!(reason_is_logged(reason), "backfill-drained");
+    }
+
+    /// An opted-out backfill releases the sweep at once rather than making it
+    /// wait out a bound nothing will satisfy.
+    ///
+    /// Run against the production constants deliberately. If the rule were
+    /// wrong this test would sit for the stall bound and then fail, so the
+    /// assertion below is not the only thing that can catch a regression.
+    #[tokio::test]
+    async fn an_opted_out_backfill_releases_the_sweep_at_once() {
+        let looks = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&looks);
+
+        let reason = await_backfill_before_sweep(
+            false,
+            move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                4096
+            },
+            SWEEP_BACKFILL_WAIT_BOUND,
+            SWEEP_BACKFILL_STALL_BOUND,
+            SWEEP_BACKFILL_POLL_INTERVAL,
+        )
+        .await;
+
+        assert_eq!(
+            reason,
+            SweepStartReason::BackfillNotRunning,
+            "with no worker to drain it, a pending count is not a reason to wait"
+        );
+        assert_eq!(
+            looks.load(Ordering::SeqCst),
+            1,
+            "one look and no sleep: an opt-out is known before the first poll interval"
+        );
+        assert_eq!(reason_is_logged(reason), "backfill-not-running");
+    }
+
+    /// A backfill still working when the whole wait bound expires loses the
+    /// sweep, and the reason says which bound ended it.
+    ///
+    /// The count falls on every look, so the stall bound can never fire here
+    /// and only the total wait bound can end this wait. That is what makes the
+    /// assertion about the wait bound rather than about either bound.
+    #[tokio::test]
+    async fn the_wait_bound_releases_a_sweep_a_working_backfill_is_still_holding() {
+        let source = Arc::new(AtomicUsize::new(1_000_000));
+        let pending = Arc::clone(&source);
+
+        let reason = await_backfill_before_sweep(
+            true,
+            move || pending.fetch_sub(1, Ordering::SeqCst),
+            Duration::from_millis(50),
+            Duration::from_secs(30),
+            Duration::from_millis(1),
+        )
+        .await;
+
+        assert_eq!(
+            reason,
+            SweepStartReason::WaitBoundExpired,
+            "the ordering is a ceiling, not a promise: a backfill that outlasts the bound must \
+             not hold the sweep forever"
+        );
+        assert!(
+            source.load(Ordering::SeqCst) > 0,
+            "and it must have been released with work still pending, or this proved nothing"
+        );
+        assert_eq!(reason_is_logged(reason), "wait-bound-expired");
+    }
+
+    /// A backfill that stops moving releases the sweep on the stall bound
+    /// rather than holding it for the whole wait bound.
+    ///
+    /// The case the wait bound alone gets wrong: a backfill wedged on a refused
+    /// vector checkpoint neither drains nor errors, so its pending count simply
+    /// stops falling.
+    #[tokio::test]
+    async fn a_wedged_backfill_releases_the_sweep_on_the_stall_bound() {
+        let reason = await_backfill_before_sweep(
+            true,
+            || 512,
+            Duration::from_secs(30),
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+        )
+        .await;
+
+        assert_eq!(
+            reason,
+            SweepStartReason::BackfillStalled,
+            "a count that never falls is a backfill going nowhere, and waiting out the full \
+             bound on it delays the sweep for nothing"
+        );
+        assert_eq!(reason_is_logged(reason), "backfill-stalled");
+    }
+
+    /// A store with nothing left to embed sweeps exactly as it did before this
+    /// gate existed: released on the first look, having waited for nothing.
+    #[tokio::test]
+    async fn a_converged_store_is_released_on_the_first_look() {
+        let looks = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&looks);
+
+        let reason = await_backfill_before_sweep(
+            true,
+            move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                0
+            },
+            SWEEP_BACKFILL_WAIT_BOUND,
+            SWEEP_BACKFILL_STALL_BOUND,
+            SWEEP_BACKFILL_POLL_INTERVAL,
+        )
+        .await;
+
+        assert_eq!(reason, SweepStartReason::NothingPending);
+        assert_eq!(
+            looks.load(Ordering::SeqCst),
+            1,
+            "one look: an already-embedded store must not pay a poll interval for this gate"
+        );
+    }
+
+    /// The rule itself, at the boundaries the loop can only reach by waiting.
+    #[test]
+    fn the_gate_holds_a_sweep_while_a_running_backfill_is_inside_both_bounds() {
+        let wait = Duration::from_secs(600);
+        let stall = Duration::from_secs(90);
+        let working = BackfillLook {
+            running: true,
+            pending: 576,
+            held: true,
+            waited: Duration::from_secs(300),
+            since_progress: Duration::from_secs(5),
+        };
+        assert_eq!(
+            sweep_gate_step(working, wait, stall),
+            SweepGateStep::Wait,
+            "a backfill halfway through its bound and landing batches keeps the sweep back"
+        );
+        assert_eq!(
+            sweep_gate_step(
+                BackfillLook {
+                    waited: wait,
+                    ..working
+                },
+                wait,
+                stall
+            ),
+            SweepGateStep::Start(SweepStartReason::WaitBoundExpired),
+            "and stops keeping it back the moment the bound is reached, not after it"
+        );
+        assert_eq!(
+            sweep_gate_step(
+                BackfillLook {
+                    since_progress: stall,
+                    ..working
+                },
+                wait,
+                stall
+            ),
+            SweepGateStep::Start(SweepStartReason::BackfillStalled),
+        );
+    }
+
+    /// A stall bound at or above the wait bound could never fire, so the wedged
+    /// backfill it exists for would hold the sweep for the full ten minutes.
+    #[test]
+    fn the_stall_bound_can_fire_before_the_wait_bound_it_sits_inside() {
+        assert!(
+            SWEEP_BACKFILL_STALL_BOUND < SWEEP_BACKFILL_WAIT_BOUND,
+            "the stall bound is the inner one; at or above the wait bound it is unreachable"
+        );
+        assert!(
+            SWEEP_BACKFILL_POLL_INTERVAL < SWEEP_BACKFILL_STALL_BOUND,
+            "and the gate has to look more than once inside the shorter bound, or it cannot \
+             tell a stalled backfill from a working one"
+        );
+    }
 }
 
 /// Whether the sweep has already finished this file.
@@ -2366,9 +2844,15 @@ pub async fn run_with_authority_on(
     // sweep skips files that already carry language-server evidence, so this is
     // cheap on a converged repository, resumable after a kill, and safe to queue
     // on every start.
+    // Decided here and acted on later. Settling the previous sweep has to happen
+    // at startup, because the in-flight record it takes is the only trace a
+    // killed sweep leaves and a second daemon would read it as its own. Queueing
+    // does not: the sweep is handed to the gate below, which starts it once the
+    // embedding backfill is out of the way.
+    let mut sweep_admitted = false;
     if enrichment_enabled && state.lsp_enrichment_tx.is_some() {
         // A store whose sweeps keep dying before enriching anything gets one
-        // fewer, not another. Queued on EVERY daemon start, this is the point
+        // fewer, not another. Decided on EVERY daemon start, this is the point
         // the marker-discard loop turns at: a sweep dies, the daemon restarts,
         // queues another, dies again. One stranger session logged 24 of them.
         match decide_sweep_on_start(&state) {
@@ -2383,8 +2867,7 @@ pub async fn run_with_authority_on(
                 );
             }
             SweepStartDecision::Queue => {
-                info!("queueing an LSP sweep so a graph with unenriched files converges");
-                state.queue_lsp_sweep();
+                sweep_admitted = true;
             }
         }
     }
@@ -2415,6 +2898,39 @@ pub async fn run_with_authority_on(
         }
     };
 
+    // Shutdown signal: when set to true, all loops exit.
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+    // Spawn the reconciliation loop BEFORE the endpoint is published, and wait
+    // for it to report its file watcher.
+    //
+    // Serving is not watching. The endpoint file is the readiness signal real
+    // clients key on, so a client that connects the moment it appears and
+    // writes immediately used to land in a window where the watcher did not yet
+    // exist: the write raised no event, startup replayed nothing, and the file
+    // stayed absent from the graph until some unrelated later touch of the same
+    // path (FIR-2466). Publishing after the watch closes that window by
+    // construction rather than by racing it.
+    //
+    // The wait is bounded and the signal fires on the loop's drop as well as on
+    // arming, so no early return, disabled loop, bare checkout, or refused
+    // watcher can leave this daemon unpublished.
+    let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
+    let loop_state = Arc::clone(&state);
+    let loop_config = config.loop_config.clone();
+    let loop_cancel = cancel_rx.clone();
+    let loop_handle = tokio::spawn(async move {
+        loop_runner::run_loop_armed(
+            loop_state,
+            loop_config,
+            loop_cancel,
+            Some(loop_runner::WatchArmed::new(armed_tx)),
+        )
+        .await
+    });
+    let arming = await_watch_armed(armed_rx, WATCH_ARMING_BOUND).await;
+    announce_watch_arming(arming, WATCH_ARMING_BOUND);
+
     // Publish PID and the actual bound port as one lifecycle-authorized
     // operation. Endpoint retirement takes the same authority, so no client can
     // delete a successor publication using a verdict about its predecessor.
@@ -2427,6 +2943,10 @@ pub async fn run_with_authority_on(
     // costs nothing here because it advertises nothing; only publication does.
     crate::lifecycle::publish_daemon_endpoint(state.layout.root(), bound_port)
         .map_err(DaemonError::Io)?;
+    // Recorded so the ordering above is readable off the daemon's own log
+    // rather than inferred from timings. A watcher record that does not precede
+    // this one is the regression.
+    info!(port = bound_port, "published the daemon endpoint");
 
     // Retire the readiness surface: the full API serves this socket from here.
     // Both handles accept from one listen queue, so there is no instant at which
@@ -2435,9 +2955,6 @@ pub async fn run_with_authority_on(
     if let Some(ready_tx) = warming_retired {
         let _ = ready_tx.send(true);
     }
-
-    // Shutdown signal: when set to true, all loops exit.
-    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
     info!(port = bound_port, "starting kin daemon");
 
@@ -2521,15 +3038,6 @@ pub async fn run_with_authority_on(
             warn!(error = %error, "failed to spawn owner-death watchdog");
         }
     }
-
-    // Spawn the reconciliation loop.
-    let loop_state = Arc::clone(&state);
-    let loop_config = config.loop_config.clone();
-    let loop_cancel = cancel_rx.clone();
-    let loop_handle =
-        tokio::spawn(
-            async move { loop_runner::run_loop(loop_state, loop_config, loop_cancel).await },
-        );
 
     // Spawn the API server on the pre-bound listener.
     let api_state = Arc::clone(&state);
@@ -3237,6 +3745,59 @@ pub async fn run_with_authority_on(
         }
         embed_pass.idle();
     });
+
+    // Order the cold sweep behind the embedding backfill.
+    //
+    // Until this gate the two were peer spawns in one process with nothing
+    // between them: the sweep was queued at startup (`decide_sweep_on_start`
+    // above) and the backfill started as soon as the daemon reported itself
+    // initialized, so on a first boot they ran together. On a full-history store
+    // inside a memory cap that is what killed the daemon, and the loss is not
+    // symmetric. The backfill checkpoints as it goes, so a kill costs it the
+    // batch in flight. Everything the sweep makes durable happens after its last
+    // file, so a kill costs the sweep the whole pass and the next daemon sweeps
+    // the same files again.
+    //
+    // So the one that checkpoints goes first. A store with nothing left to embed
+    // is released on the gate's first look and behaves exactly as it did before
+    // this existed.
+    if sweep_admitted {
+        let gate_state = Arc::clone(&state);
+        let pending_state = Arc::clone(&state);
+        let mut gate_cancel = cancel_rx.clone();
+        // Read once, here, rather than inside the loop: both halves are fixed
+        // for the life of the process, and a gate that re-read them could wait
+        // on a backfill that was never going to run.
+        let backfill_running =
+            auto_embed_enabled() && pending_state.can_persist_embed_progress_locally();
+        tokio::spawn(async move {
+            let gate = await_backfill_before_sweep(
+                backfill_running,
+                move || pending_state.graph.embedding_status().pending,
+                SWEEP_BACKFILL_WAIT_BOUND,
+                SWEEP_BACKFILL_STALL_BOUND,
+                SWEEP_BACKFILL_POLL_INTERVAL,
+            );
+            let reason = tokio::select! {
+                // Biased so a shutdown that arrives while the gate waits ends it
+                // rather than racing it. A daemon asked to stop must not queue a
+                // sweep on its way out.
+                biased;
+                _ = gate_cancel.changed() => {
+                    info!("daemon shutting down before the LSP sweep gate released; no sweep queued");
+                    return;
+                }
+                reason = gate => reason,
+            };
+            info!(
+                reason = reason.as_str(),
+                wait_bound_s = SWEEP_BACKFILL_WAIT_BOUND.as_secs(),
+                stall_bound_s = SWEEP_BACKFILL_STALL_BOUND.as_secs(),
+                "queueing an LSP sweep so a graph with unenriched files converges"
+            );
+            gate_state.queue_lsp_sweep();
+        });
+    }
 
     // Spawn the background-work supervisor.
     //
@@ -3959,6 +4520,25 @@ pub async fn run_with_authority_on(
                             lsp_state.mark_dirty();
                         }
 
+                        // Record the relation census this sweep produced,
+                        // before the publication below makes it durable.
+                        //
+                        // The sweep's relations are all in the live graph by
+                        // here; what remains is writing them to disk. Taking
+                        // the census now means the record describes the graph
+                        // the snapshot is about to publish, and a census taken
+                        // afterwards would be a second reading of the same
+                        // graph for no gain. `kin graph status` compares its
+                        // own census against this record, which is what lets it
+                        // notice a relation kind that went to zero instead of
+                        // printing the histogram that proves the loss and then
+                        // an all-clear over it.
+                        crate::background_work::record_relation_census(
+                            &lsp_state.layout,
+                            lsp_state.graph.as_ref(),
+                            kin_core::relation_census::CensusSource::Sweep,
+                        );
+
                         // Publish this sweep's enrichment ONCE, here, and wait
                         // for it.
                         //
@@ -4541,16 +5121,69 @@ async fn select_with_signals(
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        coverage_drain_verdict, drain_pending_flush, embed_work_outstanding,
+        await_watch_armed, coverage_drain_verdict, drain_pending_flush, embed_work_outstanding,
         format_singleton_contention, next_embed_error_backoff, parse_duration_secs,
         parse_owner_watch_pid, should_enable_lsp_enrichment, should_flush_now, shutdown_signalled,
         watched_process_is_alive, ControlPlane, CoverageDrainVerdict, DaemonConfig, DaemonState,
-        FlushSuppression, DEFAULT_RUNTIME_SHUTDOWN_GRACE, DEFAULT_SHUTDOWN_ESCALATION_GRACE,
-        RECON_IDLE,
+        FlushSuppression, WatchArming, DEFAULT_RUNTIME_SHUTDOWN_GRACE,
+        DEFAULT_SHUTDOWN_ESCALATION_GRACE, RECON_IDLE,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    /// FIR-2466. The healthy path: the loop reports its watcher and publication
+    /// proceeds.
+    ///
+    /// The arming is deliberately delayed rather than already sent. A future
+    /// that is ready on its first poll returns before any deadline applies, so a
+    /// version of this test with an instantly-ready signal stays green at a
+    /// one-nanosecond bound and can never tell waiting from not waiting.
+    #[tokio::test]
+    async fn a_reported_watch_releases_publication() {
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            let _ = armed_tx.send(());
+        });
+
+        assert_eq!(
+            await_watch_armed(armed_rx, Duration::from_secs(10)).await,
+            WatchArming::Armed,
+            "a watch reported inside the bound is what lets the endpoint be published"
+        );
+    }
+
+    /// A loop that ends before building a watcher releases publication too.
+    ///
+    /// Filesystem reconcile switched off, a bare checkout, or a watcher the host
+    /// refused all reach this. There is no watch coming, so waiting the bound
+    /// out would hold the endpoint back for nothing.
+    #[tokio::test]
+    async fn a_loop_that_ends_without_a_watch_releases_publication_at_once() {
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel::<()>();
+        drop(armed_tx);
+
+        assert_eq!(
+            await_watch_armed(armed_rx, Duration::from_secs(10)).await,
+            WatchArming::LoopGone
+        );
+    }
+
+    /// The bound is a ceiling on a wedged loop, not on a healthy one. An
+    /// endpoint that never appears is a daemon no client can reach, so the wait
+    /// expires into publication with the reason recorded.
+    #[tokio::test]
+    async fn a_loop_that_never_reports_stops_holding_publication_at_its_bound() {
+        // Held rather than dropped: dropping it is the LoopGone arm above, and
+        // this arm is the one where nothing happens at all.
+        let (_armed_tx, armed_rx) = tokio::sync::oneshot::channel::<()>();
+
+        assert_eq!(
+            await_watch_armed(armed_rx, Duration::from_millis(80)).await,
+            WatchArming::TimedOut
+        );
+    }
 
     #[test]
     fn default_embed_batch_is_backlog_friendly() {
@@ -6937,7 +7570,8 @@ mod shutdown_vector_checkpoint_tests {
                 &state.layout.kindb_snapshot_path(),
                 None,
             )
-            .expect("the checkpointed sidecar must be readable"),
+            .expect("the checkpointed sidecar must be readable")
+            .attached,
             "the checkpointed sidecar must install through the daemon's own open-time path"
         );
         assert_eq!(

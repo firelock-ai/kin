@@ -74,3 +74,13 @@ KIN_VECTOR_BENCH_ITERS
 # in a kin process reads either name.
 KIN_FIR2334_STORE
 KIN_FIR2334_REPO
+
+# kin-db storage/repository.rs: inputs to five ignored profiling fixtures that
+# measure history-replay and commit-preparation costs. They are read only from
+# the dependency's own `#[cfg(test)]` modules, so no Kin process can observe
+# them as operator controls.
+KIN_REPLAYWALL_COMMITS
+KIN_CLOCKHALF_COMMITS
+KIN_CLOCKHALF_FILES
+KIN_CLOCKHALF_FLAT
+KIN_CLOCKHALF_CHURN

@@ -111,6 +111,42 @@ pub fn is_new_source_file(op: &McpMutationOperation) -> bool {
             .is_some_and(|body| !body.trim().is_empty())
 }
 
+/// A payload-less operation that expresses "the complete new source of the
+/// tracked repository file at `target` is `body`": verb replace/overwrite,
+/// `target` naming a repository-relative path, and a non-empty `body`.
+///
+/// This is the sibling of [`is_new_source_file`] for source the graph already
+/// holds, and it exists because an agent that has just rewritten a file holds a
+/// path and the file's new text, never an entity. [`is_target_body_update`]
+/// resolves `target` against repository authority as an entity uuid or an exact
+/// entity name and splices the body into that entity's span, so a caller
+/// holding only a path cannot reach it, and a caller holding a whole file
+/// cannot describe a whole-file rewrite as one span edit. Every local harness
+/// that offers `edit_file` or `write_file` is in exactly that position.
+///
+/// The verb is its own, rather than a path reading of `update`, because the
+/// branches have to stay disjoint: an entity name and a repository path are
+/// both bare strings, so one verb covering both would make the meaning of an
+/// operation depend on which one the target happened to resolve as. Naming the
+/// rewrite `replace` keeps the shape decidable from the operation alone.
+///
+/// `upsert` is deliberately not one of the verbs, for the reason
+/// [`is_new_source_file`] gives: a rewrite that silently becomes an admission
+/// is the failure these two shapes exist to keep apart. A path the graph does
+/// not track is refused by name, and `create` is the verb for it.
+pub fn is_replaced_source_file(op: &McpMutationOperation) -> bool {
+    op.payload.is_none()
+        && matches!(
+            op.verb.trim().to_lowercase().as_str(),
+            "replace" | "overwrite"
+        )
+        && !op.target.trim().is_empty()
+        && op
+            .body
+            .as_deref()
+            .is_some_and(|body| !body.trim().is_empty())
+}
+
 /// A payload-less operation that expresses "the repository no longer holds the
 /// file at `target`": verb delete/remove, `target` naming a repository-relative
 /// path, and no body.
@@ -392,7 +428,7 @@ pub struct CoordinationWritePreflight {
 /// The mutation verbs the transaction commit path understands, listed for
 /// actionable error messages.
 const KNOWN_MUTATION_VERBS: &str =
-    "create/add/upsert/insert, update/modify, delete/remove, or rename/move";
+    "create/add/upsert/insert, update/modify, replace/overwrite, delete/remove, or rename/move";
 
 fn is_known_mutation_verb(verb: &str) -> bool {
     matches!(
@@ -403,6 +439,8 @@ fn is_known_mutation_verb(verb: &str) -> bool {
             | "insert"
             | "update"
             | "modify"
+            | "replace"
+            | "overwrite"
             | "delete"
             | "remove"
             | "rename"
@@ -447,6 +485,10 @@ pub fn validate_staged_operations(
                 validate_source_operation_path(idx, op, op.target.trim(), "target")?;
                 continue;
             }
+            if is_replaced_source_file(op) {
+                validate_source_operation_path(idx, op, op.target.trim(), "target")?;
+                continue;
+            }
             if is_retired_source_file(op) {
                 validate_source_operation_path(idx, op, op.target.trim(), "target")?;
                 continue;
@@ -473,10 +515,11 @@ pub fn validate_staged_operations(
                  payload, express an edit to an existing entity as verb 'update' with `target` \
                  (entity name or id) and `body` (the entity's full new source text), admit a \
                  source file the graph has never seen as verb 'create' with `target` (its \
-                 repository-relative path) and `body` (the file's complete text), retire a \
-                 tracked file as verb 'delete' with `target` (its repository-relative path) and \
-                 no body, or relocate one as verb 'rename' with `target` and `destination` (both \
-                 repository-relative paths)",
+                 repository-relative path) and `body` (the file's complete text), rewrite a \
+                 tracked file as verb 'replace' with `target` (its repository-relative path) and \
+                 `body` (the file's complete new text), retire a tracked file as verb 'delete' \
+                 with `target` (its repository-relative path) and no body, or relocate one as \
+                 verb 'rename' with `target` and `destination` (both repository-relative paths)",
                 op.verb
             ));
         };
@@ -566,6 +609,7 @@ pub fn uncommittable_reason(op: &McpMutationOperation) -> Option<String> {
     let Some(payload) = op.payload.as_ref() else {
         if is_target_body_update(op)
             || is_new_source_file(op)
+            || is_replaced_source_file(op)
             || is_retired_source_file(op)
             || is_renamed_source_file(op)
         {
@@ -589,12 +633,23 @@ pub fn uncommittable_reason(op: &McpMutationOperation) -> Option<String> {
                      repository-relative path, and `destination` set to its new one",
                     op.verb
                 ))
+            } else if matches!(verb.as_str(), "replace" | "overwrite") {
+                Some(format!(
+                    "verb '{}' is not committable for entity payloads; a replacement rewrites a \
+                     whole file, so stage it with no payload, `target` set to the file's \
+                     repository-relative path, and `body` set to its complete new text. To \
+                     change one entity in place, use verb 'update'",
+                    op.verb
+                ))
             } else {
                 None
             }
         }
         McpMutationPayload::Relation { .. } => {
-            if matches!(verb.as_str(), "update" | "modify" | "rename" | "move") {
+            if matches!(
+                verb.as_str(),
+                "update" | "modify" | "replace" | "overwrite" | "rename" | "move"
+            ) {
                 Some(format!(
                     "verb '{}' is not committable for relation payloads; relations support only \
                      create/add/upsert/insert or delete/remove",
@@ -629,6 +684,9 @@ pub const ACCEPTED_OPERATION_SHAPES: &str = "each element of `operations` is one
      \"description\": \"<why>\"}\n  \
      - a new source file: {\"verb\": \"create\", \"target\": \"<repository-relative path>\", \
      \"body\": \"<the file's complete source text>\", \"description\": \"<why>\"}\n  \
+     - a rewritten source file: {\"verb\": \"replace\", \"target\": \"<repository-relative path \
+     the graph already tracks>\", \"body\": \"<the file's complete new source text>\", \
+     \"description\": \"<why>\"}\n  \
      - a retired source file: {\"verb\": \"delete\", \"target\": \"<repository-relative path>\", \
      \"description\": \"<why>\"}\n  \
      - a renamed source file: {\"verb\": \"rename\", \"target\": \"<current path>\", \
@@ -637,11 +695,12 @@ pub const ACCEPTED_OPERATION_SHAPES: &str = "each element of `operations` is one
      source text.\n\
      Every field of an operation, and nothing else is accepted:\n  \
      - `verb` (string, REQUIRED): one of create/add/upsert/insert, update/modify, \
-     delete/remove, or rename/move. Compared case-insensitively after trimming.\n  \
+     replace/overwrite, delete/remove, or rename/move. Compared case-insensitively after \
+     trimming.\n  \
      - `target` (string, REQUIRED): the entity this operation acts on, as either its uuid or \
-     its exact name. A repository-relative path instead for the three file-level shapes \
-     (create, delete, rename). Empty string for relation payloads, which identify themselves \
-     by their endpoints and kind.\n  \
+     its exact name. A repository-relative path instead for the four file-level shapes \
+     (create, replace, delete, rename). Empty string for relation payloads, which identify \
+     themselves by their endpoints and kind.\n  \
      - `description` (string, REQUIRED): why this operation is being made.\n  \
      - `destination` (string, optional): where a rename puts the file, as a \
      repository-relative path. Required by rename/move and accepted by nothing else.\n  \
@@ -2819,6 +2878,82 @@ mod target_body_update_tests {
             "moved",
         )));
         assert!(uncommittable_reason(&entity_update).is_none());
+    }
+
+    /// The whole-file rewrite is its own shape, and the shapes it sits between
+    /// do not answer for it.
+    ///
+    /// The near misses carry the point. `replace` is a verb the stage path did
+    /// not know at all before this shape existed, so a payload-less `replace`
+    /// used to fail with "unknown verb" and now succeeds; everything that still
+    /// has to fail is listed here so the widening is bounded to what was
+    /// intended. The disjointness assertions matter most: an entity edit and a
+    /// rewrite both carry a bare target and a body, so the verb is the only
+    /// thing that separates "splice this into one entity's span" from "this is
+    /// the file's whole new text".
+    #[test]
+    fn the_rewrite_shape_is_recognized_and_its_near_misses_are_not() {
+        let rewrite = target_op("replace", "src/parser.py", Some("def parse():\n    pass\n"));
+        assert!(is_replaced_source_file(&rewrite));
+        assert!(!is_target_body_update(&rewrite));
+        assert!(!is_new_source_file(&rewrite));
+        assert!(!is_retired_source_file(&rewrite));
+        assert!(!is_renamed_source_file(&rewrite));
+        assert!(uncommittable_reason(&rewrite).is_none());
+        validate_staged_operations(std::slice::from_ref(&rewrite))
+            .expect("a payload-less replace naming a path and carrying a body must stage");
+
+        let overwrite = target_op("overwrite", "src/parser.py", Some("x = 1\n"));
+        assert!(is_replaced_source_file(&overwrite));
+        assert!(uncommittable_reason(&overwrite).is_none());
+        validate_staged_operations(std::slice::from_ref(&overwrite))
+            .expect("'overwrite' is the same shape under its other verb");
+
+        // A create and an entity edit keep their own verbs. If either matched
+        // the rewrite, an operation's meaning would depend on how its target
+        // happened to resolve rather than on what it said.
+        let create = target_op("create", "src/parser.py", Some("x = 1\n"));
+        assert!(!is_replaced_source_file(&create));
+        let edit = target_op("update", "parse", Some("def parse():\n    pass\n"));
+        assert!(!is_replaced_source_file(&edit));
+
+        // A rewrite states a whole file, so it is nothing without one.
+        let no_body = target_op("replace", "src/parser.py", None);
+        assert!(!is_replaced_source_file(&no_body));
+        assert!(validate_staged_operations(std::slice::from_ref(&no_body)).is_err());
+
+        let empty_body = target_op("replace", "src/parser.py", Some("   "));
+        assert!(!is_replaced_source_file(&empty_body));
+        assert!(validate_staged_operations(std::slice::from_ref(&empty_body)).is_err());
+
+        let no_target = target_op("replace", "", Some("x = 1\n"));
+        assert!(!is_replaced_source_file(&no_target));
+        assert!(validate_staged_operations(std::slice::from_ref(&no_target)).is_err());
+
+        // The path rule the projection applies runs here too, so a path the
+        // commit could never materialize is refused where it was typed.
+        let escaping = target_op("replace", "../outside.py", Some("x = 1\n"));
+        assert!(is_replaced_source_file(&escaping));
+        let error = validate_staged_operations(std::slice::from_ref(&escaping))
+            .expect_err("a path that escapes the repository must not stage");
+        assert!(
+            error.contains("../outside.py"),
+            "the refusal must quote the path it rejected: {error}"
+        );
+
+        // A payload turns it into a shape the commit path has no arm for, so
+        // stage time refuses it and names the payload-less form.
+        let mut with_entity = target_op("replace", "src/parser.py", Some("x = 1\n"));
+        with_entity.payload = Some(McpMutationPayload::Entity(super::tests::entity_named(
+            "parse",
+        )));
+        let reason = uncommittable_reason(&with_entity)
+            .expect("an entity payload must not be committable with a replace verb");
+        assert!(
+            reason.contains("is not committable for entity payloads"),
+            "{reason}"
+        );
+        assert!(validate_staged_operations(std::slice::from_ref(&with_entity)).is_err());
     }
 
     #[test]

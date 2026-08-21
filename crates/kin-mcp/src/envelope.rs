@@ -45,6 +45,20 @@ pub const ENVELOPE_VERSION: u32 = 1;
 /// namespaced so it never collides with a tool payload's own fields.
 pub const ENVELOPE_KEY: &str = "_kin";
 
+/// The `semantic_coverage.limited_by` label a producing surface records when the
+/// role filter narrowed the population its counters were taken over.
+///
+/// Spelled here as a literal rather than imported: this crate mirrors the
+/// coverage shape kin-cli publishes and does not depend on it. The producer is
+/// `kin_cli::commands::locate::COVERAGE_LIMIT_GRAPH_ROLE_FILTER`, and the two
+/// have to stay spelled the same.
+const SCOPE_LIMIT_ROLE_FILTER: &str = "graph_role_filter";
+
+/// The `semantic_coverage.limited_by` label for missing graph-owned source
+/// bodies. Producer:
+/// `kin_cli::commands::locate::COVERAGE_LIMIT_GRAPH_BODY_GAP`.
+const SCOPE_LIMIT_BODY_GAP: &str = "graph_body_gap";
+
 /// Which runtime produced a tool response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -72,7 +86,41 @@ pub struct SemanticCoverage {
     pub pending: u64,
     /// True when the semantic signal was complete (`total == 0`, or every entity
     /// indexed with nothing pending).
+    ///
+    /// A CONJUNCTION over several independent causes, so it cannot be read as a
+    /// statement about embeddings. Read [`Self::embedding_state`] for that, and
+    /// [`Self::limited_by`] for which cause cleared this flag.
     pub complete: bool,
+    /// What the embedding substrate itself was observed to be, as the producing
+    /// surface decided it: `present`, `partial`, `absent` or `unknown`.
+    ///
+    /// This is the one embedding verdict, computed once where the counters were
+    /// taken and carried on the wire rather than re-derived here. Deriving one
+    /// from [`Self::complete`] is the FIR-2543 defect: a `semantic_locate`
+    /// envelope carried `indexed 2112, pending 0` beside
+    /// `completeness.classes.embeddings: absent`, because fifteen test-role
+    /// paths withheld from ranking had cleared `complete` and a consumer read
+    /// that as an embedding shortfall.
+    ///
+    /// Absent on payloads minted before the field existed.
+    /// [`Self::embedding_state`] narrows those from the counters and answers
+    /// `unknown` wherever the counters alone cannot tell a detached index from
+    /// an unembedded store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_state_reported: Option<String>,
+    /// Every machine-stable reason [`Self::complete`] is false, as the producing
+    /// surface recorded them. Empty or absent when nothing was recorded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub limited_by: Vec<String>,
+    /// When the counters above were sampled, RFC 3339 in UTC, when the payload
+    /// carried it.
+    ///
+    /// Two surfaces reporting different counts for one store in the same minute
+    /// is the ordinary state of a store with a backfill running. Without a read
+    /// time it is indistinguishable from one of them being wrong, which is half
+    /// of what FIR-2543 reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_at: Option<String>,
     /// Human-readable note describing the degraded state, present only when the
     /// semantic signal was partial.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -87,7 +135,111 @@ pub struct SemanticCoverage {
     pub graph_body_gap_paths: Option<u64>,
 }
 
+/// What the embedding substrate was observed to be, as every consumer in this
+/// crate reads it.
+///
+/// Deliberately four states where [`Completeness::classes`] carries three. The
+/// class vocabulary answers "was the substrate whole", so `Partial` and `Absent`
+/// both render there as `absent`; the finer reading is kept here and named in
+/// `limits`, because "some of it is indexed" and "none of it is" have different
+/// remediations and only one of them is what a first query on a fresh
+/// conversion sees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddingState {
+    /// Every eligible entity is indexed and nothing is queued.
+    Present,
+    /// Some eligible entities are indexed and some are not.
+    Partial,
+    /// An attached index holds no embedding for any eligible entity.
+    Absent,
+    /// Nobody could say.
+    Unknown,
+}
+
+impl EmbeddingState {
+    /// The class word this state contributes to [`Completeness::classes`].
+    fn class_state(self) -> &'static str {
+        match self {
+            Self::Present => STATE_PRESENT,
+            Self::Partial | Self::Absent => STATE_ABSENT,
+            Self::Unknown => STATE_UNKNOWN,
+        }
+    }
+
+    /// The machine-stable label this state contributes to
+    /// [`Completeness::limits`], or `None` when there is no shortfall to name.
+    fn limit_label(self) -> Option<&'static str> {
+        match self {
+            Self::Present => None,
+            Self::Partial => Some("embeddings_partial"),
+            Self::Absent => Some("embeddings_absent"),
+            Self::Unknown => Some("embeddings_unknown"),
+        }
+    }
+}
+
 impl SemanticCoverage {
+    /// The one embedding verdict every surface in this crate reads.
+    ///
+    /// Prefers the observation the producing surface published, because that is
+    /// the only reader that knew whether a vector index was attached when the
+    /// counters were taken. Falls back to the counters for a payload minted
+    /// before the field existed, and that fallback answers `Unknown` for every
+    /// reading the counters cannot decide on their own:
+    /// `kin_db::InMemoryGraph::embedding_status` reports zero indexed for every
+    /// retrievable object when no index is attached, so `indexed: 0` is a
+    /// fully embedded store whose index did not load and an unembedded store at
+    /// the same time. A count nobody can read is unknown, never zero and never
+    /// absent.
+    pub fn embedding_state(&self) -> EmbeddingState {
+        match self.embedding_state_reported.as_deref() {
+            Some("present") => return EmbeddingState::Present,
+            Some("partial") => return EmbeddingState::Partial,
+            Some("absent") => return EmbeddingState::Absent,
+            Some("unknown") => return EmbeddingState::Unknown,
+            // An unrecognized word is a producer this build does not understand.
+            // Reading it as healthy would let a future state certify answers
+            // nobody has decided are certifiable.
+            Some(_) => return EmbeddingState::Unknown,
+            None => {}
+        }
+        if self.total > 0 && self.indexed >= self.total && self.pending == 0 {
+            EmbeddingState::Present
+        } else if self.total == 0 || self.indexed == 0 {
+            EmbeddingState::Unknown
+        } else {
+            EmbeddingState::Partial
+        }
+    }
+
+    /// Every reason `complete` is false that is NOT a statement about
+    /// embeddings, as machine-stable labels.
+    ///
+    /// These are disclosure. A withheld test path was never ranked and a
+    /// body-less path cannot be ranked, and both hold on stores whose every
+    /// eligible entity carries a vector, so neither may decide the embedding
+    /// class. They still narrow what an empty answer proves, which is why
+    /// [`Envelope::negative_trust`] reads them.
+    pub fn scope_limits(&self) -> Vec<String> {
+        let mut limits = Vec::new();
+        if self
+            .limited_by
+            .iter()
+            .any(|limit| limit == SCOPE_LIMIT_ROLE_FILTER)
+        {
+            limits.push("graph_role_filter_withheld".to_string());
+        }
+        if self.graph_body_gap_paths.is_some_and(|gaps| gaps > 0)
+            || self
+                .limited_by
+                .iter()
+                .any(|limit| limit == SCOPE_LIMIT_BODY_GAP)
+        {
+            limits.push("graph_body_gap".to_string());
+        }
+        limits
+    }
+
     /// Lift a `semantic_coverage` object out of a tool payload, validating the
     /// shape. Returns `None` when the payload has no such field or it is not the
     /// expected object — we surface `unknown` rather than guessing.
@@ -98,6 +250,42 @@ impl SemanticCoverage {
             total: obj.get("total").and_then(Value::as_u64)?,
             pending: obj.get("pending").and_then(Value::as_u64)?,
             complete: obj.get("complete").and_then(Value::as_bool)?,
+            embedding_state_reported: obj
+                .get("embedding_state")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            limited_by: {
+                let mut limited_by: Vec<String> = obj
+                    .get("limited_by")
+                    .and_then(Value::as_array)
+                    .map(|limits| {
+                        limits
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                // A payload that carries the body-coverage object but not the
+                // reason list still stated the role filter, in the one field
+                // that has always disclosed it. Reading it here is what keeps a
+                // producer one version behind from having its narrowed
+                // population read as an embedding shortfall.
+                let withheld = obj
+                    .get("graph_bodies")
+                    .and_then(Value::as_object)
+                    .and_then(|bodies| bodies.get("withheld_test_paths"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                if withheld > 0 && !limited_by.iter().any(|it| it == SCOPE_LIMIT_ROLE_FILTER) {
+                    limited_by.push(SCOPE_LIMIT_ROLE_FILTER.to_string());
+                }
+                limited_by
+            },
+            read_at: obj
+                .get("read_at")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             note: obj.get("note").and_then(Value::as_str).map(str::to_string),
             // Optional: payloads from surfaces that ran no retrieval, and every
             // payload minted before graph-body coverage existed, carry no such
@@ -138,6 +326,13 @@ pub struct Degraded {
     /// repository the answer would be about.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_mismatch: Option<bool>,
+    /// A daemon serving this store was killed by the memory limit, and this
+    /// store's own record says so. Set only from the kernel's own accounting,
+    /// never from an inference about how much memory was in use, and never on a
+    /// host that publishes no accounting: on those the cause is reported in the
+    /// message and no flag claims it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_killed_by_memory: Option<bool>,
 }
 
 impl Degraded {
@@ -149,6 +344,7 @@ impl Degraded {
             self.mass_deletion_blocked,
             self.offline_fallback,
             self.workspace_mismatch,
+            self.daemon_killed_by_memory,
         ]
         .into_iter()
         .any(|flag| flag == Some(true))
@@ -173,6 +369,9 @@ impl Degraded {
         }
         if self.workspace_mismatch == Some(true) {
             labels.push("workspace_mismatch");
+        }
+        if self.daemon_killed_by_memory == Some(true) {
+            labels.push("daemon_killed_by_memory");
         }
         labels
     }
@@ -273,6 +472,107 @@ pub struct Durability {
     pub note: String,
 }
 
+/// How far graph truth is behind the working copy this daemon watches.
+///
+/// Two facts a reader has to have together. `unadmitted_paths` is how many host
+/// paths the daemon's most recent complete walk observed that repository
+/// authority does not carry and no observation covered; `since` is when a
+/// complete admission last succeeded. Either alone misleads. A count with no
+/// clock cannot say whether the store fell behind a second ago or a month ago,
+/// and a clock with no count cannot say whether anything is actually missing.
+///
+/// Present only when the store IS behind. An absent object is not a claim that
+/// it is current: a runtime that reported no reconcile reading has nothing to
+/// say here, and reporting a zero it never verified is the shape of wrong
+/// answer this object exists to stop.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GraphBehind {
+    /// Host paths on disk that no admission has taken.
+    pub unadmitted_paths: u64,
+    /// When a complete admission last succeeded, as the daemon reported it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    /// A bounded sample of the unadmitted paths, enough to recognize the file
+    /// you just wrote.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sample: Vec<String>,
+    /// One line an agent can act on without reading the counts.
+    pub note: String,
+}
+
+impl GraphBehind {
+    /// Read the two halves out of a daemon `/health` body.
+    ///
+    /// `None` when the body carries no reconcile reading at all, and `None`
+    /// again when it reports nothing unadmitted. The two are different facts and
+    /// both are correctly silent here: this object speaks only when the store is
+    /// behind, and the gates that consume it treat its silence as no reading
+    /// rather than as an all-clear.
+    pub fn from_health(health: &Value) -> Option<Self> {
+        let reconcile = health.get("reconcile")?;
+        let unadmitted_paths = reconcile.get("untracked_path_count")?.as_u64()?;
+        if unadmitted_paths == 0 {
+            return None;
+        }
+        let since = reconcile
+            .get("last_admission_success_at")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let sample = reconcile
+            .get("untracked_paths_sample")
+            .and_then(Value::as_array)
+            .map(|paths| {
+                paths
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let note = Self::describe(unadmitted_paths, since.as_deref());
+        Some(Self {
+            unadmitted_paths,
+            since,
+            sample,
+            note,
+        })
+    }
+
+    fn describe(unadmitted_paths: u64, since: Option<&str>) -> String {
+        let clock = match since {
+            Some(since) => format!("the last complete admission was at {since}"),
+            None => {
+                "this daemon has not reported when a complete admission last succeeded".to_string()
+            }
+        };
+        format!(
+            "{unadmitted_paths} host path(s) are on disk that graph truth does not carry, and \
+             {clock}. Answers here cover admitted content only. `kin admit` takes those paths \
+             now, and a commit takes them anyway."
+        )
+    }
+
+    /// The machine-stable reason an absence claim cannot be certified over this
+    /// store.
+    ///
+    /// A symbol defined only inside an unadmitted path is absent from every
+    /// index the query reads, so the answer is right about the graph and wrong
+    /// about the repository. That is the difference between "not there" and "not
+    /// admitted yet", and it is the whole of what this factor names.
+    pub fn limiting_factor(&self) -> String {
+        let clock = match self.since.as_deref() {
+            Some(since) => format!("the last complete admission was at {since}"),
+            None => "no complete admission has been reported".to_string(),
+        };
+        format!(
+            "graph_behind_working_tree: {} host path(s) on disk have never been admitted and \
+             {clock}, so an absence here cannot be told apart from content the graph has not \
+             taken yet",
+            self.unadmitted_paths
+        )
+    }
+}
+
 impl Durability {
     /// Derive the durability state from the two counts the daemon observed.
     ///
@@ -337,6 +637,31 @@ impl Durability {
                 }
             ),
         }
+    }
+
+    /// Restate this reading over a store the working copy has outrun.
+    ///
+    /// [`Self::observe`] compares two ENTITY counts, so it answers a question
+    /// about what a commit carries and is structurally unable to see a file no
+    /// admission has taken. A store holding unadmitted host paths therefore
+    /// reached `recorded` and said "durable repository authority records
+    /// everything answering here" over a repository holding a 140-line module
+    /// the graph had never met (FIR-2499). The counts are left exactly as
+    /// observed, because they were never the wrong part; what changes is the
+    /// claim made from them.
+    pub fn qualified_by(mut self, behind: &GraphBehind) -> Self {
+        let counts = match (self.live_entities, self.live_only_entities) {
+            (Some(live), Some(live_only)) => format!("{live} entities, {live_only} uncommitted"),
+            (Some(live), None) => format!("{live} entities"),
+            _ => "this graph".to_string(),
+        };
+        self.note = format!(
+            "{counts}, and {} host path(s) on disk that no admission has taken; this reading \
+             covers admitted content only. `kin admit` takes those paths now, and a commit takes \
+             them anyway.",
+            behind.unadmitted_paths
+        );
+        self
     }
 
     /// True when durable authority does not carry everything the answer read.
@@ -681,23 +1006,32 @@ fn edge_class_states(
     (classes, decided_by, limits)
 }
 
-/// The embedding class state, from the coverage the envelope already lifted.
+/// The embedding class state, from the one embedding verdict the coverage
+/// object carries.
+///
+/// Reads [`SemanticCoverage::embedding_state`] and never
+/// [`SemanticCoverage::complete`]. That flag is a conjunction over the substrate
+/// AND the population a query ranked over, so deriving the embedding class from
+/// it published `classes.embeddings: absent` beside `indexed 2112, pending 0` in
+/// one shipped `semantic_locate` envelope: the role filter had withheld fifteen
+/// test-role paths, which clears `complete` and says nothing about embeddings
+/// (FIR-2543).
+///
+/// Every other reason `complete` is false is still reported, in `limits`, where
+/// it is disclosure rather than a verdict about a substrate it never measured.
 fn embedding_class_states(envelope: &Envelope) -> (Map<String, Value>, Vec<String>, Vec<String>) {
     let mut limits = Vec::new();
     let state = match &envelope.semantic_coverage {
-        None => STATE_UNKNOWN,
-        Some(coverage) if coverage.complete => STATE_PRESENT,
+        None => EmbeddingState::Unknown,
         Some(coverage) => {
-            if coverage.graph_body_gap_paths.is_some_and(|gaps| gaps > 0) {
-                limits.push("graph_body_gap".to_string());
-            }
-            STATE_ABSENT
+            limits.extend(coverage.scope_limits());
+            coverage.embedding_state()
         }
     };
     let mut classes = Map::new();
-    classes.insert("embeddings".to_string(), json!(state));
-    if state != STATE_PRESENT {
-        limits.push(format!("embeddings_{state}"));
+    classes.insert("embeddings".to_string(), json!(state.class_state()));
+    if let Some(label) = state.limit_label() {
+        limits.push(label.to_string());
     }
     (classes, vec!["embeddings".to_string()], limits)
 }
@@ -985,6 +1319,18 @@ pub struct Envelope {
     /// saying `unknown` for a runtime that has no durable layer to compare to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub durability: Option<Durability>,
+    /// How far graph truth is behind the working copy, when the runtime
+    /// reported that it is behind at all.
+    ///
+    /// Beside `durability` rather than inside it because the two count
+    /// different things and can disagree. `durability` compares entity counts
+    /// and answers "is what answered here recorded"; this compares the graph to
+    /// the host and answers "is there content that never reached the graph at
+    /// all". A store can be perfectly durable and still be missing the file you
+    /// wrote a minute ago, which is exactly the pair FIR-2499 caught reporting
+    /// an all-clear.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behind: Option<GraphBehind>,
     /// Honest graph freshness context; omitted entirely when nothing is known.
     #[serde(default, skip_serializing_if = "GraphState::is_empty")]
     pub graph_state: GraphState,
@@ -1025,6 +1371,7 @@ impl Envelope {
             semantic_coverage: None,
             graph_as_of: None,
             durability: None,
+            behind: None,
             graph_state: GraphState::default(),
             degraded: Degraded {
                 offline_fallback: Some(true),
@@ -1046,6 +1393,7 @@ impl Envelope {
             semantic_coverage: None,
             graph_as_of: None,
             durability: None,
+            behind: None,
             graph_state: GraphState::default(),
             degraded: Degraded::default(),
             completeness: None,
@@ -1081,6 +1429,14 @@ impl Envelope {
             total: embeddings_total,
             pending: embeddings_pending,
             complete,
+            // Graph status hands over counters and no index observation, so the
+            // verdict is left to the one fallback in
+            // [`SemanticCoverage::embedding_state`] rather than decided a second
+            // way here. Naming a state this path cannot observe is how a second
+            // authority for one fact gets created.
+            embedding_state_reported: None,
+            limited_by: Vec::new(),
+            read_at: None,
             note: (!complete).then(|| {
                 "Selected-graph embedding coverage is incomplete at this point-in-time observation."
                     .to_string()
@@ -1090,12 +1446,38 @@ impl Envelope {
             graph_body_gap_paths: None,
         });
         self.graph_as_of = None;
-        self.durability = Some(Durability::observe(entity_count, durable_entity_count));
+        let durability = Durability::observe(entity_count, durable_entity_count);
+        // Requalified rather than replaced. This runs on the graph-status path,
+        // which may set durability after `with_health` has already read the
+        // reconcile block, and a plain assignment there would restore the
+        // all-clear note that block exists to withdraw.
+        self.durability = Some(match self.behind.as_ref() {
+            Some(behind) => durability.qualified_by(behind),
+            None => durability,
+        });
         self.graph_state = GraphState {
             entity_count: Some(entity_count),
             ..GraphState::default()
         };
         self.degraded = Degraded::default();
+        self
+    }
+
+    /// Stamp what this store recorded about daemons of its own that were
+    /// killed.
+    ///
+    /// Only the memory attribution becomes a flag, and only when the kernel's
+    /// own counter made it. A kill this host could not attribute is reported in
+    /// the message the caller reads and claims nothing structurally, because a
+    /// client keying on a flag would read "killed by memory" out of a host that
+    /// never said so.
+    pub fn with_recorded_daemon_kill(
+        mut self,
+        record: Option<&kin_daemon_spawn::DaemonKillRecord>,
+    ) -> Self {
+        if record.is_some_and(|record| record.attributed_to_memory()) {
+            self.degraded.daemon_killed_by_memory = Some(true);
+        }
         self
     }
 
@@ -1108,6 +1490,7 @@ impl Envelope {
             semantic_coverage: None,
             graph_as_of: None,
             durability: None,
+            behind: None,
             graph_state: GraphState::default(),
             degraded: Degraded {
                 daemon_unreachable: Some(true),
@@ -1134,6 +1517,7 @@ impl Envelope {
             semantic_coverage: None,
             graph_as_of: None,
             durability: None,
+            behind: None,
             graph_state: GraphState::default(),
             degraded: Degraded {
                 workspace_mismatch: Some(true),
@@ -1180,6 +1564,17 @@ impl Envelope {
                 live,
                 health.get("durable_entity_count").and_then(Value::as_u64),
             ));
+        }
+        // Read after the counts, and applied to them. The reconcile block is
+        // the only place a response can learn that the host holds content the
+        // graph never met, and without it every surface built from the counts
+        // above states an all-clear it did not verify.
+        self.behind = GraphBehind::from_health(health);
+        if let Some(behind) = self.behind.as_ref() {
+            self.durability = self
+                .durability
+                .take()
+                .map(|durability| durability.qualified_by(behind));
         }
         // The daemon `/health` `graph_generation` marker (monotonic snapshot
         // generation, bumped per committed snapshot) is a precise freshness
@@ -1270,33 +1665,57 @@ impl Envelope {
             );
         }
         match class {
+            // Every reason this gate refuses is read off the same object the
+            // completeness class reads, and each one names the cause it actually
+            // observed. Three causes clear `coverage.complete` and they have
+            // three different remediations, so a gate that reported all of them
+            // as "the semantic index is incomplete" sent a caller to `kin embed`
+            // on a store whose embeddings were already whole (FIR-2543).
             NegativeClass::Semantic => match &self.semantic_coverage {
                 None => (
                     false,
                     "coverage_unknown: embedding coverage was not reported, so an empty result may mean 'not indexed' rather than 'not present'",
                 ),
-                // A body gap and an embedding shortfall both clear `complete`,
-                // and they are different problems with different remediations.
-                // Reporting a body gap as "the semantic index is incomplete"
-                // sends a caller to `kin embed` on a store whose embeddings are
-                // already whole, so the limiting factor is named.
-                Some(coverage)
-                    if !coverage.complete
-                        && coverage.graph_body_gap_paths.is_some_and(|gaps| gaps > 0) =>
-                {
-                    (
+                Some(coverage) => match coverage.embedding_state() {
+                    EmbeddingState::Unknown => (
                         false,
-                        "coverage_graph_body_gap: graph-owned source bodies are missing for some paths, so entities in them rank on text fallback and an empty result may mean 'no body to rank' rather than 'not present'",
-                    )
-                }
-                Some(coverage) if !coverage.complete => (
-                    false,
-                    "coverage_partial: the semantic index is incomplete, so an empty result may mean 'not indexed' rather than 'not present'",
-                ),
-                Some(_) => (
-                    true,
-                    "semantic_authoritative: daemon-owned truth with complete embedding coverage",
-                ),
+                        "coverage_unknown: no vector index was attached to read coverage from, so an empty result may mean 'not indexed' rather than 'not present'",
+                    ),
+                    EmbeddingState::Absent => (
+                        false,
+                        "coverage_absent: no entity in this store carries an embedding, so an empty result means 'nothing was ranked' rather than 'not present'",
+                    ),
+                    EmbeddingState::Partial => (
+                        false,
+                        "coverage_partial: the semantic index is incomplete, so an empty result may mean 'not indexed' rather than 'not present'",
+                    ),
+                    // Embeddings are whole. What is left can only narrow the
+                    // POPULATION that was ranked, and an absence over a narrowed
+                    // population is not an absence over the repository, so the
+                    // gate still refuses and says which narrowing it saw.
+                    EmbeddingState::Present => {
+                        let scope = coverage.scope_limits();
+                        if scope.iter().any(|limit| limit == "graph_body_gap") {
+                            (
+                                false,
+                                "coverage_graph_body_gap: graph-owned source bodies are missing for some paths, so entities in them rank on text fallback and an empty result may mean 'no body to rank' rather than 'not present'",
+                            )
+                        } else if scope
+                            .iter()
+                            .any(|limit| limit == "graph_role_filter_withheld")
+                        {
+                            (
+                                false,
+                                "coverage_role_filter_withheld: test-role source paths were withheld from ranking, so an empty result may mean 'not ranked' rather than 'not present'; pass include_tests to rank them",
+                            )
+                        } else {
+                            (
+                                true,
+                                "semantic_authoritative: daemon-owned truth with complete embedding coverage",
+                            )
+                        }
+                    }
+                },
             },
             NegativeClass::Structural => {
                 if self.graph_state.initialized != Some(true) {
@@ -1715,6 +2134,132 @@ mod tests {
             .with_health(&serde_json::json!({ "graph_loaded": true }))
             .durability
             .is_none());
+    }
+
+    /// FIR-2499. The pair that was wrong together: a store holding an
+    /// unadmitted module reported "0 uncommitted; durable repository authority
+    /// records everything answering here".
+    #[test]
+    fn a_store_holding_unadmitted_host_paths_never_reports_an_all_clear() {
+        let env = Envelope::daemon().with_health(&serde_json::json!({
+            "graph_entity_count": 51,
+            "durable_entity_count": 51,
+            "reconcile": {
+                "untracked_path_count": 1,
+                "untracked_paths_sample": ["notekeeper/search.py"],
+                "last_admission_success_at": "2026-08-20T13:00:00Z",
+            },
+        }));
+
+        let behind = env
+            .behind
+            .as_ref()
+            .expect("a reported untracked path is the store being behind");
+        assert_eq!(behind.unadmitted_paths, 1);
+        assert_eq!(behind.since.as_deref(), Some("2026-08-20T13:00:00Z"));
+        assert_eq!(behind.sample, vec!["notekeeper/search.py".to_string()]);
+
+        let durability = env.durability.expect("the counts still answer");
+        assert_eq!(
+            durability.live_entities,
+            Some(51),
+            "the counts were never the wrong part and are left exactly as observed"
+        );
+        assert!(
+            !durability
+                .note
+                .contains("records everything answering here"),
+            "the all-clear this reading cannot make: {}",
+            durability.note
+        );
+        assert!(
+            durability
+                .note
+                .contains("host path(s) on disk that no admission has taken"),
+            "the note has to name what it does not cover: {}",
+            durability.note
+        );
+    }
+
+    /// FIR-2499. The graph-status path sets durability after `with_health` has
+    /// already read the reconcile block, so it has to requalify rather than
+    /// assign.
+    ///
+    /// This is the sibling of the case above and it needed its own: a plain
+    /// assignment here restores the all-clear the reconcile block exists to
+    /// withdraw, and every assertion on the `with_health` path stays green
+    /// while it does, because that path is not the one this call rewrites.
+    #[test]
+    fn a_graph_status_reading_over_a_behind_store_does_not_restore_the_all_clear() {
+        let env = Envelope::daemon()
+            .with_health(&serde_json::json!({
+                "graph_entity_count": 51,
+                "durable_entity_count": 51,
+                "reconcile": {
+                    "untracked_path_count": 2,
+                    "untracked_paths_sample": ["notekeeper/search.py"],
+                    "last_admission_success_at": "2026-08-20T13:00:00Z",
+                },
+            }))
+            .with_selected_graph_observation(51, 51, 0, 51, Some(51));
+
+        let durability = env.durability.expect("graph status reports the counts");
+        assert!(
+            !durability
+                .note
+                .contains("records everything answering here"),
+            "the graph-status reading restored an all-clear over a behind store: {}",
+            durability.note
+        );
+        assert!(
+            durability
+                .note
+                .contains("host path(s) on disk that no admission has taken"),
+            "the note has to keep naming what it does not cover: {}",
+            durability.note
+        );
+    }
+
+    /// The control for the case above, and the one that keeps this from
+    /// qualifying every answer: a store with nothing unadmitted says so exactly
+    /// as before.
+    #[test]
+    fn a_store_with_nothing_unadmitted_keeps_its_recorded_reading() {
+        let env = Envelope::daemon().with_health(&serde_json::json!({
+            "graph_entity_count": 51,
+            "durable_entity_count": 51,
+            "reconcile": { "untracked_path_count": 0 },
+        }));
+
+        assert!(env.behind.is_none(), "nothing unadmitted is nothing to say");
+        let durability = env.durability.expect("the counts still answer");
+        assert_eq!(durability.state, "recorded");
+        assert!(
+            durability
+                .note
+                .contains("records everything answering here"),
+            "{}",
+            durability.note
+        );
+    }
+
+    /// A body carrying no reconcile reading at all says nothing here. Silence
+    /// is the absence of a reading, never a zero this envelope did not verify.
+    #[test]
+    fn a_health_body_with_no_reconcile_reading_makes_no_behind_claim() {
+        let env = Envelope::daemon().with_health(&serde_json::json!({
+            "graph_entity_count": 51,
+            "durable_entity_count": 51,
+        }));
+        assert!(env.behind.is_none());
+
+        // And a reconcile block that omits the count is the same answer, which
+        // is the arm that would otherwise read as zero.
+        let partial = Envelope::daemon().with_health(&serde_json::json!({
+            "graph_entity_count": 51,
+            "reconcile": { "skipped_events": 3 },
+        }));
+        assert!(partial.behind.is_none());
     }
 
     #[test]
@@ -2196,6 +2741,255 @@ mod tests {
         assert_eq!(completeness["bound"], "at_least");
     }
 
+    /// Build one `semantic_locate` response over a store with the given
+    /// coverage, exactly as the serving path assembles it.
+    fn locate_response_with_coverage(coverage: Value) -> Value {
+        let payload = ToolCallResult::text(
+            json!({
+                "results": [{"name": "normalize_title"}],
+                "semantic_coverage": coverage,
+            })
+            .to_string(),
+        );
+        envelope_of(&finalize(
+            payload,
+            ready_daemon_envelope(),
+            "semantic_locate",
+        ))
+    }
+
+    /// The counters and the class verdict in one envelope are one fact, so a
+    /// reader acting on either reaches the same decision.
+    ///
+    /// FIR-2543 is the case this drives with. A shipped v0.5.45 `semantic_locate`
+    /// envelope carried `semantic_coverage: {indexed: 2112, total: 2112,
+    /// pending: 0}` and `completeness.classes.embeddings: "absent"` in one
+    /// response, because fifteen test-role paths withheld from ranking had
+    /// cleared `complete` and the class was derived from that flag. An agent
+    /// reading the counters proceeded and an agent reading the class backed off,
+    /// both from the same object.
+    ///
+    /// Every case below carries real counters. There is no empty-input arm,
+    /// because a store with no eligible entity makes the agreement trivially
+    /// true and could not fail if the rule were removed.
+    #[test]
+    fn the_coverage_counters_and_the_embedding_class_never_disagree() {
+        // (case name, coverage payload, expected class, expected limit label)
+        let cases: Vec<(&str, Value, &str, Option<&str>)> = vec![
+            (
+                "n_of_n_with_a_role_filter_withholding_paths",
+                json!({
+                    "indexed": 2112, "total": 2112, "pending": 0,
+                    "complete": false,
+                    "embedding_state": "present",
+                    "limited_by": ["graph_role_filter"],
+                    "graph_bodies": {
+                        "source_paths": 275, "with_body": 275, "gap_paths": 0,
+                        "withheld_test_paths": 15,
+                    },
+                }),
+                "present",
+                None,
+            ),
+            (
+                "n_of_n_with_nothing_pending",
+                json!({
+                    "indexed": 2112, "total": 2112, "pending": 0,
+                    "complete": true,
+                    "embedding_state": "present",
+                }),
+                "present",
+                None,
+            ),
+            (
+                "zero_of_n_against_an_attached_index",
+                json!({
+                    "indexed": 0, "total": 2112, "pending": 2112,
+                    "complete": false,
+                    "embedding_state": "absent",
+                    "limited_by": ["embeddings_incomplete"],
+                }),
+                "absent",
+                Some("embeddings_absent"),
+            ),
+            (
+                "some_indexed_with_work_still_pending",
+                json!({
+                    "indexed": 1536, "total": 2112, "pending": 576,
+                    "complete": false,
+                    "embedding_state": "partial",
+                    "limited_by": ["embeddings_incomplete"],
+                }),
+                "absent",
+                Some("embeddings_partial"),
+            ),
+            (
+                "counters_taken_with_no_index_attached_to_read_them",
+                json!({
+                    "indexed": 0, "total": 2112, "pending": 2112,
+                    "complete": false,
+                    "embedding_state": "unknown",
+                    "limited_by": ["vector_index_absent"],
+                }),
+                "unknown",
+                Some("embeddings_unknown"),
+            ),
+        ];
+
+        for (case, coverage, expected_class, expected_limit) in cases {
+            let envelope = locate_response_with_coverage(coverage);
+            let completeness = &envelope["completeness"];
+            let counters = &envelope["semantic_coverage"];
+            assert_eq!(
+                completeness["classes"]["embeddings"],
+                json!(expected_class),
+                "case {case}: the class must follow the counters beside it: {envelope}"
+            );
+            // The counters have to survive intact, because the whole defect was
+            // two readings of one store in one object.
+            assert_eq!(
+                counters["indexed"], envelope["semantic_coverage"]["indexed"],
+                "case {case}: counters are republished verbatim"
+            );
+            let limits = completeness["limits"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            match expected_limit {
+                Some(label) => assert!(
+                    limits.contains(&json!(label)),
+                    "case {case}: the finer reading must be named in limits: {completeness}"
+                ),
+                None => assert!(
+                    !limits.iter().any(|limit| limit
+                        .as_str()
+                        .is_some_and(|limit| limit.starts_with("embeddings_"))),
+                    "case {case}: a whole index names no embedding shortfall: {completeness}"
+                ),
+            }
+        }
+    }
+
+    /// The FIR-2543 envelope, asserted as the one thing a reader cannot be asked
+    /// to reconcile: `pending: 0` over a full index beside a class saying the
+    /// embeddings are gone.
+    ///
+    /// The role filter is still disclosed, because it narrowed the population
+    /// that was ranked. It is disclosed as what it is.
+    #[test]
+    fn a_role_filter_is_disclosed_without_being_reported_as_a_missing_index() {
+        let envelope = locate_response_with_coverage(json!({
+            "indexed": 2112, "total": 2112, "pending": 0,
+            "complete": false,
+            "embedding_state": "present",
+            "limited_by": ["graph_role_filter"],
+            "graph_bodies": {
+                "source_paths": 275, "with_body": 275, "gap_paths": 0,
+                "withheld_test_paths": 15,
+            },
+        }));
+        let completeness = &envelope["completeness"];
+        assert_eq!(
+            completeness["classes"]["embeddings"],
+            json!("present"),
+            "2112 of 2112 indexed with nothing pending is a present index: {completeness}"
+        );
+        let limits = completeness["limits"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            limits.contains(&json!("graph_role_filter_withheld")),
+            "the narrowed population is still disclosed: {completeness}"
+        );
+        assert!(
+            !limits.contains(&json!("embeddings_absent")),
+            "a whole index is never an absent one: {completeness}"
+        );
+    }
+
+    /// A producer one version behind carries the body-coverage object and no
+    /// reason list, and its role filter still must not be read as an embedding
+    /// shortfall.
+    #[test]
+    fn a_role_filter_declared_only_by_the_body_coverage_object_is_still_read() {
+        let envelope = locate_response_with_coverage(json!({
+            "indexed": 800, "total": 800, "pending": 0,
+            "complete": false,
+            "embedding_state": "present",
+            "graph_bodies": {
+                "source_paths": 40, "with_body": 40, "gap_paths": 0,
+                "withheld_test_paths": 6,
+            },
+        }));
+        let limits = envelope["completeness"]["limits"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            limits.contains(&json!("graph_role_filter_withheld")),
+            "the filter is disclosed from the only field that carried it: {}",
+            envelope["completeness"]
+        );
+    }
+
+    /// A payload minted before the verdict existed gets the honest reading of
+    /// its own counters, and `indexed: 0` is not one of the readings the
+    /// counters can decide.
+    ///
+    /// `embedding_status` reports zero indexed for every retrievable object when
+    /// no vector index is attached, so a bare `0 of 2112` is a fully embedded
+    /// store whose index did not load and a store nobody embedded, at once.
+    #[test]
+    fn a_legacy_payload_reporting_zero_indexed_is_unknown_rather_than_absent() {
+        let envelope = locate_response_with_coverage(json!({
+            "indexed": 0, "total": 2112, "pending": 2112,
+            "complete": false,
+        }));
+        let completeness = &envelope["completeness"];
+        assert_eq!(
+            completeness["classes"]["embeddings"],
+            json!("unknown"),
+            "a count nobody could read is unknown, never zero: {completeness}"
+        );
+        assert_eq!(
+            completeness["status"],
+            json!("unknown"),
+            "and the status it decides follows it: {completeness}"
+        );
+
+        // The control that makes the arm above capable of failing: the same
+        // legacy shape with counters that DO decide reads partial, not unknown.
+        let decidable = locate_response_with_coverage(json!({
+            "indexed": 1536, "total": 2112, "pending": 576,
+            "complete": false,
+        }));
+        assert_eq!(
+            decidable["completeness"]["classes"]["embeddings"],
+            json!("absent"),
+            "counters that decide are still read: {}",
+            decidable["completeness"]
+        );
+    }
+
+    /// A wire word this build does not know is not a healthy one. A future
+    /// producer must not be able to certify an answer by naming a state nobody
+    /// here has agreed is certifiable.
+    #[test]
+    fn an_unrecognized_embedding_state_reads_as_unknown() {
+        let envelope = locate_response_with_coverage(json!({
+            "indexed": 2112, "total": 2112, "pending": 0,
+            "complete": true,
+            "embedding_state": "mostly_fine",
+        }));
+        assert_eq!(
+            envelope["completeness"]["classes"]["embeddings"],
+            json!("unknown"),
+            "{}",
+            envelope["completeness"]
+        );
+    }
+
     /// A mutation is not retrieval and carries no completeness object, so the
     /// signal means something where it appears rather than becoming a field
     /// every response has to carry an answer for.
@@ -2223,5 +3017,53 @@ mod tests {
         assert!(!obj.contains_key("graph_state"));
         // degraded is always present.
         assert!(obj.contains_key("degraded"));
+    }
+
+    fn kill_record(memory_kills: u64) -> kin_daemon_spawn::DaemonKillRecord {
+        kin_daemon_spawn::DaemonKillRecord {
+            kills: 4,
+            memory_kills,
+            first_unix: 4_320,
+            last_unix: 4_800,
+            last_pid: Some(41),
+            last_cause: if memory_kills > 0 {
+                kin_daemon_spawn::DaemonKillCause::MemoryLimit {
+                    kernel_oom_kills: 1,
+                }
+            } else {
+                kin_daemon_spawn::DaemonKillCause::Unattributed { signal: 9 }
+            },
+            limit_bytes: Some(12 * 1024 * 1024 * 1024),
+            last_rss_bytes: None,
+        }
+    }
+
+    /// Only the kernel's own attribution becomes a flag. A client keying on
+    /// `daemon_killed_by_memory` must never read it out of a host that
+    /// publishes no accounting and therefore never said memory at all.
+    #[test]
+    fn only_a_kernel_attributed_kill_is_stamped_on_the_envelope() {
+        let stamped =
+            Envelope::daemon_unreachable().with_recorded_daemon_kill(Some(&kill_record(4)));
+        assert_eq!(stamped.degraded.daemon_killed_by_memory, Some(true));
+        assert!(stamped
+            .degraded
+            .active_labels()
+            .contains(&"daemon_killed_by_memory"));
+
+        let unattributed =
+            Envelope::daemon_unreachable().with_recorded_daemon_kill(Some(&kill_record(0)));
+        assert_eq!(
+            unattributed.degraded.daemon_killed_by_memory, None,
+            "a kill nothing attributed to memory claims nothing structurally"
+        );
+
+        let never_killed = Envelope::daemon_unreachable().with_recorded_daemon_kill(None);
+        assert_eq!(never_killed.degraded.daemon_killed_by_memory, None);
+        assert_eq!(
+            serde_json::to_value(&never_killed.degraded).unwrap(),
+            serde_json::json!({"daemon_unreachable": true}),
+            "a store with no record serializes exactly as it did"
+        );
     }
 }

@@ -11,6 +11,9 @@ use super::{EnvVarSpec, Kind, Sensitivity};
 #[rustfmt::skip]
 pub const GENERATED_KNOBS: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_LOCATE_AMALGAM_PENALTY", kind: Kind::NonNegF32, default: "0.05", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: amalgam penalty" },
+    EnvVarSpec { name: "KIN_LOCATE_ARTIFACT_ADMIT_LIMIT", kind: Kind::Usize, default: "3", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: artifact admit limit" },
+    EnvVarSpec { name: "KIN_LOCATE_ARTIFACT_ADMIT_SHARE", kind: Kind::NonNegF32, default: "0.5", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: artifact admit share" },
+    EnvVarSpec { name: "KIN_LOCATE_ARTIFACT_FULL_PRIORITY", kind: Kind::NonNegF32, default: "72.0", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: artifact full priority" },
     EnvVarSpec { name: "KIN_LOCATE_ARTIFACT_HUB_FANOUT_PENALTY", kind: Kind::NonNegF32, default: "0.45", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: artifact hub fanout penalty" },
     EnvVarSpec { name: "KIN_LOCATE_ARTIFACT_PATH_OVERLAP_BOOST", kind: Kind::NonNegF32, default: "1.85", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: artifact path overlap boost" },
     EnvVarSpec { name: "KIN_LOCATE_AUTO_FANOUT_CONFIDENCE_RATIO", kind: Kind::NonNegF32, default: "1.5", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: auto fanout confidence ratio" },
@@ -92,6 +95,7 @@ pub const GENERATED_KNOBS: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_LOCATE_ENTITY_DOMINANT_RESOLVE_WEIGHT", kind: Kind::NonNegF32, default: "8.0", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: entity dominant resolve weight" },
     EnvVarSpec { name: "KIN_LOCATE_ENTITY_DOMINANT_RRF_THRESHOLD", kind: Kind::Usize, default: "3", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: entity dominant rrf threshold" },
     EnvVarSpec { name: "KIN_LOCATE_ENTITY_FUSION", kind: Kind::Bool, default: "context-dependent", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: entity fusion" },
+    EnvVarSpec { name: "KIN_LOCATE_ENTITY_SURFACE_PENALTY", kind: Kind::NonNegF32, default: "0.3", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: entity surface penalty" },
     EnvVarSpec { name: "KIN_LOCATE_EXPLAIN_DEF_FLOOR_PCT", kind: Kind::NonNegF32, default: "0.0", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: explain def floor pct" },
     EnvVarSpec { name: "KIN_LOCATE_EXPLAIN_DEF_TOPK", kind: Kind::Usize, default: "0", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: explain def topk" },
     EnvVarSpec { name: "KIN_LOCATE_EXPLICIT_PHASE_MISMATCH_PENALTY", kind: Kind::NonNegF32, default: "0.22", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: explicit phase mismatch penalty" },
@@ -146,6 +150,7 @@ pub const GENERATED_KNOBS: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_LOCATE_MULTIHOP_TEST_SEED_FILES", kind: Kind::Usize, default: "16", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: multihop test seed files" },
     EnvVarSpec { name: "KIN_LOCATE_MULTI_SIGNAL_FLOOR_MAX", kind: Kind::Usize, default: "3", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: multi signal floor max" },
     EnvVarSpec { name: "KIN_LOCATE_MULTI_SIGNAL_FLOOR_PCT", kind: Kind::NonNegF32, default: "0.2", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: multi signal floor pct" },
+    EnvVarSpec { name: "KIN_LOCATE_NAME_TIE_OWNER_MASS_LIMIT", kind: Kind::Usize, default: "16", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: name tie owner mass limit" },
     EnvVarSpec { name: "KIN_LOCATE_NEGATION_PENALTY", kind: Kind::NonNegF32, default: "0.01", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: negation penalty" },
     EnvVarSpec { name: "KIN_LOCATE_NOISE_TAIL_COMPRESS", kind: Kind::NonNegF32, default: "0.4", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: noise tail compress" },
     EnvVarSpec { name: "KIN_LOCATE_NOISY_COCHANGE_ONLY_PENALTY", kind: Kind::NonNegF32, default: "0.08", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: noisy cochange only penalty" },

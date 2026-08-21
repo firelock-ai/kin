@@ -8,15 +8,17 @@
 //! truth behind `kin setup status [--json]` and `kin doctor [--fix]`.
 
 use std::env;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
 use serde_json::Value;
 
 use crate::commands::auth::default_base_url_for_health;
 use crate::commands::setup::{
     check_binary_in_path, configured_mcp_launcher, detect_shell, detected_ai_client_names,
-    home_dir, hook_filename, kin_dir, shell_rc, shim_filename, CANONICAL_NPM_MCP_COMMAND,
-    CANONICAL_NPM_MCP_PACKAGE,
+    home_dir, hook_filename, kin_dir, shell_path_rc, shell_rc, shim_filename,
+    CANONICAL_NPM_MCP_COMMAND, CANONICAL_NPM_MCP_PACKAGE,
 };
 use crate::daemon_client::{InstalledStartupProtocol, SupervisorStartupSentinel};
 
@@ -183,10 +185,18 @@ pub async fn run_health_checks() -> HealthReport {
     checks.push(check_editor());
     checks.push(check_kinlab_connect());
     checks.push(check_semantic_query_readiness().await);
-    checks.push(check_reference_edge_coverage().await);
+    // One `graph status` for the whole run, handed to every row that reads graph
+    // truth. `kin graph status` is the slowest surface Kin has on a real store,
+    // and it was fetched per row, so each row answering from graph truth added a
+    // whole one to the wall time of a doctor run on exactly the stores where an
+    // operator is most likely to be running doctor because something is wrong.
+    let graph_status = RunGraphStatus::for_run();
+    checks.push(check_reference_edge_coverage(&graph_status).await);
+    checks.push(check_relation_census(&graph_status).await);
     checks.push(check_background_work().await);
     checks.push(check_embedding_model().await);
     checks.push(check_commit_memory_headroom());
+    checks.push(check_daemon_kill_record());
     checks.push(check_retrieval_profile());
     checks.push(check_update_policy());
     checks.push(check_binary_assessment_load());
@@ -1604,10 +1614,25 @@ fn check_shell_path() -> HealthCheck {
         .and_then(|rc| std::fs::read_to_string(rc).ok())
         .unwrap_or_default();
     let rc_sources = rc_content.contains("kin-vfs");
+
+    // The PATH line does not always live beside the hook. zsh's belongs in
+    // `.zshenv`, which is the file a non-interactive shell reads, so reading
+    // only the hook's file would report a correctly installed host as missing
+    // its PATH. Both are read and either satisfies the check, which also keeps
+    // an install that predates the split reading healthy.
+    let path_rc_content = shell_path_rc(shell)
+        .ok()
+        .filter(|path| Some(path) != rc_path.as_ref())
+        .and_then(|rc| std::fs::read_to_string(rc).ok())
+        .unwrap_or_default();
+
     let bin_display = bin_dir.to_string_lossy();
-    let rc_sets_path = rc_content.contains(bin_display.as_ref())
-        || rc_content.contains(".kin/bin")
-        || rc_content.contains("kin/bin");
+    let declares_bin = |content: &str| {
+        content.contains(bin_display.as_ref())
+            || content.contains(".kin/bin")
+            || content.contains("kin/bin")
+    };
+    let rc_sets_path = declares_bin(&rc_content) || declares_bin(&path_rc_content);
 
     let rc_display = rc_path
         .as_ref()
@@ -2611,10 +2636,7 @@ async fn check_background_work() -> HealthCheck {
 /// on a graph missing 16 imports and roughly 40 cross-file call edges, and
 /// `kin languages` listed the language as fully extracted, so every readiness
 /// signal pointed away from the gap.
-async fn check_reference_edge_coverage() -> HealthCheck {
-    const ID: &str = "reference_edge_coverage";
-    const LABEL: &str = "Reference edge coverage";
-
+async fn check_reference_edge_coverage(graph_status: &RunGraphStatus) -> HealthCheck {
     // Probed first, because it needs no daemon. Every branch below that cannot
     // read the graph still reports this half, so a repository whose daemon is
     // down does not silently lose the language-server signal that used to have
@@ -2625,56 +2647,15 @@ async fn check_reference_edge_coverage() -> HealthCheck {
     // looking for a problem somewhere else entirely.
     let readiness = crate::commands::language_servers::probe_language_server_readiness(&cwd).await;
     let missing_servers = missing_language_servers(&readiness);
-    let Some(layout) = kin_core::KinLayout::discover(&cwd) else {
-        return HealthCheck::new(
-            ID,
-            LABEL,
-            HealthStatus::Unsupported,
-            "n/a — not in a Kin repository",
-        );
-    };
-    let Some(daemon_url) = crate::daemon_client::resolve_daemon_url_if_running_async(&layout).await
-    else {
-        return coverage_unreadable(
-            HealthStatus::Unsupported,
-            "no daemon running for this repository, so relation-graph completeness cannot be \
-             read; a daemon starts on first use",
-            "run any `kin` command in the repo to auto-start the daemon",
-            &missing_servers,
-        );
-    };
-    let client = match crate::daemon_client::DaemonClient::from_base_url_for_layout(
-        daemon_url.clone(),
-        &layout,
-    ) {
-        Ok(client) => client,
-        Err(error) => {
-            return coverage_unreadable(
-                HealthStatus::Stale,
-                format!("daemon reachable ({daemon_url}), but its URL is invalid: {error}"),
-                "check the daemon URL recorded for this repository",
-                &missing_servers,
-            );
-        }
-    };
-    let response = match client
-        .graph_command(&crate::commands::graph::GraphCommandRequest::Status)
-        .await
-    {
+    // The run's one fetch. Every unreadable state is phrased by this row in its
+    // own words rather than reported once by the fetch, because a row that reads
+    // graph truth must never render the same whether the graph was healthy or
+    // unreadable.
+    let response = match coverage_row_for_unread_graph(graph_status.get().await, &missing_servers) {
         Ok(response) => response,
-        Err(error) => {
-            return coverage_unreadable(
-                HealthStatus::Stale,
-                format!(
-                    "daemon reachable ({daemon_url}), but relation-graph completeness is \
-                     unavailable: {error}"
-                ),
-                "run `kin graph status` and resolve the reported daemon error",
-                &missing_servers,
-            );
-        }
+        Err(row) => return row,
     };
-    let Some(coverage) = response.reference_edge_coverage else {
+    let Some(coverage) = response.reference_edge_coverage.as_ref() else {
         return coverage_unreadable(
             HealthStatus::Stale,
             "the daemon serving this repository does not report relation-graph completeness; it \
@@ -2683,7 +2664,270 @@ async fn check_reference_edge_coverage() -> HealthCheck {
             &missing_servers,
         );
     };
-    reference_edge_coverage_health(&coverage)
+    reference_edge_coverage_health(coverage)
+}
+
+/// This row's words for a graph status the run could not read, or the response
+/// when it could.
+///
+/// Split from the fetch and from the verdict so every cause has a rendering that
+/// is testable without a daemon, and so the property FIR-2560 must not lose stays
+/// checkable: a shared fetch carries its failure to each consumer rather than
+/// reporting it once, and no unreadable state renders as a healthy graph.
+fn coverage_row_for_unread_graph<'a>(
+    status: &'a GraphStatusForRun,
+    missing_servers: &[String],
+) -> Result<&'a crate::commands::graph::GraphCommandResponse, HealthCheck> {
+    const ID: &str = "reference_edge_coverage";
+    const LABEL: &str = "Reference edge coverage";
+
+    match status {
+        GraphStatusForRun::Answered(response) => Ok(response),
+        GraphStatusForRun::NotInRepository => Err(HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Unsupported,
+            "n/a — not in a Kin repository",
+        )),
+        GraphStatusForRun::NoDaemon => Err(coverage_unreadable(
+            HealthStatus::Unsupported,
+            "no daemon running for this repository, so relation-graph completeness cannot be \
+             read; a daemon starts on first use",
+            "run any `kin` command in the repo to auto-start the daemon",
+            missing_servers,
+        )),
+        GraphStatusForRun::DaemonUrlInvalid { daemon_url, error } => Err(coverage_unreadable(
+            HealthStatus::Stale,
+            format!("daemon reachable ({daemon_url}), but its URL is invalid: {error}"),
+            "check the daemon URL recorded for this repository",
+            missing_servers,
+        )),
+        GraphStatusForRun::Unavailable { daemon_url, error } => Err(coverage_unreadable(
+            HealthStatus::Stale,
+            format!(
+                "daemon reachable ({daemon_url}), but relation-graph completeness is unavailable: \
+                 {error}"
+            ),
+            "run `kin graph status` and resolve the reported daemon error",
+            missing_servers,
+        )),
+    }
+}
+
+/// What a doctor run's single `graph status` fetch produced.
+///
+/// The failure arms carry the cause rather than a rendered row. A shared fetch
+/// that reported its own failure once would leave every other row silent about a
+/// graph it could not read, and a row that goes quiet when the graph is
+/// unreadable is indistinguishable from one reporting a healthy graph. So each
+/// consumer phrases the same cause in the words its own row needs.
+#[derive(Debug)]
+pub(crate) enum GraphStatusForRun {
+    /// The daemon answered.
+    Answered(Box<crate::commands::graph::GraphCommandResponse>),
+    /// This process is not standing in a Kin repository, so nothing was fetched.
+    NotInRepository,
+    /// No daemon is running for this repository, so nothing was fetched.
+    NoDaemon,
+    /// A daemon is running and the URL recorded for it will not parse.
+    DaemonUrlInvalid { daemon_url: String, error: String },
+    /// The daemon was asked and did not answer.
+    Unavailable { daemon_url: String, error: String },
+}
+
+/// A future producing the run's graph status, boxed so the fetch can be
+/// substituted in tests.
+type GraphStatusFuture = Pin<Box<dyn Future<Output = GraphStatusForRun> + Send>>;
+
+/// The `graph status` a doctor run reads, fetched at most once however many rows
+/// consult it.
+///
+/// FIR-2416 measured `kin graph status` at 31.812 s on the rc0545c psf/requests
+/// store against 0.091 s on express. A second fetch therefore does not cost a
+/// little more, it roughly doubles the wall time of a doctor run, and the shape
+/// did not stop at two: every future row answering from graph truth added
+/// another whole fetch. Holding the answer here makes a new consumer free.
+///
+/// Lazy rather than eager so a run whose rows all short-circuit before reading
+/// graph truth still pays nothing, and so the fetch keeps its position in the
+/// run relative to the probes a row takes first.
+pub(crate) struct RunGraphStatus {
+    fetch: Box<dyn Fn() -> GraphStatusFuture + Send + Sync>,
+    once: tokio::sync::OnceCell<GraphStatusForRun>,
+}
+
+impl RunGraphStatus {
+    /// The real fetch, against the daemon serving the current directory.
+    pub(crate) fn for_run() -> Self {
+        Self::with_fetch(|| Box::pin(fetch_graph_status()))
+    }
+
+    fn with_fetch(fetch: impl Fn() -> GraphStatusFuture + Send + Sync + 'static) -> Self {
+        Self {
+            fetch: Box::new(fetch),
+            once: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// The run's graph status, fetching it on the first call and returning that
+    /// same answer to every later one.
+    pub(crate) async fn get(&self) -> &GraphStatusForRun {
+        self.once.get_or_init(|| (self.fetch)()).await
+    }
+}
+
+/// Take the run's one `graph status` round trip.
+///
+/// Every way this can fail to produce a response is a named variant rather than
+/// a message, so a consumer renders the cause in its own row's terms and no
+/// caller has to parse prose to tell "no daemon" from "the daemon refused".
+async fn fetch_graph_status() -> GraphStatusForRun {
+    let cwd = env::current_dir().unwrap_or_default();
+    let Some(layout) = kin_core::KinLayout::discover(&cwd) else {
+        return GraphStatusForRun::NotInRepository;
+    };
+    let Some(daemon_url) = crate::daemon_client::resolve_daemon_url_if_running_async(&layout).await
+    else {
+        return GraphStatusForRun::NoDaemon;
+    };
+    let client = match crate::daemon_client::DaemonClient::from_base_url_for_layout(
+        daemon_url.clone(),
+        &layout,
+    ) {
+        Ok(client) => client,
+        Err(error) => {
+            return GraphStatusForRun::DaemonUrlInvalid {
+                daemon_url,
+                error: error.to_string(),
+            };
+        }
+    };
+    match client
+        .graph_command(&crate::commands::graph::GraphCommandRequest::Status)
+        .await
+    {
+        Ok(response) => GraphStatusForRun::Answered(Box::new(response)),
+        Err(error) => GraphStatusForRun::Unavailable {
+            daemon_url,
+            error: error.to_string(),
+        },
+    }
+}
+
+/// Report whether this store has lost relation coverage it once held.
+///
+/// The relation-kind histogram `kin graph status` prints is a census, and until
+/// this row existed nothing compared it to anything. On the rc0545c stranger
+/// run a store went from 1985 entity-to-entity relations to 1807 and lost the
+/// `UsesType` kind entirely, from 94 edges to none, and the health line
+/// underneath the numbers that proved it read `✓ No issues detected.` Every
+/// counter needed to notice was on the screen. Nothing on the screen noticed.
+///
+/// The comparison is read structurally off the graph command rather than parsed
+/// out of its rendered lines, exactly as the reference-edge coverage above it
+/// is, so a wording change on one surface cannot silently break the other.
+async fn check_relation_census(graph_status: &RunGraphStatus) -> HealthCheck {
+    let response = match relation_census_row_for_unread_graph(graph_status.get().await) {
+        Ok(response) => response,
+        Err(row) => return row,
+    };
+    let Some(comparison) = response.relation_census.as_ref() else {
+        return HealthCheck::new(
+            "relation_census",
+            "Relation census",
+            HealthStatus::Stale,
+            "the daemon serving this repository does not report a relation census; it predates \
+             the measurement",
+        )
+        .with_manual_fix("restart the daemon with `kin daemon restart` to pick up this build");
+    };
+    relation_census_health(comparison)
+}
+
+/// This row's words for a graph status the run could not read, or the response
+/// when it could.
+fn relation_census_row_for_unread_graph(
+    status: &GraphStatusForRun,
+) -> Result<&crate::commands::graph::GraphCommandResponse, HealthCheck> {
+    const ID: &str = "relation_census";
+    const LABEL: &str = "Relation census";
+
+    match status {
+        GraphStatusForRun::Answered(response) => Ok(response),
+        GraphStatusForRun::NotInRepository => Err(HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Unsupported,
+            "n/a — not in a Kin repository",
+        )),
+        GraphStatusForRun::NoDaemon => Err(HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Unsupported,
+            "n/a — no daemon running for this repository, so the relation census cannot be \
+             read; a daemon starts on first use",
+        )
+        .with_manual_fix("run any `kin` command in the repo to auto-start the daemon")),
+        GraphStatusForRun::DaemonUrlInvalid { daemon_url, error } => Err(HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Stale,
+            format!("daemon reachable ({daemon_url}), but its URL is invalid: {error}"),
+        )
+        .with_manual_fix("check the daemon URL recorded for this repository")),
+        GraphStatusForRun::Unavailable { daemon_url, error } => Err(HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Stale,
+            format!(
+                "daemon reachable ({daemon_url}), but the relation census is unavailable: \
+                 {error}"
+            ),
+        )
+        .with_manual_fix("run `kin graph status` and resolve the reported daemon error")),
+    }
+}
+
+/// Turn the comparison into a verdict, split from its fetch so the rule is
+/// testable without a daemon.
+///
+/// A lost kind reads `Stale` rather than `Missing`: the store held those edges
+/// and no longer does, which is drift rather than a broken install, and a row
+/// that blocked readiness on it would refuse every repository whose enrichment
+/// is legitimately narrower than its last pass. It still counts as attention,
+/// so the doctor summary can no longer report a whole-kind loss as a pass.
+pub(crate) fn relation_census_health(
+    comparison: &kin_core::relation_census::RelationCensusComparison,
+) -> HealthCheck {
+    const ID: &str = "relation_census";
+    const LABEL: &str = "Relation census";
+
+    if let Some(unavailable) = &comparison.unavailable {
+        // Pending, not healthy. A store with no baseline is not a store that
+        // kept its coverage; it is one nothing can answer the question about
+        // yet, and those must not render the same.
+        return HealthCheck::new(ID, LABEL, HealthStatus::Pending, unavailable.clone())
+            .with_manual_fix(
+                "run `kin commit`, or let the enrichment sweep finish, to record the first census",
+            );
+    }
+    let losses = comparison.loss_lines();
+    if losses.is_empty() {
+        return HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Healthy,
+            format!(
+                "no relation kind has lost ground since the last recorded census ({} kind(s) \
+                 compared)",
+                comparison.changes.len()
+            ),
+        );
+    }
+    HealthCheck::new(ID, LABEL, HealthStatus::Stale, losses.join("; ")).with_manual_fix(
+        "compare `kin graph status` against the named cause, then re-run enrichment with it \
+         cleared",
+    )
 }
 
 /// The row for every state where the graph itself could not be read.
@@ -2879,6 +3123,31 @@ fn semantic_query_health_from_runtime(
     // repository whose finished index was thrown away at open. Only one of them
     // means work already paid for is being paid for again, so when the daemon
     // knows which it is, say so instead of leaving it to be inferred.
+    // Checked before the discard arm's `else`, because a salvage is the case
+    // neither arm below can describe. It attaches an index, so no discard is
+    // recorded and the first arm falls through; and it leaves a real shortfall
+    // against a fill that finished, so the "backlog is filling" arm would call
+    // a coverage loss healthy. Stale is the honest verdict: the surface is
+    // serving off less than it was.
+    if let Some(salvage) = runtime.vector_index_salvage {
+        return HealthCheck::new(
+            "semantic_query_readiness",
+            "Semantic query readiness",
+            HealthStatus::Stale,
+            format!(
+                "{detail}; the persisted vector index no longer matched this repository's graph \
+                 authority when the daemon opened, so it was salvaged per key: {} vectors were \
+                 kept and {} were retired. The daemon re-embeds the retired keys in the \
+                 background",
+                salvage.kept, salvage.dropped
+            ),
+        )
+        .with_manual_fix(
+            "allow daemon embedding to finish, or run `kin embed` to force it now; only the \
+             retired keys are re-derived",
+        );
+    }
+
     let Some(reason) = &runtime.vector_index_discarded else {
         // Nothing was discarded, so the remaining question is whether this
         // store has ever finished a fill. Before it has, partial coverage is a
@@ -3272,6 +3541,51 @@ fn check_commit_memory_headroom() -> HealthCheck {
     };
     let footprint = crate::commands::store_footprint::StoreFootprint::measure(&layout);
     commit_memory_headroom_check_for(&footprint, &crate::capability::memory_evidence())
+}
+
+/// Whether a daemon serving this store was killed, and what killed it.
+///
+/// Every other row on this page describes a daemon that is running or one that
+/// is absent. A daemon that was killed leaves both readings intact: the store
+/// is fine, a replacement is serving, and the kills that got it there appear in
+/// no count anywhere on this page. The store's own record is the only thing
+/// that remembers them, and this is the row that reads it.
+///
+/// Advisory by construction: `Degraded` does not block readiness, because a
+/// machine too small for this repository is a fact about the machine and not a
+/// broken install.
+fn check_daemon_kill_record() -> HealthCheck {
+    const ID: &str = "daemon_kill_record";
+    const LABEL: &str = "Daemon kills";
+    let cwd = env::current_dir().unwrap_or_default();
+    let Some(layout) = kin_core::KinLayout::discover(&cwd) else {
+        return HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Unsupported,
+            "not in a Kin repository, so there is no store whose daemons could have been killed",
+        );
+    };
+    daemon_kill_record_check_for(kin_daemon_spawn::read_daemon_kill_record(layout.root()).as_ref())
+}
+
+/// Core of [`check_daemon_kill_record`] with the record as its input, so both
+/// branches are testable on any host and without a killed daemon.
+fn daemon_kill_record_check_for(
+    record: Option<&kin_daemon_spawn::DaemonKillRecord>,
+) -> HealthCheck {
+    const ID: &str = "daemon_kill_record";
+    const LABEL: &str = "Daemon kills";
+    let Some(record) = record else {
+        return HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Healthy,
+            "no daemon serving this store has been killed",
+        );
+    };
+    HealthCheck::new(ID, LABEL, HealthStatus::Degraded, record.cause_sentence())
+        .with_manual_fix(record.remediation())
 }
 
 /// Core of [`check_commit_memory_headroom`] with both readings as inputs, so
@@ -3814,6 +4128,96 @@ mod tests {
         assert!(check.manual_fix.is_some());
     }
 
+    fn census_pair(
+        previous: &[(&str, u64)],
+        current: &[(&str, u64)],
+        causes: Vec<String>,
+    ) -> kin_core::relation_census::RelationCensusComparison {
+        let recorded = kin_core::relation_census::RelationCensus::new(
+            chrono::Utc::now(),
+            kin_core::relation_census::CensusSource::Sweep,
+            previous
+                .iter()
+                .map(|(kind, count)| ((*kind).to_string(), *count))
+                .collect(),
+            Vec::new(),
+        );
+        kin_core::relation_census::RelationCensusComparison::build(
+            &kin_core::relation_census::RelationCensusRead::Recorded(recorded),
+            &current
+                .iter()
+                .map(|(kind, count)| ((*kind).to_string(), *count))
+                .collect(),
+            causes,
+        )
+    }
+
+    /// The rc0545c shape, at the doctor row. A store that lost a whole relation
+    /// kind must not be tallied as a pass.
+    #[test]
+    fn doctor_reports_a_relation_kind_that_vanished_since_the_recorded_census() {
+        let check = relation_census_health(&census_pair(
+            &[("Calls", 951), ("UsesType", 94)],
+            &[("Calls", 940)],
+            vec!["KIN_DAEMON_DISABLE_LSP set to non-default value \"1\"".to_string()],
+        ));
+        assert!(
+            matches!(check.status, HealthStatus::Stale),
+            "a lost kind needs attention: {:?}",
+            check.status
+        );
+        assert!(
+            check.detail.contains("UsesType went 94 to 0"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("KIN_DAEMON_DISABLE_LSP"),
+            "the row carries the cause: {}",
+            check.detail
+        );
+    }
+
+    /// The counterpart, so the row above cannot be an unconditional warning.
+    #[test]
+    fn doctor_stays_green_when_no_relation_kind_lost_ground() {
+        let check = relation_census_health(&census_pair(
+            &[("Calls", 940), ("UsesType", 94)],
+            &[("Calls", 951), ("UsesType", 94)],
+            Vec::new(),
+        ));
+        assert!(
+            matches!(check.status, HealthStatus::Healthy),
+            "growth is not a loss: {:?} {}",
+            check.status,
+            check.detail
+        );
+    }
+
+    /// A store with no baseline cannot answer the question, and must not read
+    /// the same as one that kept its coverage.
+    #[test]
+    fn doctor_separates_a_store_with_no_recorded_census_from_a_healthy_one() {
+        let check =
+            relation_census_health(&kin_core::relation_census::RelationCensusComparison::build(
+                &kin_core::relation_census::RelationCensusRead::Absent,
+                &std::collections::BTreeMap::from([("Calls".to_string(), 940)]),
+                Vec::new(),
+            ));
+        assert!(
+            matches!(check.status, HealthStatus::Pending),
+            "an unrecorded census is pending, never healthy: {:?}",
+            check.status
+        );
+        assert!(
+            check
+                .detail
+                .contains("no previous relation census is recorded"),
+            "{}",
+            check.detail
+        );
+    }
+
     /// The counterpart, so the row above cannot be an unconditional warning:
     /// with every wired language's server installed there is no gap to report.
     #[test]
@@ -3903,6 +4307,134 @@ mod tests {
         let report = assemble_health_report("test".to_string(), vec![check]);
         assert!(report.healthy);
         assert_eq!(report.summary().attention, 1);
+    }
+
+    /// A healthy response for the fetch tests to hand back.
+    fn answered_graph_status() -> GraphStatusForRun {
+        GraphStatusForRun::Answered(Box::new(crate::commands::graph::GraphCommandResponse {
+            lines: vec!["graph status".to_string()],
+            error: None,
+            source: None,
+            reference_edge_coverage: Some(
+                kin_core::reference_coverage::ReferenceEdgeCoverage::default(),
+            ),
+            relation_census: Some(census_pair(&[], &[], Vec::new())),
+        }))
+    }
+
+    /// FIR-2560. One `graph status` per doctor run, however many rows read it.
+    ///
+    /// `kin graph status` is the slowest surface Kin has on a real store, and it
+    /// was fetched per row: FIR-2416 measured 31.812 s on the rc0545c
+    /// psf/requests store against 0.091 s on express, so a second fetch does not
+    /// cost a little more, it roughly doubles the wall time of a doctor run on
+    /// exactly the stores where an operator is most likely to be running doctor.
+    /// Three consumers here rather than the two the tree holds today, because the
+    /// cost this pins is the one a fourth row would add.
+    #[tokio::test]
+    async fn one_doctor_run_fetches_graph_status_once_however_many_rows_read_it() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&fetches);
+        let status = RunGraphStatus::with_fetch(move || {
+            let counted = Arc::clone(&counted);
+            Box::pin(async move {
+                counted.fetch_add(1, Ordering::SeqCst);
+                answered_graph_status()
+            })
+        });
+
+        assert_eq!(
+            fetches.load(Ordering::SeqCst),
+            0,
+            "the fetch is lazy, so a run whose rows never read graph truth pays nothing"
+        );
+
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            seen.push(format!("{:?}", status.get().await));
+        }
+
+        assert_eq!(
+            fetches.load(Ordering::SeqCst),
+            1,
+            "three rows reading graph status must cost one daemon round trip, not three"
+        );
+        assert_eq!(
+            seen.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            1,
+            "and every row must see the same answer: {seen:?}"
+        );
+    }
+
+    /// The property the shared fetch must not cost. A graph the run could not
+    /// read reaches the row as its own unreadable state, rather than being
+    /// reported once by the fetch and leaving the row silent.
+    ///
+    /// A row that goes quiet when the graph is unreadable is indistinguishable
+    /// from one reporting a healthy graph, which is the failure the row exists to
+    /// end. So each cause is checked for a status that is not healthy and for
+    /// words naming what happened.
+    #[test]
+    fn an_unreadable_graph_reaches_the_row_rather_than_being_reported_once() {
+        let no_servers: Vec<String> = Vec::new();
+
+        let unreadable = [
+            (
+                GraphStatusForRun::NotInRepository,
+                "not in a Kin repository",
+            ),
+            (
+                GraphStatusForRun::NoDaemon,
+                "no daemon running for this repository",
+            ),
+            (
+                GraphStatusForRun::DaemonUrlInvalid {
+                    daemon_url: "http://127.0.0.1:0".to_string(),
+                    error: "invalid port".to_string(),
+                },
+                "its URL is invalid",
+            ),
+            (
+                GraphStatusForRun::Unavailable {
+                    daemon_url: "http://127.0.0.1:4242".to_string(),
+                    error: "connection refused".to_string(),
+                },
+                "unavailable",
+            ),
+        ];
+        for (status, expected) in unreadable {
+            let coverage_row = coverage_row_for_unread_graph(&status, &no_servers)
+                .expect_err("an unread graph must produce a row rather than a response");
+            let census_row = relation_census_row_for_unread_graph(&status)
+                .expect_err("an unread graph must reach the census row too");
+            for row in [coverage_row, census_row] {
+                assert!(
+                    !matches!(row.status, HealthStatus::Healthy),
+                    "an unread graph must never render as healthy: {status:?} gave {:?}",
+                    row.status
+                );
+                assert!(
+                    row.detail.contains(expected),
+                    "the row must name what happened: {status:?} gave {}",
+                    row.detail
+                );
+            }
+        }
+
+        // And the readable case still yields the response, or the four arms
+        // above would be the only outcome and the row could never report a
+        // measurement.
+        assert!(
+            coverage_row_for_unread_graph(&answered_graph_status(), &no_servers).is_ok(),
+            "a graph the run did read must hand its response to the coverage row"
+        );
+        assert!(
+            relation_census_row_for_unread_graph(&answered_graph_status()).is_ok(),
+            "a graph the run did read must hand its response to the census row"
+        );
     }
 
     /// FIR-2370. Two rows about one graph teach an operator to skip both, so the
@@ -5813,6 +6345,57 @@ mod tests {
         );
     }
 
+    /// zsh's PATH line lives in `.zshenv`, which is the file a non-interactive
+    /// shell reads, and setup no longer writes it to `.zshrc`. Doctor has to
+    /// read that file or it reports a correctly installed host as missing its
+    /// PATH, which is the shape of check that can never pass.
+    #[test]
+    #[serial]
+    fn shell_path_reads_the_file_a_non_interactive_zsh_actually_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let kin_home = tmp.path().join("kin-home");
+        let hook_dir = kin_home.join("shell");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&hook_dir).unwrap();
+        std::fs::create_dir_all(kin_home.join("bin")).unwrap();
+
+        let hook = hook_dir.join(hook_filename("zsh"));
+        std::fs::write(&hook, "# kin-vfs test hook\n").unwrap();
+
+        // Exactly what setup writes now: the hook in the interactive file, the
+        // PATH line in the file every zsh reads, and neither in the other.
+        std::fs::write(
+            home.join(".zshrc"),
+            format!("source \"{}\"\n", hook.display()),
+        )
+        .unwrap();
+        std::fs::write(
+            home.join(".zshenv"),
+            format!("export PATH=\"{}:$PATH\"\n", kin_home.join("bin").display()),
+        )
+        .unwrap();
+
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
+        let _kin_dir = EnvVarGuard::unset("KIN_DIR");
+        let _shell = EnvVarGuard::set("SHELL", "/bin/zsh");
+        let _ps_module_path = EnvVarGuard::unset("PSModulePath");
+        let _ps_version_table = EnvVarGuard::unset("PSVersionTable");
+        let _profile = EnvVarGuard::unset("PROFILE");
+        let _path = EnvVarGuard::set("PATH", "/usr/bin");
+
+        let check = check_shell_path();
+        assert_eq!(check.id, "shell_path");
+        assert!(
+            matches!(check.status, HealthStatus::Healthy),
+            "doctor read only the interactive rc, so an install that put the PATH \
+             line where a script can see it reads as broken; got {:?}: {}",
+            check.status,
+            check.detail
+        );
+    }
+
     /// A host that merely ships PowerShell exports `PSModulePath` into every
     /// process, including the bash one the operator is actually using. The
     /// installed bash integration is the one to judge; reading the PowerShell
@@ -6137,6 +6720,67 @@ mod tests {
         assert!(semantic.detail.contains("41/41 embeddings indexed"));
         assert!(!semantic.detail.contains("graph.kvec"));
         assert!(semantic.manual_fix.is_none());
+    }
+
+    /// A salvage is lost ground, and the arm that would otherwise catch it
+    /// calls the identical counters healthy.
+    ///
+    /// A per-key salvage attaches an index, so no discard is recorded, and it
+    /// happens on stores that HAVE finished a fill, so `ever_complete` holds.
+    /// Both of those steer the same counters to the Healthy top-up arm, which
+    /// is the correct verdict for a working copy admitting new files and the
+    /// wrong one for a store that just had coverage retired. The counts kin-db
+    /// now returns are what let this path tell them apart (FIR-2562).
+    #[cfg(feature = "vector")]
+    #[test]
+    fn semantic_query_readiness_calls_a_retired_coverage_stale_not_filling() {
+        // Identical to the top-up fixture below in every field that the
+        // healthy arm reads, so the verdict can only turn on the salvage.
+        let topping_up = crate::commands::resources::EmbedRuntimeState {
+            embeddings_indexed: 40,
+            embeddings_total: 41,
+            embeddings_pending: 1,
+            embedding_coverage_ever_complete: true,
+            ..Default::default()
+        };
+        let healthy = semantic_query_health_from_runtime("http://daemon", &topping_up);
+        assert!(
+            matches!(healthy.status, HealthStatus::Healthy),
+            "the control: these counters alone are a healthy top-up: {:?}",
+            healthy.status
+        );
+
+        let salvaged = crate::commands::resources::EmbedRuntimeState {
+            vector_index_salvage: Some(crate::commands::resources::VectorSalvage {
+                kept: 1770,
+                dropped: 342,
+            }),
+            ..topping_up.clone()
+        };
+        let stale = semantic_query_health_from_runtime("http://daemon", &salvaged);
+        assert!(
+            matches!(stale.status, HealthStatus::Stale),
+            "coverage retired at open is not a backlog filling: {:?}, {}",
+            stale.status,
+            stale.detail
+        );
+        assert!(
+            stale.detail.contains("1770") && stale.detail.contains("342"),
+            "both counts have to reach the reader: {}",
+            stale.detail
+        );
+        assert!(
+            !stale
+                .detail
+                .contains("coverage completed earlier and this backlog is filling"),
+            "the filling sentence must not survive beside a retirement: {}",
+            stale.detail
+        );
+        assert!(stale.manual_fix.is_some());
+        assert!(
+            !assemble_health_report("test".to_string(), vec![stale]).healthy,
+            "a retired coverage has to fail the aggregate, as a discard does"
+        );
     }
 
     #[cfg(feature = "vector")]
@@ -7620,6 +8264,51 @@ mod tests {
                 .contains("fetches the model from huggingface.co"),
             "the fetch is still named without a size: {}",
             check.detail
+        );
+    }
+
+    /// The row exists because every other row on the page reads healthy after a
+    /// kill: the store is fine and a replacement is serving. The record is the
+    /// only thing that remembers, and a store that has lost none must not grow
+    /// a row saying so ambiguously.
+    #[test]
+    fn the_daemon_kill_row_reports_a_record_and_stays_quiet_without_one() {
+        let quiet = daemon_kill_record_check_for(None);
+        assert!(matches!(quiet.status, HealthStatus::Healthy));
+        assert!(quiet.manual_fix.is_none());
+
+        let record = kin_daemon_spawn::DaemonKillRecord {
+            kills: 4,
+            memory_kills: 4,
+            first_unix: 4_320,
+            last_unix: 4_800,
+            last_pid: Some(41),
+            last_cause: kin_daemon_spawn::DaemonKillCause::MemoryLimit {
+                kernel_oom_kills: 1,
+            },
+            limit_bytes: Some(12 * 1024 * 1024 * 1024),
+            last_rss_bytes: None,
+        };
+        let reported = daemon_kill_record_check_for(Some(&record));
+        assert!(matches!(reported.status, HealthStatus::Degraded));
+        assert!(
+            reported
+                .detail
+                .contains("killed by the memory limit 4 time(s) since 01:12Z"),
+            "{}",
+            reported.detail
+        );
+        assert!(
+            reported
+                .manual_fix
+                .as_deref()
+                .is_some_and(|fix| fix.contains("KIN_DAEMON_DISABLE_LSP=1 kin graph status")),
+            "the fix line must name something the reader can do: {:?}",
+            reported.manual_fix
+        );
+        assert!(
+            !blocks_readiness(&reported),
+            "a machine too small for this repository is not a broken install"
         );
     }
 }

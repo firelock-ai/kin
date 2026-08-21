@@ -86,6 +86,9 @@ fn seed_repository(repo: &Path) {
 fn kin_command(runtime: &common::IsolatedDaemonRuntime) -> Command<'_> {
     let mut command = runtime.kin_command();
     command
+        // This test uses an info-level worker record as the positive control,
+        // so it must not inherit a developer or lane filter that hides info.
+        .env("RUST_LOG", "info")
         .env("KIN_DAEMON_DISABLE_LSP", "1")
         .env("KIN_DAEMON_BIN", runtime.daemon_bin())
         .env("KIN_DAEMON_READY_TIMEOUT_SECS", "60")

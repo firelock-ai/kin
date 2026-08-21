@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use kin_index::{
     FileClassification, FileClassifier, FileEvent, FileWatcher, IndexPipeline, IndexedAny,
@@ -1812,11 +1812,161 @@ async fn park_reconcile_loop(
 /// 4. Projects overlay mutations back to files (overlay -> file)
 ///
 /// The loop runs on a tokio task and shares state through `DaemonState`.
+/// The reconcile loop's one-shot promise that its file watcher exists.
+///
+/// Fired on arming, and fired again on drop if the loop never got that far.
+/// Drop-firing is the whole safety argument for making endpoint publication
+/// wait on it. A loop can end before it ever builds a watcher — filesystem
+/// reconcile switched off, a bare checkout, a watcher the host refused — and a
+/// daemon that waited on a signal none of those paths sends would never publish
+/// its endpoint at all, which is a worse failure than the unobserved window
+/// this exists to close.
+#[derive(Debug)]
+pub struct WatchArmed(Option<tokio::sync::oneshot::Sender<()>>);
+
+impl WatchArmed {
+    pub fn new(signal: tokio::sync::oneshot::Sender<()>) -> Self {
+        Self(Some(signal))
+    }
+
+    /// Report the watch, once. Later calls and the drop below do nothing.
+    fn arm(&mut self) {
+        if let Some(signal) = self.0.take() {
+            let _ = signal.send(());
+        }
+    }
+}
+
+impl Drop for WatchArmed {
+    fn drop(&mut self) {
+        self.arm();
+    }
+}
+
+/// When a startup catch-up should begin, or `None` when no window can be named.
+///
+/// The window opens at the last complete admission this store recorded, because
+/// that is the last moment anything is known to have observed the working copy.
+/// A file watcher only ever reports edits it was alive for, so everything the
+/// host did between one daemon's last admission and the next daemon's watch was
+/// seen by nobody, and nothing replays it. That stretch is the whole of the
+/// "graph is one commit behind the work" complaint, and it is not only a
+/// startup artifact: an idle timeout ends a daemon mid-session and the next
+/// command starts a fresh one.
+///
+/// A store with no marker gets no catch-up. Absent means either never admitted
+/// or admitted by a build older than the marker, and neither supplies a window;
+/// with no lower bound the pass would propose the entire working copy, which is
+/// exactly the sweep startup must not perform. An unreadable marker is the same
+/// answer said louder, so it is logged rather than silently treated as absent.
+fn startup_catch_up_window(state: &DaemonState) -> Option<SystemTime> {
+    match kin_core::last_admission::read(&state.layout) {
+        kin_core::last_admission::LastAdmissionRead::Recorded(recorded) => {
+            let since = unix_instant(recorded.at);
+            info!(
+                since = %recorded.at.to_rfc3339(),
+                "planning a startup catch-up over host paths modified since the last complete \
+                 admission"
+            );
+            Some(since)
+        }
+        kin_core::last_admission::LastAdmissionRead::Absent => {
+            debug!(
+                "no last-admission marker, so no catch-up window can be named; working-copy \
+                 divergence stays projection drift until an explicit seam admits it"
+            );
+            None
+        }
+        kin_core::last_admission::LastAdmissionRead::Unreadable(reason) => {
+            warn!(
+                reason = %reason,
+                "the last-admission marker will not parse, so no catch-up window can be named; \
+                 `kin admit` takes whatever the host changed while nothing was watching"
+            );
+            None
+        }
+    }
+}
+
+/// A UTC instant as a [`SystemTime`], for comparison against host modification
+/// times.
+///
+/// A marker stamped before the epoch clamps to the epoch rather than wrapping.
+/// No real store carries one, and a wrap would silently move the window to the
+/// far future, which is the direction that loses every file.
+fn unix_instant(at: chrono::DateTime<chrono::Utc>) -> SystemTime {
+    let seconds = at.timestamp();
+    if seconds < 0 {
+        return SystemTime::UNIX_EPOCH;
+    }
+    SystemTime::UNIX_EPOCH + Duration::new(seconds as u64, at.timestamp_subsec_nanos())
+}
+
+/// Host events for every path the working copy changed at or after `since`.
+///
+/// Stat-only: the walk that produces this opens nothing and hashes nothing, so
+/// a store whose host did not move since its last admission pays one traversal
+/// and returns an empty list. The events it does return go through the ordinary
+/// tick, so a catch-up path is admitted by the same bounded observation, the
+/// same policy filter and the same compare-and-swap as one the watcher saw.
+/// This plans no transition of its own and publishes nothing.
+///
+/// The bound is inclusive because filesystem modification times are coarse. A
+/// file written in the same second the marker was stamped is re-observed, and
+/// re-observing an unchanged path costs one admission that plans nothing.
+fn plan_catch_up_events(state: &DaemonState, since: SystemTime) -> Result<Vec<FileEvent>> {
+    let working_dir = state.layout.working_dir();
+    let (_, policy) = current_authority_admission(state)?;
+    let previous = state.graph.resolved_tree();
+    let tracked_paths = previous
+        .artifacts_by_path()
+        .map(|artifact| artifact.path.clone())
+        .collect::<Vec<_>>();
+    let graph_only_paths = crate::graph_only_members::members_of(&previous)?;
+    let ignore =
+        kin_index::RepositoryIgnore::load(working_dir).map_err(kin_index::IndexError::from)?;
+    let modified = kin_index::scan_repository_modified_since(
+        working_dir,
+        &ignore,
+        policy.as_ref(),
+        tracked_paths.iter(),
+        graph_only_paths.iter(),
+        since,
+    )
+    .map_err(kin_index::IndexError::from)?;
+    Ok(modified
+        .iter()
+        .filter_map(|path| kin_index::host_path_from_repo_path(working_dir, path).ok())
+        .map(FileEvent::Changed)
+        .collect())
+}
+
 pub async fn run_loop(
     state: Arc<DaemonState>,
     config: LoopConfig,
     cancel: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
+    run_loop_armed(state, config, cancel, None).await
+}
+
+/// Run the loop and report the moment its file watcher exists.
+///
+/// The daemon publishes `.kin/daemon.port` only after this fires, so a client
+/// that finds the endpoint is finding a daemon that is already observing the
+/// working copy. Before this signal existed the endpoint was published first
+/// and the loop was spawned afterwards, so a write landing in between raised no
+/// event and nothing ever replayed it: the graph simply never learned about
+/// that file (FIR-2466).
+pub async fn run_loop_armed(
+    state: Arc<DaemonState>,
+    config: LoopConfig,
+    cancel: tokio::sync::watch::Receiver<bool>,
+    armed: Option<WatchArmed>,
+) -> Result<()> {
+    // Held for the whole body so every early return below still releases the
+    // daemon, through `WatchArmed`'s drop rather than through a call each of
+    // those paths would have to remember.
+    let mut armed = armed;
     if state.filesystem_reconcile_disabled() {
         info!(
             env = DISABLE_FILESYSTEM_RECONCILE_ENV,
@@ -1842,6 +1992,16 @@ pub async fn run_loop(
     }
 
     let watcher = FileWatcher::new(working_dir).map_err(DaemonError::from)?;
+    // Read while the watcher is already reporting and before the endpoint can
+    // be published, so the catch-up window and the watch meet rather than leave
+    // a seam between them. Planning the pass itself is deliberately left to the
+    // first round: the window is fixed here, the walk is not on the path to
+    // publication, and a client finding the port is never waiting on a
+    // traversal.
+    let mut catch_up_owed = startup_catch_up_window(&state);
+    if let Some(armed) = armed.as_mut() {
+        armed.arm();
+    }
     let enrichment_pipeline = IndexPipeline::new();
     // The watcher's running total of host events it could not place inside this
     // repository, as this loop last disclosed it. Held so a standing count is
@@ -1854,16 +2014,21 @@ pub async fn run_loop(
         "reconciliation loop started"
     );
 
-    // Startup deliberately admits nothing. Repository authority is already
-    // complete when the daemon opens it, and the working copy is a derived
-    // view of that authority. Sweeping the working copy here would publish
-    // whatever bytes happen to sit on disk into the repository-v6 workspace
-    // before any command runs, so a command that spawned this daemon would
-    // observe ambiently ingested content as graph-owned workspace state.
-    // Working-copy content crosses the compare-and-swap only through live
-    // watcher-observed edits below and through explicit admission seams such
-    // as `/commands/commit`. Divergence introduced while no daemon was
-    // running stays projection drift until one of those seams admits it.
+    // Startup sweeps nothing. Repository authority is already complete when the
+    // daemon opens it, and the working copy is a derived view of that
+    // authority. Admitting whatever bytes happen to sit on disk would publish
+    // them into the repository-v6 workspace before any command runs, so a
+    // command that spawned this daemon would observe ambiently ingested content
+    // as graph-owned workspace state.
+    //
+    // The one exception is bounded by a clock rather than by taste. A file
+    // watcher reports only the edits it was alive for, so the stretch between
+    // one daemon's last complete admission and the next daemon's watch was
+    // observed by nobody and nothing replays it. `catch_up_owed` above names
+    // that stretch, and the first round below re-observes exactly the paths the
+    // host modified inside it. Everything older is untouched: it predates the
+    // last admission, which already covered it, and divergence with no window
+    // to place it in stays projection drift until an explicit seam admits it.
 
     let interval = Duration::from_millis(config.poll_interval_ms);
     let mut cancel = cancel;
@@ -1955,6 +2120,36 @@ pub async fn run_loop(
         }
 
         sweep_expired_intents(&state).await;
+
+        // The catch-up, owed once and taken on the first round that gets this
+        // far. Enqueued as ordinary host events rather than admitted here, so
+        // every one of them crosses authority through the same bounded
+        // observation, the same policy filter and the same compare-and-swap a
+        // watcher-observed edit does. A pass that fails is logged and dropped:
+        // it is a repair, and retrying it forever would spend a traversal per
+        // round on a store that already has an explicit seam for this.
+        if let Some(since) = catch_up_owed.take() {
+            match plan_catch_up_events(&state, since) {
+                Ok(events) if events.is_empty() => {
+                    debug!("no host path changed since the last complete admission");
+                }
+                Ok(events) => {
+                    info!(
+                        count = events.len(),
+                        "admitting host paths modified since the last complete admission"
+                    );
+                    enqueue_file_events(&mut pending_events, events);
+                }
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "could not plan the startup catch-up, so host content written while \
+                         nothing was watching stays unadmitted until `kin admit` or a commit \
+                         takes it"
+                    );
+                }
+            }
+        }
 
         // Collect retries first and real watcher notifications second. Dedup once per tick,
         // only when something new arrived; a real remove/recreate therefore supersedes a
@@ -3533,23 +3728,21 @@ mod tests {
         .expect("it has to move authority, or the deferral below would still publish cleanly");
     }
 
-    /// The double failure, and the record that is the only account a status
-    /// surface gets of it.
+    /// The double failure, and the reset that ends it.
     ///
     /// A commit that fails publishes its deferred tree standalone on the way
-    /// out. When that publication fails too, the derived graph is left holding a
-    /// tree repository authority never accepted, every later admission is
-    /// refused against the mismatched tree, and only a restart clears it. It was
-    /// logged once at error level and named on no surface at all, so an operator
-    /// watching admissions refuse had nothing telling them the daemon itself was
-    /// what needed restarting.
+    /// out. When that publication fails too there is nothing left to publish, so
+    /// the derived graph is returned to the tree repository authority holds and
+    /// the next admission plans out of a tree the two agree on. Before that
+    /// reset the graph stayed ahead, every later admission was refused against
+    /// the mismatched tree, and only restarting the daemon cleared it.
     #[test]
     // Commit phases are emitted at debug level when they are fast, and the
     // level a `tracing` event is filtered by is a process-global hint. A test
     // that captures those events therefore cannot run beside one that emits
     // them, so every test on either side of that shares this group.
     #[serial_test::serial(commit_phase_capture)]
-    fn a_failed_restoring_publication_wedges_the_daemon_and_says_so() {
+    fn a_failed_restoring_publication_resets_the_graph_to_the_authority_tree() {
         let repo = tempfile::tempdir().unwrap();
         let state = open_test_state(&repo);
         std::fs::write(repo.path().join("base.rs"), b"pub fn base() -> u32 { 1 }\n").unwrap();
@@ -3585,45 +3778,191 @@ mod tests {
         publish_authority_tree_out_of_band(&state, kin_model::ResolvedTree::default());
         publish_deferred_tree_after_failure(&state, &deferred);
 
+        assert_eq!(
+            state.graph.resolved_tree(),
+            authority_workspace_tree(&state).unwrap(),
+            "a publication with nothing left to try must return the derived graph to the tree \
+             repository authority holds"
+        );
         let report = state.background_work.reconcile_report(Instant::now());
-        let wedge = report
-            .deferred_tree_wedge
-            .as_ref()
-            .expect("the double failure must reach the surfaces that answer for this daemon");
         assert!(
-            wedge.error.contains("repository authority moved"),
-            "the publication's own error is what names the cause: {wedge:?}"
+            report.deferred_tree_wedge.is_none(),
+            "a daemon whose graph agrees with authority again needs no restart: {:?}",
+            report.deferred_tree_wedge
         );
-        assert!(
-            wedge.at.is_some(),
-            "a wall-clock stamp is what lines this up against the daemon log"
-        );
-        let reasons = report.degraded_reasons();
-        assert!(
-            reasons.iter().any(|reason| {
-                reason.contains("restart required, commit deferral wedged")
-                    && reason.contains(&wedge.error)
-            }),
-            "a wedged daemon must name the restart and carry the error: {reasons:?}"
-        );
-        assert!(report.degraded(), "a wedged daemon is not a healthy one");
+        assert!(!report.degraded(), "{:?}", report.degraded_reasons());
 
-        // The state that reason describes is real rather than cosmetic. The
-        // graph holds a tree authority never accepted, so the next admission
-        // with anything to publish is refused against the mismatched tree, which
-        // is what an operator watches happen with no explanation attached.
+        // The reset is real rather than cosmetic. The next admission plans out
+        // of a tree authority accepts, so it publishes instead of being refused
+        // against a mismatch nobody could clear without restarting.
         std::fs::write(
             repo.path().join("later.rs"),
             b"pub fn later() -> u32 { 3 }\n",
         )
         .unwrap();
-        let refusal = exact_tree_admission(&state, None, TreePublication::Standalone)
-            .expect_err("a wedged daemon must refuse the next admission rather than publish it");
+        let admission = exact_tree_admission(&state, None, TreePublication::Standalone)
+            .expect("a reset daemon admits the next transition rather than refusing it");
         assert!(
-            refusal
-                .to_string()
-                .contains("not this workspace's authority tree"),
-            "the refusal must name the mismatch the wedge describes: {refusal}"
+            !admission.deltas.is_empty(),
+            "the working copy moved, so the admission must plan a transition"
+        );
+        assert_eq!(
+            state.graph.resolved_tree(),
+            authority_workspace_tree(&state).unwrap(),
+            "the admission that followed the reset left both trees agreeing"
+        );
+    }
+
+    /// FIR-2495. A refused admission must not leave the daemon holding a
+    /// workspace plan repository authority will reject forever.
+    ///
+    /// The credential scanner refuses untracked sensitive content inside the
+    /// repository transaction, so the commit carrying it fails and the
+    /// publication restoring its deferred tree carries the same artifact and
+    /// fails for the same reason. Publishing forward is the recovery that cannot
+    /// work here, and before the reset the derived graph stayed ahead of
+    /// authority for the life of the daemon: the next commit reported a tree
+    /// mismatch, `kin admit` reported that nothing had changed while authority
+    /// carried none of it, the commit after that reported a projection conflict
+    /// on a path that was simply there, and `kin status` and `kin graph status`
+    /// disagreed about the artifact count seconds apart.
+    #[tokio::test]
+    // Commit phases are emitted at debug level when they are fast, and the
+    // level a `tracing` event is filtered by is a process-global hint. A test
+    // that captures those events therefore cannot run beside one that emits
+    // them, so every test on either side of that shares this group.
+    #[serial_test::serial(commit_phase_capture)]
+    async fn a_scanner_refused_admission_rolls_back_so_the_next_commit_proceeds() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        std::fs::write(
+            repo.path().join("store.py"),
+            b"def store():\n    return 1\n",
+        )
+        .unwrap();
+        sync_filesystem_with_graph(&state).await.unwrap();
+        let baseline_generation = authority_generation(&state);
+        let baseline_tree = state.graph.resolved_tree();
+        assert_eq!(
+            baseline_tree,
+            authority_workspace_tree(&state).unwrap(),
+            "the fixture must start with the two trees agreeing"
+        );
+
+        // The stranger's situation: content the credential scanner refuses,
+        // written into the working copy and never tracked.
+        std::fs::write(
+            repo.path().join("search.py"),
+            b"def connect():\n    password = \"s3cret-notekeeper-value\"\n    return password\n",
+        )
+        .unwrap();
+
+        // The commit path. It admits the whole working copy and defers the tree
+        // transition to the transaction that publishes its change.
+        let deferred = sync_filesystem_with_graph_deferring_tree_publication(&state)
+            .await
+            .unwrap()
+            .expect("the commit seam defers its transition to the caller");
+        assert_eq!(
+            authority_generation(&state),
+            baseline_generation,
+            "nothing may be published while the deferral is open"
+        );
+        assert!(
+            state
+                .graph
+                .resolved_tree()
+                .artifact_at_path(&test_repo_path("search.py"))
+                .is_some(),
+            "the deferring admission advances the derived graph so the commit can plan against it"
+        );
+        assert!(
+            !entity_ids_for(&state, "search.py").is_empty(),
+            "the fixture needs the refused artifact enriched, or the eviction below proves nothing"
+        );
+
+        // Name the refusal the fixture rests on. A scanner that stopped
+        // refusing this content would leave the publication below succeeding,
+        // and every assertion after it would pass for the wrong reason, so the
+        // test says outright which refusal it is reproducing. This call changes
+        // nothing: a refused publication advances no authority generation.
+        let refusal = publish_exact_workspace_tree(&state, &deferred)
+            .expect_err("the credential scanner must refuse the artifact this fixture writes");
+        assert!(
+            refusal.to_string().contains("CredentialAssignment"),
+            "the fixture reproduces the credential scanner's refusal: {refusal}"
+        );
+
+        // What a commit refused by the scanner does on its way out. The
+        // publication restoring the deferred tree carries the same refused
+        // artifact, so it is refused too and there is nothing left to publish.
+        let version_before = state.vfs_version.load(Ordering::SeqCst);
+        publish_deferred_tree_after_failure(&state, &deferred);
+
+        assert!(
+            state.vfs_version.load(Ordering::SeqCst) > version_before,
+            "a reset that took artifacts out of the graph must retire the projection readers \
+             holding them and arm background persistence, or a restart reloads the graph that \
+             was ahead"
+        );
+
+        assert_eq!(
+            authority_generation(&state),
+            baseline_generation,
+            "a refused admission publishes no authority successor"
+        );
+        assert_eq!(
+            state.graph.resolved_tree(),
+            baseline_tree,
+            "a refused admission must roll the derived graph back to the pre-attempt tree"
+        );
+        assert_eq!(
+            state.graph.resolved_tree(),
+            authority_workspace_tree(&state).unwrap(),
+            "the two trees the status surfaces read must agree again"
+        );
+        assert!(
+            entity_ids_for(&state, "search.py").is_empty(),
+            "the rollback must take the enrichment derived from the artifact it removed"
+        );
+        let report = state.background_work.reconcile_report(Instant::now());
+        assert!(
+            report.deferred_tree_wedge.is_none(),
+            "a daemon that rolled back needs no restart: {:?}",
+            report.deferred_tree_wedge
+        );
+        assert!(!report.degraded(), "{:?}", report.degraded_reasons());
+
+        // The next ordinary commit proceeds. Removing the refused artifact is
+        // what a user does after reading the refusal, and before the rollback
+        // this is the point at which the daemon reported a projection conflict
+        // about a path that was simply there.
+        std::fs::remove_file(repo.path().join("search.py")).unwrap();
+        std::fs::write(
+            repo.path().join("later.py"),
+            b"def later():\n    return 3\n",
+        )
+        .unwrap();
+        sync_filesystem_with_graph(&state)
+            .await
+            .expect("a rolled-back daemon admits the next transition rather than refusing it");
+
+        assert_eq!(
+            authority_generation(&state) - baseline_generation,
+            1,
+            "the admission after the rollback publishes exactly one authority successor"
+        );
+        let after = state.graph.resolved_tree();
+        assert_eq!(
+            after,
+            authority_workspace_tree(&state).unwrap(),
+            "both status surfaces must report the same tree after the recovery"
+        );
+        assert!(
+            after
+                .artifact_at_path(&test_repo_path("later.py"))
+                .is_some(),
+            "the work that followed the refusal is what had to become committable"
         );
     }
 
@@ -3766,6 +4105,76 @@ mod tests {
         assert!(
             error.to_string().contains("no walk observed"),
             "the refusal must name what went wrong: {error}"
+        );
+    }
+
+    /// FIR-2495 ask 2. A daemon whose graph outran authority names the recovery.
+    ///
+    /// The reset above closes the route this fleet has actually seen, and a
+    /// reset that fails itself leaves the daemon in exactly this state. What the
+    /// user meets then is this refusal, and on its own it described a mismatch
+    /// without saying that restarting is what clears it, which is how four
+    /// consecutive errors named symptoms and none named the cause.
+    #[test]
+    // Commit phases are emitted at debug level when they are fast, and the
+    // level a `tracing` event is filtered by is a process-global hint. A test
+    // that captures those events therefore cannot run beside one that emits
+    // them, so every test on either side of that shares this group.
+    #[serial_test::serial(commit_phase_capture)]
+    fn a_commit_planned_out_of_a_stale_graph_tree_names_the_daemon_restart() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        std::fs::write(repo.path().join("base.rs"), b"pub fn base() -> u32 { 1 }\n").unwrap();
+        exact_tree_admission(&state, None, TreePublication::Standalone).unwrap();
+        std::fs::write(
+            repo.path().join("carried.rs"),
+            b"pub fn carried() -> u32 { 1 }\n",
+        )
+        .unwrap();
+        let admission =
+            exact_tree_admission(&state, None, TreePublication::DeferredToCaller).unwrap();
+        let deferred = admission
+            .deferred_tree
+            .expect("the admission defers its transition to this caller");
+
+        // Move repository authority under the open deferral, which is what
+        // leaves the walk's own prior tree and the plan's prior tree apart.
+        publish_authority_tree_out_of_band(&state, kin_model::ResolvedTree::default());
+
+        let authority_context =
+            crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
+                .unwrap();
+        let plan = crate::repository_commit::plan_native_commit(
+            &state.graph,
+            state.blobs.as_ref(),
+            &authority_context,
+            kin_model::OperationId::new(),
+            kin_model::Timestamp::now(),
+            kin_model::AuthorId::new("stale-graph-tree-test"),
+            "publish out of a tree authority no longer holds".to_string(),
+        )
+        .unwrap();
+
+        let error = crate::repository_commit::commit_native_plan_with_observed_target_tree(
+            &state.layout,
+            state.blobs.as_ref(),
+            &authority_context,
+            plan,
+            &deferred,
+        )
+        .expect_err("a plan whose prior tree is not the walk's prior tree must be refused");
+        let error = error.to_string();
+        assert!(
+            error.contains("planned out of a different workspace tree"),
+            "the refusal must still name the mismatch: {error}"
+        );
+        assert!(
+            error.contains("kin daemon stop"),
+            "the refusal must name the one command that clears this: {error}"
+        );
+        assert!(
+            error.contains("ahead of repository authority"),
+            "the refusal must name the state, not just the remedy: {error}"
         );
     }
 
@@ -6155,6 +6564,328 @@ mod tests {
             "no poll cadence may turn the grace into a stall"
         );
     }
+
+    /// FIR-2466. The daemon may not publish its endpoint on a promise the loop
+    /// never keeps, so the signal fires even when the loop never reaches its
+    /// watcher.
+    #[test]
+    fn a_watch_signal_fires_on_drop_when_the_loop_never_arms() {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        {
+            let _armed = WatchArmed::new(tx);
+        }
+        assert_eq!(
+            rx.try_recv(),
+            Ok(()),
+            "a dropped WatchArmed must release the daemon; a loop that ends before building a \
+             watcher would otherwise hold the endpoint back forever"
+        );
+    }
+
+    /// Arming is once. A second call after an explicit arm must not panic and
+    /// must not send again, because the receiver is a one-shot.
+    #[test]
+    fn a_watch_signal_arms_once_and_the_later_drop_is_silent() {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let mut armed = WatchArmed::new(tx);
+        armed.arm();
+        armed.arm();
+        drop(armed);
+        assert_eq!(rx.try_recv(), Ok(()), "the arm reaches the daemon");
+    }
+
+    /// A store that records no complete admission names no window, so the loop
+    /// falls back to admitting nothing at startup rather than proposing the
+    /// whole working copy.
+    #[test]
+    fn a_store_with_no_admission_marker_opens_no_catch_up_window() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        assert!(
+            matches!(
+                kin_core::last_admission::read(&state.layout),
+                kin_core::last_admission::LastAdmissionRead::Absent
+            ),
+            "the control this assertion rests on: a fresh store carries no marker"
+        );
+        assert_eq!(
+            startup_catch_up_window(&state),
+            None,
+            "with no lower bound the pass would propose the entire working copy, which is the \
+             sweep startup must never perform"
+        );
+    }
+
+    /// A recorded marker opens the window at its own instant, which is what
+    /// bounds the catch-up to the stretch nothing was watching.
+    #[test]
+    fn a_recorded_admission_marker_opens_the_window_at_its_own_instant() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let at = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        kin_core::last_admission::write(
+            &state.layout,
+            &kin_core::last_admission::LastAdmission::new(at, 7),
+        )
+        .unwrap();
+
+        assert_eq!(
+            startup_catch_up_window(&state),
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            "the window opens at the last complete admission, not at process start"
+        );
+    }
+
+    /// A marker stamped before the epoch clamps rather than wrapping. A wrap
+    /// would move the window to the far future, which loses every file.
+    #[test]
+    fn a_pre_epoch_marker_clamps_the_window_to_the_epoch() {
+        let before = chrono::DateTime::from_timestamp(-10, 0).unwrap();
+        assert_eq!(unix_instant(before), SystemTime::UNIX_EPOCH);
+        let after = chrono::DateTime::from_timestamp(5, 250_000_000).unwrap();
+        assert_eq!(
+            unix_instant(after),
+            SystemTime::UNIX_EPOCH + Duration::new(5, 250_000_000),
+            "the ordinary case is not clamped, which is the control for the arm above"
+        );
+    }
+
+    /// FIR-2499. The catch-up names what the host changed inside the window and
+    /// nothing older, and what it names is admissible by the ordinary ambient
+    /// path.
+    ///
+    /// Modification times are set outright rather than slept for, so the two
+    /// arms sit on either side of the window by construction instead of by
+    /// racing a filesystem's clock granularity.
+    #[test]
+    fn the_catch_up_names_host_paths_changed_inside_the_window_and_no_others() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+
+        let before = repo.path().join("settled.rs");
+        std::fs::write(&before, b"pub fn settled() -> u32 { 1 }\n").unwrap();
+        stamp_modified(
+            &before,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000),
+        );
+
+        let after = repo.path().join("written_while_nothing_watched.rs");
+        std::fs::write(&after, b"pub fn written() -> u32 { 2 }\n").unwrap();
+        stamp_modified(
+            &after,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(3_000_000),
+        );
+
+        let window = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000);
+        let planned = plan_catch_up_events(&state, window).unwrap();
+        let named = event_paths(&planned);
+        // The plan speaks in the working directory the state is bound to, which
+        // the layout resolved; a tempdir path is the unresolved form of the
+        // same entry, so the two are compared by leaf.
+        let named = named
+            .iter()
+            .filter_map(|path| path.file_name())
+            .map(|leaf| leaf.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        let after_leaf = "written_while_nothing_watched.rs".to_string();
+        let before_leaf = "settled.rs".to_string();
+
+        assert!(
+            named.contains(&after_leaf),
+            "a file written after the last admission is exactly what nothing observed: {named:?}"
+        );
+        assert!(
+            !named.contains(&before_leaf),
+            "a file older than the window was already covered by that admission: {named:?}"
+        );
+
+        // What the catch-up plans has to be admissible by the path it feeds,
+        // or the plan is a list nothing acts on.
+        let admitted = admit_file_event_ambient(&state, &FileEvent::Changed(after)).unwrap();
+        assert!(
+            matches!(admitted, AdmittedFileEvent::Regular { .. }),
+            "the catch-up's own event must reach the tree: {admitted:?}"
+        );
+        assert!(
+            tree_entry(&state, "written_while_nothing_watched.rs").is_some(),
+            "the file the graph never met is what the catch-up exists to admit"
+        );
+    }
+
+    /// The rules the catch-up walk shares with the content walk. An ignored
+    /// path is excluded whatever its modification time says, so the catch-up
+    /// cannot admit what an ordinary tick would refuse.
+    #[test]
+    fn the_catch_up_skips_a_path_the_ignore_rules_exclude() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join(".kinignore"), b"secrets.rs\n").unwrap();
+        let state = open_test_state(&repo);
+
+        let ignored = repo.path().join("secrets.rs");
+        std::fs::write(&ignored, b"pub fn secret() -> u32 { 3 }\n").unwrap();
+        stamp_modified(
+            &ignored,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(3_000_000),
+        );
+        let visible = repo.path().join("visible.rs");
+        std::fs::write(&visible, b"pub fn visible() -> u32 { 4 }\n").unwrap();
+        stamp_modified(
+            &visible,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(3_000_000),
+        );
+
+        let window = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000);
+        let named = event_paths(&plan_catch_up_events(&state, window).unwrap())
+            .iter()
+            .filter_map(|path| path.file_name())
+            .map(|leaf| leaf.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert!(
+            named.contains(&"visible.rs".to_string()),
+            "the positive control: an ordinary path inside the window is named: {named:?}"
+        );
+        assert!(
+            !named.contains(&"secrets.rs".to_string()),
+            "the catch-up walks under the same rules a tick does: {named:?}"
+        );
+    }
+
+    /// FIR-2499. A path graph truth already tracks is projection drift, not
+    /// catch-up work, however recently the host touched it.
+    ///
+    /// Repository authority holds bytes for a tracked path, so a host edit to
+    /// one is what `kin doctor --drift` reports and `kin doctor --heal`
+    /// repairs. A catch-up that took it would advance the workspace over
+    /// graph-owned content at daemon start and empty the report an operator is
+    /// about to read. The untracked file beside it is the positive control:
+    /// same directory, same window, and it is still named.
+    #[test]
+    fn the_catch_up_leaves_a_tracked_path_to_the_drift_report() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+
+        let tracked = repo.path().join("tracked.rs");
+        std::fs::write(&tracked, b"pub fn tracked() -> u32 { 1 }\n").unwrap();
+        admit_file_event_ambient(&state, &FileEvent::Changed(tracked.clone())).unwrap();
+        assert!(
+            tree_entry(&state, "tracked.rs").is_some(),
+            "the fixture needs this path tracked before the window is opened"
+        );
+        std::fs::write(&tracked, b"pub fn tracked() -> u32 { 2 }\n").unwrap();
+        stamp_modified(
+            &tracked,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(3_000_000),
+        );
+
+        let untracked = repo.path().join("untracked.rs");
+        std::fs::write(&untracked, b"pub fn untracked() -> u32 { 3 }\n").unwrap();
+        stamp_modified(
+            &untracked,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(3_000_000),
+        );
+
+        let window = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000);
+        let named = event_paths(&plan_catch_up_events(&state, window).unwrap())
+            .iter()
+            .filter_map(|path| path.file_name())
+            .map(|leaf| leaf.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert!(
+            named.contains(&"untracked.rs".to_string()),
+            "the positive control: content the graph has never met is still named: {named:?}"
+        );
+        assert!(
+            !named.contains(&"tracked.rs".to_string()),
+            "a tracked path edited off-watch is drift for `kin doctor`, not a silent catch-up \
+             admission: {named:?}"
+        );
+    }
+
+    /// FIR-2499. A directory graph truth has never met is disclosed, not swept
+    /// in.
+    ///
+    /// A directory arriving whole is a clone, a move, an unpacked archive or a
+    /// renamed control directory, and a move restamps every entry it carries,
+    /// so modification times cannot tell that content from authored work.
+    /// Admitting one at daemon start is the working-copy sweep startup must
+    /// never perform. The file beside the tracked one is the positive control:
+    /// it sits where the graph already looks, so the window still reaches it.
+    #[test]
+    fn the_catch_up_declines_a_directory_the_graph_has_never_met() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+
+        let known = repo.path().join("known.rs");
+        std::fs::write(&known, b"pub fn known() -> u32 { 1 }\n").unwrap();
+        admit_file_event_ambient(&state, &FileEvent::Changed(known)).unwrap();
+        assert!(
+            tree_entry(&state, "known.rs").is_some(),
+            "the fixture needs the repository root to hold tracked content"
+        );
+
+        let beside = repo.path().join("beside_known.rs");
+        std::fs::write(&beside, b"pub fn beside() -> u32 { 2 }\n").unwrap();
+        stamp_modified(
+            &beside,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(3_000_000),
+        );
+
+        let arrived = repo.path().join("arrived_whole");
+        std::fs::create_dir_all(&arrived).unwrap();
+        let carried = arrived.join("carried.rs");
+        std::fs::write(&carried, b"pub fn carried() -> u32 { 3 }\n").unwrap();
+        stamp_modified(
+            &carried,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(3_000_000),
+        );
+
+        let window = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000);
+        let named = event_paths(&plan_catch_up_events(&state, window).unwrap())
+            .iter()
+            .filter_map(|path| path.file_name())
+            .map(|leaf| leaf.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert!(
+            named.contains(&"beside_known.rs".to_string()),
+            "the positive control: a new file where the graph already looks is named: {named:?}"
+        );
+        assert!(
+            !named.contains(&"carried.rs".to_string()),
+            "a directory the graph has never met is for the behind disclosure and `kin admit`, \
+             not for a startup sweep: {named:?}"
+        );
+    }
+
+    /// The host paths a planned batch names.
+    fn event_paths(events: &[FileEvent]) -> Vec<PathBuf> {
+        events
+            .iter()
+            .map(|event| {
+                let (FileEvent::Changed(path) | FileEvent::Removed(path)) = event;
+                path.clone()
+            })
+            .collect()
+    }
+
+    /// Set a host entry's modification time outright.
+    ///
+    /// Both stamps are written because setting only one is refused on some
+    /// hosts, and the access time is not what any assertion here reads.
+    fn stamp_modified(path: &Path, at: SystemTime) {
+        let handle = std::fs::File::options().write(true).open(path).unwrap();
+        handle
+            .set_times(std::fs::FileTimes::new().set_accessed(at).set_modified(at))
+            .unwrap();
+        assert_eq!(
+            std::fs::symlink_metadata(path).unwrap().modified().unwrap(),
+            at,
+            "the stamp has to have applied, or every assertion resting on it is about the \
+             file's real age instead"
+        );
+    }
 }
 
 /// Decide whether a filesystem-sync tick's bulk deletions should be WITHHELD as
@@ -6229,6 +6960,57 @@ async fn sync_filesystem_with_graph_publishing(
     }
 }
 
+/// The exact tree repository authority currently records for this workspace.
+///
+/// The derived graph's counterpart, and the answer `kin status` reports while
+/// `kin graph status` reports the graph's own. The two agreeing is the
+/// invariant a deferral is opened against and the one a failed commit has to
+/// restore.
+fn authority_workspace_tree(state: &DaemonState) -> Result<kin_model::ResolvedTree> {
+    let authority_context =
+        crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)?;
+    crate::repository_commit::authority_workspace_tree(&authority_context)
+}
+
+/// Return the derived graph to the exact tree repository authority holds.
+///
+/// The one reset that is correct whatever went wrong. Rolling the admitted
+/// deltas back would restore the tree the pass planned out of, which is right
+/// when authority stood still and wrong when it moved, and those two cases are
+/// indistinguishable from the deltas alone. Reading authority answers both: the
+/// graph is a derived view, so the state it must return to is whatever
+/// authority currently holds, not whatever it held a moment ago.
+///
+/// Enrichment for the artifacts this removes goes first, in the order every
+/// other tree removal uses, because kin-db refuses a transition that leaves an
+/// entity on a path the staged tree no longer carries. Enrichment for a path
+/// whose content this rolls back is left alone: the working copy still holds
+/// the newer bytes, so the next admission re-derives the same transition and
+/// re-enriches from them, and evicting it here would delete answers the store
+/// can still give.
+fn reset_derived_graph_to_authority_tree(state: &DaemonState) -> Result<Vec<TreeDelta>> {
+    let authority_tree = authority_workspace_tree(state)?;
+    let graph_tree = state.graph.resolved_tree();
+    if graph_tree == authority_tree {
+        return Ok(Vec::new());
+    }
+    let deltas = kin_core::exact_tree_correction(&graph_tree, &authority_tree)?;
+    evict_enrichment_for_removed_paths(state, &deltas)?;
+    state.graph.apply_transaction_delta(&TransactionDelta {
+        entity_deltas: Vec::new(),
+        relation_deltas: Vec::new(),
+        tree_deltas: deltas.clone(),
+        ..TransactionDelta::default()
+    })?;
+    // Every graph mutation bumps the counter, and this one removes artifacts a
+    // projection reader may already hold. Skipping it would leave a VFS client
+    // materializing a tree the graph has just given up, and would leave the
+    // reset out of background persistence, so a restart would reload the graph
+    // that was ahead.
+    state.bump_version();
+    Ok(deltas)
+}
+
 /// Close a deferral whose caller will never publish it.
 ///
 /// The derived graph already carries the admitted tree, so leaving it
@@ -6238,19 +7020,26 @@ async fn sync_filesystem_with_graph_publishing(
 /// ordering a standalone admission would have established, which is exactly
 /// the state a failed commit leaves behind today.
 ///
-/// This is the one path where publication itself can fail with nothing left to
-/// try. It is reported at error level rather than swallowed, and the failure a
-/// later admission raises stays loud, because a daemon whose graph outruns
-/// authority must be restarted to rebuild the graph rather than keep answering
-/// from it.
+/// Publishing forward is the first recovery and not the only one, because it
+/// cannot work when the reason the transaction was refused is a property of the
+/// tree itself. Untracked sensitive content is exactly that shape: the
+/// credential scanner refuses the artifact inside the repository transaction, so
+/// the standalone publication carrying the same artifact is refused for the same
+/// reason, and every retry after it is too. Rolling the derived graph back to
+/// what authority holds is the second recovery, and it always terminates: the
+/// tree it resets to is one repository authority has already accepted.
 ///
-/// The error log is not the whole disclosure. It is written once, at the moment
-/// of the failure, and every status surface afterwards showed a daemon whose
-/// admissions happened to be failing, which is what a wedged daemon and a merely
-/// unlucky one look like from the outside. The state is recorded on the
-/// reconcile probes as well, so `/health`, `/commands/resources`, `kin graph
-/// status`, `kin admit`, and `kin doctor` all name the restart rather than
-/// leaving a reader to infer it from a refusal.
+/// What the user sees turns on this. A daemon that rolls back answers the next
+/// commit with the refusal that actually stopped it, every time; a daemon that
+/// stays ahead answers with a tree mismatch, then an admission that reports
+/// nothing changed, then a projection conflict about a path that is simply
+/// there, none of which name the cause.
+///
+/// Only a rollback that fails as well leaves the daemon wedged, and that is
+/// still reported at error level and recorded on the reconcile probes, so
+/// `/health`, `/commands/resources`, `kin graph status`, `kin admit`, and
+/// `kin doctor` all name the restart rather than leaving a reader to infer it
+/// from a refusal.
 pub(crate) fn publish_deferred_tree_after_failure(
     state: &DaemonState,
     admitted: &crate::repository_commit::AdmittedWorkspaceTree,
@@ -6265,18 +7054,46 @@ pub(crate) fn publish_deferred_tree_after_failure(
                 .reconcile()
                 .clear_deferred_tree_wedge();
         }
-        Err(error) => {
-            error!(
-                error = %error,
-                "failed to publish the deferred exact workspace tree after the carrying transaction \
-                 did not reach authority; the derived graph is ahead of repository authority and this \
-                 daemon must be restarted before it can admit again"
-            );
-            state
-                .background_work
-                .reconcile()
-                .record_deferred_tree_wedge(&error, Instant::now());
-        }
+        Err(publication_error) => match reset_derived_graph_to_authority_tree(state) {
+            Ok(reverted) => {
+                warn!(
+                    error = %publication_error,
+                    reverted = reverted.len(),
+                    "the publication restoring a failed commit's deferred exact workspace tree was \
+                     refused, so the derived graph was reset to the tree repository authority holds; \
+                     the next admission plans out of that tree and reports the refusal that stopped \
+                     this one"
+                );
+                // The graph and authority agree again, which is the whole of
+                // what a wedge names. Clearing it here is what stops one refused
+                // admission reporting a restart nobody has to perform.
+                state
+                    .background_work
+                    .reconcile()
+                    .clear_deferred_tree_wedge();
+            }
+            Err(reset_error) => {
+                error!(
+                    error = %publication_error,
+                    reset_error = %reset_error,
+                    "failed to publish the deferred exact workspace tree after the carrying \
+                     transaction did not reach authority, and resetting the derived graph to the \
+                     tree repository authority holds failed too; the derived graph is ahead of \
+                     repository authority and this daemon must be restarted before it can admit \
+                     again"
+                );
+                state
+                    .background_work
+                    .reconcile()
+                    .record_deferred_tree_wedge(
+                        format!(
+                        "{publication_error}; resetting the derived graph to the authority tree \
+                         failed too: {reset_error}"
+                    ),
+                        Instant::now(),
+                    );
+            }
+        },
     }
 }
 
