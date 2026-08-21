@@ -3542,7 +3542,7 @@ async fn command_graph(
     // never saw.
     let census =
         kin_core::relation_census::CensusContext::for_layout(&state.layout, std::env::vars());
-    let response = kin_cli::commands::graph::execute_graph_command(
+    let response = kin_cli::commands::graph::execute_graph_command_for_store(
         &repository_authority,
         graph.as_ref(),
         &request,
@@ -3551,6 +3551,7 @@ async fn command_graph(
             .reconcile_report(std::time::Instant::now()),
         &embedding_runtime,
         &census,
+        Some(state.layout.root()),
     )
     .map_err(internal_error)?;
     Ok(Json(response))

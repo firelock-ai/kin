@@ -258,10 +258,42 @@ pub fn execute_graph_command(
     embedding_runtime: &crate::commands::resources::EmbedRuntimeState,
     census: &kin_core::relation_census::CensusContext,
 ) -> Result<GraphCommandResponse> {
+    execute_graph_command_for_store(
+        authority,
+        graph,
+        request,
+        reconcile,
+        embedding_runtime,
+        census,
+        None,
+    )
+}
+
+/// The same command, told which store on disk it is reporting about.
+///
+/// Separate from [`execute_graph_command`] rather than an extra parameter on it
+/// because the store is knowable only to a caller that holds the layout, which
+/// today is the daemon and nobody else. Every other caller, including this
+/// module's own tests, asks the same question about a graph it already has in
+/// hand and has no `.kin` directory to name.
+pub fn execute_graph_command_for_store(
+    authority: &super::repository_authority::RequestRepositoryAuthority,
+    graph: &kin_db::InMemoryGraph,
+    request: &GraphCommandRequest,
+    reconcile: &crate::commands::resources::ReconcileHealth,
+    embedding_runtime: &crate::commands::resources::EmbedRuntimeState,
+    census: &kin_core::relation_census::CensusContext,
+    kin_root: Option<&std::path::Path>,
+) -> Result<GraphCommandResponse> {
     match request {
-        GraphCommandRequest::Status => {
-            build_graph_status_response(authority, graph, reconcile, embedding_runtime, census)
-        }
+        GraphCommandRequest::Status => build_graph_status_response_for_store(
+            authority,
+            graph,
+            reconcile,
+            embedding_runtime,
+            census,
+            kin_root,
+        ),
         GraphCommandRequest::Validate => build_graph_validate_response(authority, graph),
         GraphCommandRequest::Inspect { name } => build_graph_inspect_response(graph, name),
         GraphCommandRequest::Source { entity } => {
@@ -377,12 +409,37 @@ fn repository_coverage_line(files_with_entities: usize, admitted: usize) -> Stri
     )
 }
 
+/// The status renderer as every test asks for it, about a graph with no store
+/// named beside it.
+///
+/// A wrapper rather than a defaulted argument so a test that has no `.kin`
+/// directory keeps the spelling it had, and so the store-aware path is the one
+/// that has to say which store it means.
+#[cfg(test)]
 fn build_graph_status_response(
     authority: &super::repository_authority::RequestRepositoryAuthority,
     graph: &kin_db::InMemoryGraph,
     reconcile: &crate::commands::resources::ReconcileHealth,
     embedding_runtime: &crate::commands::resources::EmbedRuntimeState,
     census: &kin_core::relation_census::CensusContext,
+) -> Result<GraphCommandResponse> {
+    build_graph_status_response_for_store(
+        authority,
+        graph,
+        reconcile,
+        embedding_runtime,
+        census,
+        None,
+    )
+}
+
+fn build_graph_status_response_for_store(
+    authority: &super::repository_authority::RequestRepositoryAuthority,
+    graph: &kin_db::InMemoryGraph,
+    reconcile: &crate::commands::resources::ReconcileHealth,
+    embedding_runtime: &crate::commands::resources::EmbedRuntimeState,
+    census: &kin_core::relation_census::CensusContext,
+    kin_root: Option<&std::path::Path>,
 ) -> Result<GraphCommandResponse> {
     // One sample for every embedding line in this response. The counter below
     // and the health warning used to sample coverage independently, and an
@@ -844,6 +901,14 @@ fn build_graph_status_response(
     // does; changing an exit code is a separate decision from killing a false
     // all-clear, and only the second is what this closes.
     warnings.extend(census_comparison.loss_lines());
+    // A daemon killed by the memory limit is invisible to every counter above
+    // it. The graph it left behind is intact and a replacement is serving, so a
+    // store whose daemon has been killed twenty-five times prints a clean
+    // report with an all-clear under it. The store's own record is the only
+    // thing that remembers, and this is the page a reader is already on.
+    if let Some(record) = kin_root.and_then(kin_daemon_spawn::read_daemon_kill_record) {
+        warnings.push(record.summary());
+    }
     if warnings.is_empty() && criticals.is_empty() {
         lines.push(String::new());
         lines.push("✓ No issues detected.".to_string());

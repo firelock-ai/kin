@@ -553,6 +553,87 @@ pub fn is_still_starting_error(message: &str) -> bool {
     message.contains(DAEMON_STILL_STARTING)
 }
 
+/// What this store has recorded about daemons of its own that were killed.
+///
+/// Read from the store rather than remembered in this process, because the
+/// daemon that died may have been started by a different one: an out-of-band
+/// `kin` command boots a daemon this MCP server then talks to, and a record
+/// only one of them could see would be missing exactly when it is wanted.
+pub(crate) fn recorded_daemon_kill() -> Option<kin_daemon_spawn::DaemonKillRecord> {
+    kin_daemon_spawn::read_daemon_kill_record(&discover_kin_dir()?)
+}
+
+/// The recorded cause and a remediation the caller can perform, ready to append
+/// to an error about a daemon that stopped answering.
+///
+/// Empty when the store has recorded nothing, which leaves every message on a
+/// host that has never lost a daemon byte for byte what it was. A record says
+/// what has happened to this store's daemons; it is not a claim about the cause
+/// of the request that just failed, and the wording keeps those apart.
+fn recorded_kill_detail(record: Option<&kin_daemon_spawn::DaemonKillRecord>) -> String {
+    match record {
+        Some(record) => format!(" {}", record.summary()),
+        None => String::new(),
+    }
+}
+
+/// The advice that closes an error about a daemon that could not be brought
+/// back.
+///
+/// "Restart `kin mcp start` to recover" is addressed to whoever owns the MCP
+/// server process, and inside an MCP session nobody does: the agent reading it
+/// is being served by that very process, and the stranger who met this error
+/// had to leave the tool surface entirely to act on it. When the store has
+/// recorded why its daemons keep dying, the record's own remediation replaces
+/// that advice, because every action in it is one the caller can take.
+fn daemon_gone_advice(record: Option<&kin_daemon_spawn::DaemonKillRecord>) -> String {
+    match record {
+        Some(record) => record.summary(),
+        None => "Restart `kin mcp start` to recover.".to_string(),
+    }
+}
+
+/// The message for a daemon that stopped answering and could not be replaced.
+fn revival_failed_message(
+    operation: &str,
+    daemon_url: &str,
+    first_err: &str,
+    revive_err: &str,
+    record: Option<&kin_daemon_spawn::DaemonKillRecord>,
+) -> String {
+    format!(
+        "{DAEMON_EXITED_RESTART_REQUIRED}: {operation}: daemon at {daemon_url} is not \
+         responding ({first_err}); revival failed: {revive_err}. {}",
+        daemon_gone_advice(record)
+    )
+}
+
+/// The message for a replacement daemon that started and still could not answer.
+fn revived_retry_failed_message(
+    operation: &str,
+    new_url: &str,
+    detail: &str,
+    record: Option<&kin_daemon_spawn::DaemonKillRecord>,
+) -> String {
+    format!(
+        "{DAEMON_EXITED_RESTART_REQUIRED}: {operation}: daemon was revived at {new_url} but the \
+         retry still failed: {detail}. Check `kin daemon status`.{}",
+        recorded_kill_detail(record)
+    )
+}
+
+/// The message for a connection that broke while it was carrying a request.
+fn transport_dropped_message(
+    operation: &str,
+    error: &str,
+    record: Option<&kin_daemon_spawn::DaemonKillRecord>,
+) -> String {
+    format!(
+        "daemon {operation} failed: {error}{}",
+        recorded_kill_detail(record)
+    )
+}
+
 /// Does this delegate error mean the repo daemon is gone rather than that the
 /// call itself was rejected?
 ///
@@ -937,7 +1018,16 @@ fn classify_send_error(operation: &str, error: reqwest::Error) -> DaemonCallErro
     } else if error.is_timeout() {
         DaemonCallError::Timeout(error.to_string())
     } else {
-        DaemonCallError::DaemonError(format!("daemon {operation} failed: {error}"))
+        // A send that was neither refused nor timed out is a connection that
+        // broke while it was carrying this request, which is what a daemon
+        // killed mid-answer looks like from here. It reached the caller as a
+        // bare URL and nothing else; the recorded cause is appended so the
+        // fourth failure shape names memory too.
+        DaemonCallError::DaemonError(transport_dropped_message(
+            operation,
+            &error.to_string(),
+            recorded_daemon_kill().as_ref(),
+        ))
     }
 }
 
@@ -1199,6 +1289,10 @@ async fn revive_mcp_daemon() -> Result<String, String> {
     let mut cmd = plan.command();
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
+    // Opened before the spawn, because attributing a kill to memory needs the
+    // kernel's counter from before this daemon existed. A reading taken only
+    // after it died counts kills that may belong to anything else on the box.
+    let watch = kin_daemon_spawn::DaemonWatch::begin(&kin_dir);
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("MCP revival: spawn kin-daemon failed: {e}"))?;
@@ -1210,7 +1304,7 @@ async fn revive_mcp_daemon() -> Result<String, String> {
     // process's child, and dropping the handle would leave it `<defunct>` from
     // the moment it dies until the session ends. Adopt it on every outcome —
     // the startup failures below leave a daemon running on purpose too.
-    kin_daemon_spawn::adopt_detached_daemon_child(child);
+    kin_daemon_spawn::adopt_watched_daemon_child(child, watch);
     revived
 }
 
@@ -1534,10 +1628,12 @@ where
              left running. Retry this tool in a moment; do not restart `kin mcp start`, which \
              discards the startup already in progress."
         )),
-        Err(revive_err) => Err(format!(
-            "{DAEMON_EXITED_RESTART_REQUIRED}: {operation}: daemon at {daemon_url} \
-             is not responding ({first_err}); revival failed: {revive_err}. \
-             Restart `kin mcp start` to recover."
+        Err(revive_err) => Err(revival_failed_message(
+            operation,
+            daemon_url,
+            &first_err,
+            &revive_err,
+            recorded_daemon_kill().as_ref(),
         )),
         Ok(new_url) => {
             // Retry exactly once on the post-revival URL. A daemon this call
@@ -1552,10 +1648,11 @@ where
                         | DaemonCallError::Warming(s)
                         | DaemonCallError::DaemonError(s) => s,
                     };
-                    Err(format!(
-                        "{DAEMON_EXITED_RESTART_REQUIRED}: {operation}: daemon was \
-                         revived at {new_url} but the retry still failed: {detail}. \
-                         Check `kin daemon status`."
+                    Err(revived_retry_failed_message(
+                        operation,
+                        &new_url,
+                        &detail,
+                        recorded_daemon_kill().as_ref(),
                     ))
                 }
             }
@@ -4357,5 +4454,188 @@ mod tests {
         assert_eq!(fast_path_patience(), Duration::from_secs(60));
         assert_eq!(escalated_patience(), Duration::from_secs(300));
         assert!(escalated_patience() > fast_path_patience());
+    }
+
+    // ── What a killed daemon says on the query path ─────────────────────
+
+    fn memory_kill_record(kills: u64) -> kin_daemon_spawn::DaemonKillRecord {
+        kin_daemon_spawn::DaemonKillRecord {
+            kills,
+            memory_kills: kills,
+            first_unix: 4_320,
+            last_unix: 4_800,
+            last_pid: Some(41),
+            last_cause: kin_daemon_spawn::DaemonKillCause::MemoryLimit {
+                kernel_oom_kills: 1,
+            },
+            limit_bytes: Some(12 * 1024 * 1024 * 1024),
+            last_rss_bytes: None,
+        }
+    }
+
+    /// The positive control for every message below. A store that has never
+    /// lost a daemon must read exactly as it read before any of this existed,
+    /// so the expected strings here are the literal pre-change text.
+    #[test]
+    fn a_store_with_no_kill_record_reads_exactly_as_it_did() {
+        assert_eq!(
+            revival_failed_message(
+                "tool find_references",
+                "http://127.0.0.1:32881",
+                "error sending request",
+                "MCP revival: daemon exited during startup with status signal: 9 (SIGKILL)",
+                None,
+            ),
+            "repo daemon exited; restart required: tool find_references: daemon at \
+             http://127.0.0.1:32881 is not responding (error sending request); revival failed: \
+             MCP revival: daemon exited during startup with status signal: 9 (SIGKILL). Restart \
+             `kin mcp start` to recover."
+        );
+        assert_eq!(
+            revived_retry_failed_message(
+                "tool find_references",
+                "http://127.0.0.1:34507",
+                "timed out",
+                None,
+            ),
+            "repo daemon exited; restart required: tool find_references: daemon was revived at \
+             http://127.0.0.1:34507 but the retry still failed: timed out. Check `kin daemon \
+             status`."
+        );
+        assert_eq!(
+            transport_dropped_message(
+                "MCP tool call",
+                "error sending request for url (http://127.0.0.1:42231/mcp/tools/call)",
+                None,
+            ),
+            "daemon MCP tool call failed: error sending request for url \
+             (http://127.0.0.1:42231/mcp/tools/call)"
+        );
+    }
+
+    /// The remediation a caller can perform replaces the one it cannot. An
+    /// agent inside an MCP session does not own the `kin mcp start` process
+    /// serving it, so that instruction was addressed to nobody present.
+    #[test]
+    fn a_recorded_memory_kill_replaces_the_advice_nobody_can_perform() {
+        let record = memory_kill_record(4);
+        let message = revival_failed_message(
+            "tool find_references",
+            "http://127.0.0.1:32881",
+            "error sending request",
+            "MCP revival: daemon exited during startup with status signal: 9 (SIGKILL)",
+            Some(&record),
+        );
+        assert!(
+            message.contains("killed by the memory limit 4 time(s) since 01:12Z"),
+            "{message}"
+        );
+        assert!(message.contains("cap 12.0 GiB"), "{message}");
+        assert!(
+            message.contains("KIN_DAEMON_DISABLE_LSP=1 kin graph status"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("Restart `kin mcp start` to recover"),
+            "the unperformable remediation must be gone once a performable one exists: {message}"
+        );
+        assert!(
+            message.starts_with(DAEMON_EXITED_RESTART_REQUIRED),
+            "the error class a client keys on is unchanged: {message}"
+        );
+    }
+
+    /// The two shapes that are not an exhausted revival still name the cause:
+    /// a daemon revived that could not answer, and a connection that broke
+    /// while it was carrying the request.
+    #[test]
+    fn the_other_two_daemon_loss_shapes_name_the_cause_too() {
+        let record = memory_kill_record(4);
+        for message in [
+            revived_retry_failed_message(
+                "tool find_references",
+                "http://127.0.0.1:34507",
+                "timed out",
+                Some(&record),
+            ),
+            transport_dropped_message(
+                "MCP tool call",
+                "error sending request for url (http://127.0.0.1:42231/mcp/tools/call)",
+                Some(&record),
+            ),
+        ] {
+            assert!(
+                message.contains("killed by the memory limit 4 time(s)"),
+                "{message}"
+            );
+            assert!(
+                message.contains("KIN_DAEMON_DISABLE_LSP=1 kin graph status"),
+                "{message}"
+            );
+        }
+    }
+
+    /// A host that publishes no memory accounting gets the signal and nothing
+    /// else. The words "memory limit" appear in a message only where a kernel
+    /// counter put them.
+    #[test]
+    fn an_unattributed_kill_never_reads_as_a_memory_kill() {
+        let record = kin_daemon_spawn::DaemonKillRecord {
+            kills: 2,
+            memory_kills: 0,
+            first_unix: 4_320,
+            last_unix: 4_800,
+            last_pid: Some(41),
+            last_cause: kin_daemon_spawn::DaemonKillCause::Unattributed { signal: 9 },
+            limit_bytes: None,
+            last_rss_bytes: None,
+        };
+        let message = revival_failed_message(
+            "tool find_references",
+            "http://127.0.0.1:32881",
+            "error sending request",
+            "exited with signal: 9 (SIGKILL)",
+            Some(&record),
+        );
+        assert!(
+            message.contains("killed by signal 9 2 time(s)"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("killed by the memory limit"),
+            "no counter said memory, so nothing may say memory: {message}"
+        );
+        assert!(
+            message.contains("no memory accounting"),
+            "the reason nothing is attributed belongs in the message: {message}"
+        );
+    }
+
+    /// The `negative` envelope is attached by message wording: six named tools
+    /// whose error text contains "no entity" or "entity not found"
+    /// (`crate::negative::is_resolution_miss`). A sentence appended to a
+    /// daemon-loss error must therefore not speak that language, or a transport
+    /// failure would start carrying a resolution-miss verdict about an entity
+    /// nobody asked about.
+    #[test]
+    fn the_recorded_cause_never_speaks_the_negative_envelope_s_language() {
+        let record = memory_kill_record(4);
+        let unattributed = kin_daemon_spawn::DaemonKillRecord {
+            memory_kills: 0,
+            last_cause: kin_daemon_spawn::DaemonKillCause::Unattributed { signal: 9 },
+            limit_bytes: None,
+            ..memory_kill_record(2)
+        };
+        for record in [&record, &unattributed] {
+            for message in [
+                revival_failed_message("tool find_references", "url", "err", "err", Some(record)),
+                revived_retry_failed_message("tool find_references", "url", "err", Some(record)),
+                transport_dropped_message("MCP tool call", "err", Some(record)),
+            ] {
+                let lowered = message.to_ascii_lowercase();
+                assert!(!lowered.contains("no entity"), "{message}");
+                assert!(!lowered.contains("entity not found"), "{message}");
+            }
+        }
     }
 }

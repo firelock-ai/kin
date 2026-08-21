@@ -7178,6 +7178,9 @@ pub async fn ensure_daemon_running_with_idle_timeout(
     cmd.stdout(Stdio::from(log));
     cmd.stderr(Stdio::from(stderr));
 
+    // Opened before the spawn: attributing a kill to memory needs the kernel's
+    // counter from before this daemon existed, not one read after it died.
+    let watch = kin_daemon_spawn::DaemonWatch::begin(kin_root);
     let mut child = cmd
         .spawn()
         .with_context(|| format!("spawn kin-daemon for {}", working_dir.display()))
@@ -7190,7 +7193,7 @@ pub async fn ensure_daemon_running_with_idle_timeout(
     // daemon: `kin mcp start` reaches here for a whole agent session. Dropping
     // the handle waits on nothing, so hand it to the reaper before the borrow
     // ends rather than leaving a corpse behind for the session's duration.
-    kin_daemon_spawn::adopt_detached_daemon_child(child);
+    kin_daemon_spawn::adopt_watched_daemon_child(child, watch);
     let base_url = readiness.map_err(|error| match error {
         DaemonReadinessError::Failed(error) => AutoStartError::spawn(format!("{error:#}")),
         DaemonReadinessError::Timeout(detail) => AutoStartError::StartupTimeout(detail),
