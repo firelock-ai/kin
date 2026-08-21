@@ -67,6 +67,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      # Before the build, because this needs no binary and no corpus and a broken
+      # grader should be named in seconds rather than after three minutes of
+      # compiling. Every verdict the brownfield suite reports is decided by
+      # verdict_surfaces, name_matches, sweep_verdict and Result.status, and each
+      # self-test case is paired with its inverse, so a grader that cannot tell
+      # its own cases apart fails here instead of reporting a clean product on a
+      # broken one.
+      - name: Falsify the brownfield verdict graders
+        run: python3 scripts/acceptance/brownfield_repro.py --self-test
+
       - name: Install Rust toolchain
         uses: ./.github/actions/rust-toolchain
 
