@@ -1517,6 +1517,78 @@ fn write_sweep_interruptions(state: &DaemonState, count: u32) {
     let _ = std::fs::write(sweep_interruption_path(state), count.to_string());
 }
 
+/// Where a sweep records that it has begun and not yet ended.
+///
+/// Everything a sweep says about itself is written after its last file: the
+/// publication, the resume marker, the interruption count and the completion
+/// line all live in the tail of the loop. The enrichment worker is a detached
+/// task that nothing joins, so a daemon whose process ends mid-sweep reaches
+/// none of them, and the store keeps no trace that a sweep ever ran. A killed
+/// sweep and a sweep that never started are then the same store, which is the
+/// half of this that made the loss permanent: nothing downstream can act on a
+/// fact nobody recorded.
+fn sweep_in_flight_path(state: &DaemonState) -> std::path::PathBuf {
+    state.layout.root().join("lsp-sweep-in-flight")
+}
+
+/// Record that a cold sweep has begun.
+fn sweep_started(state: &DaemonState) {
+    let _ = std::fs::write(sweep_in_flight_path(state), b"");
+}
+
+/// Record how a cold sweep ended, and that it ended at all.
+///
+/// One function because they are one fact. A sweep that reaches here has an
+/// outcome the count describes, and clearing the in-flight record is what makes
+/// the absence of an outcome mean something. Written apart, a future exit could
+/// clear the record without counting, and the store would call a killed sweep a
+/// finished one.
+///
+/// Returns the count it wrote, which is what the completion line reports.
+fn sweep_finished(state: &DaemonState, ended_early: bool, enriched: usize) -> u32 {
+    let counted = next_interruption_count(read_sweep_interruptions(state), ended_early, enriched);
+    write_sweep_interruptions(state, counted);
+    let _ = std::fs::remove_file(sweep_in_flight_path(state));
+    counted
+}
+
+/// What a starting daemon does about a cold sweep, given what this store
+/// records about the last one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SweepStartDecision {
+    /// Queue a cold sweep.
+    Queue,
+    /// Queue nothing: this store's last sweeps all died without enriching.
+    CircuitOpen { interruptions: u32 },
+}
+
+/// Settle the previous sweep, then decide about this one.
+///
+/// A sweep killed before its own tail is counted HERE, because it could not
+/// count itself. Nothing it did was published or marked, so its outcome is
+/// exactly an interruption that enriched nothing, and reading it at startup is
+/// the only place the fact is available. Taking the record also clears it, so
+/// one kill is counted once however many daemons follow it.
+fn decide_sweep_on_start(state: &DaemonState) -> SweepStartDecision {
+    let path = sweep_in_flight_path(state);
+    if path.exists() {
+        let _ = std::fs::remove_file(&path);
+        let counted = next_interruption_count(read_sweep_interruptions(state), true, 0);
+        write_sweep_interruptions(state, counted);
+        warn!(
+            consecutive_fruitless_interruptions = counted,
+            "the previous language-server sweep did not reach its own end, so it published \
+             nothing and recorded nothing; this start counts it and sweeps its files again"
+        );
+    }
+    let interruptions = read_sweep_interruptions(state);
+    if sweep_circuit_open(interruptions) {
+        SweepStartDecision::CircuitOpen { interruptions }
+    } else {
+        SweepStartDecision::Queue
+    }
+}
+
 /// Whether a finished sweep may record its files as enriched.
 ///
 /// Marking is safe when the sweep published, and also when it produced nothing
@@ -1997,18 +2069,21 @@ pub async fn run_with_authority_on(
         // fewer, not another. Queued on EVERY daemon start, this is the point
         // the marker-discard loop turns at: a sweep dies, the daemon restarts,
         // queues another, dies again. One stranger session logged 24 of them.
-        let interruptions = read_sweep_interruptions(&state);
-        if sweep_circuit_open(interruptions) {
-            warn!(
-                consecutive_fruitless_interruptions = interruptions,
-                limit = SWEEP_INTERRUPTION_LIMIT,
-                "not queueing an LSP sweep: this store's last sweeps all ended early without \
-                 enriching anything, so another would repeat what has been failing. Enrichment \
-                 stays at what is already durable; one sweep that completes clears this."
-            );
-        } else {
-            info!("queueing an LSP sweep so a graph with unenriched files converges");
-            state.queue_lsp_sweep();
+        match decide_sweep_on_start(&state) {
+            SweepStartDecision::CircuitOpen { interruptions } => {
+                warn!(
+                    consecutive_fruitless_interruptions = interruptions,
+                    limit = SWEEP_INTERRUPTION_LIMIT,
+                    "not queueing an LSP sweep: this store's last sweeps all ended early without \
+                     enriching anything, so another would repeat what has been failing. \
+                     Enrichment stays at what is already durable; one sweep that completes \
+                     clears this, and `kin daemon sweep` asks for one."
+                );
+            }
+            SweepStartDecision::Queue => {
+                info!("queueing an LSP sweep so a graph with unenriched files converges");
+                state.queue_lsp_sweep();
+            }
         }
     }
 
@@ -2884,6 +2959,11 @@ pub async fn run_with_authority_on(
     ));
 
     // Spawn the LSP enrichment worker (channel was set up before Arc::new).
+    // Held rather than dropped. This worker owns the cold sweep, and everything
+    // a sweep makes durable happens after its last file, so a shutdown that
+    // does not wait for it throws away the whole pass. See
+    // `drain_lsp_enrichment` below for what the waiting costs and when.
+    let mut lsp_handle: Option<tokio::task::JoinHandle<()>> = None;
     if let Some(mut lsp_rx) = lsp_rx {
         let mut lsp_cancel = cancel_rx.clone();
         let lsp_state = Arc::clone(&state);
@@ -2898,7 +2978,7 @@ pub async fn run_with_authority_on(
         // rebuild this pass is a real loop, so it has a checkpoint to read a
         // halt at and can be stopped rather than only disclosed.
         let lsp_pass = state.background_work.pass(crate::background_work::PASS_LSP);
-        let _lsp_handle = tokio::spawn(async move {
+        lsp_handle = Some(tokio::spawn(async move {
             info!("LSP enrichment worker started");
             let source_view = match lsp_state.graph_owned_source_view() {
                 Ok(view) => view,
@@ -2953,7 +3033,14 @@ pub async fn run_with_authority_on(
                     // started keeps accumulating and becomes observable.
                     lsp_pass.idle();
                     tokio::select! {
-                        Some(msg) = lsp_rx.recv() => msg,
+                        // Biased so shutdown wins over a queued message. Both
+                        // arms are ready at once whenever a sweep is waiting
+                        // when the cancel arrives, and an unbiased select picks
+                        // between them at random: half the time a daemon that
+                        // was asked to stop STARTS a sweep instead, and the
+                        // shutdown then waits out its drain budget on work
+                        // nobody can use.
+                        biased;
                         _ = lsp_cancel.changed() => {
                             for (lang, server) in servers {
                                 info!(language = %lang, "shutting down LSP server");
@@ -2962,6 +3049,7 @@ pub async fn run_with_authority_on(
                             info!("LSP enrichment worker shutting down");
                             break;
                         }
+                        Some(msg) = lsp_rx.recv() => msg,
                     }
                 };
                 lsp_pass.working(Instant::now());
@@ -3188,6 +3276,10 @@ pub async fn run_with_authority_on(
 
                     LspEnrichmentMessage::Sweep => {
                         info!("LSP cold sweep started, enriching all entities");
+                        // Durable, and before any work, so a process that ends
+                        // between here and the tail leaves the store saying so.
+                        // First, because "any work" includes the probe below.
+                        sweep_started(&lsp_state);
                         // Re-probe here, not only at daemon start. Readiness
                         // taken once latches: a user who follows Kin's own
                         // advice and installs the server it just named leaves a
@@ -3590,13 +3682,11 @@ pub async fn run_with_authority_on(
 
                         // The breaker's count moves on the sweep's own outcome,
                         // and is persisted because the loop it guards spans
-                        // daemon restarts rather than living inside one.
-                        let interruptions = next_interruption_count(
-                            read_sweep_interruptions(&lsp_state),
-                            tally.ended_early,
-                            tally.enriched,
-                        );
-                        write_sweep_interruptions(&lsp_state, interruptions);
+                        // daemon restarts rather than living inside one. The
+                        // same call clears the in-flight record, so reaching
+                        // here is what makes this sweep a finished one.
+                        let interruptions =
+                            sweep_finished(&lsp_state, tally.ended_early, tally.enriched);
 
                         // The marker records durability, so it is written here
                         // and only here, after the publication above settled it.
@@ -3681,7 +3771,7 @@ pub async fn run_with_authority_on(
                     } // end Sweep
                 } // end match
             }
-        });
+        }));
     }
 
     // Persistent daemons stay alive until SIGTERM/SIGINT, `kin eject`, or
@@ -3704,6 +3794,11 @@ pub async fn run_with_authority_on(
         cancel_tx,
     )
     .await;
+
+    // Before the CAS barrier and before the endpoint files go, because an
+    // in-flight sweep still has a publication to make and it makes it through
+    // this state.
+    drain_lsp_enrichment(lsp_handle).await;
 
     // The derived ingestion CAS defers its directory barriers and commits them
     // on an explicit sync, on drop, or on a self-drain. This process ends in
@@ -3828,6 +3923,53 @@ async fn select_with_signals(
     )
     .await;
     result
+}
+
+/// Ceiling on how long a shutdown waits for an in-flight cold sweep to reach
+/// its own end.
+///
+/// A ceiling, not an amount of waiting. The enrichment worker's idle arm selects
+/// on the cancel signal, so a daemon with no sweep running joins immediately
+/// however large this is, and the budget is spent only when a sweep is actually
+/// mid-file. What it buys is the sweep's tail, which is where the publication,
+/// the resume marker, the interruption count and the completion line all live.
+/// Without it a shutdown lands between the first file and the last and the
+/// whole pass is lost: measured on a four-file Python store, a SIGTERM 327 ms
+/// into a sweep drained all seven other tasks by name, produced no completion
+/// line at all, and left the store carrying neither a resume marker nor an
+/// interruption count.
+///
+/// Derived from the escalation grace rather than written as a number, because
+/// the escalation watchdog is the real hard bound: it force-exits the process
+/// once the grace elapses, and a drain budget larger than that is a promise the
+/// process cannot keep. It would also be silent, since a force-exit runs no
+/// warning. Half, so the flush, the derived-CAS barrier and endpoint retirement
+/// still have the other half to finish in.
+fn lsp_drain_budget_from(escalation_grace: Duration) -> Duration {
+    escalation_grace / 2
+}
+
+fn lsp_drain_budget() -> Duration {
+    lsp_drain_budget_from(shutdown_escalation_grace())
+}
+
+/// Wait for the enrichment worker to finish what it was doing, under a ceiling.
+async fn drain_lsp_enrichment(handle: Option<tokio::task::JoinHandle<()>>) {
+    let Some(handle) = handle else {
+        return;
+    };
+    let budget = lsp_drain_budget();
+    match tokio::time::timeout(budget, handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            warn!(%error, "the LSP enrichment worker panicked during shutdown")
+        }
+        Err(_) => warn!(
+            budget_secs = budget.as_secs(),
+            "an LSP sweep did not reach its end within the shutdown budget; this store records \
+             it as in flight and the next daemon sweeps its files again"
+        ),
+    }
 }
 
 async fn drain_handles(
@@ -5396,6 +5538,260 @@ mod enrichment_marker_tests {
             "a graph that still holds language-server relations resumes rather than re-sweeping"
         );
         assert!(lsp_enriched_marker_path(&state).exists());
+    }
+}
+
+/// The lifecycle a cold sweep has across daemon restarts, which is where this
+/// went wrong and where its unit tests never looked.
+///
+/// The tally tests below exercise a sweep's arithmetic in isolation, and six of
+/// them passed throughout while an interrupted sweep on a real store recorded
+/// nothing at all. Arithmetic was never the gap: the gap was that everything a
+/// sweep writes lives after its last file, and nobody modelled a process that
+/// ends before then. These tests model exactly that, by calling the same two
+/// functions the sweep calls and simply not calling the second one.
+#[cfg(test)]
+mod sweep_lifecycle_tests {
+    use super::{
+        decide_sweep_on_start, file_already_enriched, load_lsp_enriched_marker,
+        mark_files_enriched, read_sweep_interruptions, sweep_finished, sweep_in_flight_path,
+        sweep_started, SweepStartDecision, SWEEP_INTERRUPTION_LIMIT,
+    };
+    use crate::state::DaemonState;
+    use kin_model::EntityStore;
+
+    fn open_store(repo_dir: &std::path::Path) -> DaemonState {
+        let init = kin_core::init(repo_dir).unwrap();
+        DaemonState::open(init.layout).unwrap()
+    }
+
+    /// One language-server relation, so the resume marker is corroborated by the
+    /// graph and `load_lsp_enriched_marker` honors it. Without this a marker is
+    /// discarded by design, and the skip half of these tests would pass for a
+    /// reason that has nothing to do with what they check.
+    fn install_language_server_relation(state: &DaemonState) {
+        let mut entities = Vec::new();
+        for name in ["send", "adapter_send"] {
+            let entity = kin_model::Entity {
+                id: kin_model::EntityId::new(),
+                kind: kin_model::EntityKind::Function,
+                name: name.to_string(),
+                language: kin_model::LanguageId::Python,
+                fingerprint: kin_model::SemanticFingerprint {
+                    algorithm: kin_model::FingerprintAlgorithm::V1TreeSitter,
+                    ast_hash: kin_model::Hash256::from_bytes([1; 32]),
+                    signature_hash: kin_model::Hash256::from_bytes([2; 32]),
+                    behavior_hash: kin_model::Hash256::from_bytes([3; 32]),
+                    equivalence_hash: kin_model::Hash256::from_bytes([0; 32]),
+                    stability_score: 1.0,
+                },
+                file_origin: Some(kin_model::FilePathId::new("src/pkg/adapter.py")),
+                span: None,
+                signature: format!("def {name}()"),
+                visibility: kin_model::Visibility::Public,
+                role: kin_model::EntityRole::Source,
+                doc_summary: None,
+                metadata: kin_model::EntityMetadata::default(),
+                lineage_parent: None,
+                created_in: None,
+                superseded_by: None,
+            };
+            state.graph.upsert_entity(&entity).unwrap();
+            entities.push(entity);
+        }
+        state
+            .graph
+            .upsert_relation(&kin_model::Relation {
+                id: kin_model::RelationId::new(),
+                kind: kin_model::RelationKind::Calls,
+                src: kin_model::GraphNodeId::Entity(entities[0].id),
+                dst: kin_model::GraphNodeId::Entity(entities[1].id),
+                confidence: 1.0,
+                origin: kin_model::RelationOrigin::Lsp,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+    }
+
+    fn swept_files() -> Vec<String> {
+        vec![
+            "src/pkg/adapter.py".to_string(),
+            "src/pkg/auth.py".to_string(),
+            "src/pkg/models.py".to_string(),
+            "src/main.py".to_string(),
+        ]
+    }
+
+    /// The failure this ticket is about, as a lifecycle: a sweep starts, the
+    /// daemon's process ends before the sweep's tail, and a successor comes up.
+    ///
+    /// Observed on a four-file Python store at kin d4335ad0: a SIGTERM 327 ms
+    /// into a sweep drained all seven other daemon tasks by name, emitted no
+    /// completion line, and left the store carrying neither a resume marker nor
+    /// an interruption count. A kill nobody records is a kill nothing can act
+    /// on, which is why the breaker written for exactly this loop could not see
+    /// it.
+    #[test]
+    fn a_sweep_killed_before_its_tail_is_counted_once_and_the_successor_still_sweeps() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let state = open_store(repo_dir.path());
+
+        sweep_started(&state);
+        assert!(
+            sweep_in_flight_path(&state).exists(),
+            "a sweep must record that it began before it does any work, because the process \
+             can end at any point after this and nothing later runs"
+        );
+
+        // The daemon dies here. Nothing in the sweep's tail executes.
+        let decision = decide_sweep_on_start(&state);
+
+        assert_eq!(
+            decision,
+            SweepStartDecision::Queue,
+            "a daemon following an interrupted sweep must queue a cold sweep"
+        );
+        assert_eq!(
+            read_sweep_interruptions(&state),
+            1,
+            "the successor must count the killed sweep, because the sweep could not count \
+             itself; an uncounted kill is invisible to the breaker that exists for it"
+        );
+        assert!(
+            !sweep_in_flight_path(&state).exists(),
+            "and it must take the record rather than read it, so one kill is counted once \
+             however many daemons follow"
+        );
+
+        assert_eq!(
+            decide_sweep_on_start(&state),
+            SweepStartDecision::Queue,
+            "a second start after the same kill still sweeps"
+        );
+        assert_eq!(
+            read_sweep_interruptions(&state),
+            1,
+            "and does not count that one kill again"
+        );
+    }
+
+    /// A budget the process cannot spend is not a budget.
+    ///
+    /// The escalation watchdog force-exits once its grace elapses, and it runs
+    /// no warning on the way out, so a drain budget at or above that grace both
+    /// overstates what the shutdown waits and hides the overrun it promised to
+    /// report. The first version of this fix was written as a flat 30 seconds
+    /// against a 25-second grace, which is exactly that mistake.
+    #[test]
+    fn the_drain_budget_always_ends_before_the_force_exit_it_races() {
+        let grace = super::DEFAULT_SHUTDOWN_ESCALATION_GRACE;
+        assert!(
+            super::lsp_drain_budget_from(grace) < grace,
+            "the shutdown's wait for a sweep must end before the watchdog force-exits, or the \
+             budget describes a wait the process never performs"
+        );
+        // An operator who sets the grace very low gets a proportionally low
+        // budget rather than one that swallows the whole shutdown.
+        let tight = std::time::Duration::from_secs(2);
+        assert!(
+            super::lsp_drain_budget_from(tight) < tight,
+            "and it must stay under a grace an operator has tightened, which is the case a \
+             flat constant gets wrong"
+        );
+    }
+
+    /// The breaker still turns, so counting kills does not mint an endless loop.
+    #[test]
+    fn enough_killed_sweeps_open_the_circuit() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let state = open_store(repo_dir.path());
+
+        let mut decision = SweepStartDecision::Queue;
+        for _ in 0..SWEEP_INTERRUPTION_LIMIT {
+            sweep_started(&state);
+            decision = decide_sweep_on_start(&state);
+        }
+
+        assert_eq!(
+            decision,
+            SweepStartDecision::CircuitOpen {
+                interruptions: SWEEP_INTERRUPTION_LIMIT
+            },
+            "a store whose sweeps have all died without enriching anything must stop being \
+             handed another one"
+        );
+    }
+
+    /// The other direction, so the fix above is not simply "always call it
+    /// interrupted": a sweep that reached its own end is a finished sweep, and
+    /// the next daemon must not re-derive what it already made durable.
+    #[test]
+    fn a_completed_sweep_is_not_counted_as_an_interruption_and_its_files_are_not_re_swept() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let files = swept_files();
+
+        // The empty case is its own failure, ahead of everything below. With no
+        // files enriched, "no file is re-swept" is true of any code at all,
+        // including code with the skip deleted, so an empty list would make
+        // every assertion after this one vacuous.
+        assert!(
+            !files.is_empty(),
+            "this test proves files are not re-swept, so it needs files; an empty set makes \
+             the property trivially true and the test unable to fail"
+        );
+
+        let layout = kin_core::init(repo_dir.path()).unwrap().layout;
+        {
+            let state = DaemonState::open(layout.clone()).unwrap();
+
+            sweep_started(&state);
+            // The sweep's tail, in the order the sweep runs it.
+            mark_files_enriched(&state, &files);
+            let counted = sweep_finished(&state, false, files.len());
+
+            assert_eq!(
+                counted, 0,
+                "a sweep that finished must reset the interruption count"
+            );
+            assert!(
+                !sweep_in_flight_path(&state).exists(),
+                "and must leave no in-flight record, or the next start reads a finished sweep \
+                 as a killed one"
+            );
+        }
+
+        // A new daemon on the same store. Opened fresh rather than reused,
+        // because the skip below must come from the marker this store now
+        // carries, not from a set the first daemon left in memory.
+        let state = DaemonState::open(layout).unwrap();
+        // The relations the completed sweep published, which this daemon opened
+        // its graph on. They are what the marker is checked against: a marker
+        // the graph cannot corroborate is discarded by design, so without them
+        // the skip below would fail for a reason that is not this test's.
+        install_language_server_relation(&state);
+
+        assert_eq!(
+            decide_sweep_on_start(&state),
+            SweepStartDecision::Queue,
+            "the successor still queues a sweep, which is what keeps an unfinished graph \
+             converging"
+        );
+        assert_eq!(
+            read_sweep_interruptions(&state),
+            0,
+            "but a completed sweep must not be counted as an interruption by the next start"
+        );
+
+        load_lsp_enriched_marker(&state);
+        for file in &files {
+            assert!(
+                file_already_enriched(&state, file),
+                "the successor's sweep must skip {file}, which the completed sweep already \
+                 made durable"
+            );
+        }
     }
 }
 
