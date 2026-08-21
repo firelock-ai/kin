@@ -586,6 +586,151 @@ class Session:
     );
 }
 
+// ── The declared receiver whose class is in the calling file ────────────────
+//
+// Every fixture above splits the annotated receiver from its class across two
+// files, which is the shape FIR-2500 was filed on. The greenfield miss is the
+// other half: one module holds the class and the module-level function that
+// takes it as an annotated parameter, and the call between them is the one a
+// reader would expect to be easiest.
+
+/// One module, both halves. `Database` and the function annotating a parameter
+/// with it live in `storage.py`, so the owner half of the qualified callee
+/// names a class in the calling file.
+const STORAGE_PY: &str = r#"
+class Database:
+    def upsert_note(self, path, body):
+        return path
+
+
+def ingest_directory(database: Database, root):
+    return database.upsert_note(root, "")
+"#;
+
+/// A second file so the fixture universe is a real cross-file link rather than
+/// a single-file degenerate case, and so its own cross-file call can serve as
+/// the positive control that the linker ran at all.
+const NOTEKEEPER_CLI_PY: &str = r#"
+from storage import ingest_directory
+
+
+def main(database, root):
+    return ingest_directory(database, root)
+"#;
+
+#[test]
+fn a_declared_receiver_binds_when_its_class_is_in_the_calling_file() {
+    let files = vec![
+        parse_py("storage.py", STORAGE_PY),
+        parse_py("cli.py", NOTEKEEPER_CLI_PY),
+    ];
+    let target = entity_id(
+        &files,
+        "storage.py",
+        "Database.upsert_note",
+        EntityKind::Method,
+    );
+    let caller = entity_id(
+        &files,
+        "storage.py",
+        "ingest_directory",
+        EntityKind::Function,
+    );
+    let main = entity_id(&files, "cli.py", "main", EntityKind::Function);
+
+    let relations = link_cross_file(&files);
+
+    assert!(
+        has_call(&relations, main, caller),
+        "positive control: this fixture's cross-file call must bind, or the \
+         same-file assertion below is measuring a linker that never ran"
+    );
+
+    assert!(
+        has_call(&relations, caller, target),
+        "`database.upsert_note(root, \"\")` under `database: Database` must \
+         bind to Database.upsert_note when Database is declared in this very \
+         file; a declared type the caller can see without an import is the \
+         easiest case, not the hardest"
+    );
+
+    let edge = relations
+        .iter()
+        .find(|r| {
+            r.kind == RelationKind::Calls
+                && r.src.as_entity() == Some(caller)
+                && r.dst.as_entity() == Some(target)
+        })
+        .expect("the declared receiver type binds this call");
+
+    assert_eq!(
+        RelationResolution::of(edge).as_str(),
+        "type_resolved",
+        "and it must publish as proven from the declared type, exactly as the \
+         cross-file twin does; a disclaimed bare-name edge is withheld from \
+         the counts find_references reports"
+    );
+}
+
+#[test]
+fn the_same_declared_receiver_binds_with_its_class_moved_to_another_file() {
+    // The control, and a minimal pair with the test above: same annotation,
+    // same call text, same callee. The one difference is that `Database` now
+    // lives in its own file and an import brings the name back. This is the
+    // path the rest of this suite covers, so it must pass, which is what makes
+    // a failure above a statement about the class's file and nothing else.
+    let files = vec![
+        parse_py(
+            "db.py",
+            r#"
+class Database:
+    def upsert_note(self, path, body):
+        return path
+"#,
+        ),
+        parse_py(
+            "storage.py",
+            r#"
+from db import Database
+
+
+def ingest_directory(database: Database, root):
+    return database.upsert_note(root, "")
+"#,
+        ),
+        parse_py("cli.py", NOTEKEEPER_CLI_PY),
+    ];
+    let target = entity_id(&files, "db.py", "Database.upsert_note", EntityKind::Method);
+    let caller = entity_id(
+        &files,
+        "storage.py",
+        "ingest_directory",
+        EntityKind::Function,
+    );
+
+    let relations = link_cross_file(&files);
+
+    assert!(
+        has_call(&relations, caller, target),
+        "the cross-file half of the pair must bind through the declared type"
+    );
+
+    let edge = relations
+        .iter()
+        .find(|r| {
+            r.kind == RelationKind::Calls
+                && r.src.as_entity() == Some(caller)
+                && r.dst.as_entity() == Some(target)
+        })
+        .expect("the declared receiver type binds this call");
+
+    assert_eq!(
+        RelationResolution::of(edge).as_str(),
+        "type_resolved",
+        "the cross-file half publishes the declared-type marker"
+    );
+}
+
 // ── FIR-2508: a module and a same-named function ────────────────────────────
 
 const SEARCH_PY: &str = r#"
