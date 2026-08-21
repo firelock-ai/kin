@@ -275,9 +275,12 @@ pub fn trace_relation_is_annotation(kind: RelationKind) -> bool {
 
 /// Why a trace walk reported a node as a leaf instead of expanding it.
 ///
-/// A terminal is not a truncation. Both of these are boundaries of what a
-/// data-flow answer means, so neither says the caller received less of the
-/// chain than exists; they say the chain ends there.
+/// Three of these are boundaries of what a data-flow answer means and say the
+/// chain ends there. Two are shortfalls and say the walk stopped before the
+/// chain did. [`TraceTerminal::truncates`] is the one place that distinction is
+/// decided, because a response reporting the same flag for both is the defect
+/// this enum grew to fix: a walk that stopped for lack of an edge read as a
+/// walk that ran out of code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TraceTerminal {
     /// The repository defines nothing for this symbol, so there is no next hop
@@ -291,6 +294,21 @@ pub enum TraceTerminal {
     /// class share nothing, so traversing the annotation makes every widely
     /// used type name a hub joining everything to everything.
     TypeAnnotation,
+    /// The walk read this node's relations and the graph held no admissible
+    /// edge of the walked classes, on a language whose deciding classes are
+    /// observed present. This is the only terminal that asserts the chain ends
+    /// here, and it earns that by resting on a coverage observation rather than
+    /// on the empty read alone.
+    Leaf,
+    /// The walk never read this node's relations, because the requested depth
+    /// or a work budget stopped it first. Whatever edges the node holds were
+    /// not examined, so the branch below it is unknown rather than absent.
+    BoundReached,
+    /// The walk read this node's relations and found no admissible edge, on a
+    /// language whose deciding coverage classes are absent or unmeasured. An
+    /// empty read on such a graph cannot be told apart from a graph that could
+    /// not have held the next hop in the first place.
+    CoverageGap,
 }
 
 impl TraceTerminal {
@@ -298,7 +316,88 @@ impl TraceTerminal {
         match self {
             TraceTerminal::ExternalReference => "external_reference",
             TraceTerminal::TypeAnnotation => "type_annotation",
+            TraceTerminal::Leaf => "leaf",
+            TraceTerminal::BoundReached => "bound_reached",
+            TraceTerminal::CoverageGap => "coverage_gap",
         }
+    }
+
+    /// Whether a response carrying this terminal received less chain than
+    /// exists, or may have.
+    ///
+    /// The two boundary terminals are complete answers: a symbol this
+    /// repository does not define has no next hop, and an annotation edge the
+    /// caller declined to walk is a hop they asked not to take. `Leaf` is
+    /// complete for the same reason and says so on evidence. The other two are
+    /// not: one stopped at a bound the caller can raise, and one stopped on a
+    /// graph that could not have answered. Reporting either as complete is what
+    /// let two short chains read as whole ones.
+    pub fn truncates(self) -> bool {
+        match self {
+            TraceTerminal::ExternalReference
+            | TraceTerminal::TypeAnnotation
+            | TraceTerminal::Leaf => false,
+            TraceTerminal::BoundReached | TraceTerminal::CoverageGap => true,
+        }
+    }
+}
+
+/// The terminal a published wire name stands for, or `None` for a name this
+/// build does not know.
+///
+/// Two payload builders read terminals back off a serialized chain, and a name
+/// neither of them recognizes must not be guessed at: a response written by a
+/// build this one has never seen is not evidence of a shortfall.
+pub fn trace_terminal_named(name: &str) -> Option<TraceTerminal> {
+    [
+        TraceTerminal::ExternalReference,
+        TraceTerminal::TypeAnnotation,
+        TraceTerminal::Leaf,
+        TraceTerminal::BoundReached,
+        TraceTerminal::CoverageGap,
+    ]
+    .into_iter()
+    .find(|terminal| terminal.as_str() == name)
+}
+
+/// What a walk's attempt to expand one node actually produced.
+///
+/// Recorded by the walk at the node, because none of it is recoverable from the
+/// finished chain: a node with no children in the payload looks identical
+/// whether its relations were read and held nothing, or were never read at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceExpansion {
+    /// The node's relations were never read: the requested depth was already
+    /// reached, or a work budget ended the walk before this node's turn.
+    BoundStopped,
+    /// The node's relations were read and held no admissible edge of the walked
+    /// classes in the walked direction.
+    NoEdges,
+    /// The node's relations were read and held at least one admissible edge,
+    /// whether or not the per-step cap kept it.
+    HadEdges,
+}
+
+/// Classify a node the walk did not continue through.
+///
+/// `coverage_certain` is the answer's own edge-coverage observation for THIS
+/// node's language, reduced to the one question a terminal rests on: were the
+/// classes the verdict decides on observed present. It is passed in rather than
+/// derived here so one observation governs both the per-hop terminal and the
+/// response-level gate, which is the pairing that stopped agreeing when the
+/// walk published no observation at all.
+///
+/// `None` means the node was expanded and has neighbors, so it is an ordinary
+/// step rather than an end of any kind.
+pub fn trace_walk_terminal(
+    expansion: TraceExpansion,
+    coverage_certain: bool,
+) -> Option<TraceTerminal> {
+    match expansion {
+        TraceExpansion::BoundStopped => Some(TraceTerminal::BoundReached),
+        TraceExpansion::NoEdges if coverage_certain => Some(TraceTerminal::Leaf),
+        TraceExpansion::NoEdges => Some(TraceTerminal::CoverageGap),
+        TraceExpansion::HadEdges => None,
     }
 }
 
@@ -572,6 +671,80 @@ mod tests {
             None,
             "an ordinary call is untouched by either boundary"
         );
+    }
+
+    #[test]
+    fn an_unread_node_and_an_empty_read_are_different_terminals() {
+        // The whole point: the same finished chain, three different reasons for
+        // ending, and the classifier must not collapse them.
+        assert_eq!(
+            trace_walk_terminal(TraceExpansion::BoundStopped, true),
+            Some(TraceTerminal::BoundReached),
+            "a node whose relations were never read cannot be reported as a leaf"
+        );
+        assert_eq!(
+            trace_walk_terminal(TraceExpansion::BoundStopped, false),
+            Some(TraceTerminal::BoundReached),
+            "coverage says nothing about a node the walk never examined"
+        );
+        assert_eq!(
+            trace_walk_terminal(TraceExpansion::NoEdges, true),
+            Some(TraceTerminal::Leaf)
+        );
+        assert_eq!(
+            trace_walk_terminal(TraceExpansion::NoEdges, false),
+            Some(TraceTerminal::CoverageGap),
+            "an empty read on a graph that could not hold the hop is not a leaf"
+        );
+        for certain in [false, true] {
+            assert_eq!(
+                trace_walk_terminal(TraceExpansion::HadEdges, certain),
+                None,
+                "a node with neighbors is an ordinary step, not an end"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_two_shortfall_terminals_truncate() {
+        assert!(TraceTerminal::BoundReached.truncates());
+        assert!(TraceTerminal::CoverageGap.truncates());
+        for complete in [
+            TraceTerminal::ExternalReference,
+            TraceTerminal::TypeAnnotation,
+            TraceTerminal::Leaf,
+        ] {
+            assert!(
+                !complete.truncates(),
+                "{} ends the chain and must not report a shortfall",
+                complete.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn every_terminal_has_its_own_wire_name() {
+        let names: Vec<&str> = [
+            TraceTerminal::ExternalReference,
+            TraceTerminal::TypeAnnotation,
+            TraceTerminal::Leaf,
+            TraceTerminal::BoundReached,
+            TraceTerminal::CoverageGap,
+        ]
+        .iter()
+        .map(|terminal| terminal.as_str())
+        .collect();
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            names.len(),
+            "two terminals sharing a wire name would be indistinguishable to a client: {names:?}"
+        );
+        assert!(names.contains(&"leaf"));
+        assert!(names.contains(&"bound_reached"));
+        assert!(names.contains(&"coverage_gap"));
     }
 
     fn relation(kind: RelationKind, src: EntityId, dst: EntityId) -> Relation {
