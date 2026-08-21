@@ -559,6 +559,32 @@ fn wait_for_live_growth(
     }
 }
 
+/// The live entity count, waited out rather than sampled once.
+///
+/// `kin graph status` exits non-zero on a critical graph health issue, and one
+/// of those is transient by construction: authority admission binds the entity
+/// layer and facets are written per file after it, so a read taken between the
+/// two halves sees a derived tree that trails authority. A caller that wants a
+/// number rather than an event waits for one, and reports the command's own
+/// output when the bound expires instead of a bare `None`.
+fn settled_entity_count(repo: &Path, home: &Path, port: u16) -> u64 {
+    let deadline = Instant::now() + COUNT_SETTLE_BOUND;
+    loop {
+        let (live, status) = live_entity_count(repo, home, port);
+        if let Some(live) = live {
+            return live;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "graph status never reported an entity count: it exited {} and said:\n{}\n{}",
+            status.status,
+            String::from_utf8_lossy(&status.stdout),
+            String::from_utf8_lossy(&status.stderr)
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Whether `kin_graph_status` refused this call and asked to be repeated.
 ///
 /// `crates/kin-daemon/src/api.rs:2084` fails the call outright when the
@@ -616,6 +642,37 @@ fn durability(payload: &serde_json::Value) -> serde_json::Value {
         .get("durability")
         .unwrap_or_else(|| panic!("envelope carries no durability object: {payload}"))
         .clone()
+}
+
+/// The envelope's report of how far graph truth is behind the working copy.
+///
+/// Absent when the runtime reported nothing unadmitted, which is a different
+/// answer from a zero and is why this returns an option rather than a count.
+fn behind(payload: &serde_json::Value) -> Option<serde_json::Value> {
+    payload.get("_kin")?.get("behind").cloned()
+}
+
+/// Set a host entry's modification time outright.
+///
+/// Both stamps are written because setting only one is refused on some hosts,
+/// and the access time is not what any assertion here reads.
+fn stamp_modified(path: &Path, at: std::time::SystemTime) {
+    let handle = fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open the file to stamp it");
+    handle
+        .set_times(fs::FileTimes::new().set_accessed(at).set_modified(at))
+        .expect("stamp the modification time");
+    assert_eq!(
+        fs::symlink_metadata(path)
+            .expect("read back the stamped entry")
+            .modified()
+            .expect("the host publishes modification times"),
+        at,
+        "the stamp has to have applied, or every assertion resting on it is about the file's \
+         real age instead"
+    );
 }
 
 #[test]
@@ -983,7 +1040,7 @@ fn a_file_written_while_no_daemon_watched_is_admitted_by_the_next_one() {
         &kin_against_daemon(&repo, &home, first_port, &["commit", "-m", "link graph"]),
         "kin commit",
     );
-    let watched = live_entity_count(&repo, &home, first_port);
+    let watched = settled_entity_count(&repo, &home, first_port);
     assert!(
         watched > durable_at_init,
         "the fixture needs the watched write recorded before the restart, got {watched} against \
@@ -998,6 +1055,20 @@ fn a_file_written_while_no_daemon_watched_is_admitted_by_the_next_one() {
         b"pub fn build_catch_up() -> u32 {\n    5\n}\n\npub fn walk_catch_up() -> u32 {\n    build_catch_up() + 1\n}\n\npub fn render_catch_up() -> u32 {\n    walk_catch_up() + 1\n}\n",
     )
     .expect("write the unwatched source");
+
+    // And one the catch-up must NOT take: its modification time predates every
+    // admission this store has recorded, so the window does not cover it and
+    // nothing observed it arriving. The bound matters as much as the reach. A
+    // catch-up with no lower bound would sweep the whole working copy, which is
+    // exactly what startup must never do, so this file is both the control on
+    // that bound and the store's remaining behind-ness for the disclosure
+    // assertions below.
+    let stale = repo.join("src/stale_drift.rs");
+    fs::write(&stale, b"pub fn drifted() -> u32 {\n    9\n}\n").expect("write the stale source");
+    stamp_modified(
+        &stale,
+        std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000),
+    );
 
     let second_log = root.path().join("kin-daemon-second.log");
     let mut second = IsolatedDaemon::spawn(&repo, &second_log, &runtime);
@@ -1029,20 +1100,49 @@ fn a_file_written_while_no_daemon_watched_is_admitted_by_the_next_one() {
     // entities is an enrichment defect.
     let deadline = Instant::now() + COUNT_SETTLE_BOUND;
     let caught_up = loop {
-        let live = live_entity_count(&repo, &home, second_port);
-        if live > watched {
-            break live;
+        let (live, status) = live_entity_count(&repo, &home, second_port);
+        if live.is_some_and(|live| live > watched) {
+            break live.expect("the reading above carried a count");
         }
         assert!(
             Instant::now() < deadline,
             "the graph has to carry the file written while nothing watched, but the live \
-             entity count stayed at {live} against {watched} before the restart. The second \
-             daemon's log:\n{}",
+             entity count stayed at {live:?} against {watched} before the restart; graph \
+             status exited {} and said:\n{}\nThe second daemon's log:\n{}",
+            status.status,
+            String::from_utf8_lossy(&status.stdout),
             second.log_text()
         );
         thread::sleep(Duration::from_millis(200));
     };
     assert!(caught_up > watched);
+
+    // FIR-2499's other half, read off the real MCP surface rather than a
+    // hand-built health body. The store still holds one path no admission has
+    // taken, so every envelope has to say so and none may certify over it.
+    let session = settled_mcp_session(&repo, &home, second_port);
+    let locate = payload(&session, 3, "semantic_locate");
+    let behind = behind(&locate)
+        .unwrap_or_else(|| panic!("a store holding an unadmitted path must disclose it: {locate}"));
+    assert_eq!(
+        behind["unadmitted_paths"],
+        serde_json::json!(1),
+        "exactly the stale file is outstanding; the catch-up took the other one: {behind}"
+    );
+    assert!(
+        behind["note"]
+            .as_str()
+            .is_some_and(|note| note.contains("Answers here cover admitted content only")),
+        "the disclosure has to say what it means for an answer: {behind}"
+    );
+    let durability = durability(&locate);
+    assert!(
+        !durability["note"]
+            .as_str()
+            .is_some_and(|note| note.contains("records everything answering here")),
+        "durability may not report an all-clear over a repository holding an unadmitted \
+         module: {durability}"
+    );
 
     second.stop();
 }
