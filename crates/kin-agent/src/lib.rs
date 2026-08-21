@@ -67,19 +67,48 @@ impl ExitStatus {
     }
 }
 
+/// One graph server and the repository it serves.
+///
+/// A run attaches one of these per repository. The agent's own tools are named per server,
+/// and every write is routed to the server that owns the path, so a two-repository run
+/// cannot commit one repository's change into the other's graph.
+#[derive(Debug, Clone)]
+pub struct ServerSpec {
+    pub repo: PathBuf,
+    pub mcp_command: Vec<String>,
+}
+
 /// Everything one run needs.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     pub task: String,
     pub system_prompt: Option<String>,
+    /// The primary repository: the process working directory, the default for a relative
+    /// path, and the repository the transcript names.
     pub repo: PathBuf,
     pub out_dir: PathBuf,
     pub provider: ProviderConfig,
+    /// The primary repository's server argv.
     pub mcp_command: Vec<String>,
+    /// Further repositories attached to the same run, each with its own server. Empty for
+    /// the ordinary single-repository run, whose behaviour is unchanged by this field.
+    pub extra_servers: Vec<ServerSpec>,
     pub mcp_timeout: Duration,
     pub max_tool_calls: u32,
     pub deadline: Duration,
     pub tool_profile: Option<String>,
+}
+
+impl AgentConfig {
+    /// Every server this run attaches, primary first.
+    pub fn servers(&self) -> Vec<ServerSpec> {
+        let mut servers = vec![ServerSpec {
+            repo: self.repo.clone(),
+            mcp_command: self.mcp_command.clone(),
+        }];
+        servers.extend(self.extra_servers.iter().cloned());
+        servers
+    }
 }
 
 /// What a finished run produced.

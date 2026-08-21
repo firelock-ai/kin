@@ -1821,12 +1821,14 @@ enum AgentAction {
         /// accepted on the command line, so it cannot land in a process listing.
         #[arg(long = "api-key-env", value_name = "NAME")]
         api_key_env: Option<String>,
-        /// Repository to work in (default: the current directory)
+        /// Repository to work in (default: the current directory). Repeat to attach a
+        /// second repository; the first given is the primary and a relative path means it.
         #[arg(long, value_name = "PATH")]
-        repo: Option<PathBuf>,
-        /// Override the MCP server command (default: this binary serving --repo)
+        repo: Vec<PathBuf>,
+        /// Override the MCP server command (default: this binary serving --repo). Repeat
+        /// to give one command per --repo, paired in the order both were written.
         #[arg(long = "mcp-command", value_name = "CMD")]
-        mcp_command: Option<String>,
+        mcp_command: Vec<String>,
         /// Directory for the transcript, the Kin trace and the result record
         #[arg(long, value_name = "DIR")]
         out: Option<PathBuf>,
@@ -1854,12 +1856,13 @@ enum AgentAction {
         /// Model id to look for in the endpoint's list
         #[arg(long, value_name = "ID")]
         model: Option<String>,
-        /// Repository to serve (default: the current directory)
+        /// Repository to serve (default: the current directory). Repeat to probe every
+        /// repository a run would attach.
         #[arg(long, value_name = "PATH")]
-        repo: Option<PathBuf>,
-        /// Override the MCP server command
+        repo: Vec<PathBuf>,
+        /// Override the MCP server command. Repeat to give one command per --repo.
         #[arg(long = "mcp-command", value_name = "CMD")]
-        mcp_command: Option<String>,
+        mcp_command: Vec<String>,
         /// Name of an environment variable holding the API key
         #[arg(long = "api-key-env", value_name = "NAME")]
         api_key_env: Option<String>,
