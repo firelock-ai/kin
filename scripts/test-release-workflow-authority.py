@@ -566,6 +566,14 @@ CI_JOB_DISPLAY_NAMES = {
     "install-proof-pr-gate": "Install Proof (PR) Gate",
 }
 EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
+    # The per-pull-request product acceptance job (FIR-2591). It publishes no
+    # required context and claims none; it is registered here because this
+    # census is what would otherwise let a new workflow's job NAME appear
+    # unreviewed. The job id and display name are stable on purpose: renaming
+    # either is what ejects unrelated queue entries.
+    ".github/workflows/acceptance.yml": {
+        "acceptance": "Product Acceptance",
+    },
     # The scheduled advisory sweep. It publishes no required context and runs on
     # no pull-request or merge-group event, so it can never claim one; it is
     # registered here because this census is what would otherwise let a new
