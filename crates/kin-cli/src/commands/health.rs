@@ -15,8 +15,8 @@ use serde_json::Value;
 use crate::commands::auth::default_base_url_for_health;
 use crate::commands::setup::{
     check_binary_in_path, configured_mcp_launcher, detect_shell, detected_ai_client_names,
-    home_dir, hook_filename, kin_dir, shell_rc, shim_filename, CANONICAL_NPM_MCP_COMMAND,
-    CANONICAL_NPM_MCP_PACKAGE,
+    home_dir, hook_filename, kin_dir, shell_path_rc, shell_rc, shim_filename,
+    CANONICAL_NPM_MCP_COMMAND, CANONICAL_NPM_MCP_PACKAGE,
 };
 use crate::daemon_client::{InstalledStartupProtocol, SupervisorStartupSentinel};
 
@@ -1604,10 +1604,25 @@ fn check_shell_path() -> HealthCheck {
         .and_then(|rc| std::fs::read_to_string(rc).ok())
         .unwrap_or_default();
     let rc_sources = rc_content.contains("kin-vfs");
+
+    // The PATH line does not always live beside the hook. zsh's belongs in
+    // `.zshenv`, which is the file a non-interactive shell reads, so reading
+    // only the hook's file would report a correctly installed host as missing
+    // its PATH. Both are read and either satisfies the check, which also keeps
+    // an install that predates the split reading healthy.
+    let path_rc_content = shell_path_rc(shell)
+        .ok()
+        .filter(|path| Some(path) != rc_path.as_ref())
+        .and_then(|rc| std::fs::read_to_string(rc).ok())
+        .unwrap_or_default();
+
     let bin_display = bin_dir.to_string_lossy();
-    let rc_sets_path = rc_content.contains(bin_display.as_ref())
-        || rc_content.contains(".kin/bin")
-        || rc_content.contains("kin/bin");
+    let declares_bin = |content: &str| {
+        content.contains(bin_display.as_ref())
+            || content.contains(".kin/bin")
+            || content.contains("kin/bin")
+    };
+    let rc_sets_path = declares_bin(&rc_content) || declares_bin(&path_rc_content);
 
     let rc_display = rc_path
         .as_ref()
@@ -5809,6 +5824,53 @@ mod tests {
         assert!(
             check.detail.contains("after shell restart"),
             "detail should explain why the current process PATH can lag: {}",
+            check.detail
+        );
+    }
+
+    /// zsh's PATH line lives in `.zshenv`, which is the file a non-interactive
+    /// shell reads, and setup no longer writes it to `.zshrc`. Doctor has to
+    /// read that file or it reports a correctly installed host as missing its
+    /// PATH, which is the shape of check that can never pass.
+    #[test]
+    #[serial]
+    fn shell_path_reads_the_file_a_non_interactive_zsh_actually_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let kin_home = tmp.path().join("kin-home");
+        let hook_dir = kin_home.join("shell");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&hook_dir).unwrap();
+        std::fs::create_dir_all(kin_home.join("bin")).unwrap();
+
+        let hook = hook_dir.join(hook_filename("zsh"));
+        std::fs::write(&hook, "# kin-vfs test hook\n").unwrap();
+
+        // Exactly what setup writes now: the hook in the interactive file, the
+        // PATH line in the file every zsh reads, and neither in the other.
+        std::fs::write(home.join(".zshrc"), format!("source \"{}\"\n", hook.display())).unwrap();
+        std::fs::write(
+            home.join(".zshenv"),
+            format!("export PATH=\"{}:$PATH\"\n", kin_home.join("bin").display()),
+        )
+        .unwrap();
+
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
+        let _kin_dir = EnvVarGuard::unset("KIN_DIR");
+        let _shell = EnvVarGuard::set("SHELL", "/bin/zsh");
+        let _ps_module_path = EnvVarGuard::unset("PSModulePath");
+        let _ps_version_table = EnvVarGuard::unset("PSVersionTable");
+        let _profile = EnvVarGuard::unset("PROFILE");
+        let _path = EnvVarGuard::set("PATH", "/usr/bin");
+
+        let check = check_shell_path();
+        assert_eq!(check.id, "shell_path");
+        assert!(
+            matches!(check.status, HealthStatus::Healthy),
+            "doctor read only the interactive rc, so an install that put the PATH \
+             line where a script can see it reads as broken; got {:?}: {}",
+            check.status,
             check.detail
         );
     }
