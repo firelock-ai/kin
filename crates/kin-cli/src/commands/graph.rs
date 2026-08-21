@@ -1780,10 +1780,10 @@ mod tests {
         );
         assert!(
             unchanged
-                .lines
-                .iter()
-                .any(|line| line.contains("No issues detected")),
-            "the control reaches the all-clear, so its absence below means something: {}",
+                .relation_census
+                .as_ref()
+                .is_some_and(|census| !census.reports_loss()),
+            "the control withholds nothing, so the second arm's warning means something: {}",
             unchanged.lines.join("\n")
         );
 
@@ -1809,9 +1809,17 @@ mod tests {
         )
         .unwrap();
         let rendered = lost.lines.join("\n");
+        // The marker prefix is the assertion that matters. A `⚠` line exists
+        // only when the warnings vector is non-empty, and the all-clear prints
+        // only when that vector is empty, so this proves the loss reached the
+        // branch that suppresses "No issues detected". Asserting the absence of
+        // the all-clear string directly cannot prove it here: this fixture
+        // raises unrelated warnings of its own (pending embeddings, uniform
+        // roles), so that line is unreachable in both arms and the assertion
+        // would pass whether or not the census did anything.
         assert!(
-            !rendered.contains("No issues detected"),
-            "a store that lost a whole relation kind is not issue-free: {rendered}"
+            rendered.contains("⚠ relation kind UsesType lost every edge it held"),
+            "the loss is raised as a warning, which is what withholds the all-clear: {rendered}"
         );
         assert!(
             rendered.contains("UsesType went 1 to 0"),
@@ -1856,8 +1864,15 @@ mod tests {
             "the row states what it cannot do: {rendered}"
         );
         assert!(
-            rendered.contains("No issues detected"),
-            "an unrecorded census is not an issue: {rendered}"
+            !rendered.contains("⚠ relation kind"),
+            "an unrecorded census raises no warning of its own: {rendered}"
+        );
+        assert!(
+            response
+                .relation_census
+                .as_ref()
+                .is_some_and(|census| !census.reports_loss()),
+            "and reports no loss to doctor either"
         );
     }
 
