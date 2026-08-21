@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Report the enrichment cause kin init observed, not one derived from a boolean (#1003)
 - Say when kin trace and kin search cannot rule out what they did not see (#1004)
 - Retry a refused vector checkpoint instead of abandoning its vectors (#1006)
+- Record the complete admission a commit performs (#1008)
+- Wait for the language-server sweep on shutdown, and record one that was killed (#1005)
+- Add list_file_entities, a graph-backed file entity enumeration with certifiable completeness (#1009)
+- Announce a commit to the reconcile loop before it can reach the daemon (#1010)
 
 
 ## [0.5.46] - 2026-08-21
