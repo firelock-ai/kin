@@ -53,6 +53,7 @@ pub use storage::{
     RepositoryAuthorityManager, RepositoryAuthorityState, WorkspaceAdmissionSnapshot,
 };
 pub use storage::{LoadStrategy, SystemMemInfo, TieredConfig, TieredGraph};
+pub use storage::{VectorSidecarDisposition, VectorSidecarLoadOutcome};
 pub use store::{
     ChangeStore, EntityStore, GraphStore, ProvenanceStore, SessionStore, VerificationStore,
     WorkStore,

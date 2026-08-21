@@ -1408,6 +1408,80 @@ fn current_embedding_runtime_fields() -> (
     }
 }
 
+/// Why a persisted vector sidecar's coverage moved while it was being loaded
+/// at open, in terms a caller can render to a user.
+///
+/// "Loaded whole" and "loaded partially" are different facts about a store, so
+/// the exact path and the salvage path are separate variants here. Collapsing
+/// them into one boolean is what let a store that had just retired hundreds of
+/// vectors render exactly like a store filling for the first time.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum VectorSidecarDisposition {
+    /// No sidecar was on disk, so there was no durable coverage to keep or
+    /// lose. This is the first-run case.
+    #[default]
+    NoSidecar,
+    /// The sidecar matched graph authority exactly and was installed whole.
+    /// Orphaned-generation keys minted under a prior change id are still
+    /// evicted on this path, which is why a drop count can be non-zero here.
+    LoadedExact,
+    /// The sidecar's embedding space still matched but its graph-authority
+    /// stamp had drifted, so the index was installed and reconciled per key:
+    /// what current truth can prove was retained, and the rest was retired.
+    ///
+    /// A refused vector checkpoint is one cause, and the one a user feels: the
+    /// vectors were computed, the checkpoint that would have restamped them
+    /// was refused, and the next open salvages only what current truth still
+    /// proves. An ordinary commit between flush and reopen drifts the stamp
+    /// too, with nothing wrong. So this variant reports what was observed and
+    /// never asserts which cause produced it.
+    SalvagedAfterStampDrift,
+    /// The sidecar was refused whole, nothing was installed, and the store
+    /// rebuilds from the missing-key queue. `check` names the comparison that
+    /// failed, the same value the refusal logs.
+    RefusedSidecar { check: String },
+    /// The index's self-description contradicted the sidecar metadata beside
+    /// it, so the pair was archived aside and nothing was installed. `reason`
+    /// carries what the index itself reported.
+    ArchivedIncompatibleIndex { reason: String },
+}
+
+/// What a persisted vector-index sidecar load did to a store's coverage.
+///
+/// `attached` carries exactly the boolean this load used to return on its own:
+/// `true` when an index was installed (exactly or by salvage) and `false` when
+/// nothing was. The rest is the outcome the load already computed and then
+/// dropped on the floor, which left every caller unable to tell a real
+/// coverage loss from ordinary pending work.
+#[derive(Debug, Clone, Default)]
+pub struct VectorSidecarLoadOutcome {
+    /// Whether a vector index was installed into the graph.
+    pub attached: bool,
+    /// Vectors read out of the sidecar, before reconciliation retired any.
+    ///
+    /// Zero whenever nothing was installed, including when a sidecar was on
+    /// disk and was refused before it could be read.
+    pub vectors_loaded: usize,
+    /// Vectors dropped during reconciliation: orphaned generations, plus the
+    /// artifact heads and stale entity heads a salvage could not prove. The
+    /// per-class breakdown stays in the load's own log line.
+    ///
+    /// A refusal reports zero here rather than the sidecar's size, because a
+    /// refused sidecar is never read and its size is not a number this load
+    /// holds. `attached == false` beside `durable_coverage_before_load == true`
+    /// is what says all of it stopped serving.
+    pub vectors_dropped: usize,
+    /// Why coverage moved, and which load path produced it.
+    pub disposition: VectorSidecarDisposition,
+    /// Whether a durable coverage marker (the `.kvec` sidecar) was on disk
+    /// before this load ran.
+    ///
+    /// This is what separates "nothing indexed yet" from "coverage was retired
+    /// at open". Both leave a store with pending work, and only the second one
+    /// lost ground.
+    pub durable_coverage_before_load: bool,
+}
+
 /// What a reopen may do with a persisted vector sidecar, decided from its
 /// metadata alone. Every refusal names the comparison that failed and carries
 /// both sides' values, so the log explains itself instead of announcing a
@@ -1983,8 +2057,11 @@ impl SnapshotManager {
     /// queued for a clean rebuild. After a salvage the same queueing admits only
     /// the keys the reconcile retired or found missing, not the whole store.
     ///
-    /// Returns `true` if a vector index was installed into the graph, `false`
-    /// if nothing was loaded (no sidecar present, or it was refused).
+    /// Returns a [`VectorSidecarLoadOutcome`] describing what happened:
+    /// whether an index was installed, how many vectors it carried, how many
+    /// reconciliation dropped, which load path ran, and whether a durable
+    /// coverage marker was on disk beforehand. `outcome.attached` is the
+    /// boolean this used to return.
     #[cfg(feature = "vector")]
     fn load_vector_index_if_valid(
         path: &Path,
@@ -1992,10 +2069,14 @@ impl SnapshotManager {
         retrieval_authority_hash: [u8; 32],
         write_missing_metadata: bool,
         expected_embedder_identity: Option<&str>,
-    ) -> Result<bool, KinDbError> {
+    ) -> Result<VectorSidecarLoadOutcome, KinDbError> {
         let vector_path = vector_index_path_for(path);
-        if !vector_path.exists() {
-            return Ok(false);
+        // Read once, before anything can create or archive it: a caller cannot
+        // tell "nothing indexed yet" from "coverage was retired at open"
+        // without knowing whether coverage was ever on disk.
+        let durable_coverage_before_load = vector_path.exists();
+        if !durable_coverage_before_load {
+            return Ok(VectorSidecarLoadOutcome::default());
         }
 
         let metadata_path = vector_index_metadata_path_for(path);
@@ -2038,7 +2119,13 @@ impl SnapshotManager {
                     graph.queue_missing_for_embedding();
                     graph.queue_missing_artifacts_for_embedding();
                 }
-                return Ok(false);
+                return Ok(VectorSidecarLoadOutcome {
+                    disposition: VectorSidecarDisposition::RefusedSidecar {
+                        check: "sidecar_metadata_present".to_string(),
+                    },
+                    durable_coverage_before_load,
+                    ..Default::default()
+                });
             }
         };
 
@@ -2063,7 +2150,13 @@ impl SnapshotManager {
                 graph.queue_missing_for_embedding();
                 graph.queue_missing_artifacts_for_embedding();
             }
-            return Ok(false);
+            return Ok(VectorSidecarLoadOutcome {
+                disposition: VectorSidecarDisposition::RefusedSidecar {
+                    check: check.to_string(),
+                },
+                durable_coverage_before_load,
+                ..Default::default()
+            });
         }
 
         // Defense-in-depth against silently-wrong neighbors: verify the index's
@@ -2092,11 +2185,15 @@ impl SnapshotManager {
                     graph.queue_missing_for_embedding();
                     graph.queue_missing_artifacts_for_embedding();
                 }
-                return Ok(false);
+                return Ok(VectorSidecarLoadOutcome {
+                    disposition: VectorSidecarDisposition::ArchivedIncompatibleIndex { reason },
+                    durable_coverage_before_load,
+                    ..Default::default()
+                });
             }
         };
 
-        match verdict {
+        let (disposition, vectors_dropped) = match verdict {
             SidecarVerdict::StampDrift => {
                 // The graph moved (or hashed differently on this construction
                 // path) since the stamp was written, but every vector is still
@@ -2116,6 +2213,12 @@ impl SnapshotManager {
                     retired_stale_entity_heads = stats.retired_stale_entity_heads,
                     "vector sidecar stamp drifted from graph authority; salvaged the index per key instead of rebuilding, and only unproven keys will re-embed"
                 );
+                (
+                    VectorSidecarDisposition::SalvagedAfterStampDrift,
+                    stats.evicted_orphans
+                        + stats.retired_artifact_vectors
+                        + stats.retired_stale_entity_heads,
+                )
             }
             SidecarVerdict::Exact => {
                 // Generation eviction: the stamp gate accepts a sidecar whose
@@ -2132,15 +2235,22 @@ impl SnapshotManager {
                         "evicted orphaned-generation vectors after loading sidecar"
                     );
                 }
+                (VectorSidecarDisposition::LoadedExact, evicted)
             }
             SidecarVerdict::Refuse { .. } => unreachable!("refusals return above"),
-        }
+        };
 
         if count == 0 {
             tracing::debug!(path = %vector_path.display(), "vector index metadata matched but index was empty");
         }
 
-        Ok(true)
+        Ok(VectorSidecarLoadOutcome {
+            attached: true,
+            vectors_loaded: count,
+            vectors_dropped,
+            disposition,
+            durable_coverage_before_load,
+        })
     }
 
     /// Validate and load a persisted vector-index sidecar into `graph`.
@@ -2154,9 +2264,16 @@ impl SnapshotManager {
     /// installed and reconciled per key
     /// ([`InMemoryGraph::reconcile_salvaged_vector_index`]) rather than
     /// refused, so an ordinary commit between flush and reopen does not throw
-    /// prepared vectors away. It returns `Ok(true)` if an index was installed
-    /// (exactly or by salvage) and `Ok(false)` if nothing was loaded (no
-    /// sidecar, or a refusal whose failing comparison the log names).
+    /// prepared vectors away.
+    ///
+    /// It returns a [`VectorSidecarLoadOutcome`] carrying what the load did to
+    /// this store's coverage: whether an index was installed (exactly or by
+    /// salvage), how many vectors the sidecar held, how many reconciliation
+    /// dropped, which load path ran, and whether a durable coverage marker was
+    /// on disk beforehand. `outcome.attached` is the boolean this used to
+    /// return on its own. The counts exist so a caller can tell a store that
+    /// just retired coverage from a store filling for the first time, which a
+    /// bare boolean made indistinguishable.
     ///
     /// `snapshot_path` is the `.kndb` snapshot path (the same value passed to
     /// [`SnapshotManager::open`]); the `.kvec` / `.kvec.meta.json` sidecar paths
@@ -2171,7 +2288,7 @@ impl SnapshotManager {
         graph: &InMemoryGraph,
         snapshot_path: &Path,
         expected_embedder_identity: Option<&str>,
-    ) -> Result<bool, KinDbError> {
+    ) -> Result<VectorSidecarLoadOutcome, KinDbError> {
         let retrieval_authority_hash = graph.retrieval_authority_hash();
         Self::load_vector_index_if_valid(
             snapshot_path,
@@ -2182,14 +2299,15 @@ impl SnapshotManager {
         )
     }
 
-    /// Feature-disabled stub: with no vector backend there is nothing to load.
+    /// Feature-disabled stub: with no vector backend there is nothing to load,
+    /// so the outcome reports an unattached load with no durable coverage.
     #[cfg(not(feature = "vector"))]
     pub fn load_vector_index_into_graph_if_valid(
         _graph: &InMemoryGraph,
         _snapshot_path: &Path,
         _expected_embedder_identity: Option<&str>,
-    ) -> Result<bool, KinDbError> {
-        Ok(false)
+    ) -> Result<VectorSidecarLoadOutcome, KinDbError> {
+        Ok(VectorSidecarLoadOutcome::default())
     }
 
     /// Create a new SnapshotManager with an empty in-memory graph.
@@ -6116,6 +6234,279 @@ mod tests {
             "salvage never moves or deletes the sidecar"
         );
         assert!(!archived_sidecar_path(&vector_path).exists());
+    }
+
+    /// A partial salvage is a real coverage loss and the load must be able to
+    /// say so. The counts already existed as `stats`; the defect was returning
+    /// a bare boolean, which made a store that had just retired vectors read
+    /// exactly like a store filling for the first time.
+    #[test]
+    #[cfg(feature = "vector")]
+    fn a_partial_salvage_reports_its_loaded_and_dropped_counts_and_names_the_drift() {
+        let dir = TempDir::new().unwrap();
+        let snapshot_path = dir.path().join("graph.kndb");
+        let vector_path = vector_index_path_for(&snapshot_path);
+
+        let mgr = SnapshotManager::new(&snapshot_path);
+        let graph = mgr.graph();
+        let keeper = test_entity("salvage_keeper");
+        let loser = test_entity("salvage_loser");
+        graph.upsert_entity(&keeper).unwrap();
+        graph.upsert_entity(&loser).unwrap();
+        let first = seal_change(SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([31; 32])),
+            parents: Vec::new(),
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("tester"),
+            message: "mint both head revisions".into(),
+            entity_deltas: vec![
+                EntityDelta::Added {
+                    new: keeper.clone(),
+                },
+                EntityDelta::Added { new: loser.clone() },
+            ],
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
+        });
+        graph.create_change(&first).unwrap();
+        let keeper_head = graph
+            .latest_revision_id_for(&keeper.id)
+            .expect("the change mints a head revision for the keeper");
+        let loser_head = graph
+            .latest_revision_id_for(&loser.id)
+            .expect("the change mints a head revision for the loser");
+
+        let vectors = VectorIndex::new(4).unwrap();
+        vectors.upsert(keeper.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        vectors
+            .upsert_retrievable(
+                RetrievalKey::EntityRevision(keeper_head),
+                &[0.0, 1.0, 0.0, 0.0],
+            )
+            .unwrap();
+        vectors.upsert(loser.id, &[0.0, 0.0, 1.0, 0.0]).unwrap();
+        vectors
+            .upsert_retrievable(
+                RetrievalKey::EntityRevision(loser_head),
+                &[0.0, 0.0, 0.0, 1.0],
+            )
+            .unwrap();
+        install_current_test_vector_index(graph.as_ref(), &vectors, &vector_path);
+        mgr.save().unwrap();
+        let replacement_snapshot = graph.to_snapshot();
+        drop(graph);
+        drop(mgr);
+
+        // Only the loser's content moves. Half the sidecar's keys stop being
+        // provable and half must survive: a fixture that retires everything
+        // cannot tell a partial salvage from a rebuild, which is the very
+        // distinction this outcome exists to carry.
+        let replacement = InMemoryGraph::from_snapshot(replacement_snapshot).unwrap();
+        let mut moved = loser.clone();
+        moved.signature = "fn salvage_loser_v2()".to_string();
+        replacement.upsert_entity(&moved).unwrap();
+        let second = seal_change(SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([32; 32])),
+            parents: vec![first.id],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("tester"),
+            message: "move one entity's content".into(),
+            entity_deltas: vec![EntityDelta::Modified {
+                old: loser.clone(),
+                new: moved.clone(),
+            }],
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
+        });
+        replacement.create_change(&second).unwrap();
+        assert_ne!(
+            replacement
+                .latest_revision_id_for(&loser.id)
+                .expect("the modification mints a new head revision"),
+            loser_head,
+            "the content change must advance the loser's head, or this test proves nothing"
+        );
+        SnapshotManager::save_graph(&snapshot_path, &replacement).unwrap();
+
+        let outcome = SnapshotManager::load_vector_index_into_graph_if_valid(
+            &replacement,
+            &snapshot_path,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            outcome.attached,
+            "a salvage installs the index it salvaged: {outcome:?}"
+        );
+        assert!(
+            outcome.durable_coverage_before_load,
+            "coverage was durable on disk before this load, which is what makes the drop a loss rather than a first run: {outcome:?}"
+        );
+        assert_eq!(
+            outcome.disposition,
+            VectorSidecarDisposition::SalvagedAfterStampDrift,
+            "a drifted stamp must not report as an exact load: {outcome:?}"
+        );
+        assert_eq!(
+            outcome.vectors_loaded, 4,
+            "the sidecar held two entity heads and their two head revisions: {outcome:?}"
+        );
+        assert_eq!(
+            outcome.vectors_dropped, 2,
+            "the moved entity's superseded revision is evicted and its now-stale head is retired: {outcome:?}"
+        );
+        assert_eq!(
+            replacement.embedding_status().indexed,
+            2,
+            "the unmoved entity's head and head revision keep serving, so this is a partial salvage and not a rebuild"
+        );
+        assert_eq!(
+            outcome.vectors_loaded - outcome.vectors_dropped,
+            replacement.embedding_status().indexed,
+            "loaded minus dropped is exactly what is left serving: {outcome:?}"
+        );
+        assert!(
+            vector_path.exists(),
+            "reporting the salvage never moves or deletes the sidecar"
+        );
+    }
+
+    /// A refusal is the other case the boolean flattened: nothing is serving
+    /// and the store had coverage a moment ago. The outcome names the failing
+    /// comparison so a caller can render the cause instead of a backlog.
+    #[test]
+    #[cfg(feature = "vector")]
+    fn a_refused_sidecar_names_its_check_and_reports_that_coverage_existed() {
+        let dir = TempDir::new().unwrap();
+        let snapshot_path = dir.path().join("graph.kndb");
+        let vector_path = vector_index_path_for(&snapshot_path);
+
+        let mgr = SnapshotManager::new(&snapshot_path);
+        let graph = mgr.graph();
+        let entity = test_entity("refused_owner");
+        graph.upsert_entity(&entity).unwrap();
+        let vectors = VectorIndex::new(4).unwrap();
+        vectors.upsert(entity.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        install_current_test_vector_index(graph.as_ref(), &vectors, &vector_path);
+        mgr.save().unwrap();
+
+        // The deliberate fence: an inexact delta commit zeroes the stamp, and
+        // that sidecar must keep refusing rather than being salvaged.
+        SnapshotManager::invalidate_derived_sidecars(&snapshot_path, graph.as_ref()).unwrap();
+
+        let outcome = SnapshotManager::load_vector_index_into_graph_if_valid(
+            graph.as_ref(),
+            &snapshot_path,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            !outcome.attached,
+            "a refused sidecar installs nothing: {outcome:?}"
+        );
+        assert!(
+            outcome.durable_coverage_before_load,
+            "the sidecar was on disk, so this store is not filling for the first time: {outcome:?}"
+        );
+        assert_eq!(
+            outcome.disposition,
+            VectorSidecarDisposition::RefusedSidecar {
+                check: "graph_authority_stamp".to_string()
+            },
+            "the refusal must carry the comparison that failed: {outcome:?}"
+        );
+        assert_eq!(
+            outcome.vectors_loaded, 0,
+            "a refused sidecar is never read, so no count is claimed for it: {outcome:?}"
+        );
+        assert_eq!(outcome.vectors_dropped, 0, "{outcome:?}");
+    }
+
+    /// The two ends of the discrimination this outcome exists for. A store
+    /// that has never embedded and a store whose sidecar still matches exactly
+    /// must not read like a salvage, and must not read like each other.
+    #[test]
+    #[cfg(feature = "vector")]
+    fn a_first_run_and_an_exact_load_are_distinct_outcomes() {
+        let dir = TempDir::new().unwrap();
+        let snapshot_path = dir.path().join("graph.kndb");
+        let vector_path = vector_index_path_for(&snapshot_path);
+
+        let mgr = SnapshotManager::new(&snapshot_path);
+        let graph = mgr.graph();
+        let entity = test_entity("exact_owner");
+        graph.upsert_entity(&entity).unwrap();
+        mgr.save().unwrap();
+        assert!(
+            !vector_path.exists(),
+            "a graph-only save must not manufacture a sidecar, or the first-run arm below proves nothing"
+        );
+
+        let first_run = SnapshotManager::load_vector_index_into_graph_if_valid(
+            graph.as_ref(),
+            &snapshot_path,
+            None,
+        )
+        .unwrap();
+        assert!(!first_run.attached, "{first_run:?}");
+        assert!(
+            !first_run.durable_coverage_before_load,
+            "a store that has never embedded has no coverage marker to have lost: {first_run:?}"
+        );
+        assert_eq!(
+            first_run.disposition,
+            VectorSidecarDisposition::NoSidecar,
+            "{first_run:?}"
+        );
+        assert_eq!(first_run.vectors_loaded, 0, "{first_run:?}");
+        assert_eq!(first_run.vectors_dropped, 0, "{first_run:?}");
+
+        let vectors = VectorIndex::new(4).unwrap();
+        vectors.upsert(entity.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        install_current_test_vector_index(graph.as_ref(), &vectors, &vector_path);
+        mgr.save().unwrap();
+
+        let exact = SnapshotManager::load_vector_index_into_graph_if_valid(
+            graph.as_ref(),
+            &snapshot_path,
+            None,
+        )
+        .unwrap();
+        assert!(exact.attached, "{exact:?}");
+        assert!(
+            exact.durable_coverage_before_load,
+            "an exact reload reads coverage that was already durable: {exact:?}"
+        );
+        assert_eq!(
+            exact.disposition,
+            VectorSidecarDisposition::LoadedExact,
+            "an exact match must stay distinguishable from a salvage: {exact:?}"
+        );
+        assert_eq!(exact.vectors_loaded, 1, "{exact:?}");
+        assert_eq!(
+            exact.vectors_dropped, 0,
+            "nothing is retired while the stamp still matches: {exact:?}"
+        );
+        assert_ne!(
+            first_run.disposition, exact.disposition,
+            "a first run and an exact reload are different facts about a store"
+        );
     }
 
     /// A genuinely corrupted index refuses loudly: it is archived aside under

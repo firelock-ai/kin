@@ -52,9 +52,9 @@ pub use repository::{
     PreparedWorkspaceGraphStats, RepositoryAuthorityManager, RepositoryAuthorityState,
     WorkspaceAdmissionSnapshot, PREPARED_WORKSPACE_GRAPH_VERSION,
 };
-pub use snapshot::SnapshotManager;
 #[cfg(feature = "vector")]
 pub use snapshot::VECTOR_INDEX_METADATA_VERSION;
+pub use snapshot::{SnapshotManager, VectorSidecarDisposition, VectorSidecarLoadOutcome};
 #[cfg(feature = "sql")]
 pub use sql::SqliteBackend;
 pub use tiered::{LoadStrategy, SystemMemInfo, TieredConfig, TieredGraph};
