@@ -11860,7 +11860,7 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     // before: the adapter was wired, no server was installed, the daemon logged
     // the failed start at debug level, and every cross-file call fell back to
     // matching names.
-    provision_language_servers_in_wizard(&opts, interactive);
+    provision_language_servers_in_wizard(&opts, interactive).await;
 
     report_notification_identity(interactive);
 
@@ -11884,7 +11884,7 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
 /// `--install-language-servers` was passed, because an unattended install
 /// should never spend a user's bandwidth on a prefix they share with the rest
 /// of their toolchain.
-fn provision_language_servers_in_wizard(opts: &WizardOptions, interactive: bool) {
+async fn provision_language_servers_in_wizard(opts: &WizardOptions, interactive: bool) {
     let missing = language_servers::missing_enrichable_languages();
     if missing.is_empty() {
         return;
@@ -11895,7 +11895,7 @@ fn provision_language_servers_in_wizard(opts: &WizardOptions, interactive: bool)
         opts.install_language_servers,
         interactive && !opts.install_language_servers,
     );
-    for line in apply_language_server_provisioning(&missing, consent) {
+    for line in apply_language_server_provisioning(&missing, consent).await {
         println!("  {} {line}", style("✓").green());
     }
 }
@@ -12701,7 +12701,43 @@ fn print_human_report(report: &crate::commands::health::HealthReport) {
 /// returned lines are the "what was applied" list both surfaces already print;
 /// anything not applied is printed here instead, because a declined or failed
 /// install is a fact the operator needs and an empty applied-list is not.
-fn apply_language_server_provisioning(
+/// Ask a running daemon to re-probe and re-enrich after a server was installed.
+///
+/// Readiness taken once latches: a daemon that probed before the install would
+/// keep reporting that language unavailable for the rest of its life, and that
+/// stale answer is an input under an agent-facing verdict. The sweep route
+/// re-probes at its start, so one call refreshes the verdict and produces the
+/// edges the new server can finally resolve.
+///
+/// Returns whether a daemon was actually poked, so the caller can fall back to
+/// telling the user to restart when there was none.
+async fn refresh_running_daemon_after_install(cwd: &std::path::Path) -> bool {
+    let Some(layout) = kin_core::KinLayout::discover(cwd) else {
+        return false;
+    };
+    let Some(url) = crate::daemon_client::resolve_daemon_url_if_running_async(&layout).await else {
+        return false;
+    };
+    // For_layout, not from_base_url: the latter resolves the bearer token from
+    // the process working directory, which is the silent-wrong-target class
+    // that made kin init's conversion phase 401 on runners.
+    let Ok(client) = crate::daemon_client::DaemonClient::from_base_url_for_layout(&url, &layout)
+    else {
+        return false;
+    };
+    match client.queue_lsp_sweep().await {
+        Ok(_) => {
+            println!(
+                "  {} asked the running daemon to re-check its language servers and enrich again",
+                style("✓").green()
+            );
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+async fn apply_language_server_provisioning(
     missing: &[kin_model::LanguageId],
     consent: language_servers::InstallConsent,
 ) -> Vec<String> {
@@ -12794,8 +12830,45 @@ fn apply_language_server_provisioning(
         }
     }
 
+    // An install that lands a binary the server cannot run is not a completed
+    // install. `RanButStillMissing` above already refuses to count a zero exit
+    // that left nothing on PATH; this is its sibling, a zero exit that left
+    // something on PATH which cannot start. Both are the same mistake: counting
+    // a command's exit code as the outcome an operator cares about.
+    //
+    // Probed rather than looked up, because binary presence is exactly what
+    // cannot tell these apart, and this is the surface where the wrong answer
+    // ends the interaction with the user believing they are done.
     if installed_any {
-        println!("  {}", language_servers::RESTART_AFTER_INSTALL);
+        use kin_core::reference_coverage::LanguageServerReadiness;
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let readiness = language_servers::probe_language_server_readiness(&cwd).await;
+        let mut unusable = false;
+        for language in missing {
+            if let Some(LanguageServerReadiness::Unusable { reason }) = readiness.get(language) {
+                unusable = true;
+                applied.retain(|line| !line.contains(&language.to_string()));
+                println!(
+                    "  {} the {language} language server installed but did not start: {reason}",
+                    style("✗").red(),
+                );
+            }
+        }
+        if !unusable {
+            // Poke the sweep the daemon already exposes, rather than only
+            // telling the user to restart. That one route re-probes readiness
+            // AND re-enriches, which is exactly what someone wants after
+            // installing a server, and it is why no dedicated route is needed.
+            //
+            // Best effort by design: outside a repository, or with no daemon
+            // running, there is nothing holding a stale verdict to refresh, and
+            // the restart advice below still covers a daemon this process
+            // cannot reach.
+            let refreshed = refresh_running_daemon_after_install(&cwd).await;
+            if !refreshed {
+                println!("  {}", language_servers::RESTART_AFTER_INSTALL);
+            }
+        }
     }
     applied
 }
@@ -12961,7 +13034,7 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
                 install_language_servers,
                 !install_language_servers && is_tty(),
             );
-            for line in apply_language_server_provisioning(&missing, consent) {
+            for line in apply_language_server_provisioning(&missing, consent).await {
                 applied.push(line);
             }
         }

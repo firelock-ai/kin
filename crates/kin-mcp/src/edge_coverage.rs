@@ -51,12 +51,10 @@
 //! per-entity `has_references: false` rows are absences inside a populated
 //! response.
 
-use std::collections::HashSet;
-
 use serde_json::{json, Map, Value};
 
 use kin_core::reference_coverage::{
-    reference_enrichment_for, ReferenceEnrichment, ENRICHABLE_LANGUAGES,
+    reference_enrichment_for, LanguageServerReadinessMap, ReferenceEnrichment, ENRICHABLE_LANGUAGES,
 };
 use kin_model::entity::Entity;
 use kin_model::graph::{EntityFilter, EntityStore};
@@ -557,11 +555,11 @@ fn attach_reference_resolution<S: EntityStore>(
 /// straight back to certifying because the build limit had lifted while the host
 /// limit had not.
 ///
-/// So the host is probed here now, through the same `PATH` lookup and the same
-/// table the doctor row and the install recipes read. The weakest language
-/// governs, matching how the class states above merge: one unsupported language
-/// in a batch makes the batch's reference evidence unproducible, and one missing
-/// server makes it unproduced.
+/// So the host is not probed here at all; the readiness a process with the right
+/// to spawn already established is read instead. The weakest language governs,
+/// matching how the class states above merge: one unsupported language in a
+/// batch makes the batch's reference evidence unproducible, and one missing or
+/// unusable server makes it unproduced.
 fn reference_enrichment(languages: &[LanguageId]) -> Value {
     let Some(servers) = published_language_servers() else {
         // Nobody published the host state, so nothing is established about any
@@ -593,18 +591,22 @@ fn build_only_reference_enrichment(languages: &[LanguageId]) -> ReferenceEnrichm
 /// silently stops checking is the one that runs in CI.
 fn weakest_reference_enrichment(
     languages: &[LanguageId],
-    servers_found: &HashSet<LanguageId>,
+    readiness: &LanguageServerReadinessMap,
 ) -> ReferenceEnrichment {
     languages
         .iter()
-        .map(|language| reference_enrichment_for(*language, servers_found))
+        .map(|language| reference_enrichment_for(*language, readiness))
         .min_by_key(|state| match state {
             // Weakest first: an unproducible class outranks an unproduced one,
             // which outranks an unread one, which outranks a working server.
             ReferenceEnrichment::Unsupported => 0,
             ReferenceEnrichment::NoLanguageServer => 1,
-            ReferenceEnrichment::Unknown => 2,
-            ReferenceEnrichment::Available => 3,
+            // A server that is present and cannot start produces exactly as
+            // many edges as one that is absent, so it ranks beside it and well
+            // below "nobody looked".
+            ReferenceEnrichment::LanguageServerUnusable => 2,
+            ReferenceEnrichment::Unknown => 3,
+            ReferenceEnrichment::Available => 4,
         })
         .unwrap_or(ReferenceEnrichment::Unknown)
 }
@@ -625,7 +627,7 @@ fn weakest_reference_enrichment(
 /// the same fact the enrichment path acted on. Unpublished reads as unknown, and
 /// unknown establishes nothing, which is the conservative reading this module
 /// takes everywhere else.
-fn published_language_servers() -> Option<HashSet<LanguageId>> {
+fn published_language_servers() -> Option<LanguageServerReadinessMap> {
     #[cfg(test)]
     if let Some(servers) = test_support::server_override() {
         return Some(servers);
@@ -636,18 +638,34 @@ fn published_language_servers() -> Option<HashSet<LanguageId>> {
         .and_then(|servers| servers.clone())
 }
 
-static PUBLISHED_SERVERS: std::sync::RwLock<Option<HashSet<LanguageId>>> =
+static PUBLISHED_SERVERS: std::sync::RwLock<Option<LanguageServerReadinessMap>> =
     std::sync::RwLock::new(None);
 
-/// Publish which languages have an enrichment server on this host.
+/// Publish what each language's enrichment server can actually do on this host.
 ///
-/// Called by the daemon at startup, beside the discovery that decides whether
-/// enrichment runs. Until it is called, every observation reports its languages'
-/// enrichment as unknown and the absence-trust gate stays silent about it, which
-/// is the behaviour a process that never looked should have.
-pub fn publish_installed_language_servers(servers: HashSet<LanguageId>) {
+/// Published by the process that probed, because deciding this needs a server
+/// started and a query path must not spawn subprocesses. Until it is called,
+/// every observation reports its languages' enrichment as unknown and the
+/// absence-trust gate stays silent about it, which is the behaviour a process
+/// that never looked should have, and is also the honest state while a probe is
+/// still in flight.
+///
+/// Readiness rather than a set of installed binaries: a binary on `PATH` is not
+/// a working language server, and publishing presence as though it were is how
+/// an absence came to be certified on evidence the host could not gather.
+/// The readiness a process with the right to spawn already established, or
+/// `None` when nobody has published yet.
+///
+/// Exposed so a query path can READ the verdict instead of probing the host
+/// itself. `None` is not an empty host: it means nothing looked, and a caller
+/// must leave its rows unknown rather than reporting servers missing.
+pub fn published_language_server_readiness() -> Option<LanguageServerReadinessMap> {
+    published_language_servers()
+}
+
+pub fn publish_language_server_readiness(readiness: LanguageServerReadinessMap) {
     if let Ok(mut slot) = PUBLISHED_SERVERS.write() {
-        *slot = Some(servers);
+        *slot = Some(readiness);
     }
 }
 
@@ -661,20 +679,21 @@ pub fn publish_installed_language_servers(servers: HashSet<LanguageId>) {
 /// process per test under nextest.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::{HashSet, LanguageId};
+    use super::{LanguageId, LanguageServerReadinessMap};
+    use kin_core::reference_coverage::LanguageServerReadiness;
     use std::cell::RefCell;
 
     thread_local! {
-        static SERVERS: RefCell<Option<HashSet<LanguageId>>> = const { RefCell::new(None) };
+        static SERVERS: RefCell<Option<LanguageServerReadinessMap>> = const { RefCell::new(None) };
     }
 
-    pub(crate) fn server_override() -> Option<HashSet<LanguageId>> {
+    pub(crate) fn server_override() -> Option<LanguageServerReadinessMap> {
         SERVERS.with(|servers| servers.borrow().clone())
     }
 
     /// Restores the previous host on drop, including on unwind, so one test's
     /// environment never leaks into the next on a reused thread.
-    pub(crate) struct HostGuard(Option<HashSet<LanguageId>>);
+    pub(crate) struct HostGuard(Option<LanguageServerReadinessMap>);
 
     impl Drop for HostGuard {
         fn drop(&mut self) {
@@ -683,10 +702,32 @@ pub(crate) mod test_support {
     }
 
     /// Declare, for the rest of this scope, that the host carries exactly
-    /// `servers`. Bind the guard: dropping it immediately restores the host.
+    /// `servers`, all of them usable. Bind the guard: dropping it immediately
+    /// restores the host.
     #[must_use = "binding the guard is what keeps the declared host in force"]
     pub(crate) fn scoped_language_servers(servers: &[LanguageId]) -> HostGuard {
-        HostGuard(SERVERS.with(|slot| slot.borrow_mut().replace(servers.iter().copied().collect())))
+        scoped_language_server_readiness(
+            &servers
+                .iter()
+                .map(|language| (*language, LanguageServerReadiness::Usable))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Declare a host in the three-state vocabulary, so a test can state that a
+    /// server is PRESENT AND UNUSABLE rather than only present or absent.
+    ///
+    /// That case is the one this whole area exists for and the one a
+    /// presence-only override could not express, which meant no test could fail
+    /// when a broken server was reported as serving.
+    #[must_use = "binding the guard is what keeps the declared host in force"]
+    pub(crate) fn scoped_language_server_readiness(
+        readiness: &[(LanguageId, LanguageServerReadiness)],
+    ) -> HostGuard {
+        HostGuard(SERVERS.with(|slot| {
+            slot.borrow_mut()
+                .replace(readiness.iter().cloned().collect())
+        }))
     }
 
     /// Run `body` on a host carrying exactly `servers`.
@@ -1039,15 +1080,17 @@ mod tests {
     #[test]
     fn the_weakest_language_governs_a_batch() {
         use super::weakest_reference_enrichment;
-        let all: HashSet<LanguageId> = [
+        use kin_core::reference_coverage::{LanguageServerReadiness, LanguageServerReadinessMap};
+        let all: LanguageServerReadinessMap = [
             LanguageId::Rust,
             LanguageId::Python,
             LanguageId::TypeScript,
             LanguageId::JavaScript,
         ]
         .into_iter()
+        .map(|language| (language, LanguageServerReadiness::Usable))
         .collect();
-        let none: HashSet<LanguageId> = HashSet::new();
+        let none: LanguageServerReadinessMap = LanguageServerReadinessMap::new();
 
         assert_eq!(
             weakest_reference_enrichment(&[LanguageId::Python, LanguageId::Ruby], &all),
@@ -1061,6 +1104,29 @@ mod tests {
         assert_eq!(
             weakest_reference_enrichment(&[LanguageId::Python, LanguageId::JavaScript], &all),
             ReferenceEnrichment::Available
+        );
+
+        // The state a presence-only host could not express: JavaScript's server
+        // is installed and cannot start, so the batch is unproduced rather than
+        // available, and it is NOT reported as a missing install.
+        let javascript_broken: LanguageServerReadinessMap = [
+            (LanguageId::Python, LanguageServerReadiness::Usable),
+            (
+                LanguageId::JavaScript,
+                LanguageServerReadiness::Unusable {
+                    reason: "Could not find a valid TypeScript installation".to_string(),
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            weakest_reference_enrichment(
+                &[LanguageId::Python, LanguageId::JavaScript],
+                &javascript_broken
+            ),
+            ReferenceEnrichment::LanguageServerUnusable,
+            "a usable sibling must not lift a batch whose other server cannot start"
         );
         assert_eq!(
             weakest_reference_enrichment(&[], &all),
