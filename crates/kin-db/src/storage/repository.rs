@@ -2782,6 +2782,23 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
             "repository authority successor preparation"
         );
     }
+    #[cfg(test)]
+    record_preparation_phase(
+        "prepare_successor",
+        vec![
+            ("clone_ms", clone_ms),
+            ("admit_ms", admit_ms),
+            ("refs_overlay_ms", refs_overlay_ms),
+            ("workspace_ms", workspace_ms),
+            ("merge_ms", merge_ms),
+            ("admission_verify_ms", admission_verify_ms),
+            ("change_bodies_ms", change_bodies_ms),
+            ("history_replay_ms", history_replay_ms),
+            ("roots_ms", roots_ms),
+            ("storage_admission_ms", storage_admission_ms),
+            ("successor_index_ms", successor_index_ms),
+        ],
+    );
     Ok((state, receipt))
 }
 
@@ -17137,6 +17154,528 @@ mod replaywall_measurements {
                 size * files,
                 hash_ms.saturating_sub(validate_ms)
             );
+        }
+    }
+}
+
+/// Step-13's own shape, priced by phase.
+///
+/// The 1200-commit growth loop prices the INCREMENTAL path, one transaction
+/// per commit. Step 13 hands kin-db ONE transaction carrying the whole
+/// history, so every per-change body inside a single `prepare_successor` runs
+/// at history scale rather than at delta scale. This commits exactly that
+/// shape into a fresh authority and prints the preparation's own phase laps,
+/// so the candidates are priced against each other instead of by elimination.
+///
+/// Two arms, because the workspace half is the expensive half and the growth
+/// loop had it switched off: one transaction with no `workspace_mutation`, and
+/// one that binds a workspace to the history's head exactly as a conversion
+/// does. Only the head change introduces artifacts, which is what the v3
+/// Native admission contract permits.
+#[cfg(test)]
+mod clockhalf_whole_history {
+    use super::*;
+    use kin_model::{
+        compute_resolved_tree_hash, compute_semantic_change_id, AdmissionCase,
+        AdmissionPolicyDelta, ChangeOrigin, EffectiveAdmissionPolicyStamp, EntityDelta, EntityId,
+        EntityKind, EntityMetadata, EntityRole, FilePathId, FingerprintAlgorithm,
+        FrozenLocalOverlayDelta, LanguageId, LocatedEntry, SemanticFingerprint, Visibility,
+        WorkspaceExpectation, WorkspaceMutation, WorkspaceSemanticDelta,
+        REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+    };
+    use sha2::{Digest, Sha256};
+    use uuid::Uuid;
+
+    fn digest(body: &[u8]) -> Hash256 {
+        Hash256::from_bytes(Sha256::digest(body).into())
+    }
+
+    fn fixed_timestamp() -> Timestamp {
+        Timestamp(
+            chrono::DateTime::parse_from_rfc3339("2026-07-26T12:00:00Z")
+                .expect("fixed timestamp parses")
+                .with_timezone(&chrono::Utc),
+        )
+    }
+
+    /// One distinct entity per commit, so the resolved graph grows with
+    /// history the way a converted repository's does.
+    fn measurement_entity(index: usize) -> kin_model::Entity {
+        let path = format!("src/module_{index}.rs");
+        let name = format!("kin_{index}");
+        let byte = (index % 251) as u8;
+        kin_model::Entity {
+            id: EntityId::from_content(&path, &name, "function", 1),
+            kind: EntityKind::Function,
+            name: name.clone(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([byte; 32]),
+                signature_hash: Hash256::from_bytes([byte.wrapping_add(1); 32]),
+                behavior_hash: Hash256::from_bytes([byte.wrapping_add(2); 32]),
+                equivalence_hash: Hash256::from_bytes([byte.wrapping_add(3); 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(FilePathId::new(&path)),
+            span: None,
+            signature: format!("fn {name}()"),
+            visibility: Visibility::Public,
+            role: EntityRole::Source,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    /// The head tree a conversion publishes: `files` artifacts and their bodies.
+    fn head_tree(files: usize) -> (Vec<TreeDelta>, Vec<(Hash256, Vec<u8>)>) {
+        let mut deltas = Vec::with_capacity(files);
+        let mut blobs = Vec::with_capacity(files);
+        for file in 0..files {
+            let path = format!("src/module_{file}.rs");
+            let body = format!("pub fn kin_{file}() {{}}\n").into_bytes();
+            let hash = digest(&body);
+            deltas.push(TreeDelta::Added {
+                artifact_id: ArtifactId(Uuid::from_u128(1_000_000 + file as u128)),
+                new: LocatedEntry::new(
+                    RepoPath::from_bytes(path.into_bytes()).expect("synthetic path is valid"),
+                    TreeEntry::blob(hash, false),
+                ),
+            });
+            blobs.push((hash, body));
+        }
+        (deltas, blobs)
+    }
+
+    /// `commits` chained Native changes, one entity each, head carrying `tree`.
+    fn history_chain(
+        commits: usize,
+        shared: &SharedAdmissionPolicy,
+        tree: &[TreeDelta],
+        depth: HistoryDepth,
+    ) -> Vec<kin_model::SemanticChange> {
+        let mut chain: Vec<kin_model::SemanticChange> = Vec::with_capacity(commits);
+        let mut parent: Option<SemanticChangeId> = None;
+        for index in 0..commits {
+            let mut change = kin_model::SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+                origin: ChangeOrigin::Native,
+                parents: parent.into_iter().collect(),
+                timestamp: fixed_timestamp(),
+                author: AuthorId::new("clockhalf-measurement"),
+                message: format!("synthetic converted commit {index}"),
+                entity_deltas: vec![EntityDelta::Added {
+                    new: measurement_entity(index),
+                }],
+                relation_deltas: Vec::new(),
+                tree_deltas: if index + 1 == commits {
+                    tree.to_vec()
+                } else {
+                    Vec::new()
+                },
+                admission_policy_delta: (index == 0)
+                    .then(|| AdmissionPolicyDelta::initialize(shared.clone())),
+                external_reference_deltas: Vec::new(),
+                projected_files: Vec::new(),
+                spec_link: None,
+                evidence: Vec::new(),
+                risk_summary: None,
+            };
+            change.id = compute_semantic_change_id(&change).expect("change id computes");
+            // A flat forest keeps the change COUNT and drops the lineage DEPTH,
+            // which is the only variable a per-change lineage walk can be
+            // quadratic in. The head still chains to the change before it so
+            // the workspace has a base whose tree the mutation can name.
+            parent = match depth {
+                HistoryDepth::Chain => Some(change.id),
+                HistoryDepth::Flat if index + 2 == commits => Some(change.id),
+                HistoryDepth::Flat => None,
+            };
+            chain.push(change);
+        }
+        chain
+    }
+
+    /// Whether the synthetic history is one chain or a flat forest.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum HistoryDepth {
+        Chain,
+        Flat,
+    }
+
+    /// Commit one whole-history bootstrap and print its phase laps.
+    fn price_one_bootstrap(
+        commits: usize,
+        files: usize,
+        with_workspace: bool,
+        depth: HistoryDepth,
+    ) {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let backend = std::sync::Arc::new(crate::storage::backend::LocalFileBackend::new(
+            directory.path(),
+        ));
+        let repository = RepositoryId::new("clockhalf-measurement").expect("repository id");
+        let manager = RepositoryAuthorityManager::open(repository.clone(), backend)
+            .expect("open fresh authority");
+
+        let shared = SharedAdmissionPolicy::empty(0);
+        let (tree_deltas, blobs) = if with_workspace {
+            head_tree(files)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        for (hash, body) in &blobs {
+            manager.save_source_blob(*hash, body).expect("save blob");
+        }
+        let changes = history_chain(commits, &shared, &tree_deltas, depth);
+        let head_change = changes.last().expect("at least one change").id;
+
+        let lease = manager.read_authority();
+        let mut transaction = RepositoryTransaction {
+            schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: OperationId::from_uuid(Uuid::from_u128(1)),
+            repository_id: repository.clone(),
+            expected_generation: lease.generation(),
+            expected_roots: lease.roots().clone(),
+            actor: AuthorId::new("clockhalf-measurement"),
+            reason: "synthetic whole-history bootstrap".to_string(),
+            external_objects: Vec::new(),
+            git_authority_delta: None,
+            changes,
+            aliases: Vec::new(),
+            ref_mutations: Vec::new(),
+            default_ref_mutation: None,
+            workspace_mutation: None,
+            local_overlay_delta: None,
+            merge_transaction_delta: None,
+            sealed_observation: None,
+        };
+        drop(lease);
+
+        if with_workspace {
+            let tree = ResolvedTree::default()
+                .apply(&tree_deltas)
+                .expect("head tree applies");
+            let tree_hash = compute_resolved_tree_hash(&tree).expect("tree hash");
+            let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(20));
+            let overlay =
+                FrozenLocalOverlay::new(workspace_id, 0, AdmissionCase::Sensitive, Vec::new())
+                    .expect("frozen overlay");
+            let policy = EffectiveAdmissionPolicyStamp {
+                shared: shared.stamp(),
+                local: overlay.stamp(),
+            };
+            let main = RefName::branch(b"main").expect("branch name");
+            let target = RefTarget::change(head_change);
+            transaction.ref_mutations.push(RefMutation {
+                name: main.clone(),
+                expected: RefExpectation::MustNotExist,
+                new_target: Some(target.clone()),
+                policy: RefUpdatePolicy::FastForwardOnly,
+            });
+            transaction.default_ref_mutation = Some(DefaultRefMutation {
+                expected: DefaultRefExpectation::MustBeUnset,
+                new_default: Some(main.clone()),
+            });
+            transaction.workspace_mutation = Some(WorkspaceMutation {
+                workspace_id,
+                expected: WorkspaceExpectation::MustNotExist,
+                new_generation: 0,
+                new_head: WorkspaceHead::Symbolic { target: main },
+                new_base_target: Some(target),
+                new_base_tree_hash: Some(tree_hash),
+                tree_deltas,
+                new_tree_hash: tree_hash,
+                semantic_delta: WorkspaceSemanticDelta::default(),
+                new_shared_admission_policy: shared,
+                new_admission_policy: policy,
+            });
+            transaction.local_overlay_delta = Some(FrozenLocalOverlayDelta::initialize(overlay));
+        }
+
+        PREPARATION_PHASE_LOG.with(|log| log.borrow_mut().clear());
+        let started = std::time::Instant::now();
+        let receipt = manager
+            .commit_repository_transaction(transaction)
+            .unwrap_or_else(|error| {
+                panic!("whole-history bootstrap of {commits} changes failed: {error}")
+            });
+        let commit_ms = started.elapsed().as_millis();
+        assert_eq!(receipt.generation, 1);
+
+        let arm = match (with_workspace, depth) {
+            (true, HistoryDepth::Chain) => "with_workspace",
+            (false, HistoryDepth::Chain) => "no_workspace",
+            (true, HistoryDepth::Flat) => "with_workspace_flat",
+            (false, HistoryDepth::Flat) => "no_workspace_flat",
+        };
+        println!("[{arm}] commits={commits} files={files} commit_ms={commit_ms}");
+        PREPARATION_PHASE_LOG.with(|log| {
+            for (name, laps) in log.borrow().iter() {
+                let total: u128 = laps.iter().map(|(_, ms)| *ms).sum();
+                let detail = laps
+                    .iter()
+                    .map(|(field, ms)| format!("{field}={ms}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                println!("[{arm}]   {name} sum_ms={total} {detail}");
+            }
+            log.borrow_mut().clear();
+        });
+    }
+
+    /// Price one whole-history bootstrap preparation by phase, both arms.
+    ///
+    /// `KIN_CLOCKHALF_COMMITS` is a comma-separated size ladder so the growth
+    /// law across sizes is read off the same run that attributes the phases.
+    #[test]
+    #[ignore = "measurement: commits a whole-history bootstrap and prints its phase laps"]
+    fn whole_history_bootstrap_phase_costs() {
+        let sizes: Vec<usize> = std::env::var("KIN_CLOCKHALF_COMMITS")
+            .unwrap_or_else(|_| "150,300,600,1200".to_string())
+            .split(',')
+            .filter_map(|value| value.trim().parse().ok())
+            .collect();
+        let files: usize = std::env::var("KIN_CLOCKHALF_FILES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(200);
+        let flat = std::env::var("KIN_CLOCKHALF_FLAT").is_ok_and(|value| value == "1");
+        let depth = if flat {
+            HistoryDepth::Flat
+        } else {
+            HistoryDepth::Chain
+        };
+        for commits in sizes {
+            price_one_bootstrap(commits, files, false, depth);
+            price_one_bootstrap(commits, files, true, depth);
+        }
+    }
+}
+
+/// Step 13's per-change bodies at Git origin, which is the origin a conversion
+/// actually uses.
+///
+/// The bootstrap-transaction measurement beside this one cannot give every
+/// change a tree delta: the v3 Native admission contract lets only the change
+/// the successor workspace bases on introduce artifacts. A conversion's changes
+/// are `ChangeOrigin::GitCommit`, which that rule does not reach, so every one
+/// of them carries its own tree deltas. These bodies are callable directly
+/// against a synthetic snapshot, with no transaction and no admission contract
+/// in the way, so they can be priced at the payload a converted commit really
+/// has.
+#[cfg(test)]
+mod clockhalf_git_origin {
+    use super::*;
+    use kin_model::{compute_semantic_change_id, ChangeOrigin, LocatedEntry};
+    use uuid::Uuid;
+
+    fn oid(seed: u64) -> GitObjectId {
+        let mut bytes = [0_u8; 20];
+        bytes[..8].copy_from_slice(&seed.to_le_bytes());
+        GitObjectId::sha1(bytes)
+    }
+
+    fn artifact(index: usize) -> ArtifactId {
+        ArtifactId(Uuid::from_u128(index as u128 + 1))
+    }
+
+    fn path_of(index: usize) -> RepoPath {
+        RepoPath::from_utf8(format!("src/file_{index}.rs")).expect("synthetic path is valid")
+    }
+
+    /// Two blob states per artifact, so the whole tree alternates between two
+    /// shapes and the raw-tree fixture stays O(tree) instead of O(commits x
+    /// tree). The replay still applies every delta of every commit.
+    fn entry_of(index: usize, state: u8) -> TreeEntry {
+        let mut bytes = [0_u8; 32];
+        bytes[0] = state;
+        bytes[1] = (index % 251) as u8;
+        bytes[2] = ((index / 251) % 251) as u8;
+        TreeEntry::blob(Hash256::from_bytes(bytes), false)
+    }
+
+    struct GitHistory {
+        snapshot: GraphSnapshot,
+        targets: BTreeMap<SemanticChangeId, GitProjectionTreeTarget>,
+        raw_trees: BTreeMap<GitObjectId, BTreeMap<RepoPath, TreeEntry>>,
+        order: Vec<SemanticChangeId>,
+    }
+
+    /// `commits` chained Git-origin changes over a `files`-artifact tree, where
+    /// the root adds every artifact and each later commit updates `churn` of
+    /// them.
+    fn git_history(commits: usize, files: usize, churn: usize) -> GitHistory {
+        let tree_a: BTreeMap<RepoPath, TreeEntry> = (0..files)
+            .map(|index| (path_of(index), entry_of(index, 0)))
+            .collect();
+        let mut tree_b = tree_a.clone();
+        for index in 0..churn.min(files) {
+            tree_b.insert(path_of(index), entry_of(index, 1));
+        }
+        let oid_a = oid(900_001);
+        let oid_b = oid(900_002);
+        let mut raw_trees = BTreeMap::new();
+        raw_trees.insert(oid_a, tree_a);
+        raw_trees.insert(oid_b, tree_b);
+
+        let mut snapshot = GraphSnapshot::empty();
+        let mut targets = BTreeMap::new();
+        let mut order = Vec::with_capacity(commits);
+        let mut parent: Option<SemanticChangeId> = None;
+        for index in 0..commits {
+            let tree_deltas: Vec<TreeDelta> = if index == 0 {
+                (0..files)
+                    .map(|file| TreeDelta::Added {
+                        artifact_id: artifact(file),
+                        new: LocatedEntry::new(path_of(file), entry_of(file, 0)),
+                    })
+                    .collect()
+            } else {
+                // The tree is in state 0 after the root, then alternates. So
+                // commit i starts from the state commit i-1 left, which is
+                // (i+1) % 2, not i % 2. Getting this backwards makes every
+                // `Updated` name an `old` the tree does not hold.
+                let from = ((index + 1) % 2) as u8;
+                let to = 1 - from;
+                (0..churn.min(files))
+                    .map(|file| TreeDelta::Updated {
+                        artifact_id: artifact(file),
+                        old: LocatedEntry::new(path_of(file), entry_of(file, from)),
+                        new: LocatedEntry::new(path_of(file), entry_of(file, to)),
+                    })
+                    .collect()
+            };
+            let commit_oid = oid(index as u64 + 1);
+            let mut change = kin_model::SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+                origin: ChangeOrigin::GitCommit { oid: commit_oid },
+                parents: parent.into_iter().collect(),
+                timestamp: Timestamp(
+                    chrono::DateTime::parse_from_rfc3339("2026-07-26T12:00:00Z")
+                        .expect("fixed timestamp parses")
+                        .with_timezone(&chrono::Utc),
+                ),
+                author: AuthorId::new("clockhalf-git-measurement"),
+                message: format!("converted commit {index}"),
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas,
+                admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
+                projected_files: Vec::new(),
+                spec_link: None,
+                evidence: Vec::new(),
+                risk_summary: None,
+            };
+            change.id = compute_semantic_change_id(&change).expect("change id computes");
+            let raw_tree_oid = if index == 0 || index % 2 == 0 {
+                oid_a
+            } else {
+                oid_b
+            };
+            targets.insert(
+                change.id,
+                GitProjectionTreeTarget {
+                    commit_oid,
+                    raw_tree_oid,
+                },
+            );
+            parent = Some(change.id);
+            order.push(change.id);
+            snapshot.changes.insert(change.id, change);
+        }
+        snapshot.change_children = derive_change_children(&snapshot.changes);
+        GitHistory {
+            snapshot,
+            targets,
+            raw_trees,
+            order,
+        }
+    }
+
+    fn lap<T>(label: &str, body: impl FnOnce() -> T) -> T {
+        let started = std::time::Instant::now();
+        let out = body();
+        println!("    {label}={}", started.elapsed().as_millis());
+        out
+    }
+
+    /// Price the per-change bodies of one whole-history preparation at Git
+    /// origin, against history length.
+    #[test]
+    #[ignore = "measurement: prices step 13's per-change bodies at Git origin"]
+    fn git_origin_whole_history_body_costs() {
+        let sizes: Vec<usize> = std::env::var("KIN_CLOCKHALF_COMMITS")
+            .unwrap_or_else(|_| "300,600,1200,2400".to_string())
+            .split(',')
+            .filter_map(|value| value.trim().parse().ok())
+            .collect();
+        let files: usize = std::env::var("KIN_CLOCKHALF_FILES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(200);
+        let churn: usize = std::env::var("KIN_CLOCKHALF_CHURN")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(8);
+
+        for commits in sizes {
+            let history = git_history(commits, files, churn);
+            println!("[git] commits={commits} files={files} churn={churn}");
+
+            lap("derive_change_children_ms", || {
+                let children = derive_change_children(&history.snapshot.changes);
+                assert_eq!(children.len(), commits.saturating_sub(1));
+            });
+
+            lap("derive_admission_policies_ms", || {
+                derive_admission_policies(&history.snapshot.changes)
+                    .expect("admission policies derive");
+            });
+
+            lap("storage_admission_ms", || {
+                history
+                    .snapshot
+                    .validate_storage_admission()
+                    .expect("synthetic snapshot admits");
+            });
+
+            lap("history_replay_ms", || {
+                validate_first_parent_history(&history.snapshot.changes, &history.order)
+                    .expect("first-parent history replays");
+            });
+
+            lap("history_root_ms", || {
+                let mut root = DomainRoot::new(b"kin-repository-history-root-v1\0");
+                root.unordered(
+                    "changes",
+                    &history.snapshot.changes.iter().collect::<Vec<_>>(),
+                )
+                .expect("history root hashes");
+                let _ = root.finish();
+            });
+
+            let mut materializations = 0_usize;
+            lap("git_projection_replay_ms", || {
+                validate_git_projection_tree_replay(
+                    &history.snapshot,
+                    &history.targets,
+                    |raw_tree_oid| {
+                        materializations += 1;
+                        Ok(history
+                            .raw_trees
+                            .get(&raw_tree_oid)
+                            .expect("every projection has one exact raw tree")
+                            .clone())
+                    },
+                )
+                .expect("git projection tree replay");
+            });
+            println!("    materializations={materializations}");
         }
     }
 }
