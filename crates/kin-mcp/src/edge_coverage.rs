@@ -77,6 +77,15 @@ pub const REFERENCE_RESOLUTION_KEY: &str = "reference_resolution";
 /// [`crate::negative`].
 pub const NAME_FILTER_KEY: &str = "name_filter";
 
+/// What the `language` field reads when the answer resolved no entity to take a
+/// language from, so the observation names the absence rather than guessing one.
+///
+/// Shared with [`crate::negative`], which has to be able to tell an observation
+/// about a real language from one about none: a gap sentence naming a language's
+/// extractor coverage answers a question nobody asked when no language was
+/// named, and displaces the reason the reader actually needs.
+pub const NO_RESOLVED_LANGUAGE: &str = "no resolved language";
+
 /// How many entities may have their relations read while looking for a witness.
 ///
 /// A healthy graph answers in single digits, so this bound is only reached on a
@@ -291,7 +300,7 @@ pub fn observe_cross_file_reference_coverage_for_languages_witnessed<S: EntitySt
     // and an empty string would read as one. Naming the absence keeps the reason
     // it produces readable.
     let language = if observed_languages.is_empty() {
-        "no resolved language".to_string()
+        NO_RESOLVED_LANGUAGE.to_string()
     } else {
         observed_languages
             .iter()
@@ -356,7 +365,7 @@ pub fn observe_absence_scope(languages: &[LanguageId], scope_entities: Option<us
         }
     }
     let language = if observed.is_empty() {
-        "no resolved language".to_string()
+        NO_RESOLVED_LANGUAGE.to_string()
     } else {
         observed
             .iter()

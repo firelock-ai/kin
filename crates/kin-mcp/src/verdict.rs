@@ -366,10 +366,29 @@ fn edge_coverage_reading(tool: &str, payload: &Value) -> Reading {
     }
 
     let requested = crate::negative::absence_cross_file_classes(tool, payload);
+    let states = coverage.get("classes").and_then(Value::as_object);
     if requested.is_empty() {
+        // FIR-2496. This input used to answer `certified` for any observation
+        // that named no class to check, which is every observation a tool
+        // traversing no edge publishes. That is agreement inferred from silence:
+        // the shipped verdict block read `"inputs": {"edge_coverage":
+        // "certified"}` over `"classes": {}` on the two searches that were wrong
+        // and on the one that was right, with nothing separating them. An
+        // observation that measured nothing licenses nothing, and the absence
+        // gate leads with the sharper wording when both refuse.
+        //
+        // On a real language only, matching the gate: an answer that resolved
+        // none has no language's coverage to be missing, and it carries its own
+        // sharper reason. Read from the gate's own function so the input's
+        // reading and the refusal can never disagree about one observation.
+        if crate::negative::coverage_classes_unmeasured(coverage, &requested) {
+            return Reading::Inconclusive(format!(
+                "absence_coverage_unmeasured: this answer measured no coverage class for \
+                 {language}, so nothing established what the extractor admitted for it"
+            ));
+        }
         return Reading::Certified;
     }
-    let states = coverage.get("classes").and_then(Value::as_object);
     let deciding = crate::negative::load_bearing_classes(&requested);
     let unhealthy: Vec<&str> = deciding
         .iter()
@@ -877,6 +896,90 @@ mod tests {
             verdict.to_value()["state"],
             json!(CERTIFIED),
             "{}",
+            verdict.to_value()
+        );
+    }
+
+    /// FIR-2496. The `edge_coverage` input used to answer `certified` for an
+    /// observation that named no class to check, which is every observation a
+    /// tool traversing no edge publishes. The shipped v0.5.43 verdict block read
+    /// `"inputs": {"edge_coverage": "certified"}` over `"classes": {}` on three
+    /// searches, two of which were wrong: `SCHEMA` was a module constant the
+    /// Python extractor skips and `build_match_query` sat in a file the graph
+    /// had not admitted. Agreement inferred from silence is not agreement.
+    #[test]
+    fn an_unmeasured_class_map_is_not_an_agreeing_input() {
+        let payload = json!({
+            "results": [],
+            "total_matches": 0,
+            "edge_coverage": {
+                "scope": "absence_scope",
+                "language": "Python",
+                "requested_classes": [],
+                "classes": {},
+                "reference_enrichment": "available",
+                "scope_entities": 51,
+            },
+        });
+        let verdict = Verdict::compute("semantic_search", &payload, &Envelope::daemon(), None)
+            .expect("a retrieval payload carries a verdict");
+        let value = verdict.to_value();
+        assert_eq!(value["state"], json!(INCONCLUSIVE), "{value}");
+        assert_eq!(
+            value["inputs"]["edge_coverage"],
+            json!(INCONCLUSIVE),
+            "{value}"
+        );
+        assert!(
+            value["limiting_factor"]
+                .as_str()
+                .expect("an inconclusive verdict names its limiting factor")
+                .contains("absence_coverage_unmeasured"),
+            "{value}"
+        );
+
+        // The control that makes it a reading of the observation rather than of
+        // the tool name: one measured class over the same language, same filter,
+        // same store, and the same answer certifies.
+        let mut measured = payload.clone();
+        measured["edge_coverage"]["classes"] = json!({"calls": "present"});
+        let verdict = Verdict::compute("semantic_search", &measured, &Envelope::daemon(), None)
+            .expect("a retrieval payload carries a verdict");
+        assert_eq!(
+            verdict.to_value()["inputs"]["edge_coverage"],
+            json!(CERTIFIED),
+            "{}",
+            verdict.to_value()
+        );
+    }
+
+    /// The other half of the same rule. An answer that resolved no language has
+    /// no language's extractor coverage to be missing, and this input must not
+    /// invent one: the tools that produce that observation carry their own
+    /// sharper reason (an unresolved focal, an empty filtered region), and a
+    /// correct refusal beside an unrelated reason is what this module exists to
+    /// prevent.
+    #[test]
+    fn an_observation_that_resolved_no_language_is_not_refused_for_one() {
+        let payload = json!({
+            "entities": [],
+            "relations": [],
+            "relation_count": 0,
+            "entity_count": 0,
+            "edge_coverage": {
+                "scope": "absence_scope",
+                "language": crate::edge_coverage::NO_RESOLVED_LANGUAGE,
+                "requested_classes": [],
+                "classes": {},
+                "reference_enrichment": "unknown",
+            },
+        });
+        let verdict = Verdict::compute("graph_neighborhood", &payload, &Envelope::daemon(), None)
+            .expect("a retrieval payload carries a verdict");
+        assert_eq!(
+            verdict.to_value()["inputs"]["edge_coverage"],
+            json!(CERTIFIED),
+            "the coverage input says nothing about an answer with no language: {}",
             verdict.to_value()
         );
     }
