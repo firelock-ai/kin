@@ -1254,6 +1254,30 @@ pub struct DaemonState {
     /// workspace authority for a vector checkpoint. Read under `persist_lock`.
     #[cfg(feature = "embeddings")]
     vector_checkpoint_authority_match: VectorCheckpointAuthorityMatch,
+    /// Why the last vector checkpoint was refused, held until a later
+    /// checkpoint lands.
+    ///
+    /// A refusal is transient by construction. It says the live exact tree had
+    /// moved away from committed workspace authority, which is exactly what a
+    /// commit in flight does to it, and the divergence closes when that commit
+    /// settles. The vectors are unharmed either way: they stay in the live
+    /// index, so the coverage a reader sees is true about this process.
+    ///
+    /// What was not true is that the coverage was durable. The refusal used to
+    /// be logged once at ERROR and abandoned. Nothing else in the daemon writes
+    /// the vector sidecar (`checkpoint_vector_index_for_graph` has exactly one
+    /// caller, `flush_embed_progress`), and the embed worker only reaches that
+    /// caller after a batch embeds something, so a refusal on the last batch of
+    /// a draining queue had nothing left to retry it. Every vector embedded
+    /// since the previous successful checkpoint then died with the process, and
+    /// the next open reported the shortfall as ordinary pending work. That is
+    /// the coverage regression a user reads as embedding going backwards after
+    /// a commit.
+    ///
+    /// Recording the refusal is what gives the retry something to fire on and
+    /// gives every embedding surface a cause to name while the gap is open.
+    #[cfg(feature = "embeddings")]
+    deferred_vector_checkpoint: std::sync::Mutex<Option<String>>,
     /// When the last successful background save completed.
     pub last_save: std::sync::Mutex<Instant>,
     /// When the graph was last mutated (`mark_dirty`). The background
@@ -2390,6 +2414,8 @@ impl DaemonState {
             persist_lock: Mutex::new(()),
             #[cfg(feature = "embeddings")]
             vector_checkpoint_authority_match: VectorCheckpointAuthorityMatch::default(),
+            #[cfg(feature = "embeddings")]
+            deferred_vector_checkpoint: std::sync::Mutex::new(None),
             last_save: std::sync::Mutex::new(Instant::now()),
             last_mutation: std::sync::Mutex::new(Instant::now()),
             active_embed_passes: AtomicU32::new(0),
@@ -2619,6 +2645,8 @@ impl DaemonState {
             persist_lock: Mutex::new(()),
             #[cfg(feature = "embeddings")]
             vector_checkpoint_authority_match: VectorCheckpointAuthorityMatch::default(),
+            #[cfg(feature = "embeddings")]
+            deferred_vector_checkpoint: std::sync::Mutex::new(None),
             last_save: std::sync::Mutex::new(Instant::now()),
             last_mutation: std::sync::Mutex::new(Instant::now()),
             active_embed_passes: AtomicU32::new(0),
@@ -4744,10 +4772,16 @@ impl DaemonState {
             self.run_vector_checkpoint_reopen_hook();
             let live_tree = self.graph.resolved_tree();
             if live_tree != authority_graph.resolved_tree() {
+                let refusal = format!(
+                    "refusing vector checkpoint at repository generation {generation}: live exact tree does not match workspace authority"
+                );
+                // Record before returning. The caller logs this error and moves
+                // on, and nothing downstream of that log would remember the
+                // vectors were left undurable; the retry and every embedding
+                // surface both read the record instead.
+                self.record_deferred_vector_checkpoint(refusal.clone());
                 return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
-                    format!(
-                        "refusing vector checkpoint at repository generation {generation}: live exact tree does not match workspace authority"
-                    ),
+                    refusal,
                 )));
             }
             self.vector_checkpoint_authority_match
@@ -4763,10 +4797,78 @@ impl DaemonState {
             None,
         )
         .map_err(DaemonError::from)?;
+        // Cleared only after the sidecar write returns. Clearing on entry, or
+        // beside the authority proof above, would retire the record while the
+        // work it describes was still undurable, which is the state the record
+        // exists to keep visible.
+        self.clear_deferred_vector_checkpoint();
         if self.post_commit_finalization_pending.load(Ordering::SeqCst) {
             self.finalize_committed_generation(generation)?;
         }
         Ok(self.graph.embedding_status().pending)
+    }
+
+    /// Remember that a vector checkpoint was refused, so the work it left in
+    /// memory can be retried and named rather than silently abandoned.
+    #[cfg(feature = "embeddings")]
+    fn record_deferred_vector_checkpoint(&self, reason: String) {
+        if let Ok(mut deferred) = self.deferred_vector_checkpoint.lock() {
+            *deferred = Some(reason);
+        }
+    }
+
+    /// Retire the record once a checkpoint has actually written the sidecar.
+    #[cfg(feature = "embeddings")]
+    fn clear_deferred_vector_checkpoint(&self) {
+        if let Ok(mut deferred) = self.deferred_vector_checkpoint.lock() {
+            *deferred = None;
+        }
+    }
+
+    /// Why the last vector checkpoint was refused, while that refusal still
+    /// stands.
+    ///
+    /// `Some` means this daemon holds embedded vectors the sidecar does not,
+    /// so the coverage every counter reports is real for this process and would
+    /// not survive its exit. Embedding surfaces read this to say so instead of
+    /// rendering the shortfall as ordinary pending work on the next open. A
+    /// poisoned lock answers `None`: an unreadable record is not evidence of a
+    /// deferral, and the retry below is what closes the gap either way.
+    #[cfg(feature = "embeddings")]
+    pub fn deferred_vector_checkpoint(&self) -> Option<String> {
+        self.deferred_vector_checkpoint
+            .lock()
+            .ok()
+            .and_then(|deferred| deferred.clone())
+    }
+
+    #[cfg(not(feature = "embeddings"))]
+    pub fn deferred_vector_checkpoint(&self) -> Option<String> {
+        None
+    }
+
+    /// Re-attempt a checkpoint that was refused, and report what happened.
+    ///
+    /// `None` means nothing was deferred and no work was done, which is the
+    /// answer on every tick of an ordinary daemon. `Some(Ok(pending))` means
+    /// the sidecar was written and the vectors held since the refusal are now
+    /// durable. `Some(Err(_))` means the tree still disagrees with authority
+    /// and the record still stands, so a caller can back off rather than
+    /// reopening authority every tick.
+    ///
+    /// Deliberately a retry of the same call rather than a weaker second path:
+    /// the authority proof is the whole reason the first attempt refused, so a
+    /// retry that skipped it would checkpoint exactly the state the refusal was
+    /// protecting against.
+    #[cfg(feature = "embeddings")]
+    pub fn retry_deferred_vector_checkpoint(&self) -> Option<Result<usize>> {
+        self.deferred_vector_checkpoint()?;
+        Some(self.flush_embed_progress())
+    }
+
+    #[cfg(not(feature = "embeddings"))]
+    pub fn retry_deferred_vector_checkpoint(&self) -> Option<Result<usize>> {
+        None
     }
 
     #[cfg(not(feature = "embeddings"))]
@@ -5976,6 +6078,166 @@ mod tests {
                 .vector_checkpoint_authority_match
                 .holds(generation, &tree_after),
             "a refused flush must retain nothing"
+        );
+    }
+
+    /// The whole lifecycle the coverage regression was found in, driven end to
+    /// end: vectors are embedded, a change moves the live tree while the
+    /// checkpoint is being proved, the checkpoint is refused, and the
+    /// divergence then closes.
+    ///
+    /// The test above proves the refusal is correct and retains nothing. It
+    /// proves nothing about what happens to the vectors afterwards, and that is
+    /// where the work was going. `checkpoint_vector_index_for_graph` has one
+    /// caller in this daemon, and the embed worker only reaches it after a
+    /// batch embeds something, so a refusal on the last batch of a draining
+    /// queue had nothing left to retry it: the vectors stayed in memory, the
+    /// sidecar kept its older content, and the next open reported the shortfall
+    /// as ordinary pending work. On the rc0545c brown arm that read as a store
+    /// at 2112/2112 with zero pending, then 1770/2112 with 342 pending three
+    /// minutes later.
+    ///
+    /// So the assertions here are about durability rather than about the
+    /// refusal: the sidecar must be absent while the refusal stands, the
+    /// refusal must be recorded with its cause, and the retry must land the
+    /// vectors once the divergence closes, with the count intact on both sides.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn a_refused_vector_checkpoint_is_retried_and_its_vectors_survive() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = test_state(init.layout, repo_dir.path());
+
+        // Stage completed work: a real index carrying vectors, attached to the
+        // live graph, with nothing durable behind it. Removing the file is what
+        // makes "did this checkpoint land" answerable by existence rather than
+        // by reading bytes the daemon has no API to compare.
+        const STAGED_VECTORS: usize = 3;
+        let vector_path = state.layout.kindb_vector_index_path();
+        let descriptor = kin_db::vector::IndexDescriptor {
+            model_id: Some("fixture-embedder-v1".to_string()),
+            graph_root: Some("fixture-root".to_string()),
+        };
+        let vectors = kin_db::VectorIndex::new(4).unwrap();
+        vectors.set_descriptor(descriptor.clone());
+        for slot in 0..STAGED_VECTORS {
+            let mut embedding = [0.0f32; 4];
+            embedding[slot] = 1.0;
+            vectors
+                .upsert(kin_model::EntityId::new(), &embedding)
+                .expect("the fixture index must accept a staged vector");
+        }
+        vectors.save(&vector_path).unwrap();
+        assert!(matches!(
+            state
+                .graph
+                .load_vector_index_compatible(&vector_path, &descriptor),
+            kin_db::vector::VectorIndexLoad::Loaded(STAGED_VECTORS)
+        ));
+        std::fs::remove_file(&vector_path).unwrap();
+        assert_eq!(
+            state.graph.vector_index_stats(),
+            Some((4, STAGED_VECTORS)),
+            "the live index must carry the staged vectors before anything is refused"
+        );
+        assert!(
+            state.deferred_vector_checkpoint().is_none(),
+            "nothing is deferred before the first refusal"
+        );
+
+        // A change lands while the checkpoint is proving the tree, which is what
+        // a commit in flight does to it.
+        let arriving = ArtifactId::new();
+        let arrived = LocatedEntry::new(
+            RepoPath::from_utf8("src/arrived_during_reopen.rs").unwrap(),
+            TreeEntry::blob(Hash256::from_bytes([9u8; 32]), false),
+        );
+        let moving_graph = Arc::clone(&state.graph);
+        let moved = Arc::new(AtomicBool::new(false));
+        let moved_seam = Arc::clone(&moved);
+        let arrived_seam = arrived.clone();
+        state.set_vector_checkpoint_reopen_test_hook(Some(Arc::new(move || {
+            // Once only. A seam that moved the tree on every reopen would model
+            // a repository nobody can ever checkpoint, not a commit that lands.
+            if moved_seam.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            moving_graph
+                .apply_transaction_delta(&kin_model::TransactionDelta {
+                    tree_deltas: vec![TreeDelta::Added {
+                        artifact_id: arriving,
+                        new: arrived_seam.clone(),
+                    }],
+                    ..Default::default()
+                })
+                .expect("the live graph must accept the concurrent mutation under test");
+        })));
+
+        let error = state
+            .flush_embed_progress()
+            .expect_err("a live tree that moved away from authority must be refused");
+        assert!(
+            moved.load(Ordering::SeqCst),
+            "the seam must actually have fired, or the refusal under test never happened"
+        );
+        assert!(
+            !vector_path.exists(),
+            "a refused checkpoint must write nothing, which is why the work needs retrying"
+        );
+        let deferred = state
+            .deferred_vector_checkpoint()
+            .expect("a refused checkpoint must be recorded, not logged once and abandoned");
+        assert!(
+            error.to_string().ends_with(&deferred),
+            "the record must carry the refusal's own cause, so every surface names why; \
+             recorded {deferred:?} against error {error}"
+        );
+        assert!(
+            deferred.contains("live exact tree does not match workspace authority"),
+            "expected the authority-mismatch refusal, got: {deferred}"
+        );
+        assert_eq!(
+            state.graph.vector_index_stats(),
+            Some((4, STAGED_VECTORS)),
+            "the refusal must not cost the vectors it declined to write"
+        );
+
+        // The divergence closes, the way it closes in a real store once the
+        // commit that opened it has settled.
+        state
+            .graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                tree_deltas: vec![TreeDelta::Removed {
+                    artifact_id: arriving,
+                    old: arrived,
+                }],
+                ..Default::default()
+            })
+            .expect("the live graph must accept the settling transition");
+
+        let pending = state
+            .retry_deferred_vector_checkpoint()
+            .expect("a standing refusal must give the retry something to do")
+            .expect("a settled tree must checkpoint");
+        assert!(
+            vector_path.exists(),
+            "the retry is the whole fix: the vectors must reach the sidecar (pending {pending})"
+        );
+        assert!(
+            state.deferred_vector_checkpoint().is_none(),
+            "a checkpoint that landed must retire the record it closed"
+        );
+        assert_eq!(
+            state.graph.vector_index_stats(),
+            Some((4, STAGED_VECTORS)),
+            "the staged vectors must still be indexed and counted after the whole lifecycle"
+        );
+
+        // And with nothing outstanding, the retry is a no-op rather than a
+        // standing authority reopen on every tick of the worker that calls it.
+        assert!(
+            state.retry_deferred_vector_checkpoint().is_none(),
+            "an unrefused daemon must not pay for a retry it does not need"
         );
     }
 

@@ -635,6 +635,73 @@ async fn drain_embed_flush(
     }
 }
 
+/// Ceiling on the wait between retries of a refused vector checkpoint.
+const DEFERRED_CHECKPOINT_RETRY_MAX: Duration = Duration::from_secs(300);
+
+/// Re-attempt a vector checkpoint the daemon had to refuse, so the vectors it
+/// left in memory reach the sidecar instead of dying with the process.
+///
+/// A refusal means the live exact tree had moved away from committed workspace
+/// authority, which is what a commit in flight does to it, and it closes when
+/// that commit settles. The work therefore needs nothing but somewhere to be
+/// retried from. There was nowhere: the only caller of the checkpoint is the
+/// flush the worker runs after a batch embeds something, so a refusal on the
+/// last batch of a draining queue was the end of it, and everything embedded
+/// since the previous successful checkpoint was gone on the next open. This
+/// worker's wake tick is the one clock that keeps running with no batch to
+/// embed, which is exactly the case that was losing the work.
+///
+/// The backoff is not politeness. Proving the tree against authority costs a
+/// full reopen, linear in store size rather than in the batch, so a mismatch
+/// that does not close would otherwise reopen authority on every tick for as
+/// long as it lasts.
+async fn retry_deferred_vector_checkpoint(
+    state: &Arc<DaemonState>,
+    backoff: &mut Option<Duration>,
+    due: &mut Option<Instant>,
+    base: Duration,
+) {
+    if state.deferred_vector_checkpoint().is_none() {
+        *backoff = None;
+        *due = None;
+        return;
+    }
+    if due.is_some_and(|at| Instant::now() < at) {
+        return;
+    }
+    let retry_state = Arc::clone(state);
+    match tokio::task::spawn_blocking(move || retry_state.retry_deferred_vector_checkpoint()).await
+    {
+        Ok(Some(Ok(pending))) => {
+            *backoff = None;
+            *due = None;
+            info!(
+                pending,
+                "checkpointed the vector progress a refused checkpoint had left in memory"
+            );
+        }
+        Ok(Some(Err(error))) => {
+            let next = next_embed_error_backoff(*backoff, base, DEFERRED_CHECKPOINT_RETRY_MAX);
+            *backoff = Some(next);
+            *due = Some(Instant::now() + next);
+            warn!(
+                error = %error,
+                next_retry_s = next.as_secs(),
+                "vector checkpoint still refused; embedded vectors stay in memory until it lands"
+            );
+        }
+        // The record cleared under us, which is the ordinary outcome when the
+        // worker's own flush landed between the read above and this call.
+        Ok(None) => {
+            *backoff = None;
+            *due = None;
+        }
+        Err(error) => {
+            error!(error = %error, "deferred vector checkpoint retry task panicked");
+        }
+    }
+}
+
 // Shutdown-latency bound — how long the daemon may take to actually disappear.
 // Callers that budget for daemon cleanup (the merge-trust harness attests
 // against a 45s window) depend on this being bounded rather than generous, so
@@ -2528,6 +2595,11 @@ pub async fn run_with_authority_on(
         // batch that embeds something, since progress makes the next gap a new
         // question.
         let mut backfilled_gap: Option<usize> = None;
+        // A refused vector checkpoint outlives the batch that hit it, so its
+        // retry schedule lives out here with the wake loop rather than inside
+        // the drain that produced the refusal.
+        let mut deferred_checkpoint_backoff: Option<Duration> = None;
+        let mut deferred_checkpoint_due: Option<Instant> = None;
         'wake: loop {
             // Between wakes this worker is genuinely doing nothing, so the
             // working stretch ends here. A wedged drain never reaches this
@@ -2550,6 +2622,19 @@ pub async fn run_with_authority_on(
             if embed_pass.halted() {
                 break;
             }
+
+            // Before anything this tick might embed, land what the last tick
+            // already embedded and could not checkpoint. A drained queue never
+            // reaches the flush below, so this is the only path that closes a
+            // refusal once there is nothing left to embed, which is the state
+            // the regression was found in.
+            retry_deferred_vector_checkpoint(
+                &embed_state,
+                &mut deferred_checkpoint_backoff,
+                &mut deferred_checkpoint_due,
+                embed_interval,
+            )
+            .await;
 
             // Drain the pending backlog continuously within this wake rather than
             // one batch per `embed_interval`. A fresh central-graph embed (or an

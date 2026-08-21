@@ -3343,6 +3343,7 @@ async fn command_resources(
         hybrid_metrics: hybrid_metrics_runtime(),
         metal_profile: metal_profile_runtime(),
         vector_index_discarded: state.vector_index_discarded().map(str::to_string),
+        deferred_vector_checkpoint: state.deferred_vector_checkpoint(),
         embedding_coverage_ever_complete: state.embedding_coverage_ever_complete(),
         embed_persistence_unavailable: !state.can_persist_embed_progress_locally(),
         model_fetch: kin_cli::embed_model::EmbedModelFetch::probe(embed_pass_is_working(&state)),
@@ -3445,6 +3446,7 @@ fn graph_status_embedding_runtime(
     }
     kin_cli::commands::resources::EmbedRuntimeState {
         vector_index_discarded: state.vector_index_discarded().map(str::to_string),
+        deferred_vector_checkpoint: state.deferred_vector_checkpoint(),
         embedding_coverage_ever_complete: state.embedding_coverage_ever_complete(),
         embed_persistence_unavailable: !state.can_persist_embed_progress_locally(),
         model_fetch: kin_cli::embed_model::EmbedModelFetch::probe(embed_pass_is_working(state)),
