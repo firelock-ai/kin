@@ -3847,14 +3847,14 @@ pub fn handle_trace_data_flow<G: GraphStore>(
             .copied()
             .unwrap_or(false),
     );
-    for index in 0..chain.len() {
+    for step in chain.iter_mut() {
         // An external or annotation boundary was decided at the edge that
         // reached the node and is the stronger statement: there is nothing on
         // the other side to walk.
-        if chain[index]["terminal"].as_str().is_some() {
+        if step["terminal"].as_str().is_some() {
             continue;
         }
-        let step_number = chain[index]["step"].as_u64().unwrap_or(0) as usize;
+        let step_number = step["step"].as_u64().unwrap_or(0) as usize;
         let outcome = expansion
             .get(&step_number)
             .copied()
@@ -3884,7 +3884,7 @@ pub fn handle_trace_data_flow<G: GraphStore>(
         } else {
             false
         };
-        chain[index]["terminal"] = match trace_walk_terminal(outcome, coverage_certain) {
+        step["terminal"] = match trace_walk_terminal(outcome, coverage_certain) {
             Some(terminal) => serde_json::Value::from(terminal.as_str()),
             None => serde_json::Value::Null,
         };

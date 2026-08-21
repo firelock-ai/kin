@@ -1179,14 +1179,14 @@ fn classify_walk_terminals<S: EntityStore>(
     response.focal_terminal = trace_walk_terminal(focal_expansion, focal_certain)
         .map(|terminal| terminal.as_str().to_string());
 
-    for index in 0..response.chain.len() {
+    for step in response.chain.iter_mut() {
         // An external or annotation boundary was decided at the edge that
         // reached the node and is a stronger statement than anything the
         // expansion can add: there is nothing on the other side to walk.
-        if response.chain[index].terminal.is_some() {
+        if step.terminal.is_some() {
             continue;
         }
-        let step_number = response.chain[index].step;
+        let step_number = step.step;
         let outcome = expansion
             .get(&step_number)
             .copied()
@@ -1216,7 +1216,7 @@ fn classify_walk_terminals<S: EntityStore>(
         } else {
             false
         };
-        response.chain[index].terminal = trace_walk_terminal(outcome, coverage_certain)
+        step.terminal = trace_walk_terminal(outcome, coverage_certain)
             .map(|terminal| terminal.as_str().to_string());
     }
 }
