@@ -6956,7 +6956,8 @@ mod shutdown_vector_checkpoint_tests {
                 &state.layout.kindb_snapshot_path(),
                 None,
             )
-            .expect("the checkpointed sidecar must be readable"),
+            .expect("the checkpointed sidecar must be readable")
+            .attached,
             "the checkpointed sidecar must install through the daemon's own open-time path"
         );
         assert_eq!(

@@ -44,6 +44,21 @@ pub struct EmbedRuntimeState {
     /// attached and reads as ordinary pending work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deferred_vector_checkpoint: Option<String>,
+    /// What a per-key vector salvage retired when this daemon opened, when one
+    /// happened.
+    ///
+    /// This is the state `vector_index_discarded` cannot describe. A salvage
+    /// INSTALLS an index, so no discard is recorded and coverage reads as
+    /// measured, while keys current graph truth could not prove were retired.
+    /// The counters then show a shortfall that is indistinguishable from a
+    /// first fill, which is how a store that had just lost 342 vectors rendered
+    /// as ordinary pending work (FIR-2562).
+    ///
+    /// `None` means no salvage happened, or the daemon does not report one.
+    /// Optional rather than a zeroed pair, because a salvage that retired
+    /// nothing and a load nobody measured are different facts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector_index_salvage: Option<VectorSalvage>,
     /// Whether this store's embedding coverage has ever been whole, as recorded
     /// by the daemon where the embedding queue drained. Partial coverage means
     /// something different before this has ever been true than after it.
@@ -66,6 +81,22 @@ pub struct EmbedRuntimeState {
     /// the whole download, which is indistinguishable from a wedged pass.
     #[serde(default)]
     pub model_fetch: crate::embed_model::EmbedModelFetch,
+}
+
+/// What a per-key vector salvage kept and retired at daemon open.
+///
+/// kin-db computes these while reconciling a sidecar whose graph-authority
+/// stamp drifted, and until kin-db 0.7.47 it logged them and returned a bare
+/// `bool`, so every count was thrown away at the boundary. They are carried
+/// here so a coverage LOSS can be named as a loss, with its size, rather than
+/// rendering as work not yet done.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorSalvage {
+    /// Vectors current graph truth could prove, which stayed in the index.
+    pub kept: usize,
+    /// Vectors current graph truth could not prove, which were retired and
+    /// which the daemon re-embeds.
+    pub dropped: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

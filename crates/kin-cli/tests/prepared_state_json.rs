@@ -182,7 +182,8 @@ fn seed_local_vectors(kin_dir: &Path) {
             &layout.kindb_snapshot_path(),
             None,
         )
-        .expect("validate seeded vector sidecar"),
+        .expect("validate seeded vector sidecar")
+        .attached,
         "seeded sidecar must validate against the repository graph it was built from"
     );
 }
