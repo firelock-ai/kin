@@ -173,6 +173,12 @@ fn build_dead_code_report(
     // truth, and the counts stay in the output so the scan never quietly
     // shrinks its own number.
     let mut unreferenced = Vec::new();
+    // Candidates every one of whose proven references comes from a test-role
+    // entity. They are not unreferenced and they are not live production code
+    // either, so they are neither listed under a heading that says unreferenced
+    // nor folded into the in-file exclusion, where the fact that the only caller
+    // was a test disappeared entirely.
+    let mut test_only = Vec::new();
     let mut nonproduction = 0usize;
     let mut trait_satisfying = 0usize;
     let mut referenced_in_file = 0usize;
@@ -197,16 +203,24 @@ fn build_dead_code_report(
         // same file arrives here. `find_references` reads that caller and
         // reports it; consulting the same collector is what stops the two
         // surfaces from answering opposite things about one edge.
-        let strength = incoming_reference_strength(graph, &entity.id)?;
-        if strength == Reachability::Proven {
+        let incoming = incoming_references(graph, &entity.id)?;
+        if incoming.strength == Reachability::Proven && !incoming.proven_only_from_tests {
             referenced_in_file += 1;
             continue;
         }
+        // Ahead of the test-only split, because an entry point is reached by the
+        // launcher its manifest declares whether or not a test also calls it, and
+        // reporting it as test-only would name a caller that is not the one that
+        // matters.
         if is_entry_point(&entity, entry_points) {
             declared_entry_points += 1;
             continue;
         }
-        if strength == Reachability::NameOnly {
+        if incoming.strength == Reachability::Proven {
+            test_only.push(entity);
+            continue;
+        }
+        if incoming.strength == Reachability::NameOnly {
             name_only_ids.insert(entity.id);
         }
         unreferenced.push(entity);
@@ -215,19 +229,8 @@ fn build_dead_code_report(
     // The scan reads a randomly seeded hash map in parallel, so without an
     // explicit order the same repository lists its findings differently on every
     // run and two scans cannot be diffed against each other.
-    unreferenced.sort_by(|left, right| {
-        let file_of = |entity: &kin_model::Entity| {
-            entity
-                .file_origin
-                .as_ref()
-                .map(|file| file.to_string())
-                .unwrap_or_default()
-        };
-        file_of(left)
-            .cmp(&file_of(right))
-            .then_with(|| left.name.cmp(&right.name))
-            .then_with(|| left.id.cmp(&right.id))
-    });
+    sort_rows(&mut unreferenced);
+    sort_rows(&mut test_only);
 
     // The gate. This output is a delete list, so it carries the strictest
     // completeness bar in the product: a graph that cannot support an absence
@@ -256,10 +259,23 @@ fn build_dead_code_report(
                 .map(|reason| (language.language.clone(), reason))
         })
         .collect();
+    //
+    // The fourth trigger is about the entity rather than about the graph, and it
+    // is the one this gate was missing. `find_references` has refused to certify
+    // an empty result for a method since FIR-2404, because receiver-method calls
+    // are linked by bare name and the method's incoming edges are dropped. This
+    // command read the same edges, applied none of that, and printed six live
+    // methods in a delete list the MCP surface refused to certify at the same
+    // graph generation (FIR-2550). The rule is now stated once, in
+    // `kin_core::reference_coverage`, and both surfaces read it there.
+    let method_row = |entity: &kin_model::Entity| {
+        kin_core::reference_coverage::kind_under_resolves_incoming_calls(entity.kind)
+    };
     let row_is_unverified = |entity: &kin_model::Entity| {
         manifest_gap.is_some()
             || name_only_ids.contains(&entity.id)
             || unsupportable.contains_key(&entity.language.to_string())
+            || method_row(entity)
     };
     let unverified_rows = unreferenced.iter().filter(|e| row_is_unverified(e)).count();
     let mut unverified_reasons: Vec<String> = unsupportable.values().cloned().collect();
@@ -274,6 +290,20 @@ fn build_dead_code_report(
              the edge was discarded as evidence, so the row is a candidate rather than a find"
         ));
     }
+    // Counted across both lists, because a test-only row is an absence claim too:
+    // it says no production caller exists, which for a method is exactly the
+    // claim the linker cannot support.
+    let method_rows = unreferenced
+        .iter()
+        .chain(test_only.iter())
+        .filter(|entity| method_row(entity))
+        .count();
+    if method_rows > 0 {
+        unverified_reasons.push(format!(
+            "{method_rows} listed entities are methods, and {}",
+            kin_core::reference_coverage::method_absence_limiting_factor("an empty result")
+        ));
+    }
     unverified_reasons.extend(manifest_gap.clone());
     // The verdict is about the rows this run printed. A gap in a language nothing
     // was listed for is still disclosed below, but it does not make the listed
@@ -281,8 +311,10 @@ fn build_dead_code_report(
     // under-report, so a row whose own language resolved is unaffected by it.
     let verified = unverified_rows == 0;
 
-    if unreferenced.is_empty() {
+    if unreferenced.is_empty() && test_only.is_empty() {
         lines.push("No dead code found.".to_string());
+    } else if unreferenced.is_empty() {
+        lines.push("No unreferenced entities.".to_string());
     } else if verified {
         lines.push(format!(
             "Found {} unreferenced entities:",
@@ -321,28 +353,70 @@ fn build_dead_code_report(
              points)"
         ));
     }
+    // The candidate generator drops a non-production entity by PATH before this
+    // command sees it, so the tally above counts only the tests that live in a
+    // production path and reads 0 on a repository that keeps its tests in a test
+    // directory. A run printed `0 excluded as non-production entities` while
+    // `kin graph status` read `test: 100` for the same store, and the only
+    // readings available to the user were that the classifier had not run or
+    // that the counter was lying (FIR-2550). Neither was true. This census reads
+    // the same `role` field over the same population `kin graph status` counts,
+    // so the two numbers can be put side by side without contradicting.
+    let nonproduction_in_graph = count_nonproduction_entities(graph)?;
+    if nonproduction_in_graph > 0 {
+        lines.push(format!(
+            "  ({nonproduction_in_graph} entities carry a non-production role here, the census \
+             `kin graph status` prints; the count above is only the part of that set the \
+             candidate scan still offered this filter)"
+        ));
+    }
     if !entry_points.manifests_read.is_empty() {
         lines.push(format!(
             "  (entry points read from {})",
             entry_points.manifests_read.join(", ")
         ));
     }
-    for e in &unreferenced {
-        let prefix = if row_is_unverified(e) {
-            "  [unverified] "
+    let render_row = |entity: &kin_model::Entity| {
+        // A row is read alone, pasted into a ticket or acted on by an agent that
+        // never saw the reasons above it, so the row names the factor rather than
+        // only that one applies.
+        let prefix = if method_row(entity) {
+            format!(
+                "  [unverified: {}] ",
+                kin_core::reference_coverage::METHOD_ABSENCE_LIMITING_FACTOR
+            )
+        } else if row_is_unverified(entity) {
+            "  [unverified] ".to_string()
         } else {
-            "  "
+            "  ".to_string()
         };
-        lines.push(format!(
+        format!(
             "{prefix}{} ({:?}, {}) - {}",
-            e.name,
-            e.kind,
-            e.language,
-            e.file_origin
+            entity.name,
+            entity.kind,
+            entity.language,
+            entity
+                .file_origin
                 .as_ref()
                 .map(|f| f.to_string())
                 .unwrap_or_else(|| "unknown".to_string())
-        ));
+        )
+    };
+    for e in &unreferenced {
+        lines.push(render_row(e));
+    }
+
+    if !test_only.is_empty() {
+        lines.push(format!("Referenced only by tests: {}", test_only.len()));
+        lines.push(
+            "  Every reference to a row below comes from a test-role entity, so no production \
+             caller reaches it. These rows are not unreferenced, and deleting one deletes the \
+             subject of a passing test."
+                .to_string(),
+        );
+        for e in &test_only {
+            lines.push(render_row(e));
+        }
     }
 
     Ok(DeadCodeResponse {
@@ -351,6 +425,43 @@ fn build_dead_code_report(
         unverified_reasons,
         reference_edge_coverage: Some(coverage.clone()),
     })
+}
+
+/// Order rows by file then name then id.
+///
+/// The scan reads a randomly seeded hash map in parallel, so without an explicit
+/// order the same repository lists its findings differently on every run and two
+/// scans cannot be diffed against each other. Shared by every list this report
+/// prints, so one section is never diffable while another is not.
+fn sort_rows(rows: &mut [kin_model::Entity]) {
+    rows.sort_by(|left, right| {
+        let file_of = |entity: &kin_model::Entity| {
+            entity
+                .file_origin
+                .as_ref()
+                .map(|file| file.to_string())
+                .unwrap_or_default()
+        };
+        file_of(left)
+            .cmp(&file_of(right))
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+}
+
+/// How many entities this repository defines under a non-production role.
+///
+/// Reads `Entity::role` over the same population `kin graph status` counts,
+/// external reference targets partitioned out the same way, because the whole
+/// point of the number is that a reader can hold the two outputs side by side.
+fn count_nonproduction_entities(graph: &kin_db::InMemoryGraph) -> Result<usize> {
+    Ok(graph
+        .list_all_entities()?
+        .into_iter()
+        .filter(|entity| {
+            !kin_index::is_external_reference_target(entity) && entity.role != EntityRole::Source
+        })
+        .count())
 }
 
 /// What the graph's inbound reference edges prove about one entity.
@@ -371,6 +482,20 @@ enum Reachability {
     None,
 }
 
+/// What the graph's inbound reference edges say about one entity, and who holds
+/// them.
+#[derive(Debug, Clone, Copy)]
+struct IncomingReferences {
+    strength: Reachability,
+    /// True when at least one inbound reference is proven and EVERY entity
+    /// holding a proven one carries `EntityRole::Test`.
+    ///
+    /// False when a proven reference's caller record is missing, because a
+    /// caller the graph cannot show is a caller whose role it cannot read, and
+    /// guessing it is a test is the reading that ends with a delete.
+    proven_only_from_tests: bool,
+}
+
 /// Classify an entity by the strongest inbound reference edge the graph holds.
 ///
 /// An inbound edge whose caller record is missing counts as proven: the edge
@@ -384,27 +509,47 @@ enum Reachability {
 /// edge removes an entity upstream of this call. The MCP `dead_code` tool's
 /// file-scoped path and both seeded surfaces classify entities directly rather
 /// than through that generator, so they apply the rule in full.
-fn incoming_reference_strength(
+fn incoming_references(
     graph: &impl GraphStore,
     entity_id: &EntityId,
-) -> Result<Reachability> {
+) -> Result<IncomingReferences> {
     let collected = crate::commands::refs::collect_graph_references(
         graph,
         entity_id,
         &kin_core::reference_coverage::REFERENCE_RELATION_KINDS,
     )?;
-    if !collected.missing_source_ids.is_empty()
-        || collected
-            .references
-            .iter()
-            .any(|reference| reference.resolution.is_proven())
-    {
-        return Ok(Reachability::Proven);
+    let proven: Vec<EntityId> = collected
+        .references
+        .iter()
+        .filter(|reference| reference.resolution.is_proven())
+        .map(|reference| reference.entity_id)
+        .collect();
+    if !collected.missing_source_ids.is_empty() || !proven.is_empty() {
+        let mut proven_only_from_tests = collected.missing_source_ids.is_empty();
+        for source_id in &proven {
+            // Read off the same `role` field the exclusion at the top of the
+            // scan reads, so one entity cannot be non-production for one
+            // decision and production for the other.
+            let role = graph.get_entity(source_id)?.map(|entity| entity.role);
+            if role != Some(EntityRole::Test) {
+                proven_only_from_tests = false;
+                break;
+            }
+        }
+        return Ok(IncomingReferences {
+            strength: Reachability::Proven,
+            proven_only_from_tests,
+        });
     }
-    if collected.references.is_empty() {
-        return Ok(Reachability::None);
-    }
-    Ok(Reachability::NameOnly)
+    let strength = if collected.references.is_empty() {
+        Reachability::None
+    } else {
+        Reachability::NameOnly
+    };
+    Ok(IncomingReferences {
+        strength,
+        proven_only_from_tests: false,
+    })
 }
 
 /// Whether this entity is an entry point, so no inbound edge was ever owed.
@@ -1000,16 +1145,18 @@ mod tests {
 
         let response = scan(&graph);
         assert!(
-            response.verified,
-            "a graph whose files parsed no call sites and no imports has nothing unresolved: {:?}",
+            !response.verified,
+            "one of the two rows is a method, whose incoming calls the linker under-resolves: \
+             {:?}",
             response.unverified_reasons
         );
         let lines = response.lines;
         let joined = lines.join("\n");
 
         assert!(
-            joined.contains("Found 2 unreferenced entities:"),
-            "only the orphan and the inherent method are unreferenced: {joined}"
+            joined.contains("Found 2 unreferenced entities, 1 of them UNVERIFIED:"),
+            "only the orphan and the inherent method are unreferenced, and only the method is \
+             unverifiable: {joined}"
         );
         assert!(
             joined.contains("never_called"),
@@ -1032,8 +1179,18 @@ mod tests {
             "the scan reports what it set aside: {joined}"
         );
         assert!(
-            !joined.contains("[unverified]"),
-            "a graph with nothing left to resolve answers plainly: {joined}"
+            joined.contains("1 entities carry a non-production role here"),
+            "and it reports the role census beside it, so the two never contradict: {joined}"
+        );
+        assert!(
+            joined.contains("[unverified: method_call_resolution_incomplete] Summary::helper"),
+            "the method row names the factor it could not clear: {joined}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("  never_called (")),
+            "and the function row beside it stays a plain find: {joined}"
         );
 
         let orphan_line = lines
@@ -1391,5 +1548,403 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("non-empty query"));
+    }
+
+    /// Rewrite `entity` as a Python declaration of `kind`.
+    ///
+    /// The failing run was Python, and the kind is what the gate reads, so a
+    /// fixture that leaves both at the Rust-function default cannot reproduce it.
+    fn python(mut entity: Entity, kind: EntityKind) -> Entity {
+        entity.language = LanguageId::Python;
+        entity.kind = kind;
+        entity
+    }
+
+    /// FIR-2550, in the shape the `npm0545` stranger hit: a multi-module Python
+    /// repository, 99 tests passing, whose methods are called through an
+    /// instance. A receiver call is linked by bare name while the method entity
+    /// is keyed by its qualified name, so the incoming edge is dropped and the
+    /// method reaches this scan with nothing pointing at it. `find_references`
+    /// has refused to certify that absence since FIR-2404. This command printed
+    /// it under `Found 7 unreferenced entities:` with no caveat, and six of the
+    /// seven rows were live code.
+    ///
+    /// The positive control is in the same fixture on purpose: a module-level
+    /// function nothing calls must still be a plain find, or the fix is just a
+    /// blanket caveat that teaches a reader to skip the label.
+    #[test]
+    fn a_method_reached_through_a_receiver_is_never_a_bare_unreferenced_row() {
+        let graph = InMemoryGraph::new();
+
+        // The production caller. Its `report.summary()` and `edge.resolved`
+        // reads produce no edge, which is the whole mechanism, so the fixture
+        // holds no relation into either method.
+        let cmd_ingest = measured(
+            python(
+                make_entity("cmd_ingest", "notekeeper/cli.py"),
+                EntityKind::Function,
+            ),
+            4,
+            2,
+        );
+        let main = measured(
+            python(
+                make_entity("main", "notekeeper/cli.py"),
+                EntityKind::Function,
+            ),
+            4,
+            2,
+        );
+        let parse_file = measured(
+            python(
+                make_entity("parse_file", "notekeeper/parsing.py"),
+                EntityKind::Function,
+            ),
+            2,
+            1,
+        );
+        let summary = measured(
+            python(
+                make_entity("IngestReport.summary", "notekeeper/storage.py"),
+                EntityKind::Method,
+            ),
+            3,
+            1,
+        );
+        let resolved = measured(
+            python(
+                make_entity("Edge.resolved", "notekeeper/linkgraph.py"),
+                EntityKind::Method,
+            ),
+            1,
+            1,
+        );
+        // The one true positive. A module-level function IS reached by a
+        // resolved call when one exists, so an empty result for it is an
+        // authoritative absence and the row stays a find.
+        let legacy_helper = measured(
+            python(
+                make_entity("legacy_helper", "notekeeper/legacy.py"),
+                EntityKind::Function,
+            ),
+            0,
+            0,
+        );
+
+        for entity in [
+            &main,
+            &cmd_ingest,
+            &parse_file,
+            &summary,
+            &resolved,
+            &legacy_helper,
+        ] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        // The module-level call that DOES resolve, cross file. Without it the
+        // language reads as unsupportable and every row would be labelled for a
+        // different reason, which would make this test unable to fail.
+        graph
+            .upsert_relation(&make_relation_at(
+                cmd_ingest.id,
+                parse_file.id,
+                RelationKind::Calls,
+                0.9,
+            ))
+            .unwrap();
+        // `main` dispatches to the subcommand, so the caller is itself reached
+        // and the list is the three the mechanism is about.
+        graph
+            .upsert_relation(&make_relation_at(
+                main.id,
+                cmd_ingest.id,
+                RelationKind::Calls,
+                0.9,
+            ))
+            .unwrap();
+
+        let response = scan(&graph);
+        let joined = response.lines.join("\n");
+
+        assert!(
+            !joined.contains("Found 3 unreferenced entities:"),
+            "the bare confident heading is what made the output a delete instruction: {joined}"
+        );
+        assert!(
+            joined.contains("Found 3 unreferenced entities, 2 of them UNVERIFIED:"),
+            "the two methods are candidates and the function is a find: {joined}"
+        );
+        assert!(
+            !response.verified,
+            "a list carrying a method row cannot be stood behind: {:?}",
+            response.unverified_reasons
+        );
+        for name in ["IngestReport.summary", "Edge.resolved"] {
+            assert!(
+                joined.contains(&format!(
+                    "[unverified: method_call_resolution_incomplete] {name} "
+                )),
+                "{name} carries the factor on its own row: {joined}"
+            );
+        }
+        assert!(
+            response.unverified_reasons.iter().any(|reason| reason
+                == "2 listed entities are methods, and method_call_resolution_incomplete: \
+                    receiver-method calls are linked by bare name and may be unresolved, so an \
+                    empty result is not an authoritative absence for a method"),
+            "the reason is the sentence find_references publishes, word for word: {:?}",
+            response.unverified_reasons
+        );
+        assert!(
+            response
+                .lines
+                .iter()
+                .any(|line| line == "  legacy_helper (Function, python) - notekeeper/legacy.py"),
+            "the genuinely unused function is still a plain find, unlabelled: {joined}"
+        );
+    }
+
+    /// The rule the CLI now applies is the rule the MCP envelope applies, read
+    /// from one place. Falsified by kind rather than by string: a function must
+    /// clear the gate the method trips, or the shared predicate is a constant.
+    #[test]
+    fn the_shared_method_rule_separates_a_method_from_a_function() {
+        assert!(
+            kin_core::reference_coverage::kind_under_resolves_incoming_calls(EntityKind::Method),
+            "a method's incoming calls are the ones the linker drops"
+        );
+        assert!(
+            !kin_core::reference_coverage::kind_under_resolves_incoming_calls(EntityKind::Function),
+            "a module-level function resolves, so its absence is authoritative"
+        );
+        assert!(
+            kin_core::reference_coverage::kind_name_under_resolves_incoming_calls("method"),
+            "the MCP payload spells the kind in serde case"
+        );
+        assert!(
+            !kin_core::reference_coverage::kind_name_under_resolves_incoming_calls("function"),
+            "and the string reader must disagree where the enum reader disagrees"
+        );
+        assert!(
+            !kin_core::reference_coverage::kind_name_under_resolves_incoming_calls("not_a_kind"),
+            "an unreported kind is not a method"
+        );
+    }
+
+    /// FIR-2550 ask 3, first half. Three of the stranger's seven rows were used
+    /// only by tests, which is defensible to surface and indefensible to call
+    /// unreferenced. A candidate whose every proven reference comes from a
+    /// test-role entity gets its own heading, and it is not folded into the
+    /// in-file exclusion either, where the fact that the only caller was a test
+    /// vanished.
+    #[test]
+    fn a_candidate_only_a_test_references_is_listed_under_its_own_heading() {
+        let graph = InMemoryGraph::new();
+
+        // The `#[cfg(test)] mod tests` shape: a test-role entity in a
+        // production PATH, so the candidate generator hands it to this scan
+        // rather than dropping it upstream.
+        let mut suite = measured(make_entity("renders_a_row", "src/report.rs"), 2, 0);
+        suite.role = EntityRole::Test;
+        let format_row = measured(make_entity("format_row", "src/report.rs"), 0, 0);
+        let caller = measured(make_entity("print_report", "src/report.rs"), 0, 0);
+        let render_header = measured(make_entity("render_header", "src/report.rs"), 0, 0);
+        let orphan = measured(make_entity("legacy_row", "src/legacy.rs"), 0, 0);
+
+        for entity in [&suite, &format_row, &caller, &render_header, &orphan] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        graph
+            .upsert_relation(&make_relation_at(
+                suite.id,
+                format_row.id,
+                RelationKind::Calls,
+                0.9,
+            ))
+            .unwrap();
+        // A production caller for the third function, so the in-file exclusion
+        // is exercised in the same run and the two dispositions can be told
+        // apart.
+        graph
+            .upsert_relation(&make_relation_at(
+                caller.id,
+                render_header.id,
+                RelationKind::Calls,
+                0.9,
+            ))
+            .unwrap();
+
+        let response = scan(&graph);
+        let joined = response.lines.join("\n");
+        let unreferenced_heading = response
+            .lines
+            .iter()
+            .position(|line| line.starts_with("Found "))
+            .expect("the scan lists its finds");
+        let test_heading = response
+            .lines
+            .iter()
+            .position(|line| line == "Referenced only by tests: 1")
+            .unwrap_or_else(|| panic!("the test-only section is named and counted: {joined}"));
+        let format_row_line = response
+            .lines
+            .iter()
+            .position(|line| line.contains("format_row ("))
+            .unwrap_or_else(|| panic!("a test-referenced row is still reported: {joined}"));
+        let orphan_line = response
+            .lines
+            .iter()
+            .position(|line| line.contains("legacy_row ("))
+            .unwrap_or_else(|| panic!("the unreferenced row is still reported: {joined}"));
+
+        assert!(
+            orphan_line > unreferenced_heading && orphan_line < test_heading,
+            "an entity nothing references at all stays under the unreferenced heading: {joined}"
+        );
+        assert!(
+            format_row_line > test_heading,
+            "a row whose only caller is a test is listed under the test heading, not the \
+             unreferenced one: {joined}"
+        );
+        assert!(
+            joined.contains("1 as referenced by an entity in their own file"),
+            "the production caller's target is excluded as before, so the new bucket did not \
+             swallow it: {joined}"
+        );
+        assert!(
+            !joined.contains("render_header ("),
+            "an entity a production caller reaches is not reported at all: {joined}"
+        );
+        assert!(
+            joined.contains("no production caller reaches it"),
+            "the section says what the rows mean: {joined}"
+        );
+    }
+
+    /// FIR-2550 ask 3, second half, and the counts-reconcile falsification.
+    ///
+    /// The candidate generator drops a non-production entity by PATH, so this
+    /// command's own role filter had nothing left to remove and printed `0
+    /// excluded as non-production entities` on a store whose `kin graph status`
+    /// read `test: 100`. Both numbers were right and together they were
+    /// unreadable. The census makes them agree, and the dispositions still add
+    /// up to the candidate set.
+    #[test]
+    fn the_non_production_census_matches_role_data_and_the_dispositions_add_up() {
+        let graph = InMemoryGraph::new();
+
+        let mut off_path_suite = measured(make_entity("checks_render", "src/report.rs"), 1, 0);
+        off_path_suite.role = EntityRole::Test;
+        let mut on_path_suite = measured(make_entity("test_render", "tests/test_report.rs"), 1, 0);
+        on_path_suite.role = EntityRole::Test;
+        let mut second_on_path = measured(make_entity("test_format", "tests/test_report.rs"), 1, 0);
+        second_on_path.role = EntityRole::Test;
+        let format_row = measured(make_entity("format_row", "src/report.rs"), 0, 0);
+        let caller = measured(make_entity("print_report", "src/report.rs"), 0, 0);
+        let render_header = measured(make_entity("render_header", "src/report.rs"), 0, 0);
+        let orphan = measured(make_entity("legacy_row", "src/legacy.rs"), 0, 0);
+        let mut dispatched = measured(make_entity("Report::emit", "src/sink.rs"), 0, 0);
+        dispatched.kind = EntityKind::Method;
+        let mut sink = measured(make_entity("Sink", "src/sink.rs"), 0, 0);
+        sink.kind = EntityKind::TraitDef;
+
+        for entity in [
+            &off_path_suite,
+            &on_path_suite,
+            &second_on_path,
+            &format_row,
+            &caller,
+            &render_header,
+            &orphan,
+            &dispatched,
+            &sink,
+        ] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        graph
+            .upsert_relation(&make_relation_at(
+                off_path_suite.id,
+                format_row.id,
+                RelationKind::Calls,
+                0.9,
+            ))
+            .unwrap();
+        graph
+            .upsert_relation(&make_relation_at(
+                caller.id,
+                render_header.id,
+                RelationKind::Calls,
+                0.9,
+            ))
+            .unwrap();
+        graph
+            .upsert_relation(&make_relation(
+                dispatched.id,
+                sink.id,
+                RelationKind::Implements,
+            ))
+            .unwrap();
+
+        let response = scan(&graph);
+        let joined = response.lines.join("\n");
+
+        // The role census, taken the way `kin graph status` takes it.
+        let by_role = graph
+            .list_all_entities()
+            .unwrap()
+            .into_iter()
+            .filter(|entity| {
+                !kin_index::is_external_reference_target(entity)
+                    && entity.role != EntityRole::Source
+            })
+            .count();
+        assert_eq!(by_role, 3, "the fixture holds three test-role entities");
+        assert!(
+            joined.contains("3 entities carry a non-production role here"),
+            "the census reports the role data rather than what survived the candidate scan: \
+             {joined}"
+        );
+        assert!(
+            joined.contains("1 excluded as non-production entities"),
+            "and the filter's own tally still says what IT removed, which is only the test in a \
+             production path: {joined}"
+        );
+
+        // Every candidate the generator produced reached exactly one
+        // disposition. This is the arithmetic the output invites a reader to do,
+        // so it is asserted rather than assumed.
+        let candidates = graph.find_dead_code().unwrap().len();
+        // Every printed row, by the shape `render_row` gives one, rather than by
+        // a kind allowlist: a TraitDef row counts too, and a filter naming the
+        // kinds it expects would drop the row it did not think of and reconcile
+        // anyway.
+        let listed = response
+            .lines
+            .iter()
+            .filter(|line| line.starts_with("  ") && line.contains(") - "))
+            .count();
+        assert_eq!(listed, 4, "the fixture prints four rows: {joined}");
+        let number_before = |needle: &str| -> usize {
+            let line = response
+                .lines
+                .iter()
+                .find(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("output names {needle}: {joined}"));
+            line[..line.find(needle).unwrap()]
+                .split_whitespace()
+                .next_back()
+                .and_then(|token| token.trim_start_matches('(').parse::<usize>().ok())
+                .unwrap_or_else(|| panic!("a count precedes {needle}: {line}"))
+        };
+        let excluded = number_before("excluded as non-production entities")
+            + number_before("as trait-implementation")
+            + number_before("as referenced by an entity in their own file")
+            + number_before("as declared entry points");
+        assert_eq!(
+            candidates,
+            excluded + listed,
+            "every candidate is either excluded with a stated reason or printed as a row: \
+             candidates={candidates} excluded={excluded} listed={listed}\n{joined}"
+        );
     }
 }
