@@ -129,6 +129,7 @@ pub fn build_trace_response(
     binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &impl GraphStore,
     request: &TraceRequest,
+    envelope: &kin_mcp::Envelope,
 ) -> Result<TraceResponse> {
     if request.json {
         return build_trace_json_response(layout, graph, &request.entity);
@@ -146,9 +147,48 @@ pub fn build_trace_response(
             request.max_lines,
             request.nearby_limit,
             request.transitive_limit,
+            envelope,
         )?,
         entities: Vec::new(),
     })
+}
+
+/// The absence qualifier for a pack whose dependency walk came back empty.
+///
+/// Declares `trace_data_flow`, whose spec is `field: "chain"`, `kind: "no_flow"`
+/// and subject "no data-flow chain was found from the focal entity". That is the
+/// direction this command walked: every group a pack carries
+/// (`dependency_signatures`, `transitive_deps`) runs OUTWARD from the focal.
+///
+/// Deliberately NOT `get_context_pack`, even though `kin_context::build_context_pack`
+/// above is what builds the pack. That tool's spec field is `dependents`, the
+/// INBOUND direction, and `kin_mcp::negative` chose it over `dependencies` on
+/// purpose. A `ContextPack` holds no dependents group at all, so handing that
+/// gate a synthetic `"dependents": []` would run a leaf's outbound fact through
+/// a gate built for the opposite claim and print a sentence about a set this
+/// command never walked. Matching the gate to the BUILDER rather than to the
+/// CLAIM is the same mistake as naming the wrong edge class, which is what
+/// `IMPACT_REFERENCE_KINDS` warns about one level down.
+///
+/// The coverage observation is shared with the inbound readers because it is
+/// direction-agnostic: it reports whether this graph holds cross-file edges of
+/// these classes at all, and a graph holding none can no more show what a focal
+/// reaches than what reaches it.
+fn trace_absence_qualifier(
+    graph: &impl GraphStore,
+    target: &Entity,
+    envelope: &kin_mcp::Envelope,
+) -> Vec<String> {
+    let coverage = kin_mcp::edge_coverage::observe_cross_file_reference_coverage_for_languages(
+        graph,
+        &[target.language],
+        &kin_mcp::handlers::review::IMPACT_REFERENCE_KINDS,
+    );
+    let payload = serde_json::json!({
+        "chain": [],
+        kin_mcp::EDGE_COVERAGE_KEY: coverage,
+    });
+    crate::commands::absence_qualifier::qualify("trace_data_flow", &payload, envelope, "")
 }
 
 pub fn build_trace_json_response(
@@ -207,6 +247,7 @@ fn build_trace_lines(
     max_lines: usize,
     nearby_limit: usize,
     transitive_limit: usize,
+    envelope: &kin_mcp::Envelope,
 ) -> Result<Vec<String>> {
     // Agents sometimes pass file paths instead of entity names; resolve those to
     // the graph-owned entities declared in that file rather than a raw file read.
@@ -225,6 +266,7 @@ fn build_trace_lines(
         max_lines,
         nearby_limit,
         transitive_limit,
+        envelope,
     )
 }
 
@@ -269,6 +311,7 @@ fn build_trace_lines_with_graph(
     max_lines: usize,
     nearby_limit: usize,
     transitive_limit: usize,
+    envelope: &kin_mcp::Envelope,
 ) -> Result<Vec<String>> {
     let token_budget = parse_budget(budget)?;
     let focal_max_lines = if compact {
@@ -370,6 +413,19 @@ fn build_trace_lines_with_graph(
                 }
             }
         }
+    }
+
+    // Where the silence was. An empty dependency walk printed NOTHING at all,
+    // which is quieter than impact's bare line and says even less: a reader saw
+    // a pack with no dependency section and had no way to tell a focal that
+    // reaches nothing from one whose outbound edges this graph could never have
+    // held (FIR-2524).
+    //
+    // Hoisted above the compact split on purpose. Both renderings key on the
+    // same two groups, and leaving this inside the compact arm left the DEFAULT
+    // invocation, the one a person types, as the only surface still silent.
+    if pack.dependency_signatures.is_empty() && pack.transitive_deps.is_empty() {
+        lines.extend(trace_absence_qualifier(graph, target, envelope));
     }
 
     if compact {
@@ -804,6 +860,18 @@ fn trace_not_found_guidance(entity: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    /// A daemon whose substrate is sound, so the FIR-2524 absence qualifier
+    /// answers on coverage rather than on the envelope. These cases assert trace
+    /// CONTENT and must not start failing for a reason they are not about.
+    fn healthy_trace_envelope() -> kin_mcp::Envelope {
+        kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 2,
+            "graph_generation": 1,
+        }))
+    }
+
     use super::{
         entity_mentions_qualifier, fallback_leaf_trace_matches, query_trace_matches,
         select_best_match, trace_not_found_guidance,
@@ -1045,6 +1113,7 @@ issues.map((iss) => util.finalizeItem(iss, ctx, core.config()));
                 nearby_limit: 3,
                 transitive_limit: 0,
             },
+            &healthy_trace_envelope(),
         )
         .unwrap();
         let joined = response.lines.join("\n");

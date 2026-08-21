@@ -346,27 +346,12 @@ const IMPACT_MEMBER_RELATION_KINDS: &[kin_model::RelationKind] = &[
     kin_model::RelationKind::References,
 ];
 
-/// Say, in a human sentence, that this empty answer is not evidence of absence.
+/// The absence qualifier for an empty impact answer.
 ///
-/// The VERDICT is not computed here. [`kin_mcp::negative::negative_for`] is the
-/// one gate, called with the same tool name and the same `edge_coverage`
-/// observation `impact_analysis` publishes over the same
-/// [`kin_mcp::handlers::review::IMPACT_REFERENCE_KINDS`], so this surface cannot
-/// reach a different conclusion from the MCP one about the same store. Only the
-/// RENDERING is local, because a person reading a terminal is not parsing an
-/// envelope (FIR-2524, captain's ruling 2026-08-20).
-///
-/// Silence is the certified case. A graph whose enrichment delivered says
-/// nothing extra, which is the control that stops this degrading into stamping
-/// every empty result uncertain, the FIR-2404 failure wearing its opposite
-/// costume.
-///
-/// The line promises no remedy, and that is decided rather than inherited. On a
-/// store whose sweep produced nothing the honest answer to "what should I do"
-/// does not exist yet; it is FIR-2519's to create. A promised remedy that may be
-/// false is the `absence_consequence` failure `kin_mcp::negative` already
-/// refuses on the MCP side, and `kin init` ships one today that misattributes a
-/// disabled sweep to a missing server (FIR-2531). One of those is enough.
+/// Thin on purpose: the observation is impact-specific (the cross-file classes
+/// `impact_analysis` declares) and the rendering is shared, because three CLI
+/// surfaces answering absence questions differently is the defect, not the
+/// implementation detail. See [`crate::commands::absence_qualifier`].
 fn impact_absence_qualifier(
     graph: &kin_db::InMemoryGraph,
     target: &kin_model::Entity,
@@ -381,151 +366,7 @@ fn impact_absence_qualifier(
         "entity_impacts": [],
         kin_mcp::EDGE_COVERAGE_KEY: coverage,
     });
-    let Some(negative) =
-        kin_mcp::negative::negative_for("impact_analysis", &payload, envelope, &[])
-    else {
-        return Vec::new();
-    };
-    if negative
-        .get("safe_to_conclude_absent")
-        .and_then(serde_json::Value::as_bool)
-        != Some(false)
-    {
-        return Vec::new();
-    }
-
-    let observed = payload.get(kin_mcp::EDGE_COVERAGE_KEY);
-    let language = observed
-        .and_then(|coverage| coverage.get("language"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("this language");
-    let classes = observed.and_then(|coverage| coverage.get("classes"));
-    let state_of = |class: &str| -> Option<&str> {
-        classes
-            .and_then(|classes| classes.get(class))
-            .and_then(serde_json::Value::as_str)
-    };
-    // Only the classes the gate actually rested on may be named. Listing every
-    // absent class would tell a reader their import edges were the problem on a
-    // store where imports never mattered: Kin's linker mints no entity-level
-    // `Imports` relation on any language, so that class reads absent on healthy
-    // graphs too, and naming it is a small fabrication of the same kind this
-    // change exists to stop.
-    //
-    // Which classes those are is READ from the record the verdict publishes
-    // rather than recomputed from the function that produced it. FIR-2505 made
-    // the completeness block publish `decided_by` for exactly this reason, so
-    // consuming it here is identical to the decision by construction, and needs
-    // nothing from `kin_mcp::negative` that is not already public. Importing the
-    // deciding-set helper instead would have been reading the pieces, which is
-    // the habit this ticket family exists to break.
-    let deciding = completeness_decided_by(&payload, envelope);
-    let missing: Vec<&'static str> = deciding
-        .iter()
-        .filter(|class| state_of(class) == Some("absent"))
-        .map(|class| edge_class_noun(class))
-        .collect();
-    let present: Vec<&'static str> = ["calls", "imports", "references"]
-        .into_iter()
-        .filter(|class| state_of(class) == Some("present"))
-        .map(edge_class_noun)
-        .collect();
-
-    // Naming a missing class the observation did not report would be the same
-    // fabrication this ticket family exists to end, so when nothing is absent
-    // the reason is whatever the verdict actually disclosed.
-    if missing.is_empty() {
-        let disclosed = negative
-            .get("degraded_signals")
-            .and_then(serde_json::Value::as_array)
-            .map(|signals| {
-                signals
-                    .iter()
-                    .filter_map(serde_json::Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
-            .filter(|disclosed| !disclosed.is_empty());
-        return vec![match disclosed {
-            Some(disclosed) => format!(
-                "  Kin cannot rule out dependents: this answer carries [{disclosed}], so it may \
-                 not reflect current truth."
-            ),
-            None => {
-                "  Kin cannot rule out dependents: this answer's coverage could not be established."
-                    .to_string()
-            }
-        }];
-    }
-
-    let mut said = vec![format!(
-        "  Kin cannot rule out dependents: this graph holds no cross-file {} edges for \
-         {language}, so a use reaching this entity from another file could not have been found.",
-        missing.join(" or ")
-    )];
-    if !present.is_empty() {
-        said.push(format!(
-            "  Cross-file {} edges exist but do not stand in for {} edges.",
-            present.join(" and "),
-            missing.join(" or ")
-        ));
-    }
-    said
-}
-
-/// The classes the verdict says it rested on, read off the published
-/// completeness block rather than recomputed.
-///
-/// `_kin.completeness.decided_by` is the verdict's own record of what it
-/// weighed (FIR-2505), so a renderer that reads it cannot name a class the
-/// decision did not use. Going through the same `finalize_with_envelope` the MCP
-/// surface goes through is the point: one producer, one record, two readers.
-///
-/// An empty answer here names no class, which is the conservative direction: the
-/// caller then falls back to the disclosed signals rather than inventing an edge
-/// class nobody observed.
-fn completeness_decided_by(
-    payload: &serde_json::Value,
-    envelope: &kin_mcp::Envelope,
-) -> Vec<String> {
-    let annotated = kin_mcp::finalize_with_envelope(
-        kin_mcp::ToolCallResult::text(payload.to_string()),
-        envelope.clone(),
-        "impact_analysis",
-    );
-    annotated
-        .content
-        .iter()
-        .find_map(|block| match block {
-            kin_mcp::ContentBlock::Text { text } => {
-                serde_json::from_str::<serde_json::Value>(text).ok()
-            }
-        })
-        .and_then(|value| {
-            value
-                .get(kin_mcp::ENVELOPE_KEY)
-                .and_then(|envelope| envelope.get("completeness"))
-                .and_then(|completeness| completeness.get("decided_by"))
-                .and_then(serde_json::Value::as_array)
-                .map(|classes| {
-                    classes
-                        .iter()
-                        .filter_map(serde_json::Value::as_str)
-                        .map(str::to_string)
-                        .collect()
-                })
-        })
-        .unwrap_or_default()
-}
-
-/// The edge class in the noun a sentence wants, since the observation keys are
-/// plural and the prose is not.
-fn edge_class_noun(class: &str) -> &'static str {
-    match class {
-        "calls" => "call",
-        "imports" => "import",
-        _ => "reference",
-    }
+    crate::commands::absence_qualifier::qualify("impact_analysis", &payload, envelope, "  ")
 }
 
 /// What the graph still says about a target with no downstream impact of its
