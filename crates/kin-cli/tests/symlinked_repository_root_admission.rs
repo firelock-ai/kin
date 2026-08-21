@@ -126,32 +126,65 @@ fn seed_repository(repo: &Path) {
     run_git(repo, &["commit", "-m", "seed"]);
 }
 
-/// Entities the live query graph reports, read through the production route.
-fn live_entity_count(repo: &Path, home: &Path, port: u16) -> u64 {
-    let output = Command::new(env!("CARGO_BIN_EXE_kin"))
+/// How long a reading waits for the daemon's two-phase admission to settle.
+///
+/// Only how long a reading that is going to fail spends proving it: the wait
+/// returns on the first healthy answer, so a quiet host never spends this.
+const STATUS_SETTLE_BOUND: Duration = Duration::from_secs(60);
+
+/// One `kin graph status`, run through the production route.
+fn graph_status(repo: &Path, home: &Path, port: u16) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_kin"))
         .args(["graph", "status"])
         .env("HOME", home)
         .env("USERPROFILE", home)
         .env("KIN_DAEMON_URL", format!("http://127.0.0.1:{port}"))
         .current_dir(repo)
         .output()
-        .expect("run production kin graph status route");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success(),
-        "graph status stdout={stdout} stderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    stdout
-        .lines()
-        .find(|line| line.starts_with("Entities: "))
-        .and_then(|line| {
-            line.trim_start_matches("Entities: ")
-                .split_whitespace()
-                .next()
-        })
-        .and_then(|count| count.parse::<u64>().ok())
-        .unwrap_or_else(|| panic!("graph status names an entity count: {stdout}"))
+        .expect("run production kin graph status route")
+}
+
+/// Entities the live query graph reports, once it can report them.
+///
+/// `kin graph status` exits non-zero on a critical graph health issue, and one
+/// of those issues is transient by construction: "derived graph tree has N
+/// artifacts but repository authority has M"
+/// (`crates/kin-cli/src/commands/graph_health.rs:481`), which the same output
+/// explains on the same run as authority admission binding the entity layer
+/// while facets are written per file after it. A single point-in-time read
+/// therefore samples a two-phase process and fails on the gap between its
+/// halves. That is not a product fault and no assertion here is about it, but
+/// it failed this case at 15.6 seconds on a host at load 100 while the same
+/// file passed in 5.99 seconds at load 17.87 (FIR-2566).
+///
+/// So wait for a reading rather than take the first one. A graph that is
+/// genuinely unhealthy still fails, at the bound, printing the last thing the
+/// command said.
+fn live_entity_count(repo: &Path, home: &Path, port: u16) -> u64 {
+    let deadline = Instant::now() + STATUS_SETTLE_BOUND;
+    loop {
+        let output = graph_status(repo, home, port);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if output.status.success() {
+            return stdout
+                .lines()
+                .find(|line| line.starts_with("Entities: "))
+                .and_then(|line| {
+                    line.trim_start_matches("Entities: ")
+                        .split_whitespace()
+                        .next()
+                })
+                .and_then(|count| count.parse::<u64>().ok())
+                .unwrap_or_else(|| panic!("graph status names an entity count: {stdout}"));
+        }
+        assert!(
+            Instant::now() < deadline,
+            "graph status never reported a healthy graph in {}s: stdout={stdout} stderr={}",
+            STATUS_SETTLE_BOUND.as_secs(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        thread::sleep(Duration::from_millis(250));
+    }
 }
 
 /// FIR-2442. A repository reached through a symbolic link admits host writes
