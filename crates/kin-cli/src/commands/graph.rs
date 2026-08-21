@@ -2432,6 +2432,7 @@ mod tests {
                 embedding_coverage_ever_complete: true,
                 ..Default::default()
             },
+            &Default::default(),
         )
         .unwrap();
         let ever_complete_line = ever_complete
@@ -2463,6 +2464,7 @@ mod tests {
         let first_fill = build_graph_status_response(
             &pinned(&binding),
             &graph,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         )
