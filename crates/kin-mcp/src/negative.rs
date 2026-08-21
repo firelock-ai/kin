@@ -1082,6 +1082,18 @@ fn locate_ranking_names_nothing(payload: &Value) -> bool {
         })
 }
 
+/// The wire word for the one embedding verdict, so the absence object and the
+/// completeness block publish the same vocabulary for the same fact.
+fn embedding_state_word(coverage: &crate::envelope::SemanticCoverage) -> &'static str {
+    use crate::envelope::EmbeddingState;
+    match coverage.embedding_state() {
+        EmbeddingState::Present => "present",
+        EmbeddingState::Partial => "partial",
+        EmbeddingState::Absent => "absent",
+        EmbeddingState::Unknown => "unknown",
+    }
+}
+
 /// Render the envelope's embedding coverage as a compact, agent-readable object
 /// (with a rounded percentage), or `Value::Null` when coverage is unknown.
 fn coverage_value(envelope: &Envelope) -> Value {
@@ -1092,13 +1104,24 @@ fn coverage_value(envelope: &Envelope) -> Value {
             } else {
                 (coverage.indexed as f64 / coverage.total as f64) * 100.0
             };
-            json!({
+            let mut rendered = json!({
                 "indexed": coverage.indexed,
                 "total": coverage.total,
                 "pending": coverage.pending,
                 "complete": coverage.complete,
+                // The one embedding verdict, beside the counters a reader would
+                // otherwise have to derive one from. `complete` is a
+                // conjunction and a reader deriving an embedding state from it
+                // gets `absent` on a fully embedded store (FIR-2543).
+                "embedding_state": embedding_state_word(coverage),
                 "percent": (percent * 10.0).round() / 10.0,
-            })
+            });
+            // Never fabricated: absent stays absent, so a reader can tell a
+            // producer that did not report a read time from one that did.
+            if let Some(read_at) = coverage.read_at.as_ref() {
+                rendered["read_at"] = json!(read_at);
+            }
+            rendered
         }
         None => Value::Null,
     }
@@ -1367,7 +1390,18 @@ fn coverage_basis(class: NegativeClass) -> &'static str {
 /// checked, which is exactly as much as that verdict knows.
 fn coverage_clause(class: NegativeClass, payload: &Value, envelope: &Envelope) -> String {
     match class {
+        // A percentage recited off counters nobody could read is the structural
+        // zero in prose: with no vector index attached, `embedding_status`
+        // answers zero indexed for every retrievable object, and this clause
+        // used to recite that as "semantic coverage 0.0%", which is a
+        // measurement of a store nothing measured. The unknown state says so
+        // instead (FIR-2543).
         NegativeClass::Semantic => match &envelope.semantic_coverage {
+            Some(coverage)
+                if coverage.embedding_state() == crate::envelope::EmbeddingState::Unknown =>
+            {
+                "semantic coverage unknown".to_string()
+            }
             Some(coverage) if coverage.total > 0 => {
                 let percent = (coverage.indexed as f64 / coverage.total as f64) * 100.0;
                 format!("semantic coverage {percent:.1}%")
@@ -2306,6 +2340,9 @@ mod tests {
             total: 100,
             pending: 0,
             complete: true,
+            embedding_state_reported: Some("present".to_string()),
+            limited_by: Vec::new(),
+            read_at: None,
             note: None,
             graph_body_gap_paths: None,
         });
@@ -2598,6 +2635,9 @@ mod tests {
             total: 100,
             pending: 60,
             complete: false,
+            embedding_state_reported: Some("partial".to_string()),
+            limited_by: vec!["embeddings_incomplete".to_string()],
+            read_at: None,
             note: Some("indexing".to_string()),
             graph_body_gap_paths: None,
         });
@@ -2626,6 +2666,9 @@ mod tests {
             total: 1644,
             pending: 0,
             complete: false,
+            embedding_state_reported: Some("present".to_string()),
+            limited_by: vec!["graph_body_gap".to_string()],
+            read_at: None,
             note: Some("graph body gap: 111 of 777 …".to_string()),
             graph_body_gap_paths: Some(111),
         });
