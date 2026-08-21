@@ -5473,6 +5473,112 @@ mod tests {
         }
     }
 
+    /// A whole-file rewrite is admitted for a tracked path, and refused both
+    /// when the path is untracked and when the body is the text authority
+    /// already holds.
+    ///
+    /// This is the shape an agent holding a path and a file's new contents
+    /// stages, which is every local `edit_file` and `write_file` harness. Both
+    /// refusals are checked here rather than only at commit because a caller
+    /// that learns at commit has already staged whatever it built on top, and
+    /// because each one names the verb that does what it asked: `create` for a
+    /// path the graph has never seen, and nothing at all for a body that
+    /// changes nothing.
+    ///
+    /// The identical-body answer comes from the artifact's own content hash,
+    /// so it is a graph-authority read rather than a look at the working copy.
+    #[tokio::test]
+    async fn handle_transaction_stage_admits_a_rewrite_and_refuses_the_two_ways_it_can_be_empty() {
+        use crate::session::McpMutationOperation;
+
+        const TRACKED: &str = "def value():\n    return 1\n";
+        const REWRITTEN: &str = "def value():\n    return 2\n\n\ndef added():\n    return 3\n";
+
+        let store = InMemoryGraph::default();
+        let tracked_path = kin_model::RepoPath::from_utf8("src/tracked.py".to_string()).unwrap();
+        store
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                tree_deltas: vec![kin_model::TreeDelta::Added {
+                    artifact_id: kin_model::ArtifactId::new(),
+                    new: kin_model::LocatedEntry::new(
+                        tracked_path,
+                        kin_model::TreeEntry::blob(kin_blobs::digest(TRACKED.as_bytes()), false),
+                    ),
+                }],
+                ..kin_model::TransactionDelta::default()
+            })
+            .unwrap();
+        let sessions = SessionRegistry::new();
+        let session_authority = SessionAuthorityMode::OfflineFallback;
+
+        let rewrite = |target: &str, body: &str| {
+            let op = McpMutationOperation {
+                verb: "replace".into(),
+                target: target.into(),
+                payload: None,
+                body: Some(body.into()),
+                destination: None,
+                description: format!("rewrite {target}"),
+            };
+            let mut args = HashMap::new();
+            args.insert("transaction_id".into(), serde_json::json!("no-such-tx"));
+            args.insert("operations".into(), serde_json::json!(vec![op]));
+            args
+        };
+
+        let err = sessions::handle_transaction_stage(
+            &rewrite("src/never_tracked.py", REWRITTEN),
+            &store,
+            &sessions,
+            session_authority,
+        )
+        .await
+        .expect_err("a rewrite of an untracked path must be rejected at stage time");
+        assert!(matches!(err, McpError::InvalidParams(_)));
+        let message = err.to_string();
+        assert!(
+            message.contains("\"src/never_tracked.py\" is not tracked by repository authority"),
+            "the refusal must name the path it rejected, got: {message}"
+        );
+        assert!(
+            message.contains("verb 'create'"),
+            "the refusal must name the verb that admits a new path, got: {message}"
+        );
+
+        let err = sessions::handle_transaction_stage(
+            &rewrite("src/tracked.py", TRACKED),
+            &store,
+            &sessions,
+            session_authority,
+        )
+        .await
+        .expect_err("a rewrite carrying the tracked contents must be rejected at stage time");
+        assert!(matches!(err, McpError::InvalidParams(_)));
+        let message = err.to_string();
+        assert!(
+            message.contains("byte-identical to the contents repository authority already tracks"),
+            "the refusal must say the operation changes nothing, got: {message}"
+        );
+
+        // The control: the same shape, on the tracked path, carrying text that
+        // differs, gets past both checks and fails only on the bogus
+        // transaction id. Without it the two refusals above would also be
+        // satisfied by a stage call that refused every rewrite.
+        let result = sessions::handle_transaction_stage(
+            &rewrite("src/tracked.py", REWRITTEN),
+            &store,
+            &sessions,
+            session_authority,
+        )
+        .await
+        .expect("a rewrite of a tracked path with new text must reach transaction lookup");
+        let text = tool_result_text(&result);
+        assert!(
+            text.contains("Transaction not found"),
+            "expected the bogus transaction id to be what refuses, got: {text}"
+        );
+    }
+
     use std::sync::{Mutex, OnceLock};
     static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 

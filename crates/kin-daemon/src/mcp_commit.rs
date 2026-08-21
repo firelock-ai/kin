@@ -104,6 +104,7 @@ fn authored_files_from_staged(
                 // every file it published as carried when the original declared
                 // none of them.
                 if kin_mcp::session::is_new_source_file(operation)
+                    || kin_mcp::session::is_replaced_source_file(operation)
                     || kin_mcp::session::is_retired_source_file(operation)
                 {
                     authored.insert(RepoPath::from_utf8(operation.target.trim().to_string()).ok()?);
@@ -941,6 +942,7 @@ fn plan_exact_transaction(
         .map_err(|error| format!("create prospective exact graph: {error}"))?;
     let mut edits: BTreeMap<String, (FilePathId, Vec<(Entity, Vec<u8>)>)> = BTreeMap::new();
     let mut creations: BTreeMap<String, (FilePathId, Vec<u8>)> = BTreeMap::new();
+    let mut replacements: BTreeMap<String, (FilePathId, Vec<u8>)> = BTreeMap::new();
     let mut retirements: BTreeMap<String, FilePathId> = BTreeMap::new();
     let mut relocations: BTreeMap<String, (FilePathId, FilePathId)> = BTreeMap::new();
     let mut relation_operations = Vec::new();
@@ -958,6 +960,19 @@ fn plan_exact_transaction(
         // edit another and publish both or neither.
         if operation.payload.is_none() && kin_mcp::session::is_new_source_file(operation) {
             record_new_source_file(&mut creations, base, operation)?;
+            continue;
+        }
+        // A payload-less `replace` carrying a repository path and a body
+        // rewrites source the graph already holds. It is the create's sibling
+        // for a file that exists, and it is the only shape a caller holding a
+        // path and a whole file can use: an entity edit resolves its target
+        // against one entity and splices into that entity's span, so a rewrite
+        // that adds or drops declarations has no span to land in. Recorded here
+        // and planned below, beside the creations and the edits, so one
+        // transaction can rewrite one file and create another and publish both
+        // or neither.
+        if operation.payload.is_none() && kin_mcp::session::is_replaced_source_file(operation) {
+            record_replaced_source_file(&mut replacements, base, operation)?;
             continue;
         }
         // A payload-less `delete` carrying a repository path retires source the
@@ -1119,6 +1134,7 @@ fn plan_exact_transaction(
         .values()
         .map(|(file_id, _)| file_id)
         .chain(creations.values().map(|(file_id, _)| file_id))
+        .chain(replacements.values().map(|(file_id, _)| file_id))
         .chain(retirements.values())
         .chain(relocations.values().flat_map(|(from, to)| [from, to]))
         .map(|file_id| {
@@ -1130,7 +1146,13 @@ fn plan_exact_transaction(
     let mut layouts = Vec::new();
     let pipeline = kin_index::IndexPipeline::new();
 
-    refuse_overlapping_file_operations(&creations, &retirements, &relocations, &edits)?;
+    refuse_overlapping_file_operations(
+        &creations,
+        &replacements,
+        &retirements,
+        &relocations,
+        &edits,
+    )?;
     // Retirements and relocations run before the creations and the edits. A
     // transaction that retires one path and creates another has to see the
     // retirement first, or the create plans against a tree that still carries
@@ -1141,6 +1163,7 @@ fn plan_exact_transaction(
     plan_retired_source_files(&prospective, retirements)?;
     plan_renamed_source_files(&prospective, relocations, &mut layouts)?;
     plan_new_source_files(state, &prospective, &pipeline, creations, &mut layouts)?;
+    plan_replaced_source_files(state, &prospective, &pipeline, replacements, &mut layouts)?;
     for (_, (file_id, file_edits)) in edits {
         let path = RepoPath::from_utf8(file_id.0.clone())
             .map_err(|error| format!("invalid exact source path {file_id}: {error}"))?;
@@ -1428,8 +1451,9 @@ fn record_new_source_file(
     if base.tree.artifact_at_path(&path).is_some() {
         return Err(format!(
             "{target} is already tracked by repository authority, so it cannot be created; \
-             'create' admits only source the graph has never seen. Edit it with verb 'update' \
-             naming an entity inside it, or create a path that does not exist yet"
+             'create' admits only source the graph has never seen. Rewrite it with verb \
+             'replace' carrying its complete new text, edit one entity inside it with verb \
+             'update', or create a path that does not exist yet"
         ));
     }
     let body = operation
@@ -1444,6 +1468,65 @@ fn record_new_source_file(
         return Err(format!(
             "{target} is created more than once in one transaction; overlapping source authority \
              is ambiguous"
+        ));
+    }
+    Ok(())
+}
+
+/// Record one "rewrite this tracked source file" operation against repository
+/// authority, refusing every shape the planner could not honor later.
+///
+/// The mirror of [`record_new_source_file`]: that one refuses a path authority
+/// already tracks, this one refuses a path it does not, so between them a
+/// caller is always pointed at the verb that does what it asked for. A rewrite
+/// of a path nothing tracks is not a harmless creation, because the caller
+/// believes it is changing a file that exists.
+///
+/// An identical body is refused here as well as at stage time. Publishing it
+/// would mint a change whose tree delta moves no bytes, and the transaction's
+/// own no-semantic-change guard would then refuse the whole commit with a
+/// message about the transaction rather than about the operation that emptied
+/// it. The comparison is on content hashes, which is what the tracked entry
+/// carries, so nothing is read off disk and no source is loaded to answer it.
+fn record_replaced_source_file(
+    replacements: &mut BTreeMap<String, (FilePathId, Vec<u8>)>,
+    base: &NativeCommitBase,
+    operation: &kin_mcp::McpMutationOperation,
+) -> Result<(), String> {
+    let target = operation.target.trim();
+    let path = RepoPath::from_utf8(target.to_string())
+        .map_err(|error| format!("replaced source path {target:?} is unusable: {error}"))?;
+    kin_core::validate_source_paths([&path]).map_err(|error| {
+        format!("replaced source path {target:?} is not an admissible repository path: {error}")
+    })?;
+    let artifact = base.tree.artifact_at_path(&path).ok_or_else(|| {
+        format!(
+            "{target} is not tracked by repository authority, so there is nothing to replace; \
+             'replace' rewrites only source the graph already holds. Admit a path the graph has \
+             never seen with verb 'create' instead, carrying the same body"
+        )
+    })?;
+    let body = operation
+        .body
+        .as_ref()
+        .expect("a replaced source file operation always carries a body");
+    if let TreeEntry::Blob { hash, .. } = artifact.entry {
+        if hash == kin_blobs::digest(body.as_bytes()) {
+            return Err(format!(
+                "the body sent for {target} is byte-identical to the contents repository \
+                 authority already tracks, so this operation changes nothing; no repository \
+                 commit was created"
+            ));
+        }
+    }
+    let file_id = FilePathId::new(target.to_string());
+    if replacements
+        .insert(file_id.0.clone(), (file_id, body.as_bytes().to_vec()))
+        .is_some()
+    {
+        return Err(format!(
+            "{target} is replaced more than once in one transaction; overlapping source \
+             authority is ambiguous"
         ));
     }
     Ok(())
@@ -1467,6 +1550,7 @@ fn record_new_source_file(
 /// in" that both halves survive.
 fn refuse_overlapping_file_operations(
     creations: &BTreeMap<String, (FilePathId, Vec<u8>)>,
+    replacements: &BTreeMap<String, (FilePathId, Vec<u8>)>,
     retirements: &BTreeMap<String, FilePathId>,
     relocations: &BTreeMap<String, (FilePathId, FilePathId)>,
     edits: &BTreeMap<String, (FilePathId, Vec<(Entity, Vec<u8>)>)>,
@@ -1484,10 +1568,35 @@ fn refuse_overlapping_file_operations(
                  and admit the new file in the next, so each is reviewable on its own"
             ));
         }
+        if replacements.contains_key(path) {
+            return Err(format!(
+                "{path} is both retired and rewritten in one transaction; the rewrite would be \
+                 planned against a path this transaction has already taken out"
+            ));
+        }
         if edits.contains_key(path) {
             return Err(format!(
                 "{path} is retired and also carries an entity edit in one transaction; the edit \
                  would be planned against a path this transaction has already taken out"
+            ));
+        }
+    }
+    // A rewrite states the file's whole new text, so anything else that also
+    // writes the same path in the same transaction is a second authority over
+    // the same bytes. Whichever one ran last would win silently, and the
+    // caller would have no way to tell which it was.
+    for path in replacements.keys() {
+        if relocations.contains_key(path) {
+            return Err(format!(
+                "{path} is both rewritten and renamed away in one transaction; rewrite the file \
+                 where it lands, or move it in a separate transaction"
+            ));
+        }
+        if edits.contains_key(path) {
+            return Err(format!(
+                "{path} carries both a whole-file rewrite and an entity edit in one transaction; \
+                 the rewrite already states the file's complete new text, so the edit would be \
+                 spliced into bytes it replaces"
             ));
         }
     }
@@ -1882,6 +1991,113 @@ fn plan_new_source_files(
             .get_layout(&file_id)
             .cloned()
             .ok_or_else(|| format!("parsing produced no file layout for new source {file_id}"))?;
+        prospective
+            .upsert_file_layout(&layout)
+            .map_err(|error| format!("install prospective layout for {file_id}: {error}"))?;
+        layouts.push(layout);
+    }
+    Ok(())
+}
+
+/// Turn recorded rewrites into prospective graph truth: exact blob, tree
+/// transition, re-derived entities, re-derived relations, and a file layout.
+///
+/// Every step is the one [`plan_new_source_files`] runs, against a path that
+/// already exists rather than one that does not, so the artifact keeps its
+/// identity and the transition is an update rather than an admission. The
+/// bytes come from the call, never from the working copy, and the working file
+/// appears afterwards because the commit projects the tree it published.
+///
+/// The reconciler is what makes this a rewrite rather than a splice. It reads
+/// the entities the graph already holds for the file, matches them against the
+/// declarations the new text parses to, and derives the additions, the
+/// modifications and the removals from the difference. So an entity the new
+/// text drops leaves the graph, an entity it adds enters, and one it merely
+/// edits keeps its id and its incoming edges. That is exactly what an entity
+/// edit cannot do: it names one entity and one span, so a rewrite that changes
+/// how many declarations a file has has nowhere to land.
+///
+/// A rewritten file must still classify as entity source. The alternative is
+/// to admit the new bytes and leave the entities the old bytes derived standing
+/// with nothing under them, which is a graph that answers about source the
+/// repository no longer holds. Refusing says so instead.
+fn plan_replaced_source_files(
+    state: &DaemonState,
+    prospective: &kin_db::InMemoryGraph,
+    pipeline: &kin_index::IndexPipeline,
+    replacements: BTreeMap<String, (FilePathId, Vec<u8>)>,
+    layouts: &mut Vec<FileLayout>,
+) -> Result<(), String> {
+    if replacements.is_empty() {
+        return Ok(());
+    }
+    let mut reconciler = kin_reconcile::Reconciler::new(PathBuf::new());
+    reconciler.seed_cross_file_linker_from_graph(prospective);
+
+    for (_, (file_id, body)) in replacements {
+        let path = RepoPath::from_utf8(file_id.0.clone())
+            .map_err(|error| format!("invalid replaced source path {file_id}: {error}"))?;
+        let artifact = prospective
+            .resolved_tree()
+            .artifact_at_path(&path)
+            .cloned()
+            .ok_or_else(|| {
+                format!("replaced source artifact disappeared during planning: {file_id}")
+            })?;
+        let executable = match artifact.entry {
+            TreeEntry::Blob { executable, .. } => executable,
+            TreeEntry::Symlink { .. } => {
+                return Err(format!(
+                    "replaced source {file_id} resolves through a symlink"
+                ))
+            }
+            TreeEntry::Gitlink { .. } => {
+                return Err(format!(
+                    "replaced source {file_id} resolves through a gitlink"
+                ))
+            }
+        };
+
+        let digest = state
+            .blobs
+            .write(&body)
+            .map_err(|error| format!("store replaced source {file_id}: {error}"))?;
+        let hash = Hash256::from_bytes(digest.0);
+        prospective
+            .apply_transaction_delta(&TransactionDelta {
+                tree_deltas: vec![TreeDelta::Updated {
+                    artifact_id: artifact.artifact_id,
+                    old: artifact.located_entry(),
+                    new: LocatedEntry::new(path, TreeEntry::blob(hash, executable)),
+                }],
+                ..TransactionDelta::default()
+            })
+            .map_err(|error| format!("install prospective exact tree for {file_id}: {error}"))?;
+
+        let indexed = pipeline
+            .index_any_content(&file_id, &body, digest)
+            .map_err(|error| format!("parse replaced source {file_id}: {error}"))?;
+        let kin_index::IndexedAny::EntitySource(indexed) = indexed else {
+            return Err(format!(
+                "the replacement body for {file_id} does not classify as supported entity \
+                 source, and the entities the tracked file derives would be left standing over \
+                 bytes the repository no longer holds; retire the file with verb 'delete' if \
+                 that is what you meant"
+            ));
+        };
+        let reconcile = reconciler
+            .reconcile_indexed_content(&indexed, state.blobs.as_ref(), prospective)
+            .map_err(|error| format!("derive semantics for replaced source {file_id}: {error}"))?;
+        prospective
+            .apply_transaction_delta(&reconcile.delta)
+            .map_err(|error| format!("apply derived semantics for {file_id}: {error}"))?;
+        let layout = reconciler
+            .projection()
+            .get_layout(&file_id)
+            .cloned()
+            .ok_or_else(|| {
+                format!("parsing produced no file layout for replaced source {file_id}")
+            })?;
         prospective
             .upsert_file_layout(&layout)
             .map_err(|error| format!("install prospective layout for {file_id}: {error}"))?;
@@ -2990,6 +3206,262 @@ mod tests {
         assert_eq!(
             std::fs::read(state.layout.working_dir().join("src/lib.rs")).unwrap(),
             b"pub fn value() -> u8 { 1 }\n"
+        );
+    }
+
+    /// Build the replace-file operation an agent stages to rewrite tracked
+    /// source from its complete new text.
+    fn replaced_source_file(path: &str, body: &str) -> kin_mcp::McpMutationOperation {
+        kin_mcp::McpMutationOperation {
+            verb: "replace".to_string(),
+            target: path.to_string(),
+            payload: None,
+            body: Some(body.to_string()),
+            destination: None,
+            description: format!("rewrite {path}"),
+        }
+    }
+
+    const TRACKED_RS: &str =
+        "pub fn value() -> u8 {\n    1\n}\n\npub fn doomed() -> u8 {\n    9\n}\n";
+    const REWRITTEN_RS: &str =
+        "pub fn value() -> u8 {\n    2\n}\n\npub fn added() -> u8 {\n    3\n}\n";
+
+    /// An agent holding a path and a file's complete new text lands the rewrite
+    /// as one change, and the graph re-derives the file's entities from the
+    /// bytes that were published.
+    ///
+    /// This is the half of the write surface FIR-2586 found missing. `create`
+    /// admits a path the graph has never seen, and an entity edit resolves a
+    /// target against one entity and splices into that entity's span, so a
+    /// caller holding a path and a whole file could reach neither. Every local
+    /// `edit_file` and `write_file` harness holds exactly that, which is why
+    /// kin#1049 opens no transaction for an in-place edit at all.
+    ///
+    /// The re-derivation is asserted rather than assumed, because it is what
+    /// separates a rewrite from an admission: the entity the new text keeps
+    /// holds its id, the entity it drops leaves the graph, and the entity it
+    /// adds enters. An entity edit refuses this case by name, since it may
+    /// only change the body of the one entity it resolved.
+    #[test]
+    fn replacing_a_tracked_file_over_mcp_republishes_it_and_re_derives_its_entities() {
+        let (_dir, state) = test_state();
+        let (before_entity, installed_change) =
+            install_exact_source(&state, "src/lib.rs", TRACKED_RS.as_bytes(), "value");
+        let doomed_before = state
+            .graph
+            .query_entities(&EntityFilter {
+                name_pattern: Some("doomed".to_string()),
+                file_path: Some(FilePathId::new("src/lib.rs")),
+                ..EntityFilter::default()
+            })
+            .unwrap();
+        assert_eq!(
+            doomed_before.len(),
+            1,
+            "the fixture must hold the entity the rewrite drops"
+        );
+
+        let sessions = test_sessions();
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "file:src/lib.rs")
+            .unwrap();
+        let operations = vec![replaced_source_file("src/lib.rs", REWRITTEN_RS)];
+        kin_mcp::session::validate_staged_operations(&operations)
+            .expect("staging must accept the whole-file rewrite form");
+        sessions
+            .stage_transaction(&transaction.transaction_id, operations)
+            .unwrap();
+
+        let result = commit_exact_transaction(
+            &state,
+            &sessions,
+            &HashMap::from([(
+                "transaction_id".to_string(),
+                serde_json::json!(transaction.transaction_id),
+            )]),
+            None,
+        );
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "rewriting tracked source over MCP failed: {}",
+            result_text(&result)
+        );
+
+        // The working file is a projection of what committed, written by the
+        // commit rather than by the agent. Byte-exact, so a body that arrived
+        // mangled cannot pass.
+        assert_eq!(
+            std::fs::read_to_string(state.layout.working_dir().join("src/lib.rs")).unwrap(),
+            REWRITTEN_RS
+        );
+
+        // One change, which is what `kin log` reports. A rewrite that published
+        // a retirement and an admission would read as two.
+        let reply: serde_json::Value = commit_reply(&result);
+        let committed = SemanticChangeId::from_hash(
+            Hash256::from_hex(
+                reply["change_id"]
+                    .as_str()
+                    .expect("a successful commit names its change"),
+            )
+            .expect("the change id is a content hash"),
+        );
+        let published = state
+            .graph
+            .get_changes_since(&installed_change, &committed)
+            .unwrap();
+        assert_eq!(
+            published.iter().map(|change| change.id).collect::<Vec<_>>(),
+            vec![committed],
+            "the rewrite must publish exactly one change on top of the fixture"
+        );
+
+        let after = load_native_commit_base(&state.layout).unwrap();
+        let named = |name: &str| {
+            after
+                .graph
+                .query_entities(&EntityFilter {
+                    name_pattern: Some(name.to_string()),
+                    file_path: Some(FilePathId::new("src/lib.rs")),
+                    ..EntityFilter::default()
+                })
+                .unwrap()
+                .into_iter()
+                .filter(|entity| entity.name == name)
+                .collect::<Vec<_>>()
+        };
+        let kept = named("value");
+        assert_eq!(kept.len(), 1, "the entity the new text keeps must survive");
+        assert_eq!(
+            kept[0].id, before_entity.id,
+            "a rewrite keeps entity identity; minting a new id would orphan every incoming edge"
+        );
+        assert_eq!(
+            named("added").len(),
+            1,
+            "an entity the new text adds must enter the graph"
+        );
+        assert!(
+            named("doomed").is_empty(),
+            "an entity the new text drops must leave the graph"
+        );
+    }
+
+    /// A rewrite of a path repository authority does not track is refused by
+    /// name, and told which verb admits one.
+    ///
+    /// The mirror of the create refusal, and it matters for the same reason:
+    /// admitting the file instead would report a rewrite of something that
+    /// existed while actually creating it, and the caller would have no way to
+    /// learn the file it meant to change was never there.
+    #[test]
+    fn replacing_a_path_the_graph_does_not_track_is_refused_by_name() {
+        let (_dir, state) = test_state();
+        install_exact_source(&state, "src/lib.rs", TRACKED_RS.as_bytes(), "value");
+        let sessions = test_sessions();
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "file:src/absent.rs")
+            .unwrap();
+        sessions
+            .stage_transaction(
+                &transaction.transaction_id,
+                vec![replaced_source_file("src/absent.rs", REWRITTEN_RS)],
+            )
+            .unwrap();
+
+        let result = commit_exact_transaction(
+            &state,
+            &sessions,
+            &HashMap::from([(
+                "transaction_id".to_string(),
+                serde_json::json!(transaction.transaction_id),
+            )]),
+            None,
+        );
+        assert_eq!(result.is_error, Some(true));
+        let text = result_text(&result);
+        assert!(
+            text.contains("src/absent.rs is not tracked by repository authority"),
+            "refusal must name the untracked path: {text}"
+        );
+        assert!(
+            text.contains("verb 'create'"),
+            "refusal must name the verb that admits a new path: {text}"
+        );
+        assert!(
+            !state.layout.working_dir().join("src/absent.rs").exists(),
+            "a refused rewrite must not leave the file it named on disk"
+        );
+    }
+
+    /// A rewrite carrying the text authority already holds is refused as the
+    /// empty change it is.
+    ///
+    /// Publishing it would mint a change whose tree delta moves no bytes, and
+    /// the transaction's own no-semantic-change guard would then refuse the
+    /// commit with a message about the transaction rather than about the
+    /// operation that emptied it. The comparison is on content hashes, which is
+    /// what the tracked entry carries, so nothing is read off the working copy
+    /// to answer it.
+    #[test]
+    fn replacing_a_tracked_file_with_the_text_it_already_holds_is_refused_as_an_empty_change() {
+        let (_dir, state) = test_state();
+        install_exact_source(&state, "src/lib.rs", TRACKED_RS.as_bytes(), "value");
+        let sessions = test_sessions();
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "file:src/lib.rs")
+            .unwrap();
+        sessions
+            .stage_transaction(
+                &transaction.transaction_id,
+                vec![replaced_source_file("src/lib.rs", TRACKED_RS)],
+            )
+            .unwrap();
+
+        let result = commit_exact_transaction(
+            &state,
+            &sessions,
+            &HashMap::from([(
+                "transaction_id".to_string(),
+                serde_json::json!(transaction.transaction_id),
+            )]),
+            None,
+        );
+        assert_eq!(result.is_error, Some(true));
+        let text = result_text(&result);
+        assert!(
+            text.contains("byte-identical to the contents repository authority already tracks"),
+            "refusal must say the operation changes nothing: {text}"
+        );
+
+        // The control: the same path, the same shape, different text, commits.
+        // Without it the refusal above would also be satisfied by a planner
+        // that refused every rewrite.
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "file:src/lib.rs")
+            .unwrap();
+        sessions
+            .stage_transaction(
+                &transaction.transaction_id,
+                vec![replaced_source_file("src/lib.rs", REWRITTEN_RS)],
+            )
+            .unwrap();
+        let result = commit_exact_transaction(
+            &state,
+            &sessions,
+            &HashMap::from([(
+                "transaction_id".to_string(),
+                serde_json::json!(transaction.transaction_id),
+            )]),
+            None,
+        );
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "a rewrite carrying new text must still commit: {}",
+            result_text(&result)
         );
     }
 
