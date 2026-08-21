@@ -12724,7 +12724,12 @@ fn readiness_line(report: &crate::commands::health::HealthReport) -> ReadinessLi
     let waiting: Vec<&crate::commands::health::HealthCheck> = report
         .checks
         .iter()
-        .filter(|check| !matches!(check.status, HealthStatus::Healthy | HealthStatus::Unsupported))
+        .filter(|check| {
+            !matches!(
+                check.status,
+                HealthStatus::Healthy | HealthStatus::Unsupported
+            )
+        })
         .collect();
     if report.healthy && summary.attention == 0 && waiting.is_empty() {
         return ReadinessLine {
@@ -12799,12 +12804,7 @@ fn print_unfinished_repairs(unfinished: &[UnfinishedRepair]) {
     println!();
     println!("Repairs that did not complete:");
     for repair in unfinished {
-        println!(
-            "  {} {}: {}",
-            style("✗").red(),
-            repair.what,
-            repair.reason
-        );
+        println!("  {} {}: {}", style("✗").red(), repair.what, repair.reason);
         for line in &repair.remediation {
             println!("      {line}");
         }
@@ -12997,7 +12997,9 @@ async fn apply_language_server_provisioning(
                 let remediation = recipe
                     .map(|recipe| language_servers::install_failure_remediation(recipe, &reason))
                     .unwrap_or_else(|| {
-                        vec![format!("run `{command}` yourself to see the installer's own error")]
+                        vec![format!(
+                            "run `{command}` yourself to see the installer's own error"
+                        )]
                     });
                 unfinished.push(UnfinishedRepair {
                     what: format!("install the {} language server", report.language),
@@ -13157,7 +13159,10 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
             }
             Err(e) => {
                 let reason = e.to_string();
-                println!("  {} shell hook reinstall failed: {reason}", style("✗").red());
+                println!(
+                    "  {} shell hook reinstall failed: {reason}",
+                    style("✗").red()
+                );
                 unfinished.push(UnfinishedRepair {
                     what: "reinstall the shell hook".to_string(),
                     reason,
@@ -13225,11 +13230,9 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
                         unfinished.push(UnfinishedRepair {
                             what: "restore the VFS shim".to_string(),
                             reason,
-                            remediation: vec![
-                                "reinstall kin to restore it: curl -fsSL \
+                            remediation: vec!["reinstall kin to restore it: curl -fsSL \
                                  https://get.kinlab.dev/install | sh"
-                                    .to_string(),
-                            ],
+                                .to_string()],
                             requested: false,
                         });
                     }
@@ -13352,7 +13355,20 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
     }
 
     if applied.is_empty() {
-        println!("  Nothing to repair automatically.");
+        // "Nothing to repair automatically" belongs to a run that found nothing
+        // to do. A run that attempted four repairs and failed all four printed
+        // it directly under its own four failure lines (FIR-2512), which is the
+        // same defect as the closing line that could not read its rows.
+        if unfinished.is_empty() {
+            println!("  Nothing to repair automatically.");
+        } else {
+            println!(
+                "  {} nothing was repaired; {} repair{} did not complete, listed below.",
+                style("✗").red(),
+                unfinished.len(),
+                if unfinished.len() == 1 { "" } else { "s" }
+            );
+        }
     } else {
         for line in &applied {
             println!("  {} {line}", style("✓").green());
@@ -14851,7 +14867,11 @@ mod tests {
             healthy: true,
         };
         let line = readiness_line(&report);
-        assert!(!line.ready, "{}", line.sentence);
+        assert!(
+            !line.ready,
+            "a report holding a row that needs attention must not claim readiness, got: {}",
+            line.sentence
+        );
         assert!(
             !line.sentence.contains("First-run ready"),
             "a row that knows no language server was found must not close under a claim that \
@@ -14878,13 +14898,21 @@ mod tests {
             platform: "linux".to_string(),
             checks: vec![
                 check("kin_binary", "Kin binary", HealthStatus::Healthy),
-                check("vfs_projection", "VFS projection", HealthStatus::Unsupported),
+                check(
+                    "vfs_projection",
+                    "VFS projection",
+                    HealthStatus::Unsupported,
+                ),
             ],
             healthy: true,
         };
         let line = readiness_line(&report);
         assert!(line.ready, "{}", line.sentence);
-        assert!(line.sentence.contains("First-run ready"), "{}", line.sentence);
+        assert!(
+            line.sentence.contains("First-run ready"),
+            "{}",
+            line.sentence
+        );
     }
 
     /// A real failure keeps the red mark and the repair route.
@@ -14894,7 +14922,10 @@ mod tests {
         missing.fixable = true;
         let report = HealthReport {
             platform: "linux".to_string(),
-            checks: vec![check("kin_binary", "Kin binary", HealthStatus::Healthy), missing],
+            checks: vec![
+                check("kin_binary", "Kin binary", HealthStatus::Healthy),
+                missing,
+            ],
             healthy: false,
         };
         let line = readiness_line(&report);
@@ -14921,7 +14952,10 @@ mod tests {
         let error = fix_verdict(std::slice::from_ref(&requested))
             .expect_err("a requested repair that did not happen must not exit 0");
         let text = error.to_string();
-        assert!(text.contains("install the python language server"), "{text}");
+        assert!(
+            text.contains("install the python language server"),
+            "{text}"
+        );
 
         // Two controls. Nothing unfinished is a clean run, and a best-effort
         // convergence repair reports itself without failing the run, because

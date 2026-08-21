@@ -23,7 +23,7 @@
 //! download into a shared global prefix, and Kin does not spend a user's
 //! bandwidth or mutate their toolchain on a probe's say-so.
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -509,7 +509,9 @@ pub(crate) fn is_permission_failure(reason: &str) -> bool {
         "access is denied",
     ];
     let lowered = reason.to_lowercase();
-    SIGNATURES.iter().any(|signature| lowered.contains(signature))
+    SIGNATURES
+        .iter()
+        .any(|signature| lowered.contains(signature))
 }
 
 /// The installer's own account of the failure, reduced to the lines naming it.
@@ -583,7 +585,9 @@ pub(crate) fn install_failure_remediation(
         "    npm config set prefix \"$HOME/.npm-global\"".to_string(),
         "    export PATH=\"$HOME/.npm-global/bin:$PATH\"".to_string(),
         format!("    {command}"),
-        format!("or install into the current prefix with the privileges it requires: sudo {command}"),
+        format!(
+            "or install into the current prefix with the privileges it requires: sudo {command}"
+        ),
     ]
 }
 
@@ -592,7 +596,9 @@ pub(crate) fn unreachable_after_install_remediation(recipe: &LanguageServerRecip
     let command = recipe.command_line();
     if recipe.program == "npm" {
         return vec![
-            format!("`{command}` reported success, so the package landed outside this shell's PATH"),
+            format!(
+                "`{command}` reported success, so the package landed outside this shell's PATH"
+            ),
             "`npm prefix -g` prints the prefix; add its `bin` subdirectory to PATH".to_string(),
         ];
     }
@@ -625,7 +631,14 @@ pub(crate) fn run_install(recipe: &LanguageServerRecipe) -> Result<(), String> {
     let mut stderr_lines: Vec<String> = Vec::new();
     if let Some(stderr) = child.stderr.take() {
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            eprintln!("{line}");
+            // Written rather than `eprintln!`, and the error dropped on
+            // purpose. Rust ignores SIGPIPE, so `eprintln!` panics when the
+            // reader has gone away, and the process exits 101. A caller who
+            // piped this run into `head` would then get a panic exit out of an
+            // install that completed, which is the same lie as the exit 0 this
+            // ticket is about, told in the other direction. An echoed progress
+            // line is not worth an exit code.
+            let _ = writeln!(std::io::stderr(), "{line}");
             if stderr_lines.len() < MAX_RETAINED_INSTALLER_LINES {
                 stderr_lines.push(line);
             }
