@@ -3392,6 +3392,23 @@ pub async fn run_with_authority_on(
                             // dares run is a sweep that never runs.
                             if file_already_enriched(&lsp_state, &file_id.0) {
                                 tally.already_enriched += 1;
+                                // Published here as well as on the enriching
+                                // arm, because `files_done` means a file the
+                                // sweep is done with and a skip is one. Stored
+                                // only there, a sweep over a converged store
+                                // reported `files_done=0 files_total=4` while
+                                // its own completion line said
+                                // `already_enriched=4`, and every waiter reads
+                                // the counter rather than the line: `kin init`
+                                // and `kin daemon sweep` both print "finished
+                                // without enriching any of the 4 files it
+                                // walked" over a repository that is fully
+                                // enriched. The alarm was the reporting, not
+                                // the store.
+                                lsp_state.lsp_sweep_files_done.store(
+                                    tally.files_processed() as u64,
+                                    std::sync::atomic::Ordering::SeqCst,
+                                );
                                 // Info, not debug. A skip and a zero are different
                                 // facts and both are findings, and a skip nobody can
                                 // see is how a predicate that dropped the three files

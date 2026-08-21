@@ -850,8 +850,8 @@ const SWEEP_WAIT_BUDGET: Duration = Duration::from_secs(900);
 /// How often the wait re-reads sweep progress.
 const SWEEP_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// `kin daemon sweep` — ask this repository's daemon for a language-server
-/// enrichment sweep, and by default wait for it.
+/// Ask this repository's daemon for a language-server enrichment sweep, and by
+/// default wait for it. This is `kin daemon sweep`.
 ///
 /// `POST /lsp/sweep` has existed since enrichment did, and until now nothing on
 /// the command line reached it. That mattered because the sweep is how a store
