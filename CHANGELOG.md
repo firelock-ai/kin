@@ -34,6 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Scope a review to the entities that changed, and pair same-name declarations by their own signature (#1031)
 - Give kin impact one relation policy, one depth bound and one verdict (#1032)
 - Wait on the observable in six load-flaky tests instead of on a fixed budget (#1033)
+- Refuse to bind the managed install root, and probe the shim outside the repository (#1035)
+- Cover three of the daemon allowance derivation sites with fixtures (#1036)
 
 
 ## [0.5.46] - 2026-08-21
