@@ -51,8 +51,10 @@ pub struct EmbedRuntimeState {
     ///
     /// The weights are not shipped, so the first embed pass on a fresh machine
     /// spends several hundred megabytes of egress before it can record a single
-    /// unit. Without this the pass reports working with zero progress for the
-    /// whole download, which is indistinguishable from a wedged pass.
+    /// unit. `kin init` is what starts that pass on a repository with parseable
+    /// content, so the egress is usually paid there rather than on a later
+    /// `kin embed`. Without this the pass reports working with zero progress for
+    /// the whole download, which is indistinguishable from a wedged pass.
     #[serde(default)]
     pub model_fetch: crate::embed_model::EmbedModelFetch,
 }

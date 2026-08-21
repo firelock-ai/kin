@@ -59,6 +59,26 @@ The launcher provisions the same managed native `kin` + `kin-daemon` release und
 `~/.kin/bin`; `kin setup` writes MCP configs with an absolute path to that binary and
 adds the managed bin directory to your shell profile for new sessions.
 
+A global install needs a writable npm prefix. Where the prefix is root-owned and you are
+not root, npm refuses with `EACCES: permission denied, mkdir
+'/usr/local/lib/node_modules/@kinlab'` and installs nothing, which is the usual case inside
+a container whose default user is not root. The zero-install line above needs no writable
+prefix. Otherwise move the prefix somewhere you own and put it on your `PATH`:
+
+```sh
+npm config set prefix ~/.npm-global
+export PATH="$HOME/.npm-global/bin:$PATH"   # add this to your shell profile too
+npm install -g @kinlab/kin
+```
+
+A user prefix is read by your interactive shell and by nothing else. Scripts, CI steps,
+`docker exec`, and agent clients do not inherit it, so register `kin` with those by its
+absolute path (`$(npm prefix -g)/bin/kin`, or `~/.kin/bin/kin` once `kin setup` has run)
+rather than by name. Installing as root does not fix that on an image where every user
+shares one `HOME`: root's npm reads the same `.npmrc`, reinstalls into the user prefix, and
+reports success. Use `npm install -g --prefix /usr/local @kinlab/kin` when the system prefix
+is what you want.
+
 ### Windows
 
 On native Windows, use PowerShell:

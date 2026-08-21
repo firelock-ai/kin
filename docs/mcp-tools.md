@@ -85,12 +85,43 @@ confident answer about the codebase you just left is worse than an error.
 
 A server that bound a repository of its own keeps serving it and ignores client workspace
 roots it cannot resolve to a Kin repository. That is what makes a container or remote
-registration work. Registered as `docker exec -i -w /work/repo <container> kin mcp start`,
-the server serves a container path while the client announces host paths that do not exist
-inside the container, and reading those as a workspace change would refuse every call for
-the life of the process. Roots that do name a Kin repository the server can see, and does
-not serve, are a real disagreement: those calls are refused, and the refusal carries
+registration work. Registered as
+`docker exec -i -w /work/repo <container> /absolute/path/to/kin mcp start`, the server
+serves a container path while the client announces host paths that do not exist inside the
+container, and reading those as a workspace change would refuse every call for the life of
+the process. Roots that do name a Kin repository the server can see, and does not serve,
+are a real disagreement: those calls are refused, and the refusal carries
 `degraded.workspace_mismatch` with both paths named.
+
+### Reaching `kin` from `docker exec`
+
+Give `docker exec` the absolute path to the binary. A bare `kin` is resolved against the
+image's own `ENV PATH`, which on a stock image carries neither `~/.kin/bin` nor an npm user
+prefix, so the registration fails before Kin runs at all:
+
+```
+$ docker exec -i -w /work/repo <container> kin mcp start
+OCI runtime exec failed: exec failed: unable to start container process:
+exec: "kin": executable file not found in $PATH
+```
+
+That message names Docker, not Kin, which is why it is worth recognizing. After
+`kin setup`, the managed binary is at `~/.kin/bin/kin`. After `npm install -g @kinlab/kin`,
+it is under `$(npm prefix -g)/bin/kin`. Either absolute path works as the registration
+command. To keep the bare command instead, pass the environment the exec needs:
+
+```sh
+docker exec -e PATH=/home/<user>/.kin/bin:$PATH -i -w /work/repo <container> kin mcp start
+```
+
+Reinstalling as root is not a shortcut past this on an image that gives every user the same
+`HOME`. Root's npm reads that `HOME`'s `.npmrc`, reinstalls into the user prefix, and
+reports `changed 1 package` while nothing new lands on the default `PATH`. Name the prefix
+outright when a system-wide binary is what you want:
+
+```sh
+docker exec -u root <container> npm install -g --prefix /usr/local @kinlab/kin
+```
 
 ### Tool profiles
 
