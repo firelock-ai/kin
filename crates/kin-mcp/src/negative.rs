@@ -1218,11 +1218,7 @@ fn trace_flow_gaps(payload: &Value) -> Vec<String> {
     let direction = payload.get("direction").and_then(Value::as_str);
     let walked_callers = !matches!(direction, Some("calls"));
     if walked_callers && focal_is_method(payload) {
-        gaps.push(
-            "method_call_resolution_incomplete: receiver-method calls are linked by bare name \
-             and may be unresolved, so an empty chain is not an authoritative absence for a method"
-                .to_string(),
-        );
+        gaps.push(kin_core::reference_coverage::method_absence_limiting_factor("an empty chain"));
     }
 
     // A name the graph holds more than once (the cfg-twin shape: two arms of the
@@ -1593,10 +1589,18 @@ fn focal_kind(payload: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
-/// True when the payload's focal is a method, the entity kind whose call edges
-/// the linker under-resolves, so absence must not be certified as authoritative.
+/// True when the payload's focal is a kind whose incoming call edges the linker
+/// under-resolves, so absence must not be certified as authoritative.
+///
+/// The extraction above is payload plumbing, because two tools nest the focal
+/// differently. The judgement itself is
+/// [`kin_core::reference_coverage::kind_under_resolves_incoming_calls`], shared
+/// with `kin dead-code`, which printed a delete list this gate would have
+/// refused while the rule sat here where a CLI command could not read it
+/// (FIR-2550).
 fn focal_is_method(payload: &Value) -> bool {
-    focal_kind(payload).is_some_and(|kind| kind.eq_ignore_ascii_case("method"))
+    focal_kind(payload)
+        .is_some_and(kin_core::reference_coverage::kind_name_under_resolves_incoming_calls)
 }
 
 /// The label an unavailable cross-repo answer reports, and its detail.
@@ -1870,10 +1874,7 @@ pub fn negative_for(
         push_gap(
             &mut trustworthy,
             &mut trust_reason,
-            "method_call_resolution_incomplete: receiver-method calls are \
-             linked by bare name and may be unresolved, so an empty result is not an \
-             authoritative absence for a method"
-                .to_string(),
+            kin_core::reference_coverage::method_absence_limiting_factor("an empty result"),
         );
     }
 
