@@ -153,13 +153,27 @@ pub fn build_trace_response(
     })
 }
 
-/// The absence qualifier for a context pack with no dependencies.
+/// The absence qualifier for a pack whose dependency walk came back empty.
 ///
-/// Declares `get_context_pack`, which is what `kin trace` actually builds
-/// (`kin_context::build_context_pack` above), and deliberately NOT
-/// `trace_data_flow`: that tool describes a different walk, and gating this
-/// command on its declaration would be judging a class this answer never
-/// measured, the failure `IMPACT_REFERENCE_KINDS` warns about one level down.
+/// Declares `trace_data_flow`, whose spec is `field: "chain"`, `kind: "no_flow"`
+/// and subject "no data-flow chain was found from the focal entity". That is the
+/// direction this command walked: every group a pack carries
+/// (`dependency_signatures`, `transitive_deps`) runs OUTWARD from the focal.
+///
+/// Deliberately NOT `get_context_pack`, even though `kin_context::build_context_pack`
+/// above is what builds the pack. That tool's spec field is `dependents`, the
+/// INBOUND direction, and `kin_mcp::negative` chose it over `dependencies` on
+/// purpose. A `ContextPack` holds no dependents group at all, so handing that
+/// gate a synthetic `"dependents": []` would run a leaf's outbound fact through
+/// a gate built for the opposite claim and print a sentence about a set this
+/// command never walked. Matching the gate to the BUILDER rather than to the
+/// CLAIM is the same mistake as naming the wrong edge class, which is what
+/// `IMPACT_REFERENCE_KINDS` warns about one level down.
+///
+/// The coverage observation is shared with the inbound readers because it is
+/// direction-agnostic: it reports whether this graph holds cross-file edges of
+/// these classes at all, and a graph holding none can no more show what a focal
+/// reaches than what reaches it.
 fn trace_absence_qualifier(
     graph: &impl GraphStore,
     target: &Entity,
@@ -171,10 +185,10 @@ fn trace_absence_qualifier(
         &kin_mcp::handlers::review::IMPACT_REFERENCE_KINDS,
     );
     let payload = serde_json::json!({
-        "dependents": [],
+        "chain": [],
         kin_mcp::EDGE_COVERAGE_KEY: coverage,
     });
-    crate::commands::absence_qualifier::qualify("get_context_pack", &payload, envelope, "")
+    crate::commands::absence_qualifier::qualify("trace_data_flow", &payload, envelope, "")
 }
 
 pub fn build_trace_json_response(
@@ -401,6 +415,19 @@ fn build_trace_lines_with_graph(
         }
     }
 
+    // Where the silence was. An empty dependency walk printed NOTHING at all,
+    // which is quieter than impact's bare line and says even less: a reader saw
+    // a pack with no dependency section and had no way to tell a focal that
+    // reaches nothing from one whose outbound edges this graph could never have
+    // held (FIR-2524).
+    //
+    // Hoisted above the compact split on purpose. Both renderings key on the
+    // same two groups, and leaving this inside the compact arm left the DEFAULT
+    // invocation, the one a person types, as the only surface still silent.
+    if pack.dependency_signatures.is_empty() && pack.transitive_deps.is_empty() {
+        lines.extend(trace_absence_qualifier(graph, target, envelope));
+    }
+
     if compact {
         // Compact deps: one-liner per dependency with file path so agents can Read
         // directly instead of tracing each dependency serially (anti-spiral).
@@ -410,14 +437,6 @@ fn build_trace_lines_with_graph(
             .chain(pack.transitive_deps.iter())
             .map(|e| &e.entity_id)
             .collect();
-        if all_dep_ids.is_empty() {
-            // Where the silence was. An empty dependency set printed NOTHING at
-            // all, which is quieter than impact's bare line and says even less:
-            // a reader saw a pack with no Deps section and had no way to tell a
-            // focal nothing depends on from one whose dependency edges this
-            // graph could never have held (FIR-2524).
-            lines.extend(trace_absence_qualifier(graph, target, envelope));
-        }
         if !all_dep_ids.is_empty() {
             lines.push("\n--- Deps ---".to_string());
             let mut printed = 0usize;
