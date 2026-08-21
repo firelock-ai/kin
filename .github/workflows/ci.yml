@@ -112,6 +112,7 @@ jobs:
             ./scripts/write-release-archive-docs.test.mjs \
             ./scripts/release-order.test.mjs \
             ./scripts/release-hold-alarm.test.mjs \
+            ./scripts/release-train-body.test.mjs \
             ./scripts/advisory-sweep.test.mjs \
             ./scripts/verify-capability-proof.test.mjs \
             ./scripts/verify-npm-attestation.test.mjs
@@ -121,6 +122,7 @@ jobs:
           node --check ./scripts/prepare-release.mjs
           node --check ./scripts/release-order.mjs
           node --check ./scripts/release-hold-alarm.mjs
+          node --check ./scripts/release-train-body.mjs
           node --check ./scripts/advisory-sweep.mjs
           node --check ./scripts/verify-capability-proof.mjs
           node --check ./scripts/verify-npm-attestation.mjs
@@ -1000,6 +1002,7 @@ jobs:
             scripts/check-kin-vfs-compat.test.mjs \
             scripts/check-rc-build-drift.test.mjs \
             scripts/check-release-proof-artifacts.test.mjs \
+            scripts/release-train-body.test.mjs \
             scripts/check-release-version.test.mjs \
             scripts/extract-release-notes.test.mjs \
             scripts/prepare-release.test.mjs \
