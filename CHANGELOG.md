@@ -53,6 +53,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Arm the reconcile watch before publishing the endpoint, and stop certifying absence over a store the working copy has outrun (#1044)
 - Bind a Python declared receiver to its class's own method when that class is in the calling file (#1048)
 - Stage what kin agent writes, so a run lands a commit (#1049)
+- Order the LSP cold sweep behind the embedding backfill on first boot (#1050)
 
 
 ## [0.5.46] - 2026-08-21
