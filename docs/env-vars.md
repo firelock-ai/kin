@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (483 total, 333 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (488 total, 338 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -280,6 +280,9 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | Variable | Kind | Default | Sensitivity | Description |
 | --- | --- | --- | --- | --- |
 | `KIN_LOCATE_AMALGAM_PENALTY` | float>=0 | 0.05 | correctness | locate tuning knob: amalgam penalty |
+| `KIN_LOCATE_ARTIFACT_ADMIT_LIMIT` | usize | 3 | correctness | locate tuning knob: artifact admit limit |
+| `KIN_LOCATE_ARTIFACT_ADMIT_SHARE` | float>=0 | 0.5 | correctness | locate tuning knob: artifact admit share |
+| `KIN_LOCATE_ARTIFACT_FULL_PRIORITY` | float>=0 | 72.0 | correctness | locate tuning knob: artifact full priority |
 | `KIN_LOCATE_ARTIFACT_HUB_FANOUT_PENALTY` | float>=0 | 0.45 | correctness | locate tuning knob: artifact hub fanout penalty |
 | `KIN_LOCATE_ARTIFACT_PATH_OVERLAP_BOOST` | float>=0 | 1.85 | correctness | locate tuning knob: artifact path overlap boost |
 | `KIN_LOCATE_AUTO_FANOUT_CONFIDENCE_RATIO` | float>=0 | 1.5 | correctness | locate tuning knob: auto fanout confidence ratio |
@@ -365,6 +368,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_LOCATE_ENTITY_DOMINANT_RESOLVE_WEIGHT` | float>=0 | 8.0 | correctness | locate tuning knob: entity dominant resolve weight |
 | `KIN_LOCATE_ENTITY_DOMINANT_RRF_THRESHOLD` | usize | 3 | correctness | locate tuning knob: entity dominant rrf threshold |
 | `KIN_LOCATE_ENTITY_FUSION` | bool | context-dependent | correctness | locate tuning knob: entity fusion |
+| `KIN_LOCATE_ENTITY_SURFACE_PENALTY` | float>=0 | 0.3 | correctness | locate tuning knob: entity surface penalty |
 | `KIN_LOCATE_EXPLAIN_DEF_FLOOR_PCT` | float>=0 | 0.0 | correctness | locate tuning knob: explain def floor pct |
 | `KIN_LOCATE_EXPLAIN_DEF_TOPK` | usize | 0 | correctness | locate tuning knob: explain def topk |
 | `KIN_LOCATE_EXPLICIT_PHASE_MISMATCH_PENALTY` | float>=0 | 0.22 | correctness | locate tuning knob: explicit phase mismatch penalty |
@@ -420,6 +424,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_LOCATE_MULTIHOP_TIMEOUT_MS` | ms bound (0=unbounded) | profile-dependent (200/500/1000 ms) | correctness | multihop BFS timeout; 0 disables the bound (still capped by depth/frontier) |
 | `KIN_LOCATE_MULTI_SIGNAL_FLOOR_MAX` | usize | 3 | correctness | locate tuning knob: multi signal floor max |
 | `KIN_LOCATE_MULTI_SIGNAL_FLOOR_PCT` | float>=0 | 0.2 | correctness | locate tuning knob: multi signal floor pct |
+| `KIN_LOCATE_NAME_TIE_OWNER_MASS_LIMIT` | usize | 16 | correctness | locate tuning knob: name tie owner mass limit |
 | `KIN_LOCATE_NEGATION_PENALTY` | float>=0 | 0.01 | correctness | locate tuning knob: negation penalty |
 | `KIN_LOCATE_NOISE_TAIL_COMPRESS` | float>=0 | 0.4 | correctness | locate tuning knob: noise tail compress |
 | `KIN_LOCATE_NOISY_COCHANGE_ONLY_PENALTY` | float>=0 | 0.08 | correctness | locate tuning knob: noisy cochange only penalty |

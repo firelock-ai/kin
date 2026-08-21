@@ -27,6 +27,16 @@
 //! variable, set to `minimal`, `standard`, or `performance` (case-insensitive);
 //! any other value falls through to auto-detection.
 //!
+//! [`CapabilityDetection::detect`] reads that variable from the environment of
+//! the process it runs in, once per call, and the process that runs it is
+//! whichever one serves the query. `kin-daemon` serves `/locate` by calling
+//! straight into this crate, and a daemon captured its environment when it
+//! started, so exporting the variable in front of a CLI invocation reaches the
+//! client and never the daemon that ranks. The tier a result reports is the
+//! daemon's. Changing it means setting the variable where the daemon will start
+//! and restarting it, which is what the `capability_tier` degradation's
+//! remediation says rather than naming the variable alone.
+//!
 //! Detection that cannot read the host says so. A probe failure used to be
 //! swallowed and replaced with a plausible number, which scored a large machine
 //! as `Minimal` and then advised its operator to obtain the hardware they were
