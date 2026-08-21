@@ -63,7 +63,8 @@ fn link_incremental(files: &[FileParseData]) -> Vec<kin_model::Relation> {
     for file in files {
         linker.add_file(&file.file_path, ArtifactId::new(), &file.entities);
     }
-    link_cross_file_incremental(files, &linker).expect("the incremental index holds every fixture file")
+    link_cross_file_incremental(files, &linker)
+        .expect("the incremental index holds every fixture file")
 }
 
 /// The id of the entity of `kind` named `name` in `file`.
@@ -162,7 +163,12 @@ fn requests_shaped_package() -> Vec<FileParseData> {
 #[test]
 fn a_method_call_binds_through_the_receivers_annotated_parameter_type() {
     let files = requests_shaped_package();
-    let target = entity_id(&files, "adapters.py", "HTTPAdapter.send", EntityKind::Method);
+    let target = entity_id(
+        &files,
+        "adapters.py",
+        "HTTPAdapter.send",
+        EntityKind::Method,
+    );
     let caller = entity_id(&files, "sessions.py", "Session.send", EntityKind::Method);
 
     let relations = link_cross_file(&files);
@@ -178,7 +184,12 @@ fn a_method_call_binds_through_the_receivers_annotated_parameter_type() {
 #[test]
 fn a_method_call_binds_through_a_class_declared_attribute_type() {
     let files = requests_shaped_package();
-    let target = entity_id(&files, "adapters.py", "HTTPAdapter.send", EntityKind::Method);
+    let target = entity_id(
+        &files,
+        "adapters.py",
+        "HTTPAdapter.send",
+        EntityKind::Method,
+    );
     let caller = entity_id(
         &files,
         "auth.py",
@@ -199,7 +210,12 @@ fn a_method_call_binds_through_a_class_declared_attribute_type() {
 #[test]
 fn both_declared_receiver_callers_reach_the_method_and_nothing_else_does() {
     let files = requests_shaped_package();
-    let target = entity_id(&files, "adapters.py", "HTTPAdapter.send", EntityKind::Method);
+    let target = entity_id(
+        &files,
+        "adapters.py",
+        "HTTPAdapter.send",
+        EntityKind::Method,
+    );
     let session_send = entity_id(&files, "sessions.py", "Session.send", EntityKind::Method);
     let handle_401 = entity_id(
         &files,
@@ -223,7 +239,12 @@ fn both_declared_receiver_callers_reach_the_method_and_nothing_else_does() {
 #[test]
 fn the_incremental_linker_binds_the_same_declared_receiver_types() {
     let files = requests_shaped_package();
-    let target = entity_id(&files, "adapters.py", "HTTPAdapter.send", EntityKind::Method);
+    let target = entity_id(
+        &files,
+        "adapters.py",
+        "HTTPAdapter.send",
+        EntityKind::Method,
+    );
     let session_send = entity_id(&files, "sessions.py", "Session.send", EntityKind::Method);
     let handle_401 = entity_id(
         &files,
@@ -268,7 +289,12 @@ class HTTPDigestAuth:
 "#,
         ),
     ];
-    let target = entity_id(&files, "adapters.py", "HTTPAdapter.send", EntityKind::Method);
+    let target = entity_id(
+        &files,
+        "adapters.py",
+        "HTTPAdapter.send",
+        EntityKind::Method,
+    );
     let caller = entity_id(
         &files,
         "auth.py",
@@ -309,7 +335,12 @@ class Session:
 "#,
         ),
     ];
-    let target = entity_id(&files, "adapters.py", "HTTPAdapter.send", EntityKind::Method);
+    let target = entity_id(
+        &files,
+        "adapters.py",
+        "HTTPAdapter.send",
+        EntityKind::Method,
+    );
     let caller = entity_id(&files, "sessions.py", "Session.send", EntityKind::Method);
 
     let relations = link_cross_file(&files);
@@ -343,7 +374,12 @@ class Session:
 "#,
         ),
     ];
-    let target = entity_id(&files, "adapters.py", "HTTPAdapter.send", EntityKind::Method);
+    let target = entity_id(
+        &files,
+        "adapters.py",
+        "HTTPAdapter.send",
+        EntityKind::Method,
+    );
     let caller = entity_id(&files, "sessions.py", "Session.send", EntityKind::Method);
 
     let relations = link_cross_file(&files);
@@ -372,7 +408,12 @@ class Session:
 "#,
         ),
     ];
-    let target = entity_id(&files, "adapters.py", "HTTPAdapter.send", EntityKind::Method);
+    let target = entity_id(
+        &files,
+        "adapters.py",
+        "HTTPAdapter.send",
+        EntityKind::Method,
+    );
     let caller = entity_id(&files, "sessions.py", "Session.send", EntityKind::Method);
 
     let relations = link_incremental(&files);
@@ -439,7 +480,12 @@ class Session:
 "#,
         ),
     ];
-    let target = entity_id(&files, "adapters.py", "HTTPAdapter.send", EntityKind::Method);
+    let target = entity_id(
+        &files,
+        "adapters.py",
+        "HTTPAdapter.send",
+        EntityKind::Method,
+    );
     let caller = entity_id(&files, "sessions.py", "Session.send", EntityKind::Method);
 
     let relations = link_cross_file(&files);
@@ -472,7 +518,12 @@ class Session:
 "#,
         ),
     ];
-    let target = entity_id(&files, "adapters.py", "HTTPAdapter.send", EntityKind::Method);
+    let target = entity_id(
+        &files,
+        "adapters.py",
+        "HTTPAdapter.send",
+        EntityKind::Method,
+    );
     let caller = entity_id(&files, "sessions.py", "Session.send", EntityKind::Method);
 
     let relations = link_cross_file(&files);

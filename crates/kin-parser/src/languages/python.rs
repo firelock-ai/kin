@@ -1515,7 +1515,8 @@ fn python_annotation_type_name(node: &tree_sitter::Node, source: &[u8]) -> Optio
             .map(str::to_string),
         "attribute" => {
             let text = inner.utf8_text(source).ok()?;
-            (!text.is_empty() && text.split('.').all(|seg| !seg.is_empty())).then(|| text.to_string())
+            (!text.is_empty() && text.split('.').all(|seg| !seg.is_empty()))
+                .then(|| text.to_string())
         }
         "subscript" => {
             let value = inner.child_by_field_name("value")?;
@@ -1550,11 +1551,9 @@ fn extract_calls_from_context(
             call_audit
                 .seen_calls
                 .insert((child.start_byte(), child.end_byte()));
-            let callee = child
-                .child_by_field_name("function")
-                .and_then(|function| {
-                    extract_named_callee(&function, source, class_ctx, receiver_types)
-                });
+            let callee = child.child_by_field_name("function").and_then(|function| {
+                extract_named_callee(&function, source, class_ctx, receiver_types)
+            });
             if let Some(callee) = callee {
                 relations.push(ExtractedRelation {
                     // The call expression itself, so a reference row can report the

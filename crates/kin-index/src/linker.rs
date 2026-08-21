@@ -2571,7 +2571,12 @@ fn locate_base_class(
 /// through the receiver's declared type has had no such tier, because the owner
 /// is usually defined in another file, so it asks for the class's own method
 /// first and walks the hierarchy only when the class does not declare it.
-fn resolve_declared_method(owner_file: &str, owner_class: &str, method: &str, ctx: &LinkContext<'_>) -> Option<EntityId> {
+fn resolve_declared_method(
+    owner_file: &str,
+    owner_class: &str,
+    method: &str,
+    ctx: &LinkContext<'_>,
+) -> Option<EntityId> {
     receiver_method_keys(owner_class, method)
         .iter()
         .find_map(|key| {
