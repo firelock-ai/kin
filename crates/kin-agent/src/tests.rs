@@ -201,9 +201,18 @@ fn well_formed_arguments_are_not_reported_as_malformed() {
 }
 
 fn test_belt() -> Belt {
-    Belt::new(vec![(
-        "semantic_locate".to_string(),
-        json!({
+    Belt::new(vec![kin_tool(0, "semantic_locate", None)])
+}
+
+/// One belt entry as a run would build it: bare name from the server, exposed name from
+/// that server's prefix.
+fn kin_tool(server: usize, bare: &str, label: Option<&str>) -> belt::KinTool {
+    belt::KinTool {
+        server,
+        bare: bare.to_string(),
+        exposed: format!("{}{bare}", belt::tool_prefix(label)),
+        description: format!("test tool {bare}"),
+        schema: json!({
             "type": "object",
             "properties": {
                 "query": { "type": "string" },
@@ -211,7 +220,7 @@ fn test_belt() -> Belt {
             },
             "required": ["query"]
         }),
-    )])
+    }
 }
 
 #[test]
@@ -243,7 +252,10 @@ fn the_router_routes_what_is_on_the_belt() {
     let belt = test_belt();
     assert_eq!(
         belt.route("mcp__kin__semantic_locate"),
-        Route::Kin("semantic_locate".into())
+        Route::Kin {
+            server: 0,
+            tool: "semantic_locate".into()
+        }
     );
     assert_eq!(belt.route("edit_file"), Route::Local(LocalTool::Edit));
     assert_eq!(belt.route("write_file"), Route::Local(LocalTool::Write));
@@ -280,6 +292,87 @@ fn harness_owned_tools_never_reach_the_model() {
     }
     assert!(!belt::is_harness_owned("semantic_locate"));
     assert!(!belt::is_harness_owned("get_context_pack"));
+}
+
+#[test]
+fn a_second_repository_of_the_same_name_gets_its_own_label() {
+    use std::collections::BTreeSet;
+    let mut taken = BTreeSet::new();
+    let first = belt::server_label(std::path::Path::new("/tmp/one/kin"), &taken);
+    assert_eq!(first, "kin");
+    taken.insert(first);
+    // Two checkouts of the same repository is the ordinary brownfield case, and sharing a
+    // prefix would make the model's call ambiguous rather than merely ugly.
+    let second = belt::server_label(std::path::Path::new("/other/kin"), &taken);
+    assert_eq!(second, "kin_2");
+    // A name a tool prefix cannot carry is reduced, not passed through.
+    let odd = belt::server_label(std::path::Path::new("/tmp/my repo.v2"), &BTreeSet::new());
+    assert_eq!(odd, "my_repo_v2");
+}
+
+#[test]
+fn tool_prefixes_separate_two_servers_and_a_bare_name_names_both() {
+    let belt = Belt::new(vec![
+        kin_tool(0, "semantic_locate", Some("alpha")),
+        kin_tool(1, "semantic_locate", Some("beta")),
+    ]);
+    assert_eq!(
+        belt.route("mcp__kin_alpha__semantic_locate"),
+        Route::Kin {
+            server: 0,
+            tool: "semantic_locate".into()
+        }
+    );
+    assert_eq!(
+        belt.route("mcp__kin_beta__semantic_locate"),
+        Route::Kin {
+            server: 1,
+            tool: "semantic_locate".into()
+        }
+    );
+    // A bare name is ambiguous across servers, so the refusal names every form rather than
+    // choosing a repository on the model's behalf.
+    let Route::Refused(message) = belt.route("semantic_locate") else {
+        panic!("a bare name must be refused when two servers declare it");
+    };
+    assert!(
+        message.contains("mcp__kin_alpha__semantic_locate")
+            && message.contains("mcp__kin_beta__semantic_locate"),
+        "the refusal must name both prefixed forms: {message}"
+    );
+}
+
+#[test]
+fn a_relative_path_means_the_primary_and_an_absolute_path_finds_its_own_repository() {
+    let repos = vec![
+        std::path::PathBuf::from("/work/alpha"),
+        std::path::PathBuf::from("/work/beta"),
+    ];
+    let (index, path) = belt::resolve_across_repos(&repos, "src/main.rs").unwrap();
+    assert_eq!(index, 0);
+    assert_eq!(path, std::path::PathBuf::from("/work/alpha/src/main.rs"));
+
+    let (index, path) = belt::resolve_across_repos(&repos, "/work/beta/src/main.rs").unwrap();
+    assert_eq!(index, 1);
+    assert_eq!(path, std::path::PathBuf::from("/work/beta/src/main.rs"));
+
+    // A checkout inside another checkout resolves to the innermost one, which is the
+    // containment rule; the outer repository would otherwise swallow every path.
+    let nested = vec![
+        std::path::PathBuf::from("/work/alpha"),
+        std::path::PathBuf::from("/work/alpha/vendor/beta"),
+    ];
+    let (index, _) =
+        belt::resolve_across_repos(&nested, "/work/alpha/vendor/beta/src/main.rs").unwrap();
+    assert_eq!(index, 1);
+
+    let problem = belt::resolve_across_repos(&repos, "/elsewhere/main.rs").unwrap_err();
+    assert!(
+        problem.contains("outside every repository")
+            && problem.contains("/work/alpha")
+            && problem.contains("/work/beta"),
+        "the refusal must name every root: {problem}"
+    );
 }
 
 #[test]
