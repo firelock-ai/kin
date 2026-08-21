@@ -65,6 +65,16 @@ const WATCHER_RECORD: &str = "started file watcher";
 /// into repository authority (`crates/kin-daemon/src/loop_runner.rs`).
 const ADMISSION_RECORD: &str = "admitted exact workspace tree into repository authority";
 
+/// What the daemon logs immediately after it writes `.kin/daemon.port`
+/// (`crates/kin-daemon/src/daemon.rs`, the line after
+/// `publish_daemon_endpoint`).
+const ENDPOINT_RECORD: &str = "published the daemon endpoint";
+
+/// What the reconciliation loop logs when its startup catch-up finds host paths
+/// the working copy changed while nothing was watching
+/// (`crates/kin-daemon/src/loop_runner.rs`).
+const CATCH_UP_RECORD: &str = "admitting host paths modified since the last complete admission";
+
 /// The settle budget a quiet host needs, and the floor every busier host starts
 /// from.
 ///
@@ -195,6 +205,11 @@ impl IsolatedDaemon {
     /// written after this point and cannot match an older line.
     fn log_offset(&self) -> u64 {
         fs::metadata(&self.log).map(|meta| meta.len()).unwrap_or(0)
+    }
+
+    /// Everything this daemon has recorded so far.
+    fn log_text(&self) -> String {
+        fs::read_to_string(&self.log).unwrap_or_default()
     }
 
     /// Poll the daemon's log for `record`, considering only bytes at or after
@@ -848,4 +863,136 @@ fn a_settle_that_begins_quiet_and_turns_busy_gets_the_busy_budget() {
         busy <= started + RETRY_BOUND_CEILING,
         "no sequence of readings may push the settle past its ceiling"
     );
+}
+
+/// FIR-2466. The endpoint a client finds is a daemon that is already watching.
+///
+/// `.kin/daemon.port` is the readiness signal real clients key on, and the
+/// daemon used to publish it and spawn the reconciliation loop afterwards. The
+/// loop is what calls `FileWatcher::new`, and startup replays nothing, so a
+/// write landing between those two points raised no event and never reached the
+/// graph at all. The gap measured a few milliseconds on this host and the
+/// fixture that depended on losing that race lost it repeatedly.
+///
+/// Asserted on the ordering of the daemon's own records rather than on a write
+/// that has to win a race, so restoring the old order fails this outright
+/// instead of failing it sometimes.
+#[test]
+fn the_reconciliation_watch_is_armed_before_the_endpoint_is_published() {
+    let root = tempdir().expect("temp root");
+    let home = root.path().join("home");
+    let repo = root.path().join("repo");
+    fs::create_dir_all(&home).expect("create home");
+    fs::create_dir_all(&repo).expect("create repo");
+    let repo = repo.canonicalize().expect("resolve the repository path");
+    let home = home.canonicalize().expect("resolve the home path");
+    seed_repository(&repo);
+    stdout_of(&kin(&repo, &home, &["init", "."]), "kin init");
+
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let daemon_log = root.path().join("kin-daemon.log");
+    let mut daemon = IsolatedDaemon::spawn(&repo, &daemon_log, &runtime);
+    daemon.wait_until_serving(&repo.join(".kin"));
+    // Both records have to be present before their positions mean anything.
+    // The port file appears a moment before the line that reports it, so the
+    // wait above proves the publication happened and this proves it was logged.
+    daemon.wait_for_record(ENDPOINT_RECORD, 0, WATCHER_BOUND, "publish its endpoint");
+    daemon.wait_for_record(WATCHER_RECORD, 0, WATCHER_BOUND, "register its file watcher");
+
+    let log = daemon.log_text();
+    let watch_at = log
+        .find(WATCHER_RECORD)
+        .unwrap_or_else(|| panic!("the daemon logged no watcher record:\n{log}"));
+    let publish_at = log
+        .find(ENDPOINT_RECORD)
+        .unwrap_or_else(|| panic!("the daemon logged no endpoint record:\n{log}"));
+    assert!(
+        watch_at < publish_at,
+        "the watch must exist before the endpoint advertises this daemon, but the watcher \
+         record is at byte {watch_at} and the publication record at {publish_at}; a client \
+         writing the instant the port appears would have that write observed by nobody. \
+         The log:\n{log}"
+    );
+
+    daemon.stop();
+}
+
+/// FIR-2499. A file written while no daemon was running reaches the graph
+/// without a commit.
+///
+/// The stranger's finding was that the graph is always one commit behind the
+/// work, and the mechanism is this: a watcher reports only edits it was alive
+/// for. An idle timeout ends a daemon mid-session, the next command starts a
+/// fresh one, and everything written in between was seen by nobody. Startup
+/// admitted nothing, so nothing ever replayed it and the file stayed invisible
+/// until a commit swept it in.
+///
+/// Written between two daemons deliberately: it is the only construction in
+/// which no watcher can have seen the write, so a pass here cannot be the
+/// watcher quietly doing the work.
+#[test]
+fn a_file_written_while_no_daemon_watched_is_admitted_by_the_next_one() {
+    let root = tempdir().expect("temp root");
+    let home = root.path().join("home");
+    let repo = root.path().join("repo");
+    fs::create_dir_all(&home).expect("create home");
+    fs::create_dir_all(&repo).expect("create repo");
+    let repo = repo.canonicalize().expect("resolve the repository path");
+    let home = home.canonicalize().expect("resolve the home path");
+    seed_repository(&repo);
+    let init = kin(&repo, &home, &["init", ".", "--json"]);
+    let init_payload: serde_json::Value =
+        serde_json::from_slice(&stdout_of(&init, "kin init").into_bytes())
+            .expect("init emits JSON");
+    let durable_at_init = init_payload["semantic_enrichment"]["entity_count"]
+        .as_u64()
+        .expect("init reports a durable entity count");
+
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let first_log = root.path().join("kin-daemon-first.log");
+    let mut first = IsolatedDaemon::spawn(&repo, &first_log, &runtime);
+    let first_port = first.wait_until_serving(&repo.join(".kin"));
+    first.wait_until_watching();
+
+    // One ordinary watched write, so this store records a complete admission
+    // and the catch-up below has a window to open at. Without a marker there is
+    // no lower bound and the pass correctly declines to run at all.
+    let before_write = first.log_offset();
+    fs::write(repo.join(UNCOMMITTED_PATH), UNCOMMITTED_SOURCE)
+        .expect("write the watched source");
+    let watched = wait_for_live_growth(
+        &first,
+        &repo,
+        &home,
+        first_port,
+        durable_at_init,
+        before_write,
+    );
+    first.stop();
+
+    // The write nothing could see. No daemon is running, so no watcher exists
+    // to raise an event for it and nothing will replay one.
+    fs::write(
+        repo.join("src/catch_up.rs"),
+        b"pub fn build_catch_up() -> u32 {\n    5\n}\n\npub fn walk_catch_up() -> u32 {\n    build_catch_up() + 1\n}\n\npub fn render_catch_up() -> u32 {\n    walk_catch_up() + 1\n}\n",
+    )
+    .expect("write the unwatched source");
+
+    let second_log = root.path().join("kin-daemon-second.log");
+    let mut second = IsolatedDaemon::spawn(&repo, &second_log, &runtime);
+    let second_port = second.wait_until_serving(&repo.join(".kin"));
+    second.wait_for_record(
+        CATCH_UP_RECORD,
+        0,
+        WATCHER_BOUND,
+        "plan a startup catch-up over what changed while it was down",
+    );
+    let caught_up = wait_for_live_growth(&second, &repo, &home, second_port, watched, 0);
+    assert!(
+        caught_up > watched,
+        "the graph has to carry the file written while nothing watched: {caught_up} against \
+         {watched} before it"
+    );
+
+    second.stop();
 }
