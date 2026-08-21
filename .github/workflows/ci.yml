@@ -999,6 +999,7 @@ jobs:
             scripts/check-glibc-floor.test.mjs \
             scripts/check-kin-vfs-compat.test.mjs \
             scripts/check-rc-build-drift.test.mjs \
+            scripts/check-release-proof-artifacts.test.mjs \
             scripts/check-release-version.test.mjs \
             scripts/extract-release-notes.test.mjs \
             scripts/prepare-release.test.mjs \

@@ -2320,11 +2320,34 @@ jobs:
     environment: release
     permissions:
       contents: write
+      # Resolving the pull request behind the tagged commit, which is how the
+      # proof gate below bridges a squash back to the candidate that was proven.
+      pull-requests: read
     steps:
       - name: Checkout release policy
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
+
+      # The same evidence the release train requires before it merges a bump,
+      # required again here against the tag actually being promoted. The train's
+      # gate protects the path the train owns; this one protects every other
+      # path into Latest, because a tag reaches Latest through this job no
+      # matter how it was minted. On 2026-08-20 v0.5.44 reached Latest with no
+      # preflight record and no stranger run, and nothing in the train knew the
+      # proof loop existed.
+      #
+      # A squash mints a new commit, so a tag's own sha is never the sha the
+      # proof loop judged: v0.5.44's tag commit a4ffe620 is kin#986's squash,
+      # while the preflight for that line judged the release-next head. The
+      # resolver bridges that through the merged pull request. A commit no
+      # merged pull request produced resolves to nothing and is refused, which
+      # is the intended answer for a hand-pushed tag.
+      - name: Require proof-loop artifacts for the tagged candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESOLVE_FROM_COMMIT: ${{ github.sha }}
+        run: node scripts/check-release-proof-artifacts.mjs
 
       - name: Promote stable tag after public and npm proof
         if: ${{ !contains(github.ref_name, '-') }}
