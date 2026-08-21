@@ -11263,6 +11263,11 @@ void f();
             (1.0_f32, RelationResolution::TypeResolved, "same-file"),
             (0.95, RelationResolution::TypeResolved, "import-declared"),
             (
+                RECEIVER_TYPE_CONFIDENCE,
+                RelationResolution::TypeResolved,
+                "declared receiver type",
+            ),
+            (
                 INHERITED_METHOD_CONFIDENCE,
                 RelationResolution::TypeResolved,
                 "inherited dispatch",

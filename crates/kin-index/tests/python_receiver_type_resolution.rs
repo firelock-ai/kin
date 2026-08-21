@@ -21,7 +21,7 @@
 
 use kin_index::{
     link_cross_file as link_cross_file_with_identities, link_cross_file_incremental, FileParseData,
-    IncrementalLinker,
+    IncrementalLinker, RelationResolution,
 };
 use kin_model::{ArtifactId, Entity, EntityId, EntityKind, FilePathId, RelationKind};
 use kin_parser::{LanguageAdapter, PythonAdapter};
@@ -308,6 +308,57 @@ class HTTPDigestAuth:
         has_call(&relations, caller, target),
         "an attribute whose declared type is an aliased import must bind to the \
          class the alias names; nothing else in the linker can reach it"
+    );
+}
+
+#[test]
+fn a_declared_receiver_edge_publishes_itself_as_type_resolved() {
+    // The marker is the half a reader acts on. An edge the linker bound by
+    // matching a leaf name publishes `name_only`, and every count that may
+    // only use proven edges drops it. This edge was proven from a type the
+    // source declares, so it must publish `type_resolved` and be usable as
+    // evidence that the method is called.
+    let files = vec![
+        parse_py("adapters.py", ADAPTERS_PY),
+        parse_py(
+            "sessions.py",
+            r#"
+from adapters import HTTPAdapter as Transport
+
+
+class Session:
+    def send(self, request, adapter: Transport):
+        return adapter.send(request)
+"#,
+        ),
+    ];
+    let target = entity_id(
+        &files,
+        "adapters.py",
+        "HTTPAdapter.send",
+        EntityKind::Method,
+    );
+    let caller = entity_id(&files, "sessions.py", "Session.send", EntityKind::Method);
+
+    let relations = link_cross_file(&files);
+    let edge = relations
+        .iter()
+        .find(|r| {
+            r.kind == RelationKind::Calls
+                && r.src.as_entity() == Some(caller)
+                && r.dst.as_entity() == Some(target)
+        })
+        .expect("the declared receiver type binds this call");
+
+    assert_eq!(
+        RelationResolution::of(edge).as_str(),
+        "type_resolved",
+        "an edge bound through a declared type must say so; published as \
+         name_only it is withheld from the very counts the ticket is about"
+    );
+    assert!(
+        RelationResolution::of(edge).is_proven(),
+        "and it must be countable as proof the method is used"
     );
 }
 
