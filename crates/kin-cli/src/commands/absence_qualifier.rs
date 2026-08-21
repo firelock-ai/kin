@@ -222,8 +222,9 @@ fn absence_subject(tool: &str) -> &'static str {
 /// stop, one clause later.
 fn absence_direction(tool: &str) -> &'static str {
     match tool {
-        "trace_data_flow" => "so a dependency this entity reaches in another file could not have \
-                              been found",
+        "trace_data_flow" => {
+            "so a dependency this entity reaches in another file could not have been found"
+        }
         _ => "so a use reaching this entity from another file could not have been found",
     }
 }

@@ -24646,7 +24646,10 @@ mod tests {
     #[tokio::test]
     async fn a_degraded_daemon_reaches_the_search_cli_through_the_route() {
         let state = test_state();
-        state.graph.upsert_entity(&test_entity("present", "src/a.py")).unwrap();
+        state
+            .graph
+            .upsert_entity(&test_entity("present", "src/a.py"))
+            .unwrap();
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -24701,7 +24704,10 @@ mod tests {
     #[tokio::test]
     async fn a_search_that_matches_stays_unqualified_even_when_degraded() {
         let state = test_state();
-        state.graph.upsert_entity(&test_entity("findable", "src/a.py")).unwrap();
+        state
+            .graph
+            .upsert_entity(&test_entity("findable", "src/a.py"))
+            .unwrap();
         state.graph.flush_text_index().ok();
         state
             .is_initialized
@@ -24728,7 +24734,10 @@ mod tests {
         let result: kin_cli::commands::search::DaemonSearchResponse =
             serde_json::from_slice(&body).unwrap();
 
-        assert!(!result.records.is_empty(), "the query must match: {result:?}");
+        assert!(
+            !result.records.is_empty(),
+            "the query must match: {result:?}"
+        );
         assert!(
             result.absence_qualifier.is_empty(),
             "a populated answer asserts no absence and must carry no qualifier: {:?}",
@@ -24878,7 +24887,10 @@ mod tests {
         // `test_entity` spans 0..0, which the route rejects against a file that
         // has bytes. Left unfixed the route answers 500 and every assertion
         // below never runs.
-        let span = entity.span.as_mut().expect("trace fixture entities carry a span");
+        let span = entity
+            .span
+            .as_mut()
+            .expect("trace fixture entities carry a span");
         span.end_byte = source.len();
         span.end_line = 2;
     }
