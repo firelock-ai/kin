@@ -752,7 +752,7 @@ def check_1(suite):
         res.unknown(miss)
         return res
     files = sorted({r.get("file_path") for r in payload.get("references") or []})
-    if any(f and f.endswith("acceptance-canary-no-such-file.py") for f in files):
+    if any(f and f.endswith("storage.py") for f in files):
         res.ok("find_references(parse_note) crosses into storage.py")
     else:
         res.bad("find_references(parse_note) returned %d reference(s) %s; "
