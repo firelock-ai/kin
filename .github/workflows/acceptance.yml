@@ -18,6 +18,13 @@
 # this repository (scripts/acceptance/), so the suite versions with the code it
 # tests rather than drifting against it in another checkout.
 #
+# The build is the RELEASE profile, unlike daemon-smoke.yml's debug one, and the
+# extra minutes are bought deliberately. Release is what ships, so it is what a
+# product acceptance answer should be about, and the first run of this job
+# turned up a walk that a debug build truncated and a release build did not
+# (FIR-2593). An acceptance suite whose result depends on a profile nobody
+# releases is answering a question nobody asked.
+#
 # This workflow publishes no required context yet. It becomes one on main after
 # it has been green on five consecutive pull requests, which is a separate,
 # deliberate step (FIR-2591).
@@ -62,7 +69,7 @@ jobs:
   acceptance:
     name: Product Acceptance
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -94,22 +101,29 @@ jobs:
           grep -q '^\[registries\.kin\]' .cargo/config.toml
           if grep -q '^\[patch\.kin\]' .cargo/config.toml; then echo "::error::[patch.kin] git pins must be removed. kin-* resolve from the Kin registry"; exit 1; fi
 
-      # Registry only, matching daemon-smoke.yml: the suites assert on freshly
-      # built binaries, so no target directory is carried across runs. Restore on
-      # every event, save only from main, because an entry written from a pull
-      # request ref is readable only by later runs on that same ref and would
-      # spend the shared repository cache budget that main's reusable entry needs.
-      - name: Cache cargo registry
+      # A release build of this workspace is expensive enough that the
+      # dependency target directory has to be carried, so this job takes its own
+      # cache entry rather than sharing one. `shared-key` replaces the job-id
+      # component of the key, which is what lets a pull request restore the entry
+      # main wrote; without it every job id gets its own key and a pull request
+      # would never see main's. The action strips the workspace's own crates
+      # before saving, so what is restored is dependencies and never a stale kin
+      # or kin-daemon binary, which is what the suites assert on.
+      #
+      # Restore on every event, save only from main, because an entry written
+      # from a pull request ref is readable only by later runs on that same ref
+      # and would spend the shared repository cache budget that main's reusable
+      # entry needs.
+      - name: Cache cargo registry and the release dependency build
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          cache-targets: "false"
+          shared-key: acceptance-release
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Cargo.lock and .cargo/config.toml together pin kin-* deps to public
-      # source until every crate is registry-published. Debug profile, the same
-      # build daemon-smoke.yml makes.
-      - name: Build kin + kin-daemon
-        run: cargo build --locked --bin kin --bin kin-daemon
+      # source until every crate is registry-published.
+      - name: Build kin + kin-daemon (release)
+        run: cargo build --release --locked --bin kin --bin kin-daemon
 
       # Without a language server on PATH the brownfield suite's enrichment
       # sweep never runs, and its recall checks then report UNREADABLE rather
@@ -189,8 +203,8 @@ jobs:
           mkdir -p acceptance
           rc=0
           python3 scripts/acceptance/magic_repro.py \
-            --kin target/debug/kin \
-            --daemon target/debug/kin-daemon \
+            --kin target/release/kin \
+            --daemon target/release/kin-daemon \
             --json acceptance/magic.json \
             --label "$KIN_ACCEPTANCE_LABEL" \
             --verbose >acceptance/magic.log 2>&1 || rc=$?
@@ -217,8 +231,8 @@ jobs:
           mkdir -p acceptance
           rc=0
           python3 scripts/acceptance/brownfield_repro.py \
-            --kin target/debug/kin \
-            --daemon target/debug/kin-daemon \
+            --kin target/release/kin \
+            --daemon target/release/kin-daemon \
             --json acceptance/brownfield.json \
             --corpus-cache ~/.cache/kin-brownfield-repro \
             --label "$KIN_ACCEPTANCE_LABEL" \
@@ -261,4 +275,4 @@ jobs:
           python3 scripts/acceptance/gate.py \
             --report magic=acceptance/magic.json \
             --report brownfield=acceptance/brownfield.json \
-            --allow-unreadable 'brownfield:4=the express app.handle walk returns truncated=True on ubuntu-latest against a debug build, so an absent edge cannot be told from a dropped one. Run 32512404014 reported it on the same express graph a release 0.5.44 build walked untruncated. FIR-2591 follow-up.'
+            --allow-unreadable 'brownfield:4=FIR-2593: the express app.handle walk came back truncated=True with clipped_steps=None on a debug build of main, so an absent edge could not be told from a dropped one. This job now builds release, which is what decides it; the moment the check passes this allowance announces itself stale and can go.'

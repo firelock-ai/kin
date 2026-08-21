@@ -51,23 +51,36 @@ product on a broken one.
 ## Running against a local build
 
 ```
-cargo build --locked --bin kin --bin kin-daemon
+cargo build --release --locked --bin kin --bin kin-daemon
 
 python3 scripts/acceptance/magic_repro.py \
-  --kin target/debug/kin --daemon target/debug/kin-daemon \
+  --kin target/release/kin --daemon target/release/kin-daemon \
   --json acceptance/magic.json --verbose
 
 python3 scripts/acceptance/brownfield_repro.py \
-  --kin target/debug/kin --daemon target/debug/kin-daemon \
+  --kin target/release/kin --daemon target/release/kin-daemon \
   --json acceptance/brownfield.json \
   --corpus-cache ~/.cache/kin-brownfield-repro --verbose
 ```
+
+Release, not debug. Release is what ships, so it is what an acceptance answer
+should be about, and the profile has already been shown to change an answer: on
+the first CI run a debug build truncated a data-flow walk that a release build
+walked whole (FIR-2593).
 
 Both take `--only` to select check ids, `--workdir` to keep fixtures somewhere
 known, `--keep` to leave them behind, and `--compare` a prior run's JSON so a
 check that passed there and fails now reads REGRESSION rather than plain FAIL.
 `brownfield_repro.py` also takes `--offline`, which refuses to fetch and requires
 the corpus cache to already carry both pinned commits.
+
+The magic suite's fixtures commit through kin, and kin refuses to invent an
+author, so the machine running them needs a git identity. That refusal is
+correct product behavior, not an obstacle: an invented author cannot be
+corrected later without rewriting history, so kin declines rather than guessing.
+A developer machine already has one; the workflow sets one explicitly, because a
+hosted runner does not, and without it every fixture that commits through kin
+fails to build and its checks report UNREADABLE.
 
 Two environment settings keep a run honest and both suites set them for
 themselves: `KIN_DAEMON_AUTO_EMBED=0` keeps the run off inference, and
@@ -96,6 +109,10 @@ wrote nothing did not pass.
 `gate.py --self-test` exercises every one of those rules against its inverse and
 needs no reports. The workflow runs it before the build, alongside the brownfield
 graders' self-test, so a gate that has stopped deciding is named in seconds.
+
+An allowance is meant to be temporary and every one of them names the ticket that
+will remove it. Check the workflow for the current list before assuming a green
+job means every check passed.
 
 ## The umbrella copies
 
