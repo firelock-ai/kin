@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.47] - 2026-08-21
+
+### Changed
+
+- Make kin doctor --fix honest about the repairs it could not make (#1013)
+
+
 ## [0.5.46] - 2026-08-21
 
 ### Changed
