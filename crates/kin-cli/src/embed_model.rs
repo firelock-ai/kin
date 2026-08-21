@@ -7,10 +7,16 @@
 //! No install ships the weights. The first local embed pass resolves
 //! `nomic-ai/nomic-embed-text-v1.5` through `hf-hub`, which downloads it into
 //! the Hugging Face hub cache before a single vector is computed. On a fresh
-//! machine that is several hundred megabytes of egress standing between a
-//! finished `kin init` and the first embedding, and every counter the product
-//! published during it read as an embed pass that was working and recording
-//! nothing.
+//! machine that is several hundred megabytes of egress, and every counter the
+//! product published during it read as an embed pass that was working and
+//! recording nothing.
+//!
+//! `kin init` is what usually pays it. The command's enrichment phase starts a
+//! daemon, and that daemon's background embed worker queues everything the
+//! index is missing as soon as its first reconcile lands, so on a repository
+//! with parseable content the fetch happens inside `kin init` rather than
+//! between it and a later `kin embed`. Wording on every surface says so, since
+//! the earlier phrasing put the cost on a command the user had not run yet.
 //!
 //! This module is the one place that knows where those bytes land, how many of
 //! them have landed, and what to say about it. Its probes are local filesystem
@@ -171,7 +177,7 @@ impl EmbedModelFetch {
             format!("Embed model: {} cached{location}", self.model_id)
         } else {
             format!(
-                "Embed model: {} not in the cache{location}; the first embed pass fetches {} from {EMBED_MODEL_HOST}",
+                "Embed model: {} not in the cache{location}; `kin init` starts the first embed pass, which fetches {} from {EMBED_MODEL_HOST}",
                 self.model_id,
                 self.expected_download(),
             )
@@ -524,6 +530,17 @@ mod tests {
                 && line.contains("about 523 MB")
                 && line.contains("huggingface.co"),
             "an absent model states its cost and its source: {line}"
+        );
+        // FIR-2555: which command pays. `kin init` starts the daemon whose
+        // background embed worker does the fetching, so a reader told to expect
+        // it from a later `kin embed` is told the wrong thing.
+        assert!(
+            line.contains("`kin init` starts the first embed pass"),
+            "an absent model names the command that fetches it: {line}"
+        );
+        assert!(
+            !line.contains("a later embed pass fetches"),
+            "the check must be able to fail: {line}"
         );
     }
 

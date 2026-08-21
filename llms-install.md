@@ -45,6 +45,17 @@ From npm:
 npm install -g @kinlab/kin
 ```
 
+That line needs a writable global npm prefix. If it fails with `EACCES: permission denied,
+mkdir '/usr/local/lib/node_modules/@kinlab'`, you are not root and the prefix is. Either
+run everything below through `npx -y @kinlab/kin`, which needs no writable prefix, or move
+the prefix somewhere you own first:
+
+```sh
+npm config set prefix ~/.npm-global
+export PATH="$HOME/.npm-global/bin:$PATH"
+npm install -g @kinlab/kin
+```
+
 From Homebrew:
 
 ```sh

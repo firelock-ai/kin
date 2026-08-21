@@ -82,9 +82,11 @@ struct InitResultPayload<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     uncommitted_worktree: Option<UncommittedWorktreePayload>,
     /// The embedding model the first embed pass will need, and whether this
-    /// machine already has it. Additive to this schema version: a consumer that
-    /// does not read it is unaffected, and one that does can tell a fresh
-    /// machine's pending download from a warm cache before it schedules work.
+    /// machine already has it. This command starts that pass, so on a fresh
+    /// machine the download is work `kin init` does rather than work it defers.
+    /// Additive to this schema version: a consumer that does not read it is
+    /// unaffected, and one that does can tell a fresh machine's pending
+    /// download from a warm cache before it schedules work.
     embedding_model: crate::embed_model::EmbedModelFetch,
 }
 
@@ -807,10 +809,20 @@ fn render_human_result(
 ///
 /// No install ships the weights, so a converted repository that has never
 /// embedded is one large download away from its first vector, and admission
-/// finishes long before that download starts. Said here because this is the
-/// last thing a fresh install reads before the daemon begins the fetch, and
-/// because every counter published during it reports a pass that is working
-/// and recording nothing.
+/// finishes long before that download starts.
+///
+/// Who pays for it is the part this line used to get wrong. It said "the first
+/// embed pass fetches", which reads as a later command's cost, and the stranger
+/// pass on shipped 0.5.45 measured otherwise: 2.576s to init an empty
+/// repository against 67.1s to init a one-file TypeScript one, the difference
+/// being the fetch (FIR-2555). The enrichment phase at `enrich_after_init`
+/// starts a daemon, that daemon's background embed worker starts as soon as its
+/// first reconcile lands (`kin-daemon/src/daemon.rs`, "embedding worker
+/// started"), and it queues everything the index is missing unless an operator
+/// opted out. So on a repository with parseable content the download is work
+/// `kin init` does, during `kin init`, and this notice prints after it rather
+/// than before. Saying so costs a clause and saves a reader the wrong mental
+/// model of when their machine is busy.
 fn embedding_model_notice(fetch: &crate::embed_model::EmbedModelFetch) -> String {
     if let Some(reason) = fetch.no_fetch_reason.as_deref() {
         return format!("Embedding model: {} ({reason})", fetch.model_id);
@@ -821,14 +833,14 @@ fn embedding_model_notice(fetch: &crate::embed_model::EmbedModelFetch) -> String
     };
     if fetch.present {
         return format!(
-            "Embedding model: {} is already cached{location}, so the first embed pass downloads \
-             nothing",
+            "Embedding model: {} is already cached{location}, so nothing is downloaded",
             fetch.model_id
         );
     }
     format!(
-        "Embedding model: {} is not on this machine yet; the first embed pass fetches {} \
-         from {}{}, which needs egress and runs before any vector exists",
+        "Embedding model: {} is not on this machine yet; `kin init` starts the first embed \
+         pass, which fetches {} from {}{} and needs egress. On a repository with parseable \
+         content that download happens during this command, before any vector exists",
         fetch.model_id,
         fetch.expected_download(),
         crate::embed_model::endpoint_host(),
@@ -1438,6 +1450,26 @@ mod tests {
                 && notice.contains("huggingface.co")
                 && notice.contains("/home/dev/.cache/huggingface/hub/models--x"),
             "the model, the size, the source and the destination are all named: {notice}"
+        );
+
+        // FIR-2555. The size and the host were already here; who pays was not.
+        // This line used to read "the first embed pass fetches", which put the
+        // cost on a command the reader had not run, while the enrichment phase
+        // of this very `kin init` was starting the daemon whose embed worker
+        // does the fetching. A stranger measured 2.576s to init an empty
+        // repository against 67.1s to init a one-file TypeScript one on shipped
+        // 0.5.45, and the difference was this download.
+        assert!(
+            notice.contains("`kin init` starts the first embed pass"),
+            "the notice must name the command that pays for the download: {notice}"
+        );
+        assert!(
+            notice.contains("during this command"),
+            "the notice must say the download happens now rather than later: {notice}"
+        );
+        assert!(
+            !notice.contains("after this command finishes"),
+            "the check must be able to fail: {notice}"
         );
 
         let cached = crate::embed_model::EmbedModelFetch {
