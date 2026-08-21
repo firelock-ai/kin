@@ -7,12 +7,54 @@ use super::commit_progress::{daemon_death_explanation, PhaseTail, AUTHORITY_NOT_
 
 pub async fn run(message: String, quiet: bool) -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
+    // Before attribution, before the daemon is resolved, before anything this
+    // command does for itself. The ambient reconcile tick and this commit both
+    // admit the whole working copy, and whichever publishes first makes the
+    // other's publication redundant, so the tick is written to stand down for a
+    // commit it knows about. It can only know about one that has reached it,
+    // and reaching it is the slow part: a commit that has to start the daemon
+    // waits for the store to open before it can say anything at all, by which
+    // time the first reconcile round has already decided. Announcing here
+    // reaches that round, because the announcement is on disk before the daemon
+    // exists.
+    let _announced = CommitAnnouncement::announce(layout.root());
 
     let result = run_daemon_commit(&layout, &message, quiet).await?;
     if !quiet {
         println!("{}", render_commit_summary(&result));
     }
     Ok(())
+}
+
+/// The announcement this command publishes for as long as it runs.
+///
+/// Withdrawn on drop, so every way the run can end withdraws it: a refusal, a
+/// transport failure, and the success path all pass through the same one line.
+/// What survives that is a killed process, and the announcement carries its own
+/// expiry for exactly that case.
+struct CommitAnnouncement {
+    kin_root: std::path::PathBuf,
+}
+
+impl CommitAnnouncement {
+    fn announce(kin_root: &std::path::Path) -> Self {
+        kin_daemon_spawn::write_approaching_commit(
+            kin_root,
+            &kin_daemon_spawn::ApproachingCommit {
+                pid: std::process::id(),
+                announced_unix: unix_now(),
+            },
+        );
+        Self {
+            kin_root: kin_root.to_path_buf(),
+        }
+    }
+}
+
+impl Drop for CommitAnnouncement {
+    fn drop(&mut self) {
+        kin_daemon_spawn::clear_approaching_commit(&self.kin_root);
+    }
 }
 
 /// What a successful `kin commit` prints.
@@ -740,5 +782,45 @@ mod tests {
             "the note must name the surface that keeps disagreeing: {summary}"
         );
         assert!(summary.contains("kin eject"), "{summary}");
+    }
+
+    /// The announcement this command publishes before it does anything else,
+    /// and the withdrawal every exit path shares.
+    ///
+    /// A daemon reads this while its first reconcile round is deciding whether
+    /// to publish, and that round happens before this command can send anything,
+    /// so the announcement has to be on disk rather than in a request. What the
+    /// round needs from it is only that it exists while the commit is running
+    /// and is gone afterwards.
+    #[test]
+    fn a_commit_announces_itself_for_exactly_as_long_as_it_runs() {
+        let repo = tempfile::tempdir().unwrap();
+
+        assert!(
+            kin_daemon_spawn::read_approaching_commit(repo.path()).is_none(),
+            "nothing is announced before the command starts"
+        );
+
+        {
+            let _announced = CommitAnnouncement::announce(repo.path());
+            let announced = kin_daemon_spawn::read_approaching_commit(repo.path())
+                .expect("a running commit announces itself where a cold daemon can read it");
+            assert_eq!(
+                announced.pid,
+                std::process::id(),
+                "the announcement names the client that made it"
+            );
+            assert!(
+                announced.is_fresh(unix_now()),
+                "an announcement made now is readable now, or the daemon would ignore every \
+                 one of them and the tick would never learn a commit was coming"
+            );
+        }
+
+        assert!(
+            kin_daemon_spawn::read_approaching_commit(repo.path()).is_none(),
+            "a commit that has ended must withdraw its announcement, or the next ambient tick \
+             stands down for a commit that is never coming"
+        );
     }
 }
