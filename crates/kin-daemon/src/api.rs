@@ -22036,8 +22036,11 @@ mod tests {
         )
         .await;
 
-        std::fs::write(root.join("notekeeper/client.py"), b"def normalize(term):\n    return term\n")
-            .unwrap();
+        std::fs::write(
+            root.join("notekeeper/client.py"),
+            b"def normalize(term):\n    return term\n",
+        )
+        .unwrap();
         let regression =
             commit_through_api(&app, kin_model::OperationId::new(), "publish a regression").await;
         assert_eq!(branch_change(&state), regression);
