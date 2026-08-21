@@ -32,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bind a projection root only when it is a Kin repository, and stop calling an unserved one in force (#1029)
 - Report the store's coverage beside an embed pass's own count (#1030)
 - Scope a review to the entities that changed, and pair same-name declarations by their own signature (#1031)
+- Give kin impact one relation policy, one depth bound and one verdict (#1032)
 
 
 ## [0.5.46] - 2026-08-21
