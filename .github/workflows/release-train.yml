@@ -545,14 +545,43 @@ jobs:
               .[0].number // ""
             end
           ' <<< "$pr_data")"
+          # The body is not a description of this release, it is the
+          # release's permanent commit message: this repository squashes
+          # with the pull-request body, and the merge queue mints that
+          # message when the entry is admitted. So the train owns one
+          # delimited region of it and rewrites nothing else. It used to
+          # rewrite the whole body to the line below on every cycle, which
+          # discarded the disclosures the release doctrine requires an
+          # operator to add, and a cycle landing between that edit and
+          # queue admission would have shipped a release whose permanent
+          # message carried none of them.
+          #
+          # The merge is read from protected main for the same reason the
+          # proof gate below is: the branch under judgement must not be
+          # able to change how its own commit message is assembled.
+          merge_body="$RUNNER_TEMP/release-train-body.mjs"
+          git show \
+            "refs/remotes/origin/main:scripts/release-train-body.mjs" \
+            > "$merge_body"
+          test -s "$merge_body"
+          region="$RUNNER_TEMP/release-train-region.md"
+          cat > "$region" <<'RELEASE_TRAIN_REGION'
+          Automated, coalescing Kin release PR. It carries the lockstep Cargo/npm version, exact internal path pin, workspace-only lockfile movement, and generated notes for every reviewed first-parent change since the prior stable tag.
+          RELEASE_TRAIN_REGION
+
           created=false
           if [ -z "$pr" ]; then
+            initial_body="$RUNNER_TEMP/release-train-initial-body.md"
+            node "$merge_body" \
+              --region "$region" \
+              --out "$initial_body" \
+              >/dev/null
             gh pr create \
               --repo "$GITHUB_REPOSITORY" \
               --base main \
               --head "$BRANCH" \
               --title "Release Kin ${TAG}" \
-              --body "Automated, coalescing Kin release PR. It carries the lockstep Cargo/npm version, exact internal path pin, workspace-only lockfile movement, and generated notes for every reviewed first-parent change since the prior stable tag." \
+              --body-file "$initial_body" \
               >/dev/null
             pr_data="$(gh pr list \
               --repo "$GITHUB_REPOSITORY" \
@@ -576,10 +605,47 @@ jobs:
             test -n "$pr"
             created=true
           fi
+          # The title is generated every cycle and carries nothing an
+          # operator writes, so it stays a plain overwrite.
           gh pr edit "$pr" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "Release Kin ${TAG}" \
-            --body "Automated, coalescing Kin release PR. It carries the lockstep Cargo/npm version, exact internal path pin, workspace-only lockfile movement, and generated notes for every reviewed first-parent change since the prior stable tag."
+            --title "Release Kin ${TAG}"
+          # Read the body as JSON rather than as text, so no shell or jq
+          # step can add, strip, or re-encode a byte an operator wrote.
+          current_body="$RUNNER_TEMP/release-train-current-body.json"
+          gh pr view "$pr" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json body \
+            > "$current_body"
+          next_body="$RUNNER_TEMP/release-train-next-body.md"
+          merge_result="$(node "$merge_body" \
+            --region "$region" \
+            --current-json "$current_body" \
+            --out "$next_body")"
+          merge_status="$(jq -er .status <<< "$merge_result")"
+          merge_detail="$(jq -er .detail <<< "$merge_result")"
+          # Read the flag as text, never as a jq truth value: `jq -e` exits
+          # 1 on a false result, so a no-op cycle would abort this step
+          # under set -e, and no-op is the common case. Requiring the field
+          # to be a boolean keeps the absent-field failure loud.
+          merge_changed="$(jq -er '
+            if (.changed | type) == "boolean" then
+              .changed | tostring
+            else
+              error("release PR body merge reported no changed flag")
+            end
+          ' <<< "$merge_result")"
+          if [ "$merge_status" = "unmergeable" ]; then
+            # Leave the body exactly as it stands. Refusing costs the
+            # train its own line; guessing at which region it owns costs
+            # the release the disclosures this preservation exists for.
+            echo "::error::release PR body left untouched: ${merge_detail}"
+          elif [ "$merge_changed" = "true" ]; then
+            gh pr edit "$pr" \
+              --repo "$GITHUB_REPOSITORY" \
+              --body-file "$next_body"
+            echo "::notice::release PR body reconciled: ${merge_detail}"
+          fi
           jq -n \
             --arg automated "release:automated" \
             --arg bump "release:${BUMP}" \

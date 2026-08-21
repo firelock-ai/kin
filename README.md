@@ -186,6 +186,24 @@ The npm entry point resolves the same public release channel:
 npm install -g @kinlab/kin@latest
 ```
 
+A global install needs a writable npm prefix. Where the prefix is root-owned and you are
+not root, npm refuses with `EACCES: permission denied, mkdir
+'/usr/local/lib/node_modules/@kinlab'` before Kin runs at all, which is the usual case
+inside a container whose default user is not root. Either use the zero-install path,
+`npx -y @kinlab/kin setup --intent agent --no-interactive`, or move the prefix somewhere
+you own and put it on your `PATH`:
+
+```sh
+npm config set prefix ~/.npm-global
+export PATH="$HOME/.npm-global/bin:$PATH"   # add this to your shell profile too
+npm install -g @kinlab/kin@latest
+```
+
+A user prefix is on your interactive shell's `PATH` and nowhere else. Scripts, CI steps,
+`docker exec`, and agent clients do not inherit it, so give those the absolute path to the
+binary rather than a bare `kin`. See
+[Works with your agent](#works-with-your-agent) for the registration shape.
+
 A Homebrew tap tracks the same release channel:
 
 ```sh

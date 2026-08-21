@@ -2878,6 +2878,11 @@ const MODEL_HOST_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_s
 /// egress with no surface naming the download, the size, the destination, or
 /// the host it needs to reach, and an air-gapped host produced exactly the same
 /// output as a healthy one that was simply still working.
+///
+/// The detail names `kin init` as what starts that pass. It is the command a
+/// reader has usually just run when they reach doctor, and the earlier wording
+/// pointed at a later `kin embed` that was never going to be the one paying
+/// (FIR-2555).
 async fn check_embedding_model() -> HealthCheck {
     // `false`: this is a one-shot CLI process with no embed pass of its own, so
     // the download-in-flight phase is not a state doctor can be in. Doctor
@@ -2948,16 +2953,16 @@ fn embedding_model_check_from(
             HealthStatus::Missing,
             format!(
                 "{model} is not in the cache{location} and this host did not reach {host}:443 \
-                 within {}s; the first embed pass fetches {download} from {host}, and until \
-                 that lands nothing embeds",
+                 within {}s; `kin init` starts the first embed pass, which fetches {download} \
+                 from {host}, and until that lands nothing embeds",
                 MODEL_HOST_PROBE_BUDGET.as_secs()
             ),
         ),
         (None, false, _) => (
             HealthStatus::Pending,
             format!(
-                "{model} is not in the cache{location}; the first embed pass fetches {download} \
-                 from {host} before it records anything"
+                "{model} is not in the cache{location}; `kin init` starts the first embed pass, \
+                 which fetches {download} from {host} before it records anything"
             ),
         ),
     };
@@ -6911,6 +6916,20 @@ mod tests {
         assert!(
             check.detail.contains("about 523 MB") && check.detail.contains("huggingface.co"),
             "the size and the source are both named: {}",
+            check.detail
+        );
+        // FIR-2555: the command that starts the pass, not a later one the
+        // reader has no reason to run.
+        assert!(
+            check
+                .detail
+                .contains("`kin init` starts the first embed pass"),
+            "the detail names what starts the fetch: {}",
+            check.detail
+        );
+        assert!(
+            !check.detail.contains("a later embed pass fetches"),
+            "the check must be able to fail: {}",
             check.detail
         );
         assert!(
