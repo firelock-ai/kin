@@ -530,8 +530,9 @@ impl GraphBehind {
     fn describe(unadmitted_paths: u64, since: Option<&str>) -> String {
         let clock = match since {
             Some(since) => format!("the last complete admission was at {since}"),
-            None => "this daemon has not reported when a complete admission last succeeded"
-                .to_string(),
+            None => {
+                "this daemon has not reported when a complete admission last succeeded".to_string()
+            }
         };
         format!(
             "{unadmitted_paths} host path(s) are on disk that graph truth does not carry, and \
@@ -2136,12 +2137,16 @@ mod tests {
             "the counts were never the wrong part and are left exactly as observed"
         );
         assert!(
-            !durability.note.contains("records everything answering here"),
+            !durability
+                .note
+                .contains("records everything answering here"),
             "the all-clear this reading cannot make: {}",
             durability.note
         );
         assert!(
-            durability.note.contains("host path(s) on disk that no admission has taken"),
+            durability
+                .note
+                .contains("host path(s) on disk that no admission has taken"),
             "the note has to name what it does not cover: {}",
             durability.note
         );
@@ -2162,7 +2167,9 @@ mod tests {
         let durability = env.durability.expect("the counts still answer");
         assert_eq!(durability.state, "recorded");
         assert!(
-            durability.note.contains("records everything answering here"),
+            durability
+                .note
+                .contains("records everything answering here"),
             "{}",
             durability.note
         );

@@ -897,7 +897,12 @@ fn the_reconciliation_watch_is_armed_before_the_endpoint_is_published() {
     // The port file appears a moment before the line that reports it, so the
     // wait above proves the publication happened and this proves it was logged.
     daemon.wait_for_record(ENDPOINT_RECORD, 0, WATCHER_BOUND, "publish its endpoint");
-    daemon.wait_for_record(WATCHER_RECORD, 0, WATCHER_BOUND, "register its file watcher");
+    daemon.wait_for_record(
+        WATCHER_RECORD,
+        0,
+        WATCHER_BOUND,
+        "register its file watcher",
+    );
 
     let log = daemon.log_text();
     let watch_at = log
@@ -958,8 +963,7 @@ fn a_file_written_while_no_daemon_watched_is_admitted_by_the_next_one() {
     // and the catch-up below has a window to open at. Without a marker there is
     // no lower bound and the pass correctly declines to run at all.
     let before_write = first.log_offset();
-    fs::write(repo.join(UNCOMMITTED_PATH), UNCOMMITTED_SOURCE)
-        .expect("write the watched source");
+    fs::write(repo.join(UNCOMMITTED_PATH), UNCOMMITTED_SOURCE).expect("write the watched source");
     wait_for_live_growth(
         &first,
         &repo,

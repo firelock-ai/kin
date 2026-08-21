@@ -1194,9 +1194,10 @@ impl Scanner<'_> {
             // own: a special entry is not admissible either way.
             if let ScanMode::ModifiedSince(since) = self.mode {
                 if file_type.is_file() || file_type.is_symlink() {
-                    let modified = host_entry_modified_since(&host_path, since).map_err(|error| {
-                        self.fail(&host_path, "read entry modification time", error)
-                    })?;
+                    let modified =
+                        host_entry_modified_since(&host_path, since).map_err(|error| {
+                            self.fail(&host_path, "read entry modification time", error)
+                        })?;
                     if modified == Some(true) {
                         self.modified.push(repo_path);
                     }

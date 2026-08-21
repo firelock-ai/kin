@@ -6664,11 +6664,17 @@ mod tests {
 
         let before = repo.path().join("settled.rs");
         std::fs::write(&before, b"pub fn settled() -> u32 { 1 }\n").unwrap();
-        stamp_modified(&before, SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000));
+        stamp_modified(
+            &before,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000),
+        );
 
         let after = repo.path().join("written_while_nothing_watched.rs");
         std::fs::write(&after, b"pub fn written() -> u32 { 2 }\n").unwrap();
-        stamp_modified(&after, SystemTime::UNIX_EPOCH + Duration::from_secs(3_000_000));
+        stamp_modified(
+            &after,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(3_000_000),
+        );
 
         let window = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000);
         let planned = plan_catch_up_events(&state, window).unwrap();
@@ -6717,10 +6723,16 @@ mod tests {
 
         let ignored = repo.path().join("secrets.rs");
         std::fs::write(&ignored, b"pub fn secret() -> u32 { 3 }\n").unwrap();
-        stamp_modified(&ignored, SystemTime::UNIX_EPOCH + Duration::from_secs(3_000_000));
+        stamp_modified(
+            &ignored,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(3_000_000),
+        );
         let visible = repo.path().join("visible.rs");
         std::fs::write(&visible, b"pub fn visible() -> u32 { 4 }\n").unwrap();
-        stamp_modified(&visible, SystemTime::UNIX_EPOCH + Duration::from_secs(3_000_000));
+        stamp_modified(
+            &visible,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(3_000_000),
+        );
 
         let window = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000);
         let named = event_paths(&plan_catch_up_events(&state, window).unwrap())
@@ -6766,7 +6778,6 @@ mod tests {
              file's real age instead"
         );
     }
-
 }
 
 /// Decide whether a filesystem-sync tick's bulk deletions should be WITHHELD as
