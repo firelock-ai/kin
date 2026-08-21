@@ -48,7 +48,47 @@ fn project_dirs() -> Result<ProjectDirs> {
         .ok_or_else(|| anyhow::anyhow!("failed to resolve Kin config directory"))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Where a test has redirected the fallback credential root, if anywhere.
+    ///
+    /// The real root is host-global, shared by every process on the machine,
+    /// so a test that writes into it is racing every other process that does
+    /// the same, including another checkout's copy of this same test binary.
+    /// `#[serial]` cannot help there: it orders tests inside ONE binary and the
+    /// contended resource is one path on the host.
+    ///
+    /// Thread-local rather than a static, so a threaded `cargo test` run cannot
+    /// leak one test's redirect into another, and taken through an RAII guard
+    /// so a panicking test still puts it back.
+    static TEST_CREDENTIAL_ROOT: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Redirect [`fallback_credential_root`] for the life of the guard.
+#[cfg(test)]
+struct TestCredentialRoot;
+
+#[cfg(test)]
+impl TestCredentialRoot {
+    fn set(root: &std::path::Path) -> Self {
+        TEST_CREDENTIAL_ROOT.with(|slot| *slot.borrow_mut() = Some(root.to_path_buf()));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestCredentialRoot {
+    fn drop(&mut self) {
+        TEST_CREDENTIAL_ROOT.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
 fn fallback_credential_root() -> Result<PathBuf> {
+    #[cfg(test)]
+    if let Some(root) = TEST_CREDENTIAL_ROOT.with(|slot| slot.borrow().clone()) {
+        return Ok(root);
+    }
     Ok(project_dirs()?.data_local_dir().join("auth"))
 }
 
@@ -587,10 +627,20 @@ mod tests {
     #[serial]
     fn default_cli_actor_id_prefers_saved_credential_email() {
         let base_url = "https://kinlab.example.com";
-        let dirs = project_dirs().unwrap();
-        let root = dirs.data_local_dir().join("auth");
-        fs::create_dir_all(&root).unwrap();
-        let path = root.join(format!("{}.json.age", account_key(base_url)));
+        // Per-process root. The real one is host-global, so two lanes running
+        // this binary at once wrote and deleted one file and whichever lost
+        // panicked in its own teardown.
+        let store = tempfile::tempdir().expect("a private credential store");
+        let _root = TestCredentialRoot::set(&store.path().join("auth"));
+
+        // Resolved through the locator the product itself reads, so a test
+        // that wrote somewhere the product never looks would fail rather than
+        // quietly assert on the ambient machine's credential.
+        let path = fallback_credential_path(base_url).unwrap();
+        assert!(
+            path.starts_with(store.path()),
+            "the credential path must resolve inside this test's own store, not {path:?}"
+        );
         let payload = serde_json::to_vec(&StoredCredential {
             base_url: base_url.to_string(),
             token: "token".to_string(),
@@ -608,7 +658,36 @@ mod tests {
         let actor_id = default_cli_actor_id(base_url);
         assert_eq!(actor_id, "cli:troy@firelock.ai:workstation");
 
-        fs::remove_file(path).unwrap();
+        // No teardown to race: the tempdir takes the whole store with it.
+    }
+
+    /// The redirect is what keeps the test off the host, so it gets its own
+    /// case in both directions rather than being trusted.
+    #[test]
+    #[serial]
+    fn the_credential_root_redirect_applies_and_then_stops_applying() {
+        let host_root = fallback_credential_root().unwrap();
+        let store = tempfile::tempdir().expect("a private credential store");
+        let redirected = store.path().join("auth");
+
+        {
+            let _root = TestCredentialRoot::set(&redirected);
+            assert_eq!(
+                fallback_credential_root().unwrap(),
+                redirected,
+                "the guard must redirect the root the product reads"
+            );
+        }
+
+        assert_eq!(
+            fallback_credential_root().unwrap(),
+            host_root,
+            "the guard must put the host root back when it drops"
+        );
+        assert!(
+            !host_root.starts_with(store.path()),
+            "the host root and the redirect must be different places, or this proves nothing"
+        );
     }
 
     /// A probe that never read the keyring has not learned that the machine is
