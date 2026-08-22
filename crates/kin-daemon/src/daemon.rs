@@ -1686,6 +1686,55 @@ fn mark_files_enriched(state: &DaemonState, files: &[String]) {
     }
 }
 
+/// Retire the enrichment marker for files a reconcile just changed.
+///
+/// The marker means "the enrichment for this file is durable", and an edit that
+/// re-derives the file's declarations makes that false: the language-server
+/// answers behind those edges were taken at positions the edit moved, and the
+/// entities they were installed on may no longer be the ones the graph carries.
+/// Nothing retired an entry before this, so once a file was swept it was skipped
+/// by every later sweep for the life of the store.
+///
+/// That is what made the FIR-2598 loss permanent and what made the recovery lie.
+/// A 26-line docstring commit on `psf/requests` cost the store 11 `Calls` edges
+/// and one `Overrides` edge, and the `kin daemon sweep` a user runs next
+/// finished in 518 ms reporting "enriched 37/37 files" over 37 files it skipped
+/// without asking a language server anything. A no-op that reports full coverage
+/// in half a second reads exactly like a sweep that did the work.
+///
+/// Retiring costs one file's re-enrichment on the next sweep and is the cheap
+/// direction to be wrong in, which is the same asymmetry
+/// [`load_lsp_enriched_marker`] is built on: a wrong skip is silent and loses
+/// the answers, a wrong re-sweep only costs time. The persisted set is rewritten
+/// so a restart does not reload the entry this just dropped.
+pub(crate) fn retire_enrichment_marker(state: &DaemonState, files: &[String]) {
+    if files.is_empty() {
+        return;
+    }
+    let snapshot = {
+        let Ok(mut marked) = state.lsp_enriched_files.lock() else {
+            return;
+        };
+        let mut retired = 0usize;
+        for file in files {
+            if marked.remove(file) {
+                retired += 1;
+            }
+        }
+        if retired == 0 {
+            return;
+        }
+        marked.iter().cloned().collect::<Vec<_>>()
+    };
+    debug!(
+        files = files.len(),
+        "retired the enrichment marker for edited files; the next sweep re-enriches them"
+    );
+    if let Ok(bytes) = serde_json::to_vec(&snapshot) {
+        let _ = std::fs::write(lsp_enriched_marker_path(state), bytes);
+    }
+}
+
 /// How many consecutive fruitless interrupted sweeps disable the next one.
 ///
 /// Defined in `kin-daemon-spawn` rather than here, because the daemon is the
@@ -6501,6 +6550,73 @@ mod enrichment_marker_tests {
             !file_already_enriched(&state, "src/sessions.py"),
             "and it stays unhonored while the graph still cannot corroborate it, so the \
              judgment does not depend on having deleted the file"
+        );
+    }
+
+    /// The FIR-2598 recovery path. A comment-only commit on `psf/requests` cost
+    /// the store 11 `Calls` edges and one `Overrides` edge, and the
+    /// `kin daemon sweep` a user runs next finished in 518 ms reporting
+    /// "enriched 37/37 files" over 37 files it skipped. Nothing retired a
+    /// marker entry, so a file swept once was skipped for the life of the
+    /// store however far its declarations later moved.
+    #[test]
+    fn an_edited_file_loses_its_enrichment_marker_and_is_swept_again() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = DaemonState::open(init.layout).unwrap();
+        install_language_server_relation(&state);
+        super::mark_files_enriched(
+            &state,
+            &["src/sessions.py".to_string(), "src/adapters.py".to_string()],
+        );
+        assert!(
+            file_already_enriched(&state, "src/sessions.py"),
+            "the control: a swept file is skipped, which is what makes the retirement mean \
+             something"
+        );
+
+        super::retire_enrichment_marker(&state, &["src/sessions.py".to_string()]);
+
+        assert!(
+            !file_already_enriched(&state, "src/sessions.py"),
+            "an edited file must be swept again, or the edge its edit dropped never comes back"
+        );
+        assert!(
+            file_already_enriched(&state, "src/adapters.py"),
+            "and only the edited file is retired, so one commit does not re-sweep the repository"
+        );
+
+        // The retirement has to survive a restart, or the next daemon reloads
+        // the entry this just dropped and skips the file again.
+        let reopened =
+            DaemonState::open(kin_core::KinLayout::new(repo_dir.path().join(".kin"))).unwrap();
+        install_language_server_relation(&reopened);
+        load_lsp_enriched_marker(&reopened);
+        assert!(
+            !file_already_enriched(&reopened, "src/sessions.py"),
+            "a restart must not reload a marker entry an edit retired"
+        );
+        assert!(
+            file_already_enriched(&reopened, "src/adapters.py"),
+            "while the entries the edit did not touch are still resumed"
+        );
+    }
+
+    /// The counterpart, so the retirement cannot be an unconditional wipe. A
+    /// file nothing edited keeps its marker and its skip.
+    #[test]
+    fn retiring_a_file_no_marker_names_changes_nothing() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = DaemonState::open(init.layout).unwrap();
+        install_language_server_relation(&state);
+        super::mark_files_enriched(&state, &["src/sessions.py".to_string()]);
+
+        super::retire_enrichment_marker(&state, &["src/models.py".to_string()]);
+
+        assert!(
+            file_already_enriched(&state, "src/sessions.py"),
+            "editing one file must not re-sweep another"
         );
     }
 

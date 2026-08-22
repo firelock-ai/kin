@@ -1,0 +1,316 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+# Product acceptance, on every pull request, against that request's own build.
+#
+# ci.yml tests the release machinery and the Rust workspace. The suites that ask
+# whether the product still answers correctly (the magic repro and the brownfield
+# repro) lived only in the kin-ecosystem umbrella and ran after a tag or on a
+# release candidate, by a captain, on one Mac. bin/kin-release-preflight's own
+# header records what that costs: v0.5.38 "was built, published, and then failed
+# semantic_coverage.complete on every platform with nothing local having ever
+# asked the question."
+#
+# Against a built binary the suites are minutes, not hours: measured locally on
+# 2026-08-21 against a kin built from main, the magic suite took 107 s and the
+# brownfield suite 351 s with a warm corpus cache. There is no reason for the
+# question to wait for a tag. The scripts they run are owned by
+# this repository (scripts/acceptance/), so the suite versions with the code it
+# tests rather than drifting against it in another checkout.
+#
+# The build is the RELEASE profile, unlike daemon-smoke.yml's debug one, and the
+# extra minutes are bought deliberately. Release is what ships, so it is what a
+# product acceptance answer should be about, and the first run of this job
+# turned up a walk that a debug build truncated and a release build did not
+# (FIR-2593). An acceptance suite whose result depends on a profile nobody
+# releases is answering a question nobody asked.
+#
+# This workflow publishes no required context yet. It becomes one on main after
+# it has been green on five consecutive pull requests, which is a separate,
+# deliberate step (FIR-2591).
+
+name: Acceptance
+
+on:
+  # main is here for one mechanical reason: `save-if` below writes the cargo
+  # cache only from the default branch, and a workflow that never runs there
+  # never writes one, so every pull request would pay a cold dependency build.
+  # daemon-smoke.yml carries the same trigger for the same reason.
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  merge_group:
+  workflow_dispatch:
+
+# The sha suffix is empty off main, so every pull request and merge-queue ref
+# keeps one group per ref and a superseded push is cancelled. On main each
+# commit gets its own group: `cancel-in-progress: false` does not mean "never
+# cancel", GitHub keeps at most one PENDING run per group and deletes the older
+# one, and the hosted merge queue lands PRs back to back, so two quick landings
+# would otherwise leave the earlier commit with this check absent rather than
+# failed.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.sha || '' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # The suites never run inference and never touch a real store. Set here as
+  # well as inside each suite, so a step added later inherits the same posture.
+  KIN_DAEMON_AUTO_EMBED: "0"
+  KIN_EMBED_BACKEND: cpu
+  KIN_VFS_DISABLE: "1"
+
+jobs:
+  acceptance:
+    name: Product Acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Before the build, because this needs no binary and no corpus and a broken
+      # grader should be named in seconds rather than after three minutes of
+      # compiling. Every verdict the brownfield suite reports is decided by
+      # verdict_surfaces, name_matches, sweep_verdict and Result.status, and each
+      # self-test case is paired with its inverse, so a grader that cannot tell
+      # its own cases apart fails here instead of reporting a clean product on a
+      # broken one.
+      - name: Falsify the brownfield verdict graders
+        run: python3 scripts/acceptance/brownfield_repro.py --self-test
+
+      # The gate decides this job, so it gets the same treatment. Every rule it
+      # enforces is exercised against its inverse, including the ones that keep
+      # its allowance list from becoming a way to stop enforcing.
+      - name: Falsify the acceptance gate
+        run: python3 scripts/acceptance/gate.py --self-test
+
+      # FIR-2600. The budget must never render a list it cut as an empty one,
+      # because an empty array is the shape a reader takes for "the walk found
+      # none". Each grader is handed the exact defect that shipped and has to
+      # fail on it; one of them passed a broken product during development
+      # because its fixture never reached the code under test, which is what
+      # this step exists to catch.
+      - name: Falsify the response-budget elision graders
+        run: python3 scripts/acceptance/response_budget_elisions.py --self-test
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+
+      - name: Verify kin cargo registry config
+        # Preserve the tracked config because it carries public Git [patch.kin]
+        # pins for kin-* crates that are not all registry-published yet.
+        run: |
+          test -f .cargo/config.toml
+          grep -q '^\[registries\.kin\]' .cargo/config.toml
+          if grep -q '^\[patch\.kin\]' .cargo/config.toml; then echo "::error::[patch.kin] git pins must be removed. kin-* resolve from the Kin registry"; exit 1; fi
+
+      # A release build of this workspace is expensive enough that the
+      # dependency target directory has to be carried, so this job takes its own
+      # cache entry rather than sharing one. `shared-key` replaces the job-id
+      # component of the key, which is what lets a pull request restore the entry
+      # main wrote; without it every job id gets its own key and a pull request
+      # would never see main's. The action strips the workspace's own crates
+      # before saving, so what is restored is dependencies and never a stale kin
+      # or kin-daemon binary, which is what the suites assert on.
+      #
+      # Restore on every event, save only from main, because an entry written
+      # from a pull request ref is readable only by later runs on that same ref
+      # and would spend the shared repository cache budget that main's reusable
+      # entry needs.
+      - name: Cache cargo registry and the release dependency build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: acceptance-release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Cargo.lock and .cargo/config.toml together pin kin-* deps to public
+      # source until every crate is registry-published.
+      - name: Build kin + kin-daemon (release)
+        run: cargo build --release --locked --bin kin --bin kin-daemon
+
+      # Without a language server on PATH the brownfield suite's enrichment
+      # sweep never runs, and its recall checks then report UNREADABLE rather
+      # than a verdict. The script warns and exits 0 on a registry failure, so a
+      # bad npm morning does not fail this gate; when that happens the suite
+      # says so per check instead of quietly passing.
+      - name: Install language servers for the enrichment checks
+        run: bash scripts/ci-install-language-servers.sh
+
+      # `kin commit` refuses to invent an author, and a hosted runner carries no
+      # git identity, so without this every magic-suite fixture that commits
+      # through kin fails to build and its checks report UNREADABLE. Run
+      # 32512404014 is what found it: seven of ten checks came back
+      # "kin commit failed ... Set your Git identity". The suites pass an
+      # identity to their own `git` invocations already; this is for the commits
+      # kin itself authors.
+      - name: Give the runner a git identity
+        run: |
+          set -euo pipefail
+          git config --global user.name 'Kin CI'
+          git config --global user.email 'ci@kinlab.ai'
+          git config --global --get user.email
+
+      # The magic suite's virtual-environment check builds a real venv, and
+      # Debian and Ubuntu ship `python3 -m venv` in a separate package. Probe by
+      # creating one rather than by importing the module, because the module
+      # imports fine on an image whose ensurepip was split out and only the
+      # creation fails. A missing venv would otherwise surface as UNREADABLE on
+      # that one check, which is a red job blamed on the diff under review.
+      - name: Ensure python3 can create a virtual environment
+        run: |
+          set -euo pipefail
+          probe="$(mktemp -d)"
+          if ! python3 -m venv "$probe/env" >/dev/null 2>&1; then
+            scripts/ci-apt-install.sh python3-venv
+            python3 -m venv "$probe/env"
+          fi
+          rm -rf "$probe"
+          echo "python3 -m venv works"
+
+      # The two upstream trees the brownfield suite pins, cached as depth-1
+      # fetches plus the express node_modules the language server needs to
+      # resolve require() targets. The key is derived from the pinned commits in
+      # the script itself, so moving a pin invalidates the entry rather than
+      # measuring the old tree under the new name.
+      - name: Resolve the pinned brownfield corpora
+        id: corpora
+        run: |
+          set -euo pipefail
+          key="$(python3 -c "
+          import pathlib, re
+          text = pathlib.Path('scripts/acceptance/brownfield_repro.py').read_text()
+          commits = re.findall(r'\"commit\": \"([0-9a-f]{40})\"', text)
+          if len(commits) != 2:
+              raise SystemExit('expected two pinned corpus commits, found %d' % len(commits))
+          print('-'.join(c[:12] for c in sorted(commits)))
+          ")"
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+          echo "pinned corpora: $key"
+
+      - name: Cache the brownfield corpora
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/kin-brownfield-repro
+          key: kin-brownfield-corpora-${{ runner.os }}-${{ steps.corpora.outputs.key }}
+
+      # Each suite writes its whole output to a file and the file is printed
+      # afterwards, rather than piping into tee. A pipeline's exit status is its
+      # last stage's, and `tee` exits 0 on input it never read, so a piped run
+      # can report success for a suite that failed.
+      - name: Magic acceptance suite
+        id: magic
+        env:
+          KIN_ACCEPTANCE_LABEL: ${{ github.event_name }}-${{ github.sha }}
+        run: |
+          set -uo pipefail
+          mkdir -p acceptance
+          rc=0
+          python3 scripts/acceptance/magic_repro.py \
+            --kin target/release/kin \
+            --daemon target/release/kin-daemon \
+            --json acceptance/magic.json \
+            --label "$KIN_ACCEPTANCE_LABEL" \
+            --verbose >acceptance/magic.log 2>&1 || rc=$?
+          cat acceptance/magic.log
+          {
+            echo "### Magic acceptance suite (exit $rc)"
+            echo ''
+            echo '```'
+            grep -E '^CHECK ' acceptance/magic.log || echo '(no CHECK line was printed)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error title=Magic acceptance suite failed::exit $rc (1 FAIL, 2 UNREADABLE, 3 setup); see the CHECK lines above"
+          fi
+
+      - name: Brownfield acceptance suite
+        id: brownfield
+        if: always()
+        env:
+          KIN_ACCEPTANCE_LABEL: ${{ github.event_name }}-${{ github.sha }}
+        run: |
+          set -uo pipefail
+          mkdir -p acceptance
+          rc=0
+          python3 scripts/acceptance/brownfield_repro.py \
+            --kin target/release/kin \
+            --daemon target/release/kin-daemon \
+            --json acceptance/brownfield.json \
+            --corpus-cache ~/.cache/kin-brownfield-repro \
+            --label "$KIN_ACCEPTANCE_LABEL" \
+            --verbose >acceptance/brownfield.log 2>&1 || rc=$?
+          cat acceptance/brownfield.log
+          {
+            echo "### Brownfield acceptance suite (exit $rc)"
+            echo ''
+            echo '```'
+            grep -E '^CHECK ' acceptance/brownfield.log || echo '(no CHECK line was printed)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error title=Brownfield acceptance suite failed::exit $rc (1 FAIL, 2 UNREADABLE, 3 setup); see the CHECK lines above"
+          fi
+
+      - name: Response budget elision suite
+        id: response_budget
+        if: always()
+        env:
+          KIN_ACCEPTANCE_LABEL: ${{ github.event_name }}-${{ github.sha }}
+        run: |
+          set -uo pipefail
+          mkdir -p acceptance
+          rc=0
+          python3 scripts/acceptance/response_budget_elisions.py \
+            --kin target/release/kin \
+            --daemon target/release/kin-daemon \
+            --json acceptance/response_budget.json \
+            --label "$KIN_ACCEPTANCE_LABEL" \
+            --verbose >acceptance/response_budget.log 2>&1 || rc=$?
+          cat acceptance/response_budget.log
+          {
+            echo "### Response budget elision suite (exit $rc)"
+            echo ''
+            echo '```'
+            grep -E '^CHECK ' acceptance/response_budget.log || echo '(no CHECK line was printed)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error title=Response budget elision suite failed::exit $rc (1 FAIL, 2 UNREADABLE, 3 setup); see the CHECK lines above"
+          fi
+
+      # Always, including on a cancelled or timed-out run: the reports are how a
+      # failure is diagnosed without re-running the job.
+      - name: Upload the acceptance reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: acceptance-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          path: acceptance/
+          if-no-files-found: warn
+          retention-days: 14
+
+      # The gate is its own step so both suites run and both upload even when the
+      # first one fails, and it reads the reports rather than the exit codes.
+      # A suite's exit status is one lever with two settings, demand a clean
+      # sweep or demand nothing, and neither is right while one check is blocked
+      # on something outside the change under review. gate.py fails on any FAIL
+      # with no allowance possible, fails on any UNREADABLE that is not named
+      # here with a reason, and refuses an allowance that points at a check the
+      # report does not carry.
+      - name: Gate on the acceptance suites
+        if: always()
+        run: |
+          python3 scripts/acceptance/gate.py \
+            --report magic=acceptance/magic.json \
+            --report brownfield=acceptance/brownfield.json \
+            --report response_budget=acceptance/response_budget.json \
+            --allow-unreadable 'brownfield:4=FIR-2593: the express app.handle walk comes back truncated=True with clipped_steps=None on ubuntu-latest, so an absent edge cannot be told from a dropped one. Build profile, product code from 0.5.44 through 0.5.46, and the pinned language-server versions are all ruled out; platform and code newer than 0.5.46 are still confounded. The moment the check passes this allowance announces itself stale and can go.'

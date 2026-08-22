@@ -36,6 +36,11 @@ export const EVIDENCE_REF = 'release-evidence';
 export const PREFLIGHT_SCHEMA = 'kin.release-preflight.v1';
 export const PREFLIGHT_RECORD = 'preflight.json';
 export const STRANGER_RECORD = 'stranger.env';
+// The release train's version bump branch, and the ONLY branch whose head ever
+// carried proof records. It bounds the bridge below. release-train.yml declares
+// the same literal, and the authority suite pins the two together so they
+// cannot drift into a bridge that resolves somewhere nothing was ever proven.
+export const BUMP_BRANCH = 'automation/release-next';
 
 const COMMIT_SHA = /^[0-9a-f]{40}$/;
 const ARCHIVE_SHA = /^[0-9a-f]{64}$/;
@@ -211,10 +216,16 @@ export async function fetchEvidence(
     );
   }
   if (response.status === 404) {
-    throw new Error(
+    const absent = new Error(
       `${path} does not exist on the ${EVIDENCE_REF} branch of ${repository}; ` +
       'the proof loop has not recorded this candidate, so it cannot be released',
     );
+    // Absence is the one condition a caller may act on differently, and the
+    // flag is what keeps that decision from being a string match on a message.
+    // Unreadability deliberately carries no flag: "we could not tell" must
+    // never widen a search.
+    absent.evidenceAbsent = true;
+    throw absent;
   }
   if (!response.ok) {
     throw new Error(
@@ -225,13 +236,29 @@ export async function fetchEvidence(
   return response.text();
 }
 
-// A squash merge mints a new commit, so the sha a tag points at is never the
-// sha the proof loop judged. Preflight runs on the release branch head, and the
-// tag lands on the squash of that branch onto main: v0.5.44's tag commit
-// a4ffe620 is kin#986's squash, while the preflight for that line judged the
-// release-next head. Resolving the originating pull request's head is what
-// connects the two, and it is the only link that survives a squash, because the
-// squash shares no sha, no parent and no tree with the branch it flattened.
+// The bridge for tags cut before the candidate became a main commit.
+//
+// Under that older scheme the proof loop judged the release branch head and the
+// tag landed on the squash of that branch onto main, so the two never shared a
+// sha: v0.5.44's tag commit a4ffe620 is kin#986's squash, while the preflight
+// for that line judged the release-next head. Resolving the originating pull
+// request's head is the only link that survives a squash, because the squash
+// shares no sha, no parent and no tree with the branch it flattened.
+//
+// Tags cut after the rekey point at the candidate itself and never reach this
+// function, because their direct key resolves. Neither does a recovery re-run
+// of a pre-rekey tag, which is the reason this comment used to give and it was
+// wrong: a tag run resolves its workflows AND its scripts from the tag, so
+// re-running one executes that tag's own frozen release.yml and its own frozen
+// copy of this file. No edit here can reach it.
+//
+// What keeps the bridge is a rekeyed tag whose record went absent after the
+// fact. The evidence branch is append-only by construction and unprotected in
+// practice, so that is reachable, and the bound below turns it into a refusal
+// that names where the tag came from rather than only the file that was
+// missing. The promote gate compares the sha this returns against the sha it
+// is promoting, so a bridged answer can shape a refusal and can no longer
+// admit one.
 //
 // A commit with no originating pull request resolves to nothing and the caller
 // refuses it. That is the intended answer for a tag minted through a path the
@@ -270,14 +297,34 @@ export async function resolveCandidateSha(
     );
   }
   const pulls = await response.json();
-  const merged = (Array.isArray(pulls) ? pulls : []).filter(
+  const produced = (Array.isArray(pulls) ? pulls : []).filter(
     (pull) => pull?.merge_commit_sha === commitSha && COMMIT_SHA.test(pull?.head?.sha ?? ''),
   );
+  // Bounded to the bump branch. Under the current scheme the tagged commit is
+  // the candidate, so a tag reaching this function is one whose direct record
+  // was absent, and every ordinary main commit is the squash of some feature
+  // pull request whose head never carried a record. Without this bound the
+  // bridge would happily answer about that head, which is a promote gate
+  // looking somewhere nothing was ever proven. Checked against every tag this
+  // bridge exists for: v0.5.44, v0.5.45 and v0.5.46 each resolve through a
+  // pull request from this branch.
+  const merged = produced.filter((pull) => pull?.head?.ref === BUMP_BRANCH);
   if (merged.length === 0) {
+    if (produced.length === 0) {
+      throw new Error(
+        `no merged pull request produced ${commitSha}, so there is no candidate ` +
+        'branch head whose proof records could be found; a tag minted outside ' +
+        'the release train carries no evidence by construction',
+      );
+    }
+    const refs = [
+      ...new Set(produced.map((pull) => pull?.head?.ref ?? '<none>')),
+    ].join(', ');
     throw new Error(
-      `no merged pull request produced ${commitSha}, so there is no candidate ` +
-      'branch head whose proof records could be found; a tag minted outside ' +
-      'the release train carries no evidence by construction',
+      `${commitSha} was produced by a pull request from ${refs}, not from ` +
+      `${BUMP_BRANCH}; only the release train's bump branch ever carried proof ` +
+      'records, so bridging anywhere else would answer about a build nobody ' +
+      'proved',
     );
   }
   if (merged.length > 1) {
@@ -290,11 +337,58 @@ export async function resolveCandidateSha(
   return merged[0].head.sha;
 }
 
-// Two callers, one judge. CANDIDATE_SHA names the candidate directly, which is
-// what the release train has before it merges. RESOLVE_FROM_COMMIT names a
-// landed commit to bridge through its merged pull request, which is what the
-// promote gate has: by then the candidate has been squashed and its sha is
-// gone from history.
+// Find the candidate whose records this run is about, and read the first one.
+//
+// CANDIDATE_SHA names it directly, and that is what both live callers have: the
+// tag mint knows the main commit it selected, and the promote gate knows the
+// commit the tag points at, which under the current scheme is the same object.
+//
+// RESOLVE_FROM_COMMIT is the bridge to a pull request head, which is the only
+// link that survives a squash: a squash shares no sha, no parent and no tree
+// with the branch it flattened. It is not what recovers a tag cut before the
+// rekey, because such a run resolves its workflows and its scripts from the
+// tag and never reaches this file. It stays because a tag whose direct record
+// went absent should refuse by naming where it came from, and because the
+// promote gate refuses anyway unless the sha returned here is the sha it
+// promotes.
+//
+// Order matters and so does what may trigger it. The direct key is tried first,
+// and only an ABSENT record falls through to the bridge. An unreadable record,
+// a transport failure or a server error still fails closed right here, because
+// a check that widens its search when it cannot tell is a check that reports
+// success for the wrong reason.
+async function locateCandidate({ sha, resolveFromCommit, options, log }) {
+  if (sha) {
+    try {
+      return {
+        sha,
+        preflightText: await fetchEvidence(sha, PREFLIGHT_RECORD, options),
+      };
+    } catch (error) {
+      if (!error.evidenceAbsent || !resolveFromCommit) {
+        throw error;
+      }
+      log(
+        `No preflight record under ${sha}; bridging landed commit ` +
+        `${resolveFromCommit} through the pull request that produced it`,
+      );
+    }
+  }
+  if (!resolveFromCommit) {
+    throw new Error(
+      'no candidate given; set CANDIDATE_SHA, or RESOLVE_FROM_COMMIT to bridge ' +
+      'a landed commit through the pull request that produced it',
+    );
+  }
+  const bridged = await resolveCandidateSha(resolveFromCommit, options);
+  log(`Resolved candidate ${bridged} from landed commit ${resolveFromCommit}`);
+  return {
+    sha: bridged,
+    preflightText: await fetchEvidence(bridged, PREFLIGHT_RECORD, options),
+  };
+}
+
+// Two callers, one judge.
 export async function main({
   sha = process.env.CANDIDATE_SHA,
   resolveFromCommit = process.env.RESOLVE_FROM_COMMIT,
@@ -309,18 +403,14 @@ export async function main({
   const token = env.GH_TOKEN || env.GITHUB_TOKEN;
   const options = { repository, token, fetchImpl };
 
-  if (!sha && resolveFromCommit) {
-    sha = await resolveCandidateSha(resolveFromCommit, options);
-    log(`Resolved candidate ${sha} from landed commit ${resolveFromCommit}`);
-  }
-  if (!sha) {
-    throw new Error(
-      'no candidate given; set CANDIDATE_SHA, or RESOLVE_FROM_COMMIT to bridge ' +
-      'a landed commit through the pull request that produced it',
-    );
-  }
+  let preflightText;
+  ({ sha, preflightText } = await locateCandidate({
+    sha,
+    resolveFromCommit,
+    options,
+    log,
+  }));
 
-  const preflightText = await fetchEvidence(sha, PREFLIGHT_RECORD, options);
   let preflight;
   try {
     preflight = JSON.parse(preflightText);

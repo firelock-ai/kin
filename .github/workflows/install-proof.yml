@@ -51,12 +51,29 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     # The Windows leg runs the full unconditional proof and uploads its
-    # artifacts, but its verdict does not yet gate the release: the installed
-    # daemon on Windows serves queries without publishing .kin/daemon.port, so
-    # the endpoint-provenance step cannot pass there yet. The release authority
-    # suite pins this posture to exactly the windows-latest row; a blocking
-    # Windows leg returns by deleting the experimental flag here and the
-    # posture assertion there in the same change.
+    # artifacts, but its verdict does not yet gate the release. The reason has
+    # moved, and this comment is what carries it, so it is worth keeping
+    # current: a stale cause here sends whoever picks the work up next after a
+    # defect that is already fixed.
+    #
+    # It is no longer the daemon endpoint file. kin#811 measured that the
+    # installed Windows daemon does publish `.kin/daemon.port`, and that the
+    # step could not read it because a `tee` pipeline held a handle the daemon
+    # inherited, so the shell resumed at the moment shutdown removed the file.
+    # That is fixed and proven fixed on released bytes.
+    #
+    # What fails now is one step earlier and it fails on the released binary
+    # rather than on this workflow. `kin setup status --json` reported
+    # `projection_mode=misconfigured` on a host where nothing is recorded and
+    # no projection is in force, which is a mode the chooser named rather than
+    # one anybody picked. Every release from v0.5.44 through v0.5.47 died on
+    # that same line in the step below. The product fix is FIR-2460 and it can
+    # only reach this leg by riding a release, because the leg installs what
+    # the public installer serves.
+    #
+    # So the flag comes out once a release carries that fix and the leg is
+    # green against its own bytes, together with the posture assertion the
+    # release authority suite pins to exactly the windows-latest row.
     continue-on-error: ${{ matrix.experimental == true }}
     strategy:
       fail-fast: false
@@ -693,6 +710,13 @@ jobs:
             ["semantic_query_readiness", "unsupported"],
             ["daemon_running", "unsupported"],
             ["repo_init", "unsupported"],
+            // Nothing is recorded and nothing is in force on a fresh
+            // repo-free install, so the row has no configured projection to
+            // report on. Pinned rather than tolerated: `misconfigured` here
+            // was what failed this leg on every release from v0.5.44 through
+            // v0.5.47, and a pin is what makes the leg say so again the day it
+            // comes back rather than absorbing it.
+            ["projection_mode", "unsupported"],
             ["mcp_client_claude", "healthy"],
             ["mcp_client_cursor", "healthy"],
             ["mcp_client_gemini", "healthy"],
@@ -707,13 +731,23 @@ jobs:
             // own. Accept that single named reason and keep every other
             // degradation fatal, so a real regression in any other check still
             // fails this leg.
-            const onlyMissingRepositoryBlocks = report.checks.every(
+            // Work a correct install has not done yet, named as one check and
+            // one status. A public runner has never fetched the embedding
+            // model, so `embedding_model` reads `pending`, which is why the
+            // product's own readiness aggregate does not block on it either:
+            // it names expected first-run work rather than ground a working
+            // install lost. Tolerating it by name is the difference between a
+            // sweep that still fails when a second check goes pending and one
+            // that waves through every status it has never seen.
+            const firstRunPending = new Map([["embedding_model", "pending"]]);
+            const tolerated = report.checks.every(
               (check) =>
                 check.id === "repo_init" ||
                 check.status === "healthy" ||
-                check.status === "unsupported"
+                check.status === "unsupported" ||
+                firstRunPending.get(check.id) === check.status
             );
-            if (!onlyMissingRepositoryBlocks) {
+            if (!tolerated) {
               throw new Error(
                 `${reportPath}: overall healthy=${report.healthy}; non-healthy checks: ${nonHealthyChecks(report)}`
               );
