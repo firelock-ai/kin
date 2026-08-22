@@ -429,7 +429,15 @@ fn read_attempt_record(capture: &Path) -> (Option<InitAttemptRecord>, Option<Str
     }
 }
 
-/// Bytes a directory tree holds, counting regular files only.
+/// Disk a directory tree is holding, counting regular files only.
+///
+/// Allocated blocks where the platform publishes them, not the sum of file
+/// lengths. The two differ by a lot on exactly the tree this reports on: a
+/// content-addressed capture store is thousands of small bodies, each rounded
+/// up to a filesystem block, so a 600-commit fixture whose files sum to 2.2 MB
+/// occupies 14.2 MB by `du`. The operator's question is how much disk comes
+/// back, so the answer has to be the one `du` gives them rather than the one
+/// that understates it sixfold.
 ///
 /// Never follows a symlink and never fails: a size that could not be measured
 /// reads as the part that could. This is disclosure of disk usage at an IO
@@ -452,11 +460,34 @@ fn directory_bytes(root: &Path) -> u64 {
             if metadata.is_dir() {
                 stack.push(entry.path());
             } else if metadata.is_file() {
-                total = total.saturating_add(metadata.len());
+                total = total.saturating_add(occupied_bytes(&metadata));
             }
         }
     }
     total
+}
+
+/// Disk one file occupies.
+#[cfg(unix)]
+fn occupied_bytes(metadata: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt as _;
+
+    // `blocks()` is in 512-byte units by POSIX definition, whatever the
+    // filesystem's own block size is. A file the kernel reports zero blocks for
+    // is either empty or held entirely inline in its inode, and its length is
+    // the better answer there.
+    let allocated = metadata.blocks().saturating_mul(512);
+    if allocated == 0 {
+        metadata.len()
+    } else {
+        allocated
+    }
+}
+
+/// Disk one file occupies, where the platform publishes no allocation.
+#[cfg(not(unix))]
+fn occupied_bytes(metadata: &std::fs::Metadata) -> u64 {
+    metadata.len()
 }
 
 /// Render a byte count the way a person reads one.
@@ -1003,8 +1034,11 @@ mod tests {
         serde_json::to_value(record()).unwrap()
     }
 
+    /// The size has to be the disk a tree occupies, because that is the number
+    /// an operator is deciding about, and it must not walk out of the tree
+    /// through a symlink to get it.
     #[test]
-    fn a_directory_tree_is_sized_without_following_symlinks() {
+    fn a_directory_tree_is_sized_by_disk_without_following_symlinks() {
         let root = tempfile::tempdir().unwrap();
         let tree = root.path().join("tree");
         std::fs::create_dir(&tree).unwrap();
@@ -1012,7 +1046,22 @@ mod tests {
         let nested = tree.join("nested");
         std::fs::create_dir(&nested).unwrap();
         std::fs::write(nested.join("b"), vec![0_u8; 2000]).unwrap();
-        assert_eq!(directory_bytes(&tree), 3000);
+        let sized = directory_bytes(&tree);
+        assert!(
+            sized >= 3000,
+            "two files of 1000 and 2000 bytes occupy at least their own length, got {sized}"
+        );
+        // Both files sit far under one block, so on any ordinary filesystem the
+        // occupied size exceeds the 3000 bytes of content. Asserting the
+        // inequality rather than a constant stays true across block sizes while
+        // still failing a reader that went back to summing lengths, which would
+        // report exactly 3000.
+        #[cfg(unix)]
+        assert!(
+            sized > 3000,
+            "a tree of two sub-block files occupies more disk than their lengths sum to, got \
+             {sized}"
+        );
 
         let outside = root.path().join("outside");
         std::fs::write(&outside, vec![0_u8; 999_999]).unwrap();
@@ -1021,8 +1070,14 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(
             directory_bytes(&tree),
-            3000,
+            sized,
             "a symlink out of the tree must not be counted"
+        );
+
+        assert_eq!(
+            directory_bytes(&root.path().join("absent")),
+            0,
+            "a tree that is not there holds nothing, and asking must not fail"
         );
     }
 
@@ -1092,7 +1147,10 @@ mod tests {
         // The stage never survived the kill.
         let gone = &abandoned_init_attempts(root.path()).unwrap()[0];
         assert!(gone.stage_path.is_none(), "an absent stage is not named");
-        assert_eq!(gone.stage_bytes, 0);
+        assert_eq!(
+            gone.stage_bytes, 0,
+            "a stage that is not on disk holds nothing"
+        );
         assert!(gone.owner_path.is_none(), "no stage means no sidecar");
         assert_eq!(gone.paths().len(), 1);
         assert!(gone.reclaimable_bytes() >= 4096);
@@ -1102,7 +1160,11 @@ mod tests {
         std::fs::write(stage.join("body"), vec![0_u8; 2048]).unwrap();
         let bare = &abandoned_init_attempts(root.path()).unwrap()[0];
         assert_eq!(bare.stage_path.as_deref(), Some(stage.as_path()));
-        assert_eq!(bare.stage_bytes, 2048);
+        assert!(
+            bare.stage_bytes >= 2048,
+            "the stage's own disk must be counted, got {}",
+            bare.stage_bytes
+        );
         assert!(bare.owner_path.is_none(), "an absent sidecar is not named");
         assert_eq!(bare.paths().len(), 2);
 
