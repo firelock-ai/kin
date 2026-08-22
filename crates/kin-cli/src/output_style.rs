@@ -396,6 +396,9 @@ mod tests {
                 entity: "probe_symbol".to_string(),
                 kind: "all".to_string(),
             },
+            // This fixture asserts PAINTING, not absence honesty, and it holds
+            // references, so no verdict renders on either envelope.
+            &kin_mcp::Envelope::daemon(),
         )
         .unwrap()
         .lines

@@ -209,6 +209,18 @@ fn absence_subject(tool: &str) -> &'static str {
         // Walks OUTWARD from the focal, so its empty answer is an absence of
         // things this entity reaches rather than of things that reach it.
         "trace_data_flow" => "dependencies it did not see",
+        // Its rows ARE the reference edges, and it prints "References to 'X'",
+        // so the noun a reader is holding is references. The substrate's own
+        // spec subject agrees ("no references to the focal entity were found").
+        // Letting it fall through to `dependents` would answer a question about
+        // references with a claim about dependents, which is true of the same
+        // edges and is not the sentence the reader asked for.
+        "find_references" => "references it did not see",
+        // Traverses no edge at all: its seed is a name/kind filter over the
+        // entity index, so an empty candidate list means nothing MATCHED the
+        // seed rather than that nothing is unreachable. Naming dependents here
+        // would claim a reachability finding the scan never made.
+        "find_dead_code_seeded" => "seed matches it did not see",
         _ => "dependents",
     }
 }

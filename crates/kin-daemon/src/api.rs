@@ -3972,9 +3972,18 @@ async fn command_refs(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let response =
-        kin_cli::commands::refs::build_refs_response(&state.layout, graph.as_ref(), &request)
-            .map_err(internal_error)?;
+    // The same substrate reading the MCP path gets, for the same reason the
+    // impact route builds one (FIR-2524): only the daemon holds it, and a
+    // thinner envelope is the shortcut that makes the CLI MORE confident than
+    // MCP on exactly the degraded daemon nobody exercises.
+    let envelope = kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state));
+    let response = kin_cli::commands::refs::build_refs_response(
+        &state.layout,
+        graph.as_ref(),
+        &request,
+        &envelope,
+    )
+    .map_err(internal_error)?;
     Ok(Json(response))
 }
 

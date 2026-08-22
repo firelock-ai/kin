@@ -61,6 +61,19 @@ pub struct RefsRequest {
 pub struct RefsResponse {
     #[serde(default)]
     pub lines: Vec<String>,
+    /// The absence verdict for an empty answer, in the fields `find_references`
+    /// publishes over MCP.
+    ///
+    /// Rung three of FIR-2524, carrying the same contract
+    /// `ImpactResponse::negative` already carries. The text surface renders this
+    /// as a sentence and only when it refuses, because a person reading a
+    /// terminal does not need to be told an answer is fine. A machine caller
+    /// does: an empty reference list with no verdict beside it is a false clean
+    /// at exit 0, and it is the shape a "safe to delete?" sweep acts on. This is
+    /// the object the gate returned rather than a second opinion about it, so
+    /// the CLI and the MCP tool cannot disagree about one store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negative: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,6 +179,7 @@ pub fn build_refs_response(
     layout: &kin_core::KinLayout,
     graph: &kin_db::InMemoryGraph,
     request: &RefsRequest,
+    envelope: &kin_mcp::Envelope,
 ) -> Result<RefsResponse> {
     let relation_kinds = parse_relation_kinds(&request.kind)?;
     let target = if let Ok(uuid) = uuid::Uuid::parse_str(request.entity.trim()) {
@@ -174,8 +188,12 @@ pub fn build_refs_response(
         entity_ranking::select_best_entity(graph, &request.entity)?
     };
     let Some(target) = target else {
+        // Not an absence claim about references: the focal never resolved, so
+        // nothing was walked and there is no coverage question to answer. A
+        // verdict here would qualify a lookup failure as if it were a finding.
         return Ok(RefsResponse {
             lines: refs_not_found_guidance(&request.entity),
+            negative: None,
         });
     };
     let target = &target;
@@ -198,9 +216,16 @@ pub fn build_refs_response(
             "No incoming {} relations.",
             relation_kinds_label(&relation_kinds)
         ));
+        let negative = refs_absence_verdict(graph, target, &relation_kinds, envelope);
+        lines.extend(refs_absence_qualifier(
+            graph,
+            target,
+            &relation_kinds,
+            envelope,
+        ));
         let neighbors = declaration_neighbors::collect(graph, target, &relation_kinds)?;
         lines.extend(empty_result_context(target, &neighbors));
-        return Ok(RefsResponse { lines });
+        return Ok(RefsResponse { lines, negative });
     }
 
     // FIR-1552. A receiver-method call the linker matched on the bare leaf name
@@ -275,7 +300,18 @@ pub fn build_refs_response(
         }
     }
 
-    Ok(RefsResponse { lines })
+    // No verdict on this path, and that is decided rather than skipped. The walk
+    // returned rows, so there is no absence to qualify. That includes the
+    // all-candidates case above: a receiver-name candidate is a reference the
+    // graph does hold, disclosed on its own line with its own count (FIR-1552,
+    // FIR-2463), so the reader is already being told the answer is not a clean
+    // bill. Stamping a coverage verdict on a non-empty answer is the FIR-2404
+    // failure in its opposite costume, which this rollout's positive control
+    // exists to catch.
+    Ok(RefsResponse {
+        lines,
+        negative: None,
+    })
 }
 
 /// The reference sites of one entry, or the named reason it has none.
@@ -289,6 +325,85 @@ pub fn build_refs_response(
 /// list, using the same three names the MCP row carries under
 /// `reference_lines_absent_reason`, so the two surfaces can be compared word for
 /// word.
+/// The machine-readable absence verdict for an empty `kin refs` answer.
+///
+/// A second call to the same pure gate the rendered sentence goes through, for
+/// the reason `impact_absence_verdict` is: sharing an intermediate would put a
+/// wording change one edit away from changing what an agent is told.
+///
+/// Emitted whether or not the verdict refuses, unlike the sentence. Silence is a
+/// fine answer for a person and a missing field for a caller, and a missing
+/// field is the shape that reads as a clean bill.
+fn refs_absence_verdict(
+    graph: &kin_db::InMemoryGraph,
+    target: &Entity,
+    relation_kinds: &[RelationKind],
+    envelope: &kin_mcp::Envelope,
+) -> Option<serde_json::Value> {
+    kin_mcp::negative::negative_for(
+        "find_references",
+        &refs_absence_payload(graph, target, relation_kinds),
+        envelope,
+        &[],
+    )
+}
+
+/// The absence qualifier for an empty `kin refs` answer.
+///
+/// Thin on purpose: the observation is this command's own and the rendering is
+/// shared, because CLI surfaces answering absence questions differently is the
+/// defect rather than the implementation detail. See
+/// [`crate::commands::absence_qualifier`].
+fn refs_absence_qualifier(
+    graph: &kin_db::InMemoryGraph,
+    target: &Entity,
+    relation_kinds: &[RelationKind],
+    envelope: &kin_mcp::Envelope,
+) -> Vec<String> {
+    crate::commands::absence_qualifier::qualify(
+        "find_references",
+        &refs_absence_payload(graph, target, relation_kinds),
+        envelope,
+        "",
+    )
+}
+
+/// The observation `find_references`'s gate reads, scoped to the query this
+/// command actually ran.
+///
+/// The scope is the one thing this call site must get right, and it is what
+/// makes `find_references` different from the three tools rung one and rung two
+/// wired up. Those declare the fixed reference triple; this one is gated on the
+/// query's OWN `relation_kinds` (`kin_mcp::negative::absence_cross_file_classes`
+/// reads that key and only falls back to the triple when a payload does not
+/// report the scope it ran with). So `kin refs --kind calls` must be graded on
+/// calls coverage alone. Handing over the default triple instead would refuse on
+/// an absent class the query never asked about, and handing over nothing would
+/// let a narrow query inherit a verdict only the union earned.
+///
+/// The coverage observation is taken over the same kinds for the same reason:
+/// grading a walk against classes it did not traverse is the mismatch
+/// `IMPACT_REFERENCE_KINDS` warns about one level down.
+fn refs_absence_payload(
+    graph: &kin_db::InMemoryGraph,
+    target: &Entity,
+    relation_kinds: &[RelationKind],
+) -> serde_json::Value {
+    let coverage = kin_mcp::edge_coverage::observe_cross_file_reference_coverage_for_languages(
+        graph,
+        &[target.language],
+        relation_kinds,
+    );
+    serde_json::json!({
+        "references": [],
+        "relation_kinds": relation_kinds
+            .iter()
+            .map(|kind| relation_kind_label(*kind))
+            .collect::<Vec<_>>(),
+        kin_mcp::EDGE_COVERAGE_KEY: coverage,
+    })
+}
+
 fn reference_sites_label(entry: &ReferenceEntry) -> String {
     if entry.reference_lines.is_empty() {
         let reason = entry

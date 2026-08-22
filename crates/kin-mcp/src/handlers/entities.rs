@@ -2047,31 +2047,17 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     // `semantic_search` for the same string returned six. An ambiguity counter
     // pinned at one is worse than no counter: a reader who checks it is handed
     // an explicit assurance that there was nothing to disambiguate (FIR-2475).
-    let (same_name_candidates, other_candidates, matched_by) = match resolution_query.as_deref() {
-        Some(query) if addressed_by_name => {
-            let (count, others) = query_resolution_candidates(store, query, &target.id)?;
-            (count, others, "query_name_pattern")
-        }
-        // A pinned entity_id resolved nothing by name, so there is no query
-        // ambiguity to report. What still applies is the twin question: a name
-        // the graph holds twice (two cfg arms admitted as distinct entities)
-        // means an edge the extractor could not attribute sits on neither.
-        _ => {
-            let count = same_name_entity_count(store, &target.name)?;
-            (count, Vec::new(), "exact_focal_name")
-        }
-    };
-    result["focal_resolution"] = serde_json::json!({
-        "addressed_by": if addressed_by_name { "name" } else { "entity_id" },
-        "same_name_candidates": same_name_candidates,
-        // Which rule produced the number. Without it the same field means two
-        // different things depending on how the call was addressed, and a
-        // reader cannot tell which answer they are holding.
-        "matched": matched_by,
-        // A count alone says the tool guessed and leaves no way to ask again.
-        // These are addressable by id, bounded, and never include the winner.
-        "other_candidates": other_candidates,
-    });
+    let resolution = focal_resolution_for(
+        store,
+        target,
+        if addressed_by_name {
+            resolution_query.as_deref()
+        } else {
+            None
+        },
+    )?;
+    let same_name_candidates = resolution["same_name_candidates"].as_u64().unwrap_or(1);
+    result["focal_resolution"] = resolution;
     if addressed_by_name && same_name_candidates > 1 {
         let entry = serde_json::json!({
             "component": "focal_resolution",
@@ -4178,6 +4164,54 @@ fn query_resolution_candidates<G: GraphStore>(
         })
         .collect();
     Ok((count, others))
+}
+
+/// The `focal_resolution` block, for every surface that resolves a focal and
+/// then answers about it.
+///
+/// Public and shared because `kin_mcp::negative`'s `focal_resolution_gap`
+/// REFUSES any `find_references` absence whose payload does not carry a
+/// `same_name_candidates`, and a missing block is the refusing arm rather than
+/// an exemption. So a CLI surface routed through that gate has to publish this
+/// block, and the only safe way for it to do that is to call the producer the
+/// MCP handler calls. A second copy in `kin-cli` would let the two surfaces
+/// count ambiguity by different rules and disagree about one store, which is
+/// the drift FIR-2524 exists to end and would arrive by the door its own fix
+/// left open. Same reasoning that made `IMPACT_REFERENCE_KINDS` public.
+///
+/// `query` is the name the CALLER addressed, and `None` means the focal was
+/// pinned by id. Which one it is decides the counting rule, and FIR-2475 is what
+/// happens when the count is taken against the winner's own name instead.
+pub fn focal_resolution_for<G: GraphStore>(
+    store: &G,
+    target: &kin_model::Entity,
+    query: Option<&str>,
+) -> Result<serde_json::Value> {
+    let (same_name_candidates, other_candidates, matched_by) = match query {
+        Some(query) => {
+            let (count, others) = query_resolution_candidates(store, query, &target.id)?;
+            (count, others, "query_name_pattern")
+        }
+        // A pinned entity_id resolved nothing by name, so there is no query
+        // ambiguity to report. What still applies is the twin question: a name
+        // the graph holds twice (two cfg arms admitted as distinct entities)
+        // means an edge the extractor could not attribute sits on neither.
+        None => {
+            let count = same_name_entity_count(store, &target.name)?;
+            (count, Vec::new(), "exact_focal_name")
+        }
+    };
+    Ok(serde_json::json!({
+        "addressed_by": if query.is_some() { "name" } else { "entity_id" },
+        "same_name_candidates": same_name_candidates,
+        // Which rule produced the number. Without it the same field means two
+        // different things depending on how the call was addressed, and a
+        // reader cannot tell which answer they are holding.
+        "matched": matched_by,
+        // A count alone says the tool guessed and leaves no way to ask again.
+        // These are addressable by id, bounded, and never include the winner.
+        "other_candidates": other_candidates,
+    }))
 }
 
 fn same_name_entity_count<G: GraphStore>(store: &G, name: &str) -> Result<usize> {
