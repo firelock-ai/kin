@@ -537,11 +537,25 @@ pub fn enforce(
 ) -> Option<BudgetAccounting> {
     let shape = shape_for(tool)?;
     let chars_before = measure(payload);
+
+    // Two arms bound one response. The daemon's `/mcp/tools/call` route cuts
+    // first, under the budget less the envelope reserve, and the stdio path then
+    // envelopes what it gets back and cuts again. The second arm sees an already
+    // cut payload: it measures a size the first arm produced, usually finds
+    // nothing left to trim, and its accounting is the one that lands in `_kin`.
+    // So a response the budget had already cut to its floor reported
+    // `bounded: false`, which is FIR-2602's symptom reached by its second route.
+    //
+    // The accounting describes the response, not this pass over it. What the
+    // first arm did is readable off the payload it handed over, because a cut
+    // discloses itself, so this reads that record rather than inventing a
+    // channel to carry it.
+    let prior = prior_bound(payload);
     let mut accounting = BudgetAccounting {
         max_chars: budget.max_chars,
-        chars_before,
+        chars_before: chars_before.max(prior.unwrap_or(0)),
         chars_after: chars_before,
-        bounded: false,
+        bounded: prior.is_some(),
         compact: budget.compact,
     };
     run_ladder(payload, &shape, budget, &mut accounting);
@@ -570,6 +584,7 @@ fn run_ladder(
     budget: &ResponseBudget,
     accounting: &mut BudgetAccounting,
 ) {
+    let started_at = measure(payload);
     let mut cuts: Vec<String> = Vec::new();
     let mut remediations: Vec<String> = Vec::new();
 
@@ -619,7 +634,7 @@ fn run_ladder(
             ));
         }
         if measure(payload) <= target {
-            disclose(payload, budget, &cuts, &remediations);
+            disclose(payload, budget, started_at, &cuts, &remediations);
             return;
         }
     }
@@ -635,7 +650,7 @@ fn run_ladder(
             ));
         }
         if measure(payload) <= target {
-            disclose(payload, budget, &cuts, &remediations);
+            disclose(payload, budget, started_at, &cuts, &remediations);
             return;
         }
     }
@@ -651,7 +666,7 @@ fn run_ladder(
             remediations.push("read one body with get_entity_source".to_string());
         }
         if measure(payload) <= target {
-            disclose(payload, budget, &cuts, &remediations);
+            disclose(payload, budget, started_at, &cuts, &remediations);
             return;
         }
     }
@@ -702,11 +717,37 @@ fn run_ladder(
         }
     }
 
-    disclose(payload, budget, &cuts, &remediations);
+    disclose(payload, budget, started_at, &cuts, &remediations);
 }
+
+/// The reason code a response the budget cut carries.
+pub const BOUNDED_REASON: &str = "response_bounded";
 
 /// The reason code a response that stayed over its ceiling carries.
 pub const OVER_BUDGET_REASON: &str = "response_over_budget";
+
+/// What an earlier arm recorded cutting this payload from, if one did.
+///
+/// A cut discloses itself in the `degradations` channel, and the first such
+/// entry is the earliest arm's, because disclosures are appended. Reading it is
+/// what lets the second arm report the size the answer was built at instead of
+/// the size it inherited.
+fn prior_bound(payload: &Value) -> Option<usize> {
+    payload
+        .get("degradations")?
+        .as_array()?
+        .iter()
+        .find(|entry| {
+            entry.get("component").and_then(Value::as_str) == Some("response_budget")
+                && entry.get("reason").and_then(Value::as_str) == Some(BOUNDED_REASON)
+        })
+        .map(|entry| {
+            entry
+                .get("chars_before_budget")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize
+        })
+}
 
 /// Record that the ladder finished with the payload still over its ceiling.
 ///
@@ -735,11 +776,18 @@ fn disclose_residual(payload: &mut Value, budget: &ResponseBudget) {
                         limit accepts a larger payload",
         "max_chars": max_chars,
     });
+    // One note per response. Both arms can reach this, and two copies of the
+    // same sentence spend the budget they are complaining about.
     match payload
         .get_mut("degradations")
         .and_then(Value::as_array_mut)
     {
-        Some(existing) => existing.push(entry),
+        Some(existing) => {
+            existing.retain(|prior| {
+                prior.get("reason").and_then(Value::as_str) != Some(OVER_BUDGET_REASON)
+            });
+            existing.push(entry);
+        }
         None => payload["degradations"] = Value::Array(vec![entry]),
     }
 }
@@ -876,6 +924,7 @@ fn trim_collection(payload: &mut Value, key: &str, target: usize, min_keep: usiz
 fn disclose(
     payload: &mut Value,
     budget: &ResponseBudget,
+    chars_before: usize,
     cuts: &[String],
     remediations: &[String],
 ) {
@@ -903,10 +952,13 @@ fn disclose(
     ));
     let entry = json!({
         "component": "response_budget",
-        "reason": "response_bounded",
+        "reason": BOUNDED_REASON,
         "detail": format!("the response exceeded its {ceiling}, so {}", cuts.join("; ")),
         "remediation": remediation,
         "max_chars": max_chars,
+        // The size this arm started from, so the arm that cuts second can report
+        // what the answer was built at rather than what it inherited.
+        "chars_before_budget": chars_before,
     });
     match payload
         .get_mut("degradations")
@@ -1478,6 +1530,88 @@ mod tests {
                     .all(|entry| entry["reason"] != json!(OVER_BUDGET_REASON))),
             "a response that reached its ceiling must not claim it did not: {payload}"
         );
+    }
+
+    /// Two arms bound one response. The daemon's raw route cuts first and the
+    /// stdio path cuts again, and only the second arm's accounting reaches
+    /// `_kin.response`. Measured on the release binary at `max_chars: 2000`: the
+    /// first arm cut the report to its floor, the second found nothing left to
+    /// trim, and the response shipped `bounded: false` at 13,232 characters with
+    /// a fully populated `elisions` map sitting beside it.
+    ///
+    /// The accounting is about the response, not about one pass over it.
+    #[test]
+    fn a_second_pass_reports_the_cut_the_first_pass_made() {
+        const FIRST: usize = 6_000;
+        const SECOND: usize = 8_000;
+        let mut payload = impact_payload(40);
+        let built_at = measure(&payload);
+
+        let first = ResponseBudget {
+            max_chars: FIRST,
+            ..ResponseBudget::default()
+        };
+        let cut = enforce(&mut payload, "impact_analysis", &first).expect("budgeted");
+        assert!(
+            cut.bounded,
+            "the first arm must cut, or this proves nothing"
+        );
+        assert_eq!(cut.chars_before, built_at);
+
+        // The second arm's ceiling is looser than what the first already
+        // enforced, so it has nothing of its own to do. That is exactly the
+        // shape that reported a whole answer.
+        let second = ResponseBudget {
+            max_chars: SECOND,
+            ..ResponseBudget::default()
+        };
+        let again = enforce(&mut payload, "impact_analysis", &second).expect("budgeted");
+        assert!(
+            again.chars_after <= SECOND,
+            "the second arm found nothing to cut, or this proves nothing"
+        );
+        assert!(
+            again.bounded,
+            "a response the first arm cut cannot report itself whole: {payload}"
+        );
+        assert_eq!(
+            again.chars_before, built_at,
+            "the second arm must report the size the answer was built at, not the size \
+             it inherited"
+        );
+        assert!(
+            payload["elisions"]
+                .as_object()
+                .is_some_and(|map| !map.is_empty()),
+            "the cut the first arm disclosed must still be readable: {payload}"
+        );
+    }
+
+    /// A response still over its ceiling says so once, however many arms reach
+    /// that conclusion. Two copies of the same sentence spend the budget they
+    /// are complaining about, and the release binary published two.
+    #[test]
+    fn a_response_over_its_ceiling_says_so_once() {
+        const FLOOR: usize = RESPONSE_MIN_MAX_CHARS;
+        let budget = ResponseBudget {
+            max_chars: FLOOR,
+            ..ResponseBudget::default()
+        };
+        let mut payload = impact_payload_bulk_outside_the_buckets(60);
+        for pass in 0..3 {
+            let accounting = enforce(&mut payload, "impact_analysis", &budget).expect("budgeted");
+            assert!(
+                accounting.chars_after > FLOOR,
+                "pass {pass} must stay over the ceiling, or this proves nothing"
+            );
+            let notes = payload["degradations"]
+                .as_array()
+                .expect("a cut is disclosed")
+                .iter()
+                .filter(|entry| entry["reason"] == json!(OVER_BUDGET_REASON))
+                .count();
+            assert_eq!(notes, 1, "pass {pass} left {notes} copies: {payload}");
+        }
     }
 
     /// The elision half of the same case: the widened table must cut with counts
