@@ -22,6 +22,7 @@ import {
   probeBinaryVersion,
   ensureProvisioned,
   isTruthyEnv,
+  persistentPathAdvice,
 } from '../lib/provision.mjs';
 import { binaryName, readLauncherStamp, writeLauncherStamp } from '../lib/resolve.mjs';
 
@@ -813,4 +814,69 @@ test('KIN_LAUNCHER_ADOPT=1 forces the downgrade it would otherwise refuse', asyn
   assert.equal(result, path.join(binDir, kinName));
   assert.match(fs.readFileSync(result, 'utf8'), /9\.9\.9/);
   fs.rmSync(work, { recursive: true, force: true });
+});
+
+// FIR-2628. `npm install -g` dies with EACCES on a root-owned global prefix,
+// and the death happens inside npm before this package is unpacked, so nothing
+// here can intercept it. The recovery Kin can offer is the install that needs
+// no prefix at all, and this is the one moment its own code runs to say so.
+test('a first provision names the persistent no-root install when PATH cannot see it', async () => {
+  const { work, fetchImpl, platform, arch } = makeHostProvisionFixture();
+  const home = path.join(work, 'kin-home');
+  const lines = [];
+  await provision('9.9.9', {
+    env: { KIN_HOME: home, PATH: '/usr/bin:/bin' },
+    platform,
+    arch,
+    fetchImpl,
+    log: (line) => lines.push(line),
+  });
+  const said = lines.join('\n');
+  const binDir = path.join(home, 'bin');
+
+  // Positive control: the install line itself must be there, or this test is
+  // asserting about a provision that never ran.
+  assert.match(said, /managed kin 9\.9\.9 installed at/);
+
+  assert.ok(said.includes(binDir), `the advice must name the directory: ${said}`);
+  assert.match(said, /export PATH=/);
+  assert.match(said, /needs no root and no writable npm prefix/);
+  assert.match(said, /kin setup/);
+  fs.rmSync(work, { recursive: true, force: true });
+});
+
+test('a provision into a directory already on PATH says nothing extra', async () => {
+  const { work, fetchImpl, platform, arch } = makeHostProvisionFixture();
+  const home = path.join(work, 'kin-home');
+  const binDir = path.join(home, 'bin');
+  const lines = [];
+  await provision('9.9.9', {
+    env: { KIN_HOME: home, PATH: `/usr/bin${path.delimiter}${binDir}` },
+    platform,
+    arch,
+    fetchImpl,
+    log: (line) => lines.push(line),
+  });
+  const said = lines.join('\n');
+  assert.match(said, /managed kin 9\.9\.9 installed at/);
+  assert.equal(/export PATH=/.test(said), false, `no advice was needed: ${said}`);
+  fs.rmSync(work, { recursive: true, force: true });
+});
+
+test('persistentPathAdvice compares resolved paths, not spellings', () => {
+  const dir = path.join(os.tmpdir(), 'kin-advice-fixture', 'bin');
+  assert.deepEqual(persistentPathAdvice(dir, { PATH: dir }), []);
+  assert.deepEqual(
+    persistentPathAdvice(dir, { PATH: path.join(dir, '..', 'bin') }),
+    [],
+    'a path that resolves to the same directory is the same directory',
+  );
+  assert.ok(
+    persistentPathAdvice(dir, { PATH: '/usr/bin' }).length > 0,
+    'a PATH that does not carry it must produce advice',
+  );
+  assert.ok(
+    persistentPathAdvice(dir, {}).length > 0,
+    'an absent PATH is not evidence the directory is reachable',
+  );
 });

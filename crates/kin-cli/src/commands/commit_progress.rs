@@ -373,6 +373,49 @@ pub const COMMIT_LONG_ABOUT: &str = concat!(
 mod tests {
     use super::*;
 
+    /// The CLI reference carries the same sentence the binary prints.
+    ///
+    /// `docs/cli-reference.md` is written by hand from the clap definitions,
+    /// and its own header says nothing fails the build when the two drift. For
+    /// one sentence that is not good enough: FIR-2627 exists because a fact
+    /// lived on exactly one surface, and a doc page that quotes it and then
+    /// stops matching would rebuild the same defect on a page nobody re-reads.
+    ///
+    /// Falsify by editing either the constant or the quoted line in the page:
+    /// the two stop matching and this fails.
+    #[test]
+    fn the_cli_reference_quotes_the_commit_authority_line_verbatim() {
+        let page = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/cli-reference.md");
+        let text = std::fs::read_to_string(&page)
+            .unwrap_or_else(|error| panic!("{} must be readable: {error}", page.display()));
+
+        // Positive control first: a page that failed to read, or one whose
+        // commit section was renamed, would otherwise be indistinguishable
+        // from a page that dropped the sentence.
+        assert!(
+            text.contains("### `kin commit`"),
+            "the commit section must exist, or this test asserts about nothing"
+        );
+
+        let flat_page = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let flat_note = AUTHORITY_NOT_GIT_NOTE
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            flat_page.contains(&flat_note),
+            "docs/cli-reference.md must quote the commit-time authority line verbatim"
+        );
+
+        // Falsification: a phrase never written must be absent, so a
+        // `contains` that matches anything cannot be what passed above.
+        assert!(
+            !flat_page.contains("Recorded in git authority"),
+            "the check must be able to fail"
+        );
+    }
+
     const GIB: u64 = 1024 * 1024 * 1024;
 
     fn evidence(limit_bytes: u64, oom_kills: Option<u64>) -> crate::capability::MemoryEvidence {

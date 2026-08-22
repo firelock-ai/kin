@@ -1001,6 +1001,129 @@ mod tests {
         assert!(joined.contains("npm install -g pyright"), "{joined}");
     }
 
+    /// A proxied network gets the environment named, not "run it yourself".
+    ///
+    /// The container the npm0549 stranger worked in reached the registry
+    /// through a proxy, and `kin doctor --fix --install-language-servers` came
+    /// back with four failures whose only advice was to run the same command
+    /// again by hand (FIR-2629). The command was never the problem, so the
+    /// advice could not work: what an operator needs is the suspicion that the
+    /// environment is the cause, the variables their installer actually reads,
+    /// and the size of what they lose by stopping here.
+    ///
+    /// Falsify by deleting the `network_shape` branch in
+    /// `install_failure_remediation`: the reason falls through to the generic
+    /// line and every assertion below fails.
+    #[test]
+    fn a_network_failure_names_the_environment_the_proxy_vars_and_what_still_works() {
+        let recipe = recipe_for(LanguageId::Python).expect("python must have a recipe");
+        let lines = install_failure_remediation(
+            recipe,
+            "`npm install -g pyright` exited with 1: npm error code ECONNREFUSED; npm error \
+             network request to https://registry.npmjs.org/pyright failed, reason: connect \
+             ECONNREFUSED 127.0.0.1:443",
+        );
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("the network refusing"),
+            "the cause must be attributed to the environment: {joined}"
+        );
+        assert!(
+            joined.contains("HTTPS_PROXY") && joined.contains("NO_PROXY"),
+            "the variables that would route it must be named: {joined}"
+        );
+        assert!(
+            joined.contains("npm config set https-proxy"),
+            "npm reads its own config as well as the environment: {joined}"
+        );
+        assert!(
+            joined.contains("NODE_EXTRA_CA_CERTS"),
+            "a proxy that re-signs TLS needs its bundle named: {joined}"
+        );
+        assert!(
+            joined.contains("Kin runs without this server"),
+            "the degraded mode must be stated, not left to be guessed: {joined}"
+        );
+
+        // Falsification control. A permission remedy here would mean the two
+        // classifiers cannot tell their own cases apart.
+        assert!(
+            !joined.contains("npm config set prefix"),
+            "a network failure must not be handed the permission remedy: {joined}"
+        );
+        assert!(!joined.contains("sudo"), "{joined}");
+    }
+
+    /// Each network shape is named as its own fix, and nothing else matches.
+    ///
+    /// Three shapes because they are three different repairs, and a classifier
+    /// that collapsed them would send a TLS interception to a routing fix. The
+    /// negative cases are the point: a 404, an EACCES and a compiler error must
+    /// all read as not-the-network, or the diagnosis is decoration.
+    #[test]
+    fn the_network_classifier_separates_its_three_shapes_and_refuses_everything_else() {
+        let unreachable = network_shape("npm error network request to https://r/x failed")
+            .expect("an unrouted network must classify");
+        assert!(unreachable.contains("never completed"), "{unreachable}");
+
+        let tls = network_shape(
+            "npm error code SELF_SIGNED_CERT_IN_CHAIN; npm error self signed certificate in \
+             certificate chain",
+        )
+        .expect("an intercepted TLS handshake must classify");
+        assert!(tls.contains("TLS certificate"), "{tls}");
+
+        let refused = network_shape("npm error code E403; npm error 403 Forbidden - GET https://r/x")
+            .expect("a middlebox refusal must classify");
+        assert!(refused.contains("answered and refused"), "{refused}");
+
+        assert_eq!(
+            network_shape("npm error code E404; npm error 404 Not Found - GET https://r/x"),
+            None,
+            "a package that does not exist is not a network failure"
+        );
+        assert_eq!(
+            network_shape(
+                "npm error code EACCES; npm error Error: EACCES: permission denied, mkdir \
+                 '/usr/local/lib/node_modules/pyright'"
+            ),
+            None,
+            "a permission failure must keep its own remedy"
+        );
+        assert_eq!(
+            network_shape("error: could not compile `pyright`"),
+            None,
+            "an unrelated failure must not be dressed as a proxy problem"
+        );
+    }
+
+    /// rustup and npm are told about different variables.
+    ///
+    /// rustup reads only the lowercase environment spellings and takes its
+    /// certificate bundle from the OS store, so quoting npm's config keys at a
+    /// rustup failure is advice that does nothing. One blanket list would be
+    /// wrong for whichever half read it second.
+    #[test]
+    fn the_proxy_advice_matches_the_installer_that_failed() {
+        let rust = recipe_for(LanguageId::Rust).expect("rust must have a recipe");
+        let lines = install_failure_remediation(
+            rust,
+            "`rustup component add rust-analyzer` exited with 1: error: could not download file \
+             from 'https://static.rust-lang.org/x': ETIMEDOUT",
+        );
+        let joined = lines.join("\n");
+        assert!(joined.contains("https_proxy"), "{joined}");
+        assert!(
+            !joined.contains("npm config set"),
+            "rustup does not read npm config: {joined}"
+        );
+        assert!(
+            !joined.contains("NODE_EXTRA_CA_CERTS"),
+            "rustup does not read Node's certificate variable: {joined}"
+        );
+        assert!(joined.contains("Kin runs without this server"), "{joined}");
+    }
+
     /// The failure reason has to carry the installer's own words.
     ///
     /// An exit code alone is what sent the reader of the run this came from

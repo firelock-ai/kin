@@ -410,6 +410,43 @@ function archiveExtraction(platform, env, file) {
  * managed `kin` path. Mirrors scripts/install.sh: kin + kin-daemon are
  * mandatory, kin-vfs and the projection shim library are optional extras.
  */
+/**
+ * What to tell someone whose managed binaries landed where PATH does not look.
+ *
+ * `npm install -g` fails with EACCES on any machine whose global prefix is
+ * root-owned, and the failure happens inside npm before a single byte of this
+ * package is unpacked, so no postinstall and no launcher code can catch it
+ * (FIR-2628). The recovery Kin CAN offer is the one that needs neither root nor
+ * a writable prefix: `npx` provisions the same native binaries into <KIN_HOME>/bin,
+ * and that install is persistent. The npm0549 stranger dismissed npx as "not a
+ * persistent install" and went looking for root instead, which is the gap this
+ * closes at the one moment Kin's own code is running.
+ *
+ * Returns no lines when the directory is already on PATH, because a healthy
+ * global install does not need advice about a wall it did not hit.
+ */
+export function persistentPathAdvice(binDir, env = process.env, delimiter = path.delimiter) {
+  const wanted = path.resolve(binDir);
+  const onPath = String(env.PATH ?? '')
+    .split(delimiter)
+    .filter(Boolean)
+    .some((entry) => {
+      try {
+        return path.resolve(entry) === wanted;
+      } catch {
+        return false;
+      }
+    });
+  if (onPath) return [];
+  return [
+    `kin: ${binDir} is not on your PATH.`,
+    'kin: that directory needs no root and no writable npm prefix, so putting it on PATH is a',
+    'kin: persistent install on a machine where `npm install -g` is refused:',
+    `kin:     export PATH="${binDir}:$PATH"`,
+    'kin: or run `kin setup`, which writes that line into your shell profile.',
+  ];
+}
+
 export async function provision(version, opts = {}) {
   const {
     env = process.env,
@@ -511,6 +548,9 @@ export async function provision(version, opts = {}) {
 
     writeLauncherStamp(version, env);
     log(`kin: managed kin ${version} installed at ${binDir}`);
+    for (const line of persistentPathAdvice(binDir, mergeEnvironment(process.env, env))) {
+      log(line);
+    }
     return path.join(binDir, binaryName('kin', platform));
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });

@@ -40,7 +40,8 @@ documented below.
 ## If the global install is refused
 
 On a machine whose global npm prefix is root-owned, and where you are not root and have no
-`sudo`, that first line fails before Kin runs:
+`sudo`, `npm install -g` fails before Kin runs. This is why the install at the top of this
+page leads with `npx`, which never touches that prefix:
 
 ```
 npm error code EACCES
@@ -49,9 +50,12 @@ npm error path /usr/local/lib/node_modules/@kinlab
 npm error Error: EACCES: permission denied, mkdir '/usr/local/lib/node_modules/@kinlab'
 ```
 
-Containers whose default user is not root are the common case. Two ways out. The
-zero-install path above needs no writable prefix and is the shorter one. Or move the prefix
-somewhere you own, and put it on your `PATH`:
+npm fails here before it unpacks anything, so no Kin code has run and nothing in this
+package can catch it or print a fix. Containers whose default user is not root are the
+common case. Two ways out. The `npx` path at the top of this page needs no writable prefix
+and installs the same native binaries under `~/.kin/bin`, which is why it is the default
+rather than a fallback. Or move the npm prefix somewhere you own, and put it on your
+`PATH`:
 
 ```sh
 npm config set prefix ~/.npm-global
