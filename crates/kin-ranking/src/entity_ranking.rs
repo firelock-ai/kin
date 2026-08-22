@@ -491,6 +491,7 @@ fn trace_role_rank(role: &EntityRole) -> usize {
 /// The comparable relevance key for one fan-out candidate. Higher is kept.
 pub type TraceFanoutScore = (
     bool,
+    bool,
     usize,
     usize,
     bool,
@@ -507,13 +508,25 @@ pub type TraceFanoutScore = (
 /// Compared as a tuple, most significant first:
 /// 1. the graph holds a location for it (a file-less placeholder never takes a
 ///    slot from a symbol a caller can open)
-/// 2. role rank (source over test; see [`trace_role_rank`])
-/// 3. relation rank (Calls over Imports over References)
-/// 4. declared in the same FILE as the node being expanded
-/// 5. declared in the same DIRECTORY as it
-/// 6. declaration kind rank (functions and methods over constants)
-/// 7. the edge's own confidence
-/// 8. shorter name, which only ever breaks a tie the seven signals above left
+/// 2. NOT a `raise` target (see below)
+/// 3. role rank (source over test; see [`trace_role_rank`])
+/// 4. relation rank (Calls over Imports over References)
+/// 5. declared in the same FILE as the node being expanded
+/// 6. declared in the same DIRECTORY as it
+/// 7. declaration kind rank (functions and methods over constants)
+/// 8. the edge's own confidence
+/// 9. shorter name, which only ever breaks a tie the eight signals above left
+///
+/// The raise-target signal sits second, ABOVE locality, because locality is
+/// what let it go wrong: exception classes commonly live beside the code that
+/// throws them, so same-file and same-directory both favour them over the
+/// callee that carries the value onward. Measured on a converted `psf/requests`
+/// by a stranger: nine of the twelve depth-1 slots on `HTTPAdapter.send` went
+/// to `SSLError`, `InvalidURL`, `ProxyError`, `RetryError`, `ReadTimeout` and
+/// `InvalidHeader`, and the hop governing connection reuse was not in the
+/// answer at all. It demotes rather than filters, because "what does this
+/// throw" is a real question and the edge is real evidence; a step wide enough
+/// to hold them still reports them, just last.
 ///
 /// `parent_file` and `parent_dir` describe the node whose fan-out is being cut,
 /// not the focal: locality is what makes a chain readable, and at depth 3 the
@@ -527,6 +540,7 @@ pub fn trace_fanout_score(
     parent_file: Option<&str>,
     parent_dir: Option<&str>,
     confidence: f32,
+    raise_target: bool,
 ) -> TraceFanoutScore {
     let same_file = parent_file
         .zip(entity.file_origin.as_ref())
@@ -542,6 +556,7 @@ pub fn trace_fanout_score(
     let confidence = (confidence.clamp(0.0, 1.0) * 1000.0).round() as u32;
     (
         !trace_entity_is_external(entity),
+        !raise_target,
         trace_role_rank(&entity.role),
         trace_relation_rank(relation_kind),
         same_file,

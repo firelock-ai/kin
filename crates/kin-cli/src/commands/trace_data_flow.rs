@@ -377,6 +377,11 @@ pub struct TraceEntityRecord {
     /// Whether the span that cut `body` was proven to describe those exact bytes.
     /// Null whenever no body was served, since the pairing is what it describes.
     pub span_coherence: Option<String>,
+    /// Where the in-repo graph ends, for a step sitting on the boundary.
+    /// Present on exactly the records `external` is true for; a step the
+    /// repository owns crosses nothing and carries none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crossing: Option<kin_index::TraceCrossing>,
 }
 
 /// One step in the data-flow chain.
@@ -749,7 +754,7 @@ pub fn build_trace_data_flow_response_within(
     let focal_record = bodies_included
         .then(|| source_record_or_none(projection.as_ref(), &focal_entity))
         .flatten();
-    let focal_entity_record = entity_record(&focal_entity, focal_record.as_ref());
+    let focal_entity_record = entity_record(&focal_entity, focal_record.as_ref(), None);
 
     // The kinds a data-flow claim actually rests on.
     let reference_kinds = [
@@ -912,6 +917,25 @@ pub fn build_trace_data_flow_response_within(
                             candidate.confidence = rel.confidence;
                             candidate.resolution = RelationResolution::of(rel);
                         }
+                        // These two fold across EVERY edge rather than moving
+                        // with the strongest one. A class reached by a `raise`
+                        // and also by an ordinary call is on the data path, and
+                        // a boundary one edge can name stays named when a
+                        // weaker anonymous edge arrives beside it.
+                        candidate.raise_target =
+                            candidate.raise_target && kin_index::is_raise_target_edge(rel);
+                        if candidate
+                            .crossing
+                            .as_ref()
+                            .is_none_or(|crossing| crossing.specifier.is_none())
+                        {
+                            if let Some(named) =
+                                kin_index::trace_crossing_for(&candidate.entity, Some(rel))
+                                    .filter(|crossing| crossing.specifier.is_some())
+                            {
+                                candidate.crossing = Some(named);
+                            }
+                        }
                     }
                     None => {
                         let Some(entity) = graph
@@ -921,12 +945,15 @@ pub fn build_trace_data_flow_response_within(
                             continue;
                         };
                         candidate_index.insert((next_id, role), candidates.len());
+                        let crossing = kin_index::trace_crossing_for(&entity, Some(rel));
                         candidates.push(FanoutCandidate {
+                            raise_target: kin_index::is_raise_target_edge(rel),
                             entity,
                             role,
                             relation_kind: rel.kind,
                             confidence: rel.confidence,
                             resolution: RelationResolution::of(rel),
+                            crossing,
                         });
                     }
                 }
@@ -1009,7 +1036,11 @@ pub fn build_trace_data_flow_response_within(
                             .then(|| source_record_or_none(projection.as_ref(), &candidate.entity))
                             .flatten();
                         let promoted = &mut chain[existing - 1];
-                        promoted.entity = entity_record(&candidate.entity, source.as_ref());
+                        promoted.entity = entity_record(
+                            &candidate.entity,
+                            source.as_ref(),
+                            candidate.crossing.clone(),
+                        );
                         // A promoted record is located by construction, so the
                         // external boundary no longer applies to it; the edge
                         // that reached it is unchanged, so the annotation one
@@ -1070,7 +1101,11 @@ pub fn build_trace_data_flow_response_within(
                     resolution: candidate.resolution.as_str().to_string(),
                     parent_step: node.step,
                     depth: next_depth,
-                    entity: entity_record(&candidate.entity, source.as_ref()),
+                    entity: entity_record(
+                        &candidate.entity,
+                        source.as_ref(),
+                        candidate.crossing.clone(),
+                    ),
                     fanout_truncated: false,
                     fanout_dropped: 0,
                     terminal: terminal.map(|terminal| terminal.as_str().to_string()),
@@ -1367,6 +1402,15 @@ struct FanoutCandidate {
     /// the same neighbor replaces them, so the step reports what the edge it
     /// names actually proved.
     resolution: RelationResolution,
+    /// Where the in-repo graph ends, when this candidate sits on the boundary.
+    /// Read off the edge that reached it, because the edge is where the module
+    /// pin and the receiver text live; the entity carries only identity.
+    crossing: Option<kin_index::TraceCrossing>,
+    /// Every edge into this candidate was the operand of a `raise`, so it is a
+    /// throw site rather than a hop a value travels along. False as soon as one
+    /// ordinary call reaches it: a class that is both raised and constructed is
+    /// on the data path.
+    raise_target: bool,
 }
 
 /// Order one side of a node's fan-out by relevance, most relevant first.
@@ -1382,6 +1426,7 @@ fn sort_by_relevance(candidates: &mut [FanoutCandidate], node: &FrontierNode) {
             node.file.as_deref(),
             node.dir.as_deref(),
             left.confidence,
+            left.raise_target,
         );
         let right_score = kin_ranking::entity_ranking::trace_fanout_score(
             &right.entity,
@@ -1389,6 +1434,7 @@ fn sort_by_relevance(candidates: &mut [FanoutCandidate], node: &FrontierNode) {
             node.file.as_deref(),
             node.dir.as_deref(),
             right.confidence,
+            right.raise_target,
         );
         right_score
             .cmp(&left_score)
@@ -1403,7 +1449,11 @@ fn sort_by_relevance(candidates: &mut [FanoutCandidate], node: &FrontierNode) {
 /// entirely for a shape query). When it is absent the span still comes from the
 /// entity's own graph span, because a caller asking for the shape of a chain
 /// still needs to know where each step lives.
-fn entity_record(entity: &Entity, source: Option<&GraphSourceRecord>) -> TraceEntityRecord {
+fn entity_record(
+    entity: &Entity,
+    source: Option<&GraphSourceRecord>,
+    crossing: Option<kin_index::TraceCrossing>,
+) -> TraceEntityRecord {
     let (start_line, end_line) = match (source, entity.span.as_ref()) {
         (Some(record), _) => (Some(record.start_line), Some(record.end_line)),
         (None, Some(span)) => {
@@ -1424,6 +1474,7 @@ fn entity_record(entity: &Entity, source: Option<&GraphSourceRecord>) -> TraceEn
         signature: (!entity.signature.is_empty()).then(|| entity.signature.clone()),
         body: source.map(|record| record.body.clone()),
         span_coherence: source.map(|record| record.span_coherence.clone()),
+        crossing,
     }
 }
 
@@ -2468,7 +2519,7 @@ mod tests {
         let mut chain = Vec::new();
         for index in 1..=steps {
             let step_entity = make_entity(&format!("step_{index}"), "src/step.rs");
-            let mut record = entity_record(&step_entity, None);
+            let mut record = entity_record(&step_entity, None, None);
             record.body = Some("x".repeat(body_chars));
             record.span_coherence = Some("verified".to_string());
             chain.push(TraceStep {
@@ -2490,7 +2541,7 @@ mod tests {
             focal_name: entity.name.clone(),
             focal_kind: "Function".to_string(),
             focal_file: Some("src/focal.rs".to_string()),
-            focal_entity: entity_record(&entity, None),
+            focal_entity: entity_record(&entity, None, None),
             direction: "calls".to_string(),
             depth: 1,
             limit_per_step: 25,

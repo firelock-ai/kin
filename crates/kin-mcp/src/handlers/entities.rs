@@ -3373,6 +3373,10 @@ struct TraceFanoutCandidate {
     role: &'static str,
     relation_kind: RelationKind,
     confidence: f32,
+    /// Where the in-repo graph ends, when this candidate sits on the boundary.
+    crossing: Option<kin_index::TraceCrossing>,
+    /// Every edge into this candidate was the operand of a `raise`.
+    raise_target: bool,
     /// Classification of the edge this candidate is currently described by.
     /// It moves with `relation_kind` and `confidence` when a stronger edge to
     /// the same neighbor replaces them, so the step reports what the edge it
@@ -3390,6 +3394,7 @@ fn sort_trace_candidates(candidates: &mut [TraceFanoutCandidate], node: &TraceFr
             node.file.as_deref(),
             node.dir.as_deref(),
             left.confidence,
+            left.raise_target,
         );
         let right_score = trace_fanout_score(
             &right.entity,
@@ -3397,6 +3402,7 @@ fn sort_trace_candidates(candidates: &mut [TraceFanoutCandidate], node: &TraceFr
             node.file.as_deref(),
             node.dir.as_deref(),
             right.confidence,
+            right.raise_target,
         );
         right_score
             .cmp(&left_score)
@@ -3413,7 +3419,10 @@ fn sort_trace_candidates(candidates: &mut [TraceFanoutCandidate], node: &TraceFr
 /// This arm serves no bodies — it answers from a generic graph store with no
 /// repository authority to project source through — so `body` is null on every
 /// record here and `bodies_included` on the response says so.
-fn trace_entity_value(entity: &kin_model::entity::Entity) -> serde_json::Value {
+fn trace_entity_value(
+    entity: &kin_model::entity::Entity,
+    crossing: Option<&kin_index::TraceCrossing>,
+) -> serde_json::Value {
     let (start_line, end_line) = match entity.span.as_ref() {
         Some(span) => {
             let (start, end) = presentation_span_lines(span);
@@ -3433,6 +3442,7 @@ fn trace_entity_value(entity: &kin_model::entity::Entity) -> serde_json::Value {
         "signature": (!entity.signature.is_empty()).then(|| entity.signature.clone()),
         "body": serde_json::Value::Null,
         "span_coherence": serde_json::Value::Null,
+        "crossing": crossing,
     })
 }
 
@@ -3447,6 +3457,7 @@ fn trace_step_value(
     depth: usize,
     entity: &kin_model::entity::Entity,
     terminal: Option<TraceTerminal>,
+    crossing: Option<&kin_index::TraceCrossing>,
 ) -> serde_json::Value {
     let mut value = serde_json::json!({
         "step": step,
@@ -3466,7 +3477,7 @@ fn trace_step_value(
         // broke a consumer's parser twice.
         "terminal": terminal.map(TraceTerminal::as_str),
     });
-    let record = trace_entity_value(entity);
+    let record = trace_entity_value(entity, crossing);
     if let (Some(target), Some(source)) = (value.as_object_mut(), record.as_object()) {
         for (key, entry) in source {
             target.insert(key.clone(), entry.clone());
@@ -3746,6 +3757,22 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                             candidate.confidence = rel.confidence;
                             candidate.resolution = RelationResolution::of(rel);
                         }
+                        // Folded across every edge, not moved with the
+                        // strongest one; mirrors the CLI arm exactly.
+                        candidate.raise_target =
+                            candidate.raise_target && kin_index::is_raise_target_edge(rel);
+                        if candidate
+                            .crossing
+                            .as_ref()
+                            .is_none_or(|crossing| crossing.specifier.is_none())
+                        {
+                            if let Some(named) =
+                                kin_index::trace_crossing_for(&candidate.entity, Some(rel))
+                                    .filter(|crossing| crossing.specifier.is_some())
+                            {
+                                candidate.crossing = Some(named);
+                            }
+                        }
                     }
                     None => {
                         let Some(entity) = store.get_entity(&next_id).map_err(McpError::graph)?
@@ -3753,12 +3780,15 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                             continue;
                         };
                         candidate_index.insert((next_id, role), candidates.len());
+                        let crossing = kin_index::trace_crossing_for(&entity, Some(rel));
                         candidates.push(TraceFanoutCandidate {
+                            raise_target: kin_index::is_raise_target_edge(rel),
                             entity,
                             role,
                             relation_kind: rel.kind,
                             confidence: rel.confidence,
                             resolution: RelationResolution::of(rel),
+                            crossing,
                         });
                     }
                 }
@@ -3853,6 +3883,7 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                             promoted_depth,
                             &candidate.entity,
                             promoted_terminal,
+                            candidate.crossing.as_ref(),
                         );
                         chain[existing - 1] = promoted;
                         // The record that replaced the placeholder brings its
@@ -3895,6 +3926,7 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                     next_depth,
                     &candidate.entity,
                     terminal,
+                    candidate.crossing.as_ref(),
                 ));
                 step_language.insert(step_index, candidate.entity.language);
                 if terminal.is_none() && next_depth < depth {
@@ -4018,7 +4050,7 @@ pub fn handle_trace_data_flow<G: GraphStore>(
         "focal_name": focal_entity.name.clone(),
         "focal_kind": format!("{:?}", focal_entity.kind),
         "focal_file": focal_entity.file_origin.as_ref().map(|p| p.to_string()),
-        "focal_entity": trace_entity_value(&focal_entity),
+        "focal_entity": trace_entity_value(&focal_entity, None),
         "direction": direction,
         "depth": depth,
         "limit_per_step": limit_per_step,
