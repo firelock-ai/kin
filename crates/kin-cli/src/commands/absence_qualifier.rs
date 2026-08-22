@@ -129,9 +129,7 @@ pub fn qualify(
             // `focal_resolution_gap` already distinguishes two ways one level
             // down.
             None => match limiting_factor(&negative) {
-                Some(factor) => format!(
-                    "{indent}Kin cannot rule out {subject}: {factor}."
-                ),
+                Some(factor) => format!("{indent}Kin cannot rule out {subject}: {factor}."),
                 None => format!(
                     "{indent}Kin cannot rule out {subject}: this answer's coverage could not be \
                      established."

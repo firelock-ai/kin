@@ -227,13 +227,8 @@ pub fn build_refs_response(
         // How the CALLER addressed the focal decides the ambiguity rule, and
         // taking it against the winner's own name is FIR-2475. `kin refs` takes
         // a uuid or a name, and `resolved_by_name` recorded which.
-        let negative = refs_absence_verdict(
-            graph,
-            target,
-            &relation_kinds,
-            resolved_by_name,
-            envelope,
-        );
+        let negative =
+            refs_absence_verdict(graph, target, &relation_kinds, resolved_by_name, envelope);
         lines.extend(refs_absence_qualifier(
             graph,
             target,
@@ -434,11 +429,9 @@ fn refs_absence_payload(
     // make every `kin refs` absence read uncertain for a reason that has nothing
     // to do with this store. Produced by the same function the MCP handler
     // calls, so the two surfaces count ambiguity by one rule (FIR-2475).
-    if let Ok(resolution) = kin_mcp::handlers::entities::focal_resolution_for(
-        graph,
-        target,
-        addressed_by_name,
-    ) {
+    if let Ok(resolution) =
+        kin_mcp::handlers::entities::focal_resolution_for(graph, target, addressed_by_name)
+    {
         payload["focal_resolution"] = resolution;
     }
     payload
@@ -1032,7 +1025,6 @@ mod tests {
         ReferenceLinesAbsent, RefsRequest, RelationResolution,
     };
 
-
     /// THE SPINE (FIR-2524 rung three). A degraded daemon must make `kin refs`
     /// inherit the MCP verdict for that degradation.
     ///
@@ -1239,7 +1231,11 @@ mod tests {
 
     /// A three-entity fixture whose focal has no incoming edges, with a
     /// same-file neighbour so the coverage observation has something to read.
-    fn orphan_fixture() -> (kin_db::InMemoryGraph, kin_core::KinLayout, tempfile::TempDir) {
+    fn orphan_fixture() -> (
+        kin_db::InMemoryGraph,
+        kin_core::KinLayout,
+        tempfile::TempDir,
+    ) {
         use kin_model::{
             Entity, EntityId, EntityKind, EntityMetadata, EntityRole, EntityStore, FilePathId,
             FingerprintAlgorithm, Hash256, LanguageId, SemanticFingerprint, Visibility,
@@ -1614,7 +1610,7 @@ mod tests {
                 entity: "probe_symbol".to_string(),
                 kind: "all".to_string(),
             },
-        &refs_test_envelope(),
+            &refs_test_envelope(),
         )
         .unwrap();
         let joined = response.lines.join("\n");
@@ -1774,7 +1770,7 @@ mod tests {
                 entity: target.id.to_string(),
                 kind: "calls".to_string(),
             },
-        &refs_test_envelope(),
+            &refs_test_envelope(),
         )
         .unwrap();
         let cli_text = cli.lines.join("\n");
@@ -1961,7 +1957,7 @@ mod tests {
                 entity: "probe_symbol".to_string(),
                 kind: "all".to_string(),
             },
-        &refs_test_envelope(),
+            &refs_test_envelope(),
         )
         .unwrap();
         let joined = response.lines.join("\n");
@@ -2182,7 +2178,7 @@ mod tests {
                 entity: target.id.to_string(),
                 kind: "all".to_string(),
             },
-        &refs_test_envelope(),
+            &refs_test_envelope(),
         )
         .unwrap_err();
         assert!(
@@ -2328,7 +2324,7 @@ mod tests {
                 entity: "probe_symbol".to_string(),
                 kind: "all".to_string(),
             },
-        &refs_test_envelope(),
+            &refs_test_envelope(),
         )
         .unwrap();
         let joined = response.lines.join("\n");

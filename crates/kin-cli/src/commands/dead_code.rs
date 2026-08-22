@@ -813,12 +813,7 @@ pub fn build_dead_code_seeded_response(
                 Some(scoped.len()),
             ),
         });
-        crate::commands::absence_qualifier::qualify(
-            "find_dead_code_seeded",
-            &payload,
-            envelope,
-            "",
-        )
+        crate::commands::absence_qualifier::qualify("find_dead_code_seeded", &payload, envelope, "")
     } else {
         Vec::new()
     };
@@ -887,10 +882,20 @@ mod tests {
         // the clean arm. A one-way edge leaves the caller itself unreferenced,
         // which is a populated answer and a different test.
         graph
-            .upsert_relation(&make_relation_at(caller.id, live.id, RelationKind::Calls, 0.9))
+            .upsert_relation(&make_relation_at(
+                caller.id,
+                live.id,
+                RelationKind::Calls,
+                0.9,
+            ))
             .unwrap();
         graph
-            .upsert_relation(&make_relation_at(live.id, caller.id, RelationKind::Calls, 0.9))
+            .upsert_relation(&make_relation_at(
+                live.id,
+                caller.id,
+                RelationKind::Calls,
+                0.9,
+            ))
             .unwrap();
 
         let degraded = kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
@@ -931,10 +936,20 @@ mod tests {
         // the clean arm. A one-way edge leaves the caller itself unreferenced,
         // which is a populated answer and a different test.
         graph
-            .upsert_relation(&make_relation_at(caller.id, live.id, RelationKind::Calls, 0.9))
+            .upsert_relation(&make_relation_at(
+                caller.id,
+                live.id,
+                RelationKind::Calls,
+                0.9,
+            ))
             .unwrap();
         graph
-            .upsert_relation(&make_relation_at(live.id, caller.id, RelationKind::Calls, 0.9))
+            .upsert_relation(&make_relation_at(
+                live.id,
+                caller.id,
+                RelationKind::Calls,
+                0.9,
+            ))
             .unwrap();
 
         let coverage =
@@ -1066,8 +1081,7 @@ mod tests {
         let coverage =
             kin_core::reference_coverage::collect_reference_edge_coverage(graph).unwrap();
         let entry_points = collect_declared_entry_points(None, graph).unwrap();
-        build_dead_code_report(&dead_code_test_envelope(),
-            graph, &entry_points, &coverage).unwrap()
+        build_dead_code_report(&dead_code_test_envelope(), graph, &entry_points, &coverage).unwrap()
     }
 
     /// Whether `kin refs --bulk-json` reports a caller for this entity.
@@ -1271,7 +1285,7 @@ mod tests {
                 limit: Some(10),
                 name_pattern: None,
             },
-        &dead_code_test_envelope(),
+            &dead_code_test_envelope(),
         )
         .unwrap();
 
@@ -1674,8 +1688,9 @@ mod tests {
             manifests_read: Vec::new(),
             manifests_unreadable: vec!["pyproject.toml".to_string()],
         };
-        let response = build_dead_code_report(&dead_code_test_envelope(),
-            &graph, &entry_points, &coverage).unwrap();
+        let response =
+            build_dead_code_report(&dead_code_test_envelope(), &graph, &entry_points, &coverage)
+                .unwrap();
 
         assert!(!response.verified, "{:?}", response.lines);
         assert!(
@@ -1710,8 +1725,9 @@ mod tests {
             manifests_read: vec!["pyproject.toml".to_string()],
             manifests_unreadable: Vec::new(),
         };
-        let response = build_dead_code_report(&dead_code_test_envelope(),
-            &graph, &entry_points, &coverage).unwrap();
+        let response =
+            build_dead_code_report(&dead_code_test_envelope(), &graph, &entry_points, &coverage)
+                .unwrap();
         let joined = response.lines.join("\n");
 
         assert!(response.verified, "{:?}", response.unverified_reasons);
@@ -1740,7 +1756,7 @@ mod tests {
                 limit: Some(5),
                 name_pattern: None,
             },
-        &dead_code_test_envelope(),
+            &dead_code_test_envelope(),
         )
         .unwrap_err();
         assert!(err.to_string().contains("non-empty query"));

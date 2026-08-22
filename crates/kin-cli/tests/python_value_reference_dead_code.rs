@@ -295,10 +295,15 @@ fn the_cross_file_constant_leaves_the_dead_code_list() {
     // boundary. The same-file rows below need the scan to consult the reference
     // collector as well, which is what kin#866 wires in.
     let (graph, _files) = notes_project();
-    let response = build_dead_code_response(None, &graph, &kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+    let response = build_dead_code_response(
+        None,
+        &graph,
+        &kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
             "initialized": true, "graph_loaded": true,
             "graph_entity_count": 4, "graph_generation": 1,
-        }))).expect("dead-code scan");
+        })),
+    )
+    .expect("dead-code scan");
     let listed = listed_names(&response.lines);
 
     assert!(
@@ -320,10 +325,15 @@ fn the_dead_code_list_holds_only_rows_the_collector_cannot_rescue() {
     // is rescued the moment the scan reads the reference collector. Nothing
     // else survives, and no genuinely dead symbol is hidden.
     let (graph, files) = notes_project();
-    let response = build_dead_code_response(None, &graph, &kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+    let response = build_dead_code_response(
+        None,
+        &graph,
+        &kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
             "initialized": true, "graph_loaded": true,
             "graph_entity_count": 4, "graph_generation": 1,
-        }))).expect("dead-code scan");
+        })),
+    )
+    .expect("dead-code scan");
     let listed = listed_names(&response.lines);
 
     let listed_refs: Vec<&str> = listed.iter().map(String::as_str).collect();
