@@ -296,6 +296,29 @@ class Suite(object):
             raise RuntimeError("git commit failed: %s" % (err or out)[-300:])
         self._kin_init(repo)
 
+    def _build_threestate(self, repo):
+        """A store converted from Git holding one file of each parse outcome.
+
+        Converted, not committed through Kin, and that is the whole point. The
+        Git import parses every file and drops the layout it derived, so before
+        FIR-2604 every file on a store built this way reported `parsed: absent,
+        tier: none, certifies_enumeration: false`, including files an adapter
+        had read completely. A store built by `kin commit` never had the gap,
+        which is why this fixture must take the conversion path to be able to
+        fail.
+        """
+        self.git(["init", "-q", "."], repo)
+        self._write(repo, ".gitignore", "__pycache__/\n")
+        self._write(repo, "pkg/__init__.py", "")
+        self._write(repo, THREE_STATE_FILES["parsed"], THREE_STATE_PARSED_PY)
+        self._write(repo, THREE_STATE_FILES["broken"], THREE_STATE_BROKEN_PY)
+        self._write(repo, THREE_STATE_FILES["empty"], THREE_STATE_EMPTY_PY)
+        self.git(["add", "-A"], repo)
+        rc, out, err = self.git(["commit", "-q", "-m", "three parse outcomes"], repo)
+        if rc != 0:
+            raise RuntimeError("git commit failed: %s" % (err or out)[-300:])
+        self._kin_init(repo)
+
     def _build_js(self, repo):
         self.git(["init", "-q", "."], repo)
         self._write(repo, ".gitignore", "node_modules/\n")
@@ -718,6 +741,43 @@ MIXIN_DOCSTRING = ('"""Session and redirect handling.\n'
 # declares nothing and that no adapter failed on. Measured on kin 0.5.48, the
 # store reads "of the 5 admitted, 3 carry a full language adapter; 1 of those
 # produced no entity", and that one is the prelude.
+# The three file shapes FIR-2604's acceptance names. All three are admitted as
+# Python and all three are valid UTF-8, so nothing here reaches the opaque facet
+# by accident, which is the mistake that made an earlier parse-hole fixture
+# prove nothing.
+THREE_STATE_PARSED_PY = '''"""A module an adapter reads completely."""
+
+
+def alpha(value):
+    """Return the successor."""
+    return value + 1
+
+
+class Beta:
+    def gamma(self):
+        return 2
+'''
+
+# Not valid Python. tree-sitter recovers what it can and reports error ranges,
+# which is the parse outcome that must be distinguishable from never having
+# been parsed at all.
+THREE_STATE_BROKEN_PY = '''def delta(:
+    this is not python at all ]]]
+'''
+
+# Valid Python that correctly declares nothing. An enumeration over it IS
+# certified and IS empty, and those two facts together are what no store could
+# say before this check existed.
+THREE_STATE_EMPTY_PY = '''"""Only a docstring and a comment live here."""
+# nothing is declared in this file
+'''
+
+THREE_STATE_FILES = {
+    "parsed": "pkg/parsed.py",
+    "broken": "pkg/broken.py",
+    "empty": "pkg/empty.py",
+}
+
 REEXPORT_BENIGN_FILE = "src/prelude.rs"
 REEXPORT_DEAD_FUNCTION = "legacy_shim"
 
@@ -1956,6 +2016,138 @@ def check_14(suite):
     return res
 
 
+def check_15(suite):
+    """FIR-2604: parsed, tier and certifies_enumeration must be observations.
+
+    `list_file_entities` computes its completeness verdict from the file's
+    layout facet, and a store converted from Git had none: the import parses
+    every file, keeps the parse completeness only long enough to link
+    cross-file references, and drops the layout, because the semantic
+    transaction it builds has nowhere to put one. Every file then read
+    `parsed: absent, tier: none, certifies_enumeration: false`, so the
+    certification kin#1009 shipped could never be true on a converted store and
+    no consumer could tell a file an adapter read completely from one it failed
+    on from one that declares nothing.
+
+    Measured on 2026-08-22 against main at 38bb51f2, on this fixture's shape:
+
+        pkg/parsed.py  parsed=absent tier=none certifies=False total=4
+        pkg/broken.py  parsed=absent tier=none certifies=False total=2
+        pkg/empty.py   parsed=absent tier=none certifies=False total=1
+
+    Three files, three genuinely different states, one answer. After the fix,
+    on the same fixture:
+
+        pkg/parsed.py  parsed=full    tier=entity_source certifies=True
+        pkg/broken.py  parsed=partial tier=entity_source certifies=False
+                       detail="2 parse error range(s) during indexing"
+        pkg/empty.py   parsed=full    tier=entity_source certifies=True
+
+    Four arms. The first three read each shape on its own terms. The fourth is
+    the one that makes the check falsifiable rather than decorative: it asserts
+    the three readings are not all the same, which is exactly what fails on
+    pre-fix bytes and what a future regression would break again. Reverting the
+    backfill in kin-daemon's reconcile loop returns all three to `absent` and
+    fails arms one, three and four.
+    """
+    res = Result("15", "FIR-2604", "three parse outcomes read three ways on a converted store")
+    repo = suite.fixture("threestate")
+
+    def coverage(rel):
+        try:
+            payload, _ = suite.mcp(repo, "list_file_entities", {"path": rel})
+        except McpError as exc:
+            return None, str(exc)
+        cov = payload.get("file_coverage")
+        if not isinstance(cov, dict):
+            return None, ("the response carries no file_coverage object; keys were %s"
+                          % sorted(payload.keys())[:12])
+        cov = dict(cov)
+        cov["total_in_file"] = payload.get("total_in_file")
+        cov["entities"] = payload.get("entities") or []
+        return cov, None
+
+    readings = {}
+    for name, rel in sorted(THREE_STATE_FILES.items()):
+        cov, why = coverage(rel)
+        if cov is None:
+            # A conversion's enrichment lands asynchronously, so one bounded
+            # retry separates "not yet" from "never".
+            time.sleep(3)
+            cov, why = coverage(rel)
+        if cov is None:
+            res.unknown("%s could not be read through MCP: %s" % (rel, why[:250]))
+            return res
+        readings[name] = cov
+
+    parsed = readings["parsed"]
+    if parsed.get("parsed") == "full" and parsed.get("certifies_enumeration") is True:
+        res.ok("%s reads parsed=full, tier=%s, certifies_enumeration=true over %s entities"
+               % (THREE_STATE_FILES["parsed"], parsed.get("tier"), parsed.get("total_in_file")))
+    else:
+        res.bad("%s holds entities an adapter read completely but reads parsed=%r "
+                "certifies_enumeration=%r tier=%r, so no enumeration on this store can be "
+                "certified" % (THREE_STATE_FILES["parsed"], parsed.get("parsed"),
+                               parsed.get("certifies_enumeration"), parsed.get("tier")))
+
+    broken = readings["broken"]
+    if broken.get("parsed") in ("partial", "failed") and \
+            broken.get("certifies_enumeration") is not True:
+        res.ok("%s reads parsed=%s with detail %r and certifies nothing"
+               % (THREE_STATE_FILES["broken"], broken.get("parsed"),
+                  str(broken.get("parse_detail"))[:80]))
+    elif broken.get("certifies_enumeration") is True:
+        res.bad("%s is not valid Python yet certifies its enumeration (parsed=%r), which "
+                "licenses reading an adapter failure as the file's whole surface"
+                % (THREE_STATE_FILES["broken"], broken.get("parsed")))
+    else:
+        res.bad("%s is not valid Python and its parse outcome reads %r, which does not "
+                "distinguish an adapter failure from a file nothing ever parsed"
+                % (THREE_STATE_FILES["broken"], broken.get("parsed")))
+
+    # The declares-nothing arm. Python's adapter emits a module entity for every
+    # file it reads, so "declares nothing" is the absence of a function or a
+    # class rather than an empty list, and asserting an empty list here would be
+    # asserting something no Python file can satisfy.
+    empty = readings["empty"]
+    declarations = [entity.get("name") for entity in empty.get("entities", [])
+                    if entity.get("kind") in ("function", "class", "method")]
+    if empty.get("parsed") == "full" and empty.get("certifies_enumeration") is True \
+            and not declarations:
+        res.ok("%s parsed completely and declares nothing, and its enumeration is certified "
+               "anyway, which is what separates it from a file an adapter failed on"
+               % THREE_STATE_FILES["empty"])
+    elif declarations:
+        res.unknown("%s was written to declare nothing but the graph holds %s for it, so this "
+                    "arm cannot test what it is for"
+                    % (THREE_STATE_FILES["empty"], declarations[:4]))
+    else:
+        res.bad("%s declares nothing and parses cleanly, so an enumeration over it is complete "
+                "and should say so; it reads parsed=%r certifies_enumeration=%r"
+                % (THREE_STATE_FILES["empty"], empty.get("parsed"),
+                   empty.get("certifies_enumeration")))
+
+    # The arm that makes the other three falsifiable. Without it, a build that
+    # answered `full`/`true` for everything would satisfy two of the three
+    # above, and the constant this ticket is about would be back wearing the
+    # other value.
+    states = set()
+    certifications = set()
+    for cov in readings.values():
+        states.add(cov.get("parsed"))
+        certifications.add(cov.get("certifies_enumeration"))
+    if len(states) >= 2 and certifications == {True, False}:
+        res.ok("the three files read %d distinct parse states and certification differs "
+               "between them, so these fields are observations rather than constants"
+               % len(states))
+    else:
+        res.bad("three files with three different parse outcomes read parse states %s and "
+                "certifications %s, so the fields carry no information about any file"
+                % (sorted(str(state) for state in states),
+                   sorted(str(value) for value in certifications)))
+    return res
+
+
 CHECKS = [
     ("0", check_0),
     ("1", check_1),
@@ -1972,6 +2164,7 @@ CHECKS = [
     ("12", check_12),
     ("13", check_13),
     ("14", check_14),
+    ("15", check_15),
 ]
 
 

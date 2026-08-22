@@ -978,7 +978,16 @@ fn preview_text_if_likely_text(content: &[u8], mime_hint: Option<&str>) -> Optio
     kin_index::artifacts::opaque_text_preview(content, mime_hint)
 }
 
-fn build_entity_file_layout(
+/// Build a file's layout from the entity spans the graph already holds.
+///
+/// The regions carry the graph's own entity identities rather than freshly
+/// parsed ones, which is what makes this safe to publish into a live store: a
+/// layout whose `EntityRef` names an id no entity has is a splice target that
+/// resolves to nothing, and rename and projection both read these regions.
+/// `parse_completeness` is the caller's observation about the source bytes and
+/// is carried through untouched, because only the caller knows whether it
+/// parsed the file or reconstructed it.
+pub fn build_entity_file_layout(
     file_id: &FilePathId,
     entities: &[kin_model::Entity],
     file_len: usize,

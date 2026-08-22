@@ -2143,6 +2143,164 @@ fn plan_unpublished_enrichment_repair(state: &DaemonState) -> Result<Vec<FileEve
     Ok(events)
 }
 
+/// What one layout backfill pass observed and published.
+///
+/// `parsed` and `skipped` are reported together because the useful number is
+/// the pair: a store that publishes nothing because every file already carried
+/// a layout and a store that publishes nothing because it holds no source read
+/// the same from a bare count, and only one of them is a finding.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct LayoutBackfill {
+    /// Entity-source artifacts in the tree that already carried a layout.
+    pub(crate) already_published: usize,
+    /// Artifacts this pass parsed from graph-owned CAS and published a layout for.
+    pub(crate) published: usize,
+    /// Artifacts whose bytes could not be read or parsed, left with no layout.
+    pub(crate) unreadable: usize,
+    /// Artifacts another facet already owns, which this pass must not touch.
+    pub(crate) other_facet: usize,
+}
+
+impl LayoutBackfill {
+    fn observed(&self) -> usize {
+        self.already_published + self.published + self.unreadable + self.other_facet
+    }
+}
+
+/// Publish the per-file parse observation for every admitted entity-source
+/// artifact whose facet is missing, deriving it from graph-owned CAS.
+///
+/// Why this exists. `parsed`, `tier` and `certifies_enumeration` on
+/// `list_file_entities` are all read from the file's layout facet, and a store
+/// converted from Git never had one. The Git import parses every file, keeps
+/// the parse completeness only long enough to link cross-file references
+/// (`kin_index::derive_historical_semantic_deltas`), and drops the layout on
+/// the floor, because the semantic transaction it builds carries entity and
+/// relation deltas and has nowhere to put a layout. Entities therefore land and
+/// the observation about how they were obtained does not, so every file on a
+/// converted store reads `parsed: absent, tier: none, certifies_enumeration:
+/// false` whether an adapter read it completely, failed on it, or never looked
+/// at it. Those three are the only answers that matter and the store could not
+/// tell them apart.
+///
+/// A store built by `kin commit` does not have the gap, because the reconcile
+/// path publishes the layout it registered
+/// (`DaemonState::persist_projection_truth_from_reconcile`). That asymmetry is
+/// the whole defect: the same tool answered two real stores differently for a
+/// reason that had nothing to do with either repository.
+///
+/// What it reads. The graph's own resolved tree and the CAS bodies that tree
+/// names, never the working copy. A path the tree does not carry is not
+/// considered, and a body that does not match the tree's identity is not
+/// parsed, so this cannot admit host content or repair graph truth from disk.
+///
+/// What it publishes. The parse completeness comes from re-parsing the CAS
+/// bytes; the regions come from the entities the graph already holds, through
+/// [`kin_core::build_entity_file_layout`], so no identity is invented and a
+/// splice or rename reading these regions resolves to entities that exist. A
+/// file the adapter could not read completely gets its `Partial`/`Failed`
+/// completeness and its reason, which is the state that was previously
+/// indistinguishable from never having been parsed.
+///
+/// Cost. One parse per entity-source artifact that has no layout, once per
+/// daemon life. A store whose files were committed through Kin pays a tree walk
+/// and no parses at all.
+pub(crate) fn backfill_missing_file_layouts(state: &DaemonState) -> Result<LayoutBackfill> {
+    let mut report = LayoutBackfill::default();
+    let pipeline = IndexPipeline::new();
+    let tree = state.graph.resolved_tree();
+
+    for artifact in tree.artifacts_by_path() {
+        let Some(path) = artifact.path.as_utf8() else {
+            continue;
+        };
+        // Symlinks and gitlinks are never parsed as source owned by the link
+        // path, which is the same rule the historical rebuild applies.
+        let TreeEntry::Blob { hash, .. } = artifact.entry else {
+            continue;
+        };
+        if !matches!(
+            FileClassifier::classify(Path::new(path)),
+            FileClassification::EntitySource
+        ) {
+            continue;
+        }
+        let file_id = FilePathId::new(path);
+        if state.graph.get_file_layout(&file_id)?.is_some() {
+            report.already_published += 1;
+            continue;
+        }
+        // Another facet already owns this path. The four are mutually exclusive
+        // per file and the watcher seam enforces that
+        // ([`clear_incompatible_facets_in`]), so publishing a layout beside one
+        // would leave the store holding two answers to how the file is tracked.
+        // The gap this pass closes is a path carrying no facet at all, which is
+        // exactly what a Git import leaves behind.
+        if state.graph.get_shallow_file(&file_id)?.is_some()
+            || state.graph.get_structured_artifact(&file_id)?.is_some()
+            || state.graph.get_opaque_artifact(&file_id)?.is_some()
+        {
+            report.other_facet += 1;
+            continue;
+        }
+
+        // `TreeEntry` carries kin-model's hash and the blob store speaks
+        // kin-blobs', so the identity crosses that boundary by bytes, exactly
+        // as the historical rebuild crosses it.
+        let body_hash = kin_blobs::Hash256::from_bytes(*hash.as_bytes());
+        let Ok(content) = state.blobs.read(&body_hash) else {
+            debug!(
+                file = %file_id,
+                "no CAS body for an admitted artifact, so its parse observation stays unpublished"
+            );
+            report.unreadable += 1;
+            continue;
+        };
+        // Content decides the facet, exactly as admission decides it: a path
+        // whose extension says source but whose bytes are opaque belongs to
+        // another facet and must not grow an entity-source layout here.
+        if !matches!(
+            FileClassifier::classify_with_content(Path::new(path), &content),
+            FileClassification::EntitySource
+        ) {
+            continue;
+        }
+
+        let completeness =
+            match pipeline.index_file_content_with_tests(&file_id, &content, body_hash) {
+                Ok(indexed) => indexed.indexed_file.file_layout.parse_completeness,
+                Err(error) => {
+                    debug!(
+                        file = %file_id,
+                        error = %error,
+                        "graph-owned source could not be indexed, so its parse observation stays \
+                         unpublished rather than being guessed"
+                    );
+                    report.unreadable += 1;
+                    continue;
+                }
+            };
+
+        let mut entities = state.graph.query_entities(&EntityFilter {
+            file_path: Some(file_id.clone()),
+            ..Default::default()
+        })?;
+        entities.sort_by_key(|entity| {
+            entity
+                .span
+                .as_ref()
+                .map(|span| span.start_byte)
+                .unwrap_or(usize::MAX)
+        });
+        let layout =
+            kin_core::build_entity_file_layout(&file_id, &entities, content.len(), completeness);
+        state.graph.upsert_file_layout(&layout)?;
+        report.published += 1;
+    }
+
+    Ok(report)
+}
+
 pub async fn run_loop(
     state: Arc<DaemonState>,
     config: LoopConfig,
@@ -2205,6 +2363,11 @@ pub async fn run_loop_armed(
     // paths it recovers are exactly the ones whose host modification time puts
     // them outside that window, which is why the window cannot see them.
     let mut enrichment_repair_owed = true;
+    // Owed once per daemon life for the same reason and on the same schedule:
+    // a store converted from Git carries entities whose parse observation was
+    // computed at import and never published, so every file answers
+    // `certifies_enumeration: false` until this runs.
+    let mut layout_backfill_owed = true;
     if let Some(armed) = armed.as_mut() {
         armed.arm();
     }
@@ -2388,6 +2551,45 @@ pub async fn run_loop_armed(
                         error = %error,
                         "could not plan the unpublished-enrichment repair, so a path missing its \
                          entities stays unqueryable until it is edited"
+                    );
+                }
+            }
+        }
+
+        // The per-file parse observation, owed once per daemon life. A store
+        // built by `kin commit` publishes its layouts as it goes and this pass
+        // finds nothing to do; a store converted from Git has none at all, and
+        // without them `list_file_entities` cannot tell a file an adapter read
+        // completely from one it failed on from one it never looked at.
+        if layout_backfill_owed {
+            layout_backfill_owed = false;
+            match backfill_missing_file_layouts(&state) {
+                Ok(report) if report.published == 0 => {
+                    debug!(
+                        observed = report.observed(),
+                        already_published = report.already_published,
+                        unreadable = report.unreadable,
+                        other_facet = report.other_facet,
+                        "every admitted source file already carries its parse observation"
+                    );
+                }
+                Ok(report) => {
+                    info!(
+                        published = report.published,
+                        already_published = report.already_published,
+                        unreadable = report.unreadable,
+                        other_facet = report.other_facet,
+                        observed = report.observed(),
+                        "published the per-file parse observation for admitted source files that \
+                         carried none, so an enumeration over them can be certified"
+                    );
+                    state.bump_version();
+                }
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "could not publish per-file parse observations, so `list_file_entities` \
+                         cannot certify an enumeration on this store"
                     );
                 }
             }
