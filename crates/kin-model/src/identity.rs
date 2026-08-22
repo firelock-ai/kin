@@ -348,6 +348,65 @@ fn append_canonical_json(output: &mut Vec<u8>, value: &serde_json::Value) -> Res
     Ok(())
 }
 
+/// The canonical encoding with exactly ONE byte of its framing changed.
+///
+/// Only reachable from tests, and only for one job: proving that the pinned
+/// preimage digests can actually fail. A corpus of pins is worth nothing until
+/// something shows the pins move when the encoder moves, and the cheapest
+/// honest demonstration is an encoder that differs from the real one by a single
+/// byte, here the object tag.
+///
+/// Deliberately a separate walk rather than a flag threaded through
+/// [`append_canonical_json`]. A flag inside the real encoder is a branch that
+/// ships, and a mis-set one would corrupt every identity this crate derives.
+#[cfg(test)]
+pub(crate) fn canonical_json_bytes_with_one_byte_of_framing_changed(
+    value: &impl serde::Serialize,
+) -> Result<Vec<u8>> {
+    fn append(output: &mut Vec<u8>, value: &serde_json::Value) -> Result<()> {
+        match value {
+            serde_json::Value::Object(values) => {
+                // The real encoder writes 5 here. This is the whole mutation.
+                output.push(6);
+                output.extend_from_slice(
+                    &u64::try_from(values.len())
+                        .map_err(|_| {
+                            ModelError::InvalidOperation("canonical object exceeds u64".to_string())
+                        })?
+                        .to_le_bytes(),
+                );
+                let mut values: Vec<_> = values.iter().collect();
+                values.sort_by(|left, right| left.0.cmp(right.0));
+                for (key, value) in values {
+                    append_len_prefixed_vec_field(output, key.as_bytes())?;
+                    append(output, value)?;
+                }
+                Ok(())
+            }
+            serde_json::Value::Array(values) => {
+                output.push(4);
+                output.extend_from_slice(
+                    &u64::try_from(values.len())
+                        .map_err(|_| {
+                            ModelError::InvalidOperation("canonical array exceeds u64".to_string())
+                        })?
+                        .to_le_bytes(),
+                );
+                for value in values {
+                    append(output, value)?;
+                }
+                Ok(())
+            }
+            other => append_canonical_json(output, other),
+        }
+    }
+
+    let value = serde_json::to_value(value).map_err(serialization)?;
+    let mut encoded = Vec::new();
+    append(&mut encoded, &value)?;
+    Ok(encoded)
+}
+
 fn append_len_prefixed_vec_field(output: &mut Vec<u8>, value: &[u8]) -> Result<()> {
     output.extend_from_slice(
         &u64::try_from(value.len())

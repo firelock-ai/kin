@@ -3840,6 +3840,231 @@ mod tests {
         );
     }
 
+    /// Transaction shapes whose canonical preimage is pinned.
+    ///
+    /// One shape was pinned before this: `workspace_transaction()`, whose
+    /// `changes`, `aliases`, `external_objects` and `ref_mutations` are all
+    /// empty. That pin is real and it guards an additive-field promise, but it
+    /// exercises none of the collections, so an encoder change could rewrite how
+    /// every array and every nested object is framed and still pass it.
+    ///
+    /// This corpus exists because the encoder is about to be rewritten. The
+    /// `serde_json::Value` tree it builds is 76 percent of the hash's peak, and
+    /// removing it means reproducing this encoding exactly. Every identity in
+    /// every store on disk depends on the preimage, so the acceptance for that
+    /// work is "the same bytes, less memory", and this is the "same bytes" half,
+    /// landed first and deliberately.
+    fn preimage_corpus() -> Vec<(&'static str, RepositoryTransaction)> {
+        let mut wide = canonicalizable_transaction();
+        wide.changes = vec![native_change(7, 1_000, 999, 998, 997)];
+
+        let mut unicode = canonicalizable_transaction();
+        unicode.changes = vec![{
+            let mut change = native_change(3, 21, 22, 23, 24);
+            // Combining marks, an astral-plane character, and a right-to-left
+            // mark. All three survive a round trip only if the encoder is
+            // length-prefixing bytes rather than counting characters.
+            change.message = "re\u{0301}sume\u{0301} \u{1F9EA} \u{200F}bidi".to_string();
+            change
+        }];
+
+        let mut empty_collections = canonicalizable_transaction();
+        empty_collections.changes = Vec::new();
+        empty_collections.aliases = Vec::new();
+        empty_collections.external_objects = Vec::new();
+        empty_collections.ref_mutations = Vec::new();
+
+        vec![
+            ("workspace_only", workspace_transaction()),
+            ("canonicalizable", canonicalizable_transaction()),
+            ("empty_collections", empty_collections),
+            ("one_change", wide),
+            ("unicode_message", unicode),
+            ("sixteen_changes", large_transaction(16)),
+        ]
+    }
+
+    /// The canonical preimage of every corpus shape, pinned by digest.
+    ///
+    /// Measured on the commit that introduced this test. A digest that moves
+    /// here is a change to what a transaction identity commits to, which every
+    /// store already on disk depends on. It is a decision to make and version,
+    /// never a value to regenerate.
+    const PINNED_PREIMAGE_DIGESTS: [(&str, &str); 6] = [
+        (
+            "workspace_only",
+            "87c06b3a2f89a7f7ca9cf1e45207a9b425b1e40c07d6d78ab43ea8625acb69a8",
+        ),
+        (
+            "canonicalizable",
+            "7a2fbbebb2c1ba8c8bf5e5fa5e55a62f354ef60339f76ed2f13eb78aed5c205d",
+        ),
+        (
+            "empty_collections",
+            "3dc9e8c91616d31c6e31f1e392f329144d3e471a27f5ae4ee95cd289c838bc38",
+        ),
+        (
+            "one_change",
+            "5a352ceec24d3697cfb75776c4d23e703a7e054710effd8decc52fc4b8772ccd",
+        ),
+        (
+            "unicode_message",
+            "fe3ea7ff53bd1faedcac286579664cd2754e204ff770bdb547e9bfbcb083bab4",
+        ),
+        (
+            "sixteen_changes",
+            "e03347ebd49b1da8bb3779259c4cebb030c2749437b5fddb7259ec6266a13229",
+        ),
+    ];
+
+    fn preimage_digest(transaction: &RepositoryTransaction) -> String {
+        let bytes =
+            crate::identity::canonical_json_bytes(&CanonicalTransaction::new(transaction)).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let digest = hasher.finalize();
+        let mut out = String::with_capacity(64);
+        for byte in digest {
+            use std::fmt::Write as _;
+            write!(out, "{byte:02x}").unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn the_canonical_preimage_is_pinned_for_every_corpus_shape() {
+        let corpus = preimage_corpus();
+        assert_eq!(
+            corpus.len(),
+            PINNED_PREIMAGE_DIGESTS.len(),
+            "every corpus shape needs a pin, or a shape can be added and never checked"
+        );
+        // Every shape is measured and printed BEFORE anything is asserted. A
+        // loop that panics on the first mismatch reports one moved digest and
+        // hides the other five, which is the difference between "this field
+        // changed the preimage" and "the encoder was rewritten".
+        let measured: Vec<(&str, String)> = corpus
+            .iter()
+            .map(|(name, transaction)| (*name, preimage_digest(transaction)))
+            .collect();
+        for (name, digest) in &measured {
+            println!("PREIMAGE {name} {digest}");
+        }
+
+        let moved: Vec<String> = measured
+            .iter()
+            .zip(PINNED_PREIMAGE_DIGESTS.iter())
+            .filter_map(|((name, actual), (pinned_name, pinned))| {
+                assert_eq!(name, pinned_name, "corpus and pins are out of order");
+                (actual != pinned).then(|| format!("{name}: pinned {pinned}, measured {actual}"))
+            })
+            .collect();
+        assert!(
+            moved.is_empty(),
+            "the canonical preimage moved for {} of {} shapes. Every transaction \
+             identity in every store on disk is derived from these bytes, so this \
+             is a decision to version, not a value to regenerate.\n  {}",
+            moved.len(),
+            measured.len(),
+            moved.join("\n  ")
+        );
+    }
+
+    /// The pins above can fail.
+    ///
+    /// A corpus of pinned digests is worth nothing until something shows they
+    /// move when the encoder moves. This encodes the same corpus through an
+    /// encoder that differs by exactly one byte of framing, the object tag, and
+    /// requires every shape to disagree.
+    ///
+    /// A shape that agreed would be a shape the pins cannot protect, which is
+    /// worth knowing before the encoder is rewritten rather than after.
+    #[test]
+    fn a_one_byte_encoder_change_moves_every_pinned_preimage() {
+        for (name, transaction) in preimage_corpus() {
+            let view = CanonicalTransaction::new(&transaction);
+            let real = crate::identity::canonical_json_bytes(&view).unwrap();
+            let mutated =
+                crate::identity::canonical_json_bytes_with_one_byte_of_framing_changed(&view)
+                    .unwrap();
+            assert_ne!(
+                real, mutated,
+                "changing the object tag left `{name}`'s preimage identical, so \
+                 the pin on it cannot detect an encoder change"
+            );
+            assert_eq!(
+                real.len(),
+                mutated.len(),
+                "the falsifier must differ by one byte of framing and nothing \
+                 else, or it is testing a different encoder rather than a \
+                 one-byte change to this one ({name})"
+            );
+        }
+    }
+
+    /// Which of the two whole-transaction materializations inside the hash is
+    /// the one worth removing.
+    ///
+    /// `canonical_json_bytes` builds a `serde_json::Value` tree of the whole
+    /// transaction and then encodes that whole tree into a `Vec<u8>`, and both
+    /// are live when the encode returns. A fix can remove either. This prices
+    /// them separately so the choice is made by measurement rather than by
+    /// which one is easier to write.
+    ///
+    /// Reported, never asserted as a ceiling, for the reason the test above
+    /// gives: a ceiling here pins the encoder and drifts with any serde change.
+    /// The assertions are shape only, and they are the ones that would break if
+    /// this test stopped measuring what it claims to.
+    #[test]
+    fn the_hash_holds_two_whole_transaction_materializations_and_prices_both() {
+        let transaction = large_transaction(200);
+        transaction.canonical_hash().unwrap();
+
+        let view_and_tree = measure_peak_live_bytes(|| {
+            let tree = serde_json::to_value(CanonicalTransaction::new(&transaction)).unwrap();
+            std::hint::black_box(&tree);
+        });
+        let tree_and_encoding = measure_peak_live_bytes(|| {
+            let encoded =
+                crate::identity::canonical_json_bytes(&CanonicalTransaction::new(&transaction))
+                    .unwrap();
+            std::hint::black_box(&encoded);
+        });
+        let encoded_len =
+            crate::identity::canonical_json_bytes(&CanonicalTransaction::new(&transaction))
+                .unwrap()
+                .len();
+        let whole_hash = measure_peak_live_bytes(|| {
+            transaction.canonical_hash().unwrap();
+        });
+
+        println!(
+            "tree {view_and_tree} tree+encoding {tree_and_encoding} \
+             encoded_len {encoded_len} whole_hash {whole_hash}"
+        );
+
+        assert!(
+            view_and_tree > 0 && tree_and_encoding > 0 && encoded_len > 0 && whole_hash > 0,
+            "the probe measured nothing, so it cannot fail: tree {view_and_tree}, \
+             tree+encoding {tree_and_encoding}, encoded_len {encoded_len}, \
+             whole_hash {whole_hash}"
+        );
+        assert!(
+            tree_and_encoding > view_and_tree,
+            "encoding on top of the tree must cost more than the tree alone, \
+             or the two materializations are not both live ({tree_and_encoding} \
+             against {view_and_tree})"
+        );
+        // The tree is the larger of the two. If this ever inverts, the fix that
+        // is worth writing has changed, and it should be re-chosen rather than
+        // carried forward from this measurement.
+        assert!(
+            view_and_tree > encoded_len,
+            "the Value tree {view_and_tree} is no longer larger than the encoding \
+             it produces ({encoded_len}); re-price the fix before removing either"
+        );
+    }
+
     /// Transaction identity must not depend on the order a caller built its
     /// collections in.
     ///
