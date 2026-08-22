@@ -1,0 +1,1421 @@
+{
+  "schema": "kin.release-preflight.v1",
+  "citable": false,
+  "lane": "DEV-LOCAL",
+  "run": "20260822T185730Z",
+  "host": "Darwin 25.4.0 arm64",
+  "lock_lane": "rc0550",
+  "verdict": "PASS",
+  "allow_dirty": false,
+  "cpu_embed": false,
+  "tooling": {
+    "source": "/Users/troyfortinjr/GitHub/kin-ecosystem/kin @ origin/main",
+    "validator_ported_from_sha256": "2d6e120e068ffa875aefd9b28bac2375800ce29412a8c5134819f860c62f67da",
+    "workflow_sha256_at_ref": "2d6e120e068ffa875aefd9b28bac2375800ce29412a8c5134819f860c62f67da"
+  },
+  "provenance": [
+    "archive:      /private/tmp/kpf/20260822T185730Z/rc/32590059813/kin-linux-aarch64/kin-linux-aarch64.tar.gz (sha256 7b89172dbb95038d93681390033eeaa82a8494a1b58106beec0e8ef304f3f5ac)",
+    "kin:        kin 0.5.50 (b0754c2df02eddd522de2df4f533f665578bf7e0 main 2026-08-22T18:15:06Z)",
+    "kin-daemon: kin-daemon 0.5.50 (b0754c2df02eddd522de2df4f533f665578bf7e0 main 2026-08-22T18:15:06Z)",
+    "expected:     commit b0754c2df02eddd522de2df4f533f665578bf7e0 (--expect-commit); Cargo.lock sha256 1d278c38deadf5a0de98f09673a1b86e6ed91c762823b99493eb4550c8056d95",
+    "container:    kin-release-preflight/debian12:u501-arm64 (linux/arm64)",
+    "archive:      /private/tmp/kpf/20260822T185730Z/rc/32590059813/kin-linux-x86_64/kin-linux-x86_64.tar.gz (sha256 ca0e59e3e1e6cae490580b4b20b691dfadb8b2bdadb6378ec4ad4be584eca3b7)",
+    "kin:        kin 0.5.50 (b0754c2df02eddd522de2df4f533f665578bf7e0 main 2026-08-22T18:16:06Z)",
+    "kin-daemon: kin-daemon 0.5.50 (b0754c2df02eddd522de2df4f533f665578bf7e0 main 2026-08-22T18:16:06Z)",
+    "expected:     commit b0754c2df02eddd522de2df4f533f665578bf7e0 (--expect-commit); Cargo.lock sha256 1d278c38deadf5a0de98f09673a1b86e6ed91c762823b99493eb4550c8056d95",
+    "container:    kin-release-preflight/debian12:u501-amd64 (linux/amd64)",
+    "archive:      /private/tmp/kpf/20260822T185730Z/rc/32590059813/kin-macos-aarch64/kin-macos-aarch64.tar.gz (sha256 7e97a0ebf8b1eb9ffbbe52ab8507d570b5d0d9ca97132874c7c75ad40595f7cd)",
+    "kin:        kin 0.5.50 (b0754c2df02eddd522de2df4f533f665578bf7e0 main 2026-08-22T18:17:03Z)",
+    "kin-daemon: kin-daemon 0.5.50 (b0754c2df02eddd522de2df4f533f665578bf7e0 main 2026-08-22T18:17:03Z)",
+    "expected:     commit b0754c2df02eddd522de2df4f533f665578bf7e0 (--expect-commit); Cargo.lock sha256 1d278c38deadf5a0de98f09673a1b86e6ed91c762823b99493eb4550c8056d95"
+  ],
+  "skipped": [],
+  "legs": [
+    {
+      "name": "linux (arm64, debian 12, archive)",
+      "kind": "linux",
+      "target": "kin-linux-aarch64",
+      "archive": "/private/tmp/kpf/20260822T185730Z/rc/32590059813/kin-linux-aarch64/kin-linux-aarch64.tar.gz",
+      "verdict": "PASS",
+      "magic_repro": "PASS (13 pass, 0 fail, 0 unreadable of 13)",
+      "result_path": "/private/tmp/kpf/20260822T185730Z/legs/linux-arm64/result.json",
+      "result": {
+        "schema": "kin.release-preflight.leg.v1",
+        "leg": "linux-arm64",
+        "citable": false,
+        "runner_os": "Linux",
+        "runner_arch": "ARM64",
+        "archive": {
+          "path": "/rig/dist/kin-linux-aarch64.tar.gz",
+          "sha256": "7b89172dbb95038d93681390033eeaa82a8494a1b58106beec0e8ef304f3f5ac"
+        },
+        "binaries": {
+          "kin": {
+            "version_line": "kin 0.5.50 (b0754c2df02eddd522de2df4f533f665578bf7e0 main 2026-08-22T18:15:06Z)"
+          },
+          "kin_daemon": {
+            "version_line": "kin-daemon 0.5.50 (b0754c2df02eddd522de2df4f533f665578bf7e0 main 2026-08-22T18:15:06Z)"
+          },
+          "stamp_sha": "b0754c2df02eddd522de2df4f533f665578bf7e0",
+          "version": "0.5.50"
+        },
+        "expected": {
+          "commit": "b0754c2df02eddd522de2df4f533f665578bf7e0",
+          "lock_sha256": "1d278c38deadf5a0de98f09673a1b86e6ed91c762823b99493eb4550c8056d95",
+          "allow_dirty": false
+        },
+        "steps": [
+          {
+            "step": "stage-archive",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 1,
+            "log": "/home/dev/preflight/logs/01-stage-archive.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "glibc-floor",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 0,
+            "log": "/home/dev/preflight/logs/02-glibc-floor.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "install",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 1,
+            "log": "/home/dev/preflight/logs/03-install.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "verify-binaries",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 0,
+            "log": "/home/dev/preflight/logs/04-verify-binaries.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "vfs-components",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 0,
+            "log": "/home/dev/preflight/logs/05-vfs-components.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "first-run",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 3,
+            "log": "/home/dev/preflight/logs/06-first-run.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "graph-query-mcp",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 0,
+            "log": "/home/dev/preflight/logs/07-graph-query-mcp.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "vfs-projection",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 0,
+            "log": "/home/dev/preflight/logs/08-vfs-projection.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "embedding-retrieval",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 12,
+            "log": "/home/dev/preflight/logs/09-embedding-retrieval.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "restore-captures",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 0,
+            "log": "/home/dev/preflight/logs/10-restore-captures.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "validate",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 0,
+            "log": "/home/dev/preflight/logs/11-validate.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "magic-repro",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 16,
+            "log": "/home/dev/preflight/logs/12-magic-repro.log",
+            "failing": "",
+            "tail": []
+          }
+        ],
+        "glibc_floor": {
+          "status": "PASS",
+          "detail": "/home/dev/preflight/archive/kin-linux-aarch64/kin-vfs: highest requirement GLIBC_2.30 (gettid) across 151 versioned references | /home/dev/preflight/archive/kin-linux-aarch64/libkin_vfs_shim.so: highest requirement GLIBC_2.30 (gettid) across 83 versioned references"
+        },
+        "assertions": {
+          "ported_from": {
+            "file": ".github/workflows/install-proof.yml",
+            "sha256": "2d6e120e068ffa875aefd9b28bac2375800ce29412a8c5134819f860c62f67da"
+          },
+          "counts": {
+            "PASS": 41,
+            "FAIL": 0,
+            "UNREADABLE": 0
+          },
+          "assertions": [
+            {
+              "status": "PASS",
+              "name": "installed launcher path",
+              "message": "/home/dev/preflight/home/.kin/bin/kin"
+            },
+            {
+              "status": "PASS",
+              "name": "kin-build-meta.json schema",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "cli build SHA is a full commit",
+              "message": "b0754c2df02eddd522de2df4f533f665578bf7e0"
+            },
+            {
+              "status": "PASS",
+              "name": "cli build SHA matches the expected commit",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "cli release binary is clean",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "cli release binary proves source_known",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "cli Cargo.lock provenance is well formed",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "cli Cargo.lock provenance matches the source",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "daemon build SHA is a full commit",
+              "message": "b0754c2df02eddd522de2df4f533f665578bf7e0"
+            },
+            {
+              "status": "PASS",
+              "name": "daemon build SHA matches the expected commit",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "daemon release binary is clean",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "daemon release binary proves source_known",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "daemon Cargo.lock provenance is well formed",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "daemon Cargo.lock provenance matches the source",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "CLI and daemon share Cargo.lock provenance",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-status.json schema",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "bench metadata proves vector and embedding support",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-status.json embedding coverage shape",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-claude-fallback-health.json forced Claude fallback",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-claude-fallback-doctor.json forced Claude fallback",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-health.json aggregate health",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-health.json required check statuses",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-health.json semantic_query_readiness",
+              "message": "pending"
+            },
+            {
+              "status": "PASS",
+              "name": "kin-health.json no hard failures",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-doctor.json aggregate health",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-doctor.json required check statuses",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-doctor.json semantic_query_readiness",
+              "message": "pending"
+            },
+            {
+              "status": "PASS",
+              "name": "kin-doctor.json no hard failures",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "lexical kin search returns the seeded hello entity",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin locate returns the seeded probe.py graph artifact",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "MCP client configs bind the installed launcher",
+              "message": "9 configs"
+            },
+            {
+              "status": "PASS",
+              "name": "Antigravity legacy repair preserved user policy",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "bounded clean-install embedding reached full coverage",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-embedded-status.json schema",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-embedded-status.json embedding coverage shape",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "Unix status observed embedding coverage after settle",
+              "message": "bounded settle (kin status --wait-quiesce 60)"
+            },
+            {
+              "status": "PASS",
+              "name": "Unix status proves complete observed embedding coverage",
+              "message": "indexed 4/4"
+            },
+            {
+              "status": "PASS",
+              "name": "kin-embedded-health.json healthy with semantic readiness",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-embedded-doctor.json healthy with semantic readiness",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "semantic kin search returns the seeded hello entity",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "semantic kin locate proves complete coverage and returns probe.py",
+              "message": "semantic_coverage={\"supported\":true,\"indexed\":4,\"total\":4,\"pending\":0,\"complete\":true,\"embedding_state\":\"present\",\"read_at\":\"2026-08-22T18:58:02Z\",\"graph_bodies\":{\"source_paths\":1,\"with_body\":1,\"gap_paths\":0}}"
+            }
+          ]
+        },
+        "magic_repro": {
+          "version": "kin 0.5.50 (b0754c2df02eddd522de2df4f533f665578bf7e0 main 2026-08-22T18:15:06Z)",
+          "counts": {
+            "PASS": 13,
+            "FAIL": 0,
+            "UNREADABLE": 0
+          },
+          "total": 13,
+          "checks": [
+            {
+              "id": "0",
+              "ticket": "GPU-OPTOUT",
+              "status": "PASS",
+              "detail": "embeddings indexed=0/44"
+            },
+            {
+              "id": "1",
+              "ticket": "FIR-2354",
+              "status": "PASS",
+              "detail": "find_references(parse_note) crosses into storage.py"
+            },
+            {
+              "id": "2",
+              "ticket": "FIR-2353",
+              "status": "PASS",
+              "detail": "references returned (1), so the absence path is not exercised"
+            },
+            {
+              "id": "3",
+              "ticket": "FIR-2357",
+              "status": "PASS",
+              "detail": "all three calling files returned: ['pkg/linkgraph.py', 'pkg/parsing.py', 'pkg/storage.py']"
+            },
+            {
+              "id": "4",
+              "ticket": "FIR-2356",
+              "status": "PASS",
+              "detail": "coverage is not reported incomplete (graph status reports 10 of 24 relations cross-file)"
+            },
+            {
+              "id": "5",
+              "ticket": "FIR-2360",
+              "status": "PASS",
+              "detail": "the ambiguous receiver in Session.drain produced 1 edge(s)"
+            },
+            {
+              "id": "6",
+              "ticket": "FIR-2361",
+              "status": "PASS",
+              "detail": "truncation is localized per step"
+            },
+            {
+              "id": "7",
+              "ticket": "FIR-2362",
+              "status": "PASS",
+              "detail": "relations per entity 1.00"
+            },
+            {
+              "id": "8",
+              "ticket": "FIR-2359",
+              "status": "PASS",
+              "detail": "context pack carries no decimal byte arrays (11393 chars)"
+            },
+            {
+              "id": "9",
+              "ticket": "FIR-2358",
+              "status": "PASS",
+              "detail": "graph validate does not read as a completeness bill"
+            },
+            {
+              "id": "12",
+              "ticket": "FIR-2605",
+              "status": "PASS",
+              "detail": "the row for legacy_shim carries no unverified label"
+            },
+            {
+              "id": "13",
+              "ticket": "FIR-2504",
+              "status": "PASS",
+              "detail": "the provenance field moves both ways: repository while set, kin's own default once cleared"
+            },
+            {
+              "id": "14",
+              "ticket": "FIR-2135",
+              "status": "PASS",
+              "detail": "status is live again once the store settles"
+            }
+          ],
+          "verdict": "PASS"
+        },
+        "failing": [],
+        "unreadable": [],
+        "waived": [],
+        "verdict": "PASS"
+      }
+    },
+    {
+      "name": "linux (amd64, debian 12, archive)",
+      "kind": "linux",
+      "target": "kin-linux-x86_64",
+      "archive": "/private/tmp/kpf/20260822T185730Z/rc/32590059813/kin-linux-x86_64/kin-linux-x86_64.tar.gz",
+      "verdict": "PASS",
+      "magic_repro": "not run",
+      "result_path": "/private/tmp/kpf/20260822T185730Z/legs/linux-amd642/result.json",
+      "result": {
+        "schema": "kin.release-preflight.leg.v1",
+        "leg": "linux-amd642",
+        "citable": false,
+        "runner_os": "Linux",
+        "runner_arch": "X64",
+        "archive": {
+          "path": "/rig/dist/kin-linux-x86_64.tar.gz",
+          "sha256": "ca0e59e3e1e6cae490580b4b20b691dfadb8b2bdadb6378ec4ad4be584eca3b7"
+        },
+        "binaries": {
+          "kin": {
+            "version_line": "kin 0.5.50 (b0754c2df02eddd522de2df4f533f665578bf7e0 main 2026-08-22T18:16:06Z)"
+          },
+          "kin_daemon": {
+            "version_line": "kin-daemon 0.5.50 (b0754c2df02eddd522de2df4f533f665578bf7e0 main 2026-08-22T18:16:06Z)"
+          },
+          "stamp_sha": "b0754c2df02eddd522de2df4f533f665578bf7e0",
+          "version": "0.5.50"
+        },
+        "expected": {
+          "commit": "b0754c2df02eddd522de2df4f533f665578bf7e0",
+          "lock_sha256": "1d278c38deadf5a0de98f09673a1b86e6ed91c762823b99493eb4550c8056d95",
+          "allow_dirty": false
+        },
+        "steps": [
+          {
+            "step": "stage-archive",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 8,
+            "log": "/home/dev/preflight/logs/01-stage-archive.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "glibc-floor",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 1,
+            "log": "/home/dev/preflight/logs/02-glibc-floor.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "install",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 4,
+            "log": "/home/dev/preflight/logs/03-install.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "verify-binaries",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 1,
+            "log": "/home/dev/preflight/logs/04-verify-binaries.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "vfs-components",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 1,
+            "log": "/home/dev/preflight/logs/05-vfs-components.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "first-run",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 12,
+            "log": "/home/dev/preflight/logs/06-first-run.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "restore-captures",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 0,
+            "log": "/home/dev/preflight/logs/07-restore-captures.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "validate",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 1,
+            "log": "/home/dev/preflight/logs/08-validate.log",
+            "failing": "",
+            "tail": []
+          }
+        ],
+        "glibc_floor": {
+          "status": "PASS",
+          "detail": "/home/dev/preflight/archive/kin-linux-x86_64/kin-vfs: highest requirement GLIBC_2.30 (gettid) across 152 versioned references | /home/dev/preflight/archive/kin-linux-x86_64/libkin_vfs_shim.so: highest requirement GLIBC_2.30 (gettid) across 84 versioned references"
+        },
+        "assertions": {
+          "ported_from": {
+            "file": ".github/workflows/install-proof.yml",
+            "sha256": "2d6e120e068ffa875aefd9b28bac2375800ce29412a8c5134819f860c62f67da"
+          },
+          "counts": {
+            "PASS": 41,
+            "FAIL": 0,
+            "UNREADABLE": 0
+          },
+          "assertions": [
+            {
+              "status": "PASS",
+              "name": "installed launcher path",
+              "message": "/home/dev/preflight/home/.kin/bin/kin"
+            },
+            {
+              "status": "PASS",
+              "name": "kin-build-meta.json schema",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "cli build SHA is a full commit",
+              "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-daemon-health.json; its producer step is daemon-runtime and does not run under CPU emulation"
+            },
+            {
+              "status": "PASS",
+              "name": "cli build SHA matches the expected commit",
+              "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-daemon-health.json; its producer step is daemon-runtime and does not run under CPU emulation"
+            },
+            {
+              "status": "PASS",
+              "name": "cli release binary is clean",
+              "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-daemon-health.json; its producer step is daemon-runtime and does not run under CPU emulation"
+            },
+            {
+              "status": "PASS",
+              "name": "cli release binary proves source_known",
+              "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-daemon-health.json; its producer step is daemon-runtime and does not run under CPU emulation"
+            },
+            {
+              "status": "PASS",
+              "name": "cli Cargo.lock provenance is well formed",
+              "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-daemon-health.json; its producer step is daemon-runtime and does not run under CPU emulation"
+            },
+            {
+              "status": "PASS",
+              "name": "cli Cargo.lock provenance matches the source",
+              "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-daemon-health.json; its producer step is daemon-runtime and does not run under CPU emulation"
+            },
+            {
+              "status": "PASS",
+              "name": "daemon build SHA is a full commit",
+              "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-daemon-health.json; its producer step is daemon-runtime and does not run under CPU emulation"
+            },
+            {
+              "status": "PASS",
+              "name": "daemon build SHA matches the expected commit",
+              "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-daemon-health.json; its producer step is daemon-runtime and does not run under CPU emulation"
+            },
+            {
+              "status": "PASS",
+              "name": "daemon release binary is clean",
+              "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-daemon-health.json; its producer step is daemon-runtime and does not run under CPU emulation"
+            },
+            {
+              "status": "PASS",
+              "name": "daemon release binary proves source_known",
+              "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-daemon-health.json; its producer step is daemon-runtime and does not run under CPU emulation"
+            },
+            {
+              "status": "PASS",
+              "name": "daemon Cargo.lock provenance is well formed",
+              "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-daemon-health.json; its producer step is daemon-runtime and does not run under CPU emulation"
+            },
+            {
+              "status": "PASS",
+              "name": "daemon Cargo.lock provenance matches the source",
+              "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-daemon-health.json; its producer step is daemon-runtime and does not run under CPU emulation"
+            },
+            {
+              "status": "PASS",
+              "name": "CLI and daemon share Cargo.lock provenance",
+              "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-daemon-health.json; its producer step is daemon-runtime and does not run under CPU emulation"
+            },
+            {
+              "status": "PASS",
+              "name": "kin-status.json schema",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "bench metadata proves vector and embedding support",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-status.json embedding coverage shape",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-claude-fallback-health.json forced Claude fallback",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-claude-fallback-doctor.json forced Claude fallback",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-health.json aggregate health",
+              "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-health.json; its producer step is daemon-runtime and does not run under CPU emulation"
+            },
+            {
+              "status": "PASS",
+              "name": "kin-health.json required check statuses",
+              "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-health.json; its producer step is daemon-runtime and does not run under CPU emulation"
+            },
+            {
+              "status": "PASS",
+              "name": "kin-health.json semantic_query_readiness",
+              "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-health.json; its producer step is daemon-runtime and does not run under CPU emulation"
+            },
+            {
+              "status": "PASS",
+              "name": "kin-health.json no hard failures",
+              "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-health.json; its producer step is daemon-runtime and does not run under CPU emulation"
+            },
+            {
+              "status": "PASS",
+              "name": "kin-doctor.json aggregate health",
+              "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-doctor.json; its producer step is daemon-runtime and does not run under CPU emulation"
+            },
+            {
+              "status": "PASS",
+              "name": "kin-doctor.json required check statuses",
+              "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-doctor.json; its producer step is daemon-runtime and does not run under CPU emulation"
+            },
+            {
+              "status": "PASS",
+              "name": "kin-doctor.json semantic_query_readiness",
+              "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-doctor.json; its producer step is daemon-runtime and does not run under CPU emulation"
+            },
+            {
+              "status": "PASS",
+              "name": "kin-doctor.json no hard failures",
+              "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-doctor.json; its producer step is daemon-runtime and does not run under CPU emulation"
+            },
+            {
+              "status": "PASS",
+              "name": "lexical kin search returns the seeded hello entity",
+              "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-search.json; its producer step is daemon-runtime and does not run under CPU emulation"
+            },
+            {
+              "status": "PASS",
+              "name": "kin locate returns the seeded probe.py graph artifact",
+              "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-locate.json; its producer step is daemon-runtime and does not run under CPU emulation"
+            },
+            {
+              "status": "PASS",
+              "name": "MCP client configs bind the installed launcher",
+              "message": "9 configs"
+            },
+            {
+              "status": "PASS",
+              "name": "Antigravity legacy repair preserved user policy",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "bounded clean-install embedding reached full coverage",
+              "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-embed.json; its producer step is daemon-runtime and does not run under CPU emulation"
+            },
+            {
+              "status": "PASS",
+              "name": "kin-embedded-status.json schema",
+              "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-embedded-status.json; its producer step is daemon-runtime and does not run under CPU emulation"
+            },
+            {
+              "status": "PASS",
+              "name": "kin-embedded-status.json embedding coverage shape",
+              "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-embedded-status.json; its producer step is daemon-runtime and does not run under CPU emulation"
+            },
+            {
+              "status": "PASS",
+              "name": "Unix status observed embedding coverage after settle",
+              "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-embedded-status.json; its producer step is daemon-runtime and does not run under CPU emulation"
+            },
+            {
+              "status": "PASS",
+              "name": "Unix status proves complete observed embedding coverage",
+              "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-embedded-status.json; its producer step is daemon-runtime and does not run under CPU emulation"
+            },
+            {
+              "status": "PASS",
+              "name": "kin-embedded-health.json healthy with semantic readiness",
+              "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-embedded-health.json; its producer step is daemon-runtime and does not run under CPU emulation"
+            },
+            {
+              "status": "PASS",
+              "name": "kin-embedded-doctor.json healthy with semantic readiness",
+              "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-embedded-doctor.json; its producer step is daemon-runtime and does not run under CPU emulation"
+            },
+            {
+              "status": "PASS",
+              "name": "semantic kin search returns the seeded hello entity",
+              "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-semantic-search.json; its producer step is daemon-runtime and does not run under CPU emulation"
+            },
+            {
+              "status": "PASS",
+              "name": "semantic kin locate proves complete coverage and returns probe.py",
+              "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-semantic-locate.json; its producer step is daemon-runtime and does not run under CPU emulation"
+            }
+          ]
+        },
+        "magic_repro": null,
+        "failing": [],
+        "unreadable": [],
+        "waived": [
+          {
+            "name": "cli build SHA is a full commit",
+            "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-daemon-health.json; its producer step is daemon-runtime and does not run under CPU emulation"
+          },
+          {
+            "name": "cli build SHA matches the expected commit",
+            "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-daemon-health.json; its producer step is daemon-runtime and does not run under CPU emulation"
+          },
+          {
+            "name": "cli release binary is clean",
+            "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-daemon-health.json; its producer step is daemon-runtime and does not run under CPU emulation"
+          },
+          {
+            "name": "cli release binary proves source_known",
+            "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-daemon-health.json; its producer step is daemon-runtime and does not run under CPU emulation"
+          },
+          {
+            "name": "cli Cargo.lock provenance is well formed",
+            "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-daemon-health.json; its producer step is daemon-runtime and does not run under CPU emulation"
+          },
+          {
+            "name": "cli Cargo.lock provenance matches the source",
+            "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-daemon-health.json; its producer step is daemon-runtime and does not run under CPU emulation"
+          },
+          {
+            "name": "daemon build SHA is a full commit",
+            "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-daemon-health.json; its producer step is daemon-runtime and does not run under CPU emulation"
+          },
+          {
+            "name": "daemon build SHA matches the expected commit",
+            "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-daemon-health.json; its producer step is daemon-runtime and does not run under CPU emulation"
+          },
+          {
+            "name": "daemon release binary is clean",
+            "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-daemon-health.json; its producer step is daemon-runtime and does not run under CPU emulation"
+          },
+          {
+            "name": "daemon release binary proves source_known",
+            "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-daemon-health.json; its producer step is daemon-runtime and does not run under CPU emulation"
+          },
+          {
+            "name": "daemon Cargo.lock provenance is well formed",
+            "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-daemon-health.json; its producer step is daemon-runtime and does not run under CPU emulation"
+          },
+          {
+            "name": "daemon Cargo.lock provenance matches the source",
+            "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-daemon-health.json; its producer step is daemon-runtime and does not run under CPU emulation"
+          },
+          {
+            "name": "CLI and daemon share Cargo.lock provenance",
+            "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-daemon-health.json; its producer step is daemon-runtime and does not run under CPU emulation"
+          },
+          {
+            "name": "kin-health.json aggregate health",
+            "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-health.json; its producer step is daemon-runtime and does not run under CPU emulation"
+          },
+          {
+            "name": "kin-health.json required check statuses",
+            "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-health.json; its producer step is daemon-runtime and does not run under CPU emulation"
+          },
+          {
+            "name": "kin-health.json semantic_query_readiness",
+            "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-health.json; its producer step is daemon-runtime and does not run under CPU emulation"
+          },
+          {
+            "name": "kin-health.json no hard failures",
+            "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-health.json; its producer step is daemon-runtime and does not run under CPU emulation"
+          },
+          {
+            "name": "kin-doctor.json aggregate health",
+            "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-doctor.json; its producer step is daemon-runtime and does not run under CPU emulation"
+          },
+          {
+            "name": "kin-doctor.json required check statuses",
+            "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-doctor.json; its producer step is daemon-runtime and does not run under CPU emulation"
+          },
+          {
+            "name": "kin-doctor.json semantic_query_readiness",
+            "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-doctor.json; its producer step is daemon-runtime and does not run under CPU emulation"
+          },
+          {
+            "name": "kin-doctor.json no hard failures",
+            "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-doctor.json; its producer step is daemon-runtime and does not run under CPU emulation"
+          },
+          {
+            "name": "lexical kin search returns the seeded hello entity",
+            "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-search.json; its producer step is daemon-runtime and does not run under CPU emulation"
+          },
+          {
+            "name": "kin locate returns the seeded probe.py graph artifact",
+            "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-locate.json; its producer step is daemon-runtime and does not run under CPU emulation"
+          },
+          {
+            "name": "bounded clean-install embedding reached full coverage",
+            "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-embed.json; its producer step is daemon-runtime and does not run under CPU emulation"
+          },
+          {
+            "name": "kin-embedded-status.json schema",
+            "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-embedded-status.json; its producer step is daemon-runtime and does not run under CPU emulation"
+          },
+          {
+            "name": "kin-embedded-status.json embedding coverage shape",
+            "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-embedded-status.json; its producer step is daemon-runtime and does not run under CPU emulation"
+          },
+          {
+            "name": "Unix status observed embedding coverage after settle",
+            "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-embedded-status.json; its producer step is daemon-runtime and does not run under CPU emulation"
+          },
+          {
+            "name": "Unix status proves complete observed embedding coverage",
+            "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-embedded-status.json; its producer step is daemon-runtime and does not run under CPU emulation"
+          },
+          {
+            "name": "kin-embedded-health.json healthy with semantic readiness",
+            "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-embedded-health.json; its producer step is daemon-runtime and does not run under CPU emulation"
+          },
+          {
+            "name": "kin-embedded-doctor.json healthy with semantic readiness",
+            "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-embedded-doctor.json; its producer step is daemon-runtime and does not run under CPU emulation"
+          },
+          {
+            "name": "semantic kin search returns the seeded hello entity",
+            "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-semantic-search.json; its producer step is daemon-runtime and does not run under CPU emulation"
+          },
+          {
+            "name": "semantic kin locate proves complete coverage and returns probe.py",
+            "message": "WAIVED emulated leg: capture missing: /home/dev/preflight/w/kin-install-proof/kin-semantic-locate.json; its producer step is daemon-runtime and does not run under CPU emulation"
+          }
+        ],
+        "verdict": "PASS"
+      }
+    },
+    {
+      "name": "host (macos-aarch64, archive)",
+      "kind": "host",
+      "target": "kin-macos-aarch64",
+      "archive": "/private/tmp/kpf/20260822T185730Z/rc/32590059813/kin-macos-aarch64/kin-macos-aarch64.tar.gz",
+      "verdict": "PASS",
+      "magic_repro": "PASS (13 pass, 0 fail, 0 unreadable of 13)",
+      "result_path": "/private/tmp/kpf/20260822T185730Z/legs/host3/result.json",
+      "result": {
+        "schema": "kin.release-preflight.leg.v1",
+        "leg": "host3",
+        "citable": false,
+        "runner_os": "macOS",
+        "runner_arch": "ARM64",
+        "archive": {
+          "path": "/private/tmp/kpf/20260822T185730Z/rc/32590059813/kin-macos-aarch64/kin-macos-aarch64.tar.gz",
+          "sha256": "7e97a0ebf8b1eb9ffbbe52ab8507d570b5d0d9ca97132874c7c75ad40595f7cd"
+        },
+        "binaries": {
+          "kin": {
+            "version_line": "kin 0.5.50 (b0754c2df02eddd522de2df4f533f665578bf7e0 main 2026-08-22T18:17:03Z)"
+          },
+          "kin_daemon": {
+            "version_line": "kin-daemon 0.5.50 (b0754c2df02eddd522de2df4f533f665578bf7e0 main 2026-08-22T18:17:03Z)"
+          },
+          "stamp_sha": "b0754c2df02eddd522de2df4f533f665578bf7e0",
+          "version": "0.5.50"
+        },
+        "expected": {
+          "commit": "b0754c2df02eddd522de2df4f533f665578bf7e0",
+          "lock_sha256": "1d278c38deadf5a0de98f09673a1b86e6ed91c762823b99493eb4550c8056d95",
+          "allow_dirty": false
+        },
+        "steps": [
+          {
+            "step": "stage-archive",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 2,
+            "log": "/private/tmp/kpf/20260822T185730Z/legs/host3/logs/01-stage-archive.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "install",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 2,
+            "log": "/private/tmp/kpf/20260822T185730Z/legs/host3/logs/02-install.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "verify-binaries",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 2,
+            "log": "/private/tmp/kpf/20260822T185730Z/legs/host3/logs/03-verify-binaries.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "vfs-components",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 0,
+            "log": "/private/tmp/kpf/20260822T185730Z/legs/host3/logs/04-vfs-components.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "first-run",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 20,
+            "log": "/private/tmp/kpf/20260822T185730Z/legs/host3/logs/05-first-run.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "graph-query-mcp",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 4,
+            "log": "/private/tmp/kpf/20260822T185730Z/legs/host3/logs/06-graph-query-mcp.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "vfs-projection",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 1,
+            "log": "/private/tmp/kpf/20260822T185730Z/legs/host3/logs/07-vfs-projection.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "embedding-retrieval",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 5,
+            "log": "/private/tmp/kpf/20260822T185730Z/legs/host3/logs/08-embedding-retrieval.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "restore-captures",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 0,
+            "log": "/private/tmp/kpf/20260822T185730Z/legs/host3/logs/09-restore-captures.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "validate",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 0,
+            "log": "/private/tmp/kpf/20260822T185730Z/legs/host3/logs/10-validate.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "magic-repro",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 94,
+            "log": "/private/tmp/kpf/20260822T185730Z/legs/host3/logs/11-magic-repro.log",
+            "failing": "",
+            "tail": []
+          }
+        ],
+        "glibc_floor": null,
+        "assertions": {
+          "ported_from": {
+            "file": ".github/workflows/install-proof.yml",
+            "sha256": "2d6e120e068ffa875aefd9b28bac2375800ce29412a8c5134819f860c62f67da"
+          },
+          "counts": {
+            "PASS": 41,
+            "FAIL": 0,
+            "UNREADABLE": 0
+          },
+          "assertions": [
+            {
+              "status": "PASS",
+              "name": "installed launcher path",
+              "message": "/private/tmp/kpf/20260822T185730Z/legs/host3/home/.kin/bin/kin"
+            },
+            {
+              "status": "PASS",
+              "name": "kin-build-meta.json schema",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "cli build SHA is a full commit",
+              "message": "b0754c2df02eddd522de2df4f533f665578bf7e0"
+            },
+            {
+              "status": "PASS",
+              "name": "cli build SHA matches the expected commit",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "cli release binary is clean",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "cli release binary proves source_known",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "cli Cargo.lock provenance is well formed",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "cli Cargo.lock provenance matches the source",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "daemon build SHA is a full commit",
+              "message": "b0754c2df02eddd522de2df4f533f665578bf7e0"
+            },
+            {
+              "status": "PASS",
+              "name": "daemon build SHA matches the expected commit",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "daemon release binary is clean",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "daemon release binary proves source_known",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "daemon Cargo.lock provenance is well formed",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "daemon Cargo.lock provenance matches the source",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "CLI and daemon share Cargo.lock provenance",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-status.json schema",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "bench metadata proves vector and embedding support",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-status.json embedding coverage shape",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-claude-fallback-health.json forced Claude fallback",
+              "message": "WAIVED host divergence: mcp_client_cursor, mcp_client_antigravity detected through /Applications on this host (a hosted runner has no such app); PATH- and HOME-detected clients were still required absent"
+            },
+            {
+              "status": "PASS",
+              "name": "kin-claude-fallback-doctor.json forced Claude fallback",
+              "message": "WAIVED host divergence: mcp_client_cursor, mcp_client_antigravity detected through /Applications on this host (a hosted runner has no such app); PATH- and HOME-detected clients were still required absent"
+            },
+            {
+              "status": "PASS",
+              "name": "kin-health.json aggregate health",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-health.json required check statuses",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-health.json semantic_query_readiness",
+              "message": "pending"
+            },
+            {
+              "status": "PASS",
+              "name": "kin-health.json no hard failures",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-doctor.json aggregate health",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-doctor.json required check statuses",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-doctor.json semantic_query_readiness",
+              "message": "pending"
+            },
+            {
+              "status": "PASS",
+              "name": "kin-doctor.json no hard failures",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "lexical kin search returns the seeded hello entity",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin locate returns the seeded probe.py graph artifact",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "MCP client configs bind the installed launcher",
+              "message": "9 configs"
+            },
+            {
+              "status": "PASS",
+              "name": "Antigravity legacy repair preserved user policy",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "bounded clean-install embedding reached full coverage",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-embedded-status.json schema",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-embedded-status.json embedding coverage shape",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "Unix status observed embedding coverage after settle",
+              "message": "bounded settle (kin status --wait-quiesce 60)"
+            },
+            {
+              "status": "PASS",
+              "name": "Unix status proves complete observed embedding coverage",
+              "message": "indexed 4/4"
+            },
+            {
+              "status": "PASS",
+              "name": "kin-embedded-health.json healthy with semantic readiness",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-embedded-doctor.json healthy with semantic readiness",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "semantic kin search returns the seeded hello entity",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "semantic kin locate proves complete coverage and returns probe.py",
+              "message": "semantic_coverage={\"supported\":true,\"indexed\":4,\"total\":4,\"pending\":0,\"complete\":true,\"embedding_state\":\"present\",\"read_at\":\"2026-08-22T18:59:26Z\",\"graph_bodies\":{\"source_paths\":1,\"with_body\":1,\"gap_paths\":0}}"
+            }
+          ]
+        },
+        "magic_repro": {
+          "version": "kin 0.5.50 (b0754c2df02eddd522de2df4f533f665578bf7e0 main 2026-08-22T18:17:03Z)",
+          "counts": {
+            "PASS": 13,
+            "FAIL": 0,
+            "UNREADABLE": 0
+          },
+          "total": 13,
+          "checks": [
+            {
+              "id": "0",
+              "ticket": "GPU-OPTOUT",
+              "status": "PASS",
+              "detail": "embeddings indexed=0/44"
+            },
+            {
+              "id": "1",
+              "ticket": "FIR-2354",
+              "status": "PASS",
+              "detail": "find_references(parse_note) crosses into storage.py"
+            },
+            {
+              "id": "2",
+              "ticket": "FIR-2353",
+              "status": "PASS",
+              "detail": "references returned (1), so the absence path is not exercised"
+            },
+            {
+              "id": "3",
+              "ticket": "FIR-2357",
+              "status": "PASS",
+              "detail": "all three calling files returned: ['pkg/linkgraph.py', 'pkg/parsing.py', 'pkg/storage.py']"
+            },
+            {
+              "id": "4",
+              "ticket": "FIR-2356",
+              "status": "PASS",
+              "detail": "coverage is not reported incomplete (graph status reports 10 of 24 relations cross-file)"
+            },
+            {
+              "id": "5",
+              "ticket": "FIR-2360",
+              "status": "PASS",
+              "detail": "the ambiguous receiver in Session.drain produced 1 edge(s)"
+            },
+            {
+              "id": "6",
+              "ticket": "FIR-2361",
+              "status": "PASS",
+              "detail": "truncation is localized per step"
+            },
+            {
+              "id": "7",
+              "ticket": "FIR-2362",
+              "status": "PASS",
+              "detail": "relations per entity 3.87"
+            },
+            {
+              "id": "8",
+              "ticket": "FIR-2359",
+              "status": "PASS",
+              "detail": "context pack carries no decimal byte arrays (11393 chars)"
+            },
+            {
+              "id": "9",
+              "ticket": "FIR-2358",
+              "status": "PASS",
+              "detail": "graph validate does not read as a completeness bill"
+            },
+            {
+              "id": "12",
+              "ticket": "FIR-2605",
+              "status": "PASS",
+              "detail": "the row for legacy_shim carries no unverified label"
+            },
+            {
+              "id": "13",
+              "ticket": "FIR-2504",
+              "status": "PASS",
+              "detail": "the provenance field moves both ways: repository while set, kin's own default once cleared"
+            },
+            {
+              "id": "14",
+              "ticket": "FIR-2135",
+              "status": "PASS",
+              "detail": "status is live again once the store settles"
+            }
+          ],
+          "verdict": "PASS"
+        },
+        "failing": [],
+        "unreadable": [],
+        "waived": [
+          {
+            "name": "kin-claude-fallback-health.json forced Claude fallback",
+            "message": "WAIVED host divergence: mcp_client_cursor, mcp_client_antigravity detected through /Applications on this host (a hosted runner has no such app); PATH- and HOME-detected clients were still required absent"
+          },
+          {
+            "name": "kin-claude-fallback-doctor.json forced Claude fallback",
+            "message": "WAIVED host divergence: mcp_client_cursor, mcp_client_antigravity detected through /Applications on this host (a hosted runner has no such app); PATH- and HOME-detected clients were still required absent"
+          }
+        ],
+        "verdict": "PASS"
+      }
+    }
+  ],
+  "run_root": "/private/tmp/kpf/20260822T185730Z",
+  "log": "/private/tmp/kpf/20260822T185730Z/preflight.log"
+}
