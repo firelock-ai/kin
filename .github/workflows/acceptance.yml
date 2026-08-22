@@ -87,6 +87,12 @@ jobs:
       # The gate decides this job, so it gets the same treatment. Every rule it
       # enforces is exercised against its inverse, including the ones that keep
       # its allowance list from becoming a way to stop enforcing.
+      # Same treatment, same reason: this suite's graders decide whether a store
+      # that hid a parse hole reads as healthy, and each of its cases is paired
+      # with the input that must produce the opposite verdict.
+      - name: Falsify the parse-hole verdict graders
+        run: python3 scripts/acceptance/parse_hole_repro.py --self-test
+
       - name: Falsify the acceptance gate
         run: python3 scripts/acceptance/gate.py --self-test
 
@@ -287,6 +293,34 @@ jobs:
             echo "::error title=Response budget elision suite failed::exit $rc (1 FAIL, 2 UNREADABLE, 3 setup); see the CHECK lines above"
           fi
 
+      - name: Parse-hole acceptance suite
+        id: parsehole
+        if: always()
+        env:
+          KIN_ACCEPTANCE_LABEL: ${{ github.event_name }}-${{ github.sha }}
+        run: |
+          set -uo pipefail
+          mkdir -p acceptance
+          rc=0
+          python3 scripts/acceptance/parse_hole_repro.py \
+            --kin target/release/kin \
+            --daemon target/release/kin-daemon \
+            --json acceptance/parsehole.json \
+            --label "$KIN_ACCEPTANCE_LABEL" \
+            --verbose >acceptance/parsehole.log 2>&1 || rc=$?
+          cat acceptance/parsehole.log
+          {
+            echo "### Parse-hole acceptance suite (exit $rc)"
+            echo ''
+            echo '```'
+            grep -E '^CHECK ' acceptance/parsehole.log || echo '(no CHECK line was printed)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error title=Parse-hole acceptance suite failed::exit $rc (1 FAIL, 2 UNREADABLE, 3 setup); see the CHECK lines above"
+          fi
+
       # Always, including on a cancelled or timed-out run: the reports are how a
       # failure is diagnosed without re-running the job.
       - name: Upload the acceptance reports
@@ -313,4 +347,5 @@ jobs:
             --report magic=acceptance/magic.json \
             --report brownfield=acceptance/brownfield.json \
             --report response_budget=acceptance/response_budget.json \
+            --report parsehole=acceptance/parsehole.json \
             --allow-unreadable 'brownfield:4=FIR-2593: the express app.handle walk comes back truncated=True with clipped_steps=None on ubuntu-latest, so an absent edge cannot be told from a dropped one. Build profile, product code from 0.5.44 through 0.5.46, and the pinned language-server versions are all ruled out; platform and code newer than 0.5.46 are still confounded. The moment the check passes this allowance announces itself stale and can go.'

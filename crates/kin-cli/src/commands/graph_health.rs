@@ -152,8 +152,16 @@ pub(crate) fn inspect_graph_with_entities(
     let supported_inputs = collect_supported_inputs(&resolved_tree);
     let contamination = collect_contamination(graph, entities)?;
     let artifact_coverage = collect_repository_artifact_coverage(authority, graph, &resolved_tree)?;
+    // Parse coverage rides on the reference-edge coverage type rather than
+    // beside it, because that module is the one graph-completeness vocabulary
+    // and a reader must not be handed two sections with two denominators. The
+    // census is collected separately because the reference collector starts
+    // from the entity table, and a file that produced no entity is invisible to
+    // it by construction: that is exactly the population a parse hole lives in.
     let reference_edge_coverage =
-        kin_core::reference_coverage::collect_reference_edge_coverage(graph)?;
+        kin_core::reference_coverage::collect_reference_edge_coverage(graph)?.with_parse_coverage(
+            kin_core::reference_coverage::collect_parse_coverage_from(&resolved_tree, entities),
+        );
     Ok(build_graph_health_report(
         &stats,
         &supported_inputs,

@@ -453,12 +453,35 @@ pub struct ReferenceEdgeCoverage {
     /// surface may render a zero for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub totals: Option<GraphRelationTotals>,
+    /// Parse coverage of the same graph, when the caller measured it.
+    ///
+    /// Carried here rather than beside this type because this module is the one
+    /// graph-completeness vocabulary, and a reader arriving at a status page
+    /// with "why does Kin not know about this file" must not be handed two
+    /// sections with two denominators. `None` means nobody counted, which is
+    /// not the same as a graph whose files are all parsed, so no surface may
+    /// render an all-clear for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parse: Option<ParseCoverageCensus>,
 }
 
 impl ReferenceEdgeCoverage {
     /// Attach the whole-graph totals the caller already counted.
     pub fn with_totals(mut self, totals: GraphRelationTotals) -> Self {
         self.totals = Some(totals);
+        self
+    }
+
+    /// Attach the parse census the caller collected from the repository tree.
+    ///
+    /// Kept off the collector for the reason [`Self::with_language_servers`] is:
+    /// this module's collector starts from the entity table and a file with no
+    /// entities is invisible to it by construction, which is precisely the
+    /// population a parse hole lives in. The census reads the repository tree
+    /// and the layout table instead, and [`collect_parse_coverage`] is where it
+    /// comes from.
+    pub fn with_parse_coverage(mut self, parse: ParseCoverageCensus) -> Self {
+        self.parse = Some(parse);
         self
     }
 
@@ -536,6 +559,15 @@ impl ReferenceEdgeCoverage {
     /// denominators the other was using.
     pub fn summary_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
+        // Parse coverage first, because it is the denominator every line under
+        // it inherits. A language whose files never reached an adapter has no
+        // parsed call site to resolve and no entity to hold an edge, so a
+        // resolved-edge ratio computed over it describes the part of the
+        // repository Kin managed to read rather than the repository.
+        if let Some(parse) = self.parse.as_ref() {
+            lines.extend(parse.summary_lines());
+            lines.push(String::new());
+        }
         if let Some(totals) = self.totals {
             lines.push(format!(
                 "Cross-file entity relations: {} of {} across all relation kinds ({} artifact \
@@ -860,6 +892,7 @@ where
         .collect();
 
     Ok(ReferenceEdgeCoverage {
+        parse: None,
         languages,
         totals: None,
     })
@@ -899,6 +932,280 @@ fn read_count(entity: &Entity, key: &str) -> Option<u64> {
         .get(key)
         .and_then(|value| value.as_u64())
 }
+
+/// Silent paths named on a status line before it stops being readable.
+const PARSE_HOLE_SAMPLE: usize = 5;
+
+/// The tag every sentence about a file that produced nothing opens with, for a
+/// caller keying on the class rather than reading the prose.
+///
+/// `no_entity` rather than `parse_hole`, because this census cannot establish
+/// that a parse failed. It can establish that a file the tree admits produced
+/// nothing, which is what the word says.
+pub const NO_ENTITY_OBSERVATION: &str = "no_entity";
+
+/// How many of one language's admitted files reached the entity table.
+///
+/// The denominator is the repository tree's own admitted file set, not the set
+/// of files that produced an entity. Every other counter in this module starts
+/// from an entity and therefore cannot see a file that produced none, which is
+/// the population the express run counted when it reported 75 of 141.
+///
+/// This type carries no verdict, and the reason is measured rather than
+/// cautious. A file that produced no entity is not necessarily one the
+/// extractor failed on: a side-effect script, a re-export and a comment-only
+/// file each correctly produce nothing. On a five-file JavaScript repository
+/// holding one real module beside one of each, this reads 1/5, a LOWER ratio
+/// than the express checkout the census was built for. Nothing in graph-owned
+/// state separates the two readings today, so the count is published with the
+/// paths beside it and the reading is left to someone who can open them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LanguageParseCoverage {
+    pub language: String,
+    /// Files of this language the repository tree admits and a full adapter is
+    /// registered for.
+    pub tracked: usize,
+    /// Of those, how many produced at least one entity.
+    pub with_entities: usize,
+    /// Of those, how many produced none.
+    pub silent: usize,
+    /// Silent paths, shallowest first, then alphabetical.
+    ///
+    /// Shallowest rather than largest, and the ordering is named on the line
+    /// that prints it. The repository tree records a blob hash per path and no
+    /// size, so a "biggest files" ranking would be the one part of this report
+    /// a reader could not check against the store.
+    pub sample: Vec<String>,
+}
+
+impl LanguageParseCoverage {
+    /// Percent of this language's admitted files that produced an entity.
+    pub fn entity_percent(&self) -> Option<usize> {
+        (self.tracked > 0).then(|| self.with_entities.saturating_mul(100) / self.tracked)
+    }
+
+    /// The one sentence a surface prints naming this language's silent files.
+    pub fn silent_sentence(&self) -> String {
+        let named = if self.sample.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ", including {} (shallowest paths first)",
+                self.sample.join(", ")
+            )
+        };
+        format!(
+            "{NO_ENTITY_OBSERVATION}: {} of {} admitted {} files produced no entity{named}",
+            self.silent, self.tracked, self.language
+        )
+    }
+}
+
+/// Parse coverage of a whole graph, one row per language.
+///
+/// Collected from the repository tree and the layout table rather than from the
+/// entity table, so it can count the files every other counter here is blind
+/// to. See [`collect_parse_coverage`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParseCoverageCensus {
+    pub languages: Vec<LanguageParseCoverage>,
+}
+
+impl ParseCoverageCensus {
+    /// One sentence per language holding a file that produced no entity.
+    ///
+    /// Disclosure, never a verdict. A caller rendering these must not treat a
+    /// non-empty result as a defect it has established.
+    pub fn silent_file_lines(&self) -> Vec<String> {
+        self.languages
+            .iter()
+            .filter(|language| language.silent > 0)
+            .map(LanguageParseCoverage::silent_sentence)
+            .collect()
+    }
+
+    /// Terminal rendering, one line per language that admits a file.
+    ///
+    /// Rendered in every state, including the whole-clean one. A section that
+    /// fell silent when every file produced an entity would be
+    /// indistinguishable from a build that never measured it.
+    pub fn summary_lines(&self) -> Vec<String> {
+        if self.languages.is_empty() {
+            return vec![
+                "Parse coverage: the repository tree admits no file a full adapter parses"
+                    .to_string(),
+            ];
+        }
+        let mut lines =
+            vec!["Parse coverage (files that produced an entity / files admitted):".to_string()];
+        for language in &self.languages {
+            let percent = language
+                .entity_percent()
+                .map(|percent| format!(" ({percent}%)"))
+                .unwrap_or_default();
+            lines.push(format!(
+                "  {}: {}/{}{percent}",
+                language.language, language.with_entities, language.tracked
+            ));
+        }
+        for line in self.silent_file_lines() {
+            lines.push(format!("  {line}"));
+        }
+        lines.push(
+            "  A file that produced no entity is absent from every enumeration, caller count and \
+             dead-code answer over it rather than reported as a gap in one. It is NOT on its own \
+             evidence that anything failed: a side-effect script, a re-export and a comment-only \
+             file each correctly produce nothing, and no graph-owned signal separates those from \
+             a file an adapter could not read. Open the named paths to tell them apart."
+                .to_string(),
+        );
+        lines
+    }
+}
+
+/// Measure parse coverage against graph truth alone.
+///
+/// Two graph-owned reads and no filesystem walk. The repository tree says which
+/// paths this graph admits; the entity table says which of them produced
+/// anything. `kin_index::FileClassifier` and the adapter registry are consulted
+/// about the path STRING the tree already holds, which is the same
+/// classification `collect_supported_inputs` performs to print the admitted
+/// count, and neither opens a file.
+///
+/// The signal is entity presence rather than a parsed layout, and that was
+/// measured rather than assumed. A correctly admitted repository whose entities
+/// all extracted carries ZERO rows in `list_file_layouts`: the layout table is
+/// not part of the workspace graph snapshot a query is answered from, so a
+/// census keyed on it would report every healthy store as a total parse hole
+/// and could never do anything else. Entity presence is the reading the express
+/// run itself quoted ("75 of 141 files produce no entity") and the one every
+/// query actually answers from.
+pub fn collect_parse_coverage(
+    graph: &kin_db::InMemoryGraph,
+) -> Result<ParseCoverageCensus, kin_db::KinDbError> {
+    let resolved_tree = graph.resolved_tree();
+    let entities = graph.list_all_entities()?;
+    Ok(collect_parse_coverage_from(&resolved_tree, &entities))
+}
+
+/// The census rule with both graph readings as inputs, so every branch is
+/// testable without a store.
+///
+/// The two readings are not fenced against each other, and the caller decides
+/// the order. Reading the tree FIRST is the safe order: a file admitted between
+/// the two reads is then absent from the tree and present in the entity list,
+/// which under-reports silence. The reverse order puts it in the tree and not
+/// in the entity list, which invents a silent file that parsed fine.
+/// `collect_parse_coverage` below takes them in the safe order.
+/// `graph_health` takes its entity listing from the response renderer before it
+/// clones the tree, so it takes them in the other one.
+///
+/// That is recorded rather than fixed because the cost of being wrong here is
+/// now one transient row in a disclosure, and it was a refusal only while this
+/// module carried a verdict. Fixing it properly means fencing both reads behind
+/// one epoch the way `mcp_graph_status_with_stable_authority` does, which is a
+/// change to the report's whole read discipline rather than to this function.
+pub fn collect_parse_coverage_from(
+    resolved_tree: &kin_model::ResolvedTree,
+    entities: &[Entity],
+) -> ParseCoverageCensus {
+    let registry = kin_parser::AdapterRegistry::new();
+    let producing: HashSet<&str> = entities
+        .iter()
+        .filter(|entity| !kin_index::is_external_reference_target(entity))
+        .filter_map(|entity| entity.file_origin.as_ref().map(|file| file.0.as_str()))
+        .collect();
+    let mut tallies: BTreeMap<String, ParseTally> = BTreeMap::new();
+
+    for artifact in resolved_tree.artifacts_by_path() {
+        if !matches!(artifact.entry, kin_model::TreeEntry::Blob { .. }) {
+            continue;
+        }
+        let Some(path) = artifact.path.as_utf8() else {
+            continue;
+        };
+        // Only files a FULL adapter is registered for. A shallow-syntax file
+        // produces no entity by construction, so counting one as a hole would
+        // report a gap where the design says there is none, and the express
+        // shape is entirely inside the full-adapter set.
+        if !matches!(
+            kin_index::FileClassifier::classify(std::path::Path::new(path)),
+            kin_index::FileClassification::EntitySource
+        ) {
+            continue;
+        }
+        let extension = std::path::Path::new(path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default();
+        // `.h` is left out rather than guessed at. Ingest resolves the C/C++
+        // collision by reading the file (`get_by_extension_and_content`), and
+        // this census reads no file, so the only answer available here is the
+        // one the extension gives: C. Counting a C++ project's headers under a
+        // `c` row would name a language the repository does not hold, one line
+        // above a reference-edge section keying on the entity's own language
+        // that shows `cpp` and no `c` row at all. Worse, adding real C files
+        // would dilute the same header shortfall out of the report. A number
+        // that cannot be attributed is left out rather than attributed wrongly.
+        if extension == "h" {
+            continue;
+        }
+        let Some(adapter) = registry.get_by_extension(extension) else {
+            continue;
+        };
+        let tally = tallies
+            .entry(adapter.language_id().to_string())
+            .or_default();
+        tally.tracked += 1;
+        if producing.contains(path) {
+            tally.with_entities += 1;
+        } else {
+            tally.silent += 1;
+            tally.silent_paths.push(path.to_string());
+        }
+    }
+
+    ParseCoverageCensus {
+        languages: tallies
+            .into_iter()
+            .map(|(language, tally)| tally.into_row(language))
+            .collect(),
+    }
+}
+
+#[derive(Default)]
+struct ParseTally {
+    tracked: usize,
+    with_entities: usize,
+    silent: usize,
+    silent_paths: Vec<String>,
+}
+
+impl ParseTally {
+    fn into_row(mut self, language: String) -> LanguageParseCoverage {
+        // Shallowest first, then alphabetical, so the ordering is total and the
+        // same store always names the same files. `lib/express.js` sorts above
+        // `test/fixtures/blog/index.js` because a library root is what a reader
+        // asking "what did Kin miss" means by the biggest one.
+        self.silent_paths.sort_by(|left, right| {
+            let depth = |path: &String| path.matches('/').count();
+            depth(left).cmp(&depth(right)).then_with(|| left.cmp(right))
+        });
+        self.silent_paths.truncate(PARSE_HOLE_SAMPLE);
+        LanguageParseCoverage {
+            language,
+            tracked: self.tracked,
+            with_entities: self.with_entities,
+            silent: self.silent,
+            sample: self.silent_paths,
+        }
+    }
+}
+
+/// The tag every parse-hole sentence opens with, for a surface with room for
+/// a label but not a sentence, and for a caller keying on the class rather
+/// than reading the prose.
+pub const PARSE_HOLE_LIMITING_FACTOR: &str = "parse_hole";
 
 #[cfg(test)]
 mod tests {
@@ -1299,6 +1606,7 @@ mod tests {
     #[test]
     fn one_section_carries_both_scopes_and_names_which_is_which() {
         let coverage = ReferenceEdgeCoverage {
+            parse: None,
             languages: vec![LanguageReferenceCoverage {
                 language: "python".to_string(),
                 files: 12,
@@ -1382,6 +1690,7 @@ mod tests {
     #[test]
     fn language_server_state_is_attached_rather_than_assumed() {
         let unfilled = ReferenceEdgeCoverage {
+            parse: None,
             languages: vec![
                 language_row("python", ReferenceEnrichment::Unknown),
                 language_row("go", ReferenceEnrichment::Unknown),
@@ -1464,6 +1773,7 @@ mod tests {
         row.parsed_import_statements = Some(8);
         row.resolved_import_edges = 2;
         let coverage = ReferenceEdgeCoverage {
+            parse: None,
             languages: vec![row],
             totals: None,
         };
@@ -1544,5 +1854,244 @@ mod tests {
 
         let coverage = collect_reference_edge_coverage(&graph).unwrap();
         assert!(coverage.absence_is_supportable());
+    }
+
+    /// A repository tree admitting exactly these paths as blobs.
+    fn tree_of(paths: &[&str]) -> kin_model::ResolvedTree {
+        kin_model::ResolvedTree::from_artifacts(paths.iter().map(|path| {
+            kin_model::ResolvedArtifact::new(
+                kin_model::ArtifactId::new(),
+                kin_model::RepoPath::from_utf8(*path).expect("utf8 path"),
+                kin_model::TreeEntry::blob(Hash256::from_bytes([0u8; 32]), false),
+            )
+        }))
+        .expect("build tree")
+    }
+
+    /// One row, built by hand, so the rendering is testable without a store.
+    fn parse_row(language: &str, tracked: usize, silent: usize) -> LanguageParseCoverage {
+        LanguageParseCoverage {
+            language: language.to_string(),
+            tracked,
+            with_entities: tracked.saturating_sub(silent),
+            silent,
+            sample: (0..silent.min(PARSE_HOLE_SAMPLE))
+                .map(|index| format!("lib/file{index}.js"))
+                .collect(),
+        }
+    }
+
+    /// The census publishes a count and the paths behind it, and never a
+    /// verdict. This is the assertion that keeps it that way: a file producing
+    /// no entity is not on its own evidence that anything failed, because a
+    /// side-effect script, a re-export and a comment-only file each correctly
+    /// produce nothing, and nothing in graph-owned state separates those from a
+    /// file an adapter could not read. A change that grows a verdict here has to
+    /// delete this test to do it.
+    #[test]
+    fn the_census_reports_a_count_and_never_a_verdict() {
+        let holed = ParseCoverageCensus {
+            languages: vec![parse_row("javascript", 141, 75)],
+        };
+        let lines = holed.summary_lines();
+        let rendered = lines.join("\n");
+        assert!(
+            rendered.contains("javascript: 66/141 (46%)"),
+            "the ratio is published: {rendered}"
+        );
+        assert!(
+            rendered.contains("lib/file0.js"),
+            "the paths are published beside it: {rendered}"
+        );
+        // The caveat is allowed the words the rows are not, so the rows are what
+        // this checks. A row calling the count incomplete, or failed, or marking
+        // it with the warning glyph, claims something the store cannot back.
+        let rows: Vec<&String> = lines
+            .iter()
+            .filter(|line| !line.contains("NOT on its own evidence"))
+            .collect();
+        for barred in ["incomplete", "failed", "defect", "⚠"] {
+            assert!(
+                rows.iter().all(|line| !line.contains(barred)),
+                "no row may read as a verdict, found {barred:?}: {rows:?}"
+            );
+        }
+        assert!(
+            rendered.contains("NOT on its own evidence"),
+            "the caveat rides with the number rather than in a doc nobody opens: {rendered}"
+        );
+    }
+
+    /// A store every file of which produced an entity still prints its section.
+    /// A section that fell silent when there was nothing to report would be
+    /// indistinguishable from a build that never measured it.
+    #[test]
+    fn a_fully_producing_store_still_prints_its_numbers_and_names_no_file() {
+        let clean = ParseCoverageCensus {
+            languages: vec![parse_row("rust", 200, 0)],
+        };
+        assert!(
+            clean.silent_file_lines().is_empty(),
+            "no file is named when none is silent"
+        );
+        let rendered = clean.summary_lines().join("\n");
+        assert!(rendered.contains("rust: 200/200 (100%)"), "{rendered}");
+    }
+
+    /// Disclosure is per language, so one language's silence never speaks for
+    /// another's.
+    #[test]
+    fn each_language_is_disclosed_on_its_own_numbers() {
+        let mixed = ParseCoverageCensus {
+            languages: vec![parse_row("javascript", 10, 4), parse_row("rust", 200, 0)],
+        };
+        let lines = mixed.silent_file_lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with(NO_ENTITY_OBSERVATION), "{}", lines[0]);
+        assert!(
+            lines[0].contains("javascript") && !lines[0].contains("rust"),
+            "{}",
+            lines[0]
+        );
+    }
+
+    /// The census counts the repository tree against the entity table, and that
+    /// is the whole reason it exists: every other counter here starts from an
+    /// entity, so a file that produced none is invisible to it, and that is
+    /// exactly what a parse hole is. The fixture is the express shape in
+    /// miniature, with the library files silent and the root file producing.
+    #[test]
+    fn the_census_counts_admitted_files_that_produced_no_entity() {
+        let tree = tree_of(&[
+            "lib/express.js",
+            "lib/application.js",
+            "lib/router/index.js",
+            "index.js",
+            "README.md",
+        ]);
+        let produced = [
+            entity("createApplication", "index.js", None, None),
+            entity("handle", "lib/router/index.js", None, None),
+        ];
+
+        let census = collect_parse_coverage_from(&tree, &produced);
+        assert_eq!(census.languages.len(), 1, "{census:?}");
+        let row = &census.languages[0];
+        assert_eq!(row.language, "javascript");
+        assert_eq!(row.tracked, 4, "README.md is not a full-adapter input");
+        assert_eq!(row.with_entities, 2);
+        assert_eq!(row.silent, 2);
+        assert_eq!(
+            row.sample,
+            vec![
+                "lib/application.js".to_string(),
+                "lib/express.js".to_string()
+            ],
+            "shallowest first, then alphabetical"
+        );
+        assert_eq!(row.entity_percent(), Some(50));
+    }
+
+    /// A file the tree does not admit cannot be a hole in it, and a file the
+    /// tree admits that no adapter is registered for is not one either. Both
+    /// halves keep the denominator honest: without the first a stale entity
+    /// would inflate coverage, and without the second every Markdown file in a
+    /// repository would read as an unparsed one.
+    #[test]
+    fn only_admitted_files_a_full_adapter_claims_are_counted() {
+        let tree = tree_of(&["lib/express.js", "README.md", "Makefile"]);
+        // An entity whose file the tree no longer admits.
+        let stale = [entity("gone", "lib/removed.js", None, None)];
+        let census = collect_parse_coverage_from(&tree, &stale);
+        let row = &census.languages[0];
+        assert_eq!(
+            row.tracked, 1,
+            "only lib/express.js is a full-adapter input: {census:?}"
+        );
+        assert_eq!(
+            row.with_entities, 0,
+            "an entity on an unadmitted path credits nothing"
+        );
+        assert_eq!(row.silent, 1);
+    }
+
+    /// A `.h` file is left out of every row, because the census reads no file
+    /// and the extension alone cannot say whether a header is C or C++. The
+    /// alternative is a `c` row on a repository holding no C.
+    #[test]
+    fn a_header_is_left_out_rather_than_attributed_to_the_wrong_language() {
+        let tree = tree_of(&["src/widget.h", "src/widget.cpp", "src/other.cpp"]);
+        let census = collect_parse_coverage_from(&tree, &[]);
+        assert_eq!(census.languages.len(), 1, "{census:?}");
+        let row = &census.languages[0];
+        assert_eq!(row.language, "cpp", "the .cpp files are attributable");
+        assert_eq!(
+            row.tracked, 2,
+            "widget.h is in no row, so no c row exists to dilute or mislabel: {census:?}"
+        );
+        assert!(
+            !census
+                .languages
+                .iter()
+                .any(|language| language.language == "c"),
+            "{census:?}"
+        );
+    }
+
+    /// Ordering is a claim the store can back, and "biggest" is not one: the
+    /// repository tree records a blob hash per path and no size. A library root
+    /// must outrank a deep fixture, and the same store must always name the
+    /// same files in the same order.
+    #[test]
+    fn the_named_files_are_ordered_by_path_depth_and_never_by_a_size_nobody_recorded() {
+        let tree = tree_of(&[
+            "test/fixtures/blog/deep/a.js",
+            "lib/express.js",
+            "test/exports.js",
+            "lib/application.js",
+        ]);
+        let census = collect_parse_coverage_from(&tree, &[]);
+        let row = &census.languages[0];
+        assert_eq!(
+            row.sample,
+            vec![
+                "lib/application.js".to_string(),
+                "lib/express.js".to_string(),
+                "test/exports.js".to_string(),
+                "test/fixtures/blog/deep/a.js".to_string(),
+            ],
+            "a library root outranks a deep fixture"
+        );
+    }
+
+    /// A store the extractor read completely must not grow a section that reads
+    /// like a complaint, and a store nobody measured must not read like one
+    /// that was measured and found clean.
+    #[test]
+    fn an_unmeasured_census_is_not_an_all_clear() {
+        let unmeasured = ReferenceEdgeCoverage::default();
+        assert!(
+            unmeasured.parse.is_none(),
+            "nobody counted, so there is nothing to render"
+        );
+        assert!(
+            !unmeasured
+                .summary_lines()
+                .iter()
+                .any(|line| line.contains("Parse coverage")),
+            "an unmeasured census prints no parse section at all"
+        );
+
+        let measured = ReferenceEdgeCoverage::default().with_parse_coverage(ParseCoverageCensus {
+            languages: vec![parse_row("rust", 200, 0)],
+        });
+        assert!(
+            measured
+                .summary_lines()
+                .iter()
+                .any(|line| line.contains("rust: 200/200")),
+            "a measured and clean census still prints its section: {:?}",
+            measured.summary_lines()
+        );
     }
 }

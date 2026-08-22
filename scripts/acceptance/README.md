@@ -1,7 +1,7 @@
 # Product acceptance suites
 
-Three falsifiable suites that ask whether the product still answers correctly.
-`.github/workflows/acceptance.yml` runs all three on every pull request against
+Four falsifiable suites that ask whether the product still answers correctly.
+`.github/workflows/acceptance.yml` runs all four on every pull request against
 that pull request's own build. None is release proof; all are regression gates.
 
 Each suite prints one line per check:
@@ -33,6 +33,23 @@ count rather than damaging the graph, because the loss that started the ticket
 was 0.9% of its kind and no magnitude threshold was ever going to reach it.
 Every check names the ticket it is about, so a failure is attributable without
 reading the code.
+
+`parse_hole_repro.py` covers what the others cannot see: a file the
+repository admits that produced no entity at all. It builds a JavaScript library
+of four modules that declare a function beside three that are valid source and
+declare nothing, then asserts that `kin graph status` publishes the per-language
+ratio and names the silent paths, and that `kin doctor` carries a
+`parse_coverage` row that does the same. Each check runs the same probe against
+a control repository whose files all produce entities and asserts that no file
+is named there, so a surface that reported unconditionally fails here rather
+than passing on the control alone.
+
+It asserts no verdict, deliberately. A file that produced no entity is not on
+its own evidence that anything failed: a side-effect script, a re-export and a
+comment-only file each correctly produce nothing, and no graph-owned signal
+separates those from a file an adapter could not read. The doctor row must stay
+`healthy`, and this suite fails if it does not, because a row that went red on
+the count would go red on most JavaScript repositories.
 
 `brownfield_repro.py` covers reference enrichment on two pinned upstream trees,
 `psf/requests` and `expressjs/express`, replayed as single-commit repositories
