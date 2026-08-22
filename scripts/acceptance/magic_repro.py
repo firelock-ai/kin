@@ -2145,6 +2145,7 @@ def check_15(suite):
                 "certifications %s, so the fields carry no information about any file"
                 % (sorted(str(state) for state in states),
                    sorted(str(value) for value in certifications)))
+    return res
 
 
 # The sentence rung one, two and three all render, shared by every CLI surface
@@ -2355,6 +2356,18 @@ def main(argv):
         except Exception as exc:
             res = Result(check_id, "?", "harness failure")
             res.unknown("%s: %s" % (type(exc).__name__, str(exc)[:200]))
+        # A check that falls off the end returns None, which is legal Python and
+        # survives every syntax check, then dies four lines down dereferencing
+        # `res.id` with an AttributeError that names neither the check nor the
+        # cause. It happened here: a conflict resolution truncated one check's
+        # tail, the file still parsed, and the suite crashed after fourteen
+        # green checks. Name it as this check's own UNREADABLE instead, so the
+        # run reports which check is broken and still grades the rest.
+        if res is None:
+            res = Result(check_id, "?", "harness failure")
+            res.unknown("check %s returned no Result, so it falls off the end of its "
+                        "own body; a check that returns None cannot be graded"
+                        % check_id)
         results.append(res)
         res.prior = None if prior is None else prior.get(res.id)
         res.trend = trend_of(res.status, res.prior)
