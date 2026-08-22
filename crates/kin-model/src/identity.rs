@@ -300,6 +300,67 @@ pub(crate) fn canonical_json_bytes(value: &impl serde::Serialize) -> Result<Vec<
     Ok(encoded)
 }
 
+/// The canonical encoding of one value, appended to `output`.
+///
+/// Same bytes as [`canonical_json_bytes`] produces for that value, because it
+/// is the same walk over the same `serde_json::Value`. What differs is scope:
+/// the tree built here covers this value alone, so a caller assembling a large
+/// container can build and drop one element's tree at a time instead of holding
+/// the whole document's.
+pub(crate) fn append_canonical_value(
+    output: &mut Vec<u8>,
+    value: &impl serde::Serialize,
+) -> Result<()> {
+    let value = serde_json::to_value(value).map_err(serialization)?;
+    append_canonical_json(output, &value)
+}
+
+/// The canonical encoding of an array, materializing one element at a time.
+///
+/// This is the whole point of the incremental path. `canonical_json_bytes` over
+/// a whole transaction builds a `serde_json::Value` tree eleven times the size
+/// of the transaction, and the arrays of changes are nearly all of it. Encoding
+/// element by element bounds the tree to one element while emitting byte-for-byte
+/// what the whole-tree walk emits, because the framing below is copied from
+/// [`append_canonical_json`]'s array arm and each element goes through the same
+/// walk.
+pub(crate) fn append_canonical_seq<T: serde::Serialize>(
+    output: &mut Vec<u8>,
+    items: &[T],
+) -> Result<()> {
+    output.push(4);
+    output.extend_from_slice(
+        &u64::try_from(items.len())
+            .map_err(|_| ModelError::InvalidOperation("canonical array exceeds u64".to_string()))?
+            .to_le_bytes(),
+    );
+    for item in items {
+        append_canonical_value(output, item)?;
+    }
+    Ok(())
+}
+
+/// The header of a canonical object with a known field count.
+///
+/// Copied from [`append_canonical_json`]'s object arm. A caller that emits its
+/// own fields is responsible for emitting exactly `fields` of them, in
+/// byte-wise key order, because that is what the whole-tree walk does when it
+/// sorts a `serde_json::Map`.
+pub(crate) fn append_canonical_object_header(output: &mut Vec<u8>, fields: usize) -> Result<()> {
+    output.push(5);
+    output.extend_from_slice(
+        &u64::try_from(fields)
+            .map_err(|_| ModelError::InvalidOperation("canonical object exceeds u64".to_string()))?
+            .to_le_bytes(),
+    );
+    Ok(())
+}
+
+/// One object field's key, length-prefixed as the whole-tree walk writes it.
+pub(crate) fn append_canonical_key(output: &mut Vec<u8>, key: &str) -> Result<()> {
+    append_len_prefixed_vec_field(output, key.as_bytes())
+}
+
 fn append_canonical_json(output: &mut Vec<u8>, value: &serde_json::Value) -> Result<()> {
     match value {
         serde_json::Value::Null => output.push(0),

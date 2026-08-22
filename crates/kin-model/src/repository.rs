@@ -9,9 +9,13 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    identity::canonical_json_bytes, validate_semantic_change_id, validate_transaction_delta,
-    AuthorId, DefaultRefMutation, EffectiveAdmissionPolicyStamp, EntityDelta, ExternalChangeAlias,
-    ExternalObjectKind, ExternalObjectRecord, ExternalReferenceDelta, FrozenLocalOverlayDelta,
+    identity::{
+        append_canonical_key, append_canonical_object_header, append_canonical_seq,
+        append_canonical_value, canonical_json_bytes,
+    },
+    validate_semantic_change_id, validate_transaction_delta, AuthorId, DefaultRefMutation,
+    EffectiveAdmissionPolicyStamp, EntityDelta, ExternalChangeAlias, ExternalObjectKind,
+    ExternalObjectRecord, ExternalReferenceDelta, FrozenLocalOverlayDelta,
     GitExternalAuthorityDelta, GitObjectId, Hash256, MergeTransactionDelta, ModelError,
     OperationId, RefMutation, RefName, RefTarget, RelationDelta, RepositoryId, RepositoryRef,
     ResolvedTree, Result, SealedObservationBinding, SemanticChange, SemanticChangeId,
@@ -1229,6 +1233,93 @@ impl<'a> CanonicalTransaction<'a> {
     }
 }
 
+/// Fields the human-readable serialization always writes, before its two
+/// independently-skipping tail fields.
+///
+/// Hoisted out of the `Serialize` impl so the incremental preimage counts the
+/// same fields from the same constant rather than from a copy that can drift.
+const HUMAN_READABLE_FIELD_COUNT: usize = 15;
+
+impl CanonicalTransaction<'_> {
+    /// This transaction's canonical preimage, built one field at a time.
+    ///
+    /// Byte-for-byte what `canonical_json_bytes` over the whole view produces,
+    /// and the corpus test asserts exactly that against the whole-tree path. The
+    /// difference is what is resident while it is produced: the whole-tree path
+    /// builds a `serde_json::Value` of the entire transaction, measured at
+    /// eleven times the transaction's own size and 76 percent of the hash's
+    /// peak, where this holds one array element's tree at a time.
+    ///
+    /// Two obligations come with hand-writing the framing, and both are tested
+    /// rather than trusted.
+    ///
+    /// The fields are emitted in BYTE-WISE KEY ORDER, not in the order the
+    /// `Serialize` impl below writes them, because the whole-tree walk sorts a
+    /// `serde_json::Map` before encoding it. The order here is that sorted
+    /// order, and `the_incremental_preimage_matches_the_whole_tree_path` fails
+    /// if it drifts.
+    ///
+    /// The field COUNT must match what the human-readable branch of the
+    /// `Serialize` impl emits, including how its two tail fields skip
+    /// independently. `the_preimage_field_set_matches_the_serialized_one` fails
+    /// if a field is added to one and not the other, which is the failure that
+    /// would otherwise move every identity in every store on disk silently.
+    fn canonical_preimage(&self) -> Result<Vec<u8>> {
+        let source = self.source;
+        let field_count = HUMAN_READABLE_FIELD_COUNT
+            + usize::from(source.merge_transaction_delta.is_some())
+            + usize::from(source.sealed_observation.is_some());
+
+        let mut out = Vec::new();
+        append_canonical_object_header(&mut out, field_count)?;
+
+        append_canonical_key(&mut out, "actor")?;
+        append_canonical_value(&mut out, &source.actor)?;
+        append_canonical_key(&mut out, "aliases")?;
+        append_canonical_seq(&mut out, &self.aliases)?;
+        append_canonical_key(&mut out, "changes")?;
+        append_canonical_seq(&mut out, &self.changes)?;
+        append_canonical_key(&mut out, "default_ref_mutation")?;
+        append_canonical_value(&mut out, &source.default_ref_mutation)?;
+        append_canonical_key(&mut out, "expected_generation")?;
+        append_canonical_value(&mut out, &source.expected_generation)?;
+        append_canonical_key(&mut out, "expected_roots")?;
+        append_canonical_value(&mut out, &source.expected_roots)?;
+        append_canonical_key(&mut out, "external_objects")?;
+        append_canonical_seq(&mut out, &self.external_objects)?;
+        append_canonical_key(&mut out, "git_authority_delta")?;
+        append_canonical_value(&mut out, &source.git_authority_delta)?;
+        append_canonical_key(&mut out, "local_overlay_delta")?;
+        append_canonical_value(&mut out, &source.local_overlay_delta)?;
+        if source.merge_transaction_delta.is_some() {
+            append_canonical_key(&mut out, "merge_transaction_delta")?;
+            append_canonical_value(&mut out, &source.merge_transaction_delta)?;
+        }
+        append_canonical_key(&mut out, "operation_id")?;
+        append_canonical_value(&mut out, &source.operation_id)?;
+        // "reason" sorts before "ref_mutations": they share "re", and 'a' is
+        // below 'f'. Writing them the other way round is the mistake this
+        // ordering is easiest to make, and the corpus caught it on the first
+        // run.
+        append_canonical_key(&mut out, "reason")?;
+        append_canonical_value(&mut out, &source.reason.as_str())?;
+        append_canonical_key(&mut out, "ref_mutations")?;
+        append_canonical_seq(&mut out, &self.ref_mutations)?;
+        append_canonical_key(&mut out, "repository_id")?;
+        append_canonical_value(&mut out, &source.repository_id)?;
+        append_canonical_key(&mut out, "schema_version")?;
+        append_canonical_value(&mut out, &source.schema_version)?;
+        if source.sealed_observation.is_some() {
+            append_canonical_key(&mut out, "sealed_observation")?;
+            append_canonical_value(&mut out, &source.sealed_observation)?;
+        }
+        append_canonical_key(&mut out, "workspace_mutation")?;
+        append_canonical_value(&mut out, &self.workspace_mutation)?;
+
+        Ok(out)
+    }
+}
+
 impl Serialize for CanonicalTransaction<'_> {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
@@ -1243,7 +1334,6 @@ impl Serialize for CanonicalTransaction<'_> {
             // including its name: a serializer that records struct names must
             // see the same one. Its two tail fields skip independently on their
             // own `Option::is_none`, which is NOT the positional branch's rule.
-            const HUMAN_READABLE_FIELD_COUNT: usize = 15;
             let field_count = HUMAN_READABLE_FIELD_COUNT
                 + usize::from(source.merge_transaction_delta.is_some())
                 + usize::from(source.sealed_observation.is_some());
@@ -1688,10 +1778,8 @@ impl RepositoryTransaction {
     /// not satisfy `validate`. Callers outside tests want `transaction_hash`,
     /// which validates first.
     fn canonical_hash(&self) -> Result<Hash256> {
-        hash_serialized(
-            b"kin-repository-transaction-v4\0",
-            &CanonicalTransaction::new(self),
-        )
+        let payload = CanonicalTransaction::new(self).canonical_preimage()?;
+        hash_preimage(b"kin-repository-transaction-v4\0", &payload)
     }
 }
 
@@ -1781,6 +1869,29 @@ pub trait RepositoryAuthorityStore: Send + Sync {
 /// Canonical identity of an exact resolved repository tree.
 pub fn compute_resolved_tree_hash(tree: &ResolvedTree) -> Result<Hash256> {
     hash_serialized(b"kin-resolved-tree-v1\0", tree)
+}
+
+/// Hash a canonical payload a caller has already encoded.
+///
+/// Split from [`hash_serialized`] so a caller that assembles its preimage
+/// incrementally reaches the same domain separation and the same length prefix
+/// without going back through a whole-document `serde_json::Value`. The bytes
+/// hashed are identical either way; only who built them differs.
+fn hash_preimage(domain: &[u8], payload: &[u8]) -> Result<Hash256> {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(
+        u64::try_from(payload.len())
+            .map_err(|_| {
+                ModelError::InvalidOperation("repository transaction exceeds u64".to_string())
+            })?
+            .to_le_bytes(),
+    );
+    hasher.update(payload);
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 32];
+    bytes.copy_from_slice(&digest);
+    Ok(Hash256::from_bytes(bytes))
 }
 
 fn hash_serialized(domain: &[u8], value: &impl Serialize) -> Result<Hash256> {
@@ -3797,6 +3908,15 @@ mod tests {
     ///
     /// The counter is thread-local, so tests running in parallel in this same
     /// binary cannot contaminate it.
+    ///
+    /// One number below has moved since this table was written, and in the
+    /// direction this test is indifferent to. `canonical_hash` now builds its
+    /// preimage a field at a time rather than as one `serde_json::Value` tree,
+    /// so the borrowing arm measures roughly 2.1 MB where the table records
+    /// 8_765_641. The invariants asserted here are unaffected: the view still
+    /// costs a fraction of a clone, and removing the clone still saved
+    /// approximately the clone. The table is left as measured, because it is
+    /// the record of what removing the clone bought and not a live reading.
     #[test]
     fn the_canonicalization_does_not_allocate_a_copy_of_the_transaction() {
         let transaction = large_transaction(200);
@@ -3931,6 +4051,130 @@ mod tests {
         out
     }
 
+    /// The incremental preimage is the whole-tree preimage, byte for byte.
+    ///
+    /// This is the acceptance for building the encoding a field at a time:
+    /// the same bytes, less memory. Compared against the path it replaces
+    /// rather than against a pinned digest, so a divergence names the offset
+    /// and the bytes on both sides instead of two hashes that differ.
+    ///
+    /// It earned that reporting on its first run. Emitting `ref_mutations`
+    /// before `reason` produced encodings of identical LENGTH that differed at
+    /// one offset, because the two keys sort the other way round: they share
+    /// "re" and 'a' is below 'f'. A digest comparison would have said only that
+    /// something moved.
+    #[test]
+    fn the_incremental_preimage_matches_the_whole_tree_path() {
+        for (name, transaction) in preimage_corpus() {
+            let view = CanonicalTransaction::new(&transaction);
+            let whole = crate::identity::canonical_json_bytes(&view).unwrap();
+            let incremental = view.canonical_preimage().unwrap();
+            if whole == incremental {
+                continue;
+            }
+            let at = whole
+                .iter()
+                .zip(incremental.iter())
+                .position(|(left, right)| left != right)
+                .unwrap_or(whole.len().min(incremental.len()));
+            let from = at.saturating_sub(24);
+            panic!(
+                "`{name}` encodes differently field by field than as one tree, \
+                 first at offset {at} of {} against {}. Every transaction identity \
+                 in every store on disk is derived from these bytes.\n  whole tree {:?}\n  \
+                 incremental {:?}",
+                whole.len(),
+                incremental.len(),
+                &whole[from..(at + 24).min(whole.len())],
+                &incremental[from..(at + 24).min(incremental.len())],
+            );
+        }
+    }
+
+    /// The hand-written field list is the serialized field set, exactly.
+    ///
+    /// `canonical_preimage` writes its own keys, so a field added to the
+    /// `Serialize` impl and not to it would silently drop out of every
+    /// transaction identity, and a field added only to it would silently
+    /// invent one. Neither shows up as a compile error.
+    ///
+    /// Checked against what the serialization actually produces rather than
+    /// against a second hand-written list, because two hand-written lists drift
+    /// together.
+    #[test]
+    fn the_preimage_field_set_matches_the_serialized_one() {
+        for (name, transaction) in preimage_corpus() {
+            let view = CanonicalTransaction::new(&transaction);
+            let serde_json::Value::Object(serialized) = serde_json::to_value(&view).unwrap() else {
+                panic!("`{name}` does not serialize as an object");
+            };
+            let serialized_keys: Vec<&str> = serialized.keys().map(String::as_str).collect();
+
+            let mut written = Vec::new();
+            let mut probe = Vec::new();
+            for key in &serialized_keys {
+                probe.clear();
+                crate::identity::append_canonical_key(&mut probe, key).unwrap();
+                let encoded = view.canonical_preimage().unwrap();
+                if encoded
+                    .windows(probe.len())
+                    .any(|window| window == probe.as_slice())
+                {
+                    written.push(*key);
+                }
+            }
+            assert_eq!(
+                written, serialized_keys,
+                "`{name}` serializes {serialized_keys:?} but its preimage writes \
+                 {written:?}; a field is in one and not the other"
+            );
+        }
+    }
+
+    /// The hand-written container framing is the whole-tree framing.
+    ///
+    /// `canonical_preimage` copies the array and object framing out of
+    /// `append_canonical_json` rather than calling it, so the length prefixes
+    /// at every level are now written in two places. These are the shapes where
+    /// a framing mistake hides: nothing, one thing, and nesting, where an
+    /// off-by-one in a count is still a well-formed encoding of something else.
+    #[test]
+    fn the_hand_written_container_framing_matches_the_whole_tree_framing() {
+        fn seq_matches<T: Serialize>(label: &str, items: &[T]) {
+            let mut incremental = Vec::new();
+            crate::identity::append_canonical_seq(&mut incremental, items).unwrap();
+            let whole = crate::identity::canonical_json_bytes(&items).unwrap();
+            assert_eq!(
+                incremental, whole,
+                "the array framing for {label} differs from the whole-tree walk"
+            );
+        }
+
+        seq_matches("an empty array", &Vec::<u64>::new());
+        seq_matches("one element", &[7_u64]);
+        seq_matches("many elements", &(0..64_u64).collect::<Vec<_>>());
+        seq_matches("nested empty arrays", &[Vec::<u64>::new(), Vec::new()]);
+        seq_matches(
+            "nested arrays of differing length",
+            &[vec![1_u64], vec![], vec![2, 3, 4]],
+        );
+        seq_matches("strings that need length prefixes", &["", "a", "\u{1F9EA}"]);
+        seq_matches("options that flatten to null", &[None, Some(1_u64), None]);
+
+        // The object header is the other half, and an empty object is the case
+        // a count copied from the wrong variable still encodes cleanly.
+        for fields in [0_usize, 1, 2, 17] {
+            let mut header = Vec::new();
+            crate::identity::append_canonical_object_header(&mut header, fields).unwrap();
+            assert_eq!(header[0], 5, "an object must be tagged 5");
+            assert_eq!(
+                &header[1..],
+                (fields as u64).to_le_bytes(),
+                "an object header must carry its field count as a little-endian u64"
+            );
+        }
+    }
+
     #[test]
     fn the_canonical_preimage_is_pinned_for_every_corpus_shape() {
         let corpus = preimage_corpus();
@@ -4010,6 +4254,18 @@ mod tests {
     /// are live when the encode returns. A fix can remove either. This prices
     /// them separately so the choice is made by measurement rather than by
     /// which one is easier to write.
+    ///
+    /// Measured 6_667_601 for the tree, 8_765_641 for tree and encoding
+    /// together, and 1_619_602 for the encoding itself on a 200-change
+    /// transaction. The tree was 76 percent of the peak and eleven times the
+    /// transaction it encoded, which is what chose the fix.
+    ///
+    /// `whole_hash` no longer matches `tree_and_encoding`, and that gap IS the
+    /// fix: `canonical_hash` now builds its preimage a field at a time and holds
+    /// one array element's tree rather than the whole transaction's, so it
+    /// measures about 2_161_152 where the whole-tree path still measures
+    /// 8_765_641. The two whole-tree figures stay here because they are what the
+    /// saving is against.
     ///
     /// Reported, never asserted as a ceiling, for the reason the test above
     /// gives: a ceiling here pins the encoder and drifts with any serde change.
