@@ -954,6 +954,7 @@ fn start_or_defer_background_embed(state: &DaemonState) -> bool {
     // declines here stays eligible for idle shutdown instead of reading as
     // work in flight.
     let call = pressure_verdict(kin_core::memory_pressure::HeavyWork::EmbedBatch);
+    publish_footprint_standing(state, &call);
     if let kin_core::memory_pressure::Verdict::Refuse { reason } = &call.verdict {
         let reason = reason.clone();
         state.pause_background_embed();
@@ -1775,6 +1776,141 @@ fn embed_batch_under_pressure(
     }
 }
 
+/// One row of the host's process table, in the three fields a footprint needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProcessRow {
+    pub(crate) pid: u32,
+    pub(crate) parent: Option<u32>,
+    pub(crate) rss_bytes: u64,
+}
+
+/// Fold a process table into the footprint of the tree rooted at `root`.
+///
+/// Pure over the table, because this is the rule the whole budget rests on and
+/// a rule that can only be exercised by starting a language server is a rule
+/// nobody tests. Descendants at every depth, not just direct children: a
+/// language server that spawns a worker is still Kin's memory, charged to the
+/// same container, and stopping at depth one would reintroduce the blindness
+/// one level down.
+///
+/// A table whose parent links form a cycle is malformed and cannot be walked,
+/// so the visited set is not an optimisation. Without it a two-process loop
+/// hangs the daemon inside its own back-off check, which is the least
+/// forgivable place to hang.
+///
+/// A root absent from the table reports its own bytes as zero rather than
+/// refusing to answer, because the descendants are still real and a caller that
+/// got nothing would fall back to the pre-budget behaviour on a reading that
+/// mostly succeeded.
+pub(crate) fn tree_footprint_from(
+    root: u32,
+    rows: &[ProcessRow],
+) -> kin_core::memory_pressure::TreeFootprint {
+    let mut own_bytes = 0;
+    let mut children_bytes = 0u64;
+    let mut child_count = 0usize;
+    let mut visited = std::collections::HashSet::from([root]);
+    let mut frontier = vec![root];
+    while let Some(pid) = frontier.pop() {
+        if pid == root {
+            own_bytes = rows
+                .iter()
+                .find(|row| row.pid == root)
+                .map_or(0, |row| row.rss_bytes);
+        }
+        for row in rows.iter().filter(|row| row.parent == Some(pid)) {
+            if !visited.insert(row.pid) {
+                continue;
+            }
+            children_bytes = children_bytes.saturating_add(row.rss_bytes);
+            child_count += 1;
+            frontier.push(row.pid);
+        }
+    }
+    kin_core::memory_pressure::TreeFootprint {
+        own_bytes,
+        children_bytes,
+        child_count,
+    }
+}
+
+/// How long a sampled footprint is reused before the process table is walked
+/// again.
+///
+/// The reading behind [`pressure_verdict`] is four small file reads; this one
+/// walks the host's whole process table, which is milliseconds rather than
+/// microseconds and is called from a loop that can turn several times a second.
+/// A footprint two seconds old is exactly as good for deciding whether to start
+/// a bulk pass, and the cache is what keeps a guard against spending the
+/// machine from becoming a way of spending it.
+const FOOTPRINT_SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
+
+/// This daemon's tree footprint, sampled at most once per
+/// [`FOOTPRINT_SAMPLE_INTERVAL`].
+///
+/// `None` when the process table could not be read at all, which keeps the
+/// P1 rule on this axis too: a daemon that cannot measure itself decides
+/// exactly as it did before the budget existed.
+fn sample_tree_footprint() -> Option<kin_core::memory_pressure::TreeFootprint> {
+    static LAST: std::sync::OnceLock<
+        std::sync::Mutex<Option<(Instant, Option<kin_core::memory_pressure::TreeFootprint>)>>,
+    > = std::sync::OnceLock::new();
+    let cell = LAST.get_or_init(|| std::sync::Mutex::new(None));
+    let mut guard = cell.lock().ok()?;
+    if let Some((taken, footprint)) = guard.as_ref() {
+        if taken.elapsed() < FOOTPRINT_SAMPLE_INTERVAL {
+            return *footprint;
+        }
+    }
+    let sampled = walk_process_table();
+    *guard = Some((Instant::now(), sampled));
+    sampled
+}
+
+/// Walk the host's process table and fold this process's tree out of it.
+///
+/// The pid comes from `sysinfo::get_current_pid` rather than from `std`, for
+/// the reason `commit_liveness` gives: the zero-file-search guard reads a
+/// `process::`-prefixed path as a subprocess launch, and the crate's own
+/// accessor states the intent without arguing with a guard that is right to be
+/// blunt.
+fn walk_process_table() -> Option<kin_core::memory_pressure::TreeFootprint> {
+    let me = sysinfo::get_current_pid().ok()?;
+    let mut system = sysinfo::System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::All,
+        true,
+        sysinfo::ProcessRefreshKind::nothing().with_memory(),
+    );
+    let rows = system
+        .processes()
+        .iter()
+        .map(|(pid, process)| ProcessRow {
+            pid: pid.as_u32(),
+            parent: process.parent().map(|parent| parent.as_u32()),
+            rss_bytes: process.memory(),
+        })
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        return None;
+    }
+    Some(tree_footprint_from(me.as_u32(), &rows))
+}
+
+/// This daemon's standing against its own budget, when both halves are readable.
+///
+/// The ceiling comes from the same reading [`pressure_verdict`] takes, so the
+/// derived budget on a capped container is derived from the cap rather than
+/// from the host underneath it.
+fn budget_standing(
+    pressure: &kin_core::memory_pressure::MemoryPressure,
+) -> Option<kin_core::memory_pressure::BudgetStanding> {
+    let footprint = sample_tree_footprint()?;
+    let ceiling = pressure.reading().map(|reading| reading.limit_bytes);
+    let budget = kin_core::memory_pressure::FootprintBudget::resolve(ceiling)?;
+    Some(kin_core::memory_pressure::BudgetStanding { footprint, budget })
+}
+
 /// What host memory pressure says about one piece of heavy work, right now.
 ///
 /// One function so every consultation in this daemon reads the same machine
@@ -1786,10 +1922,22 @@ fn embed_batch_under_pressure(
 pub(crate) fn pressure_verdict(work: kin_core::memory_pressure::HeavyWork) -> PressureCall {
     let pressure = kin_core::memory_pressure::read();
     let thresholds = kin_core::memory_pressure::Thresholds::from_env();
-    let level = pressure.level_under(&thresholds);
+    let standing = budget_standing(&pressure);
+    let host_level = pressure.level_under(&thresholds);
+    let level = standing
+        .as_ref()
+        .map_or(host_level, |standing| {
+            host_level.max(standing.level_under(&thresholds))
+        });
     PressureCall {
         level,
-        verdict: kin_core::memory_pressure::Verdict::for_reading(work, &pressure, &thresholds),
+        verdict: kin_core::memory_pressure::Verdict::decide(
+            work,
+            &pressure,
+            standing.as_ref(),
+            &thresholds,
+        ),
+        standing,
     }
 }
 
@@ -1797,6 +1945,55 @@ pub(crate) fn pressure_verdict(work: kin_core::memory_pressure::HeavyWork) -> Pr
 pub(crate) struct PressureCall {
     pub(crate) level: kin_core::memory_pressure::PressureLevel,
     pub(crate) verdict: kin_core::memory_pressure::Verdict,
+    /// What this daemon's own tree was holding when the call was made, when it
+    /// could be measured. Carried so a caller can publish the standing without
+    /// walking the process table a second time.
+    pub(crate) standing: Option<kin_core::memory_pressure::BudgetStanding>,
+}
+
+/// How often this daemon republishes what it is holding.
+///
+/// Slower than it samples, because the record exists so `kin status` and
+/// `kin doctor` can answer without asking a daemon, not so the store has a
+/// time series. Thirty seconds keeps the published standing inside the freshness
+/// window every reader judges it by, at one small write per half minute.
+const FOOTPRINT_PUBLISH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Publish this daemon's standing against its budget, on a cadence.
+///
+/// Called from every point that already took a pressure call, so the standing
+/// keeps up with the daemon's own work without a task of its own to schedule,
+/// idle-shutdown against, or leak. A level change publishes at once: the rung
+/// is the part a reader acts on, and delaying it by up to half a minute would
+/// be the one field worth having promptly.
+pub(crate) fn publish_footprint_standing(state: &DaemonState, call: &PressureCall) {
+    let Some(standing) = call.standing.as_ref() else {
+        return;
+    };
+    static LAST: std::sync::OnceLock<
+        std::sync::Mutex<Option<(Instant, kin_core::memory_pressure::PressureLevel)>>,
+    > = std::sync::OnceLock::new();
+    let cell = LAST.get_or_init(|| std::sync::Mutex::new(None));
+    let Ok(mut guard) = cell.lock() else {
+        return;
+    };
+    let due = match guard.as_ref() {
+        Some((published, level)) => {
+            *level != call.level || published.elapsed() >= FOOTPRINT_PUBLISH_INTERVAL
+        }
+        None => true,
+    };
+    if !due {
+        return;
+    }
+    *guard = Some((Instant::now(), call.level));
+    drop(guard);
+    kin_core::memory_pressure::DaemonFootprint::record(
+        state.layout.root(),
+        standing,
+        call.level,
+        std::process::id(),
+    );
 }
 
 /// Publish a pressure refusal where the surfaces outside this process can read
@@ -1965,6 +2162,7 @@ fn decide_sweep_on_start(state: &DaemonState) -> SweepStartDecision {
     // reboot. A machine with no room today says nothing about a store whose
     // sweeps keep dying.
     let call = pressure_verdict(kin_core::memory_pressure::HeavyWork::LspSweep);
+    publish_footprint_standing(state, &call);
     if let kin_core::memory_pressure::Verdict::Refuse { reason } = &call.verdict {
         let reason = reason.clone();
         disclose_pressure_refusal(
@@ -3714,6 +3912,7 @@ pub async fn run_with_authority_on(
                 // back-off rather than a loss: the work is still owed, and the
                 // next wake takes it when there is room.
                 let call = pressure_verdict(kin_core::memory_pressure::HeavyWork::EmbedBatch);
+                publish_footprint_standing(&embed_state, &call);
                 let pressure_changed = announced_pressure != Some(call.level);
                 if let kin_core::memory_pressure::Verdict::Refuse { reason } = &call.verdict {
                     if pressure_changed {
@@ -6974,7 +7173,8 @@ mod enrichment_marker_tests {
 mod memory_pressure_tests {
     use super::{
         clear_pressure_refusal, decide_sweep_on_start, embed_batch_under_pressure,
-        pressure_verdict, start_or_defer_background_embed, SweepStartDecision,
+        pressure_verdict, sample_tree_footprint, start_or_defer_background_embed, tree_footprint_from,
+        ProcessRow, SweepStartDecision,
     };
     use crate::state::DaemonState;
     use kin_core::memory_pressure::{HeavyWork, PressureRefusal, Verdict};
@@ -6983,6 +7183,100 @@ mod memory_pressure_tests {
     fn open_store(repo_dir: &std::path::Path) -> DaemonState {
         let init = kin_core::init(repo_dir).unwrap();
         DaemonState::open(init.layout).unwrap()
+    }
+
+    fn row(pid: u32, parent: Option<u32>, rss_bytes: u64) -> ProcessRow {
+        ProcessRow {
+            pid,
+            parent,
+            rss_bytes,
+        }
+    }
+
+    /// The shape the measured failure had: a daemon, a language server it
+    /// started, and an unrelated process that must not be counted.
+    #[test]
+    fn the_fold_counts_the_daemons_own_children_and_nothing_else() {
+        let table = [
+            row(1, None, 8 * 1024 * 1024),
+            row(100, Some(1), 6 * 1024 * 1024 * 1024),
+            row(200, Some(100), 1930 * 1024 * 1024),
+            // Somebody else's browser, on the same host, charged to nobody here.
+            row(300, Some(1), 40 * 1024 * 1024 * 1024),
+        ];
+        let tree = tree_footprint_from(100, &table);
+        assert_eq!(tree.own_bytes, 6 * 1024 * 1024 * 1024);
+        assert_eq!(tree.children_bytes, 1930 * 1024 * 1024);
+        assert_eq!(tree.child_count, 1);
+        assert_eq!(
+            tree.total_bytes(),
+            6 * 1024 * 1024 * 1024 + 1930 * 1024 * 1024
+        );
+    }
+
+    /// A language server that spawns a worker is still Kin's memory. Stopping
+    /// at direct children reintroduces the same blindness one level down.
+    #[test]
+    fn the_fold_reaches_every_depth() {
+        let table = [
+            row(100, Some(1), 1024),
+            row(200, Some(100), 2048),
+            row(300, Some(200), 4096),
+            row(400, Some(300), 8192),
+        ];
+        let tree = tree_footprint_from(100, &table);
+        assert_eq!(tree.child_count, 3);
+        assert_eq!(tree.children_bytes, 2048 + 4096 + 8192);
+    }
+
+    /// A malformed table must not hang the daemon inside its own back-off
+    /// check, which is the least forgivable place to hang.
+    #[test]
+    fn a_parent_cycle_terminates_rather_than_spinning() {
+        let table = [
+            row(100, Some(300), 1024),
+            row(200, Some(100), 2048),
+            row(300, Some(200), 4096),
+        ];
+        let tree = tree_footprint_from(100, &table);
+        assert_eq!(tree.own_bytes, 1024);
+        assert_eq!(tree.child_count, 2, "each process is counted once");
+        assert_eq!(tree.children_bytes, 2048 + 4096);
+    }
+
+    #[test]
+    fn a_root_absent_from_the_table_still_reports_its_descendants() {
+        // The descendants are real. A caller handed nothing would fall back to
+        // the pre-budget behaviour on a reading that mostly succeeded.
+        let table = [row(200, Some(100), 2048), row(300, Some(200), 4096)];
+        let tree = tree_footprint_from(100, &table);
+        assert_eq!(tree.own_bytes, 0);
+        assert_eq!(tree.children_bytes, 2048 + 4096);
+        assert_eq!(tree.child_count, 2);
+    }
+
+    #[test]
+    fn a_lone_process_reports_itself_and_no_children() {
+        let table = [row(100, Some(1), 4096)];
+        let tree = tree_footprint_from(100, &table);
+        assert_eq!(tree.own_bytes, 4096);
+        assert_eq!(tree.children_bytes, 0);
+        assert_eq!(tree.child_count, 0);
+    }
+
+    /// The sampler against this very test process, whatever host it runs on.
+    ///
+    /// Asserting a size here would be asserting on the machine CI happens to
+    /// use. What is assertable is that the walk answers at all and that its own
+    /// figure is the test binary's, which is never zero.
+    #[test]
+    fn the_sampler_measures_this_process() {
+        let sampled = sample_tree_footprint().expect("this host publishes a process table");
+        assert!(
+            sampled.own_bytes > 0,
+            "a running process holds more than nothing"
+        );
+        assert!(sampled.total_bytes() >= sampled.own_bytes);
     }
 
     #[test]
