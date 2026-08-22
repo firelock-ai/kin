@@ -3997,6 +3997,7 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
         backend,
         &transaction.repository_id,
         &next.tree,
+        current.map(|workspace| &workspace.tree),
         "workspace tree",
     )?;
     workspaces.insert(mutation.workspace_id, next);
@@ -6408,13 +6409,45 @@ fn validate_shared_policy_bodies<B: StorageBackend + ?Sized>(
     Ok(())
 }
 
+/// Prove every artifact body `tree` names is present in the immutable source
+/// CAS and hashes to the identity the entry claims.
+///
+/// `already_admitted` names a tree this repository proved earlier, normally the
+/// workspace state this mutation supersedes. Bodies are content-addressed, so
+/// an entry carried across unchanged names the same immutable body it named
+/// then, and reading it again can only reach the conclusion its own admission
+/// already reached. Skipping those is what makes a commit's body cost follow
+/// the edit instead of the repository's file count: a converted repository
+/// tracks thousands of files, and recording a one-line edit used to read and
+/// re-hash every one of them (FIR-2291).
+///
+/// This narrows what a commit re-proves; it does not widen what a commit
+/// trusts. An entry that is new, or whose blob identity moved, is proven here
+/// exactly as before, so a transaction naming a body the CAS does not hold
+/// still fails closed. A body that decays after its own admission is a
+/// repository-integrity fault rather than an admission fault, and
+/// `validate_all_authority_bodies` is what finds it, on open and on freeze.
 fn validate_tree_bodies<B: StorageBackend + ?Sized>(
     backend: &B,
     repository_id: &RepositoryId,
     tree: &kin_model::ResolvedTree,
+    already_admitted: Option<&kin_model::ResolvedTree>,
     label: &str,
 ) -> Result<(), KinDbError> {
+    // Proven content identities, seeded from the superseded tree and grown as
+    // this tree's own entries are proven, so a body shared by several paths is
+    // read once rather than once per path.
+    let mut proven: BTreeSet<Hash256> = already_admitted
+        .into_iter()
+        .flat_map(|admitted| admitted.artifacts())
+        .filter_map(|artifact| artifact.entry.blob_identity())
+        .collect();
     for artifact in tree.artifacts() {
+        if let Some(digest) = artifact.entry.blob_identity() {
+            if !proven.insert(digest) {
+                continue;
+            }
+        }
         validate_tree_entry_body(
             backend,
             repository_id,
@@ -17086,6 +17119,411 @@ mod tests {
             &reopen(&directory).read_authority(),
             "after freezing commit",
         );
+    }
+
+    // FIR-2291: what a commit spends on tree bodies, and whether that spend
+    // follows the edit or the store.
+    //
+    // Every fixture above this point carries an empty workspace tree, so none
+    // of them can see this cost at all. A converted repository is mostly tree:
+    // psf/requests tracks 130 files, expressjs/express more, and a commit used
+    // to read and re-hash every one of them to record a one-line edit.
+
+    /// A repository whose workspace tree carries `files` artifacts, each backed
+    /// by its own distinct body in the immutable source CAS.
+    struct SyntheticTreeStore {
+        backend: Arc<MemoryBackend>,
+        manager: RepositoryAuthorityManager<MemoryBackend>,
+        files: usize,
+        body_bytes: usize,
+    }
+
+    /// Body bytes for tree artifact `index`, padded out to `body_bytes` so a
+    /// store's byte size is a knob independent of its file count.
+    fn synthetic_tree_body(index: usize, body_bytes: usize) -> Vec<u8> {
+        let mut body = format!("// synthetic tree artifact {index}\n").into_bytes();
+        if body.len() < body_bytes {
+            body.resize(body_bytes, b'x');
+        }
+        body
+    }
+
+    fn synthetic_tree_path(index: usize) -> RepoPath {
+        RepoPath::from_bytes(format!("src/generated/artifact_{index:05}.rs").into_bytes())
+            .expect("a synthetic tree path is valid")
+    }
+
+    /// Seed a repository whose first change introduces `files` artifacts and
+    /// whose workspace is admitted at that exact tree.
+    fn build_synthetic_tree_store(files: usize, body_bytes: usize) -> SyntheticTreeStore {
+        assert!(
+            files >= 2,
+            "a tree store needs one file to edit and at least one to leave alone"
+        );
+        let backend = Arc::new(MemoryBackend::default());
+        let manager = initial_manager(Arc::clone(&backend));
+
+        let mut tree_deltas = Vec::with_capacity(files);
+        for index in 0..files {
+            let body = synthetic_tree_body(index, body_bytes);
+            let hash = digest(&body);
+            manager.save_source_blob(hash, &body).unwrap();
+            tree_deltas.push(TreeDelta::Added {
+                artifact_id: ArtifactId(Uuid::from_u128(1_000_000 + index as u128)),
+                new: LocatedEntry::new(synthetic_tree_path(index), TreeEntry::blob(hash, false)),
+            });
+        }
+        let tree = ResolvedTree::default().apply(&tree_deltas).unwrap();
+        let tree_hash = compute_resolved_tree_hash(&tree).unwrap();
+        let shared = SharedAdmissionPolicy::empty(0);
+        let mut change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: ChangeOrigin::Native,
+            parents: Vec::new(),
+            timestamp: Timestamp(
+                chrono::DateTime::parse_from_rfc3339("2026-08-22T12:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            author: AuthorId::new("fir2291-tree-store"),
+            message: format!("introduce {files} synthetic artifacts"),
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: tree_deltas.clone(),
+            admission_policy_delta: Some(AdmissionPolicyDelta::initialize(shared.clone())),
+            external_reference_deltas: Vec::new(),
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+        };
+        change.id = compute_semantic_change_id(&change).unwrap();
+
+        let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(2291));
+        let overlay =
+            FrozenLocalOverlay::new(workspace_id, 0, AdmissionCase::Sensitive, Vec::new()).unwrap();
+        let policy = EffectiveAdmissionPolicyStamp {
+            shared: shared.stamp(),
+            local: overlay.stamp(),
+        };
+        let main = RefName::branch(b"main").unwrap();
+        let target = RefTarget::change(change.id);
+        let workspace_mutation = WorkspaceMutation {
+            workspace_id,
+            expected: WorkspaceExpectation::MustNotExist,
+            new_generation: 0,
+            new_head: WorkspaceHead::Symbolic {
+                target: main.clone(),
+            },
+            new_base_target: Some(target.clone()),
+            new_base_tree_hash: Some(tree_hash),
+            tree_deltas,
+            new_tree_hash: tree_hash,
+            semantic_delta: WorkspaceSemanticDelta::default(),
+            new_shared_admission_policy: shared,
+            new_admission_policy: policy,
+        };
+
+        let mut transaction = transaction_shell(&manager, 0xf2_2291_0001);
+        transaction.changes.push(change);
+        transaction.ref_mutations.push(RefMutation {
+            name: main.clone(),
+            expected: RefExpectation::MustNotExist,
+            new_target: Some(target),
+            policy: RefUpdatePolicy::FastForwardOnly,
+        });
+        transaction.default_ref_mutation = Some(DefaultRefMutation {
+            expected: DefaultRefExpectation::MustBeUnset,
+            new_default: Some(main),
+        });
+        transaction.workspace_mutation = Some(workspace_mutation);
+        transaction.local_overlay_delta = Some(FrozenLocalOverlayDelta::initialize(overlay));
+        manager.commit_repository_transaction(transaction).unwrap();
+
+        SyntheticTreeStore {
+            backend,
+            manager,
+            files,
+            body_bytes,
+        }
+    }
+
+    /// The transaction for one edit to one file: the shape `kin commit` takes
+    /// after a one-line change. Generic over the backend so the same edit can
+    /// be timed against the in-memory fixture and against real disk.
+    fn one_file_edit_transaction<B: StorageBackend + ?Sized + 'static>(
+        manager: &RepositoryAuthorityManager<B>,
+        body_bytes: usize,
+        round: usize,
+    ) -> RepositoryTransaction {
+        let workspace = manager.read_authority().metadata().workspaces[0].clone();
+        let path = synthetic_tree_path(0);
+        let old = workspace
+            .tree
+            .artifact_at_path(&path)
+            .expect("artifact zero is in the seeded tree")
+            .clone();
+        let mut body = synthetic_tree_body(0, body_bytes);
+        body.extend_from_slice(format!("// edit {round}\n").as_bytes());
+        let hash = digest(&body);
+        manager.save_source_blob(hash, &body).unwrap();
+        let tree_delta = TreeDelta::Updated {
+            artifact_id: old.artifact_id,
+            old: old.located_entry(),
+            new: LocatedEntry::new(path, TreeEntry::blob(hash, false)),
+        };
+        let next_tree = workspace
+            .tree
+            .apply(std::slice::from_ref(&tree_delta))
+            .unwrap();
+        let mutation = WorkspaceMutation {
+            workspace_id: workspace.workspace_id,
+            expected: WorkspaceExpectation::MustEqual {
+                generation: workspace.generation,
+                head: workspace.head.clone(),
+                base_target: workspace.base_target.clone(),
+                base_tree_hash: workspace.base_tree_hash,
+                tree_hash: workspace.tree_hash,
+                semantic_overlay_hash: workspace.semantic_overlay_hash,
+                admission_policy: workspace.admission_policy,
+            },
+            new_generation: workspace.generation + 1,
+            new_head: workspace.head.clone(),
+            new_base_target: workspace.base_target.clone(),
+            new_base_tree_hash: workspace.base_tree_hash,
+            tree_deltas: vec![tree_delta],
+            new_tree_hash: compute_resolved_tree_hash(&next_tree).unwrap(),
+            semantic_delta: WorkspaceSemanticDelta::default(),
+            new_shared_admission_policy: workspace.shared_admission_policy.clone(),
+            new_admission_policy: workspace.admission_policy,
+        };
+        let mut transaction = transaction_shell(manager, 0xf2_2291_1000 + round as u128);
+        transaction.workspace_mutation = Some(mutation);
+        transaction
+    }
+
+    /// Commit one file edit against the in-memory fixture, returning the
+    /// source-blob reads the commit itself made. That count is the
+    /// machine-independent half of this ticket's measurement: it does not move
+    /// with host load, and it is what the whole-tree walk inflated.
+    fn commit_one_file_edit(store: &SyntheticTreeStore, round: usize) -> usize {
+        let transaction = one_file_edit_transaction(&store.manager, store.body_bytes, round);
+        store.backend.source_load_count.store(0, Ordering::SeqCst);
+        store
+            .manager
+            .commit_repository_transaction(transaction)
+            .unwrap();
+        store.backend.source_load_count.load(Ordering::SeqCst)
+    }
+
+    /// FIR-2291's acceptance, in the form the mechanism actually takes.
+    ///
+    /// The ticket's original acceptance named history depth as the multiplier.
+    /// The b1lat control disproved that (commit time was flat from depth 5 to
+    /// 17) and named store bytes instead, so this asserts the thing that is
+    /// true: the bodies a commit reads are set by what the commit changed, not
+    /// by how many files the repository tracks.
+    ///
+    /// Falsifiable in both directions. Restore the whole-tree walk and the
+    /// eight-file store reads 8 and the sixty-four-file store reads 64, so the
+    /// equality fails on the store size alone.
+    #[test]
+    fn a_commit_reads_bodies_for_its_edit_not_for_the_whole_store() {
+        let small = build_synthetic_tree_store(8, 256);
+        let mid = build_synthetic_tree_store(64, 256);
+        assert_eq!(small.files * 8, mid.files, "the two stores must differ 8x");
+
+        let small_loads = commit_one_file_edit(&small, 1);
+        let mid_loads = commit_one_file_edit(&mid, 1);
+
+        assert_eq!(
+            small_loads, mid_loads,
+            "a one-file commit read {small_loads} bodies on an {}-file store and {mid_loads} on a \
+             {}-file store, so its cost still follows the store rather than the edit",
+            small.files, mid.files
+        );
+        assert!(
+            mid_loads < mid.files,
+            "a one-file commit read {mid_loads} bodies from a {}-file store, which is the \
+             whole-store walk this ticket is about",
+            mid.files
+        );
+    }
+
+    /// The budget the acceptance check in `scripts/acceptance` mirrors: a
+    /// one-file commit's body reads are bounded by the edit's own entry count,
+    /// with a small fixed allowance for the admission surfaces every commit
+    /// reads regardless of size.
+    #[test]
+    fn a_one_file_commit_stays_inside_its_edit_size_budget() {
+        const EDIT_ENTRIES: usize = 1;
+        const FIXED_ADMISSION_ALLOWANCE: usize = 4;
+        let store = build_synthetic_tree_store(64, 256);
+        let loads = commit_one_file_edit(&store, 1);
+        assert!(
+            loads <= EDIT_ENTRIES + FIXED_ADMISSION_ALLOWANCE,
+            "a one-entry edit read {loads} bodies, over the {} the edit size class allows",
+            EDIT_ENTRIES + FIXED_ADMISSION_ALLOWANCE
+        );
+    }
+
+    /// A body this commit newly introduces is still proven present and intact.
+    /// Scoping the walk to the edit must not become trusting the edit.
+    #[test]
+    fn a_commit_still_refuses_an_edit_whose_new_body_is_absent() {
+        let store = build_synthetic_tree_store(8, 256);
+        let workspace = store.manager.read_authority().metadata().workspaces[0].clone();
+        let path = synthetic_tree_path(0);
+        let old = workspace
+            .tree
+            .artifact_at_path(&path)
+            .expect("artifact zero is in the seeded tree")
+            .clone();
+        // The body is never saved, so the CAS has nothing under this digest.
+        let hash = digest(b"a body that was never admitted\n");
+        let tree_delta = TreeDelta::Updated {
+            artifact_id: old.artifact_id,
+            old: old.located_entry(),
+            new: LocatedEntry::new(path, TreeEntry::blob(hash, false)),
+        };
+        let next_tree = workspace
+            .tree
+            .apply(std::slice::from_ref(&tree_delta))
+            .unwrap();
+        let mutation = WorkspaceMutation {
+            workspace_id: workspace.workspace_id,
+            expected: WorkspaceExpectation::MustEqual {
+                generation: workspace.generation,
+                head: workspace.head.clone(),
+                base_target: workspace.base_target.clone(),
+                base_tree_hash: workspace.base_tree_hash,
+                tree_hash: workspace.tree_hash,
+                semantic_overlay_hash: workspace.semantic_overlay_hash,
+                admission_policy: workspace.admission_policy,
+            },
+            new_generation: workspace.generation + 1,
+            new_head: workspace.head.clone(),
+            new_base_target: workspace.base_target.clone(),
+            new_base_tree_hash: workspace.base_tree_hash,
+            tree_deltas: vec![tree_delta],
+            new_tree_hash: compute_resolved_tree_hash(&next_tree).unwrap(),
+            semantic_delta: WorkspaceSemanticDelta::default(),
+            new_shared_admission_policy: workspace.shared_admission_policy.clone(),
+            new_admission_policy: workspace.admission_policy,
+        };
+        let mut transaction = transaction_shell(&store.manager, 0xf2_2291_2001);
+        transaction.workspace_mutation = Some(mutation);
+        let error = store
+            .manager
+            .commit_repository_transaction(transaction)
+            .expect_err("an edit naming an unadmitted body must fail closed")
+            .to_string();
+        assert!(
+            error.contains("absent from immutable source CAS"),
+            "the refusal must name the missing body: {error}"
+        );
+        assert_eq!(store.manager.read_authority().generation(), 1);
+    }
+
+    /// A body already in the tree that goes missing from the CAS is a
+    /// repository-integrity fault, not a commit-admission fault, and it is
+    /// `kin doctor`'s to find. This pins that boundary deliberately: the commit
+    /// path no longer re-reads bodies it already admitted, so it no longer
+    /// notices. Delete this test the day commit is meant to catch it again.
+    #[test]
+    fn a_commit_no_longer_re_reads_bodies_it_already_admitted() {
+        let store = build_synthetic_tree_store(8, 256);
+        // Evict every seeded body except the one the edit will introduce.
+        let untouched = synthetic_tree_body(7, 256);
+        store
+            .backend
+            .blobs
+            .lock()
+            .remove(digest(&untouched).as_bytes());
+        let loads = commit_one_file_edit(&store, 1);
+        assert!(
+            loads <= 5,
+            "the commit read {loads} bodies, so it is still walking the whole tree"
+        );
+        assert_eq!(
+            store.manager.read_authority().generation(),
+            2,
+            "a commit that touches neither the evicted artifact nor its body still lands"
+        );
+    }
+
+    /// Copy a synthetic tree store onto a real `LocalFileBackend`, so a commit
+    /// pays the lock acquisition, namespace re-confirmation and file read that
+    /// every body proof costs on disk. The in-memory fixture is a `HashMap`
+    /// lookup per body and hides exactly the cost this ticket is about.
+    fn seed_local_backend_from(
+        store: &SyntheticTreeStore,
+        dir: &TempDir,
+    ) -> RepositoryAuthorityManager<LocalFileBackend> {
+        let (seed_bytes, _) = store
+            .backend
+            .snapshot
+            .lock()
+            .clone()
+            .expect("the synthetic store persisted its head");
+        let backend = Arc::new(LocalFileBackend::new(dir.path()));
+        backend
+            .save_snapshot(
+                repository_id().as_str(),
+                &seed_bytes,
+                crate::storage::GENERATION_INIT,
+            )
+            .unwrap();
+        let bodies = store.backend.blobs.lock().clone();
+        backend
+            .with_source_blob_write_batch(repository_id().as_str(), &mut |batch| {
+                for (digest, body) in &bodies {
+                    batch.save(*digest, body)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        RepositoryAuthorityManager::open(repository_id(), backend).unwrap()
+    }
+
+    /// Local, non-citable wall-clock and body-read probe for FIR-2291.
+    ///
+    /// Reports, for a small and a mid store, what one one-file commit costs on
+    /// a real local backend and how many bodies it reads. Run:
+    ///
+    /// ```text
+    /// cargo test -p kin-db --release \
+    ///     fir2291_commit_body_cost_bench -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "wall-clock bench; run explicitly in release mode"]
+    fn fir2291_commit_body_cost_bench() {
+        for (label, files, body_bytes) in [
+            ("small", 128usize, 4_096usize),
+            ("mid", 2_048usize, 4_096usize),
+        ] {
+            let store = build_synthetic_tree_store(files, body_bytes);
+            let loads = commit_one_file_edit(&store, 0);
+
+            let dir = TempDir::new().unwrap();
+            let manager = seed_local_backend_from(&store, &dir);
+            let mut samples = Vec::new();
+            for round in 1..=3 {
+                let transaction = one_file_edit_transaction(&manager, body_bytes, round);
+                let started = std::time::Instant::now();
+                manager.commit_repository_transaction(transaction).unwrap();
+                samples.push(started.elapsed().as_secs_f64() * 1000.0);
+            }
+            samples.sort_by(f64::total_cmp);
+            eprintln!(
+                "{label}: {files} files x {body_bytes} B = {:.1} MiB of bodies | one-file commit on \
+                 disk median {:.1} ms (min {:.1}, max {:.1}) | body reads {loads}",
+                (files * body_bytes) as f64 / (1024.0 * 1024.0),
+                samples[samples.len() / 2],
+                samples[0],
+                samples[samples.len() - 1],
+            );
+        }
     }
 }
 
