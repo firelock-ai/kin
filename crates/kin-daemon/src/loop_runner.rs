@@ -1227,16 +1227,14 @@ fn announce_retraction(retracted: &kin_index::IgnoredTrackedPaths) {
 /// deleted file could take the entire commit path down with it: nothing else
 /// collects these, and only emptying the file first, which routes the retirement
 /// through the linker's own re-derivation, ever cleared them.
-///
-/// Returns the relations retired, so a caller can report what a removal took.
 fn retire_artifact_node_relations(
     graph: &kin_db::InMemoryGraph,
     artifact_id: kin_model::ArtifactId,
-) -> Result<Vec<kin_model::RelationId>> {
+) -> Result<()> {
     let node = kin_model::GraphNodeId::Artifact(artifact_id);
     let bound = graph.get_all_relations_for_node(&node)?;
     if bound.is_empty() {
-        return Ok(Vec::new());
+        return Ok(());
     }
     let retired: Vec<kin_model::RelationId> = bound.iter().map(|relation| relation.id).collect();
     let borrowed: Vec<&kin_model::RelationId> = retired.iter().collect();
@@ -1246,7 +1244,7 @@ fn retire_artifact_node_relations(
         retired = retired.len(),
         "retired the relations bound to a departing artifact node"
     );
-    Ok(retired)
+    Ok(())
 }
 
 /// Say what a refused tree transition was about when kin-db reports one of its
