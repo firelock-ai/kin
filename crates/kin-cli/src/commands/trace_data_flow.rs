@@ -1695,7 +1695,7 @@ mod tests {
     use kin_model::relation::{Relation, RelationOrigin};
     use std::sync::Arc;
 
-    fn make_entity(name: &str, file: &str) -> Entity {
+    pub(super) fn make_entity(name: &str, file: &str) -> Entity {
         Entity {
             id: EntityId::new(),
             kind: EntityKind::Function,
@@ -1735,7 +1735,7 @@ mod tests {
 
     /// The shape a symbol the graph owns no file for actually has: identity, no
     /// location, no span, and (in the measured repository) `Module` kind.
-    fn make_external_entity(name: &str) -> Entity {
+    pub(super) fn make_external_entity(name: &str) -> Entity {
         let mut entity = make_entity(name, "unused");
         entity.kind = EntityKind::Module;
         entity.file_origin = None;
@@ -1760,7 +1760,7 @@ mod tests {
         }
     }
 
-    fn step_names(response: &TraceDataFlowResponse) -> Vec<String> {
+    pub(super) fn step_names(response: &TraceDataFlowResponse) -> Vec<String> {
         response
             .chain
             .iter()
@@ -1784,7 +1784,8 @@ mod tests {
 
     /// Synthesize an absent repository authority. The body itself isn't
     /// required for the chain-shape tests; we only assert on identity fields.
-    fn empty_binding() -> (tempfile::TempDir, kin_core::LocalRepositoryAuthorityBinding) {
+    pub(super) fn empty_binding() -> (tempfile::TempDir, kin_core::LocalRepositoryAuthorityBinding)
+    {
         let temp = tempfile::tempdir().unwrap();
         let kin_root = temp.path().join(".kin");
         std::fs::create_dir_all(kin_root.join("objects")).unwrap();
@@ -3404,5 +3405,299 @@ mod tests {
             "its one neighbor is the focal, which the response already carries"
         );
         assert!(!response.truncated);
+    }
+}
+
+#[cfg(test)]
+mod boundary_and_ranking_tests {
+    //! FIR-2642, from the rc0550 brown stranger run. Two halves of one
+    //! contract: Kin must say where the in-repo graph ends and name the
+    //! crossing.
+    //!
+    //! Half one. `trace_data_flow(HTTPAdapter.send, direction=calls, depth=3,
+    //! limit_per_step=12)` spent nine of its twelve depth-1 slots on exception
+    //! classes, which are `raise` targets in `except` blocks and not data flow
+    //! at all. They crowded out the hop that governs connection reuse, and the
+    //! stranger's verdict was that the Kin arm trusted alone writes a wrong
+    //! answer. The edge was in the graph; the failure is ranking.
+    //!
+    //! Half two. `router.handle` is an external node connected to nothing. The
+    //! graph knows a boundary exists and says nothing about the other side, so
+    //! a reader cannot tell an npm package from a builtin from a typo.
+
+    use super::tests::{empty_binding, make_entity, make_external_entity, step_names};
+    use super::*;
+    use kin_db::InMemoryGraph;
+    use kin_model::relation::{Relation, RelationEvidence, RelationOrigin};
+    use kin_model::{EntityKind, GraphNodeId, RelationId, RelationKind};
+
+    /// An ordinary call: the kind of edge a data-flow walk is following.
+    fn call(src: EntityId, dst: EntityId) -> Relation {
+        Relation {
+            id: RelationId::new(),
+            kind: RelationKind::Calls,
+            src: GraphNodeId::Entity(src),
+            dst: GraphNodeId::Entity(dst),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: vec![],
+        }
+    }
+
+    /// A call the parser read as the operand of a `raise`, which is a throw
+    /// site rather than a hop the value travels along.
+    fn raise_call(src: EntityId, dst: EntityId) -> Relation {
+        let mut relation = call(src, dst);
+        relation.evidence = vec![RelationEvidence {
+            parser_rule: Some(kin_index::RAISE_TARGET_CALL_RULE.to_string()),
+            ..RelationEvidence::default()
+        }];
+        relation
+    }
+
+    fn exception_class(name: &str, file: &str) -> Entity {
+        let mut entity = make_entity(name, file);
+        entity.kind = EntityKind::Class;
+        entity
+    }
+
+    /// The measured shape, reduced to the one comparison that decides it: a
+    /// raise target sitting in the SAME FILE as the focal, against a
+    /// data-flow callee one file away.
+    ///
+    /// Same-file locality outranks declaration kind in the fan-out order, so
+    /// without a raise-target signal the two exception constructors take both
+    /// slots and the hop the question is about is dropped. This is the requests
+    /// shape with the file boundary moved so the fixture needs no store.
+    fn raise_crowding_graph() -> (InMemoryGraph, EntityId) {
+        let graph = InMemoryGraph::new();
+        let focal = make_entity("Adapter.send", "pkg/adapters.py");
+        let ssl_error = exception_class("SSLError", "pkg/adapters.py");
+        let proxy_error = exception_class("ProxyError", "pkg/adapters.py");
+        let pool_key = make_entity("build_pool_key", "pkg/pool.py");
+
+        for entity in [&focal, &ssl_error, &proxy_error, &pool_key] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        for relation in [
+            raise_call(focal.id, ssl_error.id),
+            raise_call(focal.id, proxy_error.id),
+            call(focal.id, pool_key.id),
+        ] {
+            graph.upsert_relation(&relation).unwrap();
+        }
+        (graph, focal.id)
+    }
+
+    #[test]
+    fn a_raise_target_does_not_take_a_slot_from_a_data_flow_hop() {
+        let (graph, focal) = raise_crowding_graph();
+        let (_t, binding) = empty_binding();
+
+        let response = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding),
+            &graph,
+            &TraceDataFlowRequest {
+                focal: focal.to_string(),
+                depth: Some(2),
+                direction: Some(TraceDirection::Calls),
+                limit_per_step: Some(2),
+                include_body: Some(false),
+                max_response_chars: None,
+                include_type_edges: None,
+            },
+        )
+        .unwrap();
+
+        let names = step_names(&response);
+        assert!(
+            names.iter().any(|n| n == "build_pool_key"),
+            "a `raise` target is a throw site, not a hop the value travels \
+             along, so it must not spend a scarce fan-out slot on one: the \
+             stranger lost the connection-reuse path exactly this way and \
+             would have written a wrong answer from it. Got {names:?}"
+        );
+    }
+
+    #[test]
+    fn a_raise_target_is_still_reported_when_the_budget_allows_it() {
+        // The recall half. Demoting a raise target orders it last; it must
+        // never drop it, because "what does this throw" is a real question and
+        // the edge is real evidence.
+        let (graph, focal) = raise_crowding_graph();
+        let (_t, binding) = empty_binding();
+
+        let response = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding),
+            &graph,
+            &TraceDataFlowRequest {
+                focal: focal.to_string(),
+                depth: Some(2),
+                direction: Some(TraceDirection::Calls),
+                limit_per_step: Some(8),
+                include_body: Some(false),
+                max_response_chars: None,
+                include_type_edges: None,
+            },
+        )
+        .unwrap();
+
+        let names = step_names(&response);
+        for expected in ["build_pool_key", "SSLError", "ProxyError"] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "a wide enough step reports every callee including the throw \
+                 sites; ranking may reorder and must not remove. Missing \
+                 {expected} from {names:?}"
+            );
+        }
+        assert_eq!(
+            names.first().map(String::as_str),
+            Some("build_pool_key"),
+            "and the data-flow hop leads, so a reader who stops at the first \
+             row stops on the one that carries the value. Got {names:?}"
+        );
+    }
+
+    #[test]
+    fn an_external_step_names_the_module_it_crosses_into() {
+        // Half two. `router.handle` reached through `require('router')` must
+        // say `router`, so a reader can tell an npm package from a builtin
+        // from a typo without leaving the tool.
+        let graph = InMemoryGraph::new();
+        let focal = make_entity("app.handle", "lib/application.js");
+        let external = make_external_entity("router.handle");
+        graph.upsert_entity(&focal).unwrap();
+        graph.upsert_entity(&external).unwrap();
+        let mut relation = call(focal.id, external.id);
+        relation.import_source = Some("router".to_string());
+        graph.upsert_relation(&relation).unwrap();
+        let (_t, binding) = empty_binding();
+
+        let response = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding),
+            &graph,
+            &TraceDataFlowRequest {
+                focal: focal.id.to_string(),
+                depth: Some(1),
+                direction: Some(TraceDirection::Calls),
+                limit_per_step: Some(8),
+                include_body: Some(false),
+                max_response_chars: None,
+                include_type_edges: None,
+            },
+        )
+        .unwrap();
+
+        let step = response
+            .chain
+            .iter()
+            .find(|s| s.entity.entity_name == "router.handle")
+            .expect("the external step is in the chain");
+        assert!(step.entity.external, "the fixture's premise");
+        let crossing = step
+            .entity
+            .crossing
+            .as_ref()
+            .expect("an external record must carry a crossing, known or not");
+        assert_eq!(
+            crossing.specifier.as_deref(),
+            Some("router"),
+            "the graph holds the specifier the importing file named, so the \
+             answer must say it rather than emit a bare external symbol"
+        );
+    }
+
+    #[test]
+    fn an_external_step_the_graph_cannot_place_says_so_rather_than_going_quiet() {
+        // The disclosure half, and the one that matters more. With import
+        // edges absent the graph genuinely does not know what is on the other
+        // side. Saying nothing reads as an in-repo symbol; saying "unknown"
+        // reads as a boundary, which is the truth.
+        let graph = InMemoryGraph::new();
+        let focal = make_entity("app.handle", "lib/application.js");
+        let external = make_external_entity("router.handle");
+        graph.upsert_entity(&focal).unwrap();
+        graph.upsert_entity(&external).unwrap();
+        graph.upsert_relation(&call(focal.id, external.id)).unwrap();
+        let (_t, binding) = empty_binding();
+
+        let response = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding),
+            &graph,
+            &TraceDataFlowRequest {
+                focal: focal.id.to_string(),
+                depth: Some(1),
+                direction: Some(TraceDirection::Calls),
+                limit_per_step: Some(8),
+                include_body: Some(false),
+                max_response_chars: None,
+                include_type_edges: None,
+            },
+        )
+        .unwrap();
+
+        let step = response
+            .chain
+            .iter()
+            .find(|s| s.entity.entity_name == "router.handle")
+            .expect("the external step is in the chain");
+        let crossing = step
+            .entity
+            .crossing
+            .as_ref()
+            .expect("an external record carries a crossing even when unknown");
+        assert_eq!(
+            crossing.specifier, None,
+            "the graph holds no specifier here, so inventing one would be worse \
+             than the silence it replaces"
+        );
+        assert_eq!(
+            crossing.status, "unknown",
+            "and the record must say the boundary is unplaced rather than \
+             leave a bare symbol that reads like an in-repo entity"
+        );
+    }
+
+    #[test]
+    fn an_in_repo_step_carries_no_crossing_at_all() {
+        // The bound. A crossing on a step the repository owns would be a
+        // boundary that is not there, and every reader would learn to ignore
+        // the field.
+        let graph = InMemoryGraph::new();
+        let focal = make_entity("app.handle", "lib/application.js");
+        let local = make_entity("app.route", "lib/application.js");
+        graph.upsert_entity(&focal).unwrap();
+        graph.upsert_entity(&local).unwrap();
+        graph.upsert_relation(&call(focal.id, local.id)).unwrap();
+        let (_t, binding) = empty_binding();
+
+        let response = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding),
+            &graph,
+            &TraceDataFlowRequest {
+                focal: focal.id.to_string(),
+                depth: Some(1),
+                direction: Some(TraceDirection::Calls),
+                limit_per_step: Some(8),
+                include_body: Some(false),
+                max_response_chars: None,
+                include_type_edges: None,
+            },
+        )
+        .unwrap();
+
+        let step = response
+            .chain
+            .iter()
+            .find(|s| s.entity.entity_name == "app.route")
+            .expect("the local step is in the chain");
+        assert!(!step.entity.external, "the fixture's premise");
+        assert!(
+            step.entity.crossing.is_none(),
+            "a step the repository owns crosses nothing"
+        );
     }
 }
