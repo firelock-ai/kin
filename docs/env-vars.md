@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (488 total, 338 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (492 total, 338 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -58,6 +58,10 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_BUILD_GRAPH_TIMEOUT_SECS` | seconds>=0 | 60 | operational | timeout for building a historical ref-view graph |
 | `KIN_BYPASS_EMBEDDING_COVERAGE_CHECK` | bool | false | correctness | bypass the embedding-coverage correctness gate |
 | `KIN_DISABLE_SPINE` | bool | false | correctness | disable the spine federation layer, narrowing retrieval scope |
+| `KIN_MEMORY_PRESSURE` | enum | *(unset)* | operational | force the memory-pressure level heavy work is judged against, in place of measuring the machine: 'critical' refuses the enrichment sweep, the embedding batch and ambient admission with a named reason, 'elevated' shrinks the embedding batch, 'unknown' proceeds exactly as an unreadable host does, and unset measures the cgroup or the host. Read by the daemon at process start, so it takes effect on the command that starts one |
+| `KIN_MEMORY_PRESSURE_CRITICAL_FRACTION` | float>=0 | 0.90 | operational | fraction of the memory ceiling at or above which heavy work refuses to start; must be within 0..=1, anything else keeps 0.90, and a value below the elevated fraction is raised to it |
+| `KIN_MEMORY_PRESSURE_ELEVATED_FRACTION` | float>=0 | 0.75 | operational | fraction of the memory ceiling at or above which heavy work shrinks; must be within 0..=1, and anything else keeps 0.75 |
+| `KIN_MEMORY_PRESSURE_SWAP_FRACTION` | float>=0 | 0.50 | operational | fraction of configured swap in use at or above which an already-elevated host is treated as critical; must be within 0..=1, and anything else keeps 0.50. Swap standing never raises a host that has room |
 | `KIN_NO_DAEMON` | bool | false | operational | never start or revive a daemon; bind only an already-running one (the probe contract behind `kin mcp start --no-spawn`) |
 | `KIN_NO_KEYRING` | bool | false | operational | skip the OS keyring for credential storage |
 | `KIN_NO_VFS` | bool | false | operational | kin-vfs shim projection bypass: set to 1 to skip VFS initialization and exec the real binary directly (only the literal '1' bypasses), default off |

@@ -240,7 +240,10 @@
         "let _ = fs::remove_file(kin_root.join(APPROACHING_COMMIT_FILE_NAME));",
         "if let Ok(contents) = fs::read_to_string(\"/sys/fs/cgroup/memory.max\") {",
         "let raw: u64 = fs::read_to_string(\"/sys/fs/cgroup/memory/memory.limit_in_bytes\")",
-        "if let Ok(contents) = fs::read_to_string(path) {",
+        {
+   "expr": "if let Ok(contents) = fs::read_to_string(path) {",
+   "count": 2
+  },
         "let raw = fs::read_to_string(kin_root.join(KILL_RECORD_FILE_NAME)).ok()?;",
         "let _ = fs::remove_file(kin_root.join(KILL_RECORD_FILE_NAME));",
         "let candidate_root = candidate_root.canonicalize()?;",
