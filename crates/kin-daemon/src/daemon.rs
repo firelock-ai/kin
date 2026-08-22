@@ -1924,11 +1924,9 @@ pub(crate) fn pressure_verdict(work: kin_core::memory_pressure::HeavyWork) -> Pr
     let thresholds = kin_core::memory_pressure::Thresholds::from_env();
     let standing = budget_standing(&pressure);
     let host_level = pressure.level_under(&thresholds);
-    let level = standing
-        .as_ref()
-        .map_or(host_level, |standing| {
-            host_level.max(standing.level_under(&thresholds))
-        });
+    let level = standing.as_ref().map_or(host_level, |standing| {
+        host_level.max(standing.level_under(&thresholds))
+    });
     PressureCall {
         level,
         verdict: kin_core::memory_pressure::Verdict::decide(
@@ -7173,8 +7171,8 @@ mod enrichment_marker_tests {
 mod memory_pressure_tests {
     use super::{
         clear_pressure_refusal, decide_sweep_on_start, embed_batch_under_pressure,
-        pressure_verdict, sample_tree_footprint, start_or_defer_background_embed, tree_footprint_from,
-        ProcessRow, SweepStartDecision,
+        pressure_verdict, sample_tree_footprint, start_or_defer_background_embed,
+        tree_footprint_from, ProcessRow, SweepStartDecision,
     };
     use crate::state::DaemonState;
     use kin_core::memory_pressure::{HeavyWork, PressureRefusal, Verdict};

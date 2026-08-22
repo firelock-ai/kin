@@ -615,7 +615,11 @@ impl Verdict {
         };
         let reason = || {
             if by_budget {
-                describe_budget(work, standing.expect("a budget level implies a standing"), did)
+                describe_budget(
+                    work,
+                    standing.expect("a budget level implies a standing"),
+                    did,
+                )
             } else {
                 describe(work, level, pressure.reading(), did)
             }
@@ -1551,8 +1555,14 @@ mod tests {
         // language servers from a reading that never looked for them.
         let quiet = standing(2 * GIB, 0, 0, 8 * GIB);
         let sentence = quiet.sentence();
-        assert!(sentence.contains("the 0 process(es) it started"), "{sentence}");
-        assert!(sentence.contains("of which 0 MiB is in those child processes"), "{sentence}");
+        assert!(
+            sentence.contains("the 0 process(es) it started"),
+            "{sentence}"
+        );
+        assert!(
+            sentence.contains("of which 0 MiB is in those child processes"),
+            "{sentence}"
+        );
     }
 
     #[test]
@@ -1691,7 +1701,10 @@ mod tests {
         let fresh = published.line(published.at_unix + 10);
         assert!(!fresh.contains("last published"), "{fresh}");
         let stale = published.line(published.at_unix + FOOTPRINT_RECORD_FRESH_FOR_SECS + 60);
-        assert!(stale.contains("last published") && stale.contains("pid 4103"), "{stale}");
+        assert!(
+            stale.contains("last published") && stale.contains("pid 4103"),
+            "{stale}"
+        );
 
         DaemonFootprint::clear(dir.path());
         assert!(DaemonFootprint::read(dir.path()).is_none());
@@ -1708,7 +1721,11 @@ mod tests {
             pid: 1,
             at_unix: 5_000,
         };
-        assert_eq!(record.age_secs(4_000), 0, "a clock that moved is not a reading from the future");
+        assert_eq!(
+            record.age_secs(4_000),
+            0,
+            "a clock that moved is not a reading from the future"
+        );
     }
 
     #[test]
