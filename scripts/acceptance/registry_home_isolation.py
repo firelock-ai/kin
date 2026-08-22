@@ -328,14 +328,18 @@ class Suite(object):
         self.stop_daemon(repo, env)
         shutil.rmtree(os.path.join(repo, ".kin"), ignore_errors=True)
 
+    def own_repos(self):
+        """The repositories this run registered under the scratch KIN_HOME."""
+        return [self.probe, self.roommate, self.stranger]
+
     def setup(self):
         """Build both homes and leave the registries in their final state."""
         self.probe = self.fixture("probe", self.env)
         self.roommate = self.fixture("roommate", self.env)
-        stranger = self.fixture("stranger", self.env)
-        outsider = self.fixture("outsider", self.real_env)
-        self.unbind(stranger, self.env)
-        self.unbind(outsider, self.real_env)
+        self.stranger = self.fixture("stranger", self.env)
+        self.outsider = self.fixture("outsider", self.real_env)
+        self.unbind(self.stranger, self.env)
+        self.unbind(self.outsider, self.real_env)
         self.stop_daemon(self.roommate, self.env)
 
     # -- probes
@@ -377,28 +381,50 @@ class Suite(object):
 # --------------------------------------------------------------------- checks
 
 def homes(suite, res):
-    """Both registries, or None when either cannot ground an absence claim."""
+    """What this run registered where, or None when absence cannot be grounded.
+
+    Returns `(own, foreign, paths)`: the ids this run registered under the
+    scratch KIN_HOME, the id it registered only in the stand-in real home, and
+    the id-to-path map both readings came from.
+
+    The ids are resolved by repository PATH across both registry files rather
+    than by set-differencing them, because on unfixed bytes the scratch home has
+    no registry at all: every `kin init` landed in the real home, including the
+    three that named the scratch one. Differencing the files there yields nothing
+    to compare and the whole suite reports UNREADABLE, which fails the gate but
+    never names the leak. Resolving by path states the defect instead: these are
+    the repositories this run put in the scratch home, this is the one it did
+    not, and here is a scratch-home surface naming it.
+    """
     scratch = registry_entries(suite.scratch_registry)
     real = registry_entries(suite.real_registry)
-    if scratch is None:
-        res.unknown("the scratch home's registry at %s could not be read, so no "
-                    "claim about what it does or does not name is grounded"
-                    % suite.scratch_registry)
+    if scratch is None and real is None:
+        res.unknown("neither registry could be read (%s, %s), so no claim about "
+                    "what either names is grounded"
+                    % (suite.scratch_registry, suite.real_registry))
         return None
-    if real is None:
-        res.unknown("the stand-in home's registry at %s could not be read, so "
-                    "there is no foreign repository to be sealed from"
-                    % suite.real_registry)
+
+    paths = {}
+    for entries in (real or {}, scratch or {}):
+        paths.update(entries)
+
+    foreign_id = id_for_path(paths, suite.outsider)
+    if foreign_id is None:
+        res.unknown("no registry names an id for the outsider repository at %s, "
+                    "so there is nothing for a scratch home to be sealed from"
+                    % suite.outsider)
         return None
-    foreign = set(real) - set(scratch)
-    if not foreign:
-        res.unknown("the stand-in home's registry names nothing the scratch home "
-                    "does not, so a sealed reading below would be vacuous")
+
+    own = {i for i in (id_for_path(paths, repo) for repo in suite.own_repos()) if i}
+    if not own:
+        res.unknown("no registry names an id for any repository this run "
+                    "registered under the scratch KIN_HOME, so a sealed reading "
+                    "would have nothing to be sealed around")
         return None
-    return scratch, real, foreign
+    return own, {foreign_id}, paths
 
 
-def grade_view(res, surface, seen, scratch, foreign, roommate_id):
+def grade_view(res, surface, seen, own, foreign, roommate_id):
     """Grade one cross-repo surface's repo-id set against both homes."""
     if seen is None:
         res.unknown("%s could not be read as a repository listing" % surface)
@@ -409,7 +435,7 @@ def grade_view(res, surface, seen, scratch, foreign, roommate_id):
                 "registered only in the operator's home: %s"
                 % (surface, len(leaked), ", ".join(sorted(leaked))))
     else:
-        stray = seen - set(scratch)
+        stray = seen - set(own)
         if stray:
             res.bad("%s under the scratch KIN_HOME names %d repository id(s) this "
                     "run never registered anywhere: %s"
@@ -421,8 +447,8 @@ def grade_view(res, surface, seen, scratch, foreign, roommate_id):
     # The control. Without it, a surface that had simply stopped answering would
     # pass the sealed assertion above for the wrong reason.
     if roommate_id is None:
-        res.unknown("the scratch home's registry names no id for the roommate "
-                    "repository, so this surface's control cannot be graded")
+        res.unknown("no registry names an id for the roommate repository, so "
+                    "this surface's control cannot be graded")
     elif roommate_id in seen:
         res.ok("control: the sibling registered in the SCRATCH home (%s) still "
                "resolves on the same surface" % roommate_id)
@@ -438,13 +464,13 @@ def check_0(suite):
     both = homes(suite, res)
     if both is None:
         return res
-    scratch, _real, foreign = both
+    own, foreign, _paths = both
     rc, out, err = suite.kin_run_split(["deps", "--all", "--json"])
     if rc != 0:
         res.unknown("kin deps --all --json exited %d: %s" % (rc, tail(err or out)))
         return res
-    grade_view(res, "kin deps --all --json", deps_ids(out), scratch, foreign,
-               id_for_path(scratch, suite.roommate))
+    grade_view(res, "kin deps --all --json", deps_ids(out), own, foreign,
+               id_for_path(_paths, suite.roommate))
     return res
 
 
@@ -454,7 +480,7 @@ def check_1(suite):
     both = homes(suite, res)
     if both is None:
         return res
-    scratch, _real, foreign = both
+    own, foreign, _paths = both
     # `kin registry` with no subcommand IS the listing; `registry list` is not a
     # subcommand and exits 2. The first draft of this probe asked for one and got
     # UNREADABLE, which is that outcome working.
@@ -462,8 +488,8 @@ def check_1(suite):
     if rc != 0:
         res.unknown("kin registry exited %d: %s" % (rc, tail(err or out)))
         return res
-    grade_view(res, "kin registry", listed_ids(out), scratch, foreign,
-               id_for_path(scratch, suite.roommate))
+    grade_view(res, "kin registry", listed_ids(out), own, foreign,
+               id_for_path(_paths, suite.roommate))
     return res
 
 
@@ -480,7 +506,7 @@ def check_2(suite):
     both = homes(suite, res)
     if both is None:
         return res
-    scratch, real, foreign = both
+    _own, foreign, paths = both
     rc, out = suite.restart_probe_daemon()
     if rc != 0:
         res.unknown("the command that starts the probe daemon exited %d: %s"
@@ -493,7 +519,7 @@ def check_2(suite):
         return res
 
     named = sorted(i for i in foreign if i in log) + \
-        sorted(p for p in (real.get(i) for i in foreign) if p and p in log)
+        sorted(p for p in (paths.get(i) for i in foreign) if p and p in log)
     if named:
         res.bad("the daemon under the scratch KIN_HOME names %d repository "
                 "registered only in the operator's home: %s"
@@ -502,10 +528,10 @@ def check_2(suite):
         res.ok("the daemon log names none of the %d repository id(s) or path(s) "
                "registered only in the operator's home" % len(foreign))
 
-    stranger_id = id_for_path(scratch, os.path.join(suite.workdir, "stranger"))
+    stranger_id = id_for_path(paths, suite.stranger)
     if stranger_id is None:
-        res.unknown("the scratch home's registry names no id for the stranger "
-                    "repository, so this check's control cannot be graded")
+        res.unknown("no registry names an id for the stranger repository, so "
+                    "this check's control cannot be graded")
     elif PIN_WARNING in log and stranger_id in log:
         res.ok("control: the unbindable sibling in the SCRATCH home (%s) still "
                "draws the pin warning, so this log can carry one" % stranger_id)
@@ -703,36 +729,84 @@ def self_test():
              registry_entries(os.path.join(work, "absent.toml")), None)
 
         # `homes` must refuse to grade rather than pass, in each way it can be
-        # ungrounded.
+        # ungrounded, and must ground itself on registered PATHS so the unfixed
+        # shape (no scratch registry at all, every repo in the real home) still
+        # names the leak instead of reporting UNREADABLE.
         class Fake(object):
             pass
 
-        fake = Fake()
-        fake.scratch_registry = os.path.join(work, "absent.toml")
-        fake.real_registry = good
-        res = Result("h", TICKET, "homes")
-        case("an unreadable scratch registry refuses to grade",
-             (homes(fake, res) is None, res.status), (True, UNREADABLE))
+        absent = os.path.join(work, "absent.toml")
+        unfixed = os.path.join(work, "unfixed.toml")
+        with open(unfixed, "w") as handle:
+            handle.write('[[repos]]\nid = "probe"\npath = "/w/probe"\n\n'
+                         '[[repos]]\nid = "roommate"\npath = "/w/roommate"\n\n'
+                         '[[repos]]\nid = "stranger"\npath = "/w/stranger"\n\n'
+                         '[[repos]]\nid = "outsider"\npath = "/w/outsider"\n')
 
-        fake.scratch_registry = good
-        fake.real_registry = os.path.join(work, "absent.toml")
-        res = Result("h", TICKET, "homes")
-        case("an unreadable stand-in registry refuses to grade",
-             (homes(fake, res) is None, res.status), (True, UNREADABLE))
+        def fake(scratch_path, real_path):
+            f = Fake()
+            f.scratch_registry = scratch_path
+            f.real_registry = real_path
+            f.probe, f.roommate, f.stranger = "/w/probe", "/w/roommate", "/w/stranger"
+            f.outsider = "/w/outsider"
+            f.own_repos = lambda: [f.probe, f.roommate, f.stranger]
+            return f
 
-        fake.real_registry = good
         res = Result("h", TICKET, "homes")
-        # Returning None is the assertion, not the status. A Result that graded
-        # nothing reads UNREADABLE on its own, so status alone cannot tell a
-        # guard that fired from a guard that was deleted.
-        case("no foreign repository at all refuses to grade",
-             (homes(fake, res) is None, res.status), (True, UNREADABLE))
+        case("neither registry readable refuses to grade",
+             (homes(fake(absent, absent), res) is None, res.status), (True, UNREADABLE))
 
-        fake.scratch_registry = empty
         res = Result("h", TICKET, "homes")
-        got = homes(fake, res)
-        case("a real foreign repository grades",
-             got is not None and got[2] == {"probe", "roommate"}, True)
+        case("no outsider anywhere refuses to grade",
+             (homes(fake(good, absent), res) is None, res.status), (True, UNREADABLE))
+
+        # Both registries as the product actually leaves them. Fixed: the three
+        # scratch repos in the scratch home, the outsider alone in the real one.
+        fixed_scratch = os.path.join(work, "fixed-scratch.toml")
+        with open(fixed_scratch, "w") as handle:
+            handle.write('[[repos]]\nid = "probe"\npath = "/w/probe"\n\n'
+                         '[[repos]]\nid = "roommate"\npath = "/w/roommate"\n\n'
+                         '[[repos]]\nid = "stranger"\npath = "/w/stranger"\n')
+        fixed_real = os.path.join(work, "fixed-real.toml")
+        with open(fixed_real, "w") as handle:
+            handle.write('[[repos]]\nid = "outsider"\npath = "/w/outsider"\n')
+
+        # An outsider and nothing else. Without the guard this grades every id
+        # the surface names as stray and FAILs, which is a confident wrong
+        # diagnosis: there is no scratch-home repository to be sealed around.
+        res = Result("h", TICKET, "homes")
+        case("an outsider with no scratch repos refuses to grade",
+             (homes(fake(absent, fixed_real), res) is None, res.status),
+             (True, UNREADABLE))
+
+        # The unfixed shape: one registry, in the real home, holding everything.
+        res = Result("h", TICKET, "homes")
+        got = homes(fake(absent, unfixed), res)
+        case("the unfixed shape still grounds a verdict",
+             (got is not None and got[0] == {"probe", "roommate", "stranger"}
+              and got[1] == {"outsider"}),
+             True)
+        # ...and grading it names the leak rather than shrugging at it.
+        unfixed_status, unfixed_detail = _diagnosis(
+            {"probe", "roommate", "stranger", "outsider"},
+            {"probe", "roommate", "stranger"}, {"outsider"}, "roommate")
+        case("the unfixed shape FAILs and names the outsider",
+             (unfixed_status, "registered only in the operator's home" in unfixed_detail,
+              "outsider" in unfixed_detail),
+             (FAIL, True, True))
+
+        # The fixed shape: two registries, the outsider only in the real one.
+        res = Result("h", TICKET, "homes")
+        got = homes(fake(fixed_scratch, fixed_real), res)
+        case("the fixed shape grounds the same verdict",
+             (got is not None and got[0] == {"probe", "roommate", "stranger"}
+              and got[1] == {"outsider"}),
+             True)
+        sealed_status, sealed_text = _diagnosis(
+            {"probe", "roommate", "stranger"}, {"probe", "roommate", "stranger"},
+            {"outsider"}, "roommate")
+        case("the fixed shape PASSes on the same grader",
+             (sealed_status, "outsider" in sealed_text), (PASS, False))
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
