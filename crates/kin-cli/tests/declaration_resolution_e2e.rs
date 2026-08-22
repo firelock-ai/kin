@@ -335,6 +335,17 @@ fn refs_on_a_declaration_names_the_other_identities_sharing_the_name() {
 /// incoming references, no members, and no same-named sibling must still get the
 /// plain empty answer. If this reddens, the honest-empty note has become
 /// unconditional and stopped carrying information.
+///
+/// The count excludes the FIR-2524 absence qualifier, and that exclusion is a
+/// fact about this fixture rather than a loosened assertion. These four files
+/// parse into a graph holding cross-file `Calls` and nothing else, so
+/// `imports` and `references` read absent, and a verdict that certified this
+/// absence would be certifying on coverage the graph does not have. The
+/// qualifier is therefore CORRECT here and is asserted rather than tolerated:
+/// the guard this test carries is about `empty_result_context`, the members and
+/// same-name note, which must stay conditional. A coverage-complete store with a
+/// genuinely dead focal is the other half of the control and lives in
+/// `commands::refs`, where the graph can be built with every class present.
 #[test]
 fn genuinely_unreferenced_entity_still_gets_the_plain_empty_answer() {
     let graph = anyhow_shaped_graph();
@@ -343,10 +354,19 @@ fn genuinely_unreferenced_entity_still_gets_the_plain_empty_answer() {
         joined.contains("No incoming"),
         "must report the empty result: {joined}"
     );
+    let content: Vec<&str> = joined
+        .lines()
+        .filter(|line| !line.contains("Kin cannot rule out"))
+        .collect();
     assert_eq!(
-        joined.lines().count(),
+        content.len(),
         2,
         "an entity with nothing further to report gets exactly the header and the empty line: {joined}"
+    );
+    assert!(
+        joined.contains("Kin cannot rule out references it did not see"),
+        "this fixture holds no cross-file imports or references edges, so the absence may not \
+         be certified and the answer has to say so: {joined}"
     );
 }
 

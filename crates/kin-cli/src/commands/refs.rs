@@ -1209,6 +1209,85 @@ mod tests {
         );
     }
 
+    /// THE TICKET'S NEGATIVE CONTROL, taken literally: a genuinely dead entity
+    /// on a healthy enriched store must still read plainly, with no qualifier.
+    ///
+    /// This is the arm that stops the rollout becoming the FIR-2404 failure in
+    /// its opposite costume, and it is not hypothetical. The first CI run of
+    /// this change went red here, on the sibling e2e fixture, because a
+    /// repository with no spine reports `cross_repo: not_configured` and the
+    /// `find_references` gate counts that as a gap. Left alone, every empty
+    /// `kin refs` on every non-federated repository would carry a warning about
+    /// a federation the user never asked for. `only_unconfigured_federation` is
+    /// what withholds that sentence, and this test is what proves it fires:
+    /// all three reference classes are present here, so the coverage gate is
+    /// satisfied and an unconfigured spine is the only thing left to object to.
+    #[test]
+    fn a_dead_focal_on_a_coverage_complete_store_reads_plainly() {
+        use kin_model::relation::{Relation, RelationOrigin};
+        use kin_model::{EntityStore, GraphNodeId};
+
+        let (graph, layout, _dir) = orphan_fixture();
+        let pick = |name: &str| {
+            EntityStore::query_entities(
+                &graph,
+                &kin_model::graph::EntityFilter {
+                    name_pattern: Some(name.to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("fixture entity")
+        };
+        let caller = pick("caller");
+        let callee = pick("callee");
+        // Every class the query asks about, cross-file, between two entities
+        // that are not the focal. The focal stays genuinely unreferenced.
+        for kind in [
+            RelationKind::Calls,
+            RelationKind::Imports,
+            RelationKind::References,
+        ] {
+            graph
+                .upsert_relation(&Relation {
+                    id: kin_model::ids::RelationId::new(),
+                    kind,
+                    src: GraphNodeId::Entity(caller.id),
+                    dst: GraphNodeId::Entity(callee.id),
+                    confidence: 1.0,
+                    origin: RelationOrigin::Parsed,
+                    created_in: None,
+                    import_source: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        }
+
+        let response = build_refs_response(
+            &layout,
+            &graph,
+            &RefsRequest {
+                entity: "orphan".to_string(),
+                kind: "all".to_string(),
+            },
+            &refs_test_envelope(),
+        )
+        .expect("refs response");
+        let rendered = response.lines.join("\n");
+
+        assert!(
+            rendered.contains("No incoming"),
+            "the fixture must reach the empty arm or this test asserts nothing: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Kin cannot rule out"),
+            "a dead focal on a coverage-complete store reads plainly; an unconfigured spine is \
+             not a gap in this repository: {rendered}"
+        );
+    }
+
     /// A focal that never resolved is a lookup failure, not a finding, so it
     /// carries no verdict. Qualifying it would tell a reader their graph lacks
     /// coverage when what it lacks is the name they typed.

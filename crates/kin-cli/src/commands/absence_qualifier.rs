@@ -128,6 +128,8 @@ pub fn qualify(
             // cause sends a reader to fix the wrong end, which is the failure
             // `focal_resolution_gap` already distinguishes two ways one level
             // down.
+            // An unconfigured spine, alone, is not a gap in THIS repository.
+            None if only_unconfigured_federation(&negative) => return Vec::new(),
             None => match limiting_factor(&negative) {
                 Some(factor) => format!("{indent}Kin cannot rule out {subject}: {factor}."),
                 None => format!(
@@ -153,6 +155,55 @@ pub fn qualify(
         ));
     }
     said
+}
+
+/// Whether the ONLY thing the verdict rested on is a cross-repo spine nobody
+/// configured.
+///
+/// A rendering decision, not a second verdict: the object `negative_for`
+/// returned is still carried verbatim on the machine surface, so an agent
+/// reading `--json` sees exactly what the MCP tool would say. What is withheld
+/// is the SENTENCE, in this one state.
+///
+/// It has to be withheld, and a standing test says so. `find_references` gates
+/// on `cross_repo`, and a repository with no spine reports `not_configured`,
+/// which the gate counts as a gap. Without this, the qualifier fires on EVERY
+/// empty `kin refs` on EVERY non-federated repository, including a healthy one
+/// whose cross-file coverage is complete and whose focal is genuinely dead. That
+/// is the FIR-2404 failure in its opposite costume, and FIR-2524's own negative
+/// control forbids it in as many words: a genuinely dead entity on a healthy
+/// enriched store must still read plainly, with no qualifier attached.
+/// `genuinely_unreferenced_entity_still_gets_the_plain_empty_answer` is the
+/// guard, and it caught this exact regression on the first CI run of the change
+/// that introduced it.
+///
+/// The producing handler agrees. It emits `not_configured` under its own comment
+/// "Local-only (no spine configured): cross-repo refs don't apply", so speaking
+/// this gap to a person reading one local repository would repeat as a warning a
+/// fact the code that published it documents as inapplicable.
+///
+/// Narrow on purpose: it fires only when NOTHING else is in the trust reason. An
+/// unconfigured spine beside an absent edge class leaves the edge class naming
+/// the sentence, and a spine that IS configured and answered badly
+/// (`cross_repo_authority_incomplete`, `cross_repo_unavailable`) is a real gap
+/// about a real federation and still speaks.
+fn only_unconfigured_federation(negative: &serde_json::Value) -> bool {
+    let Some(reason) = negative
+        .get("trust_reason")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    let clauses: Vec<&str> = reason
+        .split("; ")
+        .map(str::trim)
+        .filter(|clause| !clause.is_empty())
+        .collect();
+    !clauses.is_empty()
+        && clauses.iter().all(|clause| {
+            clause.starts_with("cross_repo_not_configured")
+                || clause.starts_with("cross_repo_authority_missing")
+        })
 }
 
 /// The verdict's own leading reason, in the words it published.
