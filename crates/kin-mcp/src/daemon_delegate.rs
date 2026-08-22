@@ -573,6 +573,16 @@ pub(crate) fn suspended_sweep() -> Option<kin_daemon_spawn::SuspendedSweep> {
     kin_daemon_spawn::SuspendedSweep::read(&discover_kin_dir()?)
 }
 
+/// Whether this store's daemon is currently holding heavy work back for want of
+/// memory.
+///
+/// Read from the store on every call for the same reason the sweep tally is:
+/// the record is retired by the pass that runs next, and a server that cached
+/// it would keep telling agents the machine was full after it had emptied.
+pub(crate) fn memory_pressure_refusal() -> Option<kin_core::memory_pressure::PressureRefusal> {
+    kin_core::memory_pressure::PressureRefusal::read(&discover_kin_dir()?)
+}
+
 /// The recorded cause and a remediation the caller can perform, ready to append
 /// to an error about a daemon that stopped answering.
 ///

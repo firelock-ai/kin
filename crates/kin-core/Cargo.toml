@@ -20,6 +20,11 @@ test-support = []
 [dependencies]
 which = "8"
 kin-model = { workspace = true }
+# The one cgroup reader for the whole product lives here, in the crate a
+# process that records why a daemon died can depend on. `memory_pressure`
+# consults it rather than opening `/sys/fs/cgroup` a second time, so the two
+# can never describe the same container differently.
+kin-daemon-spawn = { workspace = true }
 kin-db = { workspace = true }
 kin-blobs = { workspace = true }
 kin-git = { workspace = true }
@@ -61,5 +66,3 @@ kin-git = { workspace = true, features = ["test-support"] }
 pretty_assertions = { workspace = true }
 tracing-subscriber = { workspace = true }
 
-[target.'cfg(unix)'.dev-dependencies]
-kin-daemon-spawn = { workspace = true }

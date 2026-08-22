@@ -193,6 +193,15 @@ pub struct CgroupMemory {
     /// Kernel OOM kills accounted to this cgroup, or `None` when no accounting
     /// is readable.
     pub oom_kills: Option<u64>,
+    /// Bytes charged to this cgroup right now, or `None` when no accounting is
+    /// readable. This is the only field that answers "how close is this
+    /// container to its cap at this instant"; the two above answer what the cap
+    /// is and what has already been killed under it.
+    pub current_bytes: Option<u64>,
+    /// The high-water mark this cgroup has reached, or `None` when the kernel
+    /// publishes none (cgroup v2 only, and only on kernels carrying
+    /// `memory.peak`).
+    pub peak_bytes: Option<u64>,
 }
 
 /// Read what this host will say about memory pressure right now.
@@ -200,7 +209,61 @@ pub fn cgroup_memory() -> CgroupMemory {
     CgroupMemory {
         limit_bytes: cgroup_memory_limit_bytes(),
         oom_kills: cgroup_oom_kill_count(),
+        current_bytes: cgroup_memory_current_bytes(),
+        peak_bytes: cgroup_memory_peak_bytes(),
     }
+}
+
+/// Bytes charged to this cgroup right now, or `None` off Linux or when neither
+/// hierarchy publishes the counter.
+#[cfg(target_os = "linux")]
+fn cgroup_memory_current_bytes() -> Option<u64> {
+    cgroup_counter_bytes(&[
+        "/sys/fs/cgroup/memory.current",
+        "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+    ])
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cgroup_memory_current_bytes() -> Option<u64> {
+    None
+}
+
+/// The high-water mark this cgroup has reached, or `None` when the kernel
+/// publishes none.
+///
+/// `memory.peak` arrived in 5.19 and v1's `memory.max_usage_in_bytes` is
+/// disabled on many distributions, so an absent file is the ordinary case and
+/// never an error: the peak sharpens a diagnosis and nothing decides on it.
+#[cfg(target_os = "linux")]
+fn cgroup_memory_peak_bytes() -> Option<u64> {
+    cgroup_counter_bytes(&[
+        "/sys/fs/cgroup/memory.peak",
+        "/sys/fs/cgroup/memory/memory.max_usage_in_bytes",
+    ])
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cgroup_memory_peak_bytes() -> Option<u64> {
+    None
+}
+
+/// First parsable byte counter among `paths`, or `None` when none of them can
+/// be read.
+///
+/// One helper for both counters so the v2-then-v1 order is written once. The
+/// files hold a single decimal, and an unparsable body reads as absent for the
+/// same reason an absent file does: this process could not ask.
+#[cfg(target_os = "linux")]
+fn cgroup_counter_bytes(paths: &[&str]) -> Option<u64> {
+    for path in paths {
+        if let Ok(contents) = fs::read_to_string(path) {
+            if let Ok(value) = contents.trim().parse::<u64>() {
+                return Some(value);
+            }
+        }
+    }
+    None
 }
 
 /// Effective memory limit in bytes from a container memory cap, or `None` when
@@ -7426,6 +7489,7 @@ mod tests {
         CgroupMemory {
             limit_bytes: Some(TWELVE_GIB),
             oom_kills: Some(oom_kills),
+            ..CgroupMemory::default()
         }
     }
 
@@ -7477,6 +7541,7 @@ mod tests {
             CgroupMemory {
                 limit_bytes: Some(TWELVE_GIB),
                 oom_kills: None,
+                ..CgroupMemory::default()
             },
             counted(7),
             None,
