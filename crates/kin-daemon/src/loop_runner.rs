@@ -855,12 +855,15 @@ fn exact_tree_admission(
         // while its entities keep ranking is the exposure this ordering exists
         // to prevent.
         evict_enrichment_for_removed_paths(state, &deltas)?;
-        state.graph.apply_transaction_delta(&TransactionDelta {
-            entity_deltas: Vec::new(),
-            relation_deltas: Vec::new(),
-            tree_deltas: deltas.clone(),
-            ..TransactionDelta::default()
-        })?;
+        state
+            .graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: deltas.clone(),
+                ..TransactionDelta::default()
+            })
+            .map_err(|error| name_stranded_endpoint_refusal(DaemonError::Graph(error), &deltas))?;
     }
 
     if observation.is_none() {
@@ -1211,6 +1214,79 @@ fn announce_retraction(retracted: &kin_index::IgnoredTrackedPaths) {
     );
 }
 
+/// Retire every relation bound to an artifact node that is leaving the tree.
+///
+/// An artifact-class endpoint is not reachable from any entity, so clearing a
+/// path's entities leaves these edges standing: the file-level `Imports` and
+/// `Includes` edges the cross-file linker mints, its parse-coverage self-loop,
+/// and the `DerivedFrom` edges projection markers produce. kin-db validates
+/// every relation the graph holds against the staged tree on each transaction,
+/// so one surviving edge makes the removal of its artifact fail with
+/// `transaction relation <id> has unadmitted source endpoint artifact:<id>`,
+/// and it fails the whole transaction rather than the one edge. That is how a
+/// deleted file could take the entire commit path down with it: nothing else
+/// collects these, and only emptying the file first, which routes the retirement
+/// through the linker's own re-derivation, ever cleared them.
+fn retire_artifact_node_relations(
+    graph: &kin_db::InMemoryGraph,
+    artifact_id: kin_model::ArtifactId,
+) -> Result<()> {
+    let node = kin_model::GraphNodeId::Artifact(artifact_id);
+    let bound = graph.get_all_relations_for_node(&node)?;
+    if bound.is_empty() {
+        return Ok(());
+    }
+    let retired: Vec<kin_model::RelationId> = bound.iter().map(|relation| relation.id).collect();
+    let borrowed: Vec<&kin_model::RelationId> = retired.iter().collect();
+    graph.remove_relations_batch(&borrowed)?;
+    debug!(
+        ?artifact_id,
+        retired = retired.len(),
+        "retired the relations bound to a departing artifact node"
+    );
+    Ok(())
+}
+
+/// Say what a refused tree transition was about when kin-db reports one of its
+/// relations still naming a node the staged tree no longer carries.
+///
+/// The storage message names a relation uuid and an artifact uuid and nothing
+/// else. Neither maps to a file, the refusal is of the whole transaction rather
+/// than of the edge, and the surface a user meets is a commit that cannot run at
+/// all. Name the paths this transition drops and the two-step retirement that
+/// clears the edges, so the message a user reads is about their repository
+/// rather than about kin's internals.
+pub(crate) fn name_stranded_endpoint_refusal(
+    error: DaemonError,
+    deltas: &[TreeDelta],
+) -> DaemonError {
+    let message = error.to_string();
+    if !message.contains("unadmitted source endpoint")
+        && !message.contains("unadmitted destination endpoint")
+    {
+        return error;
+    }
+    let removed = deltas
+        .iter()
+        .filter_map(|delta| match delta {
+            TreeDelta::Removed { old, .. } => Some(old.path.to_string()),
+            TreeDelta::Added { .. } | TreeDelta::Updated { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    let dropped = if removed.is_empty() {
+        "this transition".to_string()
+    } else {
+        removed.join(", ")
+    };
+    DaemonError::IncompatibleRepo(format!(
+        "refusing to drop {dropped}: the graph still holds a relation whose endpoint is the \
+         artifact being removed, and kin-db refuses a transition that strands one ({message}). \
+         fix: empty the file and commit, which retires the edges through the linker, then delete \
+         the empty file and commit again. Report this: a removal is supposed to collect these \
+         edges itself"
+    ))
+}
+
 /// Remove the enrichment derived from every path a tree transition drops.
 ///
 /// Entities, their relations, and their text and vector index presence are what
@@ -1219,6 +1295,10 @@ fn announce_retraction(retracted: &kin_index::IgnoredTrackedPaths) {
 /// strand one. Clearing here is what lets a removal of any kind, a deleted file
 /// or a newly ignored one, take the whole artifact out rather than only its
 /// tree entry.
+///
+/// Artifact-class edges go with it. They have no entity endpoint, so the entity
+/// cleanup below cannot see them, and kin-db refuses the tree transition that
+/// strands one exactly as it refuses a stranded entity.
 pub(crate) fn evict_enrichment_for_removed_paths(
     state: &DaemonState,
     deltas: &[TreeDelta],
@@ -1227,6 +1307,7 @@ pub(crate) fn evict_enrichment_for_removed_paths(
         let TreeDelta::Removed { old, .. } = delta else {
             continue;
         };
+        retire_artifact_node_relations(state.graph.as_ref(), delta.artifact_id())?;
         let Some(file_id) = semantic_file_id(&old.path) else {
             continue;
         };
@@ -1941,6 +2022,127 @@ fn plan_catch_up_events(state: &DaemonState, since: SystemTime) -> Result<Vec<Fi
         .collect())
 }
 
+/// Where a daemon records the paths it derived entities for that durable
+/// authority is not known to hold.
+///
+/// Operational state beside the pid and port files, never semantic authority.
+fn unpublished_enrichment_marker_path(state: &DaemonState) -> PathBuf {
+    state.layout.root().join("unpublished-enrichment.json")
+}
+
+/// Record that this daemon derived entities for a path, and persist the set
+/// when it grows.
+///
+/// Written after the transaction is applied, so the record is of enrichment the
+/// graph actually holds rather than of a pass that was attempted. Persisted only
+/// when the path is new to the set, which bounds this to one write per path per
+/// daemon life however often that path is edited.
+///
+/// A failed write is not fatal and is not retried. The marker exists to make a
+/// loss recoverable; a store that cannot write it is no worse off than one built
+/// before this existed, and failing an admission over it would trade a
+/// recoverable gap for an unrecoverable refusal.
+fn mark_enrichment_unpublished(state: &DaemonState, file_id: &FilePathId) {
+    let snapshot = {
+        let Ok(mut marked) = state.unpublished_enrichment.lock() else {
+            return;
+        };
+        if !marked.insert(file_id.0.clone()) {
+            return;
+        }
+        marked.iter().cloned().collect::<Vec<_>>()
+    };
+    match serde_json::to_vec(&snapshot) {
+        Ok(bytes) => {
+            if let Err(error) = std::fs::write(unpublished_enrichment_marker_path(state), bytes) {
+                debug!(
+                    error = %error,
+                    "could not persist the unpublished-enrichment marker; a loss on this path \
+                     would need an edit to recover"
+                );
+            }
+        }
+        Err(error) => debug!(error = %error, "could not encode the unpublished-enrichment marker"),
+    }
+}
+
+/// Read the marker one previous daemon left, decide each entry against graph
+/// truth, and return host events for the paths whose entities did not survive.
+///
+/// Every entry is checked rather than trusted. A path whose entities a commit
+/// published is resolved and dropped; only a path the graph holds no entity for
+/// is owed a re-derivation, and that is the exact shape of the FIR-2606 wedge.
+/// A converted store therefore pays nothing: its paths were marked while the
+/// conversion derived them and its own commit published them, so the next
+/// daemon resolves every entry and re-derives none.
+///
+/// The file is rewritten with what is still owed, so a marker cannot grow
+/// without bound across restarts, and it is rewritten before the events are
+/// returned so a daemon that dies mid-repair does not lose the record of what
+/// it still owed.
+fn plan_unpublished_enrichment_repair(state: &DaemonState) -> Result<Vec<FileEvent>> {
+    use kin_model::EntityStore;
+
+    let marker = unpublished_enrichment_marker_path(state);
+    let Ok(bytes) = std::fs::read(&marker) else {
+        return Ok(Vec::new());
+    };
+    let Ok(marked) = serde_json::from_slice::<Vec<String>>(&bytes) else {
+        warn!(
+            marker = %marker.display(),
+            "the unpublished-enrichment marker will not parse, so nothing can be recovered from \
+             it; a path missing its entities stays unqueryable until it is edited"
+        );
+        return Ok(Vec::new());
+    };
+    if marked.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let held: std::collections::HashSet<FilePathId> = state
+        .graph
+        .list_all_entities()?
+        .into_iter()
+        .filter_map(|entity| entity.file_origin)
+        .collect();
+    let working_dir = state.layout.working_dir();
+    let mut still_owed = Vec::new();
+    let mut events = Vec::new();
+    for path in marked {
+        let file_id = FilePathId::new(&path);
+        if held.contains(&file_id) {
+            continue;
+        }
+        // A path the tree no longer carries was removed rather than lost, and
+        // re-deriving it would ask the host for bytes the repository has
+        // retired. The entry goes with the artifact.
+        let Ok(repo_path) = RepoPath::from_utf8(path.clone()) else {
+            continue;
+        };
+        if state.graph.artifact_id_at_path(&repo_path).is_none() {
+            continue;
+        }
+        let Ok(host_path) = kin_index::host_path_from_repo_path(working_dir, &repo_path) else {
+            continue;
+        };
+        still_owed.push(path);
+        events.push(FileEvent::Changed(host_path));
+    }
+
+    if let Ok(mut set) = state.unpublished_enrichment.lock() {
+        *set = still_owed.iter().cloned().collect();
+    }
+    match serde_json::to_vec(&still_owed) {
+        Ok(bytes) => {
+            if let Err(error) = std::fs::write(&marker, bytes) {
+                debug!(error = %error, "could not rewrite the unpublished-enrichment marker");
+            }
+        }
+        Err(error) => debug!(error = %error, "could not encode the unpublished-enrichment marker"),
+    }
+    Ok(events)
+}
+
 pub async fn run_loop(
     state: Arc<DaemonState>,
     config: LoopConfig,
@@ -1999,6 +2201,10 @@ pub async fn run_loop_armed(
     // publication, and a client finding the port is never waiting on a
     // traversal.
     let mut catch_up_owed = startup_catch_up_window(&state);
+    // Owed once per daemon life, and independent of the catch-up window: the
+    // paths it recovers are exactly the ones whose host modification time puts
+    // them outside that window, which is why the window cannot see them.
+    let mut enrichment_repair_owed = true;
     if let Some(armed) = armed.as_mut() {
         armed.arm();
     }
@@ -2146,6 +2352,38 @@ pub async fn run_loop_armed(
                         "could not plan the startup catch-up, so host content written while \
                          nothing was watching stays unadmitted until `kin admit` or a commit \
                          takes it"
+                    );
+                }
+            }
+        }
+
+        // The unpublished-enrichment repair, owed once per daemon life. A
+        // previous daemon recorded the paths it derived entities for; this
+        // checks each against graph truth and re-derives only the ones whose
+        // entities did not survive, which is the exact shape of the FIR-2606
+        // wedge. Loud when it finds anything: a file admitted with no entities
+        // answered every query as an absence, and a store that has been in that
+        // state deserves the count said out loud rather than repaired in
+        // silence.
+        if enrichment_repair_owed {
+            enrichment_repair_owed = false;
+            match plan_unpublished_enrichment_repair(&state) {
+                Ok(events) if events.is_empty() => {
+                    debug!("no path is owed a re-derivation from a previous daemon");
+                }
+                Ok(events) => {
+                    warn!(
+                        count = events.len(),
+                        "a previous daemon derived entities for these paths and ended before a \
+                         commit published them, so nothing can query them; re-deriving them now"
+                    );
+                    enqueue_file_events(&mut pending_events, events);
+                }
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "could not plan the unpublished-enrichment repair, so a path missing its \
+                         entities stays unqueryable until it is edited"
                     );
                 }
             }
@@ -2733,12 +2971,23 @@ pub async fn run_loop_armed(
                                 continue;
                             }
                         }
+                        let derived_entities = !delta.entity_deltas.is_empty();
                         if let Err(e) = state.graph.apply_transaction_delta(&delta) {
                             warn!(error = %e, "failed to apply reconciled transaction into primary graph");
                             if tree_changed {
                                 state.bump_version();
                             }
                             continue;
+                        }
+                        // Recorded after the apply, so what is marked is
+                        // enrichment the graph holds. Nothing publishes it to
+                        // durable authority outside a commit, so if this daemon
+                        // ends first the next one needs to know this path is
+                        // owed one (FIR-2606).
+                        if derived_entities {
+                            if let Some(file_id) = semantic_file_id(&semantic_repo_path) {
+                                mark_enrichment_unpublished(&state, &file_id);
+                            }
                         }
                         if let Err(e) =
                             state.persist_projection_truth_from_reconcile(&reconciler, &outcome)
@@ -6886,6 +7135,302 @@ mod tests {
              file's real age instead"
         );
     }
+
+    /// Build the artifact-to-artifact edge shape the cross-file linker mints
+    /// for a file-level import, which is the class of relation nothing else
+    /// collects when its file is deleted.
+    fn artifact_edge(
+        src: kin_model::ArtifactId,
+        dst: kin_model::ArtifactId,
+        kind: kin_model::RelationKind,
+    ) -> kin_model::Relation {
+        kin_model::Relation {
+            id: kin_model::RelationId::new(),
+            kind,
+            src: kin_model::GraphNodeId::Artifact(src),
+            dst: kin_model::GraphNodeId::Artifact(dst),
+            confidence: 1.0,
+            origin: kin_model::RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        }
+    }
+
+    fn artifact_at(state: &DaemonState, path: &str) -> kin_model::ArtifactId {
+        state
+            .graph
+            .artifact_id_at_path(&test_repo_path(path))
+            .unwrap_or_else(|| panic!("{path} must be admitted before the test asks about it"))
+    }
+
+    fn test_entity(name: &str, file_path: &str) -> kin_model::Entity {
+        kin_model::Entity {
+            id: kin_model::EntityId::new(),
+            kind: kin_model::EntityKind::Function,
+            name: name.to_string(),
+            language: kin_model::LanguageId::Rust,
+            fingerprint: kin_model::SemanticFingerprint {
+                algorithm: kin_model::FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([1; 32]),
+                signature_hash: Hash256::from_bytes([2; 32]),
+                behavior_hash: Hash256::from_bytes([3; 32]),
+                equivalence_hash: Hash256::from_bytes([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(FilePathId::new(file_path)),
+            span: None,
+            signature: format!("fn {name}()"),
+            visibility: kin_model::Visibility::Public,
+            role: kin_model::EntityRole::Source,
+            doc_summary: None,
+            metadata: kin_model::EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    fn admit_entity_for(state: &DaemonState, name: &str, path: &str) {
+        state
+            .graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: vec![kin_model::EntityDelta::Added {
+                    new: test_entity(name, path),
+                }],
+                relation_deltas: vec![],
+                tree_deltas: vec![],
+                ..TransactionDelta::default()
+            })
+            .unwrap();
+    }
+
+    /// FIR-2606. A path a previous daemon derived entities for, whose entities
+    /// did not survive, is re-derived by the next daemon's first pass.
+    ///
+    /// That is the whole wedge: the artifact is admitted at exactly the bytes on
+    /// disk, so no watcher event fires for it and the startup catch-up window,
+    /// keyed on host modification time, cannot see it either. Without a record
+    /// of what was derived, nothing ever asks about the path again.
+    #[test]
+    fn a_path_whose_derived_entities_did_not_survive_is_owed_a_re_derivation() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let stranded = repo.path().join("stranded.rs");
+        std::fs::write(&stranded, b"pub fn stranded() -> u32 { 1 }\n").unwrap();
+        admit_file_event(&state, &FileEvent::Changed(stranded)).unwrap();
+        mark_enrichment_unpublished(&state, &FilePathId::new("stranded.rs"));
+
+        let owed = plan_unpublished_enrichment_repair(&state).unwrap();
+
+        let named = owed
+            .iter()
+            .map(|event| {
+                let (FileEvent::Changed(path) | FileEvent::Removed(path)) = event;
+                path.file_name().unwrap().to_string_lossy().to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            named,
+            vec!["stranded.rs".to_string()],
+            "a marked path the graph holds no entity for is exactly what needs re-deriving"
+        );
+    }
+
+    /// The control that keeps the repair off everyone else's path, and the one
+    /// the first attempt at this failed.
+    ///
+    /// A converted store marks every path it derives and its own commit
+    /// publishes them, so the next daemon resolves every entry against graph
+    /// truth and re-derives none. An earlier repair asked the graph which
+    /// admitted source paths carried no entity instead, which on a fresh
+    /// conversion is most of the working copy, and the acceptance gate caught it
+    /// perturbing the express arm's answers.
+    #[test]
+    fn a_marked_path_whose_entities_were_published_is_resolved_not_re_derived() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let published = repo.path().join("published.rs");
+        std::fs::write(&published, b"pub fn published() -> u32 { 1 }\n").unwrap();
+        admit_file_event(&state, &FileEvent::Changed(published)).unwrap();
+        mark_enrichment_unpublished(&state, &FilePathId::new("published.rs"));
+        assert_eq!(
+            plan_unpublished_enrichment_repair(&state).unwrap().len(),
+            1,
+            "the positive control: before its entities land the path is owed one pass"
+        );
+        mark_enrichment_unpublished(&state, &FilePathId::new("published.rs"));
+        admit_entity_for(&state, "published", "published.rs");
+
+        assert!(
+            plan_unpublished_enrichment_repair(&state)
+                .unwrap()
+                .is_empty(),
+            "a path whose entities the graph holds is resolved, not re-derived"
+        );
+    }
+
+    /// A resolved entry is dropped from the durable marker as well as from this
+    /// pass, so a marker cannot grow without bound across restarts and a second
+    /// daemon does not redo the first one's decision.
+    #[test]
+    fn a_resolved_entry_is_dropped_from_the_marker() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let published = repo.path().join("published.rs");
+        std::fs::write(&published, b"pub fn published() -> u32 { 1 }\n").unwrap();
+        admit_file_event(&state, &FileEvent::Changed(published)).unwrap();
+        mark_enrichment_unpublished(&state, &FilePathId::new("published.rs"));
+        admit_entity_for(&state, "published", "published.rs");
+
+        plan_unpublished_enrichment_repair(&state).unwrap();
+
+        let written =
+            std::fs::read(unpublished_enrichment_marker_path(&state)).expect("the marker persists");
+        let still_owed: Vec<String> = serde_json::from_slice(&written).unwrap();
+        assert!(
+            still_owed.is_empty(),
+            "the resolved entry is gone from the marker: {still_owed:?}"
+        );
+    }
+
+    /// A marked path the tree no longer carries was removed rather than lost.
+    /// Re-deriving it would ask the host for bytes the repository has retired.
+    #[test]
+    fn a_marked_path_that_left_the_tree_is_not_re_derived() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        mark_enrichment_unpublished(&state, &FilePathId::new("never_admitted.rs"));
+
+        assert!(
+            plan_unpublished_enrichment_repair(&state)
+                .unwrap()
+                .is_empty(),
+            "a path with no artifact in the tree is not owed a re-derivation"
+        );
+    }
+
+    /// An absent marker is the ordinary case and costs nothing.
+    #[test]
+    fn no_marker_owes_nothing() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+
+        assert!(
+            plan_unpublished_enrichment_repair(&state)
+                .unwrap()
+                .is_empty(),
+            "a store no daemon ever marked owes no re-derivation"
+        );
+    }
+
+    /// FIR-2607. A file whose artifact is named by a relation can be deleted.
+    ///
+    /// Both shapes the linker actually produces are covered: the outgoing
+    /// import edge to another artifact, and the parse-coverage self-loop every
+    /// indexed file carries. kin-db validates every relation the graph holds
+    /// against the staged tree on each transaction, so either one left standing
+    /// fails the whole removal, not just the edge. Before the fix this test
+    /// fails with `transaction relation <id> has unadmitted source endpoint
+    /// artifact:<id>`, which is the exact refusal that made a repository unable
+    /// to commit at all until the file was emptied first.
+    #[test]
+    fn a_removal_takes_the_relations_bound_to_the_departing_artifact() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let leaving = repo.path().join("leaving.rs");
+        let staying = repo.path().join("staying.rs");
+        std::fs::write(&leaving, b"pub fn leaving() -> u32 { 1 }\n").unwrap();
+        std::fs::write(&staying, b"pub fn staying() -> u32 { 2 }\n").unwrap();
+        admit_file_event(&state, &FileEvent::Changed(leaving.clone())).unwrap();
+        admit_file_event(&state, &FileEvent::Changed(staying.clone())).unwrap();
+
+        let leaving_id = artifact_at(&state, "leaving.rs");
+        let staying_id = artifact_at(&state, "staying.rs");
+        let import = artifact_edge(leaving_id, staying_id, kin_model::RelationKind::Imports);
+        let coverage = artifact_edge(leaving_id, leaving_id, kin_model::RelationKind::DependsOn);
+        state.graph.upsert_relation(&import).unwrap();
+        state.graph.upsert_relation(&coverage).unwrap();
+
+        std::fs::remove_file(&leaving).unwrap();
+        let admitted = admit_file_event_ambient(&state, &FileEvent::Removed(leaving))
+            .expect("a removal must collect the edges bound to the artifact it drops");
+
+        assert!(matches!(admitted, AdmittedFileEvent::Removed { .. }));
+        assert!(
+            tree_entry(&state, "leaving.rs").is_none(),
+            "the artifact left the tree"
+        );
+        assert!(
+            state
+                .graph
+                .get_all_relations_for_node(&kin_model::GraphNodeId::Artifact(leaving_id))
+                .unwrap()
+                .is_empty(),
+            "and every edge naming it left with it"
+        );
+        assert!(
+            tree_entry(&state, "staying.rs").is_some(),
+            "the destination artifact is untouched: only the departing endpoint's edges go"
+        );
+    }
+
+    /// FIR-2607, the second half. A refusal a user can act on.
+    ///
+    /// The raw storage message names two uuids and offers nothing to do. This
+    /// asserts the surface a user meets names the path being dropped and the
+    /// two-step retirement that clears the edges, so the message is about their
+    /// repository rather than about kin's internals.
+    #[test]
+    fn a_stranded_endpoint_refusal_names_the_path_and_the_way_out() {
+        let raw = DaemonError::Graph(kin_db::KinDbError::StorageError(
+            "transaction relation 6b30c139-1c2a-a133-d17b-2625e60d3df9 has unadmitted source \
+             endpoint artifact:f4d9e1db-d7b2-4fd9-912c-2809f331331b"
+                .to_string(),
+        ));
+        let deltas = vec![TreeDelta::Removed {
+            artifact_id: kin_model::ArtifactId::new(),
+            old: kin_model::LocatedEntry::new(
+                test_repo_path("notekeeper/search.py"),
+                TreeEntry::blob(Hash256::from_bytes([7; 32]), false),
+            ),
+        }];
+
+        let named = name_stranded_endpoint_refusal(raw, &deltas).to_string();
+
+        assert!(
+            named.contains("notekeeper/search.py"),
+            "the refusal names the path being dropped: {named}"
+        );
+        assert!(
+            named.contains("fix: empty the file and commit"),
+            "and carries the retirement that clears the edges: {named}"
+        );
+        assert!(
+            named.contains("6b30c139-1c2a-a133-d17b-2625e60d3df9"),
+            "without losing the identifiers a report needs: {named}"
+        );
+    }
+
+    /// An unrelated failure is handed back untouched, so the naming above can
+    /// never dress up a refusal it does not understand.
+    #[test]
+    fn an_unrelated_refusal_is_not_dressed_up_as_a_stranded_endpoint() {
+        let raw = DaemonError::Graph(kin_db::KinDbError::StorageError(
+            "transaction adds existing entity 1056cc39-df63-5f0b-9d85-a161fb2c882f".to_string(),
+        ));
+
+        let passed_through = name_stranded_endpoint_refusal(raw, &[]).to_string();
+
+        assert!(
+            passed_through.contains("transaction adds existing entity"),
+            "an unrelated storage refusal keeps its own words: {passed_through}"
+        );
+        assert!(
+            !passed_through.contains("fix: empty the file"),
+            "and gains no advice that would not help: {passed_through}"
+        );
+    }
 }
 
 /// Decide whether a filesystem-sync tick's bulk deletions should be WITHHELD as
@@ -7335,9 +7880,21 @@ async fn sync_filesystem_with_graph_publishing_inner(
                              {semantic_repo_path}"
                         ))));
                     }
+                    let derived_entities = !delta.entity_deltas.is_empty();
                     if let Err(e) = state.graph.apply_transaction_delta(&delta) {
                         warn!(error = %e, "failed to apply synced transaction into primary graph");
                         continue;
+                    }
+                    // Marked here for the same reason as on the ambient tick.
+                    // This seam runs under a commit as often as not, and a
+                    // commit publishes what it derived, so most entries written
+                    // here resolve against graph truth on the next daemon's
+                    // first pass and cost nothing. The ones that do not are
+                    // exactly the losses worth recovering.
+                    if derived_entities {
+                        if let Some(file_id) = semantic_file_id(&semantic_repo_path) {
+                            mark_enrichment_unpublished(state, &file_id);
+                        }
                     }
                     // The file's declarations just moved, so whatever a language
                     // server said about them was said at positions this delta

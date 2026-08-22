@@ -193,6 +193,7 @@ pub async fn run_health_checks() -> HealthReport {
     let graph_status = RunGraphStatus::for_run();
     checks.push(check_reference_edge_coverage(&graph_status).await);
     checks.push(check_relation_census(&graph_status).await);
+    checks.push(check_parse_coverage(&graph_status).await);
     checks.push(check_background_work().await);
     checks.push(check_embedding_model().await);
     checks.push(check_commit_memory_headroom());
@@ -3711,6 +3712,136 @@ fn suspended_sweep_check_for(suspended: Option<&kin_daemon_spawn::SuspendedSweep
     .with_manual_fix(suspended.remediation())
 }
 
+/// How much of what this repository admits a language adapter actually parsed.
+///
+/// The row exists because the page reads healthy while a language's main files
+/// hold no entity at all. `kin graph status` prints "Supported inputs" (what an
+/// adapter could parse) beside "Files" (what produced an entity) and never
+/// subtracts one from the other, so an express checkout where `lib/express.js`
+/// was never parsed printed both numbers and then an all-clear, and `kin
+/// doctor` agreed with it.
+///
+/// Reads the run's one `graph status` rather than taking its own, for the
+/// reason every graph-truth row here does.
+async fn check_parse_coverage(graph_status: &RunGraphStatus) -> HealthCheck {
+    const ID: &str = "parse_coverage";
+    const LABEL: &str = "Parse coverage";
+
+    let response = match parse_coverage_row_for_unread_graph(graph_status.get().await) {
+        Ok(response) => response,
+        Err(row) => return row,
+    };
+    let Some(census) = response
+        .reference_edge_coverage
+        .as_ref()
+        .and_then(|coverage| coverage.parse.as_ref())
+    else {
+        return HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Stale,
+            "the daemon serving this repository does not report parse coverage; it predates the \
+             measurement",
+        )
+        .with_manual_fix("restart the daemon with `kin daemon restart` to pick up this build");
+    };
+    parse_coverage_health(census)
+}
+
+/// This row's words for a graph status the run could not read.
+///
+/// Phrased here rather than shared with the other graph-truth rows because a
+/// row that reads graph truth must never render the same whether the graph was
+/// healthy or unreadable.
+fn parse_coverage_row_for_unread_graph(
+    status: &GraphStatusForRun,
+) -> Result<&crate::commands::graph::GraphCommandResponse, HealthCheck> {
+    const ID: &str = "parse_coverage";
+    const LABEL: &str = "Parse coverage";
+
+    match status {
+        GraphStatusForRun::Answered(response) => Ok(response),
+        GraphStatusForRun::NotInRepository => Err(HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Unsupported,
+            "not in a Kin repository, so there is no admitted file set to measure coverage over",
+        )),
+        GraphStatusForRun::NoDaemon => Err(HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Unsupported,
+            "no daemon is serving this repository, so its parse coverage was not read",
+        )
+        .with_manual_fix("run any `kin` command in the repo to auto-start the daemon")),
+        GraphStatusForRun::DaemonUrlInvalid { daemon_url, error } => Err(HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Stale,
+            format!("daemon reachable ({daemon_url}), but its URL is invalid: {error}"),
+        )
+        .with_manual_fix("check the daemon URL recorded for this repository")),
+        GraphStatusForRun::Unavailable { daemon_url, error } => Err(HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Stale,
+            format!("daemon reachable ({daemon_url}), but parse coverage is unavailable: {error}"),
+        )
+        .with_manual_fix("run `kin graph status` and resolve the reported daemon error")),
+    }
+}
+
+/// Turn the census into a row, split from its fetch so it is testable without a
+/// daemon.
+///
+/// Healthy in every state, and that is a deliberate retreat rather than an
+/// oversight. A verdict needs a signal that separates a language the extractor
+/// failed on from a file that legitimately declares nothing, and no such signal
+/// exists in graph-owned state today: a side-effect script, a re-export and a
+/// comment-only file each produce no entity and are each perfectly correct.
+/// Measured on a five-file JavaScript repository holding one real module beside
+/// one of each of those, the ratio reads 1/5, which is worse than the express
+/// checkout this census was built for. So the row reports the count and names
+/// the files, and leaves the reading to a person who can open them.
+pub(crate) fn parse_coverage_health(
+    census: &kin_core::reference_coverage::ParseCoverageCensus,
+) -> HealthCheck {
+    const ID: &str = "parse_coverage";
+    const LABEL: &str = "Parse coverage";
+
+    if census.languages.is_empty() {
+        return HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Healthy,
+            "the repository tree admits no file a full language adapter parses",
+        );
+    }
+
+    let summary = census
+        .languages
+        .iter()
+        .map(|language| {
+            format!(
+                "{} {}/{}",
+                language.language, language.with_entities, language.tracked
+            )
+        })
+        .collect::<Vec<String>>()
+        .join("; ");
+
+    let silent = census.silent_file_lines();
+    if silent.is_empty() {
+        return HealthCheck::new(ID, LABEL, HealthStatus::Healthy, summary);
+    }
+    HealthCheck::new(
+        ID,
+        LABEL,
+        HealthStatus::Healthy,
+        format!("{summary}; {}", silent.join("; ")),
+    )
+}
+
 /// Core of [`check_commit_memory_headroom`] with both readings as inputs, so
 /// every branch is testable on any host.
 fn commit_memory_headroom_check_for(
@@ -4655,6 +4786,7 @@ mod tests {
         };
 
         let coverage = ReferenceEdgeCoverage {
+            parse: None,
             languages: vec![LanguageReferenceCoverage {
                 language: "python".to_string(),
                 files: 12,
@@ -6440,6 +6572,7 @@ mod tests {
 
         fn python(cross_file: u64, resolved_calls: u64) -> ReferenceEdgeCoverage {
             ReferenceEdgeCoverage {
+                parse: None,
                 languages: vec![LanguageReferenceCoverage {
                     language: "python".to_string(),
                     files: 12,
@@ -8697,6 +8830,88 @@ mod tests {
         assert!(
             !blocks_readiness(&reported),
             "a store whose sweeps keep dying is telling you about the machine, not the install"
+        );
+    }
+
+    /// One census row, so the row is testable without a daemon or a store.
+    fn parse_census_row(
+        language: &str,
+        tracked: usize,
+        silent: usize,
+    ) -> kin_core::reference_coverage::LanguageParseCoverage {
+        kin_core::reference_coverage::LanguageParseCoverage {
+            language: language.to_string(),
+            tracked,
+            with_entities: tracked.saturating_sub(silent),
+            silent,
+            sample: if silent > 0 {
+                vec!["lib/express.js".to_string()]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    /// The row reports and never judges. Healthy in both states, because no
+    /// graph-owned signal separates a file an adapter could not read from one
+    /// that correctly declares nothing, and a doctor row that went red on the
+    /// second would go red on most JavaScript repositories. It still has to
+    /// carry the numbers and the paths, or it is a row nobody can act on.
+    #[test]
+    fn the_parse_row_reports_its_numbers_and_never_fails_a_store() {
+        let clean = parse_coverage_health(&kin_core::reference_coverage::ParseCoverageCensus {
+            languages: vec![parse_census_row("rust", 200, 0)],
+        });
+        assert!(matches!(clean.status, HealthStatus::Healthy));
+        assert!(clean.manual_fix.is_none());
+        assert!(clean.detail.contains("rust 200/200"), "{}", clean.detail);
+
+        let silent = parse_coverage_health(&kin_core::reference_coverage::ParseCoverageCensus {
+            languages: vec![parse_census_row("javascript", 141, 75)],
+        });
+        assert!(
+            matches!(silent.status, HealthStatus::Healthy),
+            "a count is not a defect: {:?}",
+            silent.status
+        );
+        for expected in ["75", "141", "lib/express.js"] {
+            assert!(
+                silent.detail.contains(expected),
+                "the row must carry {expected}: {}",
+                silent.detail
+            );
+        }
+        assert!(
+            silent.manual_fix.is_none(),
+            "a fix line would promise a repair for something not shown to be broken: {:?}",
+            silent.manual_fix
+        );
+        assert!(!blocks_readiness(&silent));
+    }
+
+    /// A daemon that never measured parse coverage and a store whose files are
+    /// all parsed must not render the same. The first is unread and the second
+    /// is a verdict, and collapsing them is how an all-clear gets printed about
+    /// a store nobody looked at.
+    #[test]
+    fn a_store_admitting_no_parsable_file_is_not_the_same_row_as_one_nobody_measured() {
+        let empty = parse_coverage_health(&kin_core::reference_coverage::ParseCoverageCensus {
+            languages: Vec::new(),
+        });
+        assert!(matches!(empty.status, HealthStatus::Healthy));
+        assert!(
+            empty.detail.contains("admits no file"),
+            "an empty census says why it is empty: {}",
+            empty.detail
+        );
+
+        let unread = parse_coverage_row_for_unread_graph(&GraphStatusForRun::NoDaemon)
+            .expect_err("no daemon is not an answered status");
+        assert!(matches!(unread.status, HealthStatus::Unsupported));
+        assert!(
+            !unread.detail.contains("admits no file"),
+            "an unread graph must not borrow the words of a measured one: {}",
+            unread.detail
         );
     }
 }

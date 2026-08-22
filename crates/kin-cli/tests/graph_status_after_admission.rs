@@ -1006,3 +1006,107 @@ fn a_converted_store_reports_its_admission_rather_than_unknown_freshness() {
         "{graph_stdout}"
     );
 }
+
+/// `kin graph status` prints two file counts and never subtracts one from the
+/// other: "Supported inputs" is what a full adapter could parse and "Files" is
+/// what produced an entity. This section publishes the per-language ratio those
+/// two never formed, and names the files behind it.
+///
+/// It publishes no verdict, and the second half of this test is what holds that
+/// line: the section must not withhold the all-clear, because a file producing
+/// no entity is not evidence that anything failed. A side-effect script, a
+/// re-export and a comment-only file each correctly produce nothing.
+#[test]
+fn graph_status_publishes_per_language_parse_coverage_without_a_verdict() {
+    let root = tempdir().expect("temp root");
+    let repo = root.path().join("repo");
+    seed_javascript_repository(&repo, 3);
+    let admitted = admit_seeded(&repo);
+    let graph = workspace_query_graph(&admitted.binding);
+    let response = graph_status(&admitted.binding, &graph);
+    let lines = response.lines.join("\n");
+
+    assert!(
+        lines.contains("Parse coverage (files that produced an entity / files admitted):"),
+        "the section prints: {lines}"
+    );
+    let row = response
+        .lines
+        .iter()
+        .find(|line| line.trim_start().starts_with("javascript:"))
+        .unwrap_or_else(|| panic!("no javascript row in:\n{lines}"));
+    assert!(
+        row.contains("/7"),
+        "the denominator is every admitted javascript file, not the ones that produced an \
+         entity: {row}"
+    );
+    assert!(
+        lines.contains("no_entity:") && lines.contains("unreadable0.js"),
+        "the silent files are named so a reader can open them: {lines}"
+    );
+
+    // The control, and the half that can fail. A count is not a defect, so this
+    // section contributes no warning of its own and does not move the exit
+    // code. The fixture carries unrelated warnings (pending embeddings, a
+    // single-role graph), which is why this asserts on what the warnings SAY
+    // rather than on the all-clear being present.
+    let complaints: Vec<&String> = response
+        .lines
+        .iter()
+        .filter(|line| line.starts_with('⚠') || line.starts_with('✗'))
+        .filter(|line| {
+            line.contains("parse coverage")
+                || line.contains("no_entity")
+                || line.contains("produced no entity")
+        })
+        .collect();
+    assert!(
+        complaints.is_empty(),
+        "publishing a count must not withhold the all-clear on its own: {complaints:?}"
+    );
+    assert!(
+        response.error.is_none(),
+        "and must not turn the command nonzero: {:?}",
+        response.error
+    );
+}
+
+/// A repository of four parseable JavaScript modules plus `silent` files that
+/// produce no entity.
+fn seed_javascript_repository(repo: &Path, silent: usize) {
+    fs::create_dir_all(repo.join("lib")).expect("create lib directory");
+    run_git(repo, &["init", "--initial-branch=main"]);
+    run_git(repo, &["config", "user.email", "kin@example.invalid"]);
+    run_git(repo, &["config", "user.name", "Kin"]);
+    for index in 0..4 {
+        fs::write(
+            repo.join(format!("lib/module{index}.js")),
+            format!("function handler{index}() {{\n  return {index};\n}}\nmodule.exports = handler{index};\n"),
+        )
+        .expect("write a parseable module");
+    }
+    for index in 0..silent {
+        // Valid UTF-8 JavaScript that declares nothing. This is the honest
+        // shape: bytes an adapter is registered for, admitted as source, and
+        // holding no entity. NUL bytes would route the file to the opaque facet
+        // instead, which is a different state wearing the same numbers.
+        fs::write(
+            repo.join(format!("lib/unreadable{index}.js")),
+            b"require('./module0');\n// nothing is declared here\n" as &[u8],
+        )
+        .expect("write a silent module");
+    }
+    run_git(repo, &["add", "--all"]);
+    run_git(repo, &["commit", "-m", "a javascript library"]);
+}
+
+/// `admit` without its own seeding, for a fixture that wrote its own tree.
+fn admit_seeded(repo: &Path) -> AdmittedRepository {
+    let result = kin_core::init_from_git(repo).expect("admit exact Git repository authority");
+    let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&result.layout)
+        .expect("bind published repository authority");
+    AdmittedRepository {
+        layout: result.layout,
+        binding,
+    }
+}

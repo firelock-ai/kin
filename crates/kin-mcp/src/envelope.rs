@@ -1979,13 +1979,21 @@ fn apply_response_budget(annotated: &mut Value, tool_name: &str, budget: &Respon
     let mut accounting = crate::budget::BudgetAccounting {
         max_chars: budget.max_chars,
         chars_before,
+        // The placeholder carries a number of the same magnitude as the one that
+        // replaces it, so the stanza written first is the width of the stanza
+        // that ships and the ladder charges the budget for the right bytes.
+        chars_after: chars_before,
         bounded: false,
         compact: budget.compact,
     };
     write_response_accounting(annotated, &accounting);
     if let Some(applied) = crate::budget::enforce(annotated, tool_name, budget) {
         accounting = applied;
-        accounting.chars_before = chars_before;
+        // This arm's own measurement, taken before the placeholder stanza was
+        // written, is the more accurate one for this pass. It loses only to a
+        // larger number the ladder recovered from an earlier arm's disclosure,
+        // which is the size the answer was actually built at.
+        accounting.chars_before = accounting.chars_before.max(chars_before);
     }
     write_response_accounting(annotated, &accounting);
     if accounting.bounded {
