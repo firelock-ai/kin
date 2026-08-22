@@ -22,13 +22,24 @@ disclosed. A daemon that quietly stopped sweeping would look identical to one
 that had finished, since every counter on every surface keeps reporting the
 unenriched files as pending work.
 
-Why the level is forced rather than produced
---------------------------------------------
+Two constraints, both covered
+-----------------------------
+A daemon backs off for two different reasons and the remedies point in opposite
+directions. The host can be out of room, which is the user's to fix, and the
+daemon can be over its own footprint budget, which is Kin's. Checks 0 to 3 cover
+the host half; checks 4 and 5 cover the budget half, including that a budget
+refusal blames the budget and not the machine.
+
+Why both levers are pinned rather than produced
+-----------------------------------------------
 A test that has to exhaust a machine's memory to prove Kin backs off is a test
 that takes the machine down to run, on the shared runner, beside every other
-job. `KIN_MEMORY_PRESSURE` pins the level the daemon judges its work against,
-which is the same seam the product reads, so what is proven here is the shipped
-decision rather than a stand-in for it.
+job. `KIN_MEMORY_PRESSURE` pins the level the daemon judges its work against and
+`KIN_DAEMON_MEMORY_BUDGET_BYTES` names the budget outright, and both are the
+same seams the product reads, so what is proven here is the shipped decision
+rather than a stand-in for it. A one-byte budget puts any real daemon over the
+line on its first look, which is the shortest path to the decision under test
+and needs no memory at all.
 
 What it deliberately does NOT assert
 ------------------------------------
@@ -183,6 +194,28 @@ def row_blocks_readiness(row):
     return bool(row) and row.get("status") in BLOCKING_STATUSES
 
 
+def reason_names_the_budget(reason):
+    """Whether a refusal blames this daemon's own budget rather than the host.
+
+    The two constraints fail in different situations and the remedies point in
+    opposite directions, so a refusal that named the wrong one would send a
+    reader to buy memory they already have. Both halves are required: the budget
+    sentence, and the absence of the host sentence.
+    """
+    reason = reason or ""
+    return "it is allowed" in reason and "host memory pressure" not in reason
+
+
+def status_publishes_the_standing(text):
+    """Whether `kin status` printed what the daemon holds and may hold.
+
+    The child figure is required. A line without it cannot tell a daemon with no
+    language servers from a reading that never looked for them, which is the
+    blindness this whole pass exists to end.
+    """
+    return "Daemon memory:" in text and "it is allowed" in text and "child processes" in text
+
+
 def status_discloses_the_refusal(text):
     """Whether `kin graph status` printed the refusal beside its counters.
 
@@ -196,6 +229,8 @@ GRADERS = {
     "row_reports_a_refusal": row_reports_a_refusal,
     "row_blocks_readiness": row_blocks_readiness,
     "status_discloses_the_refusal": status_discloses_the_refusal,
+    "reason_names_the_budget": reason_names_the_budget,
+    "status_publishes_the_standing": status_publishes_the_standing,
 }
 
 
@@ -221,6 +256,7 @@ class Suite(object):
         # Inherited pressure would decide this suite's control runs for it. The
         # runner's own state is never an input here.
         self.env.pop("KIN_MEMORY_PRESSURE", None)
+        self.env.pop("KIN_DAEMON_MEMORY_BUDGET_BYTES", None)
         if daemon:
             self.env["KIN_DAEMON_BIN"] = daemon
         self.repos = {}
@@ -233,7 +269,7 @@ class Suite(object):
                 "-c", "commit.gpgsign=false"]
         return run(base + args, cwd=cwd, env=self.env)
 
-    def kin_run(self, args, repo, pressure=None, timeout=600):
+    def kin_run(self, args, repo, pressure=None, budget=None, timeout=600):
         """One `kin` command, optionally under a pinned pressure level.
 
         The level reaches the daemon only through the command that STARTS one:
@@ -246,16 +282,20 @@ class Suite(object):
             env.pop("KIN_MEMORY_PRESSURE", None)
         else:
             env["KIN_MEMORY_PRESSURE"] = pressure
+        if budget is None:
+            env.pop("KIN_DAEMON_MEMORY_BUDGET_BYTES", None)
+        else:
+            env["KIN_DAEMON_MEMORY_BUDGET_BYTES"] = str(budget)
         return run([self.kin] + args, cwd=repo, env=env, timeout=timeout)
 
-    def restart_daemon(self, repo, pressure=None):
+    def restart_daemon(self, repo, pressure=None, budget=None):
         """Stop whatever daemon is serving `repo` and start one under `pressure`.
 
         Returns the (rc, output) of the command that started the new one, so a
         caller can report a failure to start rather than grading its absence.
         """
         run([self.kin, "daemon", "stop"], cwd=repo, env=self.env, timeout=180)
-        return self.kin_run(["graph", "status"], repo, pressure=pressure)
+        return self.kin_run(["graph", "status"], repo, pressure=pressure, budget=budget)
 
     def record_path(self, repo):
         return os.path.join(repo, ".kin", RECORD_NAME)
@@ -479,7 +519,83 @@ def check_3(suite):
     return result
 
 
-CHECKS = [("0", check_0), ("1", check_1), ("2", check_2), ("3", check_3)]
+def check_4(suite):
+    """A daemon over its own budget backs off and blames the budget, not the host.
+
+    Driven by naming a one-byte budget rather than by allocating gigabytes, for
+    the same reason the pressure level is pinned rather than produced: a test
+    that has to fill a machine to prove Kin backs off is a test that takes the
+    machine down to run. An operator budget is honoured exactly as given, so one
+    byte puts any real daemon over it on its first look, which is the shortest
+    path to the decision under test.
+
+    The control is the same store with no budget named, where the derived budget
+    is gigabytes and nothing backs off.
+    """
+    result = Result(
+        "4", TICKET,
+        "a daemon over its footprint budget refuses, and names the budget rather than the host",
+    )
+    repo = suite.fixture("budgeted")
+    rc, out = suite.restart_daemon(repo, budget=1)
+    if rc != 0:
+        result.unknown("could not start a daemon under a one-byte budget, exit %d: %s"
+                       % (rc, tail(out)))
+        return result
+    record = suite.read_record(repo)
+    if record is None:
+        result.bad("a daemon whose tree is over its budget recorded no refusal at %s"
+                   % suite.record_path(repo))
+    elif not reason_names_the_budget(record.get("reason")):
+        result.bad("the refusal blames the wrong constraint, which sends the reader to buy "
+                   "memory they already have: %s" % json.dumps(record))
+    else:
+        result.ok("the store records a budget refusal of %s" % record.get("work"))
+
+    rc, out = suite.restart_daemon(repo, budget=None)
+    if rc != 0:
+        result.unknown("could not start a control daemon, exit %d: %s" % (rc, tail(out)))
+        return result
+    stale = suite.read_record(repo)
+    if stale is not None:
+        result.bad("the derived budget is gigabytes, yet this store still records a refusal, "
+                   "so check 4's other half proves nothing: %s" % json.dumps(stale))
+    else:
+        result.ok("a daemon inside its derived budget records nothing")
+    return result
+
+
+def check_5(suite):
+    """`kin status` publishes what the daemon holds, including its children.
+
+    The child figure is the point. Every per-pid view of the daemon that died
+    was blind to the 1.93 GiB its language server held, and a status line
+    without a child figure cannot tell a daemon with no servers from a reading
+    that never looked for them.
+    """
+    result = Result(
+        "5", TICKET,
+        "kin status publishes the daemon's footprint against its budget, children named",
+    )
+    repo = suite.fixture("budgeted")
+    rc, out = suite.restart_daemon(repo, budget=None)
+    if rc != 0:
+        result.unknown("could not start a daemon, exit %d: %s" % (rc, tail(out)))
+        return result
+    rc, out = suite.kin_run(["status"], repo)
+    if rc != 0:
+        result.unknown("`kin status` exited %d: %s" % (rc, tail(out)))
+        return result
+    if not status_publishes_the_standing(out):
+        result.bad("kin status published no daemon footprint line, so a reader has no way to "
+                   "ask what Kin thinks it is holding. Output: %s" % tail(out, 900))
+    else:
+        result.ok("kin status names the footprint, the budget and the children")
+    return result
+
+
+CHECKS = [("0", check_0), ("1", check_1), ("2", check_2), ("3", check_3),
+          ("4", check_4), ("5", check_5)]
 
 
 # ------------------------------------------------------------------ self-test
@@ -547,6 +663,42 @@ def self_test():
             failures.append("status_discloses_the_refusal(%r) = %s, wanted %s"
                             % (text, got, want))
 
+    budget_cases = [
+        (True, "this repository's daemon and the 1 process(es) it started hold 8.4 GiB of the "
+               "8.0 GiB it is allowed (derived from the memory available here), of which "
+               "1.9 GiB is in those child processes, so the language-server enrichment sweep "
+               "did not start."),
+        # The host sentence is the other constraint and must not read as this one.
+        (False, "host memory pressure is critical: 11.5 GiB of the 12.0 GiB this container "
+                "allows is in use, so the language-server enrichment sweep did not start."),
+        # A sentence carrying both blames the host, which is the ambiguity the
+        # grader exists to refuse.
+        (False, "host memory pressure is critical and it is allowed less than that"),
+        (False, None),
+        (False, ""),
+    ]
+    for want, reason in budget_cases:
+        got = reason_names_the_budget(reason)
+        if got != want:
+            failures.append("reason_names_the_budget(%r) = %s, wanted %s" % (reason, got, want))
+
+    standing_cases = [
+        (True, "Store size: 12 MiB\nDaemon memory: this repository's daemon and the 1 "
+               "process(es) it started hold 2.5 GiB of the 8.0 GiB it is allowed (derived from "
+               "the memory available here), of which 512 MiB is in those child processes"),
+        # A line with no child figure cannot tell a daemon with no servers from
+        # a reading that never looked.
+        (False, "Daemon memory: holds 2.5 GiB of the 8.0 GiB it is allowed"),
+        # And the label alone is not the disclosure.
+        (False, "Daemon memory: not measured"),
+        (False, "Store size: 12 MiB"),
+    ]
+    for want, text in standing_cases:
+        got = status_publishes_the_standing(text)
+        if got != want:
+            failures.append("status_publishes_the_standing(%r) = %s, wanted %s"
+                            % (text, got, want))
+
     # `tail` must keep the END of an output, which is where the error is.
     tail_cases = [
         ("short", "short"),
@@ -578,7 +730,7 @@ def self_test():
     for failure in failures:
         print("SELFTEST FAIL %s" % failure)
     total = (len(row_cases) + len(healthy_cases) + len(status_cases)
-             + len(tail_cases) + len(grade_cases))
+             + len(budget_cases) + len(standing_cases) + len(tail_cases) + len(grade_cases))
     print("kin-memory-pressure-repro: self-test %d/%d cases"
           % (total - len(failures), total))
     return 1 if failures else 0
