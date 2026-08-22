@@ -3728,10 +3728,7 @@ pub async fn run_with_authority_on(
                         kin_core::memory_pressure::Verdict::Shrink { reason } => {
                             warn!(
                                 pressure = call.level.as_str(),
-                                batch = embed_batch_under_pressure(
-                                    embed_batch_size,
-                                    &call.verdict
-                                ),
+                                batch = embed_batch_under_pressure(embed_batch_size, &call.verdict),
                                 configured = embed_batch_size,
                                 "{reason}"
                             );

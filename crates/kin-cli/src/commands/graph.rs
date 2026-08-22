@@ -947,9 +947,7 @@ fn build_graph_status_response_for_store(
     // Work the daemon declined for want of memory is invisible in the same way
     // and for the same reason: the counters above report it as pending, and the
     // process that declined it left nothing behind but this record.
-    if let Some(refusal) =
-        kin_root.and_then(kin_core::memory_pressure::PressureRefusal::read)
-    {
+    if let Some(refusal) = kin_root.and_then(kin_core::memory_pressure::PressureRefusal::read) {
         warnings.push(format!(
             "{} {}",
             refusal.cause_sentence(),

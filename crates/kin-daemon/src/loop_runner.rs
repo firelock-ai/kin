@@ -2589,9 +2589,8 @@ pub async fn run_loop_armed(
         // The explicit seams are deliberately not gated. A commit is a command
         // a person ran, and refusing it would trade a machine Kin might have
         // saved for work the user asked for and would have to do again.
-        let pressure = crate::daemon::pressure_verdict(
-            kin_core::memory_pressure::HeavyWork::AmbientAdmission,
-        );
+        let pressure =
+            crate::daemon::pressure_verdict(kin_core::memory_pressure::HeavyWork::AmbientAdmission);
         if let kin_core::memory_pressure::Verdict::Refuse { reason } = &pressure.verdict {
             if announced_pressure != Some(pressure.level) {
                 crate::daemon::disclose_pressure_refusal(

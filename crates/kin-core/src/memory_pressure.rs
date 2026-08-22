@@ -697,7 +697,9 @@ fn mach_vm_statistics() -> Result<libc::vm_statistics64, String> {
         )
     };
     if status != libc::KERN_SUCCESS {
-        return Err(format!("host_statistics64(HOST_VM_INFO64) returned {status}"));
+        return Err(format!(
+            "host_statistics64(HOST_VM_INFO64) returned {status}"
+        ));
     }
     Ok(stats)
 }
@@ -906,7 +908,10 @@ mod tests {
     fn a_ceiling_of_zero_reads_as_no_pressure_rather_than_total_pressure() {
         // A host that reported a zero ceiling told us nothing. Dividing into it
         // would refuse every piece of work on the machine.
-        assert_eq!(Thresholds::default().level_for(&reading(0, 0)), PressureLevel::Nominal);
+        assert_eq!(
+            Thresholds::default().level_for(&reading(0, 0)),
+            PressureLevel::Nominal
+        );
     }
 
     #[test]
@@ -959,7 +964,10 @@ mod tests {
         let unknown = MemoryPressure::Unknown {
             reason: "/proc/meminfo unreadable: No such file or directory".to_string(),
         };
-        assert_eq!(unknown.level_under(&Thresholds::default()), PressureLevel::Unknown);
+        assert_eq!(
+            unknown.level_under(&Thresholds::default()),
+            PressureLevel::Unknown
+        );
         for work in [
             HeavyWork::LspSweep,
             HeavyWork::EmbedBatch,
@@ -982,10 +990,15 @@ mod tests {
             HeavyWork::AmbientAdmission,
         ] {
             let verdict = Verdict::for_reading(work, &pressure, &Thresholds::default());
-            assert!(verdict.refused(), "{work:?} must not start under critical pressure");
+            assert!(
+                verdict.refused(),
+                "{work:?} must not start under critical pressure"
+            );
             let reason = verdict.reason().expect("a refusal carries its reason");
             assert!(
-                reason.contains("critical") && reason.contains("11.5 GiB") && reason.contains("12.0 GiB"),
+                reason.contains("critical")
+                    && reason.contains("11.5 GiB")
+                    && reason.contains("12.0 GiB"),
                 "the refusal quotes what it measured: {reason}"
             );
             assert!(
@@ -1033,7 +1046,10 @@ mod tests {
             &Thresholds::default(),
         );
         assert!(
-            !silent.reason().expect("refused").contains("out-of-memory kill"),
+            !silent
+                .reason()
+                .expect("refused")
+                .contains("out-of-memory kill"),
             "a host that could not be asked must not be reported as having answered"
         );
     }
@@ -1107,10 +1123,12 @@ mod tests {
             forced.level_under(&Thresholds::default()),
             PressureLevel::Critical
         );
-        let verdict =
-            Verdict::for_reading(HeavyWork::LspSweep, &forced, &Thresholds::default());
+        let verdict = Verdict::for_reading(HeavyWork::LspSweep, &forced, &Thresholds::default());
         let reason = verdict.reason().expect("a refusal carries its reason");
-        assert!(reason.contains("KIN_MEMORY_PRESSURE pins it there"), "{reason}");
+        assert!(
+            reason.contains("KIN_MEMORY_PRESSURE pins it there"),
+            "{reason}"
+        );
         assert!(
             !reason.contains("GiB") && !reason.contains("MiB"),
             "a level nobody read must not be dressed up with figures: {reason}"
@@ -1181,7 +1199,10 @@ mod tests {
                     "usage cannot exceed the ceiling it is measured against"
                 );
                 let fraction = reading.used_fraction();
-                assert!((0.0..=1.0).contains(&fraction), "fraction {fraction} out of range");
+                assert!(
+                    (0.0..=1.0).contains(&fraction),
+                    "fraction {fraction} out of range"
+                );
             }
             MemoryPressure::Unknown { reason } => {
                 assert!(!reason.is_empty(), "an unknown reading says why");
