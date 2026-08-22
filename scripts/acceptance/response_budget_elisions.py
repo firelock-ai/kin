@@ -92,6 +92,12 @@ IMPACT_LISTS = [
 # The reason code a response still over its ceiling publishes.
 OVER_BUDGET_REASON = "response_over_budget"
 
+# Callees on the wide focal. Sized so the whole pack clears the pack token
+# budget's 8,000 floor several times over while the serialized response stays
+# well under the 60,000-character response ceiling, which is what lets check 5
+# attribute a cut to one budget rather than to two.
+WIDE_CALLEES = 35
+
 
 class SetupError(Exception):
     """The run could not be set up. Never a pass, never a check failure."""
@@ -546,15 +552,17 @@ class Suite(object):
 
         # A second focal whose callees cost the pack's TOKEN budget without
         # costing its response budget much. Every parameter is `a<i>=0`, which
-        # the pack's estimator counts as four tokens across five characters, so
-        # fifty callees run to roughly 23,000 estimated tokens in about 36,000
-        # characters of compact JSON. That ratio is the point: the token budget
-        # has to cut this pack while the response budget, pinned at its ceiling
-        # on both calls, has nothing to do. Nothing here is named `hop`, so the
-        # locate-based checks above rank exactly what they ranked before.
+        # the pack's estimator counts as four tokens across roughly seven
+        # characters, so these callees run to about 16,000 estimated tokens in
+        # well under the 60,000-character response ceiling. That ratio is the
+        # point: the token budget has to cut this pack at its 8,000 floor while
+        # the response budget, pinned at its ceiling on both calls, has nothing
+        # to do, and check 5 asserts that rather than assuming it. Nothing here
+        # is named `hop`, so the locate-based checks above rank exactly what
+        # they ranked before.
         params = ", ".join("a%d=0" % index for index in range(100))
         wide = []
-        for index in range(50):
+        for index in range(WIDE_CALLEES):
             wide += [
                 "def wide_dep_%02d(%s):" % (index, params),
                 '    """A callee sized in tokens, not in characters."""',
@@ -563,8 +571,11 @@ class Suite(object):
                 "",
             ]
         wide += ["def wide_entry(value):", '    """The focal the pack budget arm packs."""', "    return ("]
-        for index in range(50):
-            wide.append("        wide_dep_%02d()" % index + (" +" if index < 49 else ""))
+        for index in range(WIDE_CALLEES):
+            wide.append(
+                "        wide_dep_%02d()" % index
+                + (" +" if index < WIDE_CALLEES - 1 else "")
+            )
         wide += ["    )", ""]
         with open(os.path.join(repo, "src", "wide.py"), "w") as handle:
             handle.write("\n".join(wide))

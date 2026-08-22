@@ -399,6 +399,12 @@ impl DependencySelection {
     }
 
     /// Record one candidate the token budget refused.
+    ///
+    /// Work items and annotations are scoped to an entity rather than being
+    /// one, so those groups file the scope's id and can file it more than once.
+    /// The count is still one per refused row, which is what both surfaces
+    /// render; only [`Self::budget_elided_unrecovered`]'s per-id filter is
+    /// meaningless there, and nothing asks it for those groups.
     fn refuse(&mut self, group: &'static str, entity_id: EntityId) {
         self.budget_elided.entry(group).or_default().push(entity_id);
     }
