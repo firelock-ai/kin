@@ -315,12 +315,16 @@ impl LanguageAdapter for PythonAdapter {
 
         // Annotate Calls/References relations with import_source.
         //
-        // A receiver-bearing call is skipped: its `dst_name` is an attribute
+        // A receiver-bearing CALL is skipped: its `dst_name` is an attribute
         // read off some object, not the local binding an import introduced, so
         // matching it against the import map pins `obj.get(...)` to whatever
-        // module happened to export a name called `get`.
+        // module happened to export a name called `get`. A receiver on a
+        // `References` edge means something else entirely, the class attribute
+        // whose type the edge declares, and its `dst_name` IS the local binding
+        // the import introduced, so skipping it there dropped the pin that
+        // tells the linker which module the annotated type came from.
         for rel in &mut relations {
-            if rel.receiver.is_some() {
+            if rel.kind == kin_model::RelationKind::Calls && rel.receiver.is_some() {
                 continue;
             }
             if matches!(
@@ -494,12 +498,18 @@ fn extract_py_node(
                             member.kind(),
                             "function_definition" | "class_definition" | "decorated_definition"
                         ) {
+                            let before = value_refs.len();
                             collect_python_value_refs(
                                 &member,
                                 source,
                                 &name,
                                 &std::collections::HashSet::new(),
                                 value_refs,
+                            );
+                            stamp_class_attribute_declaration(
+                                &member,
+                                source,
+                                &mut value_refs[before..],
                             );
                         }
                     }
@@ -628,6 +638,16 @@ struct PythonValueRef {
     /// lines has three reference sites and a row reporting one of them would
     /// under-report while its completeness flag read true.
     site: RelationSite,
+    /// The class attribute this reference DECLARES the type of, set only for a
+    /// class body's own `attribute: Type` annotation.
+    ///
+    /// `class Response: connection: HTTPAdapter` already emitted a reference
+    /// from `Response` to `HTTPAdapter`, and that edge alone cannot say which
+    /// attribute holds that type. Carrying the attribute is what lets the
+    /// linker join `r.connection.send(...)` under `r: Response` to
+    /// `HTTPAdapter.send`: the first hop is declared in the calling scope, the
+    /// second on a class the calling file may never open.
+    attribute: Option<String>,
 }
 
 /// Collect the references made by one `function_definition`, sourced from the
@@ -810,6 +830,7 @@ fn collect_python_value_refs(
                         root: name.to_string(),
                         member: None,
                         site: site_from_node(node),
+                        attribute: None,
                     });
                 }
             }
@@ -831,6 +852,7 @@ fn collect_python_value_refs(
                                 root: root.to_string(),
                                 member: Some(leaf.to_string()),
                                 site: site_from_node(node),
+                                attribute: None,
                             });
                         }
                     }
@@ -939,6 +961,7 @@ fn collect_python_type_refs(
                         root: name.to_string(),
                         member: None,
                         site: site_from_node(node),
+                        attribute: None,
                     });
                 }
             }
@@ -960,6 +983,7 @@ fn collect_python_type_refs(
                                 root: root.to_string(),
                                 member: Some(leaf.to_string()),
                                 site: site_from_node(node),
+                                attribute: None,
                             });
                         }
                     }
@@ -983,6 +1007,7 @@ fn collect_python_type_refs(
                             root: text.to_string(),
                             member: None,
                             site: site_from_node(&content),
+                            attribute: None,
                         });
                     }
                 }
@@ -1076,7 +1101,13 @@ fn emit_python_value_references(
         relations.push(ExtractedRelation {
             site: Some(value_ref.site),
             call_shape: None,
-            receiver: None,
+            // Set only for a class body's own `attribute: Type` annotation,
+            // where it names the attribute whose type this edge declares. The
+            // field is otherwise the receiver a `Calls` edge was written
+            // through; both spellings answer the same question, which holder
+            // does this edge hang off, and reusing it keeps the parser/linker
+            // seam byte-identical rather than versioning it for one join.
+            receiver: value_ref.attribute,
             kind: kin_model::RelationKind::References,
             src_name: value_ref.src_name,
             dst_name: dst,
@@ -1368,8 +1399,18 @@ fn extract_named_callee(
             let declared_owner = receiver_text
                 .as_deref()
                 .and_then(|receiver| receiver_types.get(receiver));
-            match (class_ctx, declared_owner) {
-                (Some(cls), _) if self_or_cls_receiver => PythonNamedCallee {
+            // The two-hop receiver. Nothing here declares `r.connection`, but
+            // the scope declares `r: Response`, so the owner half becomes
+            // `Response.connection`: the class whose body settles the second
+            // hop, and the attribute to ask it about. The linker owns that
+            // lookup because the declaration lives on another class in another
+            // file, which is exactly why the one-hop tier could not see it.
+            let declared_attribute_path = declared_owner
+                .is_none()
+                .then(|| python_declared_attribute_path(receiver_text.as_deref()?, receiver_types))
+                .flatten();
+            match (class_ctx, declared_owner, declared_attribute_path) {
+                (Some(cls), _, _) if self_or_cls_receiver => PythonNamedCallee {
                     name: format!("{cls}.{attr}"),
                     resolution_proven: true,
                     receiver: None,
@@ -1381,9 +1422,21 @@ fn extract_named_callee(
                 // from a written path, so a type the repository does not
                 // define falls back to the bare leaf instead of resolving to
                 // nothing.
-                (_, Some(owner)) => PythonNamedCallee {
+                (_, Some(owner), _) => PythonNamedCallee {
                     name: format!("{owner}.{attr}"),
                     resolution_proven: true,
+                    receiver: receiver_text,
+                },
+                // Only half proven: the parse settles which class and which
+                // attribute to ask, and whether the repository declares that
+                // attribute's type is a question this file cannot answer. So
+                // the call still counts against file call coverage exactly as
+                // the bare leaf it would otherwise have been, and a linker that
+                // finds no declaration hands it straight back to the bare-name
+                // rule.
+                (_, None, Some(path)) => PythonNamedCallee {
+                    name: format!("{path}.{attr}"),
+                    resolution_proven: false,
                     receiver: receiver_text,
                 },
                 _ => PythonNamedCallee {
@@ -1416,6 +1469,33 @@ fn extract_named_callee(
 /// right-hand side, so a name the file never annotates has no entry and its
 /// calls keep the bare-leaf behaviour they had before.
 type PythonReceiverTypes = std::collections::HashMap<String, String>;
+
+/// `Response.connection` for a call written through `r.connection` where the
+/// scope declares `r: Response`, and `None` for every other receiver.
+///
+/// Exactly one attribute hop is admitted. `r.connection.send(prep)` is the
+/// requests shape both hops of which are written down, `r: Response` in the
+/// signature and `connection: HTTPAdapter` on the class. `a.b.c.send()` needs a
+/// second declaration this returns nothing about, so it declines and the call
+/// keeps the bare leaf it already had.
+///
+/// `self` and `cls` are excluded because an attribute of the enclosing class is
+/// already keyed whole (`self.connection`) by [`python_receiver_types`], and
+/// that entry wins before this is consulted.
+fn python_declared_attribute_path(
+    receiver: &str,
+    receiver_types: &PythonReceiverTypes,
+) -> Option<String> {
+    let (root, attribute) = receiver.split_once('.')?;
+    if root.is_empty() || attribute.is_empty() || attribute.contains('.') {
+        return None;
+    }
+    if root == "self" || root == "cls" {
+        return None;
+    }
+    let root_type = receiver_types.get(root)?;
+    Some(format!("{root_type}.{attribute}"))
+}
 
 /// Collect the receiver types one `function_definition` can dispatch through.
 ///
@@ -1581,22 +1661,32 @@ fn python_self_attribute_path(node: &tree_sitter::Node, source: &[u8]) -> Option
 /// the receiver's type undecided, and a receiver whose type is undecided must
 /// keep the bare-name behaviour rather than pick one arm of it.
 fn python_annotation_type_name(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let named = python_annotation_type_node(node, source)?;
+    let text = named.utf8_text(source).ok()?;
+    (!text.is_empty() && text.split('.').all(|seg| !seg.is_empty())).then(|| text.to_string())
+}
+
+/// The node inside an annotation that names its one type, or `None` when the
+/// annotation names no single type.
+///
+/// Split out from [`python_annotation_type_name`] because a class-body
+/// attribute annotation has to be matched against the reference edge the type
+/// walk already emitted for it, and only the node's own byte offset identifies
+/// that edge unambiguously when a class declares two attributes of one type.
+/// The admitted shapes are the name's: a bare identifier, a dotted path, and
+/// `Optional[T]`, which adds `None` to `T` without changing what a call
+/// through it dispatches to.
+fn python_annotation_type_node<'tree>(
+    node: &tree_sitter::Node<'tree>,
+    source: &[u8],
+) -> Option<tree_sitter::Node<'tree>> {
     let inner = if node.kind() == "type" {
         node.named_child(0)?
     } else {
         *node
     };
     match inner.kind() {
-        "identifier" => inner
-            .utf8_text(source)
-            .ok()
-            .filter(|name| !name.is_empty())
-            .map(str::to_string),
-        "attribute" => {
-            let text = inner.utf8_text(source).ok()?;
-            (!text.is_empty() && text.split('.').all(|seg| !seg.is_empty()))
-                .then(|| text.to_string())
-        }
+        "identifier" | "attribute" => Some(inner),
         "subscript" => {
             let value = inner.child_by_field_name("value")?;
             let wrapper = value.utf8_text(source).ok()?;
@@ -1608,9 +1698,61 @@ fn python_annotation_type_name(node: &tree_sitter::Node, source: &[u8]) -> Optio
                 .children_by_field_name("subscript", &mut cursor)
                 .collect::<Vec<_>>();
             let argument = arguments.pop().filter(|_| arguments.is_empty())?;
-            python_annotation_type_name(&argument, source)
+            python_annotation_type_node(&argument, source)
         }
         _ => None,
+    }
+}
+
+/// Mark the reference a class body's own `attribute: Type` annotation produced
+/// with the attribute it declares.
+///
+/// The type walk has already pushed a reference for every name the annotation
+/// carries, so this stamps rather than emits: no second edge appears, and the
+/// one that exists gains the half it was missing. Matching is by the type
+/// node's own start byte, because a class declaring `a: T` and `b: T` produces
+/// two references to one type and a name match would stamp both.
+fn stamp_class_attribute_declaration(
+    member: &tree_sitter::Node,
+    source: &[u8],
+    refs: &mut [PythonValueRef],
+) {
+    let statement = if member.kind() == "expression_statement" {
+        match member.named_child(0) {
+            Some(inner) => inner,
+            None => return,
+        }
+    } else {
+        *member
+    };
+    if statement.kind() != "assignment" {
+        return;
+    }
+    let (Some(left), Some(annotation)) = (
+        statement.child_by_field_name("left"),
+        statement.child_by_field_name("type"),
+    ) else {
+        return;
+    };
+    // Only a plain name declares an attribute of THIS class. `self.x: T` in a
+    // class body is not valid there, and a subscript or tuple target declares
+    // no single attribute.
+    if left.kind() != "identifier" {
+        return;
+    }
+    let Ok(attribute) = left.utf8_text(source) else {
+        return;
+    };
+    let Some(named) = python_annotation_type_node(&annotation, source) else {
+        return;
+    };
+    if attribute.is_empty() {
+        return;
+    }
+    for value_ref in refs.iter_mut() {
+        if value_ref.site.start_byte == named.start_byte() {
+            value_ref.attribute = Some(attribute.to_string());
+        }
     }
 }
 
