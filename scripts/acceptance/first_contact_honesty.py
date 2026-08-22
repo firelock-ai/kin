@@ -427,6 +427,10 @@ def check_1(suite):
     # by the release install proof, not here, and the CHECK line says so.
     env = suite.npm_env(home)
     env["KIN_NO_PROVISION"] = "1"
+    # The block runs with no kin on PATH, so the only `kin` it can reach is the
+    # one its own commands put there. Without this the probe resolves the
+    # operator's installed kin and passes a block that installs nothing.
+    env["PATH"] = suite.sanitized_path(work)
     rc, out, err = run(["bash", "-euo", "pipefail", "-c", script],
                        cwd=work, env=env, timeout=900)
     said = flatten(out + " " + err)
@@ -453,21 +457,14 @@ def check_2(suite):
     work = suite.scratch("proxy")
     home = os.path.join(work, "home")
     prefix = os.path.join(work, "prefix")
-    binpath = os.path.join(work, "bin")
     os.makedirs(home)
     os.makedirs(os.path.join(prefix, "lib"))
-    os.makedirs(binpath)
 
     # A PATH with the installers on it and no language server, so the recipes
-    # read as missing and the installer reads as available. Symlinked rather
-    # than inherited, because a runner that happens to carry pyright would take
-    # the AlreadyPresent branch and this check would grade nothing.
-    for tool in ("npm", "node", "git", "sh", "bash", "uname", "env"):
-        found = shutil.which(tool)
-        if found:
-            link = os.path.join(binpath, tool)
-            if not os.path.exists(link):
-                os.symlink(found, link)
+    # read as missing and the installer reads as available. Built rather than
+    # inherited, because a runner that happens to carry pyright would take the
+    # AlreadyPresent branch and this check would grade nothing.
+    binpath = suite.sanitized_path(work)
 
     env = suite.base_env()
     env["HOME"] = home
@@ -530,6 +527,30 @@ class Suite(object):
         env["KIN_VFS_DISABLE"] = "1"
         env["NO_COLOR"] = "1"
         return env
+
+    # Every tool a README install block or a language-server install can need,
+    # and nothing else. `kin` is deliberately absent: this host has
+    # ~/.kin/bin on PATH, and a probe that inherited it would resolve the
+    # OPERATOR'S installed kin instead of the one the block was supposed to
+    # produce. That is not hypothetical. It made check 1 pass a mutant whose
+    # install block never put anything on PATH at all.
+    TOOLS = ("npm", "npx", "node", "sh", "bash", "env", "uname", "dirname",
+             "basename", "mkdir", "rm", "cp", "ln", "chmod", "tar", "sed",
+             "grep", "cat", "ls", "git", "which")
+
+    def sanitized_path(self, work):
+        """A bin directory carrying the tools and no kin of any kind."""
+        binpath = os.path.join(work, "probe-bin")
+        if not os.path.isdir(binpath):
+            os.makedirs(binpath)
+        for tool in self.TOOLS:
+            found = shutil.which(tool)
+            if not found:
+                continue
+            link = os.path.join(binpath, tool)
+            if not os.path.exists(link):
+                os.symlink(found, link)
+        return binpath
 
     def npm_env(self, home):
         env = self.base_env()
