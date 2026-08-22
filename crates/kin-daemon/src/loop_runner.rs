@@ -2022,72 +2022,6 @@ fn plan_catch_up_events(state: &DaemonState, since: SystemTime) -> Result<Vec<Fi
         .collect())
 }
 
-/// Host events for every admitted source file the graph holds no entity for.
-///
-/// Entity derivation is not durable on its own. A tree admission publishes an
-/// artifact into repository authority the moment the watcher sees the write,
-/// while the entities the same tick derives live in this daemon's query graph
-/// until a commit publishes them. A daemon that ends first, and an idle timeout
-/// ends one after sixty seconds, takes them with it. What survives is a file
-/// admitted at exactly the bytes on disk, so no later watcher event fires for
-/// it and the startup catch-up window, which is keyed on host modification
-/// time, cannot see it either: it was modified before the last admission, and
-/// that admission is precisely what recorded the artifact. The path is then
-/// permanently in the graph and permanently unqueryable, visible only as
-/// `kin graph status` counting it among the files that "produced no entity".
-///
-/// This asks the graph rather than the host: an admitted path whose language
-/// has a full adapter, which no entity names, and which carries no parsed
-/// layout either, has never been parsed by this daemon. Every path goes back
-/// through the ordinary tick, so the same bounded observation, policy filter and
-/// compare-and-swap apply as for an edit a watcher saw.
-///
-/// The layout is what keeps this from repeating. A file that genuinely declares
-/// nothing, an empty `__init__.py` among them, produces no entity however often
-/// it is parsed, and offering it on every pass would re-parse it on every commit
-/// forever while warning about a fault that is not one. Parsing registers a
-/// layout whether or not it found a declaration, so one pass answers the
-/// question for the rest of this daemon's life.
-fn plan_unenriched_source_events(state: &DaemonState) -> Result<Vec<FileEvent>> {
-    use kin_model::EntityStore;
-
-    let working_dir = state.layout.working_dir();
-    let enriched: std::collections::HashSet<FilePathId> = state
-        .graph
-        .list_all_entities()?
-        .into_iter()
-        .filter_map(|entity| entity.file_origin)
-        .collect();
-    let mut events = Vec::new();
-    for artifact in state.graph.resolved_tree().artifacts_by_path() {
-        if kin_core::source_projection_disposition(&artifact.path, artifact.entry)?
-            != kin_core::SourceProjectionDisposition::Materialized
-        {
-            continue;
-        }
-        let Some(file_id) = semantic_file_id(&artifact.path) else {
-            continue;
-        };
-        if enriched.contains(&file_id) {
-            continue;
-        }
-        if state.graph.get_file_layout(&file_id)?.is_some() {
-            continue;
-        }
-        let Ok(host_path) = kin_index::host_path_from_repo_path(working_dir, &artifact.path) else {
-            continue;
-        };
-        // Path-only classification, because the bytes are not read here. A file
-        // whose extension carries no entity adapter is enriched by a shallow,
-        // structured or opaque facet instead and is not owed a re-parse.
-        if FileClassifier::classify(&host_path) != FileClassification::EntitySource {
-            continue;
-        }
-        events.push(FileEvent::Changed(host_path));
-    }
-    Ok(events)
-}
-
 pub async fn run_loop(
     state: Arc<DaemonState>,
     config: LoopConfig,
@@ -2146,12 +2080,6 @@ pub async fn run_loop_armed(
     // publication, and a client finding the port is never waiting on a
     // traversal.
     let mut catch_up_owed = startup_catch_up_window(&state);
-    // Owed once per daemon life, and independent of the catch-up window: the
-    // paths it recovers are exactly the ones whose host modification time puts
-    // them outside that window. A store with no last-admission marker gets no
-    // catch-up and still gets this, because this bound comes from graph truth
-    // rather than from a clock.
-    let mut enrichment_repair_owed = true;
     if let Some(armed) = armed.as_mut() {
         armed.arm();
     }
@@ -2299,35 +2227,6 @@ pub async fn run_loop_armed(
                         "could not plan the startup catch-up, so host content written while \
                          nothing was watching stays unadmitted until `kin admit` or a commit \
                          takes it"
-                    );
-                }
-            }
-        }
-
-        // The enrichment repair, owed once for the same reason and taken the
-        // same way. Loud when it finds anything: a file admitted with no
-        // entities answered every query as an absence, and a store that has
-        // been in that state deserves the count said out loud rather than
-        // repaired in silence.
-        if enrichment_repair_owed {
-            enrichment_repair_owed = false;
-            match plan_unenriched_source_events(&state) {
-                Ok(events) if events.is_empty() => {
-                    debug!("every admitted source path already carries its entities");
-                }
-                Ok(events) => {
-                    warn!(
-                        count = events.len(),
-                        "admitted source paths carry no entities, so nothing can query them; \
-                         re-deriving them now"
-                    );
-                    enqueue_file_events(&mut pending_events, events);
-                }
-                Err(error) => {
-                    warn!(
-                        error = %error,
-                        "could not plan the enrichment repair, so any admitted path missing its \
-                         entities stays unqueryable until it is edited or committed"
                     );
                 }
             }
@@ -7204,155 +7103,6 @@ mod tests {
             "and gains no advice that would not help: {passed_through}"
         );
     }
-
-    /// FIR-2606. An admitted source path the graph holds no entities for is
-    /// offered for re-derivation.
-    ///
-    /// This is the state a daemon leaves behind when it ends between a write
-    /// and the commit that would have published the entities: the artifact is
-    /// admitted at exactly the bytes on disk, so no tree delta and no watcher
-    /// event ever names it again, and every query answers about it as an
-    /// absence. Recovering it is what stops that from being permanent.
-    #[test]
-    fn an_admitted_source_path_with_no_entities_is_offered_for_re_derivation() {
-        let repo = tempfile::tempdir().unwrap();
-        let state = open_test_state(&repo);
-        let source = repo.path().join("stranded.rs");
-        std::fs::write(&source, b"pub fn stranded() -> u32 { 1 }\n").unwrap();
-        admit_file_event(&state, &FileEvent::Changed(source.clone())).unwrap();
-
-        let owed = plan_unenriched_source_events(&state).unwrap();
-
-        // Compared by repository-relative name: the host root reaches this
-        // test through /var and comes back through /private/var, and the
-        // subject here is which path is owed, not how the host spells it.
-        let named = owed
-            .iter()
-            .map(|event| {
-                let (FileEvent::Changed(path) | FileEvent::Removed(path)) = event;
-                path.file_name().unwrap().to_string_lossy().to_string()
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            named,
-            vec![source.file_name().unwrap().to_string_lossy().to_string()],
-            "an admitted source path with no entities is exactly what needs re-deriving"
-        );
-    }
-
-    /// The control that keeps the repair narrow: a path whose entities the
-    /// graph already holds is never re-derived, so this cannot become a sweep
-    /// that re-parses the working copy on every daemon start.
-    #[test]
-    fn an_admitted_source_path_that_carries_entities_is_left_alone() {
-        let repo = tempfile::tempdir().unwrap();
-        let state = open_test_state(&repo);
-        let source = repo.path().join("enriched.rs");
-        std::fs::write(&source, b"pub fn enriched() -> u32 { 1 }\n").unwrap();
-        admit_file_event(&state, &FileEvent::Changed(source)).unwrap();
-        assert_eq!(
-            plan_unenriched_source_events(&state).unwrap().len(),
-            1,
-            "the positive control: before its entities land the path is owed a re-derivation"
-        );
-
-        state
-            .graph
-            .apply_transaction_delta(&TransactionDelta {
-                entity_deltas: vec![kin_model::EntityDelta::Added {
-                    new: test_entity("enriched", "enriched.rs"),
-                }],
-                relation_deltas: vec![],
-                tree_deltas: vec![],
-                ..TransactionDelta::default()
-            })
-            .unwrap();
-
-        assert!(
-            plan_unenriched_source_events(&state).unwrap().is_empty(),
-            "and once the graph holds an entity for it, nothing is owed"
-        );
-    }
-
-    /// A source file that declares nothing produces no entity however often it
-    /// is parsed. Parsing registers its layout, and that is what stops the
-    /// repair re-parsing it on every commit for the rest of the daemon's life
-    /// while warning about a fault that is not one.
-    #[test]
-    fn a_source_path_that_parsed_to_no_declarations_is_offered_once() {
-        let repo = tempfile::tempdir().unwrap();
-        let state = open_test_state(&repo);
-        let empty = repo.path().join("declares_nothing.rs");
-        std::fs::write(&empty, b"// nothing here\n").unwrap();
-        admit_file_event(&state, &FileEvent::Changed(empty)).unwrap();
-        assert_eq!(
-            plan_unenriched_source_events(&state).unwrap().len(),
-            1,
-            "the positive control: an unparsed source path is owed one pass"
-        );
-
-        state
-            .graph
-            .upsert_file_layout(&kin_model::FileLayout {
-                file_id: FilePathId::new("declares_nothing.rs"),
-                parse_completeness: kin_model::ParseCompleteness::Full,
-                imports: kin_model::ImportSection {
-                    byte_range: 0..0,
-                    items: Vec::new(),
-                },
-                regions: Vec::new(),
-            })
-            .unwrap();
-
-        assert!(
-            plan_unenriched_source_events(&state).unwrap().is_empty(),
-            "and a parsed layout with no entity in it answers the question for good"
-        );
-    }
-
-    /// A file no language adapter parses is enriched by a shallow, structured
-    /// or opaque facet instead, so it has no entities by design and must not be
-    /// proposed forever.
-    #[test]
-    fn an_admitted_path_with_no_entity_adapter_is_not_offered() {
-        let repo = tempfile::tempdir().unwrap();
-        let state = open_test_state(&repo);
-        let notes = repo.path().join("NOTES.txt");
-        std::fs::write(&notes, b"not a language this repository parses\n").unwrap();
-        admit_file_event(&state, &FileEvent::Changed(notes)).unwrap();
-
-        assert!(
-            plan_unenriched_source_events(&state).unwrap().is_empty(),
-            "a path with no entity adapter is not owed a re-parse"
-        );
-    }
-
-    fn test_entity(name: &str, file_path: &str) -> kin_model::Entity {
-        kin_model::Entity {
-            id: kin_model::EntityId::new(),
-            kind: kin_model::EntityKind::Function,
-            name: name.to_string(),
-            language: kin_model::LanguageId::Rust,
-            fingerprint: kin_model::SemanticFingerprint {
-                algorithm: kin_model::FingerprintAlgorithm::V1TreeSitter,
-                ast_hash: Hash256::from_bytes([1; 32]),
-                signature_hash: Hash256::from_bytes([2; 32]),
-                behavior_hash: Hash256::from_bytes([3; 32]),
-                equivalence_hash: Hash256::from_bytes([0; 32]),
-                stability_score: 1.0,
-            },
-            file_origin: Some(FilePathId::new(file_path)),
-            span: None,
-            signature: format!("fn {name}()"),
-            visibility: kin_model::Visibility::Public,
-            role: kin_model::EntityRole::Source,
-            doc_summary: None,
-            metadata: kin_model::EntityMetadata::default(),
-            lineage_parent: None,
-            created_in: None,
-            superseded_by: None,
-        }
-    }
 }
 
 /// Decide whether a filesystem-sync tick's bulk deletions should be WITHHELD as
@@ -7591,44 +7341,11 @@ async fn sync_filesystem_with_graph_publishing_inner(
     // Recorded before anything below can fail, so a pass that dies part way
     // through enrichment still hands the deferral back to be closed.
     *deferred_out = exact_admission.deferred_tree.take();
-    // An admitted source path the graph holds no entities for is re-derived on
-    // this seam too, and it is why the early return below cannot key on the
-    // tree transition alone. Entity derivation is not durable on its own: a
-    // daemon that ends between the write and the commit takes it with it, and
-    // what it leaves behind is an artifact admitted at exactly the bytes on
-    // disk, which produces no tree delta here and no watcher event ever again.
-    // Without this the file stays admitted and unqueryable through every later
-    // commit, which is exactly how one module dropped out of a store and stayed
-    // out (FIR-2606).
-    //
-    // A repair, so it never fails the pass carrying it. A commit that would
-    // have succeeded must not start failing because the recovery beside it
-    // could not plan; the path it would have recovered simply stays owed.
-    let unenriched = match plan_unenriched_source_events(state) {
-        Ok(events) => events,
-        Err(error) => {
-            warn!(
-                error = %error,
-                "could not plan the enrichment repair, so any admitted path missing its entities \
-                 stays unqueryable until it is edited"
-            );
-            Vec::new()
-        }
-    };
-    if exact_admission.deltas.is_empty() && unenriched.is_empty() {
+    if exact_admission.deltas.is_empty() {
         drop(graph_mutation);
         return Ok(());
     }
-    if !unenriched.is_empty() {
-        warn!(
-            count = unenriched.len(),
-            "admitted source paths carry no entities, so nothing can query them; re-deriving \
-             them into this change"
-        );
-    }
-    let mut events = exact_admission.semantic_events;
-    events.extend(unenriched);
-    let events = dedup_file_events(events);
+    let events = exact_admission.semantic_events;
 
     info!(
         count = events.len(),
