@@ -652,42 +652,60 @@ pub fn report_previous_attempts(attempts: &[AbandonedInit], source: &Path) {
 /// this module exists to end and a silent partial reclaim is the same defect
 /// wearing a smaller number.
 pub fn report_reclaimed(before: &[AbandonedInit]) {
-    if before.is_empty() {
-        return;
+    for line in reclaim_lines(before) {
+        disclose(&line);
     }
+}
+
+/// What the reap recovered and what it did not, as lines.
+///
+/// Split from the writing so the wording is pinned by tests rather than by
+/// running a conversion.
+///
+/// A path is counted as reclaimed only when it is actually gone from disk, so a
+/// directory the reaper declined to touch is never folded into the total. What
+/// stays gets named rather than summarised, because a staging directory this
+/// run left alone belongs to a repository this run is not converting, and the
+/// operator who owns it needs its path to act on it.
+pub fn reclaim_lines(before: &[AbandonedInit]) -> Vec<String> {
+    if before.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
     let mut freed = 0_u64;
     let mut retained: Vec<String> = Vec::new();
+    let mut retained_bytes = 0_u64;
     for attempt in before {
         if attempt.capture_path.exists() {
             retained.push(attempt.capture_path.display().to_string());
+            retained_bytes = retained_bytes.saturating_add(attempt.capture_bytes);
         } else {
             freed = freed.saturating_add(attempt.capture_bytes);
         }
         match &attempt.stage_path {
-            Some(stage) if stage.exists() => retained.push(stage.display().to_string()),
+            Some(stage) if stage.exists() => {
+                retained.push(stage.display().to_string());
+                retained_bytes = retained_bytes.saturating_add(attempt.stage_bytes);
+            }
             Some(_) => freed = freed.saturating_add(attempt.stage_bytes),
             None => {}
         }
     }
     if freed > 0 {
-        disclose(&format!(
+        lines.push(format!(
             "  reclaimed {} of staging those attempts left behind",
             human_bytes(freed)
         ));
     }
     if !retained.is_empty() {
-        disclose(&format!(
-            "  {} left in place, because this run could not prove nothing is using it: {}",
-            human_bytes(
-                before
-                    .iter()
-                    .map(AbandonedInit::reclaimable_bytes)
-                    .sum::<u64>()
-                    .saturating_sub(freed)
-            ),
+        lines.push(format!(
+            "  {} is still on disk and this run did not reclaim it, because it belongs to \
+             another repository's conversion or its owner could not be proven gone: {}",
+            human_bytes(retained_bytes),
             retained.join(", ")
         ));
     }
+    lines
 }
 
 /// The `kin doctor` row's detail and fix lines for whatever staging is sitting
@@ -1168,13 +1186,37 @@ mod tests {
             stage_bytes: 0,
             owner_path: None,
         };
-        // Nothing to say about nothing.
+
+        assert!(
+            reclaim_lines(&[]).is_empty(),
+            "nothing to reclaim earns no line at all"
+        );
+
+        let all_gone = reclaim_lines(std::slice::from_ref(&freed)).join("\n");
+        assert!(all_gone.contains("reclaimed 1.0 KB"), "{all_gone}");
+        assert!(
+            !all_gone.contains("still on disk"),
+            "a clean reclaim must not claim something was left: {all_gone}"
+        );
+
+        let none_gone = reclaim_lines(std::slice::from_ref(&held)).join("\n");
+        assert!(
+            !none_gone.contains("reclaimed"),
+            "nothing was freed, so nothing may be reported as reclaimed: {none_gone}"
+        );
+        assert!(
+            none_gone.contains("2.0 KB is still on disk")
+                && none_gone.contains(&held_path.display().to_string()),
+            "what stayed must be named with its size: {none_gone}"
+        );
+
+        let mixed = reclaim_lines(&[freed, held]).join("\n");
+        assert!(
+            mixed.contains("reclaimed 1.0 KB") && mixed.contains("2.0 KB is still on disk"),
+            "a partial reclaim must report both halves: {mixed}"
+        );
+
         report_reclaimed(&[]);
-        // Exercised for their branches; the lines go to stderr, and the states
-        // they distinguish are asserted through the paths themselves.
-        report_reclaimed(std::slice::from_ref(&freed));
-        report_reclaimed(std::slice::from_ref(&held));
-        report_reclaimed(&[freed, held]);
         assert!(
             held_path.exists(),
             "reporting must never delete what it reports"
