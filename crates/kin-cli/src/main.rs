@@ -132,6 +132,10 @@ enum Command {
         wait_quiesce: u64,
     },
     /// Create an exact semantic and artifact commit
+    ///
+    /// The long help is built in `commit_progress` around the same sentence a
+    /// commit prints, so this surface and that one cannot drift (FIR-2627).
+    #[command(long_about = commands::commit_progress::COMMIT_LONG_ABOUT)]
     Commit {
         /// Commit message
         #[arg(short, long)]
@@ -4898,6 +4902,80 @@ mod tests {
                 );
             }
         });
+    }
+
+    /// A stranger forms the write-through assumption at help, not at commit.
+    ///
+    /// The npm0549 green stranger read `kin commit --help`, took `kin commit`
+    /// for a git commit, and only met the correction in the line a commit
+    /// prints, after they had already reasoned about the repository as if git
+    /// held the change (FIR-2627). The commit-time line was the only surface
+    /// carrying the fact, so help now carries the same sentence, spliced from
+    /// the same macro. This asserts on the RENDERED long help rather than the
+    /// const, because a const nothing renders is a fact nobody reads.
+    #[test]
+    fn commit_help_says_the_commit_lands_in_kin_authority_and_git_stays_dirty() {
+        on_cli_test_stack(|| {
+            let command = Cli::command();
+            let mut commit = command
+                .get_subcommands()
+                .find(|subcommand| subcommand.get_name() == "commit")
+                .expect("kin commit must exist")
+                .clone();
+            let rendered = commit.render_long_help().to_string();
+            let flattened = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
+
+            // Positive control. A help surface that failed to render at all
+            // would satisfy every `!contains` below, so the check first proves
+            // it is reading the help it means to read, on a line that predates
+            // this change.
+            assert!(
+                flattened.contains("Commit message"),
+                "the control line must be present, or this test is asserting about nothing: \
+                 {flattened}"
+            );
+
+            // The sentence itself, taken from the constant the commit prints
+            // rather than restated, so a reworded commit line fails here.
+            let note = commands::commit_progress::AUTHORITY_NOT_GIT_NOTE;
+            let flat_note = note.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                flattened.contains(&flat_note),
+                "help must carry the commit-time authority line verbatim: {flattened}"
+            );
+            assert!(
+                flattened.contains("not in Git")
+                    && flattened.contains("git status")
+                    && flattened.contains("kin eject"),
+                "help must name the authority, the dirty tree and the way back: {flattened}"
+            );
+
+            // Falsification. A phrase that was never written must be absent, so
+            // a `contains` that passes on anything cannot be what made the
+            // assertions above green.
+            assert!(
+                !flattened.contains("writes through to git"),
+                "the check must be able to fail: {flattened}"
+            );
+        });
+    }
+
+    /// The two surfaces are one string, not two that agree today.
+    ///
+    /// `concat!` folds the same macro expansion into both, so this cannot fail
+    /// while the code compiles. It is here for the reader who edits one of them
+    /// and wants to know what enforces the other.
+    #[test]
+    fn the_commit_help_paragraph_ends_in_the_line_a_commit_prints() {
+        assert!(
+            commands::commit_progress::COMMIT_LONG_ABOUT
+                .ends_with(commands::commit_progress::AUTHORITY_NOT_GIT_NOTE),
+            "the help paragraph must end in the commit-time line"
+        );
+        assert!(
+            !commands::commit_progress::AUTHORITY_NOT_GIT_NOTE.is_empty(),
+            "an empty note would make the assertion above pass on anything"
+        );
     }
 
     /// A server reached through `docker exec` or over a remote boundary can
