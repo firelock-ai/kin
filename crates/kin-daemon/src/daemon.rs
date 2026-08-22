@@ -7179,8 +7179,14 @@ mod memory_pressure_tests {
     use super::{
         clear_pressure_refusal, decide_sweep_on_start, embed_batch_under_pressure,
         pressure_verdict, sample_tree_footprint, start_or_defer_background_embed,
-        tree_footprint_from, walk_process_table, ProcessRow, SweepStartDecision,
+        tree_footprint_from, ProcessRow, SweepStartDecision,
     };
+    // Gated exactly like its only caller, the walk test that spawns a real
+    // child. The daemon itself calls this on every platform; it is the test
+    // that cannot, so an ungated import here is dead on Windows and `-D
+    // warnings` makes dead imports fatal.
+    #[cfg(unix)]
+    use super::walk_process_table;
     use crate::state::DaemonState;
     use kin_core::memory_pressure::{HeavyWork, PressureRefusal, Verdict};
     use kin_core::test_env::EnvVarGuard;
