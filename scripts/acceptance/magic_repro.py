@@ -307,6 +307,22 @@ class Suite(object):
             raise RuntimeError("git commit failed: %s" % (err or out)[-300:])
         self._kin_init(repo)
 
+    def _build_mixin(self, repo):
+        """The shape a comment-only commit cost eleven edges on (FIR-2598).
+
+        A mixin declares a method, a sibling calls it through `self`, and a
+        subclass overrides it. That is what makes the `Overrides` edge
+        load-bearing: `find_references` on the subclass method composes its
+        second caller through the base declaration, and losing the override
+        edge halves the answer without moving any confidence field.
+        """
+        self.git(["init", "-q", "."], repo)
+        self._write(repo, ".gitignore", "__pycache__/\n")
+        self._write(repo, "pkg/__init__.py", "")
+        self._write(repo, "pkg/sessions.py", MIXIN_PY)
+        self._kin_init(repo)
+        self._kin_commit(repo, "Add the sessions module")
+
     def _build_venv(self, repo):
         self.git(["init", "-q", "."], repo)
         self._write(repo, ".gitignore", "*.log\n")
@@ -625,6 +641,48 @@ def trend_of(status, prior):
     if prior != PASS and status == PASS:
         return "fixed"
     return "same"
+
+
+MIXIN_PY = """import time
+
+
+class SessionRedirectMixin:
+    def send(self, request, **kwargs):
+        raise NotImplementedError
+
+    def get_redirect_target(self, resp):
+        return resp.get("location")
+
+    def resolve_redirects(self, resp, req, **kwargs):
+        target = self.get_redirect_target(resp)
+        while target:
+            resp = self.send(req, **kwargs)
+            target = self.get_redirect_target(resp)
+        return resp
+
+    def rebuild_auth(self, prepared, response):
+        return prepared
+
+
+class Session(SessionRedirectMixin):
+    def request(self, method, url):
+        prepared = self.prepare(method, url)
+        return self.send(prepared)
+
+    def prepare(self, method, url):
+        return (method, url)
+
+    def send(self, request, **kwargs):
+        time.sleep(0)
+        return self.resolve_redirects(request, request)
+"""
+
+# Twenty-six lines of prose above every declaration, which is the edit the
+# rc0547b run made to psf/requests' sessions.py. It shifts every line below it
+# and touches no executable statement.
+MIXIN_DOCSTRING = ('"""Session and redirect handling.\n'
+                   + "".join("Redirect flow note %d.\n" % i for i in range(1, 24))
+                   + '"""\n\n')
 
 
 class Result(object):
@@ -1258,6 +1316,180 @@ def check_9(suite):
     return res
 
 
+def check_10(suite):
+    """FIR-2598: a comment-only commit must not cost the graph an edge.
+
+    The rc0547b run added 26 lines of docstring above `psf/requests`'
+    `sessions.py` and the store went from 1279 `Calls` and 11 `Overrides`
+    edges to 1268 and 10, over an entity count that did not move. Every one of
+    those edges was still true about the file, and every health surface read
+    green over the loss.
+    """
+    res = Result("10", "FIR-2598", "a comment-only commit keeps every relation kind")
+    repo = suite.fixture("mixin")
+    before = suite.graph_status(repo)
+    if not before["relation_kinds"]:
+        res.unknown("graph status printed no relation-kind histogram to compare against")
+        return res
+    if before["relation_kinds"].get("Calls", 0) == 0:
+        res.unknown("the fixture produced no Calls edges, so there is nothing to lose: %s"
+                    % before["relation_kinds"])
+        return res
+
+    source = os.path.join(repo, "pkg", "sessions.py")
+    with open(source) as handle:
+        original = handle.read()
+    with open(source, "w") as handle:
+        handle.write(MIXIN_DOCSTRING + original)
+    with open(source) as handle:
+        edited = handle.read()
+    if not edited.endswith(original):
+        res.unknown("the fixture edit did not leave the original bytes intact")
+        return res
+    added = len(edited.splitlines()) - len(original.splitlines())
+    if added != 26:
+        res.unknown("the fixture edit added %d lines, not the 26 the run made" % added)
+        return res
+    try:
+        suite._kin_commit(repo, "Document the redirect flow in the module docstring")
+    except RuntimeError as exc:
+        res.unknown("the comment-only commit failed: %s" % exc)
+        return res
+
+    after = suite.graph_status(repo)
+    if before["entities"] is not None and after["entities"] is not None \
+            and after["entities"] < before["entities"]:
+        res.unknown("the commit removed entities (%d to %d), so a smaller relation count is "
+                    "not evidence of a lost edge"
+                    % (before["entities"], after["entities"]))
+        return res
+    res.ok("the entity count held at %s across the commit" % after["entities"])
+
+    lost = []
+    for kind, count in sorted(before["relation_kinds"].items()):
+        now = after["relation_kinds"].get(kind, 0)
+        if now < count:
+            lost.append("%s %d to %d" % (kind, count, now))
+    if lost:
+        res.bad("a comment-only commit cost the graph %s, with no entity removed"
+                % ", ".join(lost))
+    else:
+        res.ok("every relation kind held or grew: %s" % after["relation_kinds"])
+    return res
+
+
+def check_11(suite):
+    """FIR-2598: the census must be able to see a loss a commit introduced.
+
+    The census kin#1007 added compares the live graph to a record the commit
+    installing a change writes for itself, so on the rc0547b store the
+    comparison point moved with the loss and `kin doctor` reported
+    `no relation kind has lost ground`. This forces the state that reading is
+    only correct in: a recorded baseline holding more edges than the graph does,
+    over the same entity count. The surfaces must name the kind and both counts,
+    and the commit that follows must not be able to reset the baseline.
+    """
+    res = Result("11", "FIR-2598", "the census names a kind that lost ground across a commit")
+    repo = suite.fixture("mixin")
+    record = os.path.join(repo, ".kin", "kindb", "relation-census")
+    if not os.path.exists(record):
+        res.unknown("no relation census recorded at %s after a commit" % record)
+        return res
+    try:
+        with open(record) as handle:
+            recorded = json.load(handle)
+    except (ValueError, IOError) as exc:
+        res.unknown("the recorded census is unreadable: %s" % exc)
+        return res
+    if "entities" not in recorded:
+        res.unknown("the recorded census carries no entity count, so it cannot tell a lost "
+                    "edge from removed code: %s" % sorted(recorded))
+        return res
+
+    status = suite.graph_status(repo)
+    live = status["relation_kinds"]
+    if not live.get("Calls"):
+        res.unknown("the fixture holds no Calls edges to raise a baseline above: %s" % live)
+        return res
+
+    # A baseline claiming one more Calls edge than the graph holds, over the
+    # same entity count. One edge is far inside the 25% sharp-fall threshold on
+    # any kind this fixture can hold, so nothing but the entity count can
+    # distinguish it from ordinary movement. That is precisely the case the
+    # rc0547b run needed and did not get: eleven of 1279 is 0.9%, and a
+    # magnitude rule was never going to see it.
+    raised = dict(recorded)
+    raised["kinds"] = dict(recorded.get("kinds") or {})
+    raised["kinds"]["Calls"] = live["Calls"] + 1
+    raised["total"] = sum(raised["kinds"].values())
+    raised["entities"] = status["entities"]
+    baseline_at = raised.get("at")
+    with open(record, "w") as handle:
+        json.dump(raised, handle)
+
+    after = suite.graph_status(repo)
+    text = after["raw"]
+    expected = "Calls slipped %d to %d" % (live["Calls"] + 1, live["Calls"])
+    if expected in text:
+        res.ok("graph status names the kind and both counts: %s" % expected)
+    else:
+        line = ""
+        for candidate in text.splitlines():
+            if candidate.startswith("Relation census:"):
+                line = candidate.strip()
+        res.bad("graph status did not name the lost kind. Expected %r, census row read: %s"
+                % (expected, line or "(no census row printed)"))
+
+    rc, out, err = suite.kin_run(["doctor"], repo)
+    doctor = strip_ansi(out + "\n" + err)
+    # The row, not the summary. `kin doctor` closes with a line naming every
+    # check that needs attention, and on a runner where several do, that line
+    # contains the words "Relation census" too. A substring search picked it and
+    # reported the check red over a product that had answered correctly. The row
+    # carries its status marker and then the label; the summary carries a count
+    # between the two.
+    row = ""
+    for candidate in doctor.splitlines():
+        if re.match(r"^\s*\S?\s+Relation census\b", candidate):
+            row = candidate.strip()
+    if not row:
+        res.unknown("kin doctor rc=%d printed no relation-census row" % rc)
+    elif "no relation kind has lost ground" in doctor:
+        res.bad("kin doctor reports the census green over a kind that lost ground: %s" % row)
+    elif expected not in doctor:
+        res.bad("kin doctor does not name the kind that lost ground. Expected %r, census row "
+                "read: %s" % (expected, row))
+    elif "entity count held" not in doctor:
+        res.bad("kin doctor names the loss without the entity count that makes it a "
+                "regression rather than a deletion: %s" % row)
+    else:
+        res.ok("kin doctor names the kind and the entity count: %s" % row)
+
+    # The second half of the defect. A commit taken while the graph is below
+    # its baseline must not install its own census as the new comparison point,
+    # or the loss is invisible from the next command onward.
+    source = os.path.join(repo, "pkg", "sessions.py")
+    with open(source, "a") as handle:
+        handle.write("\n\n# A trailing note.\n")
+    try:
+        suite._kin_commit(repo, "Note the trailing comment")
+    except RuntimeError as exc:
+        res.unknown("the follow-up commit failed: %s" % exc)
+        return res
+    try:
+        with open(record) as handle:
+            settled = json.load(handle)
+    except (ValueError, IOError) as exc:
+        res.unknown("the census is unreadable after the follow-up commit: %s" % exc)
+        return res
+    if settled.get("at") != baseline_at:
+        res.bad("a commit taken over a graph below its baseline replaced the baseline: "
+                "recorded at %s, now %s" % (baseline_at, settled.get("at")))
+    else:
+        res.ok("the commit did not move the comparison point off %s" % baseline_at)
+    return res
+
+
 CHECKS = [
     ("0", check_0),
     ("1", check_1),
@@ -1269,6 +1501,8 @@ CHECKS = [
     ("7", check_7),
     ("8", check_8),
     ("9", check_9),
+    ("10", check_10),
+    ("11", check_11),
 ]
 
 

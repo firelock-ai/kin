@@ -694,8 +694,10 @@ pub fn record_relation_census(
     graph: &kin_db::InMemoryGraph,
     source: kin_core::relation_census::CensusSource,
 ) {
-    let kinds = match kin_cli::commands::graph::measure_relation_census(graph) {
-        Ok(kinds) => kinds,
+    let (kinds, entities) = match kin_cli::commands::graph::measure_relation_census_with_entities(
+        graph,
+    ) {
+        Ok(measured) => measured,
         Err(error) => {
             tracing::warn!(
                 error = %error,
@@ -709,12 +711,32 @@ pub fn record_relation_census(
         source,
         kinds,
         kin_core::relation_census::known_causes(std::env::vars()),
-    );
-    if let Err(error) = kin_core::relation_census::write(layout, &recorded) {
-        tracing::warn!(
-            error = %error,
-            "could not persist the relation census; graph status will compare against the              previous one until a later pass rewrites it"
-        );
+    )
+    .with_entities(entities);
+    // Offered rather than written. `record` refuses to make a losing census the
+    // baseline, which is what keeps a commit from resetting the comparison
+    // point to the graph it just damaged and what stops the recovery sweeps
+    // after it from burying the loss a second and third time.
+    match kin_core::relation_census::record(layout, &recorded) {
+        kin_core::relation_census::CensusRecordOutcome::Advanced => {}
+        kin_core::relation_census::CensusRecordOutcome::Held {
+            held_at,
+            held_source,
+            losses,
+        } => {
+            tracing::warn!(
+                held_at = %held_at.to_rfc3339(),
+                held_source = held_source.label(),
+                losses = %losses.join("; "),
+                "this pass lost relation ground, so the census baseline stays where it was and                  graph status keeps comparing against it until the graph recovers"
+            );
+        }
+        kin_core::relation_census::CensusRecordOutcome::Failed(error) => {
+            tracing::warn!(
+                error = %error,
+                "could not persist the relation census; graph status will compare against the              previous one until a later pass rewrites it"
+            );
+        }
     }
 }
 

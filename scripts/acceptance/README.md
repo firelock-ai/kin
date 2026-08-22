@@ -25,8 +25,14 @@ empty `find_references`, the completeness signal on a partial one, the
 `dead-code` delete list against real references, call-edge precision against a
 test double, `trace_data_flow` compact mode and localized truncation, JavaScript
 entity kinds and edge density, virtual-environment admission and context-pack
-byte arrays, and relation-graph completeness reporting. Every check names the
-ticket it is about, so a failure is attributable without reading the code.
+byte arrays, and relation-graph completeness reporting. Checks 10 and 11 cover
+the pair FIR-2598 reports: a comment-only commit must keep every relation kind
+it had, and the census must be able to see a kind that lost ground once one
+does. Check 11 raises the recorded baseline by one edge over an unchanged entity
+count rather than damaging the graph, because the loss that started the ticket
+was 0.9% of its kind and no magnitude threshold was ever going to reach it.
+Every check names the ticket it is about, so a failure is attributable without
+reading the code.
 
 `brownfield_repro.py` covers reference enrichment on two pinned upstream trees,
 `psf/requests` and `expressjs/express`, replayed as single-commit repositories
