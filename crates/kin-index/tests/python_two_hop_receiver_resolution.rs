@@ -745,3 +745,54 @@ def run(session: Session, payload):
          symbol it read; got {outgoing:?}"
     );
 }
+
+#[test]
+fn an_attribute_annotated_only_in_init_is_outside_the_tables_scope() {
+    // The bound this table is drawn at, pinned so it is a decision rather than
+    // an accident. `self.connection: HTTPAdapter = None` inside `__init__`
+    // declares the same thing a class-body annotation does, and the table reads
+    // class bodies only. The call must keep the behaviour it had rather than
+    // resolve halfway: recording the bound here is what makes widening it
+    // later a visible change instead of a silent one.
+    let files = vec![
+        parse_py("adapters.py", ADAPTERS_PY),
+        parse_py(
+            "models.py",
+            r#"
+from adapters import HTTPAdapter
+
+
+class Response:
+    def __init__(self):
+        self.connection: HTTPAdapter = None
+"#,
+        ),
+        parse_py(
+            "auth.py",
+            r#"
+from models import Response
+
+
+class Auth:
+    def handle(self, r: Response, prep):
+        return r.connection.send(prep)
+"#,
+        ),
+    ];
+    let target = entity_id(
+        &files,
+        "adapters.py",
+        "HTTPAdapter.send",
+        EntityKind::Method,
+    );
+    let caller = entity_id(&files, "auth.py", "Auth.handle", EntityKind::Method);
+
+    let relations = link_cross_file(&files);
+
+    assert!(
+        !has_call(&relations, caller, target),
+        "an attribute declared only in __init__ is outside this table's scope \
+         today; if this starts binding, the bound moved and this fixture is \
+         the place to say so deliberately"
+    );
+}
