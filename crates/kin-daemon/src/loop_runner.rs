@@ -855,12 +855,17 @@ fn exact_tree_admission(
         // while its entities keep ranking is the exposure this ordering exists
         // to prevent.
         evict_enrichment_for_removed_paths(state, &deltas)?;
-        state.graph.apply_transaction_delta(&TransactionDelta {
-            entity_deltas: Vec::new(),
-            relation_deltas: Vec::new(),
-            tree_deltas: deltas.clone(),
-            ..TransactionDelta::default()
-        })?;
+        state
+            .graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: deltas.clone(),
+                ..TransactionDelta::default()
+            })
+            .map_err(|error| {
+                name_stranded_endpoint_refusal(DaemonError::Graph(error), &deltas)
+            })?;
     }
 
     if observation.is_none() {
@@ -1211,6 +1216,81 @@ fn announce_retraction(retracted: &kin_index::IgnoredTrackedPaths) {
     );
 }
 
+/// Retire every relation bound to an artifact node that is leaving the tree.
+///
+/// An artifact-class endpoint is not reachable from any entity, so clearing a
+/// path's entities leaves these edges standing: the file-level `Imports` and
+/// `Includes` edges the cross-file linker mints, its parse-coverage self-loop,
+/// and the `DerivedFrom` edges projection markers produce. kin-db validates
+/// every relation the graph holds against the staged tree on each transaction,
+/// so one surviving edge makes the removal of its artifact fail with
+/// `transaction relation <id> has unadmitted source endpoint artifact:<id>`,
+/// and it fails the whole transaction rather than the one edge. That is how a
+/// deleted file could take the entire commit path down with it: nothing else
+/// collects these, and only emptying the file first, which routes the retirement
+/// through the linker's own re-derivation, ever cleared them.
+///
+/// Returns the relations retired, so a caller can report what a removal took.
+fn retire_artifact_node_relations(
+    graph: &kin_db::InMemoryGraph,
+    artifact_id: kin_model::ArtifactId,
+) -> Result<Vec<kin_model::RelationId>> {
+    let node = kin_model::GraphNodeId::Artifact(artifact_id);
+    let bound = graph.get_all_relations_for_node(&node)?;
+    if bound.is_empty() {
+        return Ok(Vec::new());
+    }
+    let retired: Vec<kin_model::RelationId> = bound.iter().map(|relation| relation.id).collect();
+    let borrowed: Vec<&kin_model::RelationId> = retired.iter().collect();
+    graph.remove_relations_batch(&borrowed)?;
+    debug!(
+        ?artifact_id,
+        retired = retired.len(),
+        "retired the relations bound to a departing artifact node"
+    );
+    Ok(retired)
+}
+
+/// Say what a refused tree transition was about when kin-db reports one of its
+/// relations still naming a node the staged tree no longer carries.
+///
+/// The storage message names a relation uuid and an artifact uuid and nothing
+/// else. Neither maps to a file, the refusal is of the whole transaction rather
+/// than of the edge, and the surface a user meets is a commit that cannot run at
+/// all. Name the paths this transition drops and the two-step retirement that
+/// clears the edges, so the message a user reads is about their repository
+/// rather than about kin's internals.
+pub(crate) fn name_stranded_endpoint_refusal(
+    error: DaemonError,
+    deltas: &[TreeDelta],
+) -> DaemonError {
+    let message = error.to_string();
+    if !message.contains("unadmitted source endpoint")
+        && !message.contains("unadmitted destination endpoint")
+    {
+        return error;
+    }
+    let removed = deltas
+        .iter()
+        .filter_map(|delta| match delta {
+            TreeDelta::Removed { old, .. } => Some(old.path.to_string()),
+            TreeDelta::Added { .. } | TreeDelta::Updated { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    let dropped = if removed.is_empty() {
+        "this transition".to_string()
+    } else {
+        removed.join(", ")
+    };
+    DaemonError::IncompatibleRepo(format!(
+        "refusing to drop {dropped}: the graph still holds a relation whose endpoint is the \
+         artifact being removed, and kin-db refuses a transition that strands one ({message}). \
+         fix: empty the file and commit, which retires the edges through the linker, then delete \
+         the empty file and commit again. Report this: a removal is supposed to collect these \
+         edges itself"
+    ))
+}
+
 /// Remove the enrichment derived from every path a tree transition drops.
 ///
 /// Entities, their relations, and their text and vector index presence are what
@@ -1219,6 +1299,10 @@ fn announce_retraction(retracted: &kin_index::IgnoredTrackedPaths) {
 /// strand one. Clearing here is what lets a removal of any kind, a deleted file
 /// or a newly ignored one, take the whole artifact out rather than only its
 /// tree entry.
+///
+/// Artifact-class edges go with it. They have no entity endpoint, so the entity
+/// cleanup below cannot see them, and kin-db refuses the tree transition that
+/// strands one exactly as it refuses a stranded entity.
 pub(crate) fn evict_enrichment_for_removed_paths(
     state: &DaemonState,
     deltas: &[TreeDelta],
@@ -1227,6 +1311,7 @@ pub(crate) fn evict_enrichment_for_removed_paths(
         let TreeDelta::Removed { old, .. } = delta else {
             continue;
         };
+        retire_artifact_node_relations(state.graph.as_ref(), delta.artifact_id())?;
         let Some(file_id) = semantic_file_id(&old.path) else {
             continue;
         };
@@ -1941,6 +2026,63 @@ fn plan_catch_up_events(state: &DaemonState, since: SystemTime) -> Result<Vec<Fi
         .collect())
 }
 
+/// Host events for every admitted source file the graph holds no entity for.
+///
+/// Entity derivation is not durable on its own. A tree admission publishes an
+/// artifact into repository authority the moment the watcher sees the write,
+/// while the entities the same tick derives live in this daemon's query graph
+/// until a commit publishes them. A daemon that ends first, and an idle timeout
+/// ends one after sixty seconds, takes them with it. What survives is a file
+/// admitted at exactly the bytes on disk, so no later watcher event fires for
+/// it and the startup catch-up window, which is keyed on host modification
+/// time, cannot see it either: it was modified before the last admission, and
+/// that admission is precisely what recorded the artifact. The path is then
+/// permanently in the graph and permanently unqueryable, visible only as
+/// `kin graph status` counting it among the files that "produced no entity".
+///
+/// This asks the graph rather than the host: an admitted path whose language
+/// has a full adapter and which no entity names is either genuinely empty of
+/// definitions, which costs one parse to re-confirm, or lost enrichment, which
+/// this recovers. Every path goes back through the ordinary tick, so the same
+/// bounded observation, policy filter and compare-and-swap apply as for an edit
+/// a watcher saw.
+fn plan_unenriched_source_events(state: &DaemonState) -> Result<Vec<FileEvent>> {
+    use kin_model::EntityStore;
+
+    let working_dir = state.layout.working_dir();
+    let enriched: std::collections::HashSet<FilePathId> = state
+        .graph
+        .list_all_entities()?
+        .into_iter()
+        .filter_map(|entity| entity.file_origin)
+        .collect();
+    let mut events = Vec::new();
+    for artifact in state.graph.resolved_tree().artifacts_by_path() {
+        if kin_core::source_projection_disposition(&artifact.path, artifact.entry)?
+            != kin_core::SourceProjectionDisposition::Materialized
+        {
+            continue;
+        }
+        let Some(file_id) = semantic_file_id(&artifact.path) else {
+            continue;
+        };
+        if enriched.contains(&file_id) {
+            continue;
+        }
+        let Ok(host_path) = kin_index::host_path_from_repo_path(working_dir, &artifact.path) else {
+            continue;
+        };
+        // Path-only classification, because the bytes are not read here. A file
+        // whose extension carries no entity adapter is enriched by a shallow,
+        // structured or opaque facet instead and is not owed a re-parse.
+        if FileClassifier::classify(&host_path) != FileClassification::EntitySource {
+            continue;
+        }
+        events.push(FileEvent::Changed(host_path));
+    }
+    Ok(events)
+}
+
 pub async fn run_loop(
     state: Arc<DaemonState>,
     config: LoopConfig,
@@ -1999,6 +2141,12 @@ pub async fn run_loop_armed(
     // publication, and a client finding the port is never waiting on a
     // traversal.
     let mut catch_up_owed = startup_catch_up_window(&state);
+    // Owed once per daemon life, and independent of the catch-up window: the
+    // paths it recovers are exactly the ones whose host modification time puts
+    // them outside that window. A store with no last-admission marker gets no
+    // catch-up and still gets this, because this bound comes from graph truth
+    // rather than from a clock.
+    let mut enrichment_repair_owed = true;
     if let Some(armed) = armed.as_mut() {
         armed.arm();
     }
@@ -2146,6 +2294,35 @@ pub async fn run_loop_armed(
                         "could not plan the startup catch-up, so host content written while \
                          nothing was watching stays unadmitted until `kin admit` or a commit \
                          takes it"
+                    );
+                }
+            }
+        }
+
+        // The enrichment repair, owed once for the same reason and taken the
+        // same way. Loud when it finds anything: a file admitted with no
+        // entities answered every query as an absence, and a store that has
+        // been in that state deserves the count said out loud rather than
+        // repaired in silence.
+        if enrichment_repair_owed {
+            enrichment_repair_owed = false;
+            match plan_unenriched_source_events(&state) {
+                Ok(events) if events.is_empty() => {
+                    debug!("every admitted source path already carries its entities");
+                }
+                Ok(events) => {
+                    warn!(
+                        count = events.len(),
+                        "admitted source paths carry no entities, so nothing can query them; \
+                         re-deriving them now"
+                    );
+                    enqueue_file_events(&mut pending_events, events);
+                }
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "could not plan the enrichment repair, so any admitted path missing its \
+                         entities stays unqueryable until it is edited or committed"
                     );
                 }
             }
