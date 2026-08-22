@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.49] - 2026-08-22
+
+### Changed
+
+- Cover kin dead-code over a store holding a benign re-export file (#1065)
+- Publish per-language parse coverage as a disclosure, and name the files behind it (#1063)
+- Point the degraded-health warning at the command that explains it (#1066)
+- Count every impact_analysis key the budget can cut, and report the bound that actually held (#1068)
+- Collect the relations bound to a departing artifact so a deleted file can be committed (#1067)
+- Give the install proof a runaway backstop instead of a cap the healthy Windows leg reaches (#1069)
+- Recover the enrichment a daemon derived and did not live to publish (#1070)
+- Record the abandonment of v0.5.48, whose Windows leg timeout is frozen into the tag (#1071)
+
+
 ## [0.5.48] - 2026-08-22
 
 ### Changed
