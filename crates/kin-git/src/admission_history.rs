@@ -54,6 +54,11 @@ pub struct AdmittedSemanticGitImportPlan {
     pub default_ref_mutation: Option<DefaultRefMutation>,
 }
 
+/// Refusal when an admitted plan does not match what its own raw objects,
+/// trees and CAS derive.
+const ADMITTED_DETERMINISTIC_DERIVATION: &str =
+    "admitted semantic Git import plan does not match its deterministic raw-object, tree, and CAS derivation";
+
 impl AdmittedSemanticGitImportPlan {
     /// Effective shared policy for the workspace base tree.
     pub const fn workspace_policy(&self) -> &SharedAdmissionPolicy {
@@ -117,23 +122,27 @@ impl AdmittedSemanticGitImportPlan {
         // second whole admitted history, at the one moment in the ladder where
         // the working set is already largest, to check the first.
         let mut checked = 0usize;
-        let mut mismatch = false;
         let derived = derive_admitted_semantic_git_history(
             &semantic,
             blob_store,
             &mut |_oid, admitted, alias| {
+                // Refuse at the commit that disagrees rather than carrying a
+                // flag to the end. A plan that has already failed can go on to
+                // trip a structural error further down the walk, and reporting
+                // that instead would name the wrong thing.
                 if self.changes.get(checked) != Some(&admitted)
                     || self.aliases.get(checked) != Some(&alias)
                 {
-                    mismatch = true;
+                    return Err(GitError::InvalidSnapshot(
+                        ADMITTED_DETERMINISTIC_DERIVATION.to_string(),
+                    ));
                 }
                 checked += 1;
                 Ok(())
             },
         )?;
 
-        if mismatch
-            || checked != derived.commits
+        if checked != derived.commits
             || self.changes.len() != derived.commits
             || self.aliases.len() != derived.commits
             || self.commit_policies != derived.commit_policies
@@ -150,8 +159,7 @@ impl AdmittedSemanticGitImportPlan {
             || self.default_ref_mutation != semantic.default_ref_mutation
         {
             return Err(GitError::InvalidSnapshot(
-                "admitted semantic Git import plan does not match its deterministic raw-object, tree, and CAS derivation"
-                    .to_string(),
+                ADMITTED_DETERMINISTIC_DERIVATION.to_string(),
             ));
         }
         Ok(())
