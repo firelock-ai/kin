@@ -6619,8 +6619,11 @@ mod tests {
     /// characters and could not be called from Claude Code at all. kin#902 added
     /// an `impact_analysis` entry to the response budget, but it named
     /// `impacted_entities`, a key this response has never carried, so every rung
-    /// of the ladder walked an absent array and cut nothing. The buckets an
-    /// `ImpactReport` actually serializes are the four in `IMPACT_ENTITY_BUCKETS`.
+    /// of the ladder walked an absent array and cut nothing. The blast-radius
+    /// buckets an `ImpactReport` serializes as arrays of raw entities are the
+    /// four in `IMPACT_ENTITY_BUCKETS`, which is what the budget's table named
+    /// next. FIR-2602 then widened that table to every array the response
+    /// carries, because a report can leave all four empty and still be large.
     ///
     /// This drives the handler, then applies the same `ResponseBudget` the MCP
     /// path applies, and measures the bytes a caller would receive.
