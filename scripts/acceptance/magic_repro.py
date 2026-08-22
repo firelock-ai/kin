@@ -1442,16 +1442,24 @@ def check_11(suite):
 
     rc, out, err = suite.kin_run(["doctor"], repo)
     doctor = strip_ansi(out + "\n" + err)
+    # The row, not the summary. `kin doctor` closes with a line naming every
+    # check that needs attention, and on a runner where several do, that line
+    # contains the words "Relation census" too. A substring search picked it and
+    # reported the check red over a product that had answered correctly. The row
+    # carries its status marker and then the label; the summary carries a count
+    # between the two.
     row = ""
     for candidate in doctor.splitlines():
-        if "Relation census" in candidate:
+        if re.match(r"^\s*\S?\s+Relation census\b", candidate):
             row = candidate.strip()
     if not row:
         res.unknown("kin doctor rc=%d printed no relation-census row" % rc)
-    elif expected not in row:
-        res.bad("kin doctor does not name the kind that lost ground. Expected %r, row read: %s"
-                % (expected, row))
-    elif "entity count held" not in row:
+    elif "no relation kind has lost ground" in doctor:
+        res.bad("kin doctor reports the census green over a kind that lost ground: %s" % row)
+    elif expected not in doctor:
+        res.bad("kin doctor does not name the kind that lost ground. Expected %r, census row "
+                "read: %s" % (expected, row))
+    elif "entity count held" not in doctor:
         res.bad("kin doctor names the loss without the entity count that makes it a "
                 "regression rather than a deletion: %s" % row)
     else:
