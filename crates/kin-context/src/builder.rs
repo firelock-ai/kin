@@ -3232,4 +3232,119 @@ mod tests {
     fn normalize_preserves_normal_names() {
         assert_eq!(normalize_entity_name("process"), "process");
     }
+
+    // ── What the token budget refused (FIR-2482) ────────────────────────
+
+    /// A focal calling `deps` entities, so a tight budget has candidates to
+    /// refuse and a generous one admits every last row.
+    fn calling_store(deps: usize) -> (kin_db::InMemoryGraph, Entity) {
+        use kin_model::relation::{Relation, RelationKind, RelationOrigin};
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_entity("focal", EntityKind::Function);
+        store.upsert_entity(&focal).unwrap();
+        for index in 0..deps {
+            let dep = make_entity(&format!("dep_{index:04}"), EntityKind::Function);
+            store.upsert_entity(&dep).unwrap();
+            store
+                .upsert_relation(&Relation {
+                    id: kin_model::ids::RelationId::new(),
+                    kind: RelationKind::Calls,
+                    src: GraphNodeId::Entity(focal.id),
+                    dst: GraphNodeId::Entity(dep.id),
+                    confidence: 1.0,
+                    origin: RelationOrigin::Parsed,
+                    created_in: None,
+                    import_source: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        }
+        (store, focal)
+    }
+
+    #[test]
+    fn a_budget_that_refused_a_row_says_how_many() {
+        let (store, focal) = calling_store(40);
+        let whole = ContextOptions {
+            budget: TokenBudget::Large32k,
+            ..ContextOptions::default()
+        };
+        let (full, full_selection) =
+            build_context_pack_with_provenance(&store, &focal.id, &whole).unwrap();
+        assert_eq!(
+            full_selection.budget_elided(group::DEPENDENCIES),
+            0,
+            "a budget that admitted everything must claim no loss"
+        );
+
+        let tight = ContextOptions {
+            budget: TokenBudget::Custom(full.actual_tokens / 2),
+            ..ContextOptions::default()
+        };
+        let (cut, selection) =
+            build_context_pack_with_provenance(&store, &focal.id, &tight).unwrap();
+        let kept = cut.dependency_signatures.len();
+        assert!(
+            kept > 0 && kept < full.dependency_signatures.len(),
+            "the budget must actually cut for this test to mean anything: kept {kept} of {}",
+            full.dependency_signatures.len()
+        );
+
+        // The count is the whole point: without it, `kept` rows is what a focal
+        // with `kept` dependencies looks like.
+        let elided = selection.budget_elided(group::DEPENDENCIES);
+        assert_eq!(
+            kept + elided,
+            full.dependency_signatures.len(),
+            "kept plus refused must equal what the generous budget admitted"
+        );
+        assert!(
+            selection
+                .budget_elisions()
+                .any(|(name, count)| name == group::DEPENDENCIES && count == elided),
+            "the refused group must appear in the elision listing"
+        );
+    }
+
+    #[test]
+    fn a_row_recovered_by_another_route_is_not_counted_as_lost() {
+        let (store, focal) = calling_store(40);
+        let whole = ContextOptions {
+            budget: TokenBudget::Large32k,
+            ..ContextOptions::default()
+        };
+        let (full, _) = build_context_pack_with_provenance(&store, &focal.id, &whole).unwrap();
+        let tight = ContextOptions {
+            budget: TokenBudget::Custom(full.actual_tokens / 2),
+            ..ContextOptions::default()
+        };
+        let (_, selection) = build_context_pack_with_provenance(&store, &focal.id, &tight).unwrap();
+        let elided = selection.budget_elided(group::DEPENDENCIES);
+        assert!(elided > 0, "the budget must have refused something");
+        assert_eq!(
+            selection.budget_elided_unrecovered(group::DEPENDENCIES, |_| true),
+            0,
+            "a row the caller recovered elsewhere is not a row the answer lost"
+        );
+    }
+
+    #[test]
+    fn a_pack_that_lost_nothing_claims_nothing() {
+        let (store, focal) = calling_store(3);
+        let opts = ContextOptions {
+            budget: TokenBudget::Large32k,
+            ..ContextOptions::default()
+        };
+        let (pack, selection) =
+            build_context_pack_with_provenance(&store, &focal.id, &opts).unwrap();
+        assert!(
+            !pack.dependency_signatures.is_empty(),
+            "the fixture must admit rows, or this asserts nothing"
+        );
+        assert_eq!(
+            selection.budget_elisions().count(),
+            0,
+            "a whole pack must carry no elision at all, so a disclosure means a cut"
+        );
+    }
 }

@@ -825,4 +825,111 @@ mod tests {
             resolved.name
         );
     }
+
+    // ── What the token budget refused reaches both renderings (FIR-2482) ──
+
+    /// A focal calling `deps` entities, so a tight budget has rows to refuse.
+    fn calling_graph(deps: usize) -> (kin_db::InMemoryGraph, Entity) {
+        use kin_model::relation::{Relation, RelationKind, RelationOrigin};
+        use kin_model::GraphNodeId;
+        let graph = kin_db::InMemoryGraph::new();
+        let focal = test_entity("focal");
+        graph.upsert_entity(&focal).unwrap();
+        for index in 0..deps {
+            let dep = test_entity(&format!("dep_{index:04}"));
+            graph.upsert_entity(&dep).unwrap();
+            graph
+                .upsert_relation(&Relation {
+                    id: kin_model::ids::RelationId::new(),
+                    kind: RelationKind::Calls,
+                    src: GraphNodeId::Entity(focal.id),
+                    dst: GraphNodeId::Entity(dep.id),
+                    confidence: 1.0,
+                    origin: RelationOrigin::Parsed,
+                    created_in: None,
+                    import_source: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        }
+        (graph, focal)
+    }
+
+    fn context_for(graph: &kin_db::InMemoryGraph, budget: &str) -> ContextResponse {
+        build_context_response(
+            graph,
+            &ContextRequest {
+                entity: "focal".to_string(),
+                budget: budget.to_string(),
+                assistant: None,
+            },
+        )
+        .unwrap()
+    }
+
+    /// Six rows on a focal with sixty dependencies printed "Dependencies: 6
+    /// entries", which is what a focal with six dependencies prints. The
+    /// rendering is the whole of what a `kin context` reader sees, so a cut it
+    /// does not name is a cut that did not happen as far as that reader knows.
+    #[test]
+    fn a_budget_cut_section_names_its_loss_in_the_lines_and_in_the_json() {
+        let (graph, _) = calling_graph(60);
+        let whole = context_for(&graph, "32k");
+        let full_deps = whole.pack.as_ref().unwrap().dependency_signatures.len();
+        assert!(
+            whole.budget_elisions.is_empty(),
+            "a generous budget refused nothing and must claim nothing: {:?}",
+            whole.budget_elisions
+        );
+
+        // Sized off the unconstrained pack so the cut lands mid-list however
+        // projection costs change later.
+        let tight = (whole.pack.as_ref().unwrap().actual_tokens / 2).to_string();
+        let cut = context_for(&graph, &tight);
+        let kept = cut.pack.as_ref().unwrap().dependency_signatures.len();
+        assert!(
+            kept > 0 && kept < full_deps,
+            "the budget must actually cut for this test to mean anything: kept {kept} of \
+             {full_deps}"
+        );
+
+        let elision = cut
+            .budget_elisions
+            .get("dependencies")
+            .unwrap_or_else(|| panic!("a cut section must publish an elision: {:?}", cut.lines));
+        assert_eq!(elision.kept, kept);
+        assert_eq!(elision.kept + elision.elided, elision.total);
+        assert_eq!(elision.reason, CONTEXT_ELISION_REASON_TOKEN_BUDGET);
+
+        let rendered = cut.lines.join("\n");
+        assert!(
+            rendered.contains(&format!(
+                "{} withheld by the {tight}-token budget",
+                elision.elided
+            )),
+            "the section line names what the budget took: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("Raise --budget above {tight}")),
+            "the rendering names the lever that recovers it: {rendered}"
+        );
+    }
+
+    /// The other direction, and it is the one that gives an absent disclosure
+    /// its meaning: a pack that lost nothing says nothing, on both halves.
+    #[test]
+    fn a_whole_pack_carries_no_budget_note_at_all() {
+        let (graph, _) = calling_graph(2);
+        let whole = context_for(&graph, "32k");
+        assert!(whole.budget_elisions.is_empty(), "{:?}", whole.budget_elisions);
+        let rendered = whole.lines.join("\n");
+        assert!(
+            !rendered.contains("withheld by the"),
+            "nothing was withheld, so nothing may be claimed: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Raise --budget"),
+            "no lever is offered for a cut that did not happen: {rendered}"
+        );
+    }
 }

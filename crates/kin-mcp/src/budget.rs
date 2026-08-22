@@ -1920,6 +1920,180 @@ mod tests {
     /// the recorder. The ladder guards this at its call site; this guards the
     /// recorder itself, so a second producer added later cannot publish a loss
     /// of zero.
+    // ── The body a budget takes says so on the row (FIR-2482) ───────────
+
+    /// A context pack of `rows` dependencies, each carrying a body, plus a
+    /// focal that carries one too.
+    fn pack_payload(rows: usize, body_chars: usize) -> Value {
+        let dep = |index: usize| {
+            json!({
+                "id": format!("00000000-0000-0000-0000-{index:012}"),
+                "name": format!("dep_{index}"),
+                "kind": "function",
+                "signature": format!("fn dep_{index}()"),
+                "file_path": format!("src/f{index}.rs"),
+                "start_line": 1,
+                "end_line": 40,
+                "body": "x".repeat(body_chars),
+            })
+        };
+        json!({
+            "focal_entity": {
+                "id": "00000000-0000-0000-0000-ffffffffffff",
+                "name": "focal",
+                "body": "y".repeat(body_chars),
+            },
+            "dependencies": (0..rows).map(dep).collect::<Vec<_>>(),
+            "dependents": [],
+            "token_budget": 16000,
+        })
+    }
+
+    /// Every row of every listed collection, plus the focal, as objects.
+    fn rows_of(payload: &Value, keys: &[&str]) -> Vec<Map<String, Value>> {
+        let mut rows: Vec<Map<String, Value>> = keys
+            .iter()
+            .filter_map(|key| payload.get(*key))
+            .filter_map(Value::as_array)
+            .flat_map(|entries| entries.iter().filter_map(Value::as_object).cloned())
+            .collect();
+        if let Some(focal) = payload.get("focal_entity").and_then(Value::as_object) {
+            rows.push(focal.clone());
+        }
+        rows
+    }
+
+    #[test]
+    fn a_row_whose_body_the_budget_took_says_so() {
+        let mut payload = pack_payload(24, 900);
+        // Sized so shedding the bodies alone brings the response under, and the
+        // ladder never reaches the rung that withholds rows. Both cuts are real
+        // and both are disclosed, but mixing them here would leave the row
+        // count and the body count describing different populations, and this
+        // test is about the rows that stayed.
+        let budget = ResponseBudget {
+            max_chars: 12_000,
+            ..ResponseBudget::default()
+        };
+        enforce(&mut payload, "get_context_pack", &budget).expect("get_context_pack is budgeted");
+        assert_eq!(
+            payload["dependencies"].as_array().map(Vec::len),
+            Some(24),
+            "the body rung alone must have sufficed: {payload}"
+        );
+
+        let rows = rows_of(&payload, &["dependencies"]);
+        assert_eq!(rows.len(), 25, "24 dependencies and the focal: {payload}");
+        for row in &rows {
+            // Removing the key outright is the shape of a `compact: true` call
+            // and of an entity whose source the graph does not hold. A row that
+            // lost its body to the budget must read as neither.
+            assert_eq!(
+                row.get("body"),
+                Some(&Value::Null),
+                "a stripped body keeps its field: {payload}"
+            );
+            assert_eq!(
+                row.get(BODY_ELIDED_KEY),
+                Some(&json!(["body"])),
+                "a stripped row names what the budget took: {payload}"
+            );
+            assert!(
+                row.get("body_unavailable").is_none(),
+                "a budget cut is not a graph gap, and one row cannot be both: {payload}"
+            );
+        }
+        let elision = payload["elisions"]["body"].clone();
+        assert_eq!(elision["elided"], json!(rows.len()), "{payload}");
+        assert_eq!(elision["kept"], json!(0), "{payload}");
+        assert_eq!(elision["reason"], json!(ELISION_REASON_BUDGET), "{payload}");
+    }
+
+    #[test]
+    fn a_row_that_never_had_a_body_is_neither_marked_nor_counted() {
+        let mut payload = pack_payload(24, 900);
+        // One row whose source the graph genuinely does not hold, in the
+        // vocabulary the pack handler uses for it.
+        payload["dependencies"][0]["body"] = Value::Null;
+        payload["dependencies"][0]["body_unavailable"] = json!("generated at build time");
+        let budget = ResponseBudget {
+            max_chars: 4_000,
+            ..ResponseBudget::default()
+        };
+        enforce(&mut payload, "get_context_pack", &budget).expect("get_context_pack is budgeted");
+
+        let gap = payload["dependencies"][0].clone();
+        assert!(
+            gap.get(BODY_ELIDED_KEY).is_none(),
+            "the budget took nothing from this row and must claim nothing: {payload}"
+        );
+        assert_eq!(
+            gap["body_unavailable"],
+            json!("generated at build time"),
+            "the graph gap's own reason survives: {payload}"
+        );
+    }
+
+    #[test]
+    fn a_whole_response_claims_no_body_elision() {
+        let mut payload = pack_payload(2, 40);
+        let budget = ResponseBudget {
+            max_chars: RESPONSE_MAX_MAX_CHARS,
+            ..ResponseBudget::default()
+        };
+        enforce(&mut payload, "get_context_pack", &budget).expect("get_context_pack is budgeted");
+        assert!(
+            payload.get(ELISIONS_KEY).is_none(),
+            "nothing was withheld, so nothing may be claimed: {payload}"
+        );
+        assert_eq!(
+            payload["dependencies"][0]["body"],
+            json!("x".repeat(40)),
+            "an untouched body is still its source: {payload}"
+        );
+    }
+
+    #[test]
+    fn two_cuts_on_one_list_add_up_rather_than_replacing_each_other() {
+        // What a pack's own token budget already recorded before the response
+        // budget ever sees the payload, in the shape the handler writes it.
+        let mut payload = pack_payload(24, 40);
+        record_elision_for(
+            &mut payload,
+            "dependencies",
+            24,
+            6,
+            ELISION_REASON_TOKEN_BUDGET,
+        );
+        payload["dependencies_withheld"] = json!(6);
+
+        let budget = ResponseBudget {
+            max_chars: 2_500,
+            ..ResponseBudget::default()
+        };
+        enforce(&mut payload, "get_context_pack", &budget).expect("get_context_pack is budgeted");
+
+        let kept = payload["dependencies"].as_array().unwrap().len();
+        let elision = payload["elisions"]["dependencies"].clone();
+        let withheld = payload["dependencies_withheld"].as_u64().unwrap() as usize;
+        assert!(
+            kept < 24,
+            "the response budget must cut for this test to mean anything: {payload}"
+        );
+        // 30 candidates existed: the 24 that reached the response and the 6 the
+        // token budget already refused. Overwriting would report `total` as 24
+        // and lose the earlier cause entirely.
+        assert_eq!(elision["total"], json!(30), "{payload}");
+        assert_eq!(elision["kept"], json!(kept), "{payload}");
+        assert_eq!(elision["elided"], json!(30 - kept), "{payload}");
+        assert_eq!(withheld, 30 - kept, "the scalar and the map must agree: {payload}");
+        let reason = elision["reason"].as_str().unwrap();
+        assert!(
+            reason.contains(ELISION_REASON_TOKEN_BUDGET) && reason.contains(ELISION_REASON_BUDGET),
+            "both causes survive the merge, got {reason}: {payload}"
+        );
+    }
+
     #[test]
     fn recording_a_loss_of_nothing_writes_nothing() {
         let mut payload = json!({ "entities": [] });
