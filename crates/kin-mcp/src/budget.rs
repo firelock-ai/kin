@@ -1234,24 +1234,38 @@ mod tests {
     fn the_advertised_ceiling_is_one_a_client_accepts() {
         const REFUSED_BY_A_REAL_CLIENT: usize = 117_313;
         const ACCEPTED_BY_A_REAL_CLIENT: usize = 55_000;
+        const OVERFLOWED_THE_MEASURED_STORE: usize = 30_000;
+
+        // Read through the clamp rather than off the constants, because what a
+        // caller is served is the only number that can refuse their result.
+        let served = |requested: Option<u64>| {
+            let mut args = HashMap::new();
+            if let Some(value) = requested {
+                args.insert("max_chars".to_string(), json!(value));
+            }
+            ResponseBudget::from_arguments(&args).max_chars
+        };
+        let ceiling = served(Some(u64::MAX));
+        let floor = served(Some(1));
+        let default = served(None);
+
         assert!(
-            RESPONSE_MAX_MAX_CHARS < REFUSED_BY_A_REAL_CLIENT,
-            "the ceiling advertises a size a client refused: {RESPONSE_MAX_MAX_CHARS}"
+            ceiling < REFUSED_BY_A_REAL_CLIENT,
+            "the ceiling serves a size a real client refused: {ceiling}"
         );
         assert!(
-            RESPONSE_MAX_MAX_CHARS >= ACCEPTED_BY_A_REAL_CLIENT,
-            "the ceiling sits under a size a client already took: {RESPONSE_MAX_MAX_CHARS}"
+            ceiling >= ACCEPTED_BY_A_REAL_CLIENT,
+            "the ceiling sits under a size a real client already took: {ceiling}"
         );
         assert!(
-            RESPONSE_MIN_MAX_CHARS < RESPONSE_DEFAULT_MAX_CHARS
-                && RESPONSE_DEFAULT_MAX_CHARS <= RESPONSE_MAX_MAX_CHARS,
-            "the default must sit inside its own clamp"
+            floor < default && default <= ceiling,
+            "the default {default} must sit inside its own clamp {floor}..{ceiling}"
         );
         // The old 30,000 default dropped 170 of 200 steps on the 783-entity store
         // the same run measured, and still withheld impact rows at 50,000.
         assert!(
-            RESPONSE_DEFAULT_MAX_CHARS > 30_000,
-            "the default is back at a size the measured store overflowed"
+            default > OVERFLOWED_THE_MEASURED_STORE,
+            "the default is back at a size the measured store overflowed: {default}"
         );
     }
 

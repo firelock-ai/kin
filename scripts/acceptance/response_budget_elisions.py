@@ -278,12 +278,25 @@ class Suite(object):
         with open(os.path.join(repo, "tests", "test_chain.py"), "w") as handle:
             handle.write("\n".join(tests))
 
+        # Every git call carries the fixture's own identity and no hooks. A
+        # developer host's global hooks refuse an unsigned message, and a fixture
+        # commit that a host policy blocks is a setup error wearing the costume
+        # of a product failure.
+        git = [
+            "git",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "user.email=acceptance@firelock.invalid",
+            "-c",
+            "user.name=kin-response-budget-elisions",
+        ]
         for args in (
-            ["git", "init", "--quiet"],
-            ["git", "-c", "core.hooksPath=/dev/null", "config", "user.email", "acceptance@firelock.invalid"],
-            ["git", "config", "user.name", "kin-response-budget-elisions"],
-            ["git", "add", "-A"],
-            ["git", "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "fixture"],
+            git + ["init", "--quiet"],
+            git + ["add", "-A"],
+            git + ["commit", "--quiet", "-s", "-m", "fixture"],
         ):
             proc = self.run(args, cwd=repo, timeout=120)
             if proc.returncode != 0:
@@ -503,35 +516,46 @@ def check_2(suite):
 
 
 def check_3(suite):
-    res = Result("3", "FIR-2600", "no impact bucket the budget cuts ships empty")
-    buckets = [
-        "affected_callers",
-        "affected_dependents",
-        "affected_contract_consumers",
-        "affected_tests",
-    ]
+    res = Result("3", "FIR-2600", "no ranked list the budget cuts ships empty")
+    lists = ["entities", "files"]
+    query = {"query": "hop", "limit": 60}
     try:
-        payload = suite.mcp(
-            "impact_analysis",
-            {"files": ["src/chain.py", "tests/test_chain.py"], "max_chars": 2500},
-        )
+        whole = suite.mcp("semantic_locate", dict(query, max_chars=60000))
+        cut = suite.mcp("semantic_locate", dict(query, max_chars=2000))
     except McpError as exc:
-        res.unknown("impact_analysis unreadable: %s" % exc)
+        res.unknown("semantic_locate unreadable: %s" % exc)
         return res
-    problems, graded = grade_buckets(payload, buckets)
-    if problems:
-        for problem in problems:
-            res.bad(problem)
+
+    # The same query at two budgets. Anything the walk found at the ceiling it
+    # still found at the floor, so a list that is full in one and empty in the
+    # other was emptied by the budget and by nothing else. This needs no counter
+    # to be true, which is why it is the check.
+    populated = [key for key in lists if whole.get(key)]
+    if not populated:
+        res.unknown("the ceiling call filled no list, so the rule was not exercised")
         return res
+    for key in populated:
+        rows = cut.get(key)
+        if not isinstance(rows, list) or not rows:
+            res.bad(
+                "`%s` held %d entries at the ceiling and %r at the floor, so the budget "
+                "emptied it" % (key, len(whole[key]), rows)
+            )
+    problems, graded = grade_buckets(cut, lists)
+    for problem in problems:
+        res.bad(problem)
     if graded == 0:
-        res.unknown(
-            "the budget cut no bucket on this fixture, so the rule was not exercised"
-        )
+        res.unknown("the floor call cut nothing, so the elision rule was not exercised")
         return res
-    res.ok(
-        "%d cut buckets kept an entry and published an elision: %s"
-        % (graded, json.dumps(payload.get("elisions") or {}, sort_keys=True))
-    )
+    if not res.failed:
+        res.ok(
+            "%d of %d lists were cut and every one kept an entry: %s"
+            % (
+                graded,
+                len(populated),
+                json.dumps(cut.get("elisions") or {}, sort_keys=True),
+            )
+        )
     return res
 
 
