@@ -305,6 +305,10 @@ async fn python_and_javascript_reference_rows_carry_call_site_lines_on_both_inge
                     entity: target.id.to_string(),
                     kind: "calls".to_string(),
                 },
+                &kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+                    "initialized": true, "graph_loaded": true,
+                    "graph_entity_count": 4, "graph_generation": 1,
+                })),
             )
             .expect("kin refs");
             let cli_text = cli.lines.join("\n");

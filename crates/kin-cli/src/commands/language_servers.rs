@@ -192,6 +192,19 @@ pub(crate) fn missing_enrichable_languages() -> Vec<LanguageId> {
         .collect()
 }
 
+/// Every language this build enriches with, whether or not its server is here.
+///
+/// The set [`missing_enrichable_languages`] is a subset of. A run that installed
+/// nothing has to be able to name what was even in scope, because "nothing
+/// happened" and "nothing was ever going to happen here" are different facts and
+/// a reader acts differently on each.
+pub(crate) fn enrichable_languages() -> Vec<LanguageId> {
+    LANGUAGE_SERVERS
+        .iter()
+        .map(|recipe| recipe.language)
+        .collect()
+}
+
 /// The exact commands for languages named by their wire name.
 ///
 /// The coverage report hands out `LanguageId`'s display strings rather than the

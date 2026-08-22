@@ -117,10 +117,26 @@ pub fn qualify(
                 "{indent}Kin cannot rule out {subject}: this answer carries [{disclosed}], so it \
                  may not reflect current truth."
             ),
-            None => format!(
-                "{indent}Kin cannot rule out {subject}: this answer's coverage could not be \
-                 established."
-            ),
+            // No degraded signal and no absent class, so the reason the verdict
+            // refused is neither of the two things this renderer reads directly.
+            // It is still ON the verdict, as the leading clause of
+            // `trust_reason`, and naming it beats the generic sentence that used
+            // to stand here: measured on a store whose cross-file coverage was
+            // complete, `kin refs` rendered "this answer's coverage could not be
+            // established" when coverage HAD been established and the real gap
+            // was `cross_repo_not_configured`. A qualifier that misnames its own
+            // cause sends a reader to fix the wrong end, which is the failure
+            // `focal_resolution_gap` already distinguishes two ways one level
+            // down.
+            // An unconfigured spine, alone, is not a gap in THIS repository.
+            None if only_unconfigured_federation(&negative) => return Vec::new(),
+            None => match limiting_factor(&negative) {
+                Some(factor) => format!("{indent}Kin cannot rule out {subject}: {factor}."),
+                None => format!(
+                    "{indent}Kin cannot rule out {subject}: this answer's coverage could not be \
+                     established."
+                ),
+            },
         }];
     }
 
@@ -139,6 +155,79 @@ pub fn qualify(
         ));
     }
     said
+}
+
+/// Whether the ONLY thing the verdict rested on is a cross-repo spine nobody
+/// configured.
+///
+/// A rendering decision, not a second verdict: the object `negative_for`
+/// returned is still carried verbatim on the machine surface, so an agent
+/// reading `--json` sees exactly what the MCP tool would say. What is withheld
+/// is the SENTENCE, in this one state.
+///
+/// It has to be withheld, and a standing test says so. `find_references` gates
+/// on `cross_repo`, and a repository with no spine reports `not_configured`,
+/// which the gate counts as a gap. Without this, the qualifier fires on EVERY
+/// empty `kin refs` on EVERY non-federated repository, including a healthy one
+/// whose cross-file coverage is complete and whose focal is genuinely dead. That
+/// is the FIR-2404 failure in its opposite costume, and FIR-2524's own negative
+/// control forbids it in as many words: a genuinely dead entity on a healthy
+/// enriched store must still read plainly, with no qualifier attached.
+/// `genuinely_unreferenced_entity_still_gets_the_plain_empty_answer` is the
+/// guard, and it caught this exact regression on the first CI run of the change
+/// that introduced it.
+///
+/// The producing handler agrees. It emits `not_configured` under its own comment
+/// "Local-only (no spine configured): cross-repo refs don't apply", so speaking
+/// this gap to a person reading one local repository would repeat as a warning a
+/// fact the code that published it documents as inapplicable.
+///
+/// Narrow on purpose: it fires only when NOTHING else is in the trust reason. An
+/// unconfigured spine beside an absent edge class leaves the edge class naming
+/// the sentence, and a spine that IS configured and answered badly
+/// (`cross_repo_authority_incomplete`, `cross_repo_unavailable`) is a real gap
+/// about a real federation and still speaks.
+fn only_unconfigured_federation(negative: &serde_json::Value) -> bool {
+    let Some(reason) = negative
+        .get("trust_reason")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    let clauses: Vec<&str> = reason
+        .split("; ")
+        .map(str::trim)
+        .filter(|clause| !clause.is_empty())
+        .collect();
+    !clauses.is_empty()
+        && clauses.iter().all(|clause| {
+            clause.starts_with("cross_repo_not_configured")
+                || clause.starts_with("cross_repo_authority_missing")
+        })
+}
+
+/// The verdict's own leading reason, in the words it published.
+///
+/// `trust_reason` is a semicolon-joined list of every gap the gate pushed, in
+/// the order it pushed them, and the gate orders them so the most specific one
+/// leads. Taking the head is therefore taking the reason the refusal is most
+/// ABOUT, which is the same rule the acceptance suite's check 2 already asserts
+/// against this field. The trailing clause after the first colon is the
+/// explanation, kept, because a bare machine token like
+/// `cross_repo_not_configured` is not a sentence a person can act on.
+fn limiting_factor(negative: &serde_json::Value) -> Option<String> {
+    let reason = negative.get("trust_reason")?.as_str()?.trim();
+    let head = reason.split("; ").next().unwrap_or(reason).trim();
+    if head.is_empty() {
+        return None;
+    }
+    // Drop the machine token, keep its explanation. A reason carrying no colon
+    // is already prose and is used whole.
+    let said = match head.split_once(": ") {
+        Some((_token, prose)) if !prose.trim().is_empty() => prose.trim(),
+        _ => head,
+    };
+    Some(said.trim_end_matches('.').to_string())
 }
 
 /// The classes the verdict says it rested on, read off the published
@@ -209,6 +298,25 @@ fn absence_subject(tool: &str) -> &'static str {
         // Walks OUTWARD from the focal, so its empty answer is an absence of
         // things this entity reaches rather than of things that reach it.
         "trace_data_flow" => "dependencies it did not see",
+        // Its rows ARE the reference edges, and it prints "References to 'X'",
+        // so the noun a reader is holding is references. The substrate's own
+        // spec subject agrees ("no references to the focal entity were found").
+        // Letting it fall through to `dependents` would answer a question about
+        // references with a claim about dependents, which is true of the same
+        // edges and is not the sentence the reader asked for.
+        "find_references" => "references it did not see",
+        // Traverses no edge at all: its seed is a name/kind filter over the
+        // entity index, so an empty candidate list means nothing MATCHED the
+        // seed rather than that nothing is unreachable. Naming dependents here
+        // would claim a reachability finding the scan never made.
+        "find_dead_code_seeded" => "seed matches it did not see",
+        // The whole-repo scan makes the INVERSE claim: "nothing here is
+        // unreachable". What it cannot rule out is therefore dead code it never
+        // saw, not dependents. It reads no edge class and is not language-scoped
+        // (`kin_mcp::negative` says why: a class this build cannot resolve
+        // produces MORE candidates, never fewer), so this line renders only when
+        // the SUBSTRATE is in doubt, which is the one way a clean scan can lie.
+        "dead_code" => "unreachable entities it did not see",
         _ => "dependents",
     }
 }

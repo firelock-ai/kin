@@ -1224,6 +1224,23 @@ pub(crate) struct LiveProjection {
     /// True when the mode in force is not the intent, or when the mode in force
     /// failed one of its own probes.
     pub degraded: bool,
+    /// True when the ONLY probe this mode failed is the one asking whether the
+    /// shim is preloaded into THIS process.
+    ///
+    /// Kin's own shell hook wraps `kin` as
+    /// `kin() { DYLD_INSERT_LIBRARIES= LD_PRELOAD= command kin "$@"; }`, so the
+    /// one process the hook guarantees is unshimmed is the process asking the
+    /// question. Every other probe here, the read and the bound root and the
+    /// socket behind it, is about the projection rather than this process, and a
+    /// caller that wants to tell "this binary is deliberately not injected" from
+    /// "the projection is broken" needs the two separated. [`Self::degraded`]
+    /// deliberately does not make that distinction: a surface reporting on the
+    /// process it is running in, such as `kin vfs status`, is right to say this
+    /// process is not reading graph truth.
+    ///
+    /// False for every mount mode, which is not injected per process and has no
+    /// such question to answer.
+    pub unengaged_here_only: bool,
     /// The literal probe results, in the order they were taken.
     pub evidence: Vec<String>,
 }
@@ -1525,12 +1542,25 @@ pub(crate) fn probe_live(
         evidence.push(binding.evidence());
     }
 
-    let mode_failed = match mode {
-        ProjectionMode::Shim => !shim.engaged || readable != Tri::Yes || !binding.projects(),
+    // One formula, asked twice: once about this process, and once about a
+    // process the shim IS injected into. Two calls rather than two expressions,
+    // so a probe added here is added to both answers and they cannot drift into
+    // disagreeing about the same machine.
+    let mode_failed_when = |engaged: bool| match mode {
+        ProjectionMode::Shim => !engaged || readable != Tri::Yes || !binding.projects(),
         ProjectionMode::Nfs | ProjectionMode::Fuse | ProjectionMode::ProjFs => {
             mounted != Tri::Yes || readable != Tri::Yes
         }
     };
+    let mode_failed = mode_failed_when(shim.engaged);
+    // Every probe except engagement passed, and engagement is the one the hook
+    // is designed to fail here. Both halves are required: `intent == mode`
+    // because a fallback is a real degradation whoever is asking, and
+    // `!mode_failed_when(true)` because a bound root nothing serves, or one that
+    // does not contain this directory, breaks every process the shim IS injected
+    // into (FIR-2552) and must never be reported as merely uninjected.
+    let unengaged_here_only =
+        mode == ProjectionMode::Shim && !shim.engaged && intent == mode && !mode_failed_when(true);
     // Both halves of "not projected" get their own sentence, because they need
     // different things done about them and a reader who is told the wrong one
     // goes looking in the wrong place. A shim on disk that is not injected wants
@@ -1562,6 +1592,7 @@ pub(crate) fn probe_live(
         readable,
         writable,
         degraded: intent != mode || mode_failed,
+        unengaged_here_only,
         evidence,
     }
 }
@@ -2430,6 +2461,7 @@ Options:
             readable: Tri::Yes,
             writable: Tri::NotApplicable,
             degraded: false,
+            unengaged_here_only: false,
             evidence: vec!["fixture evidence".to_string()],
         };
         let printed = live_lines(&shim).join("\n");
@@ -2645,6 +2677,112 @@ Options:
             "a bound, answered repository is in force: {}",
             served.row()
         );
+    }
+
+    /// FIR-2501, at the probe. Kin's shell hook wraps `kin` so the control plane
+    /// never runs under the shim, which makes `shim.engaged` false in every
+    /// `kin` process on a correctly installed machine. `unengaged_here_only`
+    /// separates that one probe from the rest, so a surface can tell "this
+    /// binary is deliberately unshimmed" from "the projection is broken", and it
+    /// must say no to the second in every direction.
+    #[test]
+    fn only_the_engagement_probe_may_set_unengaged_here_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let repo = dir.path().join("work/notekeeper");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("a.rs"), b"fn main() {}").unwrap();
+
+        let stripped = ShimPresence {
+            path: home.join(".kin/lib").join(shim_filename()),
+            installed: true,
+            engaged: false,
+        };
+        let served = served_binding(&repo);
+
+        // The machine under the hook: degraded, because THIS process reads raw
+        // disk, and unengaged-only, because nothing else failed.
+        let hooked = probe_live(
+            ProjectionMode::Shim,
+            ProjectionMode::Shim,
+            &repo,
+            &stripped,
+            &served,
+        );
+        assert!(
+            hooked.degraded,
+            "this process is not reading graph truth, and `degraded` must keep saying so: {}",
+            hooked.row()
+        );
+        assert!(
+            hooked.unengaged_here_only,
+            "engagement is the only probe that failed: {:?}",
+            hooked.evidence
+        );
+
+        // An engaged shim has nothing to be unengaged about, either way.
+        let engaged = ShimPresence {
+            engaged: true,
+            ..stripped.clone()
+        };
+        for binding in [served_binding(&repo), ShimBinding::Unbound] {
+            let live = probe_live(
+                ProjectionMode::Shim,
+                ProjectionMode::Shim,
+                &repo,
+                &engaged,
+                &binding,
+            );
+            assert!(
+                !live.unengaged_here_only,
+                "an injected process cannot be uninjected: {}",
+                live.row()
+            );
+        }
+
+        // FIR-2552: a root bound that nothing serves breaks every process the
+        // shim IS injected into, so it is not the unengaged case however
+        // unengaged this one is.
+        let silent = |_: &Path| (Tri::No, "there is no socket there (fixture)".to_string());
+        for binding in [
+            shim_binding_for(Some(&home), None, &repo, silent),
+            shim_binding_for(Some(&repo), None, &repo, silent),
+            ShimBinding::Unbound,
+        ] {
+            let live = probe_live(
+                ProjectionMode::Shim,
+                ProjectionMode::Shim,
+                &repo,
+                &stripped,
+                &binding,
+            );
+            assert!(
+                !live.unengaged_here_only,
+                "a projection that is broken for injected processes is not merely uninjected: {:?}",
+                live.evidence
+            );
+        }
+
+        // A fallback is a real degradation whoever is asking.
+        let fell_back = probe_live(
+            ProjectionMode::Nfs,
+            ProjectionMode::Shim,
+            &repo,
+            &stripped,
+            &served,
+        );
+        assert!(!fell_back.unengaged_here_only, "{}", fell_back.row());
+
+        // And a mount is not injected per process, so it has no such question.
+        let mount = probe_live(
+            ProjectionMode::Nfs,
+            ProjectionMode::Nfs,
+            &repo,
+            &stripped,
+            &served,
+        );
+        assert!(!mount.unengaged_here_only, "{}", mount.row());
     }
 
     /// The three fixtures the doctor row has to tell apart: everything present,
