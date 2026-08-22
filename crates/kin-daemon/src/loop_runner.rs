@@ -2229,7 +2229,10 @@ pub(crate) fn backfill_missing_file_layouts(state: &DaemonState) -> Result<Layou
             continue;
         }
 
-        let body_hash = Hash256::from_bytes(*hash.as_bytes());
+        // `TreeEntry` carries kin-model's hash and the blob store speaks
+        // kin-blobs', so the identity crosses that boundary by bytes, exactly
+        // as the historical rebuild crosses it.
+        let body_hash = kin_blobs::Hash256::from_bytes(*hash.as_bytes());
         let Ok(content) = state.blobs.read(&body_hash) else {
             debug!(
                 file = %file_id,
