@@ -33168,11 +33168,19 @@ mod tests {
             let payload: serde_json::Value =
                 serde_json::from_str(&bounded).expect("a bounded locate response is still JSON");
             let hits = payload["entities"].as_array().expect("hits survive").len();
+            // The value, not the key. A row whose source the budget took
+            // keeps `body` as an explicit null beside a marker naming what
+            // went, so a row that carries nothing still answers `is_some()`.
+            // Counting keys makes every emptied row read as an answer, and the
+            // two arms tie at the hit count no matter what the budget did.
+            let carries = |hit: &serde_json::Value, key: &str| {
+                !matches!(hit.get(key), None | Some(serde_json::Value::Null))
+            };
             let with_source = payload["entities"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .filter(|hit| hit.get("body").is_some() || hit.get("snippet").is_some())
+                .filter(|hit| carries(hit, "body") || carries(hit, "snippet"))
                 .count();
             (raw, bounded.len(), hits, with_source)
         };
