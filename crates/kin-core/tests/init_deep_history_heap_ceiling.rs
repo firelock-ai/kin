@@ -185,6 +185,11 @@ fn proving_deep_history_does_not_cost_another_copy_of_it() {
         peak as f64 / 1024.0 / 1024.0,
         PEAK_HEAP_CEILING / 1024 / 1024
     );
+    // Printed on every run, not only on a breach. A guard that shows its
+    // working only when it fails leaves the number that is about to become a
+    // failure invisible until it is one, and this table is the only view of
+    // what a conversion holds and where.
+    println!("{}", support::phase_attribution_table());
     println!(
         "{PROOF_PHASE} added {} bytes to the peak, ceiling {} MiB",
         proof_growth
