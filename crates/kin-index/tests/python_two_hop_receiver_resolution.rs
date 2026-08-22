@@ -422,8 +422,18 @@ class Auth:
 "#,
         ),
     ];
-    let socket_send = entity_id(&files, "adapters.py", "SocketAdapter.send", EntityKind::Method);
-    let http_send = entity_id(&files, "adapters.py", "HTTPAdapter.send", EntityKind::Method);
+    let socket_send = entity_id(
+        &files,
+        "adapters.py",
+        "SocketAdapter.send",
+        EntityKind::Method,
+    );
+    let http_send = entity_id(
+        &files,
+        "adapters.py",
+        "HTTPAdapter.send",
+        EntityKind::Method,
+    );
     let caller = entity_id(&files, "auth.py", "Auth.handle", EntityKind::Method);
 
     let relations = link_cross_file(&files);

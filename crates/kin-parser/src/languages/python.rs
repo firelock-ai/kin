@@ -242,18 +242,11 @@ impl LanguageAdapter for PythonAdapter {
                 &mut call_audit,
                 &mut value_refs,
             );
-            // Extract imports at top level
+            // Extract imports at module scope, including the guards a
+            // type-only or optional import is written behind.
+            collect_python_module_imports(&child, source, &mut imports);
             match child.kind() {
-                "import_statement" => {
-                    if let Some(import) = extract_py_import(&child, source) {
-                        imports.push(import);
-                    }
-                }
-                "import_from_statement" => {
-                    if let Some(import) = extract_py_from_import(&child, source) {
-                        imports.push(import);
-                    }
-                }
+                "import_statement" | "import_from_statement" => {}
                 "function_definition" | "class_definition" | "decorated_definition" => {}
                 _ => {
                     // Module-scope statements. `HANDLERS = {"ingest": cmd_ingest}`
@@ -1469,6 +1462,48 @@ fn extract_named_callee(
 /// right-hand side, so a name the file never annotates has no entry and its
 /// calls keep the bare-leaf behaviour they had before.
 type PythonReceiverTypes = std::collections::HashMap<String, String>;
+
+/// Collect the imports one module-scope statement carries, descending into the
+/// guards an import is idiomatically written behind.
+///
+/// `if TYPE_CHECKING:` is where PEP 484 puts an import that exists only so
+/// annotations can name a class without a runtime cycle, and requests puts
+/// `from .adapters import HTTPAdapter` exactly there. A flat walk over the
+/// module's own children saw none of them, so the file appeared to import
+/// nothing: [`emit_python_value_references`] binds only what a file defines or
+/// imports, which meant every annotation naming such a class emitted no edge at
+/// all. `try: import fast except ImportError: import slow` is the same shape for
+/// an optional dependency.
+///
+/// A function-local import is deliberately not reached. This walks the module's
+/// own statements, where a binding is visible to every annotation in the file;
+/// an import inside a function body binds only in that scope.
+fn collect_python_module_imports(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    out: &mut Vec<FileImport>,
+) {
+    match node.kind() {
+        "import_statement" => {
+            if let Some(import) = extract_py_import(node, source) {
+                out.push(import);
+            }
+        }
+        "import_from_statement" => {
+            if let Some(import) = extract_py_from_import(node, source) {
+                out.push(import);
+            }
+        }
+        "if_statement" | "elif_clause" | "else_clause" | "try_statement" | "except_clause"
+        | "finally_clause" | "block" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_python_module_imports(&child, source, out);
+            }
+        }
+        _ => {}
+    }
+}
 
 /// `Response.connection` for a call written through `r.connection` where the
 /// scope declares `r: Response`, and `None` for every other receiver.
