@@ -159,15 +159,28 @@ def row_reports_a_refusal(row):
     return row.get("status") == "degraded" and "memory pressure" in detail
 
 
-def report_stays_healthy(report):
-    """Whether the page's own verdict is unchanged by the row.
+# The two statuses `kin doctor` treats as blocking. Mirrored from
+# `blocks_readiness` in crates/kin-cli/src/commands/health.rs, whose third case
+# is `stale` on the one id `semantic_query_readiness` and cannot apply to this
+# row. A row of any other status is advisory and changes no verdict.
+BLOCKING_STATUSES = ("missing", "misconfigured")
 
-    This is the half that could break a release rather than a store. The
-    install proof asserts on `kin doctor`'s aggregate, so a pressure row that
-    flipped a healthy store to unhealthy would fail the gate over a busy
-    machine rather than over a defective install.
+
+def row_blocks_readiness(row):
+    """Whether this row's own status would withhold the page's all-clear.
+
+    This is the half that could break a release rather than a store: the
+    install proof gates on `kin doctor`'s aggregate, so a pressure row that
+    withheld it would fail a release over a busy machine rather than over a
+    defective install.
+
+    Asked of the ROW rather than of the report, because a report is also
+    unhealthy on any machine that has no VFS driver or no configured MCP
+    client, which is most development machines and none of what this suite is
+    about. The report-level property is the A/B below: forcing pressure must
+    not change the verdict at all.
     """
-    return report.get("healthy") is True
+    return bool(row) and row.get("status") in BLOCKING_STATUSES
 
 
 def status_discloses_the_refusal(text):
@@ -181,7 +194,7 @@ def status_discloses_the_refusal(text):
 
 GRADERS = {
     "row_reports_a_refusal": row_reports_a_refusal,
-    "report_stays_healthy": report_stays_healthy,
+    "row_blocks_readiness": row_blocks_readiness,
     "status_discloses_the_refusal": status_discloses_the_refusal,
 }
 
@@ -338,49 +351,69 @@ def check_0(suite):
 
 
 def check_1(suite):
-    """`kin doctor` reports the refusal without failing the page.
+    """`kin doctor` reports the refusal, heals, and changes no verdict.
 
-    Two assertions that pull in opposite directions and both matter. The row
-    has to be there, because a refusal nobody can see is the defect this ticket
-    is about. The page has to stay healthy, because the install proof asserts on
-    that verdict and a busy machine is not a broken install.
+    Three assertions that pull in different directions and all matter. The row
+    has to be there under pressure, because a refusal nobody can see is the
+    defect this ticket is about. It has to go away once the work runs, or a
+    surface reporting last week's refusal reads exactly like one reporting this
+    second's. And forcing pressure must not move the page's verdict, because the
+    install proof gates on that verdict and a busy machine is not a broken
+    install.
+
+    Both arms run against ONE store on ONE machine, so the only difference
+    between the two reports is the pressure. Comparing two stores would fold in
+    every row that describes the host, and on a development machine several of
+    those are unhealthy for reasons this suite is not about.
     """
     result = Result(
         "1", TICKET,
-        "the doctor row reports a refusal, stays quiet without one, and never fails the page",
+        "the doctor row reports a refusal, heals when the work runs, and changes no verdict",
     )
-    for name, pressure, wanted in (("pressured", "critical", True), ("control", None, False)):
-        repo = suite.fixture(name)
+    repo = suite.fixture("pressured")
+    reports = {}
+    for arm, pressure in (("pressured", "critical"), ("healed", None)):
         rc, out = suite.restart_daemon(repo, pressure=pressure)
         if rc != 0:
-            result.unknown("%s: could not start a daemon, exit %d: %s" % (name, rc, tail(out)))
-            continue
+            result.unknown("%s: could not start a daemon, exit %d: %s" % (arm, rc, tail(out)))
+            return result
         rc, out = suite.kin_run(["doctor", "--json"], repo, pressure=pressure)
         try:
-            report = json.loads(out[out.index("{"):out.rindex("}") + 1])
+            reports[arm] = json.loads(out[out.index("{"):out.rindex("}") + 1])
         except (ValueError, json.JSONDecodeError):
             result.unknown("%s: `kin doctor --json` payload was not JSON (rc=%d): %s"
-                           % (name, rc, tail(out)))
-            continue
-        row = doctor_row(report)
-        if row is None:
-            result.unknown("%s: this build's doctor report carries no `%s` row" % (name, ROW_ID))
-            continue
-        reported = row_reports_a_refusal(row)
-        if reported != wanted:
-            result.bad("%s: the row read %s, wanted a refusal=%s. Row: %s"
-                       % (name, row.get("status"), wanted, json.dumps(row)))
-            continue
-        if not report_stays_healthy(report):
-            unhappy = [r.get("id") for r in report.get("checks", [])
-                       if r.get("status") in ("missing", "misconfigured")]
-            result.bad(
-                "%s: the page's verdict is not healthy, so this row would fail the install "
-                "proof over the host rather than the install. Blocking rows: %s"
-                % (name, unhappy)
-            )
-            continue
-        result.ok("%s: row=%s and the page stays healthy" % (name, row.get("status")))
+                           % (arm, rc, tail(out)))
+            return result
+
+    under = doctor_row(reports["pressured"])
+    healed = doctor_row(reports["healed"])
+    if under is None or healed is None:
+        result.unknown("this build's doctor report carries no `%s` row" % ROW_ID)
+        return result
+
+    if not row_reports_a_refusal(under):
+        result.bad("under pressure the row read %s, which reports nothing a reader can act "
+                   "on. Row: %s" % (under.get("status"), json.dumps(under)))
+    else:
+        result.ok("under pressure the row reports the refusal")
+
+    if row_reports_a_refusal(healed):
+        result.bad("the row still reports a refusal after the work ran, so it reports the "
+                   "past rather than the present. Row: %s" % json.dumps(healed))
+    else:
+        result.ok("the row heals to %s once the work runs" % healed.get("status"))
+
+    if row_blocks_readiness(under) or row_blocks_readiness(healed):
+        result.bad("the row's own status withholds the page's all-clear, so it would fail "
+                   "the install proof over a busy machine: %s" % json.dumps(under))
+    elif reports["pressured"].get("healthy") != reports["healed"].get("healthy"):
+        result.bad(
+            "forcing pressure moved the page's verdict from %s to %s, so this row decides a "
+            "gate it must not touch"
+            % (reports["healed"].get("healthy"), reports["pressured"].get("healthy"))
+        )
+    else:
+        result.ok("the verdict is %s either way" % reports["healed"].get("healthy"))
     return result
 
 
@@ -481,18 +514,21 @@ def self_test():
                             % (json.dumps(row), got, want))
 
     healthy_cases = [
-        (True, {"healthy": True}),
-        (False, {"healthy": False}),
-        # A report with no verdict is not a healthy one. Treating a missing key
-        # as healthy is how a gate passes a build whose shape it cannot read.
-        (False, {}),
-        (False, {"healthy": "true"}),
+        # The two statuses that withhold the page's all-clear.
+        (True, {"id": ROW_ID, "status": "missing"}),
+        (True, {"id": ROW_ID, "status": "misconfigured"}),
+        # And the four that do not, which is what this row is allowed to be.
+        (False, {"id": ROW_ID, "status": "degraded"}),
+        (False, {"id": ROW_ID, "status": "healthy"}),
+        (False, {"id": ROW_ID, "status": "unsupported"}),
+        (False, {"id": ROW_ID, "status": "pending"}),
+        (False, None),
     ]
-    for want, report in healthy_cases:
-        got = report_stays_healthy(report)
+    for want, row in healthy_cases:
+        got = row_blocks_readiness(row)
         if got != want:
-            failures.append("report_stays_healthy(%s) = %s, wanted %s"
-                            % (json.dumps(report), got, want))
+            failures.append("row_blocks_readiness(%s) = %s, wanted %s"
+                            % (json.dumps(row), got, want))
 
     status_cases = [
         (True, "Entities: 12  |  Files: 3\n\n⚠ host memory pressure is critical, so the "
