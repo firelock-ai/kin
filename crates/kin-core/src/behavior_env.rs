@@ -46,6 +46,7 @@ pub const BEHAVIOR_ENV_VARS: &[&str] = &[
     "KIN_DAEMON_DISABLE_FILESYSTEM_RECONCILE",
     "KIN_DAEMON_LOCATE_ONLY",
     "KIN_DAEMON_AUTO_EMBED",
+    "KIN_MEMORY_PRESSURE",
     "KIN_COCHANGE_MAX_FAN_OUT",
     "EMBED_MAX_SEQ_LEN",
 ];
@@ -182,6 +183,18 @@ mod tests {
         assert!(
             BEHAVIOR_ENV_VARS.contains(&"KIN_DAEMON_AUTO_EMBED"),
             "daemon health must report the background-embedding opt-out it is running under"
+        );
+    }
+
+    #[test]
+    fn the_memory_pressure_override_is_reported() {
+        // The daemon decides whether to sweep, embed and admit from this
+        // value, and it captures it at process start. An operator who forces a
+        // level on a later command and watches the daemon keep working has no
+        // way to tell a rejected override from an ignored one.
+        assert!(
+            BEHAVIOR_ENV_VARS.contains(&"KIN_MEMORY_PRESSURE"),
+            "daemon health must report the memory-pressure level it is running under"
         );
     }
 

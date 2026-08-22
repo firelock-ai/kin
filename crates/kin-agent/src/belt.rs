@@ -516,6 +516,27 @@ pub fn run_write(repo: &Path, arguments: &Value) -> LocalOutcome {
     }
 }
 
+/// The outcome of a `write_file` whose file repository authority published for us.
+///
+/// The bytes reached the working copy through the commit rather than through this process,
+/// so nothing is written here; the model is told what landed and where.
+pub fn published_create(arguments: &Value) -> LocalOutcome {
+    let raw_path = arguments.get("path").and_then(Value::as_str).unwrap_or("");
+    let content = arguments
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    LocalOutcome {
+        text: format!(
+            "Created `{raw_path}` ({} bytes) and published it through repository authority, \
+             which wrote the file.",
+            content.len()
+        ),
+        is_error: false,
+        changed: Some(raw_path.to_string()),
+    }
+}
+
 impl LocalOutcome {
     /// A refusal the model is handed instead of a run, in the shape a run would have
     /// produced, so a routing failure reads to the caller exactly like a tool failure.

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.50] - 2026-08-22
+
+### Changed
+
+- Measure host memory pressure, back off before the machine does, and say so (#1074)
+- Put kin on PATH for a bash login shell, not just an interactive one (#1073)
+
+
 ## [0.5.49] - 2026-08-22
 
 ### Changed

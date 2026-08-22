@@ -4376,6 +4376,53 @@ pub enum GraphStatusSampling {
     /// counter, then revalidated the selected graph's mutation epoch and scope
     /// authority before publishing the report.
     PointInTimeSelectedGraph,
+    /// The live sample could not be taken inside its bounded attempts, so every
+    /// counter below replays the last settled observation of this same selected
+    /// graph. `stale` says when that instant was and what blocked the live one.
+    ///
+    /// This exists because a status surface that answers only on a quiet system
+    /// answers exactly when nobody needs it (FIR-2135). A reading labelled as of
+    /// an earlier instant is an answer a caller can act on; a bare instruction
+    /// to retry is not.
+    LastSettledSelectedGraph,
+}
+
+/// What stopped the live sample, stated as the state that blocked it rather
+/// than as advice the caller has no way to act on.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphStatusStaleReason {
+    /// Embedding-work serialization stayed held across every attempt, which is
+    /// what a store mid-embed looks like from the status path.
+    EmbeddingCoverageChanging,
+    /// The selected graph's authority epoch moved during every attempt, which is
+    /// what a store under continuous reconcile churn looks like.
+    SelectedGraphChanging,
+}
+
+/// The disclosure that makes a replayed reading honest.
+///
+/// Present exactly when `sampling` is [`GraphStatusSampling::LastSettledSelectedGraph`],
+/// which [`GraphStatusReport::validate`] enforces in both directions: a stale
+/// report that forgot its disclosure and a fresh report that carries one are
+/// both rejected, so neither can ship as a silent relabelling of the other.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GraphStatusStaleness {
+    /// The state that blocked the live sample.
+    pub reason: GraphStatusStaleReason,
+    /// How long before this response the replayed observation was taken.
+    pub settled_age_ms: u64,
+    /// The graph-authority epoch current when the live sample was abandoned,
+    /// when one could be read at all. `authority_epoch` above is the replayed
+    /// reading's own epoch, so a difference between the two is the change this
+    /// report is disclosing rather than hiding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_authority_epoch: Option<u64>,
+    /// How many bounded live attempts were spent before the replay.
+    pub live_attempts: u32,
+    /// One sentence naming what was tried, what blocked it, and what would
+    /// change the outcome.
+    pub note: String,
 }
 
 /// Readiness observations for the one daemon query graph selected for an MCP
@@ -4430,6 +4477,11 @@ pub struct GraphStatusReport {
     pub embedding_keys_not_in_graph: Option<usize>,
     /// Observed counts do not attest that every eligible source was enriched.
     pub completion_attested: bool,
+    /// Why every counter above is an earlier instant's, when it is (FIR-2135).
+    /// Absent on a live point-in-time sample, which is the only shape where its
+    /// absence is honest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale: Option<GraphStatusStaleness>,
     /// The stdio server's standard response envelope. Direct daemon calls omit
     /// it; stdio adds a report-derived envelope that is validated against these
     /// same selected-graph observations. No unscoped `/health` graph metadata
@@ -4462,6 +4514,8 @@ struct GraphStatusReportWire {
     embedding_keys_not_in_graph: Option<usize>,
     #[serde(deserialize_with = "deserialize_graph_status_unattested")]
     completion_attested: bool,
+    #[serde(default)]
+    stale: Option<GraphStatusStaleness>,
     #[serde(default, rename = "_kin")]
     response_envelope: Option<crate::envelope::Envelope>,
 }
@@ -4489,6 +4543,7 @@ impl<'de> Deserialize<'de> for GraphStatusReport {
             embedding_index_keys: wire.embedding_index_keys,
             embedding_keys_not_in_graph: wire.embedding_keys_not_in_graph,
             completion_attested: wire.completion_attested,
+            stale: wire.stale,
             response_envelope: wire.response_envelope,
         };
         report.validate().map_err(serde::de::Error::custom)?;
@@ -4539,6 +4594,30 @@ impl GraphStatusReport {
                  derived from"
                     .to_string(),
             );
+        }
+        // Both directions, because either one alone lets a relabelling ship
+        // silently: a replayed reading that forgot to disclose itself reads as a
+        // live sample, and a live sample carrying a disclosure reads as stale
+        // when it is not.
+        match (&self.sampling, &self.stale) {
+            (GraphStatusSampling::LastSettledSelectedGraph, None) => {
+                return Err(
+                    "sampling is last_settled_selected_graph with no stale disclosure beside it"
+                        .to_string(),
+                );
+            }
+            (GraphStatusSampling::PointInTimeSelectedGraph, Some(_)) => {
+                return Err(
+                    "a point_in_time_selected_graph sample cannot carry a stale disclosure"
+                        .to_string(),
+                );
+            }
+            _ => {}
+        }
+        if let Some(stale) = &self.stale {
+            if stale.note.trim().is_empty() {
+                return Err("stale.note is empty, so the disclosure says nothing".to_string());
+            }
         }
         if let Some(envelope) = &self.response_envelope {
             self.validate_response_envelope(envelope)?;
@@ -4635,6 +4714,12 @@ fallback coverage is reported by semantic_locate itself. sampling=point_in_time_
 means the daemon held its normal embedding-work fence while reading internally synchronized \
 coverage counters, then revalidated authority_epoch after capturing every counter; \
 authority_epoch is process-local, not a durable repository generation. \
+On a store mid-embed or under continuous reconcile the live sample can lose every bounded \
+attempt, and rather than refuse, this tool then answers sampling=last_settled_selected_graph: \
+the same counters as of the last settled reading of this same selected graph, with a `stale` \
+block giving that reading's age in milliseconds, which state blocked the live sample, and the \
+authority_epoch that was current when it was abandoned. Read those counters as of that \
+earlier instant, not as of now. \
 Enrichment completeness is not attested \
 (completion_attested=false), so a populated graph is not by itself a complete one. This \
 tool requires the Kin daemon; it does not invent an offline approximation.";
@@ -4679,6 +4764,46 @@ pub fn handle_daemon_graph_status_observation(
             .embedding_index_keys
             .map(|keys| keys.saturating_sub(observation.embeddings_indexed)),
         completion_attested: false,
+        stale: None,
+        response_envelope: None,
+    };
+    report.validate().map_err(crate::McpError::Other)?;
+    Ok(ToolCallResult::text(serde_json::to_string_pretty(&report)?))
+}
+
+/// Publish the last settled observation of this selected graph, labelled as of
+/// the instant it was taken (FIR-2135).
+///
+/// Same counters, same validation, same schema as the live path; the one
+/// difference is that `sampling` says the reading is replayed and `stale`
+/// carries the age, the blocking state, and the epoch that was current when the
+/// live sample was abandoned. The caller decides whether a reading that old is
+/// usable, which is a decision a bare retry instruction takes away from it.
+pub fn handle_daemon_graph_status_stale_observation(
+    scope: GraphStatusScope,
+    observation: GraphStatusObservation,
+    staleness: GraphStatusStaleness,
+) -> Result<ToolCallResult> {
+    let report = GraphStatusReport {
+        schema: GRAPH_STATUS_SCHEMA.to_string(),
+        view: GraphStatusView::DaemonSelectedGraph,
+        scope,
+        authority: GraphStatusAuthority::RepoDaemon,
+        sampling: GraphStatusSampling::LastSettledSelectedGraph,
+        authority_epoch: observation.authority_epoch,
+        entity_count: observation.entity_count,
+        durable_entity_count: observation.durable_entity_count,
+        relation_count: observation.relation_count,
+        embedding_source: GraphStatusEmbeddingSource::SelectedGraph,
+        embeddings_indexed: observation.embeddings_indexed,
+        embeddings_pending: observation.embeddings_pending,
+        embeddings_total: observation.embeddings_total,
+        embedding_index_keys: observation.embedding_index_keys,
+        embedding_keys_not_in_graph: observation
+            .embedding_index_keys
+            .map(|keys| keys.saturating_sub(observation.embeddings_indexed)),
+        completion_attested: false,
+        stale: Some(staleness),
         response_envelope: None,
     };
     report.validate().map_err(crate::McpError::Other)?;

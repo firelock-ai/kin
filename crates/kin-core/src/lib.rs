@@ -31,6 +31,7 @@ mod init_staging;
 pub mod last_admission;
 pub mod layout;
 pub mod manifest;
+pub mod memory_pressure;
 pub mod ranking;
 pub mod ref_view;
 pub mod reference_coverage;
@@ -63,7 +64,8 @@ pub use assistant_sync::{
 pub use config::{
     ExecutionPolicyConfig, ExternalToolExecutionPolicy, GitBranchTrackingConfig,
     GitCoexistenceConfig, GitPushDefault, GitRemoteTransportConfig, KinConfig, RemoteConfig,
-    RemoteHostKind, RemoteRefConfig, RemoteTransportKind, WorldConfig, WorldPreset,
+    RemoteHostKind, RemoteRefConfig, RemoteTransportKind, ResourcesConfig, WorldConfig,
+    WorldPreset, RESOURCE_PROFILE_NAMES,
 };
 pub use error::{KinError, Result};
 pub use exact_tree::{

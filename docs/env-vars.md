@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (488 total, 338 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (493 total, 338 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -58,6 +58,10 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_BUILD_GRAPH_TIMEOUT_SECS` | seconds>=0 | 60 | operational | timeout for building a historical ref-view graph |
 | `KIN_BYPASS_EMBEDDING_COVERAGE_CHECK` | bool | false | correctness | bypass the embedding-coverage correctness gate |
 | `KIN_DISABLE_SPINE` | bool | false | correctness | disable the spine federation layer, narrowing retrieval scope |
+| `KIN_MEMORY_PRESSURE` | enum | *(unset)* | operational | force the memory-pressure level heavy work is judged against, in place of measuring the machine: 'critical' refuses the enrichment sweep, the embedding batch and ambient admission with a named reason, 'elevated' shrinks the embedding batch, 'unknown' proceeds exactly as an unreadable host does, and unset measures the cgroup or the host. Read by the daemon at process start, so it takes effect on the command that starts one |
+| `KIN_MEMORY_PRESSURE_CRITICAL_FRACTION` | float>=0 | 0.90 | operational | fraction of the memory ceiling at or above which heavy work refuses to start; must be within 0..=1, anything else keeps 0.90, and a value below the elevated fraction is raised to it |
+| `KIN_MEMORY_PRESSURE_ELEVATED_FRACTION` | float>=0 | 0.75 | operational | fraction of the memory ceiling at or above which heavy work shrinks; must be within 0..=1, and anything else keeps 0.75 |
+| `KIN_MEMORY_PRESSURE_SWAP_FRACTION` | float>=0 | 0.50 | operational | fraction of configured swap in use at or above which an already-elevated host is treated as critical; must be within 0..=1, and anything else keeps 0.50. Swap standing never raises a host that has room |
 | `KIN_NO_DAEMON` | bool | false | operational | never start or revive a daemon; bind only an already-running one (the probe contract behind `kin mcp start --no-spawn`) |
 | `KIN_NO_KEYRING` | bool | false | operational | skip the OS keyring for credential storage |
 | `KIN_NO_VFS` | bool | false | operational | kin-vfs shim projection bypass: set to 1 to skip VFS initialization and exec the real binary directly (only the literal '1' bypasses), default off |
@@ -75,6 +79,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_REQUIRE_COMPLETE_EMBEDDINGS` | bool | false | correctness | require full embedding coverage before answering locate/search |
 | `KIN_RESOURCE_PROFILE` | enum | interactive | correctness | runtime resource profile (kin-cli/kin-daemon/kin-infer/kin-db): proof/interactive/throughput/ci; unset, the kin binaries select interactive at startup (value-preserving Metal kernels, proof's embedding budgets), while a library caller that never selects still resolves to proof; throughput additionally scales the batch budgets, may engage CPU/GPU hybrid embedding and overlaps persist with compute, and is non-citable |
 | `KIN_RESOURCE_PROFILE_PRODUCT_DEFAULT` | string | *(unset)* | operational | provenance marker written beside KIN_RESOURCE_PROFILE by whichever kin binary selected the default; never set by an operator. A binary that selects the ship default writes it into its own environment, and every process it spawns inherits a set variable indistinguishable from an operator's export, which is how a daemon reported the ship default as an operator override. This carries the VALUE the default was written for, so a child trusts it only when it names the profile actually in effect and an overridden profile is not mistaken for kin's own choice |
+| `KIN_RESOURCE_PROFILE_REPOSITORY_CONFIG` | string | *(unset)* | operational | provenance marker written beside KIN_RESOURCE_PROFILE when the profile came from this repository's [resources] config rather than from the operator's shell; never set by an operator. Carries the VALUE it was written for, on the same rule as the product-default marker, so a spawned child reports a repository choice as a repository choice instead of as an operator override |
 | `KIN_ROPE_PERELEM` | string | *(unset)* | correctness | kin-infer forces the per-input RoPE path (one submission per input) instead of the single whole-batch dispatch; any present value including '0' forces it, and the two strategies are held to a cosine and max-absolute-error parity bar rather than being bit-identical |
 | `KIN_SCOPE_TIMING` | bool | false | diagnostic | print scope graph build timing to stderr |
 | `KIN_SEARCH_INCREMENTAL_PERSIST` | bool | true | operational | kin-search segmented/incremental persistence, on by default; only 0/false/no/off keep the monolithic full-rewrite path, and because load auto-detects the on-disk format the flag governs write strategy and dirty-tracking only, so toggling it is safe in both directions |

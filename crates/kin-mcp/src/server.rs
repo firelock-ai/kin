@@ -1270,6 +1270,11 @@ async fn handle_tools_call_daemon(
     // nothing: an agent certifying that absence needs to know the producer that
     // would have filled it is switched off.
     base_env = base_env.with_suspended_sweep(daemon_delegate::suspended_sweep().as_ref());
+    // Stamped for the same reason and on the same calls. Work Kin declined
+    // because the machine had no room is work no producer is doing, and the
+    // answer it changes the reading of is the one that succeeds and returns
+    // nothing.
+    base_env = base_env.with_memory_pressure(daemon_delegate::memory_pressure_refusal().as_ref());
 
     // `kin_graph_status` already reports the exact graph view selected by the
     // daemon, including temporal-session scope. Generic `/health` is HEAD-only:

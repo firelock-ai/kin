@@ -392,17 +392,77 @@ add_to_path() (
     ok "Added $KIN_BIN to PATH in $rc_file"
 )
 
+# The file a bash login shell will actually read in this home.
+#
+# bash runs the FIRST of .bash_profile, .bash_login and .profile that it can
+# read and none of the rest, and .bashrc is not among them: a login bash reads
+# .bashrc only when one of these sources it. When a home has none of the three
+# there is nothing to append to, and .bash_profile is the file to create,
+# because it is the one bash looks at first and the one that belongs to bash
+# alone. .profile is shared with sh and every other POSIX shell, so the
+# installer never conjures that one.
+bash_login_rc() (
+    for candidate in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
+        if [ -f "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    printf '%s\n' "$HOME/.bash_profile"
+)
+
+# bash's PATH line needs two homes. .bashrc serves an interactive non-login
+# shell and nothing else, so a line written only there is invisible to
+# `bash -lc`, to an ssh login and to a macOS Terminal tab, which opens a login
+# shell by default. `kin setup` resolves the same three names in the same order
+# and writes the same two files; the two must agree or one writes where the
+# other never reads.
+add_bash_to_path() (
+    add_to_path "$HOME/.bashrc"
+    login_rc="$(bash_login_rc)"
+    if [ ! -f "$login_rc" ]; then
+        # Kin is bringing this file into existence, so it owes the user the
+        # pairing a bash home normally has. The interactivity guard is
+        # deliberate: ~/.bashrc carries the projection hook, which activates the
+        # VFS overlay on entry, and `bash -lc` is a login shell that is not
+        # interactive.
+        cat > "$login_rc" <<'KIN_BASH_PROFILE_EOF'
+# Created by the Kin installer.
+#
+# A login bash reads .bash_profile, .bash_login or .profile, the first one only,
+# and never .bashrc, so Kin's PATH line below has to live here. Sourcing
+# ~/.bashrc keeps an interactive login shell equivalent to an interactive
+# non-login one; the guard keeps it out of `bash -lc`, which is not interactive.
+case $- in
+    *i*) [ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc" ;;
+esac
+KIN_BASH_PROFILE_EOF
+        ok "Created $login_rc, which is the file a bash login shell reads"
+    fi
+    add_to_path "$login_rc"
+)
+
+# Whether this home belongs to a bash user at all. An existing bash startup
+# file or a bash $SHELL says yes; .profile alone does not, because nearly every
+# Linux home has one whatever shell it runs.
+uses_bash() {
+    [ -f "$HOME/.bashrc" ] ||
+        [ -f "$HOME/.bash_profile" ] ||
+        [ -f "$HOME/.bash_login" ] ||
+        [ "$(basename "${SHELL:-}")" = "bash" ]
+}
+
 # zsh reads .zshenv on every launch and .zshrc only when interactive, so the
 # PATH line goes in .zshenv: a script, a Makefile, a launchd job or an agent
 # shelling out through a non-interactive zsh could not find kin at all when it
 # went in .zshrc, and .zshenv covers the interactive case as well.
 case "$OS" in
     macos)
-        if [ -f "$HOME/.zshrc" ] || [ -f "$HOME/.zshenv" ] || [ "$(basename "$SHELL")" = "zsh" ]; then
+        if [ -f "$HOME/.zshrc" ] || [ -f "$HOME/.zshenv" ] || [ "$(basename "${SHELL:-}")" = "zsh" ]; then
             add_to_path "$HOME/.zshenv"
         fi
-        if [ -f "$HOME/.bashrc" ]; then
-            add_to_path "$HOME/.bashrc"
+        if uses_bash; then
+            add_bash_to_path
         fi
         ;;
     linux|windows)
@@ -411,8 +471,8 @@ case "$OS" in
         # all until the post-extract path above stopped aborting on those hosts,
         # so a Windows install that got this far previously left the CLI off
         # PATH with nothing said about it.
-        if [ -f "$HOME/.bashrc" ]; then
-            add_to_path "$HOME/.bashrc"
+        if uses_bash; then
+            add_bash_to_path
         fi
         if [ -f "$HOME/.zshrc" ] || [ -f "$HOME/.zshenv" ]; then
             add_to_path "$HOME/.zshenv"

@@ -104,6 +104,9 @@ struct Counters {
     kin_calls: u32,
     local_calls: u32,
     refused_calls: u32,
+    /// Local edits whose transaction the daemon refused to publish. A run holding one of
+    /// these wrote files and landed nothing, which must not read as a success.
+    unpublished_changes: u32,
     repairs: u32,
     unsafe_absence_events: u32,
     unreadable_results: u32,
@@ -122,6 +125,7 @@ impl Counters {
             kin_calls: 0,
             local_calls: 0,
             refused_calls: 0,
+            unpublished_changes: 0,
             repairs: 0,
             unsafe_absence_events: 0,
             unreadable_results: 0,
@@ -163,6 +167,7 @@ impl Counters {
             "kin_calls": self.kin_calls,
             "local_calls": self.local_calls,
             "refused_calls": self.refused_calls,
+            "unpublished_changes": self.unpublished_changes,
             "repairs": self.repairs,
             "unsafe_absence_events": self.unsafe_absence_events,
             "unreadable_results": self.unreadable_results,
@@ -653,35 +658,95 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                                                 &plan,
                                                 &mut writer,
                                             )?;
-                                            let outcome = match tool {
-                                                LocalTool::Edit => {
-                                                    belt::run_edit(&repo, &call.arguments)
-                                                }
-                                                LocalTool::Write => {
-                                                    belt::run_write(&repo, &call.arguments)
-                                                }
-                                            };
-                                            // Stage what the harness just did, inside the
-                                            // open bracket, so the commit below has
-                                            // something to publish. An empty transaction
-                                            // is refused by design.
-                                            let staged = if outcome.is_error {
-                                                false
-                                            } else {
-                                                stage_planned_operation(
+                                            // Repository authority writes a created file
+                                            // itself as part of publishing the change. So
+                                            // a create is published FIRST and the local
+                                            // write is the fallback: writing it here
+                                            // first leaves an untracked path sitting on
+                                            // the exact workspace target, which
+                                            // `validate_reconciliation_targets` refuses,
+                                            // and every commit fails on the harness's own
+                                            // file.
+                                            let publish_first = bracket.transaction_id.is_some()
+                                                && matches!(plan, StagePlan::Create { .. });
+                                            let (outcome, provenance) = if publish_first {
+                                                let staged = stage_planned_operation(
                                                     &mut servers[index],
                                                     &mut bracket,
                                                     session.as_deref(),
                                                     &plan,
                                                     &mut writer,
-                                                )?
+                                                )?;
+                                                let provenance = close_transaction(
+                                                    &mut servers[index],
+                                                    bracket,
+                                                    staged,
+                                                    &mut writer,
+                                                )?;
+                                                if published_by_authority(&provenance) {
+                                                    (
+                                                        belt::published_create(&call.arguments),
+                                                        provenance,
+                                                    )
+                                                } else {
+                                                    // Nothing was published, so the file
+                                                    // does not exist yet. Write it, so the
+                                                    // model keeps its work, and tell the
+                                                    // model the change did not land rather
+                                                    // than reporting a bare success.
+                                                    counters.unpublished_changes += 1;
+                                                    let mut outcome =
+                                                        belt::run_write(&repo, &call.arguments);
+                                                    if !outcome.is_error {
+                                                        outcome.text = format!(
+                                                            "{} Repository authority did \
+                                                             not publish it: {}. The file \
+                                                             is on disk and uncommitted.",
+                                                            outcome.text,
+                                                            unpublished_reason(&provenance),
+                                                        );
+                                                    }
+                                                    (outcome, provenance)
+                                                }
+                                            } else {
+                                                let outcome = match tool {
+                                                    LocalTool::Edit => {
+                                                        belt::run_edit(&repo, &call.arguments)
+                                                    }
+                                                    LocalTool::Write => {
+                                                        belt::run_write(&repo, &call.arguments)
+                                                    }
+                                                };
+                                                // Stage what the harness just did, inside
+                                                // the open bracket, so the commit below
+                                                // has something to publish. An empty
+                                                // transaction is refused by design.
+                                                let staged = if outcome.is_error {
+                                                    false
+                                                } else {
+                                                    stage_planned_operation(
+                                                        &mut servers[index],
+                                                        &mut bracket,
+                                                        session.as_deref(),
+                                                        &plan,
+                                                        &mut writer,
+                                                    )?
+                                                };
+                                                let wanted_publication =
+                                                    !outcome.is_error && staged;
+                                                let provenance = close_transaction(
+                                                    &mut servers[index],
+                                                    bracket,
+                                                    wanted_publication,
+                                                    &mut writer,
+                                                )?;
+                                                if wanted_publication
+                                                    && !published_by_authority(&provenance)
+                                                {
+                                                    counters.unpublished_changes += 1;
+                                                }
+                                                (outcome, provenance)
                                             };
-                                            let provenance = close_transaction(
-                                                &mut servers[index],
-                                                bracket,
-                                                !outcome.is_error && staged,
-                                                &mut writer,
-                                            )?;
                                             if let Some(path) = outcome.changed.clone() {
                                                 // With several repositories attached the
                                                 // same relative path exists in more than
@@ -1139,7 +1204,7 @@ fn stage_planned_operation(
     }
     let outcome = server.client.call_tool("kin_transaction_stage", &arguments);
     let (is_error, detail) = match &outcome {
-        Ok(outcome) => (outcome.is_error, truncate(&outcome.text, 300)),
+        Ok(outcome) => (outcome.is_error, close_detail(&outcome.text)),
         Err(err) => (true, err.to_string()),
     };
     writer.trace(json!({
@@ -1190,7 +1255,7 @@ fn close_transaction(
         .client
         .call_tool(tool, &json!({ "transaction_id": transaction_id }));
     let (is_error, detail) = match &outcome {
-        Ok(outcome) => (outcome.is_error, truncate(&outcome.text, 300)),
+        Ok(outcome) => (outcome.is_error, close_detail(&outcome.text)),
         Err(err) => (true, err.to_string()),
     };
     writer.trace(json!({
@@ -1214,6 +1279,43 @@ fn close_transaction(
         "response": detail.clone(),
         "detail": if is_error { Value::String(detail) } else { Value::Null },
     }))
+}
+
+/// Whether repository authority actually published this bracket.
+///
+/// A clean close is not enough on its own: an abort closes cleanly too, and a run that
+/// read `closed_cleanly` alone would score an aborted transaction as a landed change.
+fn published_by_authority(provenance: &Value) -> bool {
+    provenance["closed_with"] == json!("kin_transaction_commit")
+        && provenance["closed_cleanly"] == json!(true)
+}
+
+/// What the server said when it declined to publish, in one line fit for the model.
+fn unpublished_reason(provenance: &Value) -> String {
+    for key in ["detail", "response", "reason"] {
+        if let Some(text) = provenance.get(key).and_then(Value::as_str) {
+            if !text.trim().is_empty() {
+                return text.to_string();
+            }
+        }
+    }
+    "the server gave no reason".to_string()
+}
+
+/// Truncate a server answer for the trace, keeping the part that says what happened.
+///
+/// Every Kin answer carries a `_kin` envelope longer than the old 300-character budget, so
+/// truncating the raw text spent the whole budget on the envelope and dropped the `message`
+/// key entirely. The envelope is graph freshness, which the trace records elsewhere; the
+/// failure reason is the thing a reader cannot reconstruct.
+fn close_detail(text: &str) -> String {
+    match serde_json::from_str::<Value>(text.trim()) {
+        Ok(Value::Object(mut payload)) => {
+            payload.remove("_kin");
+            truncate(&Value::Object(payload).to_string(), 300)
+        }
+        _ => truncate(text, 300),
+    }
 }
 
 fn extract_id(outcome: &ToolOutcome, keys: &[&str]) -> Option<String> {
@@ -1255,6 +1357,15 @@ fn finish(
     started: Instant,
     _reserved: Option<()>,
 ) -> anyhow::Result<RunOutcome> {
+    // A run that wrote files repository authority never published landed nothing, whatever
+    // the model's closing paragraph says. Downgrading here rather than at each exit path
+    // means no future exit can forget it. A run that stopped for its own reason keeps that
+    // reason, which is more specific than this one.
+    let status = if status == ExitStatus::Success && counters.unpublished_changes > 0 {
+        ExitStatus::ChangesUnpublished
+    } else {
+        status
+    };
     let record = writer.result(
         status.subtype(),
         status != ExitStatus::Success,

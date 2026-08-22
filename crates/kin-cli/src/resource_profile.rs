@@ -70,8 +70,22 @@ pub const RESOURCE_PROFILE_PRODUCT_DEFAULT_ENV: &str = "KIN_RESOURCE_PROFILE_PRO
 /// which changes the order vectors are written in.
 pub const PRODUCT_DEFAULT_PROFILE: &str = "interactive";
 
+/// Records that the value in effect came from this repository's
+/// `.kin/config.toml` rather than from the operator's shell or from kin's own
+/// ship default (FIR-2504).
+///
+/// It carries the value for the same reason the product-default marker does: a
+/// marker naming a different value is a stale inheritance from a parent whose
+/// profile was overridden on the way down, and is not evidence about this
+/// process. Without this, a config-selected profile would be reported as
+/// `(set by operator)`, which is the exact confusion FIR-2434 was filed for.
+pub const RESOURCE_PROFILE_REPOSITORY_CONFIG_ENV: &str = "KIN_RESOURCE_PROFILE_REPOSITORY_CONFIG";
+
 /// Set by [`apply_product_default`] when it actually wrote the default.
 static PRODUCT_SELECTED: AtomicBool = AtomicBool::new(false);
+
+/// Set by [`apply_repository_profile`] when it actually adopted one.
+static REPOSITORY_CONFIG_SELECTED: AtomicBool = AtomicBool::new(false);
 
 /// The profile to write given the current raw value of the selector, or `None`
 /// to leave the environment exactly as it is.
@@ -133,6 +147,84 @@ pub fn product_selected() -> bool {
     PRODUCT_SELECTED.load(Ordering::Relaxed)
 }
 
+/// The repository-configured profile to write given what is currently in
+/// effect, or `None` to leave the environment exactly as it is.
+///
+/// Pure, so the precedence rule is testable without touching the process
+/// environment. A repository config outranks kin's ship default and never
+/// outranks an operator: a profile someone exported into this shell is a
+/// statement about this host and this run, and a file in the repo cannot know
+/// better than that.
+pub fn repository_profile_for<'a>(
+    configured: Option<&'a str>,
+    current: Option<&str>,
+    current_is_product_default: bool,
+) -> Option<&'a str> {
+    let configured = configured
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    match current {
+        // Nothing in effect at all: the config is the only opinion there is.
+        None => Some(configured),
+        // Kin's own default is in effect, so nobody has chosen anything and the
+        // repository's recorded choice takes over.
+        Some(_) if current_is_product_default => Some(configured),
+        // An operator's export is in effect. Leave it alone.
+        Some(_) => None,
+    }
+}
+
+/// Adopt this repository's recorded resource profile when the operator has not
+/// chosen one (FIR-2504).
+///
+/// Call immediately after [`apply_product_default`] and under the same ordering
+/// requirement: the environment must be mutated while the process is still
+/// single-threaded and before the first reader caches its answer. Returns the
+/// value it adopted, or `None` when it left the environment alone.
+pub fn apply_repository_profile(configured: Option<&str>) -> Option<String> {
+    let current = std::env::var(RESOURCE_PROFILE_ENV).ok();
+    let current_is_product_default =
+        inherited_product_default(current.as_deref(), |key| std::env::var(key).ok());
+    let adopt = repository_profile_for(configured, current.as_deref(), current_is_product_default)?
+        .to_string();
+    std::env::set_var(RESOURCE_PROFILE_ENV, &adopt);
+    std::env::set_var(RESOURCE_PROFILE_REPOSITORY_CONFIG_ENV, &adopt);
+    // The value is no longer kin's ship default, so neither marker may keep
+    // claiming it is. Leaving the old marker set is what would make the next
+    // reader report a repository choice as an unasked-for default.
+    std::env::remove_var(RESOURCE_PROFILE_PRODUCT_DEFAULT_ENV);
+    PRODUCT_SELECTED.store(false, Ordering::Relaxed);
+    REPOSITORY_CONFIG_SELECTED.store(true, Ordering::Relaxed);
+    Some(adopt)
+}
+
+/// Whether a value already in effect is one this repository's config selected,
+/// including across a spawn. Same marker-names-the-value rule as
+/// [`inherited_product_default`].
+pub fn inherited_repository_profile<F>(current: Option<&str>, lookup: F) -> bool
+where
+    F: Fn(&str) -> Option<String>,
+{
+    match current {
+        None => false,
+        Some(current) => {
+            lookup(RESOURCE_PROFILE_REPOSITORY_CONFIG_ENV).is_some_and(|marked| marked == current)
+        }
+    }
+}
+
+/// Whether the active profile came from this repository's config.
+pub fn repository_config_selected() -> bool {
+    REPOSITORY_CONFIG_SELECTED.load(Ordering::Relaxed)
+}
+
+/// Reset the repository-config mark. Test-only, for the same process-global
+/// reason as [`reset_product_selected_for_tests`].
+#[doc(hidden)]
+pub fn reset_repository_config_selected_for_tests() {
+    REPOSITORY_CONFIG_SELECTED.store(false, Ordering::Relaxed);
+}
+
 /// Reset the product-selected mark. Test-only: the flag is process-global and
 /// tests covering both sides of the distinction share one process.
 #[doc(hidden)]
@@ -143,6 +235,56 @@ pub fn reset_product_selected_for_tests() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FIR-2504 precedence, exercised as a pure function so no process
+    /// environment is touched: the repository config fills in for kin's own ship
+    /// default and never for an operator's export.
+    #[test]
+    fn a_repository_profile_replaces_the_ship_default_and_never_an_operator() {
+        // Nothing in effect: the config is the only opinion there is.
+        assert_eq!(repository_profile_for(Some("ci"), None, false), Some("ci"));
+        // Kin's default is in effect, so nobody has chosen anything.
+        assert_eq!(
+            repository_profile_for(Some("ci"), Some(PRODUCT_DEFAULT_PROFILE), true),
+            Some("ci")
+        );
+        // An operator exported something. The file does not get to overrule a
+        // statement about this host, even when the file agrees.
+        assert_eq!(
+            repository_profile_for(Some("ci"), Some("proof"), false),
+            None
+        );
+        assert_eq!(repository_profile_for(Some("ci"), Some("ci"), false), None);
+        // Nothing recorded is not a choice.
+        assert_eq!(repository_profile_for(None, Some("proof"), false), None);
+        assert_eq!(repository_profile_for(Some("  "), None, false), None);
+        assert_eq!(repository_profile_for(Some(""), None, false), None);
+    }
+
+    /// The marker has to name the value in effect, or an inherited marker from a
+    /// parent whose profile was overridden on the way down would report this
+    /// process's profile as a repository choice it never made.
+    #[test]
+    fn a_repository_marker_is_trusted_only_when_it_names_the_live_value() {
+        let marked = |value: &str| {
+            let value = value.to_string();
+            move |key: &str| (key == RESOURCE_PROFILE_REPOSITORY_CONFIG_ENV).then(|| value.clone())
+        };
+        assert!(inherited_repository_profile(Some("ci"), marked("ci")));
+        assert!(!inherited_repository_profile(Some("proof"), marked("ci")));
+        assert!(!inherited_repository_profile(None, marked("ci")));
+        assert!(!inherited_repository_profile(Some("ci"), |_| None));
+    }
+
+    /// The provenance marker is a KIN_* name, so it has to be in the registry or
+    /// the startup audit reports it as an unknown variable in every kin process.
+    #[test]
+    fn the_repository_provenance_marker_is_a_registered_environment_variable() {
+        assert!(
+            kin_core::env_registry::spec(RESOURCE_PROFILE_REPOSITORY_CONFIG_ENV).is_some(),
+            "{RESOURCE_PROFILE_REPOSITORY_CONFIG_ENV} is not registered"
+        );
+    }
 
     /// A `KIN_*` name this code sets must be in the central registry, or every
     /// kin invocation warns that it is probably a typo.

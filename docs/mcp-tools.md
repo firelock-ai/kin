@@ -29,10 +29,15 @@ The envelope's fields:
 - `semantic_coverage`: `indexed`, `total`, `pending`, and `complete` for the embedding
   signal, carried only when the daemon computed it and never fabricated here.
 - `degraded`: honest flags (`daemon_unreachable`, `embed_worker_failed`,
-  `mass_deletion_blocked`, `offline_fallback`, `workspace_mismatch`), each present only
+  `mass_deletion_blocked`, `offline_fallback`, `workspace_mismatch`,
+  `daemon_killed_by_memory`, `sweep_suspended`, `memory_pressure`), each present only
   when observed. `workspace_mismatch` is a refusal about which repository an answer would
   be about, not a transport failure: the daemon is reachable and the server declined to
-  answer from a repository the client is not looking at.
+  answer from a repository the client is not looking at. The last three are standing
+  facts about the store rather than about the call: a daemon this store has lost to the
+  memory limit, enrichment the sweep circuit has switched off, and heavy work the daemon
+  declined because the machine had no room for it. Each changes what an absence means,
+  because the producer that would have filled it is not running.
 
 Empty results carry a named trust verdict, so an agent can tell "not present" apart from
 "not indexed yet". Semantic tools (`semantic_locate`, `semantic_search`) report
