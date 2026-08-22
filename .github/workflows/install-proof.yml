@@ -914,17 +914,19 @@ jobs:
           fs.writeFileSync(process.env.ANTIGRAVITY_LEGACY, `${JSON.stringify(config, null, 2)}\n`);
           NODE
 
-          # Never pipe a command that can spawn the daemon, for the reason
-          # `kin status` above is not piped. `--intent agent` configures
-          # auto-daemon and this is an admitted repository, so setup starts a
-          # daemon here; on Windows that child inherits the pipe and holds the
-          # write end until it idles out, and `tee` then blocks reading a pipe
-          # nobody will close until the 1800 s idle window expires. That is
-          # what the two silent thirty-minute gaps in v0.5.49's Windows leg
-          # were: 3672 s of a 3684 s step, and 62 of the 63.5 minutes between
-          # the published tag and npm. Redirect, then print. Setup's own exit
-          # status is captured rather than left to `set -e` so a failure still
-          # reaches the job log instead of aborting before the `cat`.
+          # Never pipe setup, for the reason `kin status` above is not piped.
+          # Setup leaves a long-lived child behind in an admitted repository,
+          # and on Windows that child inherits the write end of the pipe and
+          # holds it until it idles out, so `tee` blocks reading a pipe nobody
+          # will close even though setup itself has finished and printed
+          # everything it will print. v0.5.49's Windows leg measured that wait
+          # twice, at 1805 s and 1868 s, which is the 1800 s daemon idle
+          # window plus startup and shutdown slack: 3672 s of a 3684 s step,
+          # and 62 of the 63.5 minutes between the published tag and npm.
+          # Redirecting ends the wait whatever the child turns out to be,
+          # because nothing waits on a file. Setup's own exit status is
+          # captured rather than left to `set -e` so a failure still reaches
+          # the job log instead of aborting before the `cat`.
           setup_status=0
           kin setup --no-interactive --intent agent --shell "$PROOF_SHELL" \
             > "$captures/kin-setup.txt" 2>&1 || setup_status=$?
@@ -971,8 +973,8 @@ jobs:
           fi
           claude_fallback_path="$claude_fallback_bin:$primary_home/.kin/bin:/usr/bin:/bin"
           # Unpiped for the same reason as the setup above, and it cost the
-          # same: this second setup spawned the second daemon that held the
-          # second thirty-minute pipe.
+          # same: this second setup left the child that held the second pipe
+          # for its own full idle window.
           fallback_setup_status=0
           HOME="$claude_fallback_home" USERPROFILE="$claude_fallback_home" \
           KIN_HOME="$primary_home/.kin" PATH="$claude_fallback_path" \

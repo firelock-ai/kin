@@ -3078,13 +3078,14 @@ def assert_install_proof_first_run_never_pipes_the_daemon_spawner(
 ) -> None:
     """Keep every daemon-spawning command in the first-run step unpiped.
 
-    A piped command whose child is the daemon does not end when the command
-    ends. On Windows the daemon inherits the write end of the pipe and holds
-    it until idle shutdown, so the reader blocks for the full 1800 s idle
-    window while the step looks like it is working. v0.5.49's Windows leg
-    spent 3672 s of a 3684 s step in exactly two of those waits, both on a
-    ``kin setup --intent agent`` piped into ``tee``, and that step was 62 of
-    the 63.5 minutes between the published tag and npm.
+    A pipeline outlives the command that wrote to it whenever a child
+    inherits the descriptor. On Windows that child holds the write end until
+    it idles out, so the reader blocks while the step looks like it is
+    working. v0.5.49's Windows leg spent 3672 s of a 3684 s step in exactly
+    two such waits, 1805 s and 1868 s, which is the 1800 s daemon idle window
+    plus slack; both were a ``kin setup --intent agent`` piped into ``tee``,
+    and that step was 62 of the 63.5 minutes between the published tag and
+    npm.
 
     `kin status` and the graph queries already carry that rule in prose. This
     is the executable half: the first-run step captures by redirect and
@@ -3098,7 +3099,7 @@ def assert_install_proof_first_run_never_pipes_the_daemon_spawner(
     if piped:
         raise AssertionError(
             "the first-run install proof captures by redirect, never by pipe: "
-            "a daemon that inherits the pipe holds it for its whole idle "
+            "a child that inherits the pipe holds it for its whole idle "
             f"window and the step waits on it; found {piped}"
         )
     for policy in (
