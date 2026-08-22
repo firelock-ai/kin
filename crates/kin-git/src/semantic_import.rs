@@ -76,57 +76,38 @@ pub struct SemanticGitImportPlan {
 }
 
 impl SemanticGitImportPlan {
-    /// Rebuild the plan from its exact raw-object/ref state and require a
-    /// byte-for-byte deterministic semantic result.
-    pub fn validate(&self, blob_store: &BlobStore) -> Result<()> {
-        let snapshot = LosslessGitRepository {
+    /// This plan's own raw Git state, which every re-derivation starts from.
+    fn raw_snapshot(&self) -> LosslessGitRepository {
+        LosslessGitRepository {
             repository_id: self.repository_id.clone(),
             object_format: self.object_format,
             objects: self.external_objects.clone(),
             refs: self.refs.clone(),
             head: self.head.clone(),
-        };
-        let base = build_semantic_git_import_plan(&snapshot, blob_store)?;
-        let mut by_oid = BTreeMap::new();
-        for change in &self.changes {
-            let ChangeOrigin::GitCommit { oid } = change.origin else {
-                return Err(GitError::InvalidSnapshot(
-                    "semantic Git import contains a native-origin change".to_string(),
-                ));
-            };
-            if by_oid.insert(oid, change).is_some() {
-                return Err(GitError::InvalidSnapshot(format!(
-                    "semantic Git import repeats commit {oid}"
-                )));
-            }
         }
-        let deltas = base
-            .changes
-            .iter()
-            .map(|base_change| {
-                let ChangeOrigin::GitCommit { oid } = base_change.origin else {
-                    unreachable!("the exact Git planner only emits Git-origin changes");
-                };
-                let enriched = by_oid.get(&oid).ok_or_else(|| {
-                    GitError::InvalidSnapshot(format!(
-                        "semantic Git import is missing enriched commit {oid}"
-                    ))
-                })?;
-                Ok((
-                    base_change.id,
-                    enriched.entity_deltas.clone(),
-                    enriched.relation_deltas.clone(),
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let rebuilt = apply_historical_semantic_deltas_unchecked(base, &deltas)?;
-        if rebuilt != *self {
-            return Err(GitError::InvalidSnapshot(
-                "semantic Git import plan does not match its deterministic raw-object derivation"
-                    .to_string(),
-            ));
-        }
-        Ok(())
+    }
+
+    /// Rebuild the plan from its exact raw-object/ref state and require a
+    /// byte-for-byte deterministic semantic result.
+    ///
+    /// The rebuild is compared commit by commit as it is derived, and each
+    /// derived commit is dropped once it has been checked. That is the same
+    /// comparison a whole-structure `!=` made, on the same bytes, in the same
+    /// parent-first order; what it no longer does is hold a second complete
+    /// history in order to check the first. No proof is weakened here and none
+    /// is skipped: every commit's change, alias, and exact resolved tree is
+    /// still re-derived from raw objects and still compared.
+    pub fn validate(&self, blob_store: &BlobStore) -> Result<()> {
+        let snapshot = self.raw_snapshot();
+        let mut comparison =
+            HeldPlanComparison::new(self, Enrichment::ReapplyHeldDeltas, DETERMINISTIC_DERIVATION)?;
+        let derived = derive_semantic_git_history(
+            &snapshot,
+            blob_store,
+            TreeRetention::Frontier,
+            &mut |oid, change, alias, tree| comparison.check_commit(oid, change, alias, tree),
+        )?;
+        comparison.finish(&derived)
     }
 
     /// Bind deterministic CAS-native semantic deltas and recompute every
@@ -143,13 +124,14 @@ impl SemanticGitImportPlan {
             refs: self.refs.clone(),
             head: self.head.clone(),
         };
-        let exact = build_semantic_git_import_plan(&snapshot, blob_store)?;
-        if exact != self {
-            return Err(GitError::InvalidSnapshot(
-                "historical semantics may only be bound to the exact unenriched import plan"
-                    .to_string(),
-            ));
-        }
+        let mut comparison = HeldPlanComparison::new(&self, Enrichment::None, EXACT_UNENRICHED)?;
+        let derived = derive_semantic_git_history(
+            &snapshot,
+            blob_store,
+            TreeRetention::Frontier,
+            &mut |oid, change, alias, tree| comparison.check_commit(oid, change, alias, tree),
+        )?;
+        comparison.finish(&derived)?;
         apply_historical_semantic_deltas_unchecked(self, deltas)
     }
 }
@@ -240,10 +222,204 @@ struct ParsedCommit {
     message: String,
 }
 
-fn build_semantic_git_import_plan(
+/// Refusal when a plan does not match what its own raw objects derive.
+const DETERMINISTIC_DERIVATION: &str =
+    "semantic Git import plan does not match its deterministic raw-object derivation";
+
+/// Refusal when historical semantics are offered against something other than
+/// the exact unenriched plan.
+const EXACT_UNENRICHED: &str =
+    "historical semantics may only be bound to the exact unenriched import plan";
+
+/// Whether the plan a re-derivation is checked against already carries bound
+/// semantics.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Enrichment {
+    /// The held plan is the exact unenriched derivation, so each derived commit
+    /// is compared as it comes off the walk.
+    None,
+    /// The held plan carries bound entity and relation deltas. Each derived
+    /// commit has the held commit's own deltas re-applied to it first, and the
+    /// identity that re-application computes is what gets compared, which is
+    /// exactly what rebuilding the whole enriched plan used to do.
+    ReapplyHeldDeltas,
+}
+
+/// Checks a re-derivation against a held plan one commit at a time.
+///
+/// This replaces a whole-structure `rebuilt != *self`. It compares the same
+/// values, derived the same way, in the same parent-first order, and refuses
+/// with the same sentence. The difference is that a commit is compared the
+/// instant it is derived and dropped immediately after, so proving a history
+/// no longer costs a second copy of it.
+struct HeldPlanComparison<'a> {
+    plan: &'a SemanticGitImportPlan,
+    enrichment: Enrichment,
+    refusal: &'static str,
+    /// Where each Git commit's held change sits, so a derived commit can find
+    /// the deltas to re-apply without a whole-history copy of them.
+    held_by_oid: BTreeMap<GitObjectId, usize>,
+    /// Pre-admission identity to the identity re-application computes, which is
+    /// how a re-applied change reaches its parents. Identities only, so this
+    /// stays small no matter how deep history is.
+    reidentified: BTreeMap<SemanticChangeId, SemanticChangeId>,
+    checked: usize,
+}
+
+impl<'a> HeldPlanComparison<'a> {
+    fn new(
+        plan: &'a SemanticGitImportPlan,
+        enrichment: Enrichment,
+        refusal: &'static str,
+    ) -> Result<Self> {
+        let mut held_by_oid = BTreeMap::new();
+        for (index, change) in plan.changes.iter().enumerate() {
+            let ChangeOrigin::GitCommit { oid } = change.origin else {
+                return Err(GitError::InvalidSnapshot(
+                    "semantic Git import contains a native-origin change".to_string(),
+                ));
+            };
+            if held_by_oid.insert(oid, index).is_some() {
+                return Err(GitError::InvalidSnapshot(format!(
+                    "semantic Git import repeats commit {oid}"
+                )));
+            }
+        }
+        Ok(Self {
+            plan,
+            enrichment,
+            refusal,
+            held_by_oid,
+            reidentified: BTreeMap::new(),
+            checked: 0,
+        })
+    }
+
+    fn refuse(&self) -> GitError {
+        GitError::InvalidSnapshot(self.refusal.to_string())
+    }
+
+    fn check_commit(
+        &mut self,
+        oid: GitObjectId,
+        mut change: SemanticChange,
+        alias: ExternalChangeAlias,
+        tree: &ResolvedTree,
+    ) -> Result<()> {
+        let held_index = *self.held_by_oid.get(&oid).ok_or_else(|| {
+            GitError::InvalidSnapshot(format!(
+                "semantic Git import is missing enriched commit {oid}"
+            ))
+        })?;
+        let mut alias = alias;
+        if self.enrichment == Enrichment::ReapplyHeldDeltas {
+            let held = self.plan.changes.get(held_index).ok_or_else(|| self.refuse())?;
+            let old_id = change.id;
+            change.parents = change
+                .parents
+                .iter()
+                .map(|parent| {
+                    self.reidentified.get(parent).copied().ok_or_else(|| {
+                        GitError::InvalidSnapshot(format!(
+                            "parent {parent} was not reidentified before change {old_id}"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            change.entity_deltas = held.entity_deltas.clone();
+            change.relation_deltas = held.relation_deltas.clone();
+            change.id = placeholder_change_id();
+            change.id = compute_semantic_change_id(&change)?;
+            validate_semantic_change_id(&change)?;
+            alias = ExternalChangeAlias::new(self.plan.repository_id.clone(), oid, change.id);
+            alias.validate_change(&change)?;
+            self.reidentified.insert(old_id, change.id);
+        }
+
+        // Positional, because whole-`Vec` equality asserted order as well as
+        // content. The held commit is located by object id for its deltas and
+        // compared at the position the derivation reached, so a plan whose
+        // changes are reordered still fails here.
+        let index = self.checked;
+        if self.plan.changes.get(index) != Some(&change)
+            || self.plan.aliases.get(index) != Some(&alias)
+            || self.plan.commit_trees.get(&oid) != Some(tree)
+        {
+            return Err(self.refuse());
+        }
+        self.checked += 1;
+        Ok(())
+    }
+
+    fn finish(self, derived: &DerivedGitHistory) -> Result<()> {
+        // Every derived commit matched a held one at its own position, and the
+        // derivation already refused unless it derived each reachable commit
+        // exactly once. Requiring the held collections to be exactly that long
+        // is what rules out a plan carrying anything extra, which is the other
+        // half of what whole-structure equality asserted.
+        if self.checked != derived.commits
+            || self.plan.changes.len() != derived.commits
+            || self.plan.aliases.len() != derived.commits
+            || self.plan.commit_trees.len() != derived.commits
+            || self.plan.workspace_seed != derived.workspace_seed
+            || self.plan.ref_mutations != derived.ref_mutations
+            || self.plan.default_ref_mutation != derived.default_ref_mutation
+        {
+            return Err(self.refuse());
+        }
+        Ok(())
+    }
+}
+
+/// What a history derivation keeps while it walks parent-first.
+///
+/// A conversion holds one exact `ResolvedTree` per commit, which is the largest
+/// structure in the ladder and the one that scales with history. Whether that
+/// is unavoidable depends entirely on who reads it afterwards, so the retention
+/// rule is a parameter of the walk rather than a property of the planner.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TreeRetention {
+    /// Keep every commit's exact tree, because the plan under construction
+    /// carries all of them and later phases resolve against them.
+    Whole,
+    /// Keep only the trees a later commit still resolves against, plus the one
+    /// the workspace seed peels to.
+    ///
+    /// A structural revalidation compares each commit the instant it is derived
+    /// and never reads that commit's tree again once its last child is
+    /// resolved. Holding the rest means holding a second whole history in order
+    /// to prove the first, which is what made a re-derivation cost as much as
+    /// the derivation it checks.
+    Frontier,
+}
+
+/// What a derivation still holds once every commit has been visited.
+struct DerivedGitHistory {
+    /// Under [`TreeRetention::Whole`], every commit's exact tree. Under
+    /// [`TreeRetention::Frontier`], only the trees no reader has finished with,
+    /// which at the end of a complete walk is the workspace seed's tree and the
+    /// tip of every ref.
+    commit_trees: BTreeMap<GitObjectId, ResolvedTree>,
+    workspace_seed: GitWorkspaceSeed,
+    ref_mutations: Vec<RefMutation>,
+    default_ref_mutation: Option<DefaultRefMutation>,
+    /// Commits derived, which a caller compares against what it accumulated.
+    commits: usize,
+}
+
+/// Derive exact semantic history from a lossless snapshot and its CAS, handing
+/// every commit to `visit` in parent-first order as it is resolved.
+///
+/// This is the single derivation rule. Building a plan and re-deriving one to
+/// check it against are the same walk with different visitors, so the two can
+/// never drift apart, and only the visitor decides what survives the commit it
+/// was handed.
+fn derive_semantic_git_history(
     snapshot: &LosslessGitRepository,
     blob_store: &BlobStore,
-) -> Result<SemanticGitImportPlan> {
+    retention: TreeRetention,
+    visit: &mut dyn FnMut(GitObjectId, SemanticChange, ExternalChangeAlias, &ResolvedTree) -> Result<()>,
+) -> Result<DerivedGitHistory> {
     let bodies = validate_snapshot(snapshot, blob_store)?;
     let records = snapshot
         .objects
@@ -263,23 +439,38 @@ fn build_semantic_git_import_plan(
         tree_decoder.decode_relative(record.object.oid)?;
     }
 
-    let mut changes = Vec::with_capacity(order.len());
-    let mut aliases = Vec::with_capacity(order.len());
+    // A commit's exact tree has exactly two kinds of reader: the commits that
+    // name it as a parent, and the workspace seed. Counting them before the
+    // walk is what lets a bounded derivation drop a tree the moment its last
+    // reader is done, rather than at the end of history.
+    let mut remaining_readers = BTreeMap::<GitObjectId, usize>::new();
+    for parsed in commits.values() {
+        for parent in &parsed.parents {
+            *remaining_readers.entry(*parent).or_default() += 1;
+        }
+    }
+    let seed_commit = resolve_workspace_seed_commit(snapshot, &bodies, hash_kind)?;
+    if let Some(seed) = seed_commit {
+        *remaining_readers.entry(seed).or_default() += 1;
+    }
+
     let mut commit_trees = BTreeMap::new();
     let mut change_ids = BTreeMap::new();
     let mut known_artifact_ids = BTreeSet::new();
+    let unborn_tree = ResolvedTree::default();
+    let mut derived = 0usize;
 
     for oid in order {
         let parsed = commits.get(&oid).ok_or_else(|| {
             GitError::InvalidSnapshot(format!("topological order contains unknown commit {oid}"))
         })?;
         let first_parent_tree = match parsed.parents.first() {
-            Some(parent) => commit_trees.get(parent).cloned().ok_or_else(|| {
+            Some(parent) => commit_trees.get(parent).ok_or_else(|| {
                 GitError::InvalidSnapshot(format!(
                     "first parent {parent} was not resolved before commit {oid}"
                 ))
             })?,
-            None => ResolvedTree::default(),
+            None => &unborn_tree,
         };
         let secondary_parent_trees = parsed
             .parents
@@ -296,12 +487,12 @@ fn build_semantic_git_import_plan(
         let raw_tree = tree_decoder.resolved_entries(parsed.tree)?;
         let resolved_tree = assign_artifact_identities(
             oid,
-            &first_parent_tree,
+            first_parent_tree,
             &secondary_parent_trees,
             raw_tree,
             &known_artifact_ids,
         )?;
-        let tree_deltas = exact_tree_deltas(&first_parent_tree, &resolved_tree);
+        let tree_deltas = exact_tree_deltas(first_parent_tree, &resolved_tree);
         let applied = first_parent_tree.apply(&tree_deltas).map_err(|error| {
             GitError::InvalidSnapshot(format!(
                 "commit {oid} has an invalid first-parent tree transition: {error}"
@@ -352,17 +543,39 @@ fn build_semantic_git_import_plan(
                 .map(|artifact| artifact.artifact_id),
         );
         change_ids.insert(oid, change.id);
+        visit(oid, change, alias, &resolved_tree)?;
         commit_trees.insert(oid, resolved_tree);
-        aliases.push(alias);
-        changes.push(change);
+        derived += 1;
+
+        if retention == TreeRetention::Frontier {
+            let parents = commits
+                .get(&oid)
+                .map(|parsed| parsed.parents.clone())
+                .unwrap_or_default();
+            for parent in &parents {
+                let Some(remaining) = remaining_readers.get_mut(parent) else {
+                    continue;
+                };
+                *remaining = remaining.checked_sub(1).ok_or_else(|| {
+                    GitError::InvalidSnapshot(format!(
+                        "parent {parent} of commit {oid} has invalid tree-reader accounting"
+                    ))
+                })?;
+                if *remaining == 0 {
+                    commit_trees.remove(parent);
+                }
+            }
+            // A ref tip that nothing else reads, and that is not the seed, is
+            // finished the moment it is derived.
+            if remaining_readers.get(&oid).copied().unwrap_or(0) == 0 {
+                commit_trees.remove(&oid);
+            }
+        }
     }
 
-    if commit_trees.len() != commits.len()
-        || changes.len() != commits.len()
-        || aliases.len() != commits.len()
-    {
+    if derived != commits.len() {
         return Err(GitError::InvalidSnapshot(
-            "not every reachable Git commit produced one tree, change, and alias".to_string(),
+            "not every reachable Git commit was derived exactly once".to_string(),
         ));
     }
 
@@ -400,18 +613,53 @@ fn build_semantic_git_import_plan(
         mutation.validate()?;
     }
 
+    Ok(DerivedGitHistory {
+        commit_trees,
+        workspace_seed,
+        ref_mutations,
+        default_ref_mutation,
+        commits: commits.len(),
+    })
+}
+
+fn build_semantic_git_import_plan(
+    snapshot: &LosslessGitRepository,
+    blob_store: &BlobStore,
+) -> Result<SemanticGitImportPlan> {
+    let mut changes = Vec::new();
+    let mut aliases = Vec::new();
+    let derived = derive_semantic_git_history(
+        snapshot,
+        blob_store,
+        TreeRetention::Whole,
+        &mut |_oid, change, alias, _tree| {
+            changes.push(change);
+            aliases.push(alias);
+            Ok(())
+        },
+    )?;
+
+    if derived.commit_trees.len() != derived.commits
+        || changes.len() != derived.commits
+        || aliases.len() != derived.commits
+    {
+        return Err(GitError::InvalidSnapshot(
+            "not every reachable Git commit produced one tree, change, and alias".to_string(),
+        ));
+    }
+
     Ok(SemanticGitImportPlan {
         repository_id: snapshot.repository_id.clone(),
         object_format: snapshot.object_format,
         external_objects: snapshot.objects.clone(),
         changes,
         aliases,
-        commit_trees,
+        commit_trees: derived.commit_trees,
         refs: snapshot.refs.clone(),
         head: snapshot.head.clone(),
-        workspace_seed,
-        ref_mutations,
-        default_ref_mutation,
+        workspace_seed: derived.workspace_seed,
+        ref_mutations: derived.ref_mutations,
+        default_ref_mutation: derived.default_ref_mutation,
     })
 }
 
@@ -836,6 +1084,46 @@ fn exact_tree_deltas(base: &ResolvedTree, target: &ResolvedTree) -> Vec<TreeDelt
     }
     deltas.sort_by_key(TreeDelta::artifact_id);
     deltas
+}
+
+/// The commit whose exact tree seeds the workspace, or `None` for an unborn
+/// HEAD.
+///
+/// Split out of [`resolve_workspace_seed`] so a bounded derivation can learn
+/// which tree the seed will still need before it starts dropping the ones
+/// nothing reads again. Both callers resolve HEAD by this one rule.
+fn resolve_workspace_seed_commit(
+    snapshot: &LosslessGitRepository,
+    bodies: &BTreeMap<ExternalObjectId, Vec<u8>>,
+    hash_kind: gix::hash::Kind,
+) -> Result<Option<GitObjectId>> {
+    let refs = snapshot
+        .refs
+        .refs
+        .iter()
+        .map(|repository_ref| (repository_ref.name.clone(), repository_ref.target.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let base_target = match &snapshot.head {
+        WorkspaceHead::Symbolic { target } => resolve_symbolic_target(target, &refs)?,
+        WorkspaceHead::Detached { target } => Some(target.clone()),
+    };
+    let Some(base_target) = base_target else {
+        return Ok(None);
+    };
+    let object = match &base_target {
+        RefTarget::ExternalObject { object } => *object,
+        RefTarget::Change { change_id } => {
+            return Err(GitError::InvalidSnapshot(format!(
+                "lossless Git HEAD resolves to native change {change_id}"
+            )))
+        }
+        RefTarget::Symbolic { .. } => {
+            return Err(GitError::InvalidSnapshot(
+                "HEAD resolution ended at a symbolic target".to_string(),
+            ))
+        }
+    };
+    Ok(Some(peel_to_commit(object, bodies, hash_kind)?))
 }
 
 fn resolve_workspace_seed(

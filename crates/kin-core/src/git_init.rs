@@ -967,6 +967,11 @@ fn bind_historical_semantics(
     plan: kin_git::SemanticGitImportPlan,
     capture_store: &BlobStore,
 ) -> Result<kin_git::SemanticGitImportPlan> {
+    // Lend the exact trees rather than copy them. This map exists only to re-key
+    // `commit_trees` from Git object id to semantic change id for the enrichment
+    // fold, which reads a tree and never keeps one. Cloning here doubled the
+    // largest structure a whole-history conversion holds, and held both copies
+    // for the whole phase, to change a key.
     let mut trees = std::collections::BTreeMap::new();
     for alias in &plan.aliases {
         let tree = plan.commit_trees.get(&alias.oid).ok_or_else(|| {
@@ -975,7 +980,7 @@ fn bind_historical_semantics(
                 format!("imported commit {} has no exact resolved tree", alias.oid),
             )
         })?;
-        if trees.insert(alias.change_id, tree.clone()).is_some() {
+        if trees.insert(alias.change_id, tree).is_some() {
             return Err(git_boundary_error(
                 "bind historical semantics",
                 format!("imported history repeats change {}", alias.change_id),
