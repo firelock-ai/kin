@@ -2145,6 +2145,110 @@ def check_15(suite):
                 "certifications %s, so the fields carry no information about any file"
                 % (sorted(str(state) for state in states),
                    sorted(str(value) for value in certifications)))
+
+
+# The sentence rung one, two and three all render, shared by every CLI surface
+# that answers an absence question (crates/kin-cli/src/commands/absence_qualifier.rs).
+CANNOT_RULE_OUT = re.compile(r"Kin cannot rule out ", re.I)
+
+
+def check_16(suite):
+    """FIR-2524 rung three: the CLI must carry the verdict MCP publishes, on the
+    partial-vocabulary command group.
+
+    Rungs one and two gave `kin impact`, `kin trace` and `kin search` the
+    absence verdict. All three are in the ticket's ZERO-vocabulary row group, so
+    the requirement to falsify one command from EACH group stayed undischarged.
+    This check is the other group: `kin refs` and `kin dead-code`, which started
+    with partial vocabulary of their own and could reach a different conclusion
+    from their MCP counterparts about one store.
+
+    Three arms, and the last two are what stop this from becoming the FIR-2404
+    failure in its opposite costume: a fix that stamps every empty result
+    uncertain has failed, and so has one that qualifies an answer holding rows.
+    """
+    res = Result("16", "FIR-2524", "CLI absence verdict on refs and dead-code")
+    repo = suite.fixture("incremental")
+
+    # ARM A, refusing direction, partial-vocabulary group (`kin refs`).
+    # Same focal check 2 uses for the MCP half, so the two surfaces are being
+    # asked one question about one store.
+    try:
+        payload = suite.references(repo, "parse_note")
+    except McpError as exc:
+        res.unknown("find_references(parse_note) unreadable: %s" % exc)
+        return res
+    miss = resolution_miss(payload, "parse_note")
+    if miss:
+        res.unknown(miss)
+        return res
+    negative = payload.get("negative")
+    mcp_refuses = (isinstance(negative, dict)
+                   and negative.get("safe_to_conclude_absent") is False)
+
+    rc, out, err = suite.kin_run(["refs", "parse_note"], repo)
+    text = out + "\n" + err
+    if rc != 0 and not text.strip():
+        res.unknown("kin refs parse_note exited %d with no output" % rc)
+        return res
+    cli_qualifies = bool(CANNOT_RULE_OUT.search(text))
+
+    if not (payload.get("references") or []):
+        # The absence path is live, so the two surfaces must agree.
+        if mcp_refuses and not cli_qualifies:
+            res.bad("MCP refuses to certify this absence (safe_to_conclude_absent=false) "
+                    "while the CLI prints a bare answer: %s" % text.strip()[:240])
+        elif mcp_refuses and cli_qualifies:
+            res.ok("group=partial-vocabulary refs: both surfaces refuse; CLI carries "
+                   "the verdict")
+        elif not mcp_refuses and cli_qualifies:
+            res.bad("the CLI qualifies an absence MCP certifies, so the two surfaces "
+                    "disagree in the other direction: %s" % text.strip()[:240])
+        else:
+            res.ok("group=partial-vocabulary refs: both surfaces certify")
+    else:
+        res.ok("references returned (%d), so the refusing arm is not exercised here"
+               % len(payload.get("references") or []))
+
+    # ARM B, the positive control. An answer holding rows is not an absence, so
+    # it carries no qualifier. This is the arm a fix that stamps everything
+    # uncertain fails.
+    rc_b, out_b, err_b = suite.kin_run(["refs", "normalize_title"], repo)
+    text_b = out_b + "\n" + err_b
+    has_rows = bool(re.search(r"referenced by \d+ entit", text_b))
+    if not has_rows:
+        res.unknown("kin refs normalize_title returned no rows, so the positive control "
+                    "cannot be evaluated: %s" % text_b.strip()[:200])
+    elif CANNOT_RULE_OUT.search(text_b):
+        res.bad("an answer holding rows was qualified anyway, which is the "
+                "stamp-everything-uncertain regression: %s" % text_b.strip()[:240])
+    else:
+        res.ok("positive control: an answer holding rows stays unqualified")
+
+    # ARM C, the negative control on the ruled exclusion, second row-group
+    # command. `dead_code`'s empty result is the INVERSE claim, so kin_mcp gives
+    # it no cross-file classes and no language scope; only the SUBSTRATE can put
+    # it in doubt. On a sound daemon it certifies, so a clean scan says nothing
+    # extra. This arm fails if a future change bolts a coverage refusal onto the
+    # inverse claim.
+    dead = suite.dead_code(repo)
+    dead_text = dead.get("raw") or ""
+    if not dead_text.strip():
+        res.unknown("kin dead-code produced no output, so the negative control cannot "
+                    "be evaluated")
+    elif "No dead code found." in dead_text:
+        if CANNOT_RULE_OUT.search(dead_text):
+            res.bad("a clean dead-code scan on a sound substrate was qualified; its "
+                    "empty result is the INVERSE claim and missing edges produce MORE "
+                    "candidates, never fewer: %s" % dead_text.strip()[:240])
+        else:
+            res.ok("group=partial-vocabulary dead-code: a clean scan on a sound "
+                   "substrate stays unqualified")
+    elif CANNOT_RULE_OUT.search(dead_text):
+        res.bad("a dead-code scan that LISTED rows was qualified; a populated answer "
+                "is not an absence claim: %s" % dead_text.strip()[:240])
+    else:
+        res.ok("group=partial-vocabulary dead-code: a populated scan stays unqualified")
     return res
 
 
@@ -2165,6 +2269,7 @@ CHECKS = [
     ("13", check_13),
     ("14", check_14),
     ("15", check_15),
+    ("16", check_16),
 ]
 
 
