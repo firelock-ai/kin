@@ -54,6 +54,11 @@ pub struct AdmittedSemanticGitImportPlan {
     pub default_ref_mutation: Option<DefaultRefMutation>,
 }
 
+/// Refusal when an admitted plan does not match what its own raw objects,
+/// trees and CAS derive.
+const ADMITTED_DETERMINISTIC_DERIVATION: &str =
+    "admitted semantic Git import plan does not match its deterministic raw-object, tree, and CAS derivation";
+
 impl AdmittedSemanticGitImportPlan {
     /// Effective shared policy for the workspace base tree.
     pub const fn workspace_policy(&self) -> &SharedAdmissionPolicy {
@@ -109,11 +114,52 @@ impl AdmittedSemanticGitImportPlan {
             })
             .collect::<Result<Vec<_>>>()?;
         let semantic = semantic.with_historical_semantics(blob_store, &deltas)?;
-        let rebuilt = build_admitted_semantic_git_import_plan(&semantic, blob_store)?;
-        if rebuilt != *self {
+        drop(deltas);
+
+        // Compared commit by commit as the admitted history is re-derived, and
+        // each derived commit dropped once checked. Same values, same
+        // parent-first order, same refusal; what it no longer does is build a
+        // second whole admitted history, at the one moment in the ladder where
+        // the working set is already largest, to check the first.
+        let mut checked = 0usize;
+        let derived = derive_admitted_semantic_git_history(
+            &semantic,
+            blob_store,
+            &mut |_oid, admitted, alias| {
+                // Refuse at the commit that disagrees rather than carrying a
+                // flag to the end. A plan that has already failed can go on to
+                // trip a structural error further down the walk, and reporting
+                // that instead would name the wrong thing.
+                if self.changes.get(checked) != Some(&admitted)
+                    || self.aliases.get(checked) != Some(&alias)
+                {
+                    return Err(GitError::InvalidSnapshot(
+                        ADMITTED_DETERMINISTIC_DERIVATION.to_string(),
+                    ));
+                }
+                checked += 1;
+                Ok(())
+            },
+        )?;
+
+        if checked != derived.commits
+            || self.changes.len() != derived.commits
+            || self.aliases.len() != derived.commits
+            || self.commit_policies != derived.commit_policies
+            || self.workspace_policy != derived.workspace_policy
+            || self.workspace_base_change_id != derived.workspace_base_change_id
+            || self.repository_id != semantic.repository_id
+            || self.object_format != semantic.object_format
+            || self.external_objects != semantic.external_objects
+            || self.commit_trees != semantic.commit_trees
+            || self.refs != semantic.refs
+            || self.head != semantic.head
+            || self.workspace_seed != semantic.workspace_seed
+            || self.ref_mutations != semantic.ref_mutations
+            || self.default_ref_mutation != semantic.default_ref_mutation
+        {
             return Err(GitError::InvalidSnapshot(
-                "admitted semantic Git import plan does not match its deterministic raw-object, tree, and CAS derivation"
-                    .to_string(),
+                ADMITTED_DETERMINISTIC_DERIVATION.to_string(),
             ));
         }
         Ok(())
@@ -174,10 +220,29 @@ pub fn admit_semantic_git_import(
     build_admitted_semantic_git_import_plan(plan, blob_store)
 }
 
-fn build_admitted_semantic_git_import_plan(
+/// What an admitted derivation still holds once every commit has been visited.
+struct DerivedAdmittedHistory {
+    commit_policies: BTreeMap<GitObjectId, SharedAdmissionPolicy>,
+    workspace_policy: SharedAdmissionPolicy,
+    workspace_base_change_id: Option<SemanticChangeId>,
+    commits: usize,
+}
+
+/// Derive branch-versioned admission policy for every imported commit, handing
+/// each admitted change and alias to `visit` in parent-first order.
+///
+/// Same arrangement as the exact planner: building the admitted plan and
+/// re-deriving one to check it against are the same walk with different
+/// visitors, so they cannot drift, and only the visitor decides what survives
+/// the commit it was handed. The policy map stays whole because a commit
+/// resolves against its first parent's policy and the workspace seed peels to
+/// one; it is the small structure here, where the admitted changes are the
+/// history-sized one.
+fn derive_admitted_semantic_git_history(
     plan: &SemanticGitImportPlan,
     blob_store: &BlobStore,
-) -> Result<AdmittedSemanticGitImportPlan> {
+    visit: &mut dyn FnMut(GitObjectId, SemanticChange, ExternalChangeAlias) -> Result<()>,
+) -> Result<DerivedAdmittedHistory> {
     let mut old_id_to_oid = BTreeMap::<SemanticChangeId, GitObjectId>::new();
     for alias in &plan.aliases {
         if old_id_to_oid.insert(alias.change_id, alias.oid).is_some() {
@@ -188,10 +253,9 @@ fn build_admitted_semantic_git_import_plan(
         }
     }
 
-    let mut changes = Vec::with_capacity(plan.changes.len());
-    let mut aliases = Vec::with_capacity(plan.aliases.len());
     let mut new_change_ids = BTreeMap::<GitObjectId, SemanticChangeId>::new();
     let mut policies = BTreeMap::<GitObjectId, SharedAdmissionPolicy>::new();
+    let mut derived = 0usize;
 
     for original in &plan.changes {
         let oid = match original.origin {
@@ -257,14 +321,11 @@ fn build_admitted_semantic_git_import_plan(
                 "Git commit {oid} appears more than once in admitted history"
             )));
         }
-        changes.push(admitted);
-        aliases.push(alias);
+        visit(oid, admitted, alias)?;
+        derived += 1;
     }
 
-    if changes.len() != plan.changes.len()
-        || aliases.len() != plan.aliases.len()
-        || policies.len() != plan.commit_trees.len()
-    {
+    if derived != plan.changes.len() || policies.len() != plan.commit_trees.len() {
         return Err(GitError::InvalidSnapshot(
             "not every imported commit produced one admitted change, alias, and policy".to_string(),
         ));
@@ -286,6 +347,32 @@ fn build_admitted_semantic_git_import_plan(
         None => (SharedAdmissionPolicy::empty(0), None),
     };
 
+    Ok(DerivedAdmittedHistory {
+        commit_policies: policies,
+        workspace_policy,
+        workspace_base_change_id,
+        commits: derived,
+    })
+}
+
+fn build_admitted_semantic_git_import_plan(
+    plan: &SemanticGitImportPlan,
+    blob_store: &BlobStore,
+) -> Result<AdmittedSemanticGitImportPlan> {
+    let mut changes = Vec::with_capacity(plan.changes.len());
+    let mut aliases = Vec::with_capacity(plan.aliases.len());
+    let derived =
+        derive_admitted_semantic_git_history(plan, blob_store, &mut |_oid, admitted, alias| {
+            changes.push(admitted);
+            aliases.push(alias);
+            Ok(())
+        })?;
+    if changes.len() != plan.changes.len() || aliases.len() != plan.aliases.len() {
+        return Err(GitError::InvalidSnapshot(
+            "not every imported commit produced one admitted change, alias, and policy".to_string(),
+        ));
+    }
+
     Ok(AdmittedSemanticGitImportPlan {
         repository_id: plan.repository_id.clone(),
         object_format: plan.object_format,
@@ -293,12 +380,12 @@ fn build_admitted_semantic_git_import_plan(
         changes,
         aliases,
         commit_trees: plan.commit_trees.clone(),
-        commit_policies: policies,
+        commit_policies: derived.commit_policies,
         refs: plan.refs.clone(),
         head: plan.head.clone(),
         workspace_seed: plan.workspace_seed.clone(),
-        workspace_policy,
-        workspace_base_change_id,
+        workspace_policy: derived.workspace_policy,
+        workspace_base_change_id: derived.workspace_base_change_id,
         ref_mutations: plan.ref_mutations.clone(),
         default_ref_mutation: plan.default_ref_mutation.clone(),
     })
