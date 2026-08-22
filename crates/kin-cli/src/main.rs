@@ -2544,6 +2544,14 @@ fn main() -> Result<()> {
     // process, and mutating the environment is only safe while the process is
     // still single-threaded. An operator's explicit KIN_RESOURCE_PROFILE wins.
     kin_cli::resource_profile::apply_product_default();
+    // ...then let the repository's recorded profile take over from that default,
+    // exactly as kin-daemon does, so the two agree by construction. Without this
+    // the daemon runs under the repository's profile and this process does not,
+    // and every command in such a repository reports a behavior-env divergence
+    // whose remedy cannot clear it.
+    if let Ok(cwd) = std::env::current_dir() {
+        kin_cli::resource_profile::apply_repository_profile_at(&cwd);
+    }
     if kin_migrate::run_migration_process_host_if_requested()? {
         return Ok(());
     }

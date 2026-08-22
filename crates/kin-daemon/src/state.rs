@@ -1920,6 +1920,10 @@ impl DaemonState {
     /// part-way through a fill still knows what earlier runs of this store
     /// finished. The cost is one stat on a path taken once per embed interval
     /// and once per readiness probe.
+    pub fn embedding_coverage_ever_complete(&self) -> bool {
+        self.layout.kindb_embedding_coverage_marker_path().exists()
+    }
+
     /// Publish the batch size the background embedding queue will run with.
     /// Called once by the daemon runtime after it resolves its configuration.
     pub fn publish_embed_batch_size(&self, size: usize) {
@@ -1933,10 +1937,6 @@ impl DaemonState {
             0 => None,
             size => Some(size),
         }
-    }
-
-    pub fn embedding_coverage_ever_complete(&self) -> bool {
-        self.layout.kindb_embedding_coverage_marker_path().exists()
     }
 
     /// Publish the has-ever-completed marker if embedding coverage is now whole.

@@ -2029,8 +2029,10 @@ const GRAPH_STATUS_WRITER_SETTLE_FLOOR: Duration = Duration::from_millis(50);
 /// step that is merely between lock-points settles inside a few tens of
 /// milliseconds, and answering live is always better than answering stale. It
 /// is deliberately small because status is what settle loops poll, and it
-/// doubles per attempt, so the total added latency in the contended case is
-/// under a tenth of a second and nothing is held while it elapses.
+/// doubles per attempt, so with three attempts a fully contended call waits
+/// 25 ms then 50 ms, 75 ms in total, and nothing is held while it elapses.
+/// The last attempt does not wait at all: the loop exits immediately after it,
+/// so a backoff there would buy the writer no time and cost the caller 100 ms.
 const GRAPH_STATUS_ATTEMPT_BACKOFF: Duration = Duration::from_millis(25);
 
 /// The last settled `kin_graph_status` observation of one selected graph.
@@ -2315,6 +2317,11 @@ impl GraphStatusBlocked {
 /// progress is the thing that unblocks the sample.
 async fn graph_status_attempt_backoff(attempt: usize) {
     tokio::task::yield_now().await;
+    // Nothing follows the final attempt but the answer, so sleeping after it
+    // delays the caller without giving the writer another chance to finish.
+    if attempt + 1 >= GRAPH_STATUS_STABLE_READ_ATTEMPTS {
+        return;
+    }
     let shift = u32::try_from(attempt).unwrap_or(u32::MAX).min(4);
     tokio::time::sleep(GRAPH_STATUS_ATTEMPT_BACKOFF.saturating_mul(1 << shift)).await;
 }
