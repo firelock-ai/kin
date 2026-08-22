@@ -563,6 +563,16 @@ pub(crate) fn recorded_daemon_kill() -> Option<kin_daemon_spawn::DaemonKillRecor
     kin_daemon_spawn::read_daemon_kill_record(&discover_kin_dir()?)
 }
 
+/// Whether this store's enrichment sweeps are currently suspended.
+///
+/// Read from the store on every call rather than remembered, for the same
+/// reason the kill record is and one more: the tally clears when a sweep
+/// completes, and a server that cached this would keep telling agents the
+/// producer was off after it had come back on.
+pub(crate) fn suspended_sweep() -> Option<kin_daemon_spawn::SuspendedSweep> {
+    kin_daemon_spawn::SuspendedSweep::read(&discover_kin_dir()?)
+}
+
 /// The recorded cause and a remediation the caller can perform, ready to append
 /// to an error about a daemon that stopped answering.
 ///

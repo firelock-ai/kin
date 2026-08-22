@@ -197,6 +197,7 @@ pub async fn run_health_checks() -> HealthReport {
     checks.push(check_embedding_model().await);
     checks.push(check_commit_memory_headroom());
     checks.push(check_daemon_kill_record());
+    checks.push(check_suspended_sweep());
     checks.push(check_retrieval_profile());
     checks.push(check_update_policy());
     checks.push(check_binary_assessment_load());
@@ -3586,6 +3587,53 @@ fn daemon_kill_record_check_for(
     };
     HealthCheck::new(ID, LABEL, HealthStatus::Degraded, record.cause_sentence())
         .with_manual_fix(record.remediation())
+}
+
+/// Whether this store's language-server enrichment has been switched off.
+///
+/// The daemon opens that circuit after three consecutive sweeps end early
+/// having enriched nothing, and until now it said so in its own log and nowhere
+/// else. Every counter a reader can see keeps reporting unenriched files as
+/// pending work, which is the one reading that is wrong: nothing is going to
+/// pick them up until a sweep is asked for.
+///
+/// Advisory rather than blocking, for the reason the kill row is: a store whose
+/// sweeps keep dying is telling you about the machine, and the install is fine.
+fn check_suspended_sweep() -> HealthCheck {
+    const ID: &str = "suspended_sweep";
+    const LABEL: &str = "Enrichment sweeps";
+    let cwd = env::current_dir().unwrap_or_default();
+    let Some(layout) = kin_core::KinLayout::discover(&cwd) else {
+        return HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Unsupported,
+            "not in a Kin repository, so there is no store whose sweeps could be suspended",
+        );
+    };
+    suspended_sweep_check_for(kin_daemon_spawn::SuspendedSweep::read(layout.root()).as_ref())
+}
+
+/// Core of [`check_suspended_sweep`] with the reading as its input, so both
+/// branches are testable without a store that has lost three sweeps.
+fn suspended_sweep_check_for(suspended: Option<&kin_daemon_spawn::SuspendedSweep>) -> HealthCheck {
+    const ID: &str = "suspended_sweep";
+    const LABEL: &str = "Enrichment sweeps";
+    let Some(suspended) = suspended else {
+        return HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Healthy,
+            "language-server enrichment is not suspended for this store",
+        );
+    };
+    HealthCheck::new(
+        ID,
+        LABEL,
+        HealthStatus::Degraded,
+        suspended.cause_sentence(),
+    )
+    .with_manual_fix(suspended.remediation())
 }
 
 /// Core of [`check_commit_memory_headroom`] with both readings as inputs, so
@@ -8309,6 +8357,43 @@ mod tests {
         assert!(
             !blocks_readiness(&reported),
             "a machine too small for this repository is not a broken install"
+        );
+    }
+
+    /// The sweep row exists because the page reads healthy while enrichment is
+    /// off: unenriched files are counted as pending everywhere else, and
+    /// pending is the one thing they are not. A store whose sweeps are running
+    /// must not grow a row that reads like a complaint.
+    #[test]
+    fn the_sweep_row_reports_a_suspension_and_stays_quiet_without_one() {
+        let quiet = suspended_sweep_check_for(None);
+        assert!(matches!(quiet.status, HealthStatus::Healthy));
+        assert!(quiet.manual_fix.is_none());
+        assert!(
+            !quiet.detail.contains("kin daemon sweep"),
+            "a store that is sweeping normally is not told to ask for a sweep: {}",
+            quiet.detail
+        );
+
+        let suspended = kin_daemon_spawn::SuspendedSweep { interruptions: 3 };
+        let reported = suspended_sweep_check_for(Some(&suspended));
+        assert!(matches!(reported.status, HealthStatus::Degraded));
+        assert!(
+            reported.detail.contains('3') && reported.detail.contains("suspended"),
+            "{}",
+            reported.detail
+        );
+        assert!(
+            reported
+                .manual_fix
+                .as_deref()
+                .is_some_and(|fix| fix.contains("kin daemon sweep")),
+            "the fix line must name something the reader can do: {:?}",
+            reported.manual_fix
+        );
+        assert!(
+            !blocks_readiness(&reported),
+            "a store whose sweeps keep dying is telling you about the machine, not the install"
         );
     }
 }

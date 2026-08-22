@@ -242,11 +242,26 @@ fn config(repo: &Path, out: &Path, base_url: &str, mcp_command: Vec<String>) -> 
             request_timeout: Duration::from_secs(20),
         },
         mcp_command,
+        extra_servers: Vec::new(),
         mcp_timeout: Duration::from_secs(60),
         max_tool_calls: 10,
         deadline: Duration::from_secs(120),
         tool_profile: None,
     }
+}
+
+/// A fixture repository at a named directory, so two attached repositories carry
+/// different labels and their tool prefixes are told apart by name rather than by index.
+fn fixture_repo_named(dir: &Path, name: &str) -> PathBuf {
+    let repo = dir.join(name);
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(
+        repo.join("src/greet.py"),
+        "def greet(name):\n    return f\"hello {name}\"\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("README.md"), "# fixture\n").unwrap();
+    repo
 }
 
 fn read_jsonl(path: &Path) -> Vec<Value> {
@@ -664,6 +679,237 @@ fn a_write_over_a_tracked_path_is_refused_by_the_graph_and_aborts() {
     assert!(
         detail.contains("already tracked"),
         "the graph's refusal must survive into the provenance: {detail}"
+    );
+}
+
+/// Two repositories, two servers, two graphs. Each write is staged and committed into the
+/// graph of the repository that owns its path, and a Kin call reaches only the server whose
+/// prefix the model used.
+#[test]
+fn two_repositories_each_get_their_own_server_session_and_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let alpha = fixture_repo_named(dir.path(), "alpha");
+    let beta = fixture_repo_named(dir.path(), "beta");
+    let out = dir.path().join("out");
+    let server = write_fake_mcp_server(dir.path());
+    let alpha_log = dir.path().join("alpha-calls.jsonl");
+    let beta_log = dir.path().join("beta-calls.jsonl");
+    let beta_file = beta.join("src/new_b.py");
+
+    let endpoint = FakeEndpoint::start(vec![
+        completion(
+            "Looking in beta.",
+            Some(tool_call(
+                "c1",
+                "mcp__kin_beta__semantic_locate",
+                json!({ "query": "greet" }),
+            )),
+        ),
+        completion(
+            "Writing into the primary.",
+            Some(tool_call(
+                "c2",
+                "write_file",
+                json!({ "path": "src/new_a.py", "content": "a = 1\n" }),
+            )),
+        ),
+        completion(
+            "Writing into beta.",
+            Some(tool_call(
+                "c3",
+                "write_file",
+                json!({ "path": beta_file.display().to_string(), "content": "b = 2\n" }),
+            )),
+        ),
+        completion("Both files are written.", None),
+    ]);
+    let base_url = endpoint.base_url.clone();
+
+    let mut cfg = config(&alpha, &out, &base_url, mcp_command(&server, &alpha_log));
+    cfg.extra_servers = vec![kin_agent::ServerSpec {
+        repo: beta.clone(),
+        mcp_command: mcp_command(&server, &beta_log),
+    }];
+
+    let outcome = kin_agent::run(cfg).expect("the run completes");
+    assert_eq!(outcome.status, ExitStatus::Success);
+
+    // Both files landed, each in its own tree.
+    assert_eq!(
+        std::fs::read_to_string(alpha.join("src/new_a.py")).unwrap(),
+        "a = 1\n"
+    );
+    assert!(
+        beta_file.exists(),
+        "the absolute-path write must land in the second repository at {}",
+        beta_file.display()
+    );
+    assert_eq!(std::fs::read_to_string(&beta_file).unwrap(), "b = 2\n");
+
+    // The primary server saw its own session, its own transaction, and no beta work.
+    let alpha_names: Vec<String> = mcp_log(&alpha_log)
+        .iter()
+        .map(|call| call["tool"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        alpha_names,
+        vec![
+            "kin_session_start",
+            "kin_transaction_begin",
+            "kin_transaction_stage",
+            "kin_transaction_commit",
+            "kin_session_end"
+        ],
+        "the primary must carry only its own relative-path write"
+    );
+
+    // The second server saw the model's Kin call and its own absolute-path write.
+    let beta_calls = mcp_log(&beta_log);
+    let beta_names: Vec<String> = beta_calls
+        .iter()
+        .map(|call| call["tool"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        beta_names,
+        vec![
+            "kin_session_start",
+            "semantic_locate",
+            "kin_transaction_begin",
+            "kin_transaction_stage",
+            "kin_transaction_commit",
+            "kin_session_end"
+        ],
+        "the prefixed Kin call and the absolute-path write must both reach beta"
+    );
+
+    // Each staged create names the path relative to its OWN repository, never the other's.
+    let staged_target = |calls: &[Value]| -> String {
+        calls
+            .iter()
+            .find(|call| call["tool"] == "kin_transaction_stage")
+            .expect("a create is staged")["args"]["operations"][0]["target"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(staged_target(&mcp_log(&alpha_log)), "src/new_a.py");
+    assert_eq!(staged_target(&beta_calls), "src/new_b.py");
+
+    // The trace attributes every call to the server that served it.
+    let trace = read_jsonl(&outcome.trace_path);
+    let locate = trace
+        .iter()
+        .find(|row| row["tool"] == "semantic_locate")
+        .expect("the Kin call is traced");
+    assert_eq!(locate["server"], "kin_beta");
+    let writes: Vec<&Value> = trace
+        .iter()
+        .filter(|row| row["surface"] == "local" && row["tool"] == "write_file")
+        .collect();
+    assert_eq!(writes.len(), 2);
+    assert_eq!(writes[0]["server"], "kin_alpha");
+    assert_eq!(writes[0]["repo"], alpha.display().to_string());
+    assert_eq!(writes[1]["server"], "kin_beta");
+    assert_eq!(writes[1]["repo"], beta.display().to_string());
+    for write in &writes {
+        assert_eq!(write["provenance"]["staged"]["accepted"], true);
+        assert_eq!(write["provenance"]["closed_with"], "kin_transaction_commit");
+    }
+
+    // The belt the model was given namespaces each repository's tools, and carries no
+    // ambiguous bare Kin name.
+    let requests = endpoint.requests();
+    let sent: Vec<String> = requests[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|spec| spec["function"]["name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(sent
+        .iter()
+        .any(|name| name == "mcp__kin_alpha__semantic_locate"));
+    assert!(sent
+        .iter()
+        .any(|name| name == "mcp__kin_beta__semantic_locate"));
+    assert!(
+        !sent.iter().any(|name| name == "mcp__kin__semantic_locate"),
+        "a multi-repository run must not expose an unqualified Kin tool: {sent:?}"
+    );
+
+    // Files changed are recorded absolutely, because the same relative path exists in both.
+    let changed: Vec<String> = outcome.result["kin_agent"]["files_changed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap().to_string())
+        .collect();
+    assert!(changed
+        .iter()
+        .any(|path| path.ends_with("alpha/src/new_a.py")));
+    assert!(changed
+        .iter()
+        .any(|path| path.ends_with("beta/src/new_b.py")));
+}
+
+/// A path in no attached repository runs nothing at all, and the refusal names the roots.
+#[test]
+fn a_path_outside_every_attached_repository_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let alpha = fixture_repo_named(dir.path(), "alpha");
+    let beta = fixture_repo_named(dir.path(), "beta");
+    let out = dir.path().join("out");
+    let server = write_fake_mcp_server(dir.path());
+    let alpha_log = dir.path().join("alpha-calls.jsonl");
+    let beta_log = dir.path().join("beta-calls.jsonl");
+    let stray = dir.path().join("elsewhere/escaped.py");
+
+    let endpoint = FakeEndpoint::start(vec![
+        completion(
+            "Writing outside.",
+            Some(tool_call(
+                "c1",
+                "write_file",
+                json!({ "path": stray.display().to_string(), "content": "x = 1\n" }),
+            )),
+        ),
+        completion("I could not write there.", None),
+    ]);
+    let base_url = endpoint.base_url.clone();
+
+    let mut cfg = config(&alpha, &out, &base_url, mcp_command(&server, &alpha_log));
+    cfg.extra_servers = vec![kin_agent::ServerSpec {
+        repo: beta.clone(),
+        mcp_command: mcp_command(&server, &beta_log),
+    }];
+
+    let outcome = kin_agent::run(cfg).expect("the run completes");
+    assert_eq!(outcome.status, ExitStatus::Success);
+    assert!(
+        !stray.exists(),
+        "nothing may be written outside the repositories"
+    );
+
+    // Neither server opened a transaction for it.
+    for log in [&alpha_log, &beta_log] {
+        let names: Vec<String> = mcp_log(log)
+            .iter()
+            .map(|call| call["tool"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, vec!["kin_session_start", "kin_session_end"]);
+    }
+
+    let trace = read_jsonl(&outcome.trace_path);
+    let write = trace
+        .iter()
+        .find(|row| row["surface"] == "local" && row["tool"] == "write_file")
+        .expect("the refused write is traced");
+    assert_eq!(write["is_error"], true);
+    let problem = write["problem"].as_str().unwrap();
+    assert!(
+        problem.contains("outside every repository")
+            && problem.contains(&alpha.display().to_string())
+            && problem.contains(&beta.display().to_string()),
+        "the refusal must name every root: {problem}"
     );
 }
 

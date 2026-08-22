@@ -25,12 +25,80 @@ pub const KIN_TOOL_PREFIX: &str = "mcp__kin__";
 /// Where a routed call goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Route {
-    /// A Kin tool, named without the transcript prefix.
-    Kin(String),
+    /// A Kin tool, named without the transcript prefix, on the server that serves it.
+    Kin { server: usize, tool: String },
     /// One of the two local tools.
     Local(LocalTool),
     /// Not in the belt. Carries the refusal the model is told.
     Refused(String),
+}
+
+/// One Kin tool on the belt, bound to the server that declared it.
+///
+/// A run can attach several graph servers, one per repository, and every one of them
+/// declares the same tool names. The binding has to travel with the tool or a call cannot
+/// be sent anywhere: the model's name is the only thing the router has to go on.
+#[derive(Debug, Clone)]
+pub struct KinTool {
+    /// Index into the run's server list.
+    pub server: usize,
+    /// The name the server itself declares.
+    pub bare: String,
+    /// The name the model calls, carrying the transcript prefix.
+    pub exposed: String,
+    pub description: String,
+    pub schema: Value,
+}
+
+/// The prefix one server's tools carry on the model's belt.
+///
+/// A single-server run keeps the historical `mcp__kin__`, so a one-repository transcript
+/// stays byte-identical to what the fleet's analyzers already read. Several servers each
+/// get `mcp__kin_<label>__`, which holds the `mcp__<server>__<tool>` shape those analyzers
+/// classify while naming the repository in every call the model makes.
+pub fn tool_prefix(label: Option<&str>) -> String {
+    match label {
+        None => KIN_TOOL_PREFIX.to_string(),
+        Some(label) => format!("mcp__kin_{label}__"),
+    }
+}
+
+/// A short, stable, unique label for one repository, for use in a tool prefix.
+///
+/// The directory name is what an operator recognizes, so it is the source. Anything a tool
+/// name cannot carry becomes `_`, and a collision takes a numeric suffix rather than
+/// silently sharing a namespace with another repository.
+pub fn server_label(repo: &Path, taken: &BTreeSet<String>) -> String {
+    let base: String = repo
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let base = base.trim_matches('_').to_string();
+    let base = if base.is_empty() {
+        "repo".to_string()
+    } else {
+        base
+    };
+    if !taken.contains(&base) {
+        return base;
+    }
+    let mut suffix = 2usize;
+    loop {
+        let candidate = format!("{base}_{suffix}");
+        if !taken.contains(&candidate) {
+            return candidate;
+        }
+        suffix += 1;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,17 +110,15 @@ pub enum LocalTool {
 /// The belt: every name the model may call this run.
 #[derive(Debug, Clone)]
 pub struct Belt {
-    kin_tools: Vec<(String, Value)>,
+    kin_tools: Vec<KinTool>,
     names: BTreeSet<String>,
 }
 
 impl Belt {
-    /// Build the belt from what the MCP server declared, plus the two local tools.
-    pub fn new(kin_tools: Vec<(String, Value)>) -> Self {
-        let mut names: BTreeSet<String> = kin_tools
-            .iter()
-            .map(|(name, _)| format!("{KIN_TOOL_PREFIX}{name}"))
-            .collect();
+    /// Build the belt from what the MCP servers declared, plus the two local tools.
+    pub fn new(kin_tools: Vec<KinTool>) -> Self {
+        let mut names: BTreeSet<String> =
+            kin_tools.iter().map(|tool| tool.exposed.clone()).collect();
         names.insert(EDIT_FILE.to_string());
         names.insert(WRITE_FILE.to_string());
         Belt { kin_tools, names }
@@ -65,12 +131,8 @@ impl Belt {
 
     /// The schema a named tool declares, for argument validation.
     pub fn schema_for(&self, name: &str) -> Option<Value> {
-        if let Some(bare) = name.strip_prefix(KIN_TOOL_PREFIX) {
-            return self
-                .kin_tools
-                .iter()
-                .find(|(tool, _)| tool == bare)
-                .map(|(_, schema)| schema.clone());
+        if let Some(tool) = self.kin_tools.iter().find(|tool| tool.exposed == name) {
+            return Some(tool.schema.clone());
         }
         match name {
             EDIT_FILE => Some(edit_file_schema()),
@@ -81,10 +143,11 @@ impl Belt {
 
     /// Route a name the model produced.
     pub fn route(&self, name: &str) -> Route {
-        if let Some(bare) = name.strip_prefix(KIN_TOOL_PREFIX) {
-            if self.kin_tools.iter().any(|(tool, _)| tool == bare) {
-                return Route::Kin(bare.to_string());
-            }
+        if let Some(tool) = self.kin_tools.iter().find(|tool| tool.exposed == name) {
+            return Route::Kin {
+                server: tool.server,
+                tool: tool.bare.clone(),
+            };
         }
         match name {
             EDIT_FILE => return Route::Local(LocalTool::Edit),
@@ -92,11 +155,20 @@ impl Belt {
             _ => {}
         }
         // A bare Kin tool name is a near miss worth naming precisely, because the model
-        // very likely meant the prefixed one and a generic refusal would not say so.
-        if self.kin_tools.iter().any(|(tool, _)| tool == name) {
+        // very likely meant a prefixed one and a generic refusal would not say so. With
+        // several repositories attached the same bare name exists on each, so the refusal
+        // names every prefixed form rather than picking one for the model.
+        let candidates: Vec<String> = self
+            .kin_tools
+            .iter()
+            .filter(|tool| tool.bare == name)
+            .map(|tool| format!("`{}`", tool.exposed))
+            .collect();
+        if !candidates.is_empty() {
             return Route::Refused(format!(
-                "There is no tool named `{name}`. The Kin tool is called `{KIN_TOOL_PREFIX}{name}`. \
-                 Call it by that exact name."
+                "There is no tool named `{name}`. The Kin tool is called {}. Call it by that \
+                 exact name.",
+                candidates.join(" or ")
             ));
         }
         Route::Refused(format!(
@@ -108,31 +180,35 @@ impl Belt {
     }
 
     /// The `tools` array sent to the chat endpoint.
-    pub fn to_specs(&self, descriptions: &[(String, String)]) -> Vec<Value> {
+    ///
+    /// `repo_note` is appended to the two local tool descriptions when a run attached more
+    /// than one repository, because the path rule genuinely changes: a relative path can no
+    /// longer mean only one tree.
+    pub fn to_specs(&self, repo_note: Option<&str>) -> Vec<Value> {
         let mut specs = Vec::new();
-        for (name, schema) in &self.kin_tools {
-            let description = descriptions
-                .iter()
-                .find(|(tool, _)| tool == name)
-                .map(|(_, text)| text.clone())
-                .unwrap_or_default();
+        for tool in &self.kin_tools {
             specs.push(json!({
                 "type": "function",
                 "function": {
-                    "name": format!("{KIN_TOOL_PREFIX}{name}"),
-                    "description": description,
-                    "parameters": schema,
+                    "name": tool.exposed,
+                    "description": tool.description,
+                    "parameters": tool.schema,
                 }
             }));
         }
+        let suffix = match repo_note {
+            Some(note) => format!(" {note}"),
+            None => String::new(),
+        };
         specs.push(json!({
             "type": "function",
             "function": {
                 "name": EDIT_FILE,
-                "description": "Replace one exact snippet of text in one file. The `find` text \
-                                must appear exactly once in the file unless `replace_all` is true. \
-                                Use this for a small, surgical change once Kin has told you where \
-                                the code is.",
+                "description": format!(
+                    "Replace one exact snippet of text in one file. The `find` text must appear \
+                     exactly once in the file unless `replace_all` is true. Use this for a small, \
+                     surgical change once Kin has told you where the code is.{suffix}"
+                ),
                 "parameters": edit_file_schema(),
             }
         }));
@@ -140,8 +216,10 @@ impl Belt {
             "type": "function",
             "function": {
                 "name": WRITE_FILE,
-                "description": "Write a file in full, creating it if it does not exist. Use this \
-                                for a new file; prefer edit_file for a change to an existing one.",
+                "description": format!(
+                    "Write a file in full, creating it if it does not exist. Use this for a new \
+                     file; prefer edit_file for a change to an existing one.{suffix}"
+                ),
                 "parameters": write_file_schema(),
             }
         }));
@@ -301,6 +379,49 @@ pub fn resolve_in_repo(repo: &Path, raw: &str) -> Result<PathBuf, String> {
     Ok(repo.join(resolved))
 }
 
+/// Resolve a model-supplied path to the repository that owns it, and to the file inside it.
+///
+/// One repository is the ordinary case and behaves exactly like [`resolve_in_repo`]. With
+/// several attached, an absolute path is matched against every root and the longest match
+/// wins, which is the containment rule and the only one that stays correct when one
+/// checkout sits inside another. A relative path resolves against the primary repository,
+/// because the alternative is asking the filesystem which tree the model meant, and a wrong
+/// guess writes into the wrong repository. The model is told this rule in the tool
+/// descriptions rather than left to discover it.
+pub fn resolve_across_repos(repos: &[PathBuf], raw: &str) -> Result<(usize, PathBuf), String> {
+    let Some(primary) = repos.first() else {
+        return Err("this run attached no repository".to_string());
+    };
+    if repos.len() == 1 || !Path::new(raw).is_absolute() {
+        return resolve_in_repo(primary, raw).map(|path| (0, path));
+    }
+    let mut best: Option<(usize, PathBuf, usize)> = None;
+    for (index, repo) in repos.iter().enumerate() {
+        let Ok(path) = resolve_in_repo(repo, raw) else {
+            continue;
+        };
+        let depth = repo.components().count();
+        let better = match &best {
+            None => true,
+            Some((_, _, chosen)) => depth > *chosen,
+        };
+        if better {
+            best = Some((index, path, depth));
+        }
+    }
+    match best {
+        Some((index, path, _)) => Ok((index, path)),
+        None => Err(format!(
+            "`{raw}` is outside every repository this run attached. The roots are: {}.",
+            repos
+                .iter()
+                .map(|repo| repo.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
 /// Run `edit_file`.
 pub fn run_edit(repo: &Path, arguments: &Value) -> LocalOutcome {
     let raw_path = arguments.get("path").and_then(Value::as_str).unwrap_or("");
@@ -396,7 +517,9 @@ pub fn run_write(repo: &Path, arguments: &Value) -> LocalOutcome {
 }
 
 impl LocalOutcome {
-    fn error(message: String) -> Self {
+    /// A refusal the model is handed instead of a run, in the shape a run would have
+    /// produced, so a routing failure reads to the caller exactly like a tool failure.
+    pub fn error(message: String) -> Self {
         LocalOutcome {
             text: message,
             is_error: true,

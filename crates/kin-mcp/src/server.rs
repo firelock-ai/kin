@@ -1264,6 +1264,13 @@ async fn handle_tools_call_daemon(
             }
         };
 
+    // Stamped on every answer, not only on the ones that failed. A suspended
+    // sweep is a standing fact about what this store's graph can contain, so
+    // the call it changes the reading of is the one that SUCCEEDS and returns
+    // nothing: an agent certifying that absence needs to know the producer that
+    // would have filled it is switched off.
+    base_env = base_env.with_suspended_sweep(daemon_delegate::suspended_sweep().as_ref());
+
     // `kin_graph_status` already reports the exact graph view selected by the
     // daemon, including temporal-session scope. Generic `/health` is HEAD-only:
     // borrowing its entity count or generation here would mix two authorities
