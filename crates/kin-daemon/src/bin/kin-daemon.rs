@@ -257,6 +257,33 @@ fn parse_allowed_repo_ids() -> Option<HashSet<String>> {
     }
 }
 
+/// Adopt this repository's recorded resource profile while the process is still
+/// single-threaded.
+///
+/// The layout is resolved here rather than reused from `async_main` because the
+/// environment must be mutated before the runtime exists, and `async_main` does
+/// not run until after it is built. `parse_args` is pure over the process
+/// arguments, so calling it twice costs nothing and changes nothing. Every
+/// failure is silent on purpose: an argument or layout problem is reported once,
+/// with its real message, by `async_main`.
+fn apply_repository_resource_profile() {
+    let Ok(args) = parse_args() else {
+        return;
+    };
+    if args.supervisor || args.compat_json {
+        return;
+    }
+    let Some(layout) = resolve_layout(&args.repo) else {
+        return;
+    };
+    let Ok(config) = kin_core::KinConfig::load_or_default(&layout.config_path()) else {
+        return;
+    };
+    kin_cli::resource_profile::apply_repository_profile(
+        config.resources.normalized_profile().as_deref(),
+    );
+}
+
 fn resolve_layout(path: &Path) -> Option<KinLayout> {
     if path.file_name().and_then(|name| name.to_str()) == Some(".kin") && path.is_dir() {
         return Some(KinLayout::new(path.to_path_buf()));
@@ -334,6 +361,10 @@ fn main() {
     // comparison `kin embed` and `kin resources inspect` run against this
     // daemon still matches. An operator's explicit KIN_RESOURCE_PROFILE wins.
     kin_cli::resource_profile::apply_product_default();
+    // …then let this repository's recorded profile take over from that default,
+    // still single-threaded and still ahead of every reader (FIR-2504). An
+    // operator's own KIN_RESOURCE_PROFILE outranks the file and is untouched.
+    apply_repository_resource_profile();
     // Build the async runtime explicitly (rather than via `#[tokio::main]`) so
     // we own its teardown. The embedding worker dispatches batches onto the
     // blocking pool doing synchronous GPU compute that cannot observe the
@@ -576,11 +607,33 @@ async fn async_main() -> i32 {
         }
     };
 
+    // The batch size an operator recorded for this repository, which is what
+    // has to survive the restart an OOM forces (FIR-2504). Read from the state
+    // the daemon has already opened, so no new file and no second discovery.
+    let repository_resources = kin_core::KinConfig::load_or_default(&state.layout.config_path())
+        .map_or_else(
+            |error| {
+                // A config this process cannot parse is a fact worth saying out
+                // loud. Refusing to boot over it would strand a repository whose
+                // config drifted, so the daemon runs on its defaults and says
+                // which knobs it therefore did not adopt.
+                eprintln!(
+                    "kin-daemon: ignoring [resources] config: {error}; running with the built-in \
+                     embed batch size"
+                );
+                kin_core::ResourcesConfig::default()
+            },
+            |config| config.resources,
+        );
+
     let embed_batch_size = match embed_batch_size_from_env() {
         Ok(explicit) => {
             let resource_profile = env::var("KIN_RESOURCE_PROFILE").ok();
             kin_cli::commands::resources::resolve_embed_batch_size(
-                explicit,
+                // An operator's environment still wins; the repository config
+                // is what fills in for it once the shell that exported it is
+                // gone, which on a restart is always.
+                explicit.or(repository_resources.embed_batch_size),
                 resource_profile.as_deref(),
                 DaemonConfig::default().embed_batch_size,
                 kin_cli::commands::resources::throughput_embed_batch_size,

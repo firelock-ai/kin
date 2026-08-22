@@ -1292,6 +1292,24 @@ pub struct DaemonState {
     /// worker so they cannot drain queues and mutate the vector index
     /// concurrently.
     pub embedding_work: Mutex<()>,
+    /// Batch size the background embedding queue is actually running with,
+    /// published by the daemon's own startup once it has resolved the operator's
+    /// environment, this repository's `[resources]` config, and its built-in
+    /// default (FIR-2504).
+    ///
+    /// Reported by `kin resources inspect` because without it there is no way to
+    /// see whether a knob took. The ticket's whole mechanism was a flag that
+    /// looked like it worked, so a surface that cannot show the effective value
+    /// cannot answer the question an operator is actually asking. Zero means the
+    /// daemon has not published one yet, which is not a batch size of zero.
+    embed_batch_size: AtomicUsize,
+    /// Last settled `kin_graph_status` reading per selected-graph scope, so a
+    /// status call whose live sample loses every bounded attempt answers with
+    /// that reading marked stale instead of a bare retry instruction
+    /// (FIR-2135). Two fixed slots holding one already-computed observation
+    /// each; it costs no lock the embed path needs and no work proportional to
+    /// the graph, which is the constraint FIR-2416 put on this surface.
+    pub(crate) graph_status_settled: crate::api::GraphStatusSettledCache,
     /// Serializes derived-index and hosted snapshot persistence so the
     /// persistence loop, idle-shutdown flush, and embedding worker can never
     /// interleave writes. Local repository-v6 authority is committed before
@@ -1902,6 +1920,21 @@ impl DaemonState {
     /// part-way through a fill still knows what earlier runs of this store
     /// finished. The cost is one stat on a path taken once per embed interval
     /// and once per readiness probe.
+    /// Publish the batch size the background embedding queue will run with.
+    /// Called once by the daemon runtime after it resolves its configuration.
+    pub fn publish_embed_batch_size(&self, size: usize) {
+        self.embed_batch_size.store(size, Ordering::Relaxed);
+    }
+
+    /// The background embedding queue's batch size, or `None` when the daemon
+    /// has not published one yet. Absent and zero are different answers.
+    pub fn embed_batch_size(&self) -> Option<usize> {
+        match self.embed_batch_size.load(Ordering::Relaxed) {
+            0 => None,
+            size => Some(size),
+        }
+    }
+
     pub fn embedding_coverage_ever_complete(&self) -> bool {
         self.layout.kindb_embedding_coverage_marker_path().exists()
     }
@@ -2539,6 +2572,8 @@ impl DaemonState {
             dirty: AtomicBool::new(false),
             mutation_epoch: AtomicU64::new(0),
             embedding_work: Mutex::new(()),
+            embed_batch_size: AtomicUsize::new(0),
+            graph_status_settled: crate::api::GraphStatusSettledCache::default(),
             persist_lock: Mutex::new(()),
             #[cfg(feature = "embeddings")]
             vector_checkpoint_authority_match: VectorCheckpointAuthorityMatch::default(),
@@ -2773,6 +2808,8 @@ impl DaemonState {
             dirty: AtomicBool::new(false),
             mutation_epoch: AtomicU64::new(0),
             embedding_work: Mutex::new(()),
+            embed_batch_size: AtomicUsize::new(0),
+            graph_status_settled: crate::api::GraphStatusSettledCache::default(),
             persist_lock: Mutex::new(()),
             #[cfg(feature = "embeddings")]
             vector_checkpoint_authority_match: VectorCheckpointAuthorityMatch::default(),

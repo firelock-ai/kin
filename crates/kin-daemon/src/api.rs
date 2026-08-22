@@ -2023,6 +2023,90 @@ async fn resolve_session_source_scope(
 const XREF_STABLE_READ_ATTEMPTS: usize = 3;
 const GRAPH_STATUS_STABLE_READ_ATTEMPTS: usize = 3;
 const GRAPH_STATUS_WRITER_SETTLE_FLOOR: Duration = Duration::from_millis(50);
+/// How long a contended status attempt waits before trying again.
+///
+/// The wait is the cheap half of FIR-2135: an embedding batch or a reconcile
+/// step that is merely between lock-points settles inside a few tens of
+/// milliseconds, and answering live is always better than answering stale. It
+/// is deliberately small because status is what settle loops poll, and it
+/// doubles per attempt, so the total added latency in the contended case is
+/// under a tenth of a second and nothing is held while it elapses.
+const GRAPH_STATUS_ATTEMPT_BACKOFF: Duration = Duration::from_millis(25);
+
+/// The last settled `kin_graph_status` observation of one selected graph.
+///
+/// The graph is held as a [`std::sync::Weak`] for two reasons: a temporal
+/// session graph must still be freed while a reading about it is cached, and
+/// holding the weak reference keeps the allocation reserved, so a later graph
+/// can never land on the same address and be mistaken for this one.
+struct SettledGraphStatus {
+    graph: std::sync::Weak<kin_db::InMemoryGraph>,
+    observation: kin_mcp::handlers::entities::GraphStatusObservation,
+    at: Instant,
+}
+
+/// The daemon's last settled status reading per selected-graph scope.
+///
+/// Two fixed slots, HEAD and temporal session, and never a map: an unbounded
+/// per-session cache would grow with sessions, and the case the defect is about
+/// is a poller hammering one selected graph. A scope whose slot describes a
+/// different graph simply has no settled reading, which is reported as exactly
+/// that rather than answered from the wrong graph.
+#[derive(Default)]
+pub(crate) struct GraphStatusSettledCache {
+    head: std::sync::Mutex<Option<SettledGraphStatus>>,
+    session: std::sync::Mutex<Option<SettledGraphStatus>>,
+}
+
+impl GraphStatusSettledCache {
+    fn slot(
+        &self,
+        scope: kin_mcp::handlers::entities::GraphStatusScope,
+    ) -> &std::sync::Mutex<Option<SettledGraphStatus>> {
+        match scope {
+            kin_mcp::handlers::entities::GraphStatusScope::Head => &self.head,
+            kin_mcp::handlers::entities::GraphStatusScope::TemporalSession => &self.session,
+        }
+    }
+
+    /// Record a reading that completed the full live fence. O(1), taken after
+    /// the fence is released, so recording can never lengthen the window an
+    /// embed worker waits on.
+    fn record(
+        &self,
+        scope: kin_mcp::handlers::entities::GraphStatusScope,
+        graph: &Arc<kin_db::InMemoryGraph>,
+        observation: kin_mcp::handlers::entities::GraphStatusObservation,
+    ) {
+        let Ok(mut slot) = self.slot(scope).lock() else {
+            return;
+        };
+        *slot = Some(SettledGraphStatus {
+            graph: Arc::downgrade(graph),
+            observation,
+            at: Instant::now(),
+        });
+    }
+
+    /// The settled reading for this exact selected graph, with its age.
+    ///
+    /// Identity is pointer equality against the retained weak reference, so a
+    /// HEAD reading is never served for a session scope and a reading about a
+    /// retired session graph is never served for its replacement.
+    fn get(
+        &self,
+        scope: kin_mcp::handlers::entities::GraphStatusScope,
+        graph: &Arc<kin_db::InMemoryGraph>,
+    ) -> Option<(
+        kin_mcp::handlers::entities::GraphStatusObservation,
+        Duration,
+    )> {
+        let slot = self.slot(scope).lock().ok()?;
+        let settled = slot.as_ref()?;
+        (std::ptr::eq(settled.graph.as_ptr(), Arc::as_ptr(graph)))
+            .then(|| (settled.observation, settled.at.elapsed()))
+    }
+}
 
 /// Capture one point-in-time status observation of the graph selected for this
 /// request.
@@ -2060,14 +2144,20 @@ async fn mcp_graph_status_with_stable_authority(
     authority: RequestGraphAuthority,
     scope: kin_mcp::handlers::entities::GraphStatusScope,
 ) -> kin_mcp::Result<kin_mcp::ToolCallResult> {
-    for _ in 0..GRAPH_STATUS_STABLE_READ_ATTEMPTS {
+    let mut blocked = GraphStatusBlocked::SelectedGraphChanging;
+    for attempt in 0..GRAPH_STATUS_STABLE_READ_ATTEMPTS {
         let Some(authority_epoch) = state.stable_graph_authority_epoch() else {
-            tokio::task::yield_now().await;
+            blocked = GraphStatusBlocked::SelectedGraphChanging;
+            graph_status_attempt_backoff(attempt).await;
             continue;
         };
 
-        let observation = match state.embedding_work.try_lock() {
-            Ok(_embedding_guard) => {
+        // The try-lock result is resolved to a plain Option before anything is
+        // awaited: the guard is a `std::sync::MutexGuard`, so letting the match
+        // scrutinee live across the backoff below would make this future
+        // non-Send and the route would stop compiling.
+        let sampled = match state.embedding_work.try_lock() {
+            Ok(_embedding_guard) => Some({
                 let embeddings = selected_graph.embedding_status();
                 kin_mcp::handlers::entities::GraphStatusObservation {
                     authority_epoch,
@@ -2091,21 +2181,27 @@ async fn mcp_graph_status_with_stable_authority(
                     // is held.
                     durable_entity_count: state.durable_entity_count(),
                 }
-            }
-            Err(std::sync::TryLockError::WouldBlock) => {
-                return Ok(kin_mcp::ToolCallResult::error(
-                    "selected-graph embedding coverage is changing; retry kin_graph_status",
-                ));
-            }
+            }),
+            Err(std::sync::TryLockError::WouldBlock) => None,
             Err(std::sync::TryLockError::Poisoned(_)) => {
                 return Err(kin_mcp::McpError::Other(
                     "embedding work lock poisoned while sampling kin_graph_status".to_string(),
                 ));
             }
         };
+        let Some(observation) = sampled else {
+            // Spend the attempt rather than the caller's round trip. Before
+            // FIR-2135 this arm returned at the first contended try, so a store
+            // mid-embed never reached the second attempt and the caller was
+            // told to do the retrying the loop was built to do.
+            blocked = GraphStatusBlocked::EmbeddingCoverageChanging;
+            graph_status_attempt_backoff(attempt).await;
+            continue;
+        };
 
         if !state.graph_authority_epoch_is_current(authority_epoch) {
-            tokio::task::yield_now().await;
+            blocked = GraphStatusBlocked::SelectedGraphChanging;
+            graph_status_attempt_backoff(attempt).await;
             continue;
         }
         if !state
@@ -2113,19 +2209,114 @@ async fn mcp_graph_status_with_stable_authority(
             .await
             || !state.graph_authority_epoch_is_current(authority_epoch)
         {
-            tokio::task::yield_now().await;
+            blocked = GraphStatusBlocked::SelectedGraphChanging;
+            graph_status_attempt_backoff(attempt).await;
             continue;
         }
 
+        // Recorded after the fence is released and only for a reading that
+        // survived revalidation, so what a later contended call replays is a
+        // reading that was true at one instant rather than a torn one.
+        state
+            .graph_status_settled
+            .record(scope, selected_graph, observation);
         return kin_mcp::handlers::entities::handle_daemon_graph_status_observation(
             scope,
             observation,
         );
     }
 
-    Ok(kin_mcp::ToolCallResult::error(
-        "selected graph changed during status sampling; retry kin_graph_status",
-    ))
+    let attempts = u32::try_from(GRAPH_STATUS_STABLE_READ_ATTEMPTS).unwrap_or(u32::MAX);
+    let observed_authority_epoch = state.stable_graph_authority_epoch();
+    let Some((observation, age)) = state.graph_status_settled.get(scope, selected_graph) else {
+        // The one case with no honest reading to publish: this daemon has never
+        // completed a live sample of this selected graph. Say what was tried and
+        // what state blocked it, and name the condition that changes the answer,
+        // rather than instructing the caller to repeat what just failed.
+        return Ok(kin_mcp::ToolCallResult::error(format!(
+            "kin_graph_status could not sample the selected graph: {} across \
+             {attempts} attempts, and this daemon holds no settled reading of this graph to \
+             report as of an earlier instant. {}",
+            blocked.state_sentence(),
+            blocked.what_would_change_it(),
+        )));
+    };
+
+    let age_ms = u64::try_from(age.as_millis()).unwrap_or(u64::MAX);
+    kin_mcp::handlers::entities::handle_daemon_graph_status_stale_observation(
+        scope,
+        observation,
+        kin_mcp::handlers::entities::GraphStatusStaleness {
+            reason: blocked.stale_reason(),
+            settled_age_ms: age_ms,
+            observed_authority_epoch,
+            live_attempts: attempts,
+            note: format!(
+                "every counter here is as of {age_ms} ms ago: {} across {attempts} attempts, so \
+                 the live sample was abandoned and this daemon's last settled reading of the same \
+                 selected graph is reported instead. {}",
+                blocked.state_sentence(),
+                blocked.what_would_change_it(),
+            ),
+        },
+    )
+}
+
+/// What blocked the live status sample, carried across the attempt loop so the
+/// answer names the state rather than the last thing that happened to fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraphStatusBlocked {
+    EmbeddingCoverageChanging,
+    SelectedGraphChanging,
+}
+
+impl GraphStatusBlocked {
+    fn state_sentence(self) -> &'static str {
+        match self {
+            Self::EmbeddingCoverageChanging => {
+                "embedding-work serialization was held by an in-flight embedding pass"
+            }
+            Self::SelectedGraphChanging => {
+                "the selected graph's authority epoch moved while the counters were being read"
+            }
+        }
+    }
+
+    fn what_would_change_it(self) -> &'static str {
+        match self {
+            Self::EmbeddingCoverageChanging => {
+                "A live sample succeeds once the in-flight embedding pass releases; kin embed \
+                 --once drains the queue in the foreground, and the daemon log's \
+                 process_embedding_queue records show whether one is running."
+            }
+            Self::SelectedGraphChanging => {
+                "A live sample succeeds once graph mutation quiesces; the daemon's reconcile \
+                 activity is what is moving the epoch."
+            }
+        }
+    }
+
+    fn stale_reason(self) -> kin_mcp::handlers::entities::GraphStatusStaleReason {
+        match self {
+            Self::EmbeddingCoverageChanging => {
+                kin_mcp::handlers::entities::GraphStatusStaleReason::EmbeddingCoverageChanging
+            }
+            Self::SelectedGraphChanging => {
+                kin_mcp::handlers::entities::GraphStatusStaleReason::SelectedGraphChanging
+            }
+        }
+    }
+}
+
+/// Wait a bounded, doubling moment between contended status attempts.
+///
+/// Nothing is held across it: the embedding fence is already released and the
+/// counters have not been read, so this yields the daemon to the writer whose
+/// progress is the thing that unblocks the sample.
+async fn graph_status_attempt_backoff(attempt: usize) {
+    tokio::task::yield_now().await;
+    let shift = u32::try_from(attempt).unwrap_or(u32::MAX).min(4);
+    tokio::time::sleep(GRAPH_STATUS_ATTEMPT_BACKOFF.saturating_mul(1 << shift)).await;
 }
 
 /// One optimistic, point-in-time graph authority used by xref-style reads.
@@ -3347,14 +3538,23 @@ async fn command_resources(
         ));
     }
 
-    let profile = kin_cli::commands::resources::parse_profile(request.profile.as_deref())
-        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    // The daemon's own selector, not the request's absent case. Reporting
+    // `interactive` while this process runs under `ci` is a check that cannot
+    // fail, which is what FIR-2504 caught: the stranger set the profile,
+    // restarted as instructed, and inspect kept answering with the default.
+    let runtime_selector = std::env::var("KIN_RESOURCE_PROFILE").ok();
+    let profile = kin_cli::commands::resources::effective_inspect_profile(
+        request.profile.as_deref(),
+        runtime_selector.as_deref(),
+    )
+    .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
     let plan = kin_infer::resource::ResourcePlan::detect(profile);
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
     let embed_status = graph.embedding_status();
     let embed_runtime = kin_cli::commands::resources::EmbedRuntimeState {
+        embed_batch_size: state.embed_batch_size(),
         embed_worker_failed: state
             .embed_worker_failed
             .load(std::sync::atomic::Ordering::Relaxed),
@@ -23902,48 +24102,153 @@ mod tests {
         assert_eq!(unscoped_report.entity_count, 1);
     }
 
+    async fn head_graph_status(
+        state: &DaemonState,
+        graph: &Arc<kin_db::InMemoryGraph>,
+    ) -> kin_mcp::ToolCallResult {
+        mcp_graph_status_with_stable_authority(
+            state,
+            None,
+            graph,
+            RequestGraphAuthority::Head,
+            kin_mcp::handlers::entities::GraphStatusScope::Head,
+        )
+        .await
+        .unwrap()
+    }
+
+    fn parse_graph_status(
+        result: &kin_mcp::ToolCallResult,
+    ) -> kin_mcp::handlers::entities::GraphStatusReport {
+        serde_json::from_str(&mcp_result_text(result))
+            .unwrap_or_else(|error| panic!("status is not a valid report: {error}: {result:?}"))
+    }
+
+    /// FIR-2135: a status call that cannot take a live sample answers with the
+    /// last settled reading of the same graph, labelled as of that instant,
+    /// rather than refusing. The health-reporting tool must be able to report
+    /// while the box is busy, which is the only time anyone asks it.
     #[tokio::test]
-    async fn mcp_graph_status_fails_loud_while_embedding_coverage_is_changing() {
+    async fn graph_status_replays_the_settled_reading_while_embedding_coverage_changes() {
+        let state = test_state();
+        let graph = Arc::clone(&state.graph);
+        state
+            .graph
+            .upsert_entity(&test_entity("handler", "src/lib.py"))
+            .unwrap();
+
+        let settled = parse_graph_status(&head_graph_status(&state, &graph).await);
+        assert_eq!(
+            settled.sampling,
+            kin_mcp::handlers::entities::GraphStatusSampling::PointInTimeSelectedGraph
+        );
+        assert!(settled.stale.is_none(), "{settled:?}");
+
+        let _embedding_guard = state.embedding_work.lock().unwrap();
+        let result = head_graph_status(&state, &graph).await;
+
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let report = parse_graph_status(&result);
+        assert_eq!(
+            report.sampling,
+            kin_mcp::handlers::entities::GraphStatusSampling::LastSettledSelectedGraph
+        );
+        let stale = report.stale.as_ref().expect("a replay discloses itself");
+        assert_eq!(
+            stale.reason,
+            kin_mcp::handlers::entities::GraphStatusStaleReason::EmbeddingCoverageChanging
+        );
+        assert_eq!(
+            stale.live_attempts,
+            GRAPH_STATUS_STABLE_READ_ATTEMPTS as u32
+        );
+        // The counters are the settled reading's own, not invented and not zero.
+        assert_eq!(report.entity_count, settled.entity_count);
+        assert_eq!(report.relation_count, settled.relation_count);
+        assert_eq!(report.embeddings_total, settled.embeddings_total);
+        assert_eq!(report.authority_epoch, settled.authority_epoch);
+        // The note states the blocking state and what changes it, and never
+        // stands in for the answer as a bare instruction to try again.
+        assert!(
+            stale.note.contains("in-flight embedding pass"),
+            "{:?}",
+            stale.note
+        );
+        assert!(stale.note.contains("kin embed"), "{:?}", stale.note);
+    }
+
+    /// The same shape for the churn the ticket was filed from: an authority
+    /// epoch that keeps moving is a busy graph, not an unanswerable one.
+    #[tokio::test]
+    async fn graph_status_replays_the_settled_reading_during_graph_authority_mutation() {
+        let state = test_state();
+        let graph = Arc::clone(&state.graph);
+
+        let settled = parse_graph_status(&head_graph_status(&state, &graph).await);
+
+        let _mutation_guard = state.begin_graph_authority_mutation();
+        let result = head_graph_status(&state, &graph).await;
+
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let report = parse_graph_status(&result);
+        assert_eq!(
+            report.sampling,
+            kin_mcp::handlers::entities::GraphStatusSampling::LastSettledSelectedGraph
+        );
+        let stale = report.stale.as_ref().expect("a replay discloses itself");
+        assert_eq!(
+            stale.reason,
+            kin_mcp::handlers::entities::GraphStatusStaleReason::SelectedGraphChanging
+        );
+        assert_eq!(report.entity_count, settled.entity_count);
+    }
+
+    /// The one case with nothing honest to publish still must not answer with a
+    /// bare retry instruction: it names what was tried, the state that blocked
+    /// it, and the condition that changes the outcome.
+    #[tokio::test]
+    async fn graph_status_with_no_settled_reading_names_the_blocking_state() {
         let state = test_state();
         let graph = Arc::clone(&state.graph);
         let _embedding_guard = state.embedding_work.lock().unwrap();
 
-        let result = mcp_graph_status_with_stable_authority(
-            &state,
-            None,
-            &graph,
-            RequestGraphAuthority::Head,
-            kin_mcp::handlers::entities::GraphStatusScope::Head,
-        )
-        .await
-        .unwrap();
+        let result = head_graph_status(&state, &graph).await;
 
         assert_eq!(result.is_error, Some(true));
+        let text = mcp_result_text(&result);
+        assert!(text.contains("in-flight embedding pass"), "{text}");
+        assert!(text.contains("holds no settled reading"), "{text}");
+        assert!(text.contains("kin embed"), "{text}");
         assert!(
-            mcp_result_text(&result).contains("embedding coverage is changing"),
-            "{result:?}"
+            !text.contains("retry kin_graph_status"),
+            "the refusal is still a bare retry instruction: {text}"
         );
     }
 
+    /// The replay is about ONE selected graph. A settled HEAD reading must never
+    /// answer for a different graph, or status would publish another store's
+    /// counters under this scope.
     #[tokio::test]
-    async fn mcp_graph_status_fails_loud_during_graph_authority_mutation() {
+    async fn a_settled_reading_is_never_replayed_for_a_different_graph() {
         let state = test_state();
         let graph = Arc::clone(&state.graph);
-        let _mutation_guard = state.begin_graph_authority_mutation();
+        let _settled = head_graph_status(&state, &graph).await;
 
+        let other: Arc<kin_db::InMemoryGraph> = Arc::new(kin_db::InMemoryGraph::new());
+        let _embedding_guard = state.embedding_work.lock().unwrap();
         let result = mcp_graph_status_with_stable_authority(
             &state,
             None,
-            &graph,
+            &other,
             RequestGraphAuthority::Head,
             kin_mcp::handlers::entities::GraphStatusScope::Head,
         )
         .await
         .unwrap();
 
-        assert_eq!(result.is_error, Some(true));
+        assert_eq!(result.is_error, Some(true), "{result:?}");
         assert!(
-            mcp_result_text(&result).contains("changed during status sampling"),
+            mcp_result_text(&result).contains("holds no settled reading"),
             "{result:?}"
         );
     }

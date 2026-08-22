@@ -2342,6 +2342,27 @@ kin resources <subcommand>
 
 Subcommands:
 
+#### `kin resources set`
+
+Record resource knobs for this repository so they survive a daemon restart
+
+```
+kin resources set [options]
+```
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--profile <profile>` |  | Resource profile the daemon adopts at its next start: proof, interactive, throughput, or ci |
+| `--embed-batch-size <n>` |  | Batch size for the daemon's background embedding queue |
+| `--clear` |  | Remove the recorded knobs and go back to the built-in defaults |
+
+The knobs land in this repository's `.kin/config.toml` under `[resources]`, and
+the daemon reads them at startup, so a batch size set to survive an OOM is still
+in force on the restart that OOM causes. An operator's own `KIN_RESOURCE_PROFILE`
+or `KIN_DAEMON_EMBED_BATCH_SIZE` still outranks the file. A running daemon keeps
+the values it started with; stop it, or let it idle out, for the new ones to
+take effect.
+
 #### `kin resources inspect`
 
 Report the detected resource plan and live daemon embedding state
@@ -2354,6 +2375,12 @@ kin resources inspect [options]
 | --- | --- | --- |
 | `--json` |  | Output the stable JSON resource plan instead of a human summary |
 | `--profile <profile>` |  | Resource profile to plan for: proof, interactive, throughput, or ci |
+
+With no `--profile`, the plan reported is the one the inspected daemon is
+actually running under, and the `Profile selector` line names where that came
+from: an operator's environment, this repository's config, or kin's own default.
+A selector value the runtime cannot act on is reported as `REJECTED` with the
+reason, rather than silently replaced by the default.
 
 ### `kin support`
 

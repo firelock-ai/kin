@@ -2999,6 +2999,10 @@ pub async fn run_with_authority_on(
     };
 
     let state = Arc::new(state);
+    // Publish the resolved background batch size so `kin resources inspect` can
+    // report the value actually in force rather than leaving an operator to
+    // infer it from log lines (FIR-2504).
+    state.publish_embed_batch_size(config.embed_batch_size);
 
     // Nothing used to trigger a sweep. The enrichment worker started, blocked on
     // a channel, and waited: the incremental path fires only on watcher
