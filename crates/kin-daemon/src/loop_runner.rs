@@ -863,9 +863,7 @@ fn exact_tree_admission(
                 tree_deltas: deltas.clone(),
                 ..TransactionDelta::default()
             })
-            .map_err(|error| {
-                name_stranded_endpoint_refusal(DaemonError::Graph(error), &deltas)
-            })?;
+            .map_err(|error| name_stranded_endpoint_refusal(DaemonError::Graph(error), &deltas))?;
     }
 
     if observation.is_none() {
