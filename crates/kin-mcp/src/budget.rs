@@ -1907,10 +1907,6 @@ mod tests {
         }
     }
 
-    /// A list nothing was taken from must not grow an elision, whatever calls
-    /// the recorder. The ladder guards this at its call site; this guards the
-    /// recorder itself, so a second producer added later cannot publish a loss
-    /// of zero.
     // ── The body a budget takes says so on the row (FIR-2482) ───────────
 
     /// A context pack of `rows` dependencies, each carrying a body, plus a
@@ -2089,6 +2085,10 @@ mod tests {
         );
     }
 
+    /// A list nothing was taken from must not grow an elision, whatever calls
+    /// the recorder. The ladder guards this at its call site; this guards the
+    /// recorder itself, so a second producer added later cannot publish a loss
+    /// of zero.
     #[test]
     fn recording_a_loss_of_nothing_writes_nothing() {
         let mut payload = json!({ "entities": [] });
