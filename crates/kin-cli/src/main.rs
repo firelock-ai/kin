@@ -132,6 +132,10 @@ enum Command {
         wait_quiesce: u64,
     },
     /// Create an exact semantic and artifact commit
+    ///
+    /// The long help is built in `commit_progress` around the same sentence a
+    /// commit prints, so this surface and that one cannot drift (FIR-2627).
+    #[command(long_about = commands::commit_progress::COMMIT_LONG_ABOUT)]
     Commit {
         /// Commit message
         #[arg(short, long)]

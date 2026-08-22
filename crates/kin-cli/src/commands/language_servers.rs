@@ -514,6 +514,114 @@ pub(crate) fn is_permission_failure(reason: &str) -> bool {
         .any(|signature| lowered.contains(signature))
 }
 
+/// Whether a failure is the network refusing the installer rather than the
+/// installer refusing the package, and in which of its three shapes.
+///
+/// Matched against the installer's own words, because that is all Kin has: npm
+/// and rustup both exit non-zero with the cause in stderr and nothing in the
+/// status. The signatures are the shapes a proxied or filtered network
+/// produces, split three ways because they are three different fixes. A
+/// connection that never completes is routing, a certificate that will not
+/// verify is a proxy re-signing TLS, and a 403 or 407 from a registry that
+/// answered is an allowlist or proxy credentials.
+///
+/// Deliberately checked AFTER `is_permission_failure`: an EACCES that also
+/// mentions a registry URL is still a permission failure, and its remedy is the
+/// one that moves the prefix. `None` when nothing in the reason looks like the
+/// network.
+pub(crate) fn network_shape(reason: &str) -> Option<&'static str> {
+    const UNREACHABLE: [&str; 12] = [
+        "etimedout",
+        "esockettimedout",
+        "econnrefused",
+        "econnreset",
+        "enotfound",
+        "eai_again",
+        "ehostunreach",
+        "enetunreach",
+        "socket hang up",
+        "network request to",
+        "error network",
+        "could not download",
+    ];
+    const TLS: [&str; 7] = [
+        "self signed certificate",
+        "self-signed certificate",
+        "unable to get local issuer",
+        "unable to verify the first certificate",
+        "cert_",
+        "depth_zero_self_signed_cert",
+        "ssl routines",
+    ];
+    const REFUSED_BY_A_MIDDLEBOX: [&str; 6] = [
+        "e403",
+        "403 forbidden",
+        "e407",
+        "407 proxy",
+        "proxy authentication required",
+        "tunneling socket could not be established",
+    ];
+    let lowered = reason.to_lowercase();
+    let has = |signatures: &[&str]| {
+        signatures
+            .iter()
+            .any(|signature| lowered.contains(signature))
+    };
+    if has(&TLS) {
+        return Some("a TLS certificate this host would not verify, which is what a proxy that \
+                     re-signs traffic looks like");
+    }
+    if has(&REFUSED_BY_A_MIDDLEBOX) {
+        return Some("a server that answered and refused, which is what a proxy or a registry \
+                     allowlist looks like");
+    }
+    if has(&UNREACHABLE) {
+        return Some("a connection that never completed, which is what a blocked or unrouted \
+                     network looks like");
+    }
+    None
+}
+
+/// What Kin still does when a language server is not installed.
+///
+/// The half FIR-2629 found missing. A failed install told an operator what
+/// broke and left them to guess whether Kin was now useless, which it is not:
+/// the parse-derived graph is unaffected, and the loss is bounded and named.
+pub(crate) const WORKS_WITHOUT_LANGUAGE_SERVERS: &str =
+    "Kin runs without this server. Parsing, search, history, review and commits are unaffected; \
+     what is missing is cross-file reference enrichment for that language, which Kin reports as \
+     pending rather than certifying that no reference exists.";
+
+/// The environment every installer here reads to route through a proxy.
+///
+/// Per program, because they do not agree. npm reads its own config keys as
+/// well as the environment, and rustup reads only the lowercase environment
+/// variables. Printing one blanket list would send half of its readers to a
+/// setting their installer ignores.
+fn proxy_environment_lines(program: &str) -> Vec<String> {
+    let mut lines = vec![
+        "    export HTTPS_PROXY=http://proxy.example:3128 HTTP_PROXY=http://proxy.example:3128"
+            .to_string(),
+        "    export NO_PROXY=localhost,127.0.0.1".to_string(),
+    ];
+    if program == "npm" {
+        lines.push(
+            "    npm config set proxy \"$HTTP_PROXY\"; npm config set https-proxy \
+             \"$HTTPS_PROXY\""
+                .to_string(),
+        );
+        lines.push(
+            "    export NODE_EXTRA_CA_CERTS=/path/to/proxy-ca.pem   # when the proxy re-signs TLS"
+                .to_string(),
+        );
+    } else {
+        // rustup reads the lowercase spellings only, and its downloader takes
+        // the certificate bundle from the OS store.
+        lines.push("    export https_proxy=\"$HTTPS_PROXY\" http_proxy=\"$HTTP_PROXY\"".to_string());
+    }
+    lines
+}
+
 /// The installer's own account of the failure, reduced to the lines naming it.
 ///
 /// npm leads with the code, the syscall and the path, which is exactly the
@@ -570,6 +678,24 @@ pub(crate) fn install_failure_remediation(
 ) -> Vec<String> {
     let command = recipe.command_line();
     if !is_permission_failure(reason) {
+        // A network shape is named before the generic advice, because "run it
+        // yourself to see the error" is worthless when the error is the one
+        // already printed and the cause is the environment rather than the
+        // command (FIR-2629).
+        if let Some(shape) = network_shape(reason) {
+            let mut lines = vec![
+                format!(
+                    "this is the network refusing `{command}`, not Kin and not the package: \
+                     {shape}"
+                ),
+                "if this host reaches the internet through a proxy, name it where the installer \
+                 reads it, then run the command again:"
+                    .to_string(),
+            ];
+            lines.extend(proxy_environment_lines(recipe.program));
+            lines.push(WORKS_WITHOUT_LANGUAGE_SERVERS.to_string());
+            return lines;
+        }
         return vec![format!(
             "run `{command}` yourself to see the installer's own error"
         )];
