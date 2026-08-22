@@ -105,6 +105,14 @@ jobs:
       - name: Falsify the response-budget elision graders
         run: python3 scripts/acceptance/response_budget_elisions.py --self-test
 
+      # FIR-2539. A memory cap that cannot fail is worse than no cap: it reads
+      # green while a conversion goes back to holding a second copy of history.
+      # The grader is driven against its own inverse, and the shipped cap is
+      # driven against a pre-fix-sized peak and a post-fix-sized one, so a cap
+      # loosened until nothing can trip it breaks here rather than passing.
+      - name: Falsify the init-memory graders
+        run: python3 scripts/acceptance/init_memory_repro.py --self-test
+
       - name: Install Rust toolchain
         uses: ./.github/actions/rust-toolchain
 
@@ -321,6 +329,34 @@ jobs:
             echo "::error title=Parse-hole acceptance suite failed::exit $rc (1 FAIL, 2 UNREADABLE, 3 setup); see the CHECK lines above"
           fi
 
+      - name: Init-memory acceptance suite
+        id: initmemory
+        if: always()
+        env:
+          KIN_ACCEPTANCE_LABEL: ${{ github.event_name }}-${{ github.sha }}
+        run: |
+          set -uo pipefail
+          mkdir -p acceptance
+          rc=0
+          python3 scripts/acceptance/init_memory_repro.py \
+            --kin target/release/kin \
+            --daemon target/release/kin-daemon \
+            --json acceptance/initmemory.json \
+            --label "$KIN_ACCEPTANCE_LABEL" \
+            --verbose >acceptance/initmemory.log 2>&1 || rc=$?
+          cat acceptance/initmemory.log
+          {
+            echo "### Init-memory acceptance suite (exit $rc)"
+            echo ''
+            echo '```'
+            grep -E '^CHECK ' acceptance/initmemory.log || echo '(no CHECK line was printed)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error title=Init-memory acceptance suite failed::exit $rc (1 FAIL, 2 UNREADABLE, 3 setup); see the CHECK lines above"
+          fi
+
       # Always, including on a cancelled or timed-out run: the reports are how a
       # failure is diagnosed without re-running the job.
       - name: Upload the acceptance reports
@@ -348,4 +384,5 @@ jobs:
             --report brownfield=acceptance/brownfield.json \
             --report response_budget=acceptance/response_budget.json \
             --report parsehole=acceptance/parsehole.json \
+            --report initmemory=acceptance/initmemory.json \
             --allow-unreadable 'brownfield:4=FIR-2593: the express app.handle walk comes back truncated=True with clipped_steps=None on ubuntu-latest, so an absent edge cannot be told from a dropped one. Build profile, product code from 0.5.44 through 0.5.46, and the pinned language-server versions are all ruled out; platform and code newer than 0.5.46 are still confounded. The moment the check passes this allowance announces itself stale and can go.'
