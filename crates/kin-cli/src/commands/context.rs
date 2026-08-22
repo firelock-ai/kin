@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use kin_model::EntityStore;
 use kin_model::{Entity, EntityFilter, EntityId, EntityKind, TokenBudget};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Resolve session id from KIN_SESSION_ID env var.
 ///
@@ -116,7 +117,38 @@ pub struct ContextResponse {
     /// the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dependency_selection: Option<ContextDependencySelection>,
+    /// What the token budget refused, per section, under the same group names
+    /// and the same shape the `get_context_pack` MCP tool publishes.
+    ///
+    /// Empty when the budget refused nothing, so a reader keying on this map
+    /// never has to tell "lost nothing" from "does not report losses": the
+    /// human rendering says the same thing on the same run.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub budget_elisions: BTreeMap<String, ContextElision>,
 }
+
+/// What one pack section lost to the token budget.
+///
+/// The same four fields the MCP `elisions` map carries, so a reader moving
+/// between `kin context --json` and `get_context_pack` is not learning two
+/// vocabularies for one fact.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextElision {
+    /// Rows the token budget refused.
+    pub elided: usize,
+    /// Rows the pack still carries.
+    pub kept: usize,
+    /// Rows that were candidates, which is `kept + elided`.
+    pub total: usize,
+    /// What withheld them. `token_budget` here, named rather than assumed so a
+    /// cut made later for another reason cannot be read as this one.
+    pub reason: String,
+}
+
+/// The reason code a row the pack's token budget refused carries. Matches
+/// `kin_mcp::budget::ELISION_REASON_TOKEN_BUDGET`, which is the same fact
+/// reported on the other surface.
+pub const CONTEXT_ELISION_REASON_TOKEN_BUDGET: &str = "token_budget";
 
 pub async fn run(
     entity: String,
@@ -194,6 +226,7 @@ pub fn build_context_response(
             target: None,
             pack: None,
             dependency_selection: None,
+            budget_elisions: BTreeMap::new(),
         });
     };
     let opts = kin_context::ContextOptions {
@@ -210,26 +243,76 @@ pub fn build_context_response(
     let dependents_returned = count_dependents(&pack, &selection);
     let dependencies_returned = pack.dependency_signatures.len() - dependents_returned;
 
+    let max_tokens = token_budget.max_tokens();
+    // What the budget refused, per section. The pack's rows are the whole of
+    // what the rendering used to show, and a section trimmed from twelve rows
+    // to six printed "Dependencies: 6 entries", which is exactly what a focal
+    // with six dependencies prints. Nothing on the surface distinguished them.
+    let elisions = budget_elisions(
+        &selection,
+        &[
+            (kin_context::group::DEPENDENCIES, dependencies_returned),
+            (kin_context::group::DEPENDENTS, dependents_returned),
+            (
+                kin_context::group::TRANSITIVE_DEPS,
+                pack.transitive_deps.len(),
+            ),
+            (kin_context::group::TESTS, pack.tests.len()),
+            (kin_context::group::CONTRACTS, pack.contracts.len()),
+            (kin_context::group::WORK_ITEMS, pack.work_items.len()),
+            (kin_context::group::ANNOTATIONS, pack.annotations.len()),
+        ],
+    );
+    let withheld = |group: &str| -> String { budget_note(&elisions, group, max_tokens) };
+
     let mut lines = vec![
         format!("Context pack for '{}' ({:?}):", target.name, target.kind),
-        format!(
-            "  Budget: {}/{} tokens",
-            pack.actual_tokens,
-            token_budget.max_tokens()
-        ),
+        format!("  Budget: {}/{} tokens", pack.actual_tokens, max_tokens),
         format!("  Focal: {} entries", pack.focal_entities.len()),
         format!(
             "  Dependencies: {} entries{}",
             dependencies_returned,
-            dependency_selection_note(&selection, dependencies_returned)
+            dependency_selection_note(
+                &selection,
+                dependencies_returned,
+                &elisions,
+                max_tokens
+            )
         ),
-        format!("  Dependents: {} entries", dependents_returned),
-        format!("  Transitive: {} entries", pack.transitive_deps.len()),
-        format!("  Contracts: {} entries", pack.contracts.len()),
-        format!("  Tests: {} entries", pack.tests.len()),
-        String::new(),
-        "--- Context Pack ---".to_string(),
+        format!(
+            "  Dependents: {} entries{}",
+            dependents_returned,
+            withheld(kin_context::group::DEPENDENTS)
+        ),
+        format!(
+            "  Transitive: {} entries{}",
+            pack.transitive_deps.len(),
+            withheld(kin_context::group::TRANSITIVE_DEPS)
+        ),
+        format!(
+            "  Contracts: {} entries{}",
+            pack.contracts.len(),
+            withheld(kin_context::group::CONTRACTS)
+        ),
+        format!(
+            "  Tests: {} entries{}",
+            pack.tests.len(),
+            withheld(kin_context::group::TESTS)
+        ),
     ];
+    // One line naming the lever, because a per-section count says what was lost
+    // and not what recovers it. Present only when something was cut, so a whole
+    // pack never carries a note about a cut that did not happen.
+    let total_elided: usize = elisions.values().map(|elision| elision.elided).sum();
+    if total_elided > 0 {
+        lines.push(format!(
+            "  Raise --budget above {max_tokens} to recover the {total_elided} \
+             {} the token budget withheld.",
+            if total_elided == 1 { "entry" } else { "entries" }
+        ));
+    }
+    lines.push(String::new());
+    lines.push("--- Context Pack ---".to_string());
 
     for entry in &pack.focal_entities {
         lines.push(entry.content.clone());
@@ -257,8 +340,52 @@ pub fn build_context_response(
             same_file_candidates: selection.same_file_candidates(),
             same_file_dropped: selection.same_file_dropped(),
         }),
+        budget_elisions: elisions,
         pack: Some(pack),
     })
+}
+
+/// What the token budget refused, per section, keyed by the group names the two
+/// surfaces share.
+///
+/// Sections with nothing refused are absent rather than present with a zero, so
+/// the map answers "did this pack lose anything" by being empty or not.
+fn budget_elisions(
+    selection: &kin_context::DependencySelection,
+    sections: &[(&str, usize)],
+) -> BTreeMap<String, ContextElision> {
+    let mut elisions = BTreeMap::new();
+    for (group, kept) in sections {
+        let elided = selection.budget_elided(group);
+        if elided == 0 {
+            continue;
+        }
+        elisions.insert(
+            (*group).to_string(),
+            ContextElision {
+                elided,
+                kept: *kept,
+                total: kept.saturating_add(elided),
+                reason: CONTEXT_ELISION_REASON_TOKEN_BUDGET.to_string(),
+            },
+        );
+    }
+    elisions
+}
+
+/// The parenthetical a section line carries when the budget took rows from it.
+fn budget_note(
+    elisions: &BTreeMap<String, ContextElision>,
+    group: &str,
+    max_tokens: usize,
+) -> String {
+    match elisions.get(group) {
+        Some(elision) => format!(
+            " ({} withheld by the {max_tokens}-token budget)",
+            elision.elided
+        ),
+        None => String::new(),
+    }
 }
 
 /// Rows in the pack's dependency section that depend on the focal.
@@ -288,15 +415,41 @@ fn count_dependents(
 fn dependency_selection_note(
     selection: &kin_context::DependencySelection,
     returned: usize,
+    elisions: &BTreeMap<String, ContextElision>,
+    max_tokens: usize,
 ) -> String {
+    let budget = budget_note(elisions, kin_context::group::DEPENDENCIES, max_tokens);
     match selection.source() {
-        kin_context::DependencySource::DependencyEdges if returned == 0 => String::new(),
-        kin_context::DependencySource::DependencyEdges => " (dependency edges)".to_string(),
-        kin_context::DependencySource::SameFileFallback => format!(
-            " (same-file neighbors, no dependency edges; kept {} of {})",
-            selection.same_file_kept(),
-            selection.same_file_candidates()
-        ),
+        kin_context::DependencySource::DependencyEdges if returned == 0 => budget,
+        kin_context::DependencySource::DependencyEdges => format!(" (dependency edges){budget}"),
+        // Both causes, separately, whenever both are real. Nothing recovers the
+        // cap and `--budget` recovers the other, so folding them into one
+        // shortfall would rebuild the two-causes-one-number reading this
+        // disclosure exists to remove. Naming both is what keeps the whole
+        // shortfall accountable while the causes stay distinct.
+        kin_context::DependencySource::SameFileFallback => {
+            let candidates = selection.same_file_candidates();
+            let kept = selection.same_file_kept();
+            let refused = elisions
+                .get(kin_context::group::DEPENDENCIES)
+                .map_or(0, |elision| elision.elided);
+            let capped = candidates.saturating_sub(kept).saturating_sub(refused);
+            let mut note =
+                format!(" (same-file neighbors, no dependency edges; kept {kept} of {candidates}");
+            if refused > 0 {
+                note.push_str(&format!(
+                    "; {refused} withheld by the {max_tokens}-token budget"
+                ));
+            }
+            if capped > 0 {
+                note.push_str(&format!(
+                    "; {capped} past the {}-neighbor cap",
+                    kin_context::SAME_FILE_FALLBACK_MAX
+                ));
+            }
+            note.push(')');
+            note
+        }
     }
 }
 

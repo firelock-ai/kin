@@ -233,8 +233,31 @@ impl BudgetAccounting {
 /// to parse prose.
 pub const ELISION_REASON_BUDGET: &str = "response_budget";
 
+/// The reason code a row cut by a pack's own token budget carries.
+///
+/// Deliberately not [`ELISION_REASON_BUDGET`]. The two budgets cut at different
+/// times, for different reasons, and are raised by different parameters: a
+/// caller widens the response budget with `max_chars` and the pack's with
+/// `token_budget`. A caller told only that something was withheld cannot act,
+/// and one told the wrong lever acts and gets the same answer back.
+pub const ELISION_REASON_TOKEN_BUDGET: &str = "token_budget";
+
+/// The reason code a dependent withheld by the certified-dependents cap
+/// carries. A cap is not a budget: no budget parameter recovers it, so reading
+/// it as one would send a caller to a lever that cannot help.
+pub const ELISION_REASON_DEPENDENTS_CAP: &str = "dependents_cap";
+
 /// Where a payload publishes what its lists lost.
 pub const ELISIONS_KEY: &str = "elisions";
+
+/// Per-row marker naming the budget that took this row's inline source.
+///
+/// A row that simply loses its `body` key is byte-identical to a row from a
+/// `compact: true` call, and sits beside the context pack's own `body: null`
+/// plus `body_unavailable`, which is its vocabulary for source the graph does
+/// not have. Both readings are wrong about a row the budget cut, and neither is
+/// corrected by a count elsewhere in the response: the reader looks at the row.
+pub const BODY_ELIDED_KEY: &str = "body_elided";
 
 /// What one list lost to the response budget.
 ///
@@ -263,13 +286,18 @@ pub struct Elision {
 }
 
 impl Elision {
-    /// One list's loss, from what survived and what did not.
+    /// One list's loss to the response budget.
     pub fn budget(kept: usize, elided: usize) -> Self {
+        Self::for_reason(kept, elided, ELISION_REASON_BUDGET)
+    }
+
+    /// One list's loss, from what survived, what did not, and what took it.
+    pub fn for_reason(kept: usize, elided: usize, reason: &str) -> Self {
         Self {
             elided,
             kept,
             total: kept.saturating_add(elided),
-            reason: ELISION_REASON_BUDGET.to_string(),
+            reason: reason.to_string(),
         }
     }
 }
@@ -283,10 +311,50 @@ impl Elision {
 /// stay beside it, because a client already reading them must not lose its
 /// counter to this change.
 pub fn record_elision(payload: &mut Value, field: &str, kept: usize, elided: usize) {
+    record_elision_for(payload, field, kept, elided, ELISION_REASON_BUDGET);
+}
+
+/// Record one list's elision under a named cause, merging with any already
+/// standing against that field.
+///
+/// One list can be cut twice. A context pack's own token budget refuses rows
+/// before the response budget ever sees the payload, and the daemon's raw route
+/// cuts once before the stdio path envelopes the result and cuts again. An
+/// entry that overwrote its predecessor would report only the last cut, so
+/// `total` would describe what the second cutter was handed rather than what
+/// the walk found, and the first cause would vanish. The counts add and the
+/// causes are kept in the order they happened.
+pub fn record_elision_for(
+    payload: &mut Value,
+    field: &str,
+    kept: usize,
+    elided: usize,
+    reason: &str,
+) {
     if elided == 0 {
         return;
     }
-    let entry = serde_json::to_value(Elision::budget(kept, elided)).unwrap_or(Value::Null);
+    let prior = payload
+        .get(ELISIONS_KEY)
+        .and_then(|map| map.get(field))
+        .and_then(|entry| serde_json::from_value::<Elision>(entry.clone()).ok());
+    let entry = match prior {
+        Some(prior) => {
+            let mut merged =
+                Elision::for_reason(kept, prior.elided.saturating_add(elided), &prior.reason);
+            if !merged
+                .reason
+                .split(", ")
+                .any(|already| already == reason)
+            {
+                merged.reason.push_str(", ");
+                merged.reason.push_str(reason);
+            }
+            merged
+        }
+        None => Elision::for_reason(kept, elided, reason),
+    };
+    let entry = serde_json::to_value(entry).unwrap_or(Value::Null);
     match payload.get_mut(ELISIONS_KEY).and_then(Value::as_object_mut) {
         Some(map) => {
             map.insert(field.to_string(), entry);
@@ -664,7 +732,8 @@ fn run_ladder(
     }
 
     if !shape.body_keys.is_empty() {
-        let stripped = strip_keys(payload, shape, shape.body_keys, &[]);
+        let carrying = rows_carrying(payload, shape, shape.body_keys);
+        let stripped = strip_keys_marking(payload, shape, shape.body_keys, &[], true);
         if stripped > 0 {
             accounting.bounded = true;
             cuts.push(format!(
@@ -672,6 +741,16 @@ fn run_ladder(
                  identity, location, and span"
             ));
             remediations.push("read one body with get_entity_source".to_string());
+            // The prose above has said this since the rung existed, and prose is
+            // not what a caller keys on. `elisions` is the one map that answers
+            // "did this response lose anything", and until now inline source
+            // could go without appearing in it at all.
+            record_elision(
+                payload,
+                "body",
+                carrying.saturating_sub(stripped),
+                stripped,
+            );
         }
         if measure(payload) <= target {
             disclose(payload, budget, started_at, &cuts, &remediations);
@@ -825,6 +904,24 @@ fn strip_keys(
     keys: &[&str],
     top_keys: &[&str],
 ) -> usize {
+    strip_keys_marking(payload, shape, keys, top_keys, false)
+}
+
+/// Remove `keys` from every hit, optionally leaving each stripped row a marker
+/// naming what went.
+///
+/// `mark` is what separates a row the budget cut from a row that never had the
+/// field. Diagnostics and duplicate roll-ups do not need it: a caller reads
+/// those as description, and their absence claims nothing about the code. A
+/// missing `body` does claim something, twice over, because it is also the
+/// shape of a `compact` call and of source the graph does not hold.
+fn strip_keys_marking(
+    payload: &mut Value,
+    shape: &ResponseShape,
+    keys: &[&str],
+    top_keys: &[&str],
+    mark: bool,
+) -> usize {
     let mut stripped = 0usize;
     for key in top_keys {
         if let Some(map) = payload.as_object_mut() {
@@ -836,6 +933,27 @@ fn strip_keys(
     if keys.is_empty() {
         return stripped;
     }
+    let strip_row = |map: &mut Map<String, Value>| -> bool {
+        let mut taken: Vec<Value> = Vec::new();
+        for key in keys {
+            if remove_present(map, key) {
+                taken.push(Value::from(*key));
+                // `body` keeps its place as an explicit null rather than
+                // vanishing, so a typed reader still finds the field and finds
+                // it empty, and the marker beside it says who emptied it.
+                if *key == "body" {
+                    map.insert((*key).to_string(), Value::Null);
+                }
+            }
+        }
+        if taken.is_empty() {
+            return false;
+        }
+        if mark {
+            map.insert(BODY_ELIDED_KEY.to_string(), Value::Array(taken));
+        }
+        true
+    };
     for collection in shape.collections {
         let Some(entries) = payload.get_mut(*collection).and_then(Value::as_array_mut) else {
             continue;
@@ -844,13 +962,7 @@ fn strip_keys(
             let Some(map) = entry.as_object_mut() else {
                 continue;
             };
-            let mut touched = false;
-            for key in keys {
-                if remove_present(map, key) {
-                    touched = true;
-                }
-            }
-            if touched {
+            if strip_row(map) {
                 stripped += 1;
             }
         }
@@ -860,18 +972,36 @@ fn strip_keys(
     // largest single body in a response that just dropped every other one.
     for focal in ["focal_entity", "focal"] {
         if let Some(map) = payload.get_mut(focal).and_then(Value::as_object_mut) {
-            let mut touched = false;
-            for key in keys {
-                if remove_present(map, key) {
-                    touched = true;
-                }
-            }
-            if touched {
+            if strip_row(map) {
                 stripped += 1;
             }
         }
     }
     stripped
+}
+
+/// How many rows carry at least one of `keys`, counted before a rung takes
+/// them, so the elision it publishes can say what the response held.
+fn rows_carrying(payload: &Value, shape: &ResponseShape, keys: &[&str]) -> usize {
+    let carries = |value: &Value| -> bool {
+        value.as_object().is_some_and(|map| {
+            keys.iter()
+                .any(|key| !matches!(map.get(*key), None | Some(Value::Null)))
+        })
+    };
+    let in_collections: usize = shape
+        .collections
+        .iter()
+        .filter_map(|collection| payload.get(*collection))
+        .filter_map(Value::as_array)
+        .map(|entries| entries.iter().filter(|entry| carries(entry)).count())
+        .sum();
+    let in_focal = ["focal_entity", "focal"]
+        .iter()
+        .filter_map(|focal| payload.get(*focal))
+        .filter(|value| carries(value))
+        .count();
+    in_collections + in_focal
 }
 
 /// Remove one key when it carries something. A key already absent, or already
@@ -919,7 +1049,16 @@ fn trim_collection(payload: &mut Value, key: &str, target: usize, min_keep: usiz
     payload[key] = Value::Array(full[..kept].to_vec());
     let withheld = full.len() - kept;
     if withheld > 0 {
-        payload[format!("{key}_withheld")] = Value::from(withheld);
+        // Added to, not overwritten. Two arms bound one response and a pack's
+        // own token budget cuts before either, so a list can arrive here having
+        // already lost rows. Assigning would make this scalar describe the last
+        // cut while `elisions` described them all, and the two channels are
+        // asserted against each other.
+        let prior = payload
+            .get(format!("{key}_withheld"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        payload[format!("{key}_withheld")] = Value::from(prior.saturating_add(withheld));
     }
     withheld
 }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use kin_model::{
     relation::RelationKind, Annotation, AnnotationEntry, ArtifactContextEntry, ArtifactContextKind,
@@ -312,6 +312,29 @@ impl DependencySource {
     }
 }
 
+/// The wire name of a pack group, shared by `kin context` and the
+/// `get_context_pack` MCP tool.
+///
+/// Named here rather than spelled at each call site because the token budget's
+/// elisions are keyed by these, and a group whose count is filed under a name
+/// no surface renders is a disclosure nobody reads.
+pub mod group {
+    /// Rows the focal depends on.
+    pub const DEPENDENCIES: &str = "dependencies";
+    /// Rows that depend on the focal.
+    pub const DEPENDENTS: &str = "dependents";
+    /// Rows reached at more than one hop.
+    pub const TRANSITIVE_DEPS: &str = "transitive_deps";
+    /// Tests covering the focal or its direct dependencies.
+    pub const TESTS: &str = "tests";
+    /// Contracts the focal participates in.
+    pub const CONTRACTS: &str = "contracts";
+    /// Open work items scoped to the focal or its direct dependencies.
+    pub const WORK_ITEMS: &str = "work_items";
+    /// Fresh annotations on the focal or its direct dependencies.
+    pub const ANNOTATIONS: &str = "annotations";
+}
+
 /// How a pack's dependency section was filled, and what filling it left out.
 ///
 /// These are selection facts only the builder holds: whether the same-file
@@ -325,6 +348,11 @@ pub struct DependencySelection {
     same_file_candidates: usize,
     same_file_neighbors: Vec<EntityId>,
     dependents: Vec<EntityId>,
+    /// Candidates the token budget refused, by the group each would have
+    /// joined. Ids rather than counts, because a caller can recover a refused
+    /// row by another route and a row that reached the answer is not one the
+    /// answer lost.
+    budget_elided: BTreeMap<&'static str, Vec<EntityId>>,
 }
 
 impl DependencySelection {
@@ -368,6 +396,42 @@ impl DependencySelection {
     pub fn same_file_dropped(&self) -> usize {
         self.same_file_candidates
             .saturating_sub(self.same_file_neighbors.len())
+    }
+
+    /// Record one candidate the token budget refused.
+    fn refuse(&mut self, group: &'static str, entity_id: EntityId) {
+        self.budget_elided.entry(group).or_default().push(entity_id);
+    }
+
+    /// Rows one group lost to the token budget, discounting any the caller
+    /// recovered by another route.
+    ///
+    /// The MCP pack recovers a certified caller this fold refused, from the
+    /// same reference authority `find_references` reads. A row that reached the
+    /// answer is not a row the answer lost, and claiming it in both places
+    /// would be a false report of loss, which is the same defect as silence
+    /// with its sign flipped.
+    pub fn budget_elided_unrecovered(
+        &self,
+        group: &str,
+        recovered: impl Fn(&EntityId) -> bool,
+    ) -> usize {
+        self.budget_elided
+            .get(group)
+            .map_or(0, |ids| ids.iter().filter(|id| !recovered(id)).count())
+    }
+
+    /// Rows one group lost to the token budget.
+    pub fn budget_elided(&self, group: &str) -> usize {
+        self.budget_elided_unrecovered(group, |_| false)
+    }
+
+    /// Every group the token budget took rows from, with its count.
+    pub fn budget_elisions(&self) -> impl Iterator<Item = (&'static str, usize)> + '_ {
+        self.budget_elided
+            .iter()
+            .filter(|(_, ids)| !ids.is_empty())
+            .map(|(group, ids)| (*group, ids.len()))
     }
 }
 
@@ -719,49 +783,51 @@ where
             content,
             tokens,
         } = candidate;
-        match section {
-            AssemblySection::Test => {
-                if total_tokens + tokens <= budget_max {
-                    total_tokens += tokens;
-                    test_entries.push(ContextEntry {
-                        entity_id,
-                        projection_level,
-                        content,
-                    });
+        // Which group this candidate would have joined, resolved before the
+        // admission decision so a refusal can be filed under the name the two
+        // surfaces render it by. `relation_for` is answerable here because
+        // `selection.dependents` is populated above and the same-file fallback
+        // has not run yet.
+        let target_group = match section {
+            AssemblySection::Test => group::TESTS,
+            AssemblySection::Contract => group::CONTRACTS,
+            AssemblySection::Transitive => group::TRANSITIVE_DEPS,
+            AssemblySection::DirectDep => match selection.relation_for(&entity_id) {
+                DependencyRelation::DependentEdge => group::DEPENDENTS,
+                DependencyRelation::DependencyEdge | DependencyRelation::SameFileNeighbor => {
+                    group::DEPENDENCIES
                 }
-            }
-            AssemblySection::Contract => {
-                if total_tokens + tokens <= budget_max {
-                    total_tokens += tokens;
-                    contract_entries.push(ContextEntry {
-                        entity_id,
-                        projection_level,
-                        content,
-                    });
-                }
-            }
-            AssemblySection::DirectDep => {
-                if total_tokens + tokens <= budget_max {
-                    total_tokens += tokens;
-                    dep_entries.push(ContextEntry {
-                        entity_id,
-                        projection_level,
-                        content,
-                    });
-                }
-            }
+            },
+        };
+        let fits = match section {
             AssemblySection::Transitive => {
-                if total_tokens + tokens <= budget_max
-                    && transitive_tokens + tokens <= transitive_budget
-                {
-                    total_tokens += tokens;
-                    transitive_tokens += tokens;
-                    transitive_entries.push(ContextEntry {
-                        entity_id,
-                        projection_level,
-                        content,
-                    });
-                }
+                total_tokens + tokens <= budget_max && transitive_tokens + tokens <= transitive_budget
+            }
+            _ => total_tokens + tokens <= budget_max,
+        };
+        // A refusal is the cut this fold makes, and it used to make it in
+        // silence: a dependency section trimmed from twelve rows to six
+        // serializes exactly like a focal that has six. The count is recorded
+        // here, at the only place that knows a row was ever a candidate, so
+        // both surfaces can say what the budget took instead of rendering the
+        // loss as absence.
+        if !fits {
+            selection.refuse(target_group, entity_id);
+            continue;
+        }
+        total_tokens += tokens;
+        let entry = ContextEntry {
+            entity_id,
+            projection_level,
+            content,
+        };
+        match section {
+            AssemblySection::Test => test_entries.push(entry),
+            AssemblySection::Contract => contract_entries.push(entry),
+            AssemblySection::DirectDep => dep_entries.push(entry),
+            AssemblySection::Transitive => {
+                transitive_tokens += tokens;
+                transitive_entries.push(entry);
             }
         }
     }
@@ -780,15 +846,23 @@ where
                 }
             }
             let tokens = estimate_tokens(&content);
-            if total_tokens + tokens <= budget_max {
-                total_tokens += tokens;
-                selection.same_file_neighbors.push(entity.id);
-                dep_entries.push(ContextEntry {
-                    entity_id: entity.id,
-                    projection_level: ProjectionLevel::SignatureOnly,
-                    content,
-                });
+            // Neighbours past `SAME_FILE_FALLBACK_MAX` are never seen by this
+            // loop and stay counted by `same_file_dropped`, which is the cap's
+            // own number. Only a neighbour the budget refused is filed as a
+            // budget elision: a cap and a budget are different causes recovered
+            // by different levers, and `Elision::reason` exists so one cannot
+            // be read as the other.
+            if total_tokens + tokens > budget_max {
+                selection.refuse(group::DEPENDENCIES, entity.id);
+                continue;
             }
+            total_tokens += tokens;
+            selection.same_file_neighbors.push(entity.id);
+            dep_entries.push(ContextEntry {
+                entity_id: entity.id,
+                projection_level: ProjectionLevel::SignatureOnly,
+                content,
+            });
         }
     }
 
@@ -815,13 +889,15 @@ where
                 }
                 let content = format_work_item(&item);
                 let tokens = estimate_tokens(&content);
-                if total_tokens + tokens <= budget_max {
-                    total_tokens += tokens;
-                    work_entries.push(WorkItemEntry {
-                        work_item: item,
-                        content,
-                    });
+                if total_tokens + tokens > budget_max {
+                    selection.refuse(group::WORK_ITEMS, *eid);
+                    continue;
                 }
+                total_tokens += tokens;
+                work_entries.push(WorkItemEntry {
+                    work_item: item,
+                    content,
+                });
             }
         }
     }
@@ -836,13 +912,15 @@ where
                 }
                 let content = format_annotation(&ann);
                 let tokens = estimate_tokens(&content);
-                if total_tokens + tokens <= budget_max {
-                    total_tokens += tokens;
-                    annotation_entries.push(AnnotationEntry {
-                        annotation: ann,
-                        content,
-                    });
+                if total_tokens + tokens > budget_max {
+                    selection.refuse(group::ANNOTATIONS, *eid);
+                    continue;
                 }
+                total_tokens += tokens;
+                annotation_entries.push(AnnotationEntry {
+                    annotation: ann,
+                    content,
+                });
             }
         }
     }

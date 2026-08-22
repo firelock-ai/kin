@@ -1094,6 +1094,81 @@ pub fn handle_get_context_pack<G: GraphStore>(
         result["nearby_traffic"] = serde_json::to_value(&pack.traffic).map_err(McpError::Json)?;
     }
 
+    // What the pack's own token budget refused, in the map the response budget
+    // already publishes its cuts to.
+    //
+    // Two budgets cut this answer and only one of them was ever visible. The
+    // token budget runs first, inside the builder, and a dependency section it
+    // trimmed from twelve rows to six serialized exactly like a focal with six:
+    // `returned: 6` beside six rows, and nothing anywhere saying a row had been
+    // a candidate. That is the reading kin#1062 removed from the list case and
+    // kin#1068 from the impact case, arriving here through the earlier budget.
+    //
+    // One map, keyed by the group, with the cause named on each entry: a caller
+    // raises `token_budget` for these and `max_chars` for the response budget's,
+    // and being told the wrong lever costs a round trip that cannot help.
+    let recovered = |id: &kin_model::ids::EntityId| packed.contains(id);
+    let mut budget_groups: Vec<&str> = vec![
+        kin_context::group::DEPENDENCIES,
+        kin_context::group::DEPENDENTS,
+    ];
+    if !compact {
+        // A section `compact` never serves cannot be misread as an empty one,
+        // because dropping it is the documented shape of that mode. A section
+        // this mode does serve is absent only when it holds nothing, which is
+        // exactly the reading a budget cut must not produce.
+        budget_groups.extend([
+            kin_context::group::TRANSITIVE_DEPS,
+            kin_context::group::TESTS,
+            kin_context::group::CONTRACTS,
+            kin_context::group::WORK_ITEMS,
+            kin_context::group::ANNOTATIONS,
+        ]);
+    }
+    for group in budget_groups {
+        let elided = selection.budget_elided_unrecovered(group, recovered);
+        if elided == 0 {
+            continue;
+        }
+        let kept = result
+            .get(group)
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len);
+        // The scalar beside the map, written here so the response budget's own
+        // later cut of the same list adds to it rather than replacing it.
+        result[format!("{group}_withheld")] = serde_json::json!(elided);
+        crate::budget::record_elision_for(
+            &mut result,
+            group,
+            kept,
+            elided,
+            crate::budget::ELISION_REASON_TOKEN_BUDGET,
+        );
+    }
+    // The certified-dependents cap is the third cutter on this payload, and it
+    // was disclosed only as a nested counter inside `dependency_selection`,
+    // which is the sibling-counter shape that saved nobody in the stranger
+    // session kin#1062 was filed from. It carries its own reason because no
+    // budget parameter recovers it.
+    if dependents_withheld > 0 {
+        let kept = result
+            .get("dependents")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len);
+        let prior = result
+            .get("dependents_withheld")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize;
+        result["dependents_withheld"] = serde_json::json!(prior + dependents_withheld);
+        crate::budget::record_elision_for(
+            &mut result,
+            "dependents",
+            kept,
+            dependents_withheld,
+            crate::budget::ELISION_REASON_DEPENDENTS_CAP,
+        );
+    }
+
     let json = serialize_with_measured_tokens(&mut result)?;
     Ok(ToolCallResult::text(json))
 }
