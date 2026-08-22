@@ -716,7 +716,7 @@ EXPECTED_DYNAMIC_JOB_CONTEXT_SHA256 = {
     (
         ".github/workflows/install-proof.yml",
         "install-proof",
-    ): "44b510d0d82f7b56b525b08f38a3f84916243c30e9c365b340718670f95af1ca",
+    ): "3ab38cec398001873f4a29bb17ce14264b6eb54dbbe2b865ff109d1d4a74767d",
     (
         ".github/workflows/rc-build.yml",
         "build",
@@ -3003,66 +3003,114 @@ def assert_install_proof_runs_on_pull_requests(ci: str, install_proof: str) -> N
         )
 
 
-def assert_install_proof_windows_experimental_posture(install_proof: str) -> None:
-    """Pin the declared experimental scope of the install-proof matrix.
+def assert_install_proof_every_leg_gates_the_release(install_proof: str) -> None:
+    """Require every install-proof matrix row to gate the release.
 
-    The Windows leg still executes its full unconditional proof, but its
-    verdict is tolerated while the installed daemon does not publish an
-    endpoint file there. Tolerance is admitted only as the exact job-level
-    matrix guard — enforced as the single active ``continue-on-error``
-    mention in the entire job, so a step-level tolerance (which would spare
-    every leg, not one) cannot hide below the job header — and the
-    ``experimental: true`` flag only on the ``windows-latest`` row. Anything
-    looser — an unconditional ``continue-on-error``, a tolerated step, an
-    experimental Unix row, or a value other than ``true`` — silently removes
-    a reviewed OS from the release gate, so each is rejected here by name.
+    The windows-latest row carried ``experimental: true`` and the job carried
+    the matching ``continue-on-error`` guard, so the one platform most likely
+    to break shipped without a verdict. Two defects held that waiver open and
+    both are fixed on released bytes: kin#811's inherited-pipe read of
+    ``.kin/daemon.port``, then a projection chooser that named
+    ``projection_mode=misconfigured`` on a host where nothing was recorded,
+    which killed every release from v0.5.44 through v0.5.47. v0.5.49's run
+    concluded ``Public Install Proof / windows-latest`` SUCCESS against its
+    own published archives, which is the condition the waiver itself named
+    for its removal, so the waiver is spent.
+
+    Tolerance is therefore rejected in every spelling it could return in: a
+    job-level ``continue-on-error`` of any value, a step-level one, which
+    would spare every leg rather than one, and an ``experimental`` key on any
+    row of either decoded matrix, since that key is the half of the waiver a
+    reader would restore first. The reviewed platform set stays pinned here
+    too, so a row cannot be dropped in the same edit that would have
+    tolerated it.
     """
 
     jobs = workflow_job_blocks(install_proof)
     install_job = jobs.get("install-proof")
     if install_job is None:
         raise AssertionError(
-            "windows experimental posture lost the install-proof job"
+            "install-proof gating posture lost the install-proof job"
         )
     job_fields = job_top_level_mapping_fields(install_job)
     tolerance = [
         value.strip() for key, value in job_fields if key == "continue-on-error"
     ]
-    if tolerance != ["${{ matrix.experimental == true }}"]:
+    if tolerance:
         raise AssertionError(
-            "install-proof continue-on-error must be exactly the matrix "
-            f"experimental guard; found {tolerance}"
+            "install-proof admits no job-level continue-on-error; every "
+            f"matrix row gates the release; found {tolerance}"
         )
     tolerance_mentions = [
         line for line in active_lines(install_job) if "continue-on-error" in line
     ]
-    if tolerance_mentions != [
-        "continue-on-error: ${{ matrix.experimental == true }}"
-    ]:
+    if tolerance_mentions:
         raise AssertionError(
-            "install-proof admits exactly one continue-on-error, the "
-            "job-level matrix experimental guard; a step-level tolerance "
-            f"would spare every leg; found {tolerance_mentions}"
+            "install-proof admits no continue-on-error at all; a step-level "
+            "tolerance would spare every leg, not one; found "
+            f"{tolerance_mentions}"
         )
     release_rows, pull_request_rows = install_proof_matrix_rows(install_job)
     for label, rows in (("release", release_rows), ("pull request", pull_request_rows)):
-        experimental_rows = []
-        for row in rows:
-            if "experimental" not in row:
-                continue
-            if row["experimental"] is not True:
-                raise AssertionError(
-                    f"install-proof {label} matrix rows admit only a literal "
-                    f"`experimental: true`; found {row['experimental']!r} under "
-                    f"{row.get('os')}"
-                )
-            experimental_rows.append(row.get("os"))
-        expected = ["windows-latest"] if label == "release" else []
-        if experimental_rows != expected:
+        tolerated = [row.get("os") for row in rows if "experimental" in row]
+        if tolerated:
             raise AssertionError(
-                f"install-proof {label} experimental rows must be exactly "
-                f"{expected}; found {experimental_rows}"
+                f"install-proof {label} matrix rows admit no experimental "
+                f"key; the Windows waiver is spent; found it under {tolerated}"
             )
+    release_platforms = [row.get("os") for row in release_rows]
+    expected_platforms = [
+        "ubuntu-latest",
+        "ubuntu-24.04-arm",
+        "macos-latest",
+        "macos-15-intel",
+        "windows-latest",
+    ]
+    if release_platforms != expected_platforms:
+        raise AssertionError(
+            "install-proof release matrix must gate exactly "
+            f"{expected_platforms}; found {release_platforms}"
+        )
+
+
+def assert_install_proof_first_run_never_pipes_the_daemon_spawner(
+    first_run: str,
+) -> None:
+    """Keep every daemon-spawning command in the first-run step unpiped.
+
+    A piped command whose child is the daemon does not end when the command
+    ends. On Windows the daemon inherits the write end of the pipe and holds
+    it until idle shutdown, so the reader blocks for the full 1800 s idle
+    window while the step looks like it is working. v0.5.49's Windows leg
+    spent 3672 s of a 3684 s step in exactly two of those waits, both on a
+    ``kin setup --intent agent`` piped into ``tee``, and that step was 62 of
+    the 63.5 minutes between the published tag and npm.
+
+    `kin status` and the graph queries already carry that rule in prose. This
+    is the executable half: the first-run step captures by redirect and
+    prints with `cat`, never by pipe, and a setup that fails still reaches
+    the job log rather than aborting the step before the `cat`.
+    """
+
+    # The pipe scan runs first, so a capture that reverts to `tee` is named as
+    # the pipe it is rather than as a missing redirect line.
+    piped = [line for line in active_lines(first_run) if "| tee" in line]
+    if piped:
+        raise AssertionError(
+            "the first-run install proof captures by redirect, never by pipe: "
+            "a daemon that inherits the pipe holds it for its whole idle "
+            f"window and the step waits on it; found {piped}"
+        )
+    for policy in (
+        'kin setup --no-interactive --intent agent --shell "$PROOF_SHELL" \\',
+        '> "$captures/kin-setup.txt" 2>&1 || setup_status=$?',
+        'cat "$captures/kin-setup.txt"',
+        'if [ "$setup_status" -ne 0 ]; then exit "$setup_status"; fi',
+        '> "$captures/kin-claude-fallback-setup.txt" 2>&1 || fallback_setup_status=$?',
+        'cat "$captures/kin-claude-fallback-setup.txt"',
+        'if [ "$fallback_setup_status" -ne 0 ]; then exit "$fallback_setup_status"; fi',
+    ):
+        require(first_run, policy, "unpiped first-run setup capture")
 
 
 def assert_install_proof_repo_steps_cover_windows(install_proof: str) -> None:
@@ -9429,6 +9477,51 @@ def main() -> None:
     ):
         require(first_run, policy, "cross-step install-proof shell pin")
     assert_install_proof_init_log_authority(first_run)
+    assert_install_proof_first_run_never_pipes_the_daemon_spawner(first_run)
+    for label, original, mutation, expected in (
+        (
+            "the first setup goes back through a pipe",
+            '            > "$captures/kin-setup.txt" 2>&1 || setup_status=$?',
+            '            2>&1 | tee "$captures/kin-setup.txt"',
+            "never by pipe",
+        ),
+        (
+            "the fallback setup goes back through a pipe",
+            '            > "$captures/kin-claude-fallback-setup.txt" 2>&1 || fallback_setup_status=$?',
+            '            2>&1 | tee "$captures/kin-claude-fallback-setup.txt"',
+            "never by pipe",
+        ),
+        (
+            "a failing setup stops reaching the job log",
+            '          cat "$captures/kin-setup.txt"\n',
+            "",
+            "unpiped first-run setup capture",
+        ),
+        (
+            "a refused setup stops failing the install proof",
+            '          if [ "$setup_status" -ne 0 ]; then exit "$setup_status"; fi\n',
+            "",
+            "unpiped first-run setup capture",
+        ),
+        (
+            "a refused fallback setup stops failing the install proof",
+            '          if [ "$fallback_setup_status" -ne 0 ]; then exit "$fallback_setup_status"; fi\n',
+            "",
+            "unpiped first-run setup capture",
+        ),
+    ):
+        if original not in first_run:
+            raise AssertionError(
+                "first-run unpiped-setup falsification lost fixture for "
+                f"{label}: {original!r}"
+            )
+        expect_assertion(
+            label,
+            expected,
+            lambda mutated=first_run.replace(original, mutation, 1): (
+                assert_install_proof_first_run_never_pipes_the_daemon_spawner(mutated)
+            ),
+        )
     expect_assertion(
         "kin init writes its log into the worktree it admits",
         "outside the worktree it admits",
@@ -9941,7 +10034,7 @@ def main() -> None:
         ),
         (
             "the Windows matrix row disappears",
-            ',{"os":"windows-latest","setup-shell":"powershell","experimental":true}',
+            ',{"os":"windows-latest","setup-shell":"powershell"}',
             "",
             "windows-latest row",
         ),
@@ -9965,63 +10058,63 @@ def main() -> None:
             ),
         )
 
-    assert_install_proof_windows_experimental_posture(install_proof)
+    assert_install_proof_every_leg_gates_the_release(install_proof)
     for label, original, mutation, expected in (
         (
-            "the experimental flag spreads to a Unix matrix row",
+            "the Windows waiver returns as a matrix flag",
+            '{"os":"windows-latest","setup-shell":"powershell"}',
+            '{"os":"windows-latest","setup-shell":"powershell","experimental":true}',
+            "admit no experimental",
+        ),
+        (
+            "the waiver returns on a Unix row instead",
             '{"os":"ubuntu-latest","setup-shell":"bash"}',
             '{"os":"ubuntu-latest","setup-shell":"bash","experimental":true}',
-            "experimental rows must be exactly",
+            "admit no experimental",
         ),
         (
             "the install proof tolerates every leg unconditionally",
-            "    continue-on-error: ${{ matrix.experimental == true }}\n",
-            "    continue-on-error: true\n",
-            "matrix experimental guard",
+            "    strategy:\n",
+            "    continue-on-error: true\n    strategy:\n",
+            "no job-level continue-on-error",
         ),
         (
-            "the tolerance guard survives while the Windows flag disappears",
-            ',"experimental":true',
-            "",
-            "exactly ['windows-latest']",
-        ),
-        (
-            "an experimental value other than a literal true appears",
-            '"experimental":true',
-            '"experimental":"yes"',
-            "literal `experimental: true`",
-        ),
-        (
-            "the tolerance guard disappears while the flag stays",
-            "    continue-on-error: ${{ matrix.experimental == true }}\n",
-            "",
-            "matrix experimental guard",
+            "the matrix-guard spelling of the waiver returns",
+            "    strategy:\n",
+            "    continue-on-error: ${{ matrix.experimental == true }}\n    strategy:\n",
+            "no job-level continue-on-error",
         ),
         (
             "a step-level tolerance spares every leg below the job header",
             "      - name: Public install (Unix)\n",
             "      - name: Public install (Unix)\n"
             "        continue-on-error: true\n",
-            "exactly one continue-on-error",
+            "no continue-on-error at all",
         ),
         (
             "a quoted-key tolerance hides on a step",
             "      - name: Public install (Unix)\n",
             "      - name: Public install (Unix)\n"
             "        \"continue-on-error\": true\n",
-            "exactly one continue-on-error",
+            "no continue-on-error at all",
+        ),
+        (
+            "a reviewed platform is dropped from the gating matrix",
+            ',{"os":"macos-15-intel","setup-shell":"zsh"}',
+            "",
+            "must gate exactly",
         ),
     ):
         if original not in install_proof:
             raise AssertionError(
-                "windows experimental posture falsification lost fixture for "
+                "install-proof gating posture falsification lost fixture for "
                 f"{label}: {original!r}"
             )
         expect_assertion(
             label,
             expected,
             lambda mutated=install_proof.replace(original, mutation, 1): (
-                assert_install_proof_windows_experimental_posture(mutated)
+                assert_install_proof_every_leg_gates_the_release(mutated)
             ),
         )
 

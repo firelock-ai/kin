@@ -49,40 +49,33 @@ jobs:
   install-proof:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    # 90 is a runaway backstop, not a ceiling the leg is expected to reach.
-    # v0.5.48's run proved the healthy Windows leg needs more than 45: with the
-    # projection defect fixed it ran deep into the real proof for the first
-    # time and was cancelled at 45m12s, and a timeout lands as CANCELLED, which
-    # the experimental waiver below does not absorb (continue-on-error covers
-    # failure only), so the cancellation skipped npm publish and promotion.
-    # A cap the leg can reach while healthy is therefore a release-killer on
-    # exactly the runs where the leg improves.
+    # 90 is a runaway backstop, not a ceiling any leg is expected to reach.
+    # It was raised from 45 because v0.5.48's Windows leg was cancelled at
+    # 45m12s while healthy, and a timeout lands as CANCELLED, which skips npm
+    # publish and promotion. Every leg is gating now, so a cap a healthy leg
+    # can reach is a release-killer; leave the backstop generous.
     timeout-minutes: 90
-    # The Windows leg runs the full unconditional proof and uploads its
-    # artifacts, but its verdict does not yet gate the release. The reason has
-    # moved, and this comment is what carries it, so it is worth keeping
-    # current: a stale cause here sends whoever picks the work up next after a
-    # defect that is already fixed.
+    # Every row in the matrix below gates the release. There is no
+    # continue-on-error here and no experimental flag on any row, and the
+    # release authority suite asserts both absences, so tolerance cannot
+    # return to this job without review.
     #
-    # It is no longer the daemon endpoint file. kin#811 measured that the
-    # installed Windows daemon does publish `.kin/daemon.port`, and that the
-    # step could not read it because a `tee` pipeline held a handle the daemon
-    # inherited, so the shell resumed at the moment shutdown removed the file.
-    # That is fixed and proven fixed on released bytes.
-    #
-    # What fails now is one step earlier and it fails on the released binary
-    # rather than on this workflow. `kin setup status --json` reported
+    # Windows was the one tolerated row and its waiver is spent. Two defects
+    # kept it red and both are fixed on released bytes. kin#811 measured that
+    # the installed Windows daemon does publish `.kin/daemon.port`, and that
+    # the step could not read it because a `tee` pipeline held a handle the
+    # daemon inherited, so the shell resumed at the moment shutdown removed
+    # the file. Then `kin setup status --json` reported
     # `projection_mode=misconfigured` on a host where nothing is recorded and
-    # no projection is in force, which is a mode the chooser named rather than
-    # one anybody picked. Every release from v0.5.44 through v0.5.47 died on
-    # that same line in the step below. The product fix is FIR-2460 and it can
-    # only reach this leg by riding a release, because the leg installs what
-    # the public installer serves.
+    # no projection is in force, a mode the chooser named rather than one
+    # anybody picked, and every release from v0.5.44 through v0.5.47 died on
+    # that line. FIR-2460 fixed it and could only reach this leg by riding a
+    # release, because the leg installs what the public installer serves.
     #
-    # So the flag comes out once a release carries that fix and the leg is
-    # green against its own bytes, together with the posture assertion the
-    # release authority suite pins to exactly the windows-latest row.
-    continue-on-error: ${{ matrix.experimental == true }}
+    # v0.5.49 is that release. Its run concluded `Public Install Proof /
+    # windows-latest` SUCCESS against its own published bytes, which is the
+    # condition the waiver named for its own removal, so the flag is gone and
+    # a Windows failure now blocks a release exactly as a Linux one does.
     strategy:
       fail-fast: false
       # The reviewed release matrix is what every public release still proves.
@@ -90,7 +83,7 @@ jobs:
       # exist for exactly one platform, so it collapses to the Linux leg rather
       # than installing a released archive on the other four. Both lists are
       # decoded and pinned by the release authority suite, so neither can grow,
-      # shrink, or gain an experimental row unreviewed.
+      # shrink, or gain a tolerated row unreviewed.
       #
       # The pull-request list is the OVERRIDE and the release list is what an
       # absent input falls back to. That direction is the whole point: this
@@ -100,7 +93,7 @@ jobs:
       # release gate. Truthiness answers null and "" identically, so neither
       # spelling of absent can reach the one-platform list.
       matrix:
-        include: ${{ fromJSON(inputs.local_artifact && '[{"os":"ubuntu-latest","setup-shell":"bash"}]' || '[{"os":"ubuntu-latest","setup-shell":"bash"},{"os":"ubuntu-24.04-arm","setup-shell":"bash"},{"os":"macos-latest","setup-shell":"zsh"},{"os":"macos-15-intel","setup-shell":"zsh"},{"os":"windows-latest","setup-shell":"powershell","experimental":true}]') }}
+        include: ${{ fromJSON(inputs.local_artifact && '[{"os":"ubuntu-latest","setup-shell":"bash"}]' || '[{"os":"ubuntu-latest","setup-shell":"bash"},{"os":"ubuntu-24.04-arm","setup-shell":"bash"},{"os":"macos-latest","setup-shell":"zsh"},{"os":"macos-15-intel","setup-shell":"zsh"},{"os":"windows-latest","setup-shell":"powershell"}]') }}
     steps:
       - name: Public install (Unix)
         if: runner.os != 'Windows' && !inputs.local_artifact
@@ -921,8 +914,22 @@ jobs:
           fs.writeFileSync(process.env.ANTIGRAVITY_LEGACY, `${JSON.stringify(config, null, 2)}\n`);
           NODE
 
+          # Never pipe a command that can spawn the daemon, for the reason
+          # `kin status` above is not piped. `--intent agent` configures
+          # auto-daemon and this is an admitted repository, so setup starts a
+          # daemon here; on Windows that child inherits the pipe and holds the
+          # write end until it idles out, and `tee` then blocks reading a pipe
+          # nobody will close until the 1800 s idle window expires. That is
+          # what the two silent thirty-minute gaps in v0.5.49's Windows leg
+          # were: 3672 s of a 3684 s step, and 62 of the 63.5 minutes between
+          # the published tag and npm. Redirect, then print. Setup's own exit
+          # status is captured rather than left to `set -e` so a failure still
+          # reaches the job log instead of aborting before the `cat`.
+          setup_status=0
           kin setup --no-interactive --intent agent --shell "$PROOF_SHELL" \
-            2>&1 | tee "$captures/kin-setup.txt"
+            > "$captures/kin-setup.txt" 2>&1 || setup_status=$?
+          cat "$captures/kin-setup.txt"
+          if [ "$setup_status" -ne 0 ]; then exit "$setup_status"; fi
 
           # Normalize the real TOML Codex entry with Python's standard parser
           # so the later cross-platform Node validator can apply the same exact
@@ -963,10 +970,16 @@ jobs:
             chmod +x "$claude_fallback_bin/claude"
           fi
           claude_fallback_path="$claude_fallback_bin:$primary_home/.kin/bin:/usr/bin:/bin"
+          # Unpiped for the same reason as the setup above, and it cost the
+          # same: this second setup spawned the second daemon that held the
+          # second thirty-minute pipe.
+          fallback_setup_status=0
           HOME="$claude_fallback_home" USERPROFILE="$claude_fallback_home" \
           KIN_HOME="$primary_home/.kin" PATH="$claude_fallback_path" \
             kin setup --no-interactive --intent agent --shell "$PROOF_SHELL" \
-            2>&1 | tee "$captures/kin-claude-fallback-setup.txt"
+            > "$captures/kin-claude-fallback-setup.txt" 2>&1 || fallback_setup_status=$?
+          cat "$captures/kin-claude-fallback-setup.txt"
+          if [ "$fallback_setup_status" -ne 0 ]; then exit "$fallback_setup_status"; fi
           if [ -e "$claude_fallback_home/.claude.json" ]; then
             echo "Claude fallback proof unexpectedly wrote the primary ~/.claude.json path" >&2
             exit 1
