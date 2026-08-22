@@ -1545,9 +1545,15 @@ fn collect_python_guarded_imports(
 /// second declaration this returns nothing about, so it declines and the call
 /// keeps the bare leaf it already had.
 ///
-/// `self` and `cls` are excluded because an attribute of the enclosing class is
+/// `self` and `cls` are excluded. The enclosing class's own attributes are
 /// already keyed whole (`self.connection`) by [`python_receiver_types`], and
-/// that entry wins before this is consulted.
+/// that entry wins before this is consulted; what the exclusion actually costs
+/// is the rarer `def handle(self: BaseAuth, ...)`, where routing `self` through
+/// the repository-wide table would resolve a call through a class the signature
+/// merely annotates. That is new behaviour rather than a restored edge, this
+/// lane measured no demand for it, and the fixture
+/// `an_annotated_self_receiver_is_left_to_the_enclosing_class` says so, so
+/// widening it later is a decision somebody makes on purpose.
 fn python_declared_attribute_path(
     receiver: &str,
     receiver_types: &PythonReceiverTypes,

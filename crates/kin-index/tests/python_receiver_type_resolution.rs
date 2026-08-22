@@ -1140,3 +1140,52 @@ class Session:
          type_resolved; got {resolutions:?}"
     );
 }
+
+#[test]
+fn a_container_of_a_type_is_not_that_type() {
+    // The other half of the Optional bound, and the one the Union fixture
+    // cannot reach. `Optional[T]` adds None to T, so a call through it still
+    // dispatches to T. `List[T]` is a different object entirely, and unwrapping
+    // it would bind `adapters.send(request)` to the method of the element
+    // class, which is an edge the source does not contain.
+    let files = vec![
+        parse_py("adapters.py", ADAPTERS_PY),
+        parse_py(
+            "sessions.py",
+            r#"
+from typing import List
+
+from adapters import HTTPAdapter
+
+
+class Session:
+    def send(self, request, adapters: List[HTTPAdapter]):
+        return adapters.send(request)
+"#,
+        ),
+    ];
+    let target = entity_id(
+        &files,
+        "adapters.py",
+        "HTTPAdapter.send",
+        EntityKind::Method,
+    );
+    let caller = entity_id(&files, "sessions.py", "Session.send", EntityKind::Method);
+
+    let relations = link_cross_file(&files);
+    let resolution = relations
+        .iter()
+        .find(|r| {
+            r.kind == RelationKind::Calls
+                && r.src.as_entity() == Some(caller)
+                && r.dst.as_entity() == Some(target)
+        })
+        .map(RelationResolution::of);
+
+    assert_ne!(
+        resolution,
+        Some(RelationResolution::TypeResolved),
+        "a container of T declares a container, so no call through it may be \
+         published as proven from a declaration"
+    );
+}

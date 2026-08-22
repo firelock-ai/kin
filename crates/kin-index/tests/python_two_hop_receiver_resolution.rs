@@ -1054,3 +1054,52 @@ class Response:
          in this answer means the allowlist moved deliberately"
     );
 }
+
+#[test]
+fn an_annotated_self_receiver_is_left_to_the_enclosing_class() {
+    // The `self`/`cls` bound. `def handle(self: BaseAuth, ...)` is a real
+    // declaration, and routing it through the repository-wide table would make
+    // `self.connection.send(...)` resolve through a class the signature merely
+    // names rather than through the class the method is written in. That is
+    // new behaviour, not a restored edge, and this lane measured no demand for
+    // it. A change in this answer means somebody widened the tier on purpose.
+    let files = vec![
+        parse_py("adapters.py", ADAPTERS_PY),
+        parse_py(
+            "base.py",
+            r#"
+from adapters import HTTPAdapter
+
+
+class BaseAuth:
+    connection: HTTPAdapter
+"#,
+        ),
+        parse_py(
+            "auth.py",
+            r#"
+from base import BaseAuth
+
+
+class DigestAuth(BaseAuth):
+    def handle(self: BaseAuth, prep):
+        return self.connection.send(prep)
+"#,
+        ),
+    ];
+    let target = entity_id(
+        &files,
+        "adapters.py",
+        "HTTPAdapter.send",
+        EntityKind::Method,
+    );
+    let caller = entity_id(&files, "auth.py", "DigestAuth.handle", EntityKind::Method);
+
+    let relations = link_cross_file(&files);
+
+    assert!(
+        !has_call(&relations, caller, target),
+        "an annotated `self` is outside this tier's scope today; the enclosing \
+         class owns that receiver and the table is not consulted for it"
+    );
+}
