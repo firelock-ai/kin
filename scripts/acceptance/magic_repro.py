@@ -2156,6 +2156,12 @@ def check_16(suite):
     """FIR-2524 rung three: the CLI must carry the verdict MCP publishes, on the
     partial-vocabulary command group.
 
+    Numbered 16, and the ledger for why is worth carrying: three branches added a
+    "check 13" off one base. kin#1075 took 13 and 14, lane fir2604 took 15, and
+    both landed while this one was in flight. Renumbering a check someone else
+    has landed would break the allowance entries that name it, so the free number
+    is taken rather than the next one that merely looks free.
+
     Rungs one and two gave `kin impact`, `kin trace` and `kin search` the
     absence verdict. All three are in the ticket's ZERO-vocabulary row group, so
     the requirement to falsify one command from EACH group stayed undischarged.
