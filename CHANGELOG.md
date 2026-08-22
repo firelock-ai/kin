@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.47] - 2026-08-22
+
+### Changed
+
+- Make kin doctor --fix honest about the repairs it could not make (#1013)
+- Bound what an LSP sweep holds, and stop a re-sweep rewriting what the graph already has (#1015)
+- Let the release train own a region of its PR body, not the whole message (#1011)
+- Read a member that exited mid-classification as contained, and scale the settle by load (#1012)
+- Document a registration and an install a stranger can actually run (#1014)
+- Report the enrichment cause kin init observed, not one derived from a boolean (#1003)
+- Say when kin trace and kin search cannot rule out what they did not see (#1004)
+- Retry a refused vector checkpoint instead of abandoning its vectors (#1006)
+- Record the complete admission a commit performs (#1008)
+- Wait for the language-server sweep on shutdown, and record one that was killed (#1005)
+- Add list_file_entities, a graph-backed file entity enumeration with certifiable completeness (#1009)
+- Announce a commit to the reconcile loop before it can reach the daemon (#1010)
+- Give the sensitive-artifact refusal a command that performs the approval it names (#1016)
+- Say why a trace walk stopped, per hop, and stop reporting coverage as unreported on complete walks (#1018)
+- Give kin dead-code the absence discipline the MCP surface applies (#1017)
+- Bump clap from 4.6.2 to 4.6.6 (#1019)
+- Bump serde_json from 1.0.150 to 1.0.151 (#1021)
+- Give the auth credential test a per-process store instead of the host one (#1027)
+- Bind a projection root only when it is a Kin repository, and stop calling an unserved one in force (#1029)
+- Report the store's coverage beside an embed pass's own count (#1030)
+- Scope a review to the entities that changed, and pair same-name declarations by their own signature (#1031)
+- Give kin impact one relation policy, one depth bound and one verdict (#1032)
+- Wait on the observable in six load-flaky tests instead of on a fixed budget (#1033)
+- Refuse to bind the managed install root, and probe the shim outside the repository (#1035)
+- Cover three of the daemon allowance derivation sites with fixtures (#1036)
+- Move the kin registry pin to kin-vfs-core 0.4.13 and advance the kin-vfs release input (#1034)
+- Bind a Python method call through its receiver's declared type, and keep a module off its function's call edges (#1038)
+- Admit single-word uppercase and call-bound Python module constants (#1039)
+- Record the complete admission init conversion and stash perform, and fetch doctor's graph status once per run (#1040)
+- Roll a refused admission back instead of leaving the derived graph ahead of authority (#1041)
+- Add the profiling layer to the logging stack instead of replacing it (#1042)
+- Decide the embedding class from the coverage counters, not from a conjunction (#1026)
+- Compare the relation census to the one this store last recorded (#1007)
+- Write the Kin PATH line where a non-interactive zsh reads it (#1037)
+- Refuse to certify an absence over a coverage map that measured nothing (#1043)
+- Cover the sealed-tree and restored-tree allowance derivation sites with fixtures (#1045)
+- Retire projection readers after an admission rollback (#1046)
+- Name a vector salvage as lost coverage instead of pending work (#1047)
+- Say when a repo daemon was killed by the memory limit, on the query path (#1025)
+- Arm the reconcile watch before publishing the endpoint, and stop certifying absence over a store the working copy has outrun (#1044)
+- Bind a Python declared receiver to its class's own method when that class is in the calling file (#1048)
+- Stage what kin agent writes, so a run lands a commit (#1049)
+- Order the LSP cold sweep behind the embedding backfill on first boot (#1050)
+- Rank a public entity above its private helpers on a description query (#1051)
+- Admit a path-keyed rewrite of a tracked file as a stage operation (#1052)
+- Attach one graph server per repository to a kin agent run (#1053)
+- Say when a store's enrichment sweeps have been suspended (#1055)
+
+
 ## [0.5.46] - 2026-08-21
 
 ### Changed
