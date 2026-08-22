@@ -7164,6 +7164,28 @@ mod enrichment_marker_tests {
     }
 }
 
+/// A budget no test process can fill, so an arm about host pressure reads host
+/// pressure.
+///
+/// [`pressure_verdict`] takes the worse of two axes: the host's own reading, and
+/// this daemon's standing against its own budget. An arm that pins only the host
+/// still fails when the test binary itself is large. One run of this suite held
+/// 6.1 GiB across a thousand parallel tests, against the 8.0 GiB the budget
+/// derives on this machine, and a `Proceed` control came back `Shrink`. That is
+/// the budget being right about a question the arm was not asking.
+///
+/// The operator value wins outright and is not clamped, so pinning it takes the
+/// second axis out of every arm that is not about it. The budget itself is
+/// proven in `scripts/acceptance/memory_pressure_refusal.py`, where the levers
+/// are the other way round.
+#[cfg(test)]
+fn budget_no_test_can_fill() -> kin_core::test_env::EnvVarGuard {
+    kin_core::test_env::EnvVarGuard::set(
+        kin_core::memory_pressure::FOOTPRINT_BUDGET_ENV,
+        (1024u64 * 1024 * 1024 * 1024).to_string(),
+    )
+}
+
 /// What the daemon does about heavy work when the machine has no room for it.
 ///
 /// Driven through the forced-level override rather than by filling the host,
@@ -7335,6 +7357,7 @@ mod memory_pressure_tests {
     #[test]
     fn a_critical_machine_refuses_the_cold_sweep_and_says_why() {
         let _lock = crate::test_env_lock();
+        let _budget = super::budget_no_test_can_fill();
         let dir = tempfile::tempdir().unwrap();
         let state = open_store(dir.path());
 
@@ -7372,6 +7395,7 @@ mod memory_pressure_tests {
         // be read has said nothing, and a daemon that stopped enriching over it
         // would have invented a limit nobody measured.
         let _lock = crate::test_env_lock();
+        let _budget = super::budget_no_test_can_fill();
         let dir = tempfile::tempdir().unwrap();
         let state = open_store(dir.path());
         let _forced = EnvVarGuard::set("KIN_MEMORY_PRESSURE", "unknown");
@@ -7385,6 +7409,7 @@ mod memory_pressure_tests {
     #[test]
     fn a_critical_machine_defers_the_background_embedding_pass() {
         let _lock = crate::test_env_lock();
+        let _budget = super::budget_no_test_can_fill();
         let dir = tempfile::tempdir().unwrap();
         let state = open_store(dir.path());
         {
@@ -7408,6 +7433,7 @@ mod memory_pressure_tests {
         // A surface reporting last week's refusal reads exactly like one
         // reporting this second's, so the pass that proceeds clears it.
         let _lock = crate::test_env_lock();
+        let _budget = super::budget_no_test_can_fill();
         let dir = tempfile::tempdir().unwrap();
         let state = open_store(dir.path());
         {
@@ -7425,6 +7451,7 @@ mod memory_pressure_tests {
     #[test]
     fn an_elevated_machine_shrinks_the_batch_rather_than_stopping() {
         let _lock = crate::test_env_lock();
+        let _budget = super::budget_no_test_can_fill();
         let _forced = EnvVarGuard::set("KIN_MEMORY_PRESSURE", "elevated");
         let call = pressure_verdict(HeavyWork::EmbedBatch);
         assert!(
@@ -7440,6 +7467,7 @@ mod memory_pressure_tests {
         // A size knob allowed to reach zero is a silent refusal wearing a
         // shrink's name: the loop would run forever embedding nothing.
         let _lock = crate::test_env_lock();
+        let _budget = super::budget_no_test_can_fill();
         let _forced = EnvVarGuard::set("KIN_MEMORY_PRESSURE", "elevated");
         let call = pressure_verdict(HeavyWork::EmbedBatch);
         assert_eq!(embed_batch_under_pressure(1, &call.verdict), 1);
@@ -7449,6 +7477,7 @@ mod memory_pressure_tests {
     #[test]
     fn a_machine_with_room_leaves_every_batch_at_its_configured_size() {
         let _lock = crate::test_env_lock();
+        let _budget = super::budget_no_test_can_fill();
         let _forced = EnvVarGuard::set("KIN_MEMORY_PRESSURE", "nominal");
         let call = pressure_verdict(HeavyWork::EmbedBatch);
         assert_eq!(call.verdict, Verdict::Proceed);
@@ -7461,6 +7490,7 @@ mod memory_pressure_tests {
         // last complete admission stays where it was. A commit is a command
         // someone ran, and this module never refuses one.
         let _lock = crate::test_env_lock();
+        let _budget = super::budget_no_test_can_fill();
         let _forced = EnvVarGuard::set("KIN_MEMORY_PRESSURE", "critical");
         let ambient = pressure_verdict(HeavyWork::AmbientAdmission);
         assert!(matches!(ambient.verdict, Verdict::Refuse { .. }));
@@ -7489,11 +7519,33 @@ mod sweep_lifecycle_tests {
         sweep_started, SweepStartDecision, SWEEP_INTERRUPTION_LIMIT,
     };
     use crate::state::DaemonState;
+    use kin_core::test_env::EnvVarGuard;
     use kin_model::EntityStore;
 
     fn open_store(repo_dir: &std::path::Path) -> DaemonState {
         let init = kin_core::init(repo_dir).unwrap();
         DaemonState::open(init.layout).unwrap()
+    }
+
+    /// Hold the pressure lever still for a test that only reads it.
+    ///
+    /// `decide_sweep_on_start` consults host memory pressure, and
+    /// `KIN_MEMORY_PRESSURE` overrides that reading for the whole process. The
+    /// sibling pressure tests set it under `test_env_lock`, whose stated domain
+    /// is every env-mutating test in this binary. These tests mutate nothing,
+    /// so they were never inside it, and a lock serializes only the sessions
+    /// that take it: a reader outside sees whatever a writer is holding
+    /// mid-test. Pinning the no-pressure control under the same lock is what
+    /// makes these assertions about interruption counting rather than about
+    /// what a sibling thread left behind, and it keeps them honest on a box
+    /// that is genuinely short of memory.
+    fn unpressured() -> (EnvVarGuard, EnvVarGuard, std::sync::MutexGuard<'static, ()>) {
+        let lock = crate::test_env_lock();
+        let budget = super::budget_no_test_can_fill();
+        let pressure = EnvVarGuard::set("KIN_MEMORY_PRESSURE", "nominal");
+        // Both pins are released before the lock, so no window exists where the
+        // next holder can observe this test's overrides.
+        (pressure, budget, lock)
     }
 
     /// One language-server relation, so the resume marker is corroborated by the
@@ -7566,6 +7618,7 @@ mod sweep_lifecycle_tests {
     /// it.
     #[test]
     fn a_sweep_killed_before_its_tail_is_counted_once_and_the_successor_still_sweeps() {
+        let _quiet = unpressured();
         let repo_dir = tempfile::tempdir().unwrap();
         let state = open_store(repo_dir.path());
 
@@ -7636,6 +7689,7 @@ mod sweep_lifecycle_tests {
     /// The breaker still turns, so counting kills does not mint an endless loop.
     #[test]
     fn enough_killed_sweeps_open_the_circuit() {
+        let _quiet = unpressured();
         let repo_dir = tempfile::tempdir().unwrap();
         let state = open_store(repo_dir.path());
 
@@ -7660,6 +7714,7 @@ mod sweep_lifecycle_tests {
     /// the next daemon must not re-derive what it already made durable.
     #[test]
     fn a_completed_sweep_is_not_counted_as_an_interruption_and_its_files_are_not_re_swept() {
+        let _quiet = unpressured();
         let repo_dir = tempfile::tempdir().unwrap();
         let files = swept_files();
 
