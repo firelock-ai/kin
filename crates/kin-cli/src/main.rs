@@ -409,9 +409,11 @@ enum Command {
     /// `--rebuild` to drop the stale index and re-embed every entity at the
     /// current model's dimension.
     Embed {
-        /// Embedding batch size (entities per inference pass). Defaults to 64, or
-        /// the throughput resource plan's per-chunk budget when
-        /// KIN_RESOURCE_PROFILE=throughput is set.
+        /// Embedding batch size (entities per inference pass) for THIS pass only.
+        /// Defaults to 64, or the throughput resource plan's per-chunk budget when
+        /// KIN_RESOURCE_PROFILE=throughput is set. It does not change the daemon's
+        /// own background queue and does not survive a daemon restart; record a
+        /// durable one with `kin resources set --embed-batch-size N`.
         #[arg(long)]
         batch_size: Option<usize>,
         /// Stop after this many seconds, persist completed vectors, and leave the rest pending.
@@ -1298,6 +1300,18 @@ enum NotifyAction {
 
 #[derive(Subcommand)]
 enum ResourcesAction {
+    /// Record resource knobs for this repository so they survive a daemon restart
+    Set {
+        /// Resource profile the daemon adopts at its next start: proof, interactive, throughput, or ci
+        #[arg(long)]
+        profile: Option<String>,
+        /// Batch size for the daemon's background embedding queue
+        #[arg(long)]
+        embed_batch_size: Option<usize>,
+        /// Remove the recorded knobs and go back to the built-in defaults
+        #[arg(long)]
+        clear: bool,
+    },
     /// Report the detected resource plan and live daemon embedding state
     Inspect {
         /// Output the stable JSON resource plan instead of a human summary
@@ -2607,6 +2621,11 @@ fn main() -> Result<()> {
                     commands::status::run(json, std::time::Duration::from_secs(wait_quiesce)).await
                 }
                 Command::Resources { action } => match action {
+                    ResourcesAction::Set {
+                        profile,
+                        embed_batch_size,
+                        clear,
+                    } => commands::resources::set(profile, embed_batch_size, clear),
                     ResourcesAction::Inspect { json, profile } => {
                         commands::resources::run(json, profile).await
                     }

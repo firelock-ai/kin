@@ -8,6 +8,7 @@
 //! CAS bodies. Every other artifact remains represented by the exact tree even
 //! when it has no language adapter.
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -97,9 +98,15 @@ struct SemanticTreeState {
 /// `trees` is keyed by each input change's current identity. The input changes
 /// must not already contain semantic deltas: this is a single, explicit build
 /// phase, not a best-effort repair path.
-pub fn derive_historical_semantic_deltas(
+///
+/// The map is generic over how its trees are held so a caller that already owns
+/// every exact tree can lend them rather than copy them. Enrichment only ever
+/// reads a tree, so requiring ownership here obliged the one caller that runs at
+/// whole-repository scale to deep-copy the largest structure a conversion holds
+/// purely to re-key it, and hold both copies at once for the whole phase.
+pub fn derive_historical_semantic_deltas<T: Borrow<ResolvedTree>>(
     changes: &[SemanticChange],
-    trees: &BTreeMap<SemanticChangeId, ResolvedTree>,
+    trees: &BTreeMap<SemanticChangeId, T>,
     blob_store: &BlobStore,
 ) -> Result<Vec<HistoricalSemanticDelta>> {
     let pipeline = IndexPipeline::new();
@@ -167,7 +174,7 @@ pub fn derive_historical_semantic_deltas(
             ))
         })?;
         let current = semantic_state_for_tree(
-            tree,
+            tree.borrow(),
             &parent_states,
             blob_store,
             &pipeline,

@@ -13,7 +13,10 @@
 crates/kin-cli/src/commands/mcp.rs
 
 # `kin` and `kin-daemon` select their resource profile at startup when the
-# operator set none. KIN_RESOURCE_PROFILE is the published interface kin-infer
+# operator set none, and `kin-daemon` additionally adopts the profile this
+# repository recorded in its `[resources]` config so a knob set to survive an OOM
+# is still in force on the restart that OOM causes (FIR-2504); an operator's own
+# export outranks both. KIN_RESOURCE_PROFILE is the published interface kin-infer
 # and kin-db read for the kernel plan, submission depth and embedding budgets, so
 # writing it IS how a binary states its choice — there is no argument to pass it
 # by across a registry dependency. The write happens in the first statement of

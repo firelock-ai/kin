@@ -755,6 +755,70 @@ pub struct KinConfig {
     /// languages, and proof posture.
     #[serde(default)]
     pub lsp: LspConfig,
+
+    /// Resource knobs that must survive a daemon restart.
+    #[serde(default)]
+    pub resources: ResourcesConfig,
+}
+
+/// The two knobs an operator reaches for on a constrained host, recorded where
+/// they outlive the process that set them (FIR-2504).
+///
+/// Before this section both knobs lived only in the environment of whichever
+/// process happened to spawn the daemon, so the batch size an operator set
+/// reverted to the daemon default on the restart an OOM forced, which is
+/// precisely when it was needed. Absent fields mean "not set here" and leave the
+/// environment and the built-in defaults in charge; this section never
+/// outranks an explicit environment variable.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResourcesConfig {
+    /// Resource profile this repository's daemon should run under: `proof`,
+    /// `interactive`, `throughput`, or `ci`. Validated at load and at save, so
+    /// an unusable value is rejected at the moment it is written rather than
+    /// silently ignored at the moment it would have mattered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+
+    /// Batch size for the daemon's background embedding queue. `None` leaves the
+    /// daemon's own default in place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embed_batch_size: Option<usize>,
+}
+
+/// The profile names a repository config may carry, which are the same names
+/// `KIN_RESOURCE_PROFILE` accepts. Duplicated as data here rather than imported
+/// so kin-core keeps no dependency on the CLI; the two are pinned together by a
+/// test in `crates/kin-cli/src/commands/resources.rs`.
+pub const RESOURCE_PROFILE_NAMES: [&str; 4] = ["proof", "interactive", "throughput", "ci"];
+
+impl ResourcesConfig {
+    /// Reject a profile name the runtime cannot act on, and a batch size of
+    /// zero, which would stall the embedding queue rather than slow it.
+    pub fn validate(&self) -> Result<()> {
+        if let Some(profile) = &self.profile {
+            let normalized = profile.trim().to_ascii_lowercase();
+            if !RESOURCE_PROFILE_NAMES.contains(&normalized.as_str()) {
+                return Err(KinError::Config(format!(
+                    "unknown resource profile '{profile}' in [resources] config (expected {})",
+                    RESOURCE_PROFILE_NAMES.join(", ")
+                )));
+            }
+        }
+        if self.embed_batch_size == Some(0) {
+            return Err(KinError::Config(
+                "[resources] embed_batch_size must be greater than 0".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The profile name normalized to what the runtime compares against, so a
+    /// config carrying `CI` behaves exactly like one carrying `ci`.
+    pub fn normalized_profile(&self) -> Option<String> {
+        self.profile
+            .as_ref()
+            .map(|profile| profile.trim().to_ascii_lowercase())
+    }
 }
 
 fn default_mode() -> String {
@@ -811,6 +875,7 @@ impl Default for KinConfig {
             remote: RemoteConfig::default(),
             git: GitCoexistenceConfig::default(),
             lsp: LspConfig::default(),
+            resources: ResourcesConfig::default(),
         }
     }
 }
@@ -840,6 +905,7 @@ impl KinConfig {
     pub fn validate(&self) -> Result<()> {
         self.lsp.validate()?;
         self.git.validate()?;
+        self.resources.validate()?;
         Ok(())
     }
 
@@ -1788,6 +1854,72 @@ mod tests {
         let loaded = KinConfig::load(&path).unwrap();
         assert_eq!(loaded.name, Some("test-repo".to_string()));
         assert_eq!(loaded.default_branch, "main");
+    }
+
+    /// FIR-2504: the knobs an operator sets on a constrained host must be
+    /// readable again after the process that read them is gone. A round trip
+    /// through the real writer is the only proof of that.
+    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+    #[test]
+    fn resource_knobs_survive_a_write_and_a_fresh_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = repository_config_path(&dir);
+        let mut config = KinConfig::default();
+        assert_eq!(config.resources, ResourcesConfig::default());
+        config.resources.profile = Some("ci".to_string());
+        config.resources.embed_batch_size = Some(16);
+        config.save(&path).unwrap();
+
+        let loaded = KinConfig::load(&path).unwrap();
+        assert_eq!(loaded.resources.profile.as_deref(), Some("ci"));
+        assert_eq!(loaded.resources.embed_batch_size, Some(16));
+        // A config that records nothing writes nothing, so an untouched repo
+        // keeps a config with no [resources] table at all.
+        let bare = toml::to_string_pretty(&KinConfig::default()).unwrap();
+        assert!(!bare.contains("profile"), "{bare}");
+        assert!(!bare.contains("embed_batch_size"), "{bare}");
+    }
+
+    /// A knob the runtime cannot act on is refused where the operator is
+    /// watching. Both directions: load and save.
+    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+    #[test]
+    fn an_unusable_resource_knob_is_refused_rather_than_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = repository_config_path(&dir);
+
+        let mut config = KinConfig::default();
+        config.resources.profile = Some("bananas".to_string());
+        let error = config
+            .save(&path)
+            .expect_err("an unknown profile must not be written");
+        assert!(
+            error.to_string().contains("unknown resource profile"),
+            "{error}"
+        );
+        assert!(!path.exists(), "a refused save left a file behind");
+
+        let mut zero = KinConfig::default();
+        zero.resources.embed_batch_size = Some(0);
+        let error = zero
+            .save(&path)
+            .expect_err("a zero batch would stall the queue, not slow it");
+        assert!(error.to_string().contains("greater than 0"), "{error}");
+
+        // The same rule on the way in, so a hand-edited file fails loud.
+        std::fs::write(&path, "[resources]\nprofile = \"bananas\"\n").unwrap();
+        let error = KinConfig::load(&path).expect_err("a hand-edited bad profile must fail loud");
+        assert!(
+            error.to_string().contains("unknown resource profile"),
+            "{error}"
+        );
+
+        // Control: the four accepted names all load, so the check above can
+        // fail for the right reason rather than because every value is refused.
+        for name in RESOURCE_PROFILE_NAMES {
+            std::fs::write(&path, format!("[resources]\nprofile = \"{name}\"\n")).unwrap();
+            KinConfig::load(&path).unwrap_or_else(|error| panic!("{name} must load: {error}"));
+        }
     }
 
     #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]

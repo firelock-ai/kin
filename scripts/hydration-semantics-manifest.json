@@ -5,7 +5,7 @@
     {
       "file": "crates/kin-index/src/history.rs",
       "function": "derive_historical_semantic_deltas",
-      "digest": "sha256:8033956783d1bc36651423c022d06db20d6ef61a27ae08b318d79980f32af224",
+      "digest": "sha256:038396986f07f0d43e7efca1725066ade9ce3835d27d09d8b30dfa51e6235ab0",
       "reason": "Drives the whole parent-first replay: it decides the per-change baseline, which trees are enriched, and the exact EntityDelta/RelationDelta payload persisted for every historical change.",
       "owner": "kin-index"
     },
@@ -82,7 +82,7 @@
     {
       "file": "crates/kin-git/src/semantic_import.rs",
       "function": "build_semantic_git_import_plan",
-      "digest": "sha256:f7d2b5c5e1b35c9f62b5b920a5a7955e7922fbb4ede9ec2bc19f03972c473b45",
+      "digest": "sha256:cb98f5e26da58c875a7e3427f1c72f910e717ab1d6b54160ddce7243d82cd9b4",
       "reason": "Builds the parent-first change sequence and tree map replay consumes. Its ordering and tree selection decide the baseline every historical delta is computed against.",
       "owner": "kin-git"
     },

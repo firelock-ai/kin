@@ -269,6 +269,15 @@ fn init_from_git_with_hooks(
     };
 
     progress.begin("apply admission policy");
+    // Both this phase and the proof after it re-derive the whole history from
+    // raw objects, one commit at a time, and on a mature repository that is
+    // minutes of silence. Naming the count is the difference between a
+    // conversion that looks wedged and one whose remaining work an operator can
+    // estimate.
+    progress.detail(format_args!(
+        "re-deriving {} commits",
+        semantic_plan.changes.len()
+    ));
     let admitted = {
         let _span = info_span!("kin.init.admit_semantic_import").entered();
         admit_semantic_git_import(&semantic_plan, &capture_store).map_err(|error| {
@@ -288,6 +297,10 @@ fn init_from_git_with_hooks(
     // of the three that revalidates the plan structurally, which is what the
     // other two reuse rather than repeat.
     progress.begin("prove Git source");
+    progress.detail(format_args!(
+        "re-deriving {} commits",
+        semantic_plan.changes.len()
+    ));
     let source_proof = {
         let _span = info_span!("kin.init.source_proof_staged").entered();
         preflight_git_migration(&source, &snapshot, &semantic_plan, &capture_store)
@@ -967,6 +980,11 @@ fn bind_historical_semantics(
     plan: kin_git::SemanticGitImportPlan,
     capture_store: &BlobStore,
 ) -> Result<kin_git::SemanticGitImportPlan> {
+    // Lend the exact trees rather than copy them. This map exists only to re-key
+    // `commit_trees` from Git object id to semantic change id for the enrichment
+    // fold, which reads a tree and never keeps one. Cloning here doubled the
+    // largest structure a whole-history conversion holds, and held both copies
+    // for the whole phase, to change a key.
     let mut trees = std::collections::BTreeMap::new();
     for alias in &plan.aliases {
         let tree = plan.commit_trees.get(&alias.oid).ok_or_else(|| {
@@ -975,7 +993,7 @@ fn bind_historical_semantics(
                 format!("imported commit {} has no exact resolved tree", alias.oid),
             )
         })?;
-        if trees.insert(alias.change_id, tree.clone()).is_some() {
+        if trees.insert(alias.change_id, tree).is_some() {
             return Err(git_boundary_error(
                 "bind historical semantics",
                 format!("imported history repeats change {}", alias.change_id),

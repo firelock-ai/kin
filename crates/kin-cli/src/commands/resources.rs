@@ -18,6 +18,14 @@ pub struct CommandResourcesRequest {
 /// doing. Sourced entirely from daemon-owned state — never recomputed here.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmbedRuntimeState {
+    /// Batch size the daemon's background embedding queue is running with, or
+    /// absent when the daemon has not published one (FIR-2504).
+    ///
+    /// The knob an operator sets to survive a constrained host is worth nothing
+    /// if there is no way to see whether it took, and the flag that looked like
+    /// it worked is exactly what the defect was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embed_batch_size: Option<usize>,
     /// The background embedding worker has permanently stopped (embed-degraded).
     pub embed_worker_failed: bool,
     /// The embedding work mutex is currently held — an embed pass is in flight.
@@ -150,6 +158,21 @@ pub struct ActualResources {
     /// tell a deliberate pin from the shipped default.
     #[serde(default)]
     pub resource_profile_product_selected: bool,
+    /// Whether that value came from this repository's `[resources]` config
+    /// rather than from the operator's shell (FIR-2504). Third state beside the
+    /// two above, because a config-selected profile reported as an operator
+    /// override is the same lie FIR-2434 fixed in the other direction.
+    #[serde(default)]
+    pub resource_profile_repository_config: bool,
+    /// Why the value in effect is not a profile the runtime can act on, when it
+    /// is not (FIR-2504).
+    ///
+    /// The environment audit warns about this at startup and then the read sites
+    /// silently fall back, so an operator who exported a name with a typo saw
+    /// `Profile: interactive` and no explanation. Reporting the rejection here
+    /// is what turns "the profile I set is ignored" into a sentence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_profile_rejected: Option<String>,
     /// Active `RAYON_NUM_THREADS` override, if set and non-empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rayon_num_threads_env: Option<String>,
@@ -164,13 +187,17 @@ impl ActualResources {
     /// the pool that actually runs ingest/embed work rather than a transient CLI
     /// process pool.
     pub fn capture() -> Self {
+        let resource_profile_env = non_empty_env("KIN_RESOURCE_PROFILE");
         ActualResources {
             rayon_global_threads: rayon::current_num_threads(),
             available_parallelism: std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(0),
-            resource_profile_env: non_empty_env("KIN_RESOURCE_PROFILE"),
+            resource_profile_rejected: parse_profile(resource_profile_env.as_deref()).err(),
+            resource_profile_env,
             resource_profile_product_selected: crate::resource_profile::product_selected(),
+            resource_profile_repository_config: crate::resource_profile::repository_config_selected(
+            ),
             rayon_num_threads_env: non_empty_env("RAYON_NUM_THREADS"),
             tokenizers_parallelism_env: non_empty_env("TOKENIZERS_PARALLELISM"),
         }
@@ -647,6 +674,28 @@ pub fn parse_profile(raw: Option<&str>) -> Result<Profile, String> {
     }
 }
 
+/// The profile an inspect with no explicit `--profile` should plan under.
+///
+/// Before FIR-2504 this was `parse_profile(request.profile)`, whose absent case
+/// is `Interactive`, so `kin resources inspect` reported `interactive` on a host
+/// whose daemon was running under `ci` and there was no way to see the
+/// difference. The inspected runtime's own selector is the honest default; an
+/// explicit `--profile` stays a what-if plan and still wins.
+///
+/// A runtime selector the parser rejects falls back to `Interactive` rather than
+/// failing the whole inspect, because the operator asking why their profile did
+/// nothing needs the answer, not a second error. `ActualResources` carries the
+/// rejection so the rendered output says so.
+pub fn effective_inspect_profile(
+    request: Option<&str>,
+    runtime_selector: Option<&str>,
+) -> Result<Profile, String> {
+    match request.map(str::trim) {
+        Some(name) if !name.is_empty() => parse_profile(Some(name)),
+        _ => Ok(parse_profile(runtime_selector).unwrap_or(Profile::Interactive)),
+    }
+}
+
 fn profile_label(profile: Profile) -> &'static str {
     match profile {
         Profile::Proof => "proof",
@@ -773,6 +822,10 @@ fn render_lines(
             "Embed coverage: {}/{} indexed, {} pending",
             embed.embeddings_indexed, embed.embeddings_total, embed.embeddings_pending
         ),
+        match embed.embed_batch_size {
+            Some(size) => format!("Background embed batch: {size} entities per pass"),
+            None => "Background embed batch: not published by this daemon".to_string(),
+        },
         format!(
             "Embed worker: {}",
             if embed.embed_worker_failed {
@@ -819,7 +872,20 @@ fn render_lines(
 /// origin is the only thing that separates a deliberate pin from the ship
 /// default.
 fn profile_selector_line(actual: &ActualResources) -> String {
+    if let (Some(value), Some(reason)) = (
+        actual.resource_profile_env.as_deref(),
+        actual.resource_profile_rejected.as_deref(),
+    ) {
+        return format!(
+            "Profile selector: KIN_RESOURCE_PROFILE={value} REJECTED ({reason}); this runtime \
+             is planning under its default instead"
+        );
+    }
     match actual.resource_profile_env.as_deref() {
+        Some(value) if actual.resource_profile_repository_config => format!(
+            "Profile selector: KIN_RESOURCE_PROFILE={value} (from this repository's \
+             [resources] config; unset in the environment)"
+        ),
         Some(value) if actual.resource_profile_product_selected => {
             format!("Profile selector: KIN_RESOURCE_PROFILE={value} (selected by kin; unset in the environment)")
         }
@@ -893,6 +959,74 @@ pub fn throughput_embed_batch_size() -> usize {
 /// fully deterministic.
 pub fn embed_pipeline_overlap_default(resource_profile: Option<&str>) -> bool {
     resource_profile.map(str::trim) == Some("throughput")
+}
+
+/// Record resource knobs for this repository so they outlive the daemon that
+/// read them (FIR-2504).
+///
+/// The two knobs an operator reaches for on a constrained host lived only in the
+/// environment of whichever process spawned the daemon, so the batch size set to
+/// survive an OOM was gone on the restart that OOM caused. This writes them to
+/// `.kin/config.toml` through the same atomic, capability-scoped writer the rest
+/// of the repository config uses, under the same projection freeze, so a
+/// concurrent eject cannot see a half-written config.
+pub fn set(profile: Option<String>, embed_batch_size: Option<usize>, clear: bool) -> Result<()> {
+    let layout = crate::commands::require_repository_layout()?;
+    if clear && (profile.is_some() || embed_batch_size.is_some()) {
+        anyhow::bail!("--clear cannot be combined with --profile or --embed-batch-size");
+    }
+    if !clear && profile.is_none() && embed_batch_size.is_none() {
+        anyhow::bail!(
+            "kin resources set needs --profile, --embed-batch-size, or --clear; it changes nothing \
+             on its own"
+        );
+    }
+    // Reject a profile the runtime cannot act on HERE, where the operator is
+    // watching, rather than at the next daemon start where the only symptom is
+    // a knob that did nothing.
+    if let Some(name) = profile.as_deref() {
+        parse_profile(Some(name)).map_err(|message| anyhow::anyhow!(message))?;
+    }
+    if embed_batch_size == Some(0) {
+        anyhow::bail!("--embed-batch-size must be greater than 0");
+    }
+
+    // Config is part of the repository namespace handed to exact eject; share
+    // the projection lock exactly as the remote config writer does.
+    let projection_freeze = kin_core::ExactProjectionFreeze::acquire_existing(layout.working_dir())
+        .context("freeze the existing repository projection before updating resources config")?;
+    let config_path = layout.config_path();
+    let mut config = kin_core::KinConfig::load_or_default(&config_path)?;
+    if clear {
+        config.resources = kin_core::ResourcesConfig::default();
+    } else {
+        if let Some(name) = profile {
+            config.resources.profile = Some(name.trim().to_ascii_lowercase());
+        }
+        if let Some(size) = embed_batch_size {
+            config.resources.embed_batch_size = Some(size);
+        }
+    }
+    config.save(&config_path)?;
+    drop(projection_freeze);
+
+    let recorded = kin_core::KinConfig::load_or_default(&config_path)?.resources;
+    match (&recorded.profile, recorded.embed_batch_size) {
+        (None, None) => println!("Recorded resource knobs for this repository: none"),
+        _ => {
+            println!("Recorded resource knobs for this repository:");
+            match &recorded.profile {
+                Some(name) => println!("  profile: {name}"),
+                None => println!("  profile: (unset)"),
+            }
+            match recorded.embed_batch_size {
+                Some(size) => println!("  embed_batch_size: {size}"),
+                None => println!("  embed_batch_size: (unset)"),
+            }
+        }
+    }
+    println!("A running daemon adopts these at its next start.");
+    Ok(())
 }
 
 pub async fn run(json: bool, profile: Option<String>) -> Result<()> {
@@ -1632,6 +1766,95 @@ mod tests {
         assert!(response
             .text
             .contains("Profile selector: KIN_RESOURCE_PROFILE=interactive (selected by kin"));
+    }
+
+    /// FIR-2504: `kin resources inspect` with no `--profile` must report the
+    /// plan the inspected runtime is actually on. The stranger set `ci`,
+    /// restarted exactly as told, and read `interactive` back, because the
+    /// request's absent case defaulted rather than asking the runtime.
+    #[test]
+    fn an_inspect_with_no_flag_plans_under_the_runtime_selector() {
+        assert_eq!(effective_inspect_profile(None, Some("ci")), Ok(Profile::Ci));
+        assert_eq!(
+            effective_inspect_profile(None, Some("throughput")),
+            Ok(Profile::Throughput)
+        );
+        // An explicit flag is still a what-if plan and still wins.
+        assert_eq!(
+            effective_inspect_profile(Some("proof"), Some("ci")),
+            Ok(Profile::Proof)
+        );
+        // Nothing to ask: kin's own default.
+        assert_eq!(
+            effective_inspect_profile(None, None),
+            Ok(Profile::Interactive)
+        );
+        assert_eq!(
+            effective_inspect_profile(Some("  "), Some("ci")),
+            Ok(Profile::Ci)
+        );
+        // A runtime selector the parser rejects does not fail the inspect; the
+        // operator asking why their profile did nothing needs the answer.
+        assert_eq!(
+            effective_inspect_profile(None, Some("bananas")),
+            Ok(Profile::Interactive)
+        );
+        // An explicit bad flag is still the caller's error.
+        assert!(effective_inspect_profile(Some("bananas"), Some("ci")).is_err());
+    }
+
+    /// The rejection has to reach the operator's screen, or the fallback is
+    /// exactly the silent substitution the ticket is about.
+    #[test]
+    fn a_rejected_selector_is_reported_as_rejected_with_its_reason() {
+        let rejected = ActualResources {
+            resource_profile_env: Some("bananas".to_string()),
+            resource_profile_rejected: parse_profile(Some("bananas")).err(),
+            ..Default::default()
+        };
+        let line = profile_selector_line(&rejected);
+        assert!(line.contains("REJECTED"), "{line}");
+        assert!(line.contains("bananas"), "{line}");
+        assert!(line.contains("expected proof, interactive"), "{line}");
+
+        // Control: an accepted value never wears the rejection wording, so the
+        // assertion above can fail for the right reason.
+        let accepted = ActualResources {
+            resource_profile_env: Some("ci".to_string()),
+            resource_profile_rejected: parse_profile(Some("ci")).err(),
+            ..Default::default()
+        };
+        assert!(!profile_selector_line(&accepted).contains("REJECTED"));
+    }
+
+    /// A config-selected profile is neither an operator override nor kin's ship
+    /// default, and saying it is either is the FIR-2434 lie in a new costume.
+    #[test]
+    fn a_repository_selected_profile_is_named_as_one() {
+        let from_config = ActualResources {
+            resource_profile_env: Some("ci".to_string()),
+            resource_profile_repository_config: true,
+            ..Default::default()
+        };
+        let line = profile_selector_line(&from_config);
+        assert!(line.contains("[resources] config"), "{line}");
+        assert!(!line.contains("set by operator"), "{line}");
+        assert!(!line.contains("selected by kin"), "{line}");
+    }
+
+    /// kin-core validates the recorded profile against its own copy of the
+    /// name list. The two must not drift, or a config kin-core accepts is one
+    /// the runtime rejects.
+    #[test]
+    fn the_config_profile_names_are_the_names_the_runtime_parses() {
+        for name in kin_core::RESOURCE_PROFILE_NAMES {
+            parse_profile(Some(name)).unwrap_or_else(|error| panic!("{name}: {error}"));
+        }
+        assert_eq!(
+            kin_core::RESOURCE_PROFILE_NAMES.len(),
+            4,
+            "a profile was added to the runtime without teaching the config about it"
+        );
     }
 
     #[test]

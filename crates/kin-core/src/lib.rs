@@ -64,7 +64,8 @@ pub use assistant_sync::{
 pub use config::{
     ExecutionPolicyConfig, ExternalToolExecutionPolicy, GitBranchTrackingConfig,
     GitCoexistenceConfig, GitPushDefault, GitRemoteTransportConfig, KinConfig, RemoteConfig,
-    RemoteHostKind, RemoteRefConfig, RemoteTransportKind, WorldConfig, WorldPreset,
+    RemoteHostKind, RemoteRefConfig, RemoteTransportKind, ResourcesConfig, WorldConfig,
+    WorldPreset, RESOURCE_PROFILE_NAMES,
 };
 pub use error::{KinError, Result};
 pub use exact_tree::{
