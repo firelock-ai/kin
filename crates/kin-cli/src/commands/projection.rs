@@ -1230,8 +1230,8 @@ pub(crate) struct LiveProjection {
     /// Kin's own shell hook wraps `kin` as
     /// `kin() { DYLD_INSERT_LIBRARIES= LD_PRELOAD= command kin "$@"; }`, so the
     /// one process the hook guarantees is unshimmed is the process asking the
-    /// question. Every other probe here — the read, the bound root, the socket
-    /// behind it — is about the projection rather than about this process, and a
+    /// question. Every other probe here, the read and the bound root and the
+    /// socket behind it, is about the projection rather than this process, and a
     /// caller that wants to tell "this binary is deliberately not injected" from
     /// "the projection is broken" needs the two separated. [`Self::degraded`]
     /// deliberately does not make that distinction: a surface reporting on the

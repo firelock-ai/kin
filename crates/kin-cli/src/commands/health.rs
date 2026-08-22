@@ -1170,12 +1170,12 @@ fn check_projection_mode() -> HealthCheck {
 /// This exists because the projection row was asking the one question the hook
 /// guarantees a "no" to. The hook wraps the control plane as
 /// `kin() { DYLD_INSERT_LIBRARIES= LD_PRELOAD= command kin "$@"; }`, which is
-/// correct — injecting the shim into the binary that serves it is circular — and
-/// then the row measured whether the shim was preloaded into `kin doctor` and
-/// told a correctly installed user to start a new shell so the hook would inject
-/// it. It never would (FIR-2501). The question worth asking is about the OTHER
-/// processes in this shell, and it is answerable, because the two variables the
-/// `kin` wrapper does not clear pass straight through.
+/// correct, since injecting the shim into the binary that serves it is
+/// circular. The row then measured whether the shim was preloaded into `kin
+/// doctor` and told a correctly installed user to start a new shell so the hook
+/// would inject it. It never would (FIR-2501). The question worth asking is
+/// about the OTHER processes in this shell, and it is answerable, because the
+/// two variables the `kin` wrapper does not clear pass straight through.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ShellHook {
     /// Live: this shell runs Kin's hook, so the non-`kin` processes it starts
@@ -1246,11 +1246,7 @@ fn probe_shell_hook(kin_home: &Path, shell: &str, shim_path: &Path) -> ShellHook
         .ok()
         .and_then(|rc| std::fs::read_to_string(rc).ok())
         .unwrap_or_default();
-    let non_empty = |name: &str| {
-        env::var(name)
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-    };
+    let non_empty = |name: &str| env::var(name).ok().filter(|value| !value.trim().is_empty());
     shell_hook_from(ShellHookFacts {
         shell,
         hook_path: &hook_path,
@@ -1329,11 +1325,12 @@ fn shell_hook_from(facts: ShellHookFacts<'_>) -> ShellHook {
     // activate path having run in THIS shell: every POSIX hook exports
     // KIN_VFS_WORKSPACE and the preload together, and clears both together, so
     // the variable `kin`'s own wrapper forgets to strip is a witness to the
-    // preload that wrapper just stripped. Where there is no witness — outside a
-    // repository the hook stands down by design — the evidence is the file and
-    // the rc line, and currency is required there because nobody has read this
-    // hook's behavior and an older one is a file whose contents are a guess.
-    match bound_root.filter(|_| current) {
+    // preload that wrapper just stripped. Where there is no witness, and
+    // outside a repository the hook stands down by design, the evidence is the
+    // file and the rc line. Currency is required there because nobody has read
+    // this hook's behavior and an older one is a file whose contents are a
+    // guess.
+    match bound_root {
         Some(root) => ShellHook::Live(format!(
             "Kin's {shell} hook is live in this shell: it bound {root} as the projection root and \
              exports the {} shim ({shim_size} bytes) into every process this shell starts except \
@@ -1714,8 +1711,8 @@ fn projection_mode_check_for(
     //   softer status, let alone a green one.
     // - `unengaged_here_only` is the projection's own verdict with the
     //   engagement question answered yes. Without it this branch would report
-    //   the FIR-2552 machine — a root bound that nothing serves, or one that
-    //   does not contain this directory — as healthy, which is the state where
+    //   the FIR-2552 machine, a root bound that nothing serves or one that does
+    //   not contain this directory, as healthy, which is the state where
     //   every path under that root returns EIO for every process the shim IS
     //   injected into.
     // - `hook.is_live()` is the hook evidence itself.
@@ -5732,8 +5729,8 @@ mod tests {
     /// FIR-2501, in both directions, over one fixture with one fact flipped.
     ///
     /// The defect was a row that measured whether the shim was preloaded into
-    /// `kin doctor` — the one process Kin's hook exists to keep unshimmed —
-    /// called a correct install STALE, and printed a fix that could not work. A
+    /// `kin doctor`, the one process Kin's hook exists to keep unshimmed, then
+    /// called a correct install STALE and printed a fix that could not work. A
     /// STALE row denies "First-run ready" since FIR-2547, so this was every
     /// correctly hook-installed machine.
     #[test]
@@ -5760,8 +5757,12 @@ mod tests {
         // The detail must not claim the doctor process is shimmed. It must say
         // the opposite, and say that it is correct.
         assert!(
-            green.detail.contains("IS injected into the processes this shell starts")
-                && green.detail.contains("correctly NOT injected into `kin` itself"),
+            green
+                .detail
+                .contains("IS injected into the processes this shell starts")
+                && green
+                    .detail
+                    .contains("correctly NOT injected into `kin` itself"),
             "the green detail must say plainly which processes are injected and which are not: {}",
             green.detail
         );
@@ -5933,7 +5934,10 @@ mod tests {
             assert!(vfs_disabled_by(on), "{on:?} switches the hook off");
         }
         for off in ["", "0", "false", "no", "off", "2", "onward"] {
-            assert!(!vfs_disabled_by(off), "{off:?} does not switch the hook off");
+            assert!(
+                !vfs_disabled_by(off),
+                "{off:?} does not switch the hook off"
+            );
         }
     }
 
@@ -6082,7 +6086,8 @@ mod tests {
         for probe in &mut remedyless.modes {
             probe.remedy = None;
         }
-        let bare_windows = projection_mode_check_for(&remedyless, "windows", &not_probed(), &no_hook());
+        let bare_windows =
+            projection_mode_check_for(&remedyless, "windows", &not_probed(), &no_hook());
         assert!(
             !bare_windows.detail.contains("fixture remedy for projfs"),
             "the remedy must come from the probes: {}",
