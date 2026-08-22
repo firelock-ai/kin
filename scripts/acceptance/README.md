@@ -1,7 +1,7 @@
 # Product acceptance suites
 
-Three falsifiable suites that ask whether the product still answers correctly.
-`.github/workflows/acceptance.yml` runs all three on every pull request against
+Four falsifiable suites that ask whether the product still answers correctly.
+`.github/workflows/acceptance.yml` runs all four on every pull request against
 that pull request's own build. None is release proof; all are regression gates.
 
 Each suite prints one line per check:
@@ -34,7 +34,7 @@ was 0.9% of its kind and no magnitude threshold was ever going to reach it.
 Every check names the ticket it is about, so a failure is attributable without
 reading the code.
 
-`parse_hole_repro.py` covers what the other two cannot see: a file the
+`parse_hole_repro.py` covers what the others cannot see: a file the
 repository admits that produced no entity at all. It builds a JavaScript library
 of four modules that declare a function beside three that are valid source and
 declare nothing, then asserts that `kin graph status` publishes the per-language
