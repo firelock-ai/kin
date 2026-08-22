@@ -1034,8 +1034,7 @@ fn graph_status_refuses_the_all_clear_over_a_language_it_did_not_parse() {
         "a repository whose files all produced entities must not be warned about: {before_lines}"
     );
     assert!(
-        before_lines.contains("✓ No issues detected.")
-            || !before_lines.contains("parse coverage"),
+        before_lines.contains("✓ No issues detected.") || !before_lines.contains("parse coverage"),
         "the control must not be carrying the warning under another name: {before_lines}"
     );
 

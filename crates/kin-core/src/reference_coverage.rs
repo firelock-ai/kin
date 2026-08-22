@@ -1217,7 +1217,9 @@ pub fn collect_parse_coverage_from(
         let Some(adapter) = registry.get_by_extension(extension) else {
             continue;
         };
-        let tally = tallies.entry(adapter.language_id().to_string()).or_default();
+        let tally = tallies
+            .entry(adapter.language_id().to_string())
+            .or_default();
         tally.tracked += 1;
         if producing.contains(path) {
             tally.with_entities += 1;

@@ -8848,9 +8848,11 @@ mod tests {
             tracked,
             with_entities: tracked.saturating_sub(unparsed),
             unparsed,
-            sample: (unparsed > 0)
-                .then(|| vec!["lib/express.js".to_string()])
-                .unwrap_or_default(),
+            sample: if unparsed > 0 {
+                vec!["lib/express.js".to_string()]
+            } else {
+                Vec::new()
+            },
         }
     }
 
