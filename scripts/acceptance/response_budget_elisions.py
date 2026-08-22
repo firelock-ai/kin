@@ -1089,8 +1089,14 @@ def check_6(suite):
     problems, marked = grade_body_elisions(payload)
     for problem in problems:
         res.bad(problem)
-    if marked == 0:
+    if marked == 0 and not problems:
+        # Only when the rule genuinely went unexercised. A response that broke
+        # the rule marked nothing precisely because it marks nothing, and
+        # appending "not exercised" to that verdict would soften a FAIL into a
+        # sentence arguing with itself.
         res.unknown("the budget took no body, so the rule was not exercised")
+        return res
+    if res.failed:
         return res
     if not res.failed:
         res.ok(

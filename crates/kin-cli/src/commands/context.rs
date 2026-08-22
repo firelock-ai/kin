@@ -309,6 +309,28 @@ pub fn build_context_response(
             withheld(kin_context::group::TESTS)
         ),
     ];
+    // Work items and annotations have never had a line of their own, because a
+    // pack usually carries none and a row of zeroes is noise. A section the
+    // budget took rows from is the case where saying nothing is the defect, so
+    // the line appears exactly when there is something to report.
+    for (group, label, held) in [
+        (
+            kin_context::group::WORK_ITEMS,
+            "Work items",
+            pack.work_items.len(),
+        ),
+        (
+            kin_context::group::ANNOTATIONS,
+            "Annotations",
+            pack.annotations.len(),
+        ),
+    ] {
+        let note = withheld(group);
+        if held == 0 && note.is_empty() {
+            continue;
+        }
+        lines.push(format!("  {label}: {held} entries{note}"));
+    }
     // One line naming the lever, because a per-section count says what was lost
     // and not what recovers it. Present only when something was cut, so a whole
     // pack never carries a note about a cut that did not happen.
