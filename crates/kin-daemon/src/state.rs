@@ -1406,6 +1406,32 @@ pub struct DaemonState {
     /// any of that: it records what the sweep DID, which is the only thing a
     /// skip is entitled to act on.
     pub lsp_enriched_files: std::sync::Mutex<std::collections::HashSet<String>>,
+
+    /// Repo-relative paths this daemon derived entities for that durable
+    /// authority is not known to hold.
+    ///
+    /// Entity derivation is not durable on its own. A tree admission publishes
+    /// an artifact into repository authority the moment the watcher sees the
+    /// write, while the entities the same tick derives live in this graph until
+    /// a commit publishes them, and a daemon that ends first takes them with
+    /// it. What it leaves behind is a file admitted at exactly the bytes on
+    /// disk, so no later watcher event fires for it and the startup catch-up,
+    /// keyed on host modification time since the last complete admission,
+    /// cannot see it either: the admission that recorded the artifact is later
+    /// than the write. The path is then permanently admitted and permanently
+    /// unqueryable (FIR-2606).
+    ///
+    /// This names those paths and nothing else, which is the whole point. The
+    /// first repair written for FIR-2606 asked the graph which admitted source
+    /// paths carried no entity, and on a freshly converted store that is most
+    /// of the working copy at the moment the conversion answers its first
+    /// queries; the acceptance gate caught it and the approach came out. A
+    /// record of what this daemon actually derived cannot make that mistake.
+    ///
+    /// Operational state beside the pid and port files, never semantic
+    /// authority: nothing answers a query from it, and the next daemon checks
+    /// every entry against the graph before acting on it.
+    pub unpublished_enrichment: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Repo ID resolved once at construction. Cached to avoid re-reading
     /// `.kin/manifest.json` on every snapshot save — under high host
     /// concurrency those reads contend and surface as opaque "Core error"
@@ -2533,6 +2559,7 @@ impl DaemonState {
             lsp_sweeps_completed: AtomicU64::new(0),
             lsp_sweep_running: AtomicBool::new(false),
             lsp_enriched_files: std::sync::Mutex::new(std::collections::HashSet::new()),
+            unpublished_enrichment: std::sync::Mutex::new(std::collections::HashSet::new()),
             cached_repo_id,
             cached_workspace_id: Some(workspace_id),
             is_shutdown: AtomicBool::new(false),
@@ -2766,6 +2793,7 @@ impl DaemonState {
             lsp_sweeps_completed: AtomicU64::new(0),
             lsp_sweep_running: AtomicBool::new(false),
             lsp_enriched_files: std::sync::Mutex::new(std::collections::HashSet::new()),
+            unpublished_enrichment: std::sync::Mutex::new(std::collections::HashSet::new()),
             cached_repo_id: repo_id.to_string(),
             cached_workspace_id: None,
             is_shutdown: AtomicBool::new(false),
