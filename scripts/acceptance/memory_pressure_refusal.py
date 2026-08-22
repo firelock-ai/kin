@@ -50,9 +50,18 @@ for reasons having nothing to do with the code. The reading itself is unit
 tested in `kin_core::memory_pressure`, against readings supplied as inputs.
 
 Every check is paired with its control, because a build that had simply broken
-the sweep would pass the refusal half of every one of them. The control is the
-same store with no pressure forced, and it has to behave exactly as it did
-before this guard existed.
+the sweep would pass the refusal half of every one of them.
+
+The control pins `nominal` rather than leaving the host unpinned, and that is
+not tidiness. The first run of the budget checks was on a development box the
+fleet had filled: 98.9 GiB of 128 in use with 41.5 GiB of 42 GiB swap gone, so
+Kin's own unforced reading was critical and it was refusing background embedding
+exactly as designed. Every unpinned control failed, and it failed for a fact
+about the machine rather than about the build. A control that assumes the host
+is healthy is no control at all on a machine that is genuinely full, which is
+precisely the machine this product exists for. Both axes are therefore pinned in
+every arm, so each check moves one lever and the other stays where the check
+needs it.
 
     CHECK <id> <ticket> PASS|FAIL|UNREADABLE <detail>
 
@@ -375,7 +384,7 @@ def check_0(suite):
         result.ok("the store records a %s refusal of %s" % (record.get("level"), record.get("work")))
 
     control = suite.fixture("control")
-    rc, out = suite.restart_daemon(control, pressure=None)
+    rc, out = suite.restart_daemon(control, pressure="nominal")
     if rc != 0:
         result.unknown("could not start a control daemon, exit %d: %s" % (rc, tail(out)))
         return result
@@ -412,7 +421,7 @@ def check_1(suite):
     )
     repo = suite.fixture("pressured")
     reports = {}
-    for arm, pressure in (("pressured", "critical"), ("healed", None)):
+    for arm, pressure in (("pressured", "critical"), ("healed", "nominal")):
         rc, out = suite.restart_daemon(repo, pressure=pressure)
         if rc != 0:
             result.unknown("%s: could not start a daemon, exit %d: %s" % (arm, rc, tail(out)))
@@ -463,7 +472,10 @@ def check_2(suite):
         "2", TICKET,
         "graph status discloses a refusal and says nothing on a machine with room",
     )
-    for name, pressure, wanted in (("pressured", "critical", True), ("control", None, False)):
+    for name, pressure, wanted in (
+        ("pressured", "critical", True),
+        ("control", "nominal", False),
+    ):
         repo = suite.fixture(name)
         rc, out = suite.restart_daemon(repo, pressure=pressure)
         if rc != 0:
@@ -537,7 +549,7 @@ def check_4(suite):
         "a daemon over its footprint budget refuses, and names the budget rather than the host",
     )
     repo = suite.fixture("budgeted")
-    rc, out = suite.restart_daemon(repo, budget=1)
+    rc, out = suite.restart_daemon(repo, pressure="nominal", budget=1)
     if rc != 0:
         result.unknown("could not start a daemon under a one-byte budget, exit %d: %s"
                        % (rc, tail(out)))
@@ -552,7 +564,7 @@ def check_4(suite):
     else:
         result.ok("the store records a budget refusal of %s" % record.get("work"))
 
-    rc, out = suite.restart_daemon(repo, budget=None)
+    rc, out = suite.restart_daemon(repo, pressure="nominal", budget=None)
     if rc != 0:
         result.unknown("could not start a control daemon, exit %d: %s" % (rc, tail(out)))
         return result
@@ -578,11 +590,11 @@ def check_5(suite):
         "kin status publishes the daemon's footprint against its budget, children named",
     )
     repo = suite.fixture("budgeted")
-    rc, out = suite.restart_daemon(repo, budget=None)
+    rc, out = suite.restart_daemon(repo, pressure="nominal", budget=None)
     if rc != 0:
         result.unknown("could not start a daemon, exit %d: %s" % (rc, tail(out)))
         return result
-    rc, out = suite.kin_run(["status"], repo)
+    rc, out = suite.kin_run(["status"], repo, pressure="nominal")
     if rc != 0:
         result.unknown("`kin status` exited %d: %s" % (rc, tail(out)))
         return result
