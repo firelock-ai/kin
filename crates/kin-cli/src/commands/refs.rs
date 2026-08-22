@@ -1288,6 +1288,90 @@ mod tests {
         );
     }
 
+    /// The federation guard must not swallow a REAL gap.
+    ///
+    /// Written because falsification found the hole rather than because the
+    /// design predicted it: making `only_unconfigured_federation` fire on any
+    /// trust reason at all left every refs test green. Every one of them runs on
+    /// a coverage-poor store, which renders the absent-class sentence and never
+    /// consults the guard, so an over-broad guard silencing genuine degradation
+    /// was invisible. Coverage is COMPLETE here on purpose, so the absent-class
+    /// path cannot fire and the degraded signal is the only thing left to say.
+    #[test]
+    fn a_degraded_daemon_still_speaks_when_coverage_is_complete() {
+        use kin_model::relation::{Relation, RelationOrigin};
+        use kin_model::{EntityStore, GraphNodeId};
+
+        let (graph, layout, _dir) = orphan_fixture();
+        let pick = |name: &str| {
+            EntityStore::query_entities(
+                &graph,
+                &kin_model::graph::EntityFilter {
+                    name_pattern: Some(name.to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("fixture entity")
+        };
+        let caller = pick("caller");
+        let callee = pick("callee");
+        for kind in [
+            RelationKind::Calls,
+            RelationKind::Imports,
+            RelationKind::References,
+        ] {
+            graph
+                .upsert_relation(&Relation {
+                    id: kin_model::ids::RelationId::new(),
+                    kind,
+                    src: GraphNodeId::Entity(caller.id),
+                    dst: GraphNodeId::Entity(callee.id),
+                    confidence: 1.0,
+                    origin: RelationOrigin::Parsed,
+                    created_in: None,
+                    import_source: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        }
+
+        let degraded = kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 3,
+            "graph_generation": 1,
+            "embed_worker_failed": true,
+        }));
+        let response = build_refs_response(
+            &layout,
+            &graph,
+            &RefsRequest {
+                entity: "orphan".to_string(),
+                kind: "all".to_string(),
+            },
+            &degraded,
+        )
+        .expect("refs response");
+        let rendered = response.lines.join("\n");
+
+        assert!(
+            !rendered.contains("holds no cross-file"),
+            "coverage is complete here, so the absent-class path must not fire or this test is \
+             exercising the wrong branch: {rendered}"
+        );
+        assert!(
+            rendered.contains("Kin cannot rule out references it did not see"),
+            "a degraded daemon is a real gap and must still be spoken: {rendered}"
+        );
+        assert!(
+            rendered.contains("embed_worker_failed"),
+            "and it must name the signal the verdict disclosed: {rendered}"
+        );
+    }
+
     /// A focal that never resolved is a lookup failure, not a finding, so it
     /// carries no verdict. Qualifying it would tell a reader their graph lacks
     /// coverage when what it lacks is the name they typed.
