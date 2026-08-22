@@ -10,20 +10,26 @@
 //! against init's fixed cost and a change that doubles them barely moves the
 //! number.
 //!
-//! This fixture buys the depth that makes them the dominant term. A full-history
-//! psf/requests conversion measured 11.72 GiB of resident set inside a 12 GiB
-//! container, hitting the cgroup limit 871 times, because a conversion proved
-//! its import plan by rebuilding the whole plan and comparing the two, six times
-//! over, holding as many as four whole histories at once. That class is
-//! invisible to every functional test in this workspace: a re-derivation that
-//! materializes a second copy of history produces exactly the same verdict as
-//! one that streams it, and fails no assertion until the machine runs out of
-//! memory.
+//! This fixture buys the depth that prices them. A full-history psf/requests
+//! conversion measured 11.72 GiB of resident set inside a 12 GiB container,
+//! hitting the cgroup limit 871 times, because a conversion proved its import
+//! plan by rebuilding the whole plan and comparing the two, six times over,
+//! holding as many as four whole histories at once. That class is invisible to
+//! every functional test in this workspace: a re-derivation that materializes a
+//! second copy of history produces exactly the same verdict as one that streams
+//! it, and fails no assertion until the machine runs out of memory.
 //!
-//! What this guards is therefore not a number but a shape: that proving a
-//! history costs a bounded amount of memory rather than another copy of the
-//! history. Revert the streaming comparison and this ceiling breaks; the
-//! functional suite does not.
+//! Read `PROOF_PEAK_GROWTH_CEILING` as the guard and `PEAK_HEAP_CEILING` as a
+//! backstop, and do not reverse them. The total is set by the bootstrap
+//! transaction, built and then committed after every proof has run, so it does
+//! NOT move when a proof stops copying history: the base commit and the fix
+//! both measure 995.3 MiB here. Measuring that, rather than assuming it, is
+//! what stopped this file from shipping a ceiling that could not fail.
+//!
+//! What the guard asserts is therefore one phase, not one number: proof 1
+//! revalidates the whole import plan and keeps nothing, so whatever it adds to
+//! the peak is a second copy of history built to check the first. It added
+//! 88,146,432 bytes before the re-derivation was made to stream and 0 after.
 //!
 //! Live heap, not resident set, for the reason spelled out in
 //! `init_peak_heap_ceiling`: RSS keeps counting memory that was freed but not
