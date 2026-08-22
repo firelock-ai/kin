@@ -7172,7 +7172,7 @@ mod memory_pressure_tests {
     use super::{
         clear_pressure_refusal, decide_sweep_on_start, embed_batch_under_pressure,
         pressure_verdict, sample_tree_footprint, start_or_defer_background_embed,
-        tree_footprint_from, ProcessRow, SweepStartDecision,
+        tree_footprint_from, walk_process_table, ProcessRow, SweepStartDecision,
     };
     use crate::state::DaemonState;
     use kin_core::memory_pressure::{HeavyWork, PressureRefusal, Verdict};
@@ -7275,6 +7275,48 @@ mod memory_pressure_tests {
             "a running process holds more than nothing"
         );
         assert!(sampled.total_bytes() >= sampled.own_bytes);
+    }
+
+    /// A real child, counted through the real process table.
+    ///
+    /// Every test above folds a table this file wrote. This one spawns an
+    /// actual process and asks the host, which is the only way to catch the
+    /// case where the fold is right and the walk that feeds it is not: a
+    /// `parent()` this platform does not populate, or a table this build reads
+    /// per-pid. That is the exact blindness the budget exists to end, so it
+    /// gets a test that talks to the kernel.
+    ///
+    /// `walk_process_table` rather than `sample_tree_footprint`, because the
+    /// sampler caches for two seconds and a test that read a cache primed by
+    /// its neighbours would pass without asking anything.
+    #[test]
+    #[cfg(unix)]
+    fn a_real_child_process_is_counted_by_the_real_walk() {
+        let before = walk_process_table().expect("this host publishes a process table");
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a child");
+        // The child has to be scheduled and carry a resident set before the
+        // table can show one. That wait is this test's whole flake surface, so
+        // it retries rather than sleeping once and hoping.
+        let mut after = before;
+        for _ in 0..40 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            after = walk_process_table().expect("this host publishes a process table");
+            if after.child_count > before.child_count {
+                break;
+            }
+        }
+        let counted = after.child_count > before.child_count;
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            counted,
+            "a process this one started was not counted: before={before:?} after={after:?}. \
+             A daemon that cannot see the language server it spawned is the blindness that \
+             let the sweep run"
+        );
     }
 
     #[test]
