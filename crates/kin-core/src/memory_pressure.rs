@@ -130,6 +130,15 @@ pub enum MemoryPressure {
     Unknown { reason: String },
     /// This is what the machine says.
     Known(MemoryReading),
+    /// An operator pinned the level through [`PRESSURE_OVERRIDE_ENV`], so no
+    /// machine was read.
+    ///
+    /// A third variant rather than a synthesized reading, because a synthesized
+    /// one would be printed by every surface as though a kernel had published
+    /// it. The whole register of these disclosures is that their numbers are
+    /// quoted from the machine; inventing a plausible pair to satisfy the
+    /// grader would be the one line in them a reader could not check.
+    Forced { level: PressureLevel },
 }
 
 impl MemoryPressure {
@@ -137,7 +146,7 @@ impl MemoryPressure {
     pub fn reading(&self) -> Option<&MemoryReading> {
         match self {
             MemoryPressure::Known(reading) => Some(reading),
-            MemoryPressure::Unknown { .. } => None,
+            MemoryPressure::Unknown { .. } | MemoryPressure::Forced { .. } => None,
         }
     }
 
@@ -145,7 +154,7 @@ impl MemoryPressure {
     pub fn unknown_reason(&self) -> Option<&str> {
         match self {
             MemoryPressure::Unknown { reason } => Some(reason),
-            MemoryPressure::Known(_) => None,
+            MemoryPressure::Known(_) | MemoryPressure::Forced { .. } => None,
         }
     }
 
@@ -161,6 +170,11 @@ impl MemoryPressure {
         match self {
             MemoryPressure::Unknown { .. } => PressureLevel::Unknown,
             MemoryPressure::Known(reading) => thresholds.level_for(reading),
+            // A pinned level is the answer, not an input to the grader. Running
+            // it back through the fractions would let an operator who also
+            // moved a bar get a level they did not ask for, which is the one
+            // thing an override must never do.
+            MemoryPressure::Forced { level } => *level,
         }
     }
 }
@@ -397,9 +411,7 @@ impl Verdict {
         thresholds: &Thresholds,
     ) -> Self {
         let level = pressure.level_under(thresholds);
-        let Some(reading) = pressure.reading() else {
-            return Verdict::Proceed;
-        };
+        let reading = pressure.reading();
         match level {
             PressureLevel::Unknown | PressureLevel::Nominal => Verdict::Proceed,
             PressureLevel::Elevated => match work {
@@ -439,30 +451,39 @@ impl Verdict {
 fn describe(
     work: HeavyWork,
     level: PressureLevel,
-    reading: &MemoryReading,
+    reading: Option<&MemoryReading>,
     did: &'static str,
 ) -> String {
-    let mut sentence = format!(
-        "host memory pressure is {}: {} of the {} this {} allows is in use",
-        level.as_str(),
-        human_bytes(reading.used_bytes),
-        human_bytes(reading.limit_bytes),
-        reading.source.as_str(),
-    );
-    if let (Some(swap_used), Some(swap_total)) = (reading.swap_used_bytes, reading.swap_total_bytes)
-    {
-        if swap_total > 0 {
+    let mut sentence = format!("host memory pressure is {}", level.as_str());
+    match reading {
+        Some(reading) => {
             sentence.push_str(&format!(
-                ", and {} of {} swap is in use",
-                human_bytes(swap_used),
-                human_bytes(swap_total)
+                ": {} of the {} this {} allows is in use",
+                human_bytes(reading.used_bytes),
+                human_bytes(reading.limit_bytes),
+                reading.source.as_str(),
             ));
+            if let (Some(swap_used), Some(swap_total)) =
+                (reading.swap_used_bytes, reading.swap_total_bytes)
+            {
+                if swap_total > 0 {
+                    sentence.push_str(&format!(
+                        ", and {} of {} swap is in use",
+                        human_bytes(swap_used),
+                        human_bytes(swap_total)
+                    ));
+                }
+            }
+            if let Some(kills) = reading.oom_kills.filter(|kills| *kills > 0) {
+                sentence.push_str(&format!(
+                    ", and this machine's kernel has recorded {kills} out-of-memory kill(s) \
+                     against it"
+                ));
+            }
         }
-    }
-    if let Some(kills) = reading.oom_kills.filter(|kills| *kills > 0) {
-        sentence.push_str(&format!(
-            ", and this machine's kernel has recorded {kills} out-of-memory kill(s) against it"
-        ));
+        // No numbers, because none were measured. A level nobody read is
+        // reported as exactly that.
+        None => sentence.push_str(&format!(" because {PRESSURE_OVERRIDE_ENV} pins it there")),
     }
     sentence.push_str(&format!(
         ", so {} {}. {}.",
@@ -510,36 +531,22 @@ pub fn read() -> MemoryPressure {
     probe()
 }
 
-/// The forced reading behind [`PRESSURE_OVERRIDE_ENV`], when one is set.
+/// The level pinned by [`PRESSURE_OVERRIDE_ENV`], when one is pinned.
 ///
-/// A forced level still has to arrive as a reading, because every surface
-/// prints the numbers beside the level. The synthesized figures are the
-/// smallest ones that grade to the level asked for under the default
-/// thresholds, and they are labelled as the override in the reason a forced
-/// `unknown` carries.
+/// A pinned `unknown` arrives as an ordinary unreadable machine, because that
+/// is exactly what it is asking to simulate: a host this process cannot ask.
+/// Every other level arrives as [`MemoryPressure::Forced`], carrying no numbers
+/// at all, so nothing downstream can print an invented reading as a measured
+/// one.
 fn forced_pressure() -> Option<MemoryPressure> {
     let raw = std::env::var(PRESSURE_OVERRIDE_ENV).ok()?;
     let level = PressureLevel::from_override(&raw)?;
-    const GIB: u64 = 1024 * 1024 * 1024;
-    let used = match level {
-        PressureLevel::Unknown => {
-            return Some(MemoryPressure::Unknown {
-                reason: format!("{PRESSURE_OVERRIDE_ENV} is set to {raw:?}"),
-            })
-        }
-        PressureLevel::Nominal => GIB,
-        PressureLevel::Elevated => 8 * GIB,
-        PressureLevel::Critical => 11 * GIB + GIB / 2,
-    };
-    Some(MemoryPressure::Known(MemoryReading {
-        source: PressureSource::Host,
-        limit_bytes: 12 * GIB,
-        used_bytes: used,
-        swap_used_bytes: None,
-        swap_total_bytes: None,
-        oom_kills: None,
-        peak_bytes: None,
-    }))
+    Some(match level {
+        PressureLevel::Unknown => MemoryPressure::Unknown {
+            reason: format!("{PRESSURE_OVERRIDE_ENV} is set to {raw:?}"),
+        },
+        level => MemoryPressure::Forced { level },
+    })
 }
 
 /// Read the machine, cgroup first.
@@ -1088,6 +1095,46 @@ mod tests {
     }
 
     #[test]
+    fn a_forced_level_refuses_without_quoting_numbers_nobody_measured() {
+        // The override exists so an acceptance run can prove the refusal
+        // without filling a machine's memory. What it must not do is put an
+        // invented pair of figures into a sentence whose whole register is
+        // that its numbers came from a kernel.
+        let forced = MemoryPressure::Forced {
+            level: PressureLevel::Critical,
+        };
+        assert_eq!(
+            forced.level_under(&Thresholds::default()),
+            PressureLevel::Critical
+        );
+        let verdict =
+            Verdict::for_reading(HeavyWork::LspSweep, &forced, &Thresholds::default());
+        let reason = verdict.reason().expect("a refusal carries its reason");
+        assert!(reason.contains("KIN_MEMORY_PRESSURE pins it there"), "{reason}");
+        assert!(
+            !reason.contains("GiB") && !reason.contains("MiB"),
+            "a level nobody read must not be dressed up with figures: {reason}"
+        );
+        assert!(reason.contains("the language-server enrichment sweep did not start"));
+    }
+
+    #[test]
+    fn a_pinned_level_ignores_a_moved_bar() {
+        // An operator who pins critical and also moves the fractions must get
+        // critical. Running the pin back through the grader would hand them a
+        // level they did not ask for.
+        let forced = MemoryPressure::Forced {
+            level: PressureLevel::Critical,
+        };
+        let odd = Thresholds {
+            elevated: 0.99,
+            critical: 1.0,
+            swap: 1.0,
+        };
+        assert_eq!(forced.level_under(&odd), PressureLevel::Critical);
+    }
+
+    #[test]
     fn a_refusal_survives_a_round_trip_through_the_store() {
         let dir = tempfile::tempdir().expect("a temp dir");
         assert!(PressureRefusal::read(dir.path()).is_none());
@@ -1138,6 +1185,9 @@ mod tests {
             }
             MemoryPressure::Unknown { reason } => {
                 assert!(!reason.is_empty(), "an unknown reading says why");
+            }
+            MemoryPressure::Forced { level } => {
+                panic!("nothing forces a level in this test, yet the probe returned {level:?}")
             }
         }
     }

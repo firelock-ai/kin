@@ -2260,6 +2260,10 @@ pub async fn run_loop_armed(
     // larger than `batch_size` is deferred instead of silently discarded.
     let mut pending_events: VecDeque<FileEvent> = VecDeque::new();
     let mut backlog_warning_active = false;
+    // The pressure level this loop has already spoken about, so a machine that
+    // stays critical is disclosed once instead of on every tick it holds work
+    // back.
+    let mut announced_pressure: Option<kin_core::memory_pressure::PressureLevel> = None;
     // The admission policy the last complete pass planned against, kept so the
     // event filter below costs no authority load of its own. `None` until the
     // first pass resolves one, which is the safe direction: nothing is dropped
@@ -2573,6 +2577,42 @@ pub async fn run_loop_armed(
             count = watcher_batch.len(),
             "processing file events (after dedup)"
         );
+
+        // Ask the machine before walking the working copy. An ambient tick is
+        // a complete scan planned into a tree transition, from a host event
+        // nobody asked for, and it is the one admission that can wait: the
+        // events go back on the queue and nothing about them is lost, because
+        // this tick publishes nothing and the last complete admission stays
+        // where it was, so the startup catch-up window still covers every path
+        // held back here.
+        //
+        // The explicit seams are deliberately not gated. A commit is a command
+        // a person ran, and refusing it would trade a machine Kin might have
+        // saved for work the user asked for and would have to do again.
+        let pressure = crate::daemon::pressure_verdict(
+            kin_core::memory_pressure::HeavyWork::AmbientAdmission,
+        );
+        if let kin_core::memory_pressure::Verdict::Refuse { reason } = &pressure.verdict {
+            if announced_pressure != Some(pressure.level) {
+                crate::daemon::disclose_pressure_refusal(
+                    &state,
+                    kin_core::memory_pressure::HeavyWork::AmbientAdmission,
+                    &pressure,
+                    reason,
+                );
+                announced_pressure = Some(pressure.level);
+            }
+            enqueue_file_events(&mut pending_events, watcher_batch);
+            state
+                .reconciliation_status
+                .store(RECON_IDLE, Ordering::Relaxed);
+            tokio::time::sleep(interval).await;
+            continue;
+        }
+        if announced_pressure.is_some_and(|level| level != pressure.level) {
+            crate::daemon::clear_pressure_refusal(&state);
+        }
+        announced_pressure = Some(pressure.level);
 
         // Serialize exact-tree admission and semantic enrichment with every
         // other graph-authority mutation, including commit and checkout. The

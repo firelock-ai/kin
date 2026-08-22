@@ -947,6 +947,24 @@ pub(crate) fn auto_embed_enabled() -> bool {
 /// daemon eligible for idle shutdown: a backlog no worker will drain must not
 /// read as work in flight.
 fn start_or_defer_background_embed(state: &DaemonState) -> bool {
+    // Asked before the queue is built rather than after, because building it
+    // walks the graph for everything the index is missing and a machine with no
+    // room should not pay for a queue nothing is going to drain. The pass is
+    // deferred exactly the way an operator opt-out defers it, so a daemon that
+    // declines here stays eligible for idle shutdown instead of reading as
+    // work in flight.
+    let call = pressure_verdict(kin_core::memory_pressure::HeavyWork::EmbedBatch);
+    if let kin_core::memory_pressure::Verdict::Refuse { reason } = &call.verdict {
+        let reason = reason.clone();
+        state.pause_background_embed();
+        disclose_pressure_refusal(
+            state,
+            kin_core::memory_pressure::HeavyWork::EmbedBatch,
+            &call,
+            &reason,
+        );
+        return false;
+    }
     if !auto_embed_enabled() {
         state.pause_background_embed();
         warn!(
@@ -1735,6 +1753,94 @@ pub(crate) fn retire_enrichment_marker(state: &DaemonState, files: &[String]) {
     }
 }
 
+/// The batch size one embedding pass may use under a pressure verdict.
+///
+/// Shrinking rather than refusing is the whole reason `Elevated` exists as a
+/// separate level. An embedding pass holds a batch of vectors and the model
+/// that produced them, and the batch is the part that scales with the number
+/// this picks; a quarter of it is a quarter of the transient peak, and the pass
+/// still converges, just more slowly. The floor of one keeps a shrink from
+/// becoming a silent refusal, which is the failure mode of every size knob that
+/// is allowed to reach zero.
+///
+/// Pure, so the rule is testable without an embedder.
+fn embed_batch_under_pressure(
+    configured: usize,
+    verdict: &kin_core::memory_pressure::Verdict,
+) -> usize {
+    match verdict {
+        kin_core::memory_pressure::Verdict::Shrink { .. } => (configured / 4).max(1),
+        kin_core::memory_pressure::Verdict::Proceed
+        | kin_core::memory_pressure::Verdict::Refuse { .. } => configured,
+    }
+}
+
+/// What host memory pressure says about one piece of heavy work, right now.
+///
+/// One function so every consultation in this daemon reads the same machine
+/// through the same thresholds. The reading itself is four small pseudo-file
+/// reads on Linux and two syscalls on macOS, so this is safe to call at the top
+/// of a loop; it is deliberately not called per file or per entity, where the
+/// cost would start to matter and the answer could not change fast enough to
+/// earn it.
+pub(crate) fn pressure_verdict(work: kin_core::memory_pressure::HeavyWork) -> PressureCall {
+    let pressure = kin_core::memory_pressure::read();
+    let thresholds = kin_core::memory_pressure::Thresholds::from_env();
+    let level = pressure.level_under(&thresholds);
+    PressureCall {
+        level,
+        verdict: kin_core::memory_pressure::Verdict::for_reading(work, &pressure, &thresholds),
+    }
+}
+
+/// One consultation: what was measured, and what that means for this work.
+pub(crate) struct PressureCall {
+    pub(crate) level: kin_core::memory_pressure::PressureLevel,
+    pub(crate) verdict: kin_core::memory_pressure::Verdict,
+}
+
+/// Publish a pressure refusal where the surfaces outside this process can read
+/// it, and log it here.
+///
+/// Both halves, because neither is enough on its own. The log line is what an
+/// operator reading `daemon.log` after the fact needs, and the record is what
+/// `kin doctor`, `kin graph status` and the MCP envelope read on their own next
+/// run. The sweep circuit spent two releases as a WARN nobody saw, which is
+/// exactly the mistake not to repeat here.
+pub(crate) fn disclose_pressure_refusal(
+    state: &DaemonState,
+    work: kin_core::memory_pressure::HeavyWork,
+    call: &PressureCall,
+    reason: &str,
+) {
+    warn!(
+        work = work.id(),
+        pressure = call.level.as_str(),
+        "{reason} {}",
+        kin_core::memory_pressure::PRESSURE_REMEDY
+    );
+    kin_core::memory_pressure::PressureRefusal::record(
+        state.layout.root(),
+        work,
+        call.level,
+        reason,
+    );
+}
+
+/// Retire a pressure refusal this store still records, because the work it
+/// describes has just run.
+///
+/// Read before removing so the ordinary case, a store that never refused
+/// anything, costs one failed open rather than a write. Without this the row
+/// heals only when a store is reinitialized, and a surface reporting last
+/// week's refusal reads exactly like one reporting this second's.
+pub(crate) fn clear_pressure_refusal(state: &DaemonState) {
+    let root = state.layout.root();
+    if kin_core::memory_pressure::PressureRefusal::read(root).is_some() {
+        kin_core::memory_pressure::PressureRefusal::clear(root);
+    }
+}
+
 /// How many consecutive fruitless interrupted sweeps disable the next one.
 ///
 /// Defined in `kin-daemon-spawn` rather than here, because the daemon is the
@@ -1819,12 +1925,16 @@ fn sweep_finished(state: &DaemonState, ended_early: bool, enriched: usize) -> u3
 
 /// What a starting daemon does about a cold sweep, given what this store
 /// records about the last one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum SweepStartDecision {
     /// Queue a cold sweep.
     Queue,
     /// Queue nothing: this store's last sweeps all died without enriching.
     CircuitOpen { interruptions: u32 },
+    /// Queue nothing yet: this machine has no room for the pass that peaked at
+    /// 18.2 GB on a one-gigabyte store. Unlike the circuit, this is about the
+    /// host and not the store, so it clears by itself when the machine does.
+    PressureRefused { reason: String },
 }
 
 /// Settle the previous sweep, then decide about this one.
@@ -1848,10 +1958,24 @@ fn decide_sweep_on_start(state: &DaemonState) -> SweepStartDecision {
     }
     let interruptions = read_sweep_interruptions(state);
     if sweep_circuit_open(interruptions) {
-        SweepStartDecision::CircuitOpen { interruptions }
-    } else {
-        SweepStartDecision::Queue
+        return SweepStartDecision::CircuitOpen { interruptions };
     }
+    // Asked after the circuit and before the queue, because the two are
+    // different facts and the store's own tally is the one that survives a
+    // reboot. A machine with no room today says nothing about a store whose
+    // sweeps keep dying.
+    let call = pressure_verdict(kin_core::memory_pressure::HeavyWork::LspSweep);
+    if let kin_core::memory_pressure::Verdict::Refuse { reason } = &call.verdict {
+        let reason = reason.clone();
+        disclose_pressure_refusal(
+            state,
+            kin_core::memory_pressure::HeavyWork::LspSweep,
+            &call,
+            &reason,
+        );
+        return SweepStartDecision::PressureRefused { reason };
+    }
+    SweepStartDecision::Queue
 }
 
 /// Whether a finished sweep may record its files as enriched.
@@ -2912,8 +3036,14 @@ pub async fn run_with_authority_on(
                      clears this, and `kin daemon sweep` asks for one."
                 );
             }
+            SweepStartDecision::PressureRefused { .. } => {
+                // The reason was disclosed where it was decided, both to this
+                // log and to the record every surface outside this process
+                // reads. Nothing further is needed here beyond not queueing.
+            }
             SweepStartDecision::Queue => {
                 sweep_admitted = true;
+                clear_pressure_refusal(&state);
             }
         }
     }
@@ -3440,6 +3570,11 @@ pub async fn run_with_authority_on(
         // the drain that produced the refusal.
         let mut deferred_checkpoint_backoff: Option<Duration> = None;
         let mut deferred_checkpoint_due: Option<Instant> = None;
+        // The pressure level this worker has already spoken about. Held so a
+        // machine that stays critical is disclosed once rather than on every
+        // wake: the record is a statement of the current state, and rewriting
+        // it every few seconds would turn a disclosure into a log.
+        let mut announced_pressure: Option<kin_core::memory_pressure::PressureLevel> = None;
         'wake: loop {
             // Between wakes this worker is genuinely doing nothing, so the
             // working stretch ends here. A wedged drain never reaches this
@@ -3569,11 +3704,50 @@ pub async fn run_with_authority_on(
                         }
                     }
                 }
+                // Everything below spends the machine, so the machine is
+                // asked first. A refusal leaves the queue exactly as it is and
+                // goes back to the idle wake, which is what makes this a
+                // back-off rather than a loss: the work is still owed, and the
+                // next wake takes it when there is room.
+                let call = pressure_verdict(kin_core::memory_pressure::HeavyWork::EmbedBatch);
+                let pressure_changed = announced_pressure != Some(call.level);
+                if let kin_core::memory_pressure::Verdict::Refuse { reason } = &call.verdict {
+                    if pressure_changed {
+                        disclose_pressure_refusal(
+                            &embed_state,
+                            kin_core::memory_pressure::HeavyWork::EmbedBatch,
+                            &call,
+                            reason,
+                        );
+                        announced_pressure = Some(call.level);
+                    }
+                    break;
+                }
+                if pressure_changed {
+                    match &call.verdict {
+                        kin_core::memory_pressure::Verdict::Shrink { reason } => {
+                            warn!(
+                                pressure = call.level.as_str(),
+                                batch = embed_batch_under_pressure(
+                                    embed_batch_size,
+                                    &call.verdict
+                                ),
+                                configured = embed_batch_size,
+                                "{reason}"
+                            );
+                        }
+                        kin_core::memory_pressure::Verdict::Proceed => {
+                            clear_pressure_refusal(&embed_state);
+                        }
+                        kin_core::memory_pressure::Verdict::Refuse { .. } => {}
+                    }
+                    announced_pressure = Some(call.level);
+                }
                 // From here to the next `idle` this worker is spending the
                 // machine. Latched, so a drain that never finishes keeps one
                 // stretch rather than restarting it every batch.
                 embed_pass.working(Instant::now());
-                let batch = embed_batch_size;
+                let batch = embed_batch_under_pressure(embed_batch_size, &call.verdict);
                 let state_for_embed = Arc::clone(&embed_state);
                 let is_artifact = pending == 0;
                 let reset_on_index_error = !index_reset_triggered;
@@ -6782,6 +6956,171 @@ mod enrichment_marker_tests {
             relations.len(),
             "and writing nothing must not remove anything either"
         );
+    }
+}
+
+/// What the daemon does about heavy work when the machine has no room for it.
+///
+/// Driven through the forced-level override rather than by filling the host,
+/// because a test that has to exhaust a machine's memory to prove Kin backs off
+/// is a test that takes the machine down to run. The override is the same seam
+/// the acceptance suite uses, so what is proven here is what ships.
+///
+/// Each case is paired with its control: the same call under no pressure has to
+/// reach the same decision it reached before this guard existed, or the guard
+/// would be indistinguishable from having broken the work outright.
+#[cfg(test)]
+mod memory_pressure_tests {
+    use super::{
+        clear_pressure_refusal, decide_sweep_on_start, embed_batch_under_pressure,
+        pressure_verdict, start_or_defer_background_embed, SweepStartDecision,
+    };
+    use crate::state::DaemonState;
+    use kin_core::memory_pressure::{HeavyWork, PressureRefusal, Verdict};
+    use kin_core::test_env::EnvVarGuard;
+
+    fn open_store(repo_dir: &std::path::Path) -> DaemonState {
+        let init = kin_core::init(repo_dir).unwrap();
+        DaemonState::open(init.layout).unwrap()
+    }
+
+    #[test]
+    fn a_critical_machine_refuses_the_cold_sweep_and_says_why() {
+        let _lock = crate::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let state = open_store(dir.path());
+
+        // The control first, so a refusal below cannot be a store that would
+        // have declined a sweep anyway.
+        {
+            let _forced = EnvVarGuard::set("KIN_MEMORY_PRESSURE", "nominal");
+            assert_eq!(
+                decide_sweep_on_start(&state),
+                SweepStartDecision::Queue,
+                "a machine with room sweeps exactly as it did before this guard"
+            );
+        }
+
+        let _forced = EnvVarGuard::set("KIN_MEMORY_PRESSURE", "critical");
+        let decision = decide_sweep_on_start(&state);
+        let SweepStartDecision::PressureRefused { reason } = decision else {
+            panic!("a critical machine must not queue an 18 GB pass: {decision:?}");
+        };
+        assert!(
+            reason.contains("critical") && reason.contains("enrichment sweep"),
+            "the refusal names the pressure and the work: {reason}"
+        );
+
+        let record = PressureRefusal::read(state.layout.root())
+            .expect("a refusal reaches the surfaces outside this process, not just the log");
+        assert_eq!(record.work, "lsp-sweep");
+        assert_eq!(record.level, "critical");
+        assert_eq!(record.reason, reason);
+    }
+
+    #[test]
+    fn an_unreadable_machine_sweeps_exactly_as_before() {
+        // Absence of evidence is not pressure. A host whose accounting cannot
+        // be read has said nothing, and a daemon that stopped enriching over it
+        // would have invented a limit nobody measured.
+        let _lock = crate::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let state = open_store(dir.path());
+        let _forced = EnvVarGuard::set("KIN_MEMORY_PRESSURE", "unknown");
+        assert_eq!(decide_sweep_on_start(&state), SweepStartDecision::Queue);
+        assert!(
+            PressureRefusal::read(state.layout.root()).is_none(),
+            "an unknown reading discloses nothing, because there is nothing to disclose"
+        );
+    }
+
+    #[test]
+    fn a_critical_machine_defers_the_background_embedding_pass() {
+        let _lock = crate::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let state = open_store(dir.path());
+        {
+            let _forced = EnvVarGuard::set("KIN_MEMORY_PRESSURE", "nominal");
+            assert!(
+                start_or_defer_background_embed(&state),
+                "a machine with room queues the backlog exactly as it did before"
+            );
+        }
+        let _forced = EnvVarGuard::set("KIN_MEMORY_PRESSURE", "critical");
+        assert!(
+            !start_or_defer_background_embed(&state),
+            "a machine with no room must not start a bulk accelerator pass"
+        );
+        let record = PressureRefusal::read(state.layout.root()).expect("a disclosed refusal");
+        assert_eq!(record.work, "embed-batch");
+    }
+
+    #[test]
+    fn the_record_is_retired_once_the_work_runs_again() {
+        // A surface reporting last week's refusal reads exactly like one
+        // reporting this second's, so the pass that proceeds clears it.
+        let _lock = crate::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let state = open_store(dir.path());
+        {
+            let _forced = EnvVarGuard::set("KIN_MEMORY_PRESSURE", "critical");
+            assert!(matches!(
+                decide_sweep_on_start(&state),
+                SweepStartDecision::PressureRefused { .. }
+            ));
+        }
+        assert!(PressureRefusal::read(state.layout.root()).is_some());
+        clear_pressure_refusal(&state);
+        assert!(PressureRefusal::read(state.layout.root()).is_none());
+    }
+
+    #[test]
+    fn an_elevated_machine_shrinks_the_batch_rather_than_stopping() {
+        let _lock = crate::test_env_lock();
+        let _forced = EnvVarGuard::set("KIN_MEMORY_PRESSURE", "elevated");
+        let call = pressure_verdict(HeavyWork::EmbedBatch);
+        assert!(
+            matches!(call.verdict, Verdict::Shrink { .. }),
+            "elevated shrinks; refusing at three-quarters would stop embedding on every busy \
+             machine"
+        );
+        assert_eq!(embed_batch_under_pressure(512, &call.verdict), 128);
+    }
+
+    #[test]
+    fn a_shrink_never_reaches_a_batch_of_zero() {
+        // A size knob allowed to reach zero is a silent refusal wearing a
+        // shrink's name: the loop would run forever embedding nothing.
+        let _lock = crate::test_env_lock();
+        let _forced = EnvVarGuard::set("KIN_MEMORY_PRESSURE", "elevated");
+        let call = pressure_verdict(HeavyWork::EmbedBatch);
+        assert_eq!(embed_batch_under_pressure(1, &call.verdict), 1);
+        assert_eq!(embed_batch_under_pressure(3, &call.verdict), 1);
+    }
+
+    #[test]
+    fn a_machine_with_room_leaves_every_batch_at_its_configured_size() {
+        let _lock = crate::test_env_lock();
+        let _forced = EnvVarGuard::set("KIN_MEMORY_PRESSURE", "nominal");
+        let call = pressure_verdict(HeavyWork::EmbedBatch);
+        assert_eq!(call.verdict, Verdict::Proceed);
+        assert_eq!(embed_batch_under_pressure(512, &call.verdict), 512);
+    }
+
+    #[test]
+    fn ambient_admission_is_refused_while_the_explicit_seam_is_not_gated_here() {
+        // The ambient tick can wait: its events go back on the queue and the
+        // last complete admission stays where it was. A commit is a command
+        // someone ran, and this module never refuses one.
+        let _lock = crate::test_env_lock();
+        let _forced = EnvVarGuard::set("KIN_MEMORY_PRESSURE", "critical");
+        let ambient = pressure_verdict(HeavyWork::AmbientAdmission);
+        assert!(matches!(ambient.verdict, Verdict::Refuse { .. }));
+        assert!(ambient
+            .verdict
+            .reason()
+            .expect("refused")
+            .contains("nothing is lost"));
     }
 }
 
