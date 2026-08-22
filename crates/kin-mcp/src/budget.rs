@@ -30,21 +30,26 @@ use serde_json::{json, Map, Value};
 
 /// Serialized characters one retrieval response may occupy by default.
 ///
-/// Sized against **Claude Code**, the primary agent client for this server: it
-/// rejects a tool result above roughly 25,000 tokens and writes it to a file
-/// instead. JSON-wrapped source runs around 3.5 characters per token, so the
-/// refusal threshold sits near 87,000 characters, which is why the two measured
-/// payloads above (80,571 and 79,278) both tripped it while sitting inside the
-/// 80,000-character trace budget that was supposed to prevent exactly this.
+/// Sized against **Claude Code**, the primary agent client for this server. Its
+/// shipped default caps one MCP tool result at 25,000 tokens, read out of the
+/// 2.1.239 binary as `MAX_MCP_OUTPUT_TOKENS` falling back to 25000, and over
+/// that it refuses the result and writes it to a file the agent then has to
+/// `Read` with an offset.
 ///
-/// 30,000 characters is roughly 8,500 tokens: about a third of that ceiling. The
-/// margin is deliberate and is not a guess about tokenization. A response is
-/// counted by the client after its own JSON-RPC framing, an agent typically
-/// holds several tool results in one context window, and a budget chosen to
-/// *just* fit one client's limit becomes the next overflow the moment any client
-/// counts slightly differently. A caller with a larger window raises it per call
-/// with `max_chars`.
-pub const RESPONSE_DEFAULT_MAX_CHARS: usize = 30_000;
+/// The band around that cap is measured, not guessed. On the v0.5.47 candidate
+/// a `trace_data_flow` at `depth: 5, include_body: false` produced 117,313
+/// characters and the client refused them outright, while `impact_analysis`
+/// responses at 50,000 and 55,000 characters in the same session came back
+/// whole. So the refusal threshold sits above 55,000 and at or below 117,313.
+///
+/// 45,000 characters is three quarters of [`RESPONSE_MAX_MAX_CHARS`], which
+/// leaves a caller room to raise the bound on the same call. It is not a promise
+/// that every walk fits: the same run still withheld `impact_analysis` rows at
+/// 50,000. What it buys is a default that keeps roughly half again as much of a
+/// chain as 30,000 did, on a store where 30,000 dropped 170 of 200 steps, and
+/// every list the budget still cuts now says what it cut rather than rendering
+/// empty.
+pub const RESPONSE_DEFAULT_MAX_CHARS: usize = 45_000;
 
 /// Floor for a caller-supplied budget. Below this the envelope and the
 /// disclosure alone do not fit, so a smaller number could only be honoured by
@@ -52,9 +57,21 @@ pub const RESPONSE_DEFAULT_MAX_CHARS: usize = 30_000;
 pub const RESPONSE_MIN_MAX_CHARS: usize = 2_000;
 
 /// Ceiling for a caller-supplied budget. A caller with a larger window may raise
-/// the bound, but not to unbounded: the daemon serving this has other callers,
-/// and a response nothing can read is not worth building.
-pub const RESPONSE_MAX_MAX_CHARS: usize = 400_000;
+/// the bound, but not past what a real client will accept: the daemon serving
+/// this has other callers, and a response nothing can read is not worth
+/// building.
+///
+/// 400,000 sat here and was roughly four times what any measurement supports, so
+/// the tool advertised a ceiling that guaranteed a refusal to any caller who
+/// took it at its word, and one did: it asked for 120,000, got 117,313, and the
+/// client threw the whole result away.
+///
+/// 60,000 is just above the largest payload that run proved a client accepts and
+/// roughly half the smallest it proved refused. The token arithmetic agrees:
+/// 60,000 characters stays under a 25,000-token cap for any payload averaging
+/// more than 2.4 characters per token, and the refusal at 117,313 puts this
+/// JSON's own average below 4.69.
+pub const RESPONSE_MAX_MAX_CHARS: usize = 60_000;
 
 /// Characters held back from the budget for the disclosure a cut adds.
 ///
@@ -94,8 +111,9 @@ pub struct ResponseBudget {
     /// ceiling is not the published one. Carrying the difference lets the
     /// disclosure name both and the reserve between them, so one response stops
     /// reporting two budgets and explaining neither. Both strangers on the
-    /// v0.5.40 candidate spent attention deciding which of 30000 and 28000 was
-    /// real; the arithmetic joining them was in this file the whole time.
+    /// v0.5.40 candidate spent attention deciding which of the published default
+    /// and the reduced one was real; the arithmetic joining them was in this file
+    /// the whole time.
     pub envelope_reserve: usize,
 }
 
@@ -188,6 +206,76 @@ pub struct BudgetAccounting {
 impl BudgetAccounting {
     pub fn to_value(&self) -> Value {
         serde_json::to_value(self).unwrap_or(Value::Null)
+    }
+}
+
+/// The reason code a budget elision carries, so a caller keying on it never has
+/// to parse prose.
+pub const ELISION_REASON_BUDGET: &str = "response_budget";
+
+/// Where a payload publishes what its lists lost.
+pub const ELISIONS_KEY: &str = "elisions";
+
+/// What one list lost to the response budget.
+///
+/// A list the budget cut must never render as an empty array. An empty array is
+/// the shape a caller reads as "the walk saw none", and no counter elsewhere in
+/// the response outranks it: two `impact_analysis` answers in one stranger
+/// session carried `"affected_tests": []` beside a `covering_tests: 16` that
+/// contradicted it, and both times the empty array won and the reader drew the
+/// wrong conclusion. A sibling `affected_tests_withheld: 15` was right there in
+/// the second one and did not save it either.
+///
+/// So a cut list keeps at least one entry and publishes this record beside it,
+/// and an empty array afterward means one thing only.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Elision {
+    /// Entries the budget withheld from this list.
+    pub elided: usize,
+    /// Entries the response still carries. Never zero when the walk found any.
+    pub kept: usize,
+    /// Entries the walk actually found, which is `kept + elided`.
+    pub total: usize,
+    /// Why they were withheld. [`ELISION_REASON_BUDGET`] today, named rather
+    /// than assumed, so a cut made later for a different reason cannot be read
+    /// as this one.
+    pub reason: String,
+}
+
+impl Elision {
+    /// One list's loss, from what survived and what did not.
+    pub fn budget(kept: usize, elided: usize) -> Self {
+        Self {
+            elided,
+            kept,
+            total: kept.saturating_add(elided),
+            reason: ELISION_REASON_BUDGET.to_string(),
+        }
+    }
+}
+
+/// Record one list's elision on the payload, under the top-level `elisions`
+/// map, keyed by the field that was cut.
+///
+/// One map rather than a sibling key per list: a caller asking "did this
+/// response lose anything" reads one key, and the answer has the same shape for
+/// `chain` as it has for `affected_tests`. The older `<field>_withheld` scalars
+/// stay beside it, because a client already reading them must not lose its
+/// counter to this change.
+pub fn record_elision(payload: &mut Value, field: &str, kept: usize, elided: usize) {
+    if elided == 0 {
+        return;
+    }
+    let entry = serde_json::to_value(Elision::budget(kept, elided)).unwrap_or(Value::Null);
+    match payload.get_mut(ELISIONS_KEY).and_then(Value::as_object_mut) {
+        Some(map) => {
+            map.insert(field.to_string(), entry);
+        }
+        None => {
+            let mut map = Map::new();
+            map.insert(field.to_string(), entry);
+            payload[ELISIONS_KEY] = Value::Object(map);
+        }
     }
 }
 
@@ -490,21 +578,28 @@ pub fn enforce(
     // first. This is the only stage that removes an answer, so it reports the
     // count withheld and the parameter that recovers them.
     //
-    // The first collection is the primary one and always keeps at least one
-    // entry. A bound is not a refusal: a caller handed an empty ranking cannot
-    // tell it from "nothing matched", which is the one reading a size cut must
-    // never produce.
+    // Every collection keeps at least one entry, not just the primary one. A
+    // bound is not a refusal: a caller handed an empty array cannot tell it from
+    // "nothing matched", which is the one reading a size cut must never produce,
+    // and the reading does not get safer further down the response. The floor
+    // used to be the primary alone, so the last bucket of an `impact_analysis`
+    // emptied first and `"affected_tests": []` shipped beside a
+    // `covering_tests: 16` that said sixteen tests cover it.
     let primary = shape.collections.first().copied();
     let mut withheld_any = false;
     for key in shape.collections.iter().rev() {
-        let floor = usize::from(Some(*key) == primary);
-        let withheld = trim_collection(payload, key, target, floor);
+        let found = payload
+            .get(*key)
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        let withheld = trim_collection(payload, key, target, 1);
         if withheld > 0 {
             accounting.bounded = true;
             withheld_any = true;
             cuts.push(format!(
-                "{withheld} entries withheld from the end of `{key}`"
+                "{withheld} of {found} entries withheld from the end of `{key}`"
             ));
+            record_elision(payload, key, found.saturating_sub(withheld), withheld);
             payload["truncated"] = Value::Bool(true);
         }
         if measure(payload) <= target {
@@ -682,8 +777,10 @@ fn disclose(
     if !remediation.is_empty() {
         remediation.push_str("; ");
     }
-    remediation
-        .push_str("or raise max_chars if the caller's own result limit accepts a larger payload");
+    remediation.push_str(&format!(
+        "or raise max_chars, up to the {RESPONSE_MAX_MAX_CHARS} this server will build, if the \
+         caller's own result limit accepts a larger payload"
+    ));
     let entry = json!({
         "component": "response_budget",
         "reason": "response_bounded",
@@ -969,11 +1066,16 @@ mod tests {
     }
 
     /// One response named two budgets and explained neither: the envelope
-    /// published 30000 while the arm that cut disclosed 28000. The disclosure
-    /// now carries the arithmetic joining them.
+    /// published the default while the arm that cut disclosed the default less
+    /// the reserve. The disclosure now carries the arithmetic joining them.
+    ///
+    /// Every number here is read off the constants rather than written out, so
+    /// moving the default moves the test with it instead of leaving a green
+    /// assertion about a budget nothing serves.
     #[test]
     fn a_default_budget_discloses_the_envelope_reserve_it_was_cut_by() {
-        let mut payload = locate_payload(40, 900);
+        let enforced = RESPONSE_DEFAULT_MAX_CHARS - RESPONSE_ENVELOPE_RESERVE_CHARS;
+        let mut payload = locate_payload(120, 900);
         let budget = ResponseBudget::default().less_envelope_reserve();
         enforce(&mut payload, "semantic_locate", &budget).expect("budgeted");
         let detail = payload["degradations"][0]["detail"]
@@ -981,15 +1083,17 @@ mod tests {
             .expect("a cut was disclosed")
             .to_string();
         assert!(
-            detail.contains("28000-character budget"),
+            detail.contains(&format!("{enforced}-character budget")),
             "must name what it enforced: {detail}"
         );
         assert!(
-            detail.contains("30000-character default")
-                && detail.contains("2000-character envelope reserve"),
+            detail.contains(&format!("{RESPONSE_DEFAULT_MAX_CHARS}-character default"))
+                && detail.contains(&format!(
+                    "{RESPONSE_ENVELOPE_RESERVE_CHARS}-character envelope reserve"
+                )),
             "must name the published default and the reserve between them: {detail}"
         );
-        assert_eq!(payload["degradations"][0]["max_chars"], json!(28_000));
+        assert_eq!(payload["degradations"][0]["max_chars"], json!(enforced));
     }
 
     /// A caller who named a ceiling is told that ceiling and nothing else: there
@@ -1025,6 +1129,186 @@ mod tests {
         assert_eq!(
             defaulted.less_envelope_reserve().max_chars,
             RESPONSE_DEFAULT_MAX_CHARS - RESPONSE_ENVELOPE_RESERVE_CHARS
+        );
+    }
+
+    /// The defect the v0.5.47 stranger run named twice in one session:
+    /// `"affected_tests": []` shipped beside a `covering_tests: 16` that
+    /// contradicted it, and the empty array won both times. `affected_tests` is
+    /// the last bucket, so the ladder emptied it first, and a sibling
+    /// `affected_tests_withheld: 15` sat right there and saved nobody.
+    ///
+    /// Every list the budget cuts now keeps an entry and publishes what it lost.
+    #[test]
+    fn a_budget_never_empties_a_list_it_cut() {
+        const BUCKETS: [&str; 4] = [
+            "affected_callers",
+            "affected_dependents",
+            "affected_contract_consumers",
+            "affected_tests",
+        ];
+        let mut payload = impact_payload(40);
+        let found: Vec<usize> = BUCKETS
+            .iter()
+            .map(|key| payload[*key].as_array().expect("bucket").len())
+            .collect();
+        assert!(
+            found.iter().all(|count| *count > 0),
+            "the fixture must fill every bucket or this proves nothing: {found:?}"
+        );
+        let budget = ResponseBudget {
+            max_chars: 4_000,
+            ..ResponseBudget::default()
+        };
+        let accounting = enforce(&mut payload, "impact_analysis", &budget).expect("budgeted");
+        assert!(accounting.bounded, "the fixture must overflow: {payload}");
+
+        let mut cut_any = false;
+        for (key, before) in BUCKETS.iter().zip(found) {
+            let kept = payload[*key].as_array().expect("bucket survives").len();
+            assert!(
+                kept > 0,
+                "`{key}` was emptied by the budget, which reads as \"the walk found none\": \
+                 {payload}"
+            );
+            if kept == before {
+                assert!(
+                    payload["elisions"].get(*key).is_none(),
+                    "`{key}` lost nothing and must claim nothing: {payload}"
+                );
+                continue;
+            }
+            cut_any = true;
+            let elision = &payload["elisions"][*key];
+            assert_eq!(elision["kept"], json!(kept), "{payload}");
+            assert_eq!(elision["elided"], json!(before - kept), "{payload}");
+            assert_eq!(elision["total"], json!(before), "{payload}");
+            assert_eq!(elision["reason"], json!(ELISION_REASON_BUDGET), "{payload}");
+            assert_eq!(
+                payload[format!("{key}_withheld")],
+                json!(before - kept),
+                "the older counter must still agree with the elision: {payload}"
+            );
+        }
+        assert!(
+            cut_any,
+            "a budget this small must have cut something: {payload}"
+        );
+    }
+
+    /// The other direction, which is what makes the first test worth anything: a
+    /// list the walk genuinely found nothing for stays empty and claims no
+    /// elision. Without this, "never empty" could be satisfied by inventing an
+    /// entry, and an empty array would still mean two things.
+    #[test]
+    fn an_empty_list_stays_empty_and_claims_no_elision() {
+        let mut payload = impact_payload(40);
+        payload["affected_tests"] = json!([]);
+        let budget = ResponseBudget {
+            max_chars: 4_000,
+            ..ResponseBudget::default()
+        };
+        enforce(&mut payload, "impact_analysis", &budget).expect("budgeted");
+        assert_eq!(
+            payload["affected_tests"],
+            json!([]),
+            "a walk that found none must still report none: {payload}"
+        );
+        assert!(
+            payload["elisions"].get("affected_tests").is_none(),
+            "nothing was withheld, so nothing may be claimed: {payload}"
+        );
+        assert!(
+            payload.get("affected_tests_withheld").is_none(),
+            "nothing was withheld: {payload}"
+        );
+    }
+
+    /// A list nothing was taken from must not grow an elision, whatever calls
+    /// the recorder. The ladder guards this at its call site; this guards the
+    /// recorder itself, so a second producer added later cannot publish a loss
+    /// of zero.
+    #[test]
+    fn recording_a_loss_of_nothing_writes_nothing() {
+        let mut payload = json!({ "entities": [] });
+        record_elision(&mut payload, "entities", 0, 0);
+        assert_eq!(payload, json!({ "entities": [] }), "{payload}");
+        record_elision(&mut payload, "entities", 1, 2);
+        assert_eq!(
+            payload["elisions"]["entities"]["elided"],
+            json!(2),
+            "{payload}"
+        );
+        assert_eq!(
+            payload["elisions"]["entities"]["total"],
+            json!(3),
+            "{payload}"
+        );
+    }
+
+    /// The ceiling has to be a number a real MCP client accepts, and 400,000 was
+    /// not: Claude Code caps one tool result at 25,000 tokens by default, and on
+    /// the v0.5.47 candidate a caller who took the advertised ceiling at its word
+    /// asked for 120,000, got 117,313 characters, and had the whole result thrown
+    /// away. Responses of 50,000 and 55,000 characters in the same session came
+    /// back whole.
+    #[test]
+    fn the_advertised_ceiling_is_one_a_client_accepts() {
+        const REFUSED_BY_A_REAL_CLIENT: usize = 117_313;
+        const ACCEPTED_BY_A_REAL_CLIENT: usize = 55_000;
+        const OVERFLOWED_THE_MEASURED_STORE: usize = 30_000;
+
+        // Read through the clamp rather than off the constants, because what a
+        // caller is served is the only number that can refuse their result.
+        let served = |requested: Option<u64>| {
+            let mut args = HashMap::new();
+            if let Some(value) = requested {
+                args.insert("max_chars".to_string(), json!(value));
+            }
+            ResponseBudget::from_arguments(&args).max_chars
+        };
+        let ceiling = served(Some(u64::MAX));
+        let floor = served(Some(1));
+        let default = served(None);
+
+        assert!(
+            ceiling < REFUSED_BY_A_REAL_CLIENT,
+            "the ceiling serves a size a real client refused: {ceiling}"
+        );
+        assert!(
+            ceiling >= ACCEPTED_BY_A_REAL_CLIENT,
+            "the ceiling sits under a size a real client already took: {ceiling}"
+        );
+        assert!(
+            floor < default && default <= ceiling,
+            "the default {default} must sit inside its own clamp {floor}..{ceiling}"
+        );
+        // The old 30,000 default dropped 170 of 200 steps on the 783-entity store
+        // the same run measured, and still withheld impact rows at 50,000.
+        assert!(
+            default > OVERFLOWED_THE_MEASURED_STORE,
+            "the default is back at a size the measured store overflowed: {default}"
+        );
+    }
+
+    /// A cut names the ceiling a caller may raise to, on the response that got
+    /// cut. The raw daemon route carries no `_kin` envelope, so this in-band line
+    /// is the only place that number reaches a caller there.
+    #[test]
+    fn a_cut_discloses_the_ceiling_a_caller_may_raise_to() {
+        let mut payload = locate_payload(40, 900);
+        let budget = ResponseBudget {
+            max_chars: 4_000,
+            ..ResponseBudget::default()
+        };
+        enforce(&mut payload, "semantic_locate", &budget).expect("budgeted");
+        let remediation = payload["degradations"][0]["remediation"]
+            .as_str()
+            .expect("a cut was disclosed")
+            .to_string();
+        assert!(
+            remediation.contains(&RESPONSE_MAX_MAX_CHARS.to_string()),
+            "the response must name the ceiling it will serve: {remediation}"
         );
     }
 

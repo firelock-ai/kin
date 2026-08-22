@@ -1,8 +1,8 @@
 # Product acceptance suites
 
-Two falsifiable suites that ask whether the product still answers correctly.
-`.github/workflows/acceptance.yml` runs both on every pull request against that
-pull request's own build. Neither is release proof; both are regression gates.
+Three falsifiable suites that ask whether the product still answers correctly.
+`.github/workflows/acceptance.yml` runs all three on every pull request against
+that pull request's own build. None is release proof; all are regression gates.
 
 Each suite prints one line per check:
 
@@ -49,10 +49,26 @@ one-commit-shape results. The suite prints that scope on every run and records i
 in the JSON. History-shaped behavior, meaning conversion cost, provenance depth,
 and commit peak memory, is not exercised here.
 
-`brownfield_repro.py --self-test` exercises the verdict graders on fixed payloads
-and needs no binary and no corpus. Each case is paired with its inverse, so a
-grader that cannot tell its own cases apart fails rather than reporting a clean
-product on a broken one.
+`response_budget_elisions.py` covers the one rule the response budget owes every
+answer it shortens: a list it cut is never rendered as an empty one. An empty
+array is the shape a reader takes for "the walk found none", and the v0.5.47
+stranger read `"affected_tests": []` beside a `covering_tests: 16` twice in one
+session and drew the wrong conclusion both times, with a sibling
+`affected_tests_withheld` counter sitting in the same response. Check 0 cuts a
+trace and asserts the chain keeps a step and publishes `elisions.chain`. Check 1
+walks an entity with no callees and asserts the empty chain claims no elision, so
+an empty array still means one thing. Check 2 reads `tools/list` and asserts every
+advertised budget sits under what a real MCP client accepts. Check 3 runs one
+query at the ceiling and again at the floor and asserts nothing full in the first
+is empty in the second, which needs no counter to be true.
+
+`brownfield_repro.py --self-test` and `response_budget_elisions.py --self-test`
+exercise their verdict graders on fixed payloads and need no binary and no
+corpus. Each case is paired with its inverse, so a grader that cannot tell its
+own cases apart fails rather than reporting a clean product on a broken one. That
+pairing has already earned its keep: one elision grader passed a deliberately
+broken product because its fixture sat under the budget and never reached the
+code the check was about.
 
 ## Running against a local build
 
@@ -67,6 +83,10 @@ python3 scripts/acceptance/brownfield_repro.py \
   --kin target/release/kin --daemon target/release/kin-daemon \
   --json acceptance/brownfield.json \
   --corpus-cache ~/.cache/kin-brownfield-repro --verbose
+
+python3 scripts/acceptance/response_budget_elisions.py \
+  --kin target/release/kin --daemon target/release/kin-daemon \
+  --json acceptance/response_budget.json --verbose
 ```
 
 Release, not debug. Release is what ships, so it is what an acceptance answer
@@ -74,11 +94,13 @@ should be about, and the profile has already been shown to change an answer: on
 the first CI run a debug build truncated a data-flow walk that a release build
 walked whole (FIR-2593).
 
-Both take `--only` to select check ids, `--workdir` to keep fixtures somewhere
-known, `--keep` to leave them behind, and `--compare` a prior run's JSON so a
-check that passed there and fails now reads REGRESSION rather than plain FAIL.
-`brownfield_repro.py` also takes `--offline`, which refuses to fetch and requires
-the corpus cache to already carry both pinned commits.
+`magic_repro.py` and `brownfield_repro.py` take `--only` to select check ids,
+`--workdir` to keep fixtures somewhere known, `--keep` to leave them behind, and
+`--compare` a prior run's JSON so a check that passed there and fails now reads
+REGRESSION rather than plain FAIL. `brownfield_repro.py` also takes `--offline`,
+which refuses to fetch and requires the corpus cache to already carry both pinned
+commits. `response_budget_elisions.py` builds its own fixture, fetches nothing,
+and takes `--workdir` and `--verbose`.
 
 The magic suite's fixtures commit through kin, and kin refuses to invent an
 author, so the machine running them needs a git identity. That refusal is

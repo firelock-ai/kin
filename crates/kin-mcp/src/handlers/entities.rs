@@ -222,8 +222,8 @@ all take it. `id_space: \"artifact\"` means the hit is an artifact-level embeddi
 tracked file the parsers produced no entities for — so it carries `artifact_path` and NO \
 `entity_id`, and those tools will refuse it; read it with kin_artifact_read instead. Do \
 not synthesize an entity id from an artifact hit's path. The response bounds its own size \
-(max_chars, default 30000 serialized characters) so it is never refused by a client for being \
-too large: it is compact by default, meaning no per-signal `match_evidence` breakdown unless you \
+(max_chars, default 45000 serialized characters, ceiling 60000) so it is never refused by a \
+client for being too large: it is compact by default, meaning no per-signal `match_evidence` breakdown unless you \
 ask with explain=true or compact=false, and under pressure it sheds the per-file symbol roll-up, \
 then inline snippets, and only then withholds hits from the end of the page. Any cut is reported \
 in `degradations` and in `_kin.response`, which carries the budget applied and what the response \
@@ -1231,7 +1231,8 @@ unused from the absence of anything but `name_only` rows without confirming. \
 `total_upstream` of 0 with `unconfirmed_candidates` above 0 means this answer is holding \
 rows it could not confirm and the zero may not be read alone. \
 `_kin.verdict` is the one verdict for the whole response and outranks every count in it. \
-The response bounds its own size (max_chars, default 30000 serialized characters): a symbol \
+The response bounds its own size (max_chars, default 45000 serialized characters, ceiling \
+60000): a symbol \
 with hundreds of call sites sheds its inline snippets before it withholds any row, and any cut \
 is reported in `degradations` and in `_kin.response` with the size the response had before the \
 budget, so a short answer is never mistaken for a complete one.";
@@ -3208,8 +3209,10 @@ happens substrate-side and comes back as one structured response, so you don't l
 get_entity_source per hop and exhaust your tool-call budget. Ask for the chain's SHAPE with \
 include_body=false (names, kinds, roles, spans, edges, no source) — that is the cheap call, and \
 the one to reach for unless you mean to read the code. The response bounds its own size \
-(max_response_chars) and cuts bodies before edges, so it is never refused for being too large; \
-any cut is reported in `degradations` with the numbers. Tune depth and limit_per_step to control \
+(max_response_chars, default 45000, ceiling 60000) and cuts bodies before edges, so it is never \
+refused for being too large; any cut is reported in `degradations` with the numbers. A budget \
+that cut the chain never empties it: at least one step survives and `elisions.chain` names what \
+was kept, what was withheld, and why, so an empty `chain` always means the walk reached nothing. Tune depth and limit_per_step to control \
 breadth: the per-step cap keeps the most relevant neighbors (located over file-less, source over \
 test, Calls over Imports over References, the expanded node's own file first) rather than \
 whatever order the relation table returned, and any node whose fan-out was cut carries \
@@ -3416,8 +3419,14 @@ fn bound_trace_payload(result: &mut serde_json::Value, max_chars: usize) {
 
     // Bisected rather than popped one step at a time: the same answer, in a
     // handful of serializations instead of one per dropped step.
-    let mut kept = 0usize;
-    let mut low = 0usize;
+    //
+    // The floor is one step, not zero. A walk that found 200 steps and returns
+    // `"chain": []` is indistinguishable from a walk that found none, and the
+    // caller has no second field that outranks the empty array. One step plus
+    // the elision beside it says both what was reached and what was withheld.
+    let floor = usize::from(!full.is_empty());
+    let mut kept = floor;
+    let mut low = floor;
     let mut high = full.len();
     while low <= high {
         let mid = (low + high) / 2;
@@ -3426,7 +3435,7 @@ fn bound_trace_payload(result: &mut serde_json::Value, max_chars: usize) {
         if measure(result) <= target {
             kept = mid;
             low = mid + 1;
-        } else if mid == 0 {
+        } else if mid <= floor {
             break;
         } else {
             high = mid - 1;
@@ -3440,6 +3449,9 @@ fn bound_trace_payload(result: &mut serde_json::Value, max_chars: usize) {
         return;
     }
     result["steps_omitted"] = serde_json::Value::from(omitted);
+    // The same loss in the shape every budgeted list reports it in, so a caller
+    // reads one key whether the tool cut a chain or a bucket of tests.
+    crate::budget::record_elision(result, "chain", kept, omitted);
     // Dropped steps are edges the caller did not receive, which is what this flag
     // has always meant.
     result["truncated"] = serde_json::Value::Bool(true);
@@ -4705,6 +4717,97 @@ mod tests {
 
     fn make_entity(name: &str, file: &str) -> Entity {
         make_entity_in(LanguageId::Rust, name, file)
+    }
+
+    /// A chain payload in the shape the generic-`GraphStore` arm builds, sized
+    /// so the caller can force a cut.
+    fn chain_payload(steps: usize, signature_chars: usize) -> serde_json::Value {
+        chain_payload_padded(steps, signature_chars, 0)
+    }
+
+    /// The same payload with bulk the budget cannot trim, so a walk with an
+    /// empty chain still reaches the bisect. Without it an empty-chain fixture
+    /// is under budget, the bounder returns at its first line, and a test
+    /// asserting what it did not do can never fail. That was measured: the
+    /// unpadded version of the test below passed with the rule deliberately
+    /// broken.
+    fn chain_payload_padded(
+        steps: usize,
+        signature_chars: usize,
+        pad_chars: usize,
+    ) -> serde_json::Value {
+        let chain: Vec<serde_json::Value> = (0..steps)
+            .map(|index| {
+                serde_json::json!({
+                    "step": index + 1,
+                    "parent_step": index,
+                    "entity_id": format!("00000000-0000-0000-0000-{index:012}"),
+                    "entity_name": format!("hop_{index}"),
+                    "entity_kind": "Function",
+                    "entity_file": format!("src/hop_{index}.rs"),
+                    "relation": "Calls",
+                    "signature": "s".repeat(signature_chars),
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "focal": "entry",
+            "focal_body": "b".repeat(pad_chars),
+            "total_steps": steps,
+            "chain": chain,
+        })
+    }
+
+    /// A walk that reached steps must never answer with an empty chain, because
+    /// an empty chain is the shape that means the walk reached nothing and no
+    /// counter beside it outranks that reading. One step survives and
+    /// `elisions.chain` says what the budget took.
+    #[test]
+    fn a_budget_never_returns_an_empty_chain_for_a_walk_that_found_steps() {
+        let mut payload = chain_payload(200, 400);
+        bound_trace_payload(&mut payload, 2_000);
+        let kept = payload["chain"].as_array().expect("chain survives").len();
+        assert!(
+            kept > 0,
+            "the budget emptied a chain of 200 steps: {payload}"
+        );
+        let omitted = payload["steps_omitted"].as_u64().expect("a cut is counted") as usize;
+        assert_eq!(kept + omitted, 200, "{payload}");
+        assert_eq!(payload["total_steps"], serde_json::json!(kept), "{payload}");
+        let elision = &payload["elisions"]["chain"];
+        assert_eq!(elision["kept"], serde_json::json!(kept), "{payload}");
+        assert_eq!(elision["elided"], serde_json::json!(omitted), "{payload}");
+        assert_eq!(elision["total"], serde_json::json!(200), "{payload}");
+        assert_eq!(
+            elision["reason"],
+            serde_json::json!(crate::budget::ELISION_REASON_BUDGET),
+            "{payload}"
+        );
+        assert_eq!(payload["truncated"], serde_json::json!(true), "{payload}");
+    }
+
+    /// The direction that makes the rule mean something: a walk that reached
+    /// nothing still answers with an empty chain and claims no elision.
+    #[test]
+    fn a_walk_that_reached_nothing_still_answers_with_an_empty_chain() {
+        // Padded past the budget on purpose, so the bounder runs its bisect on an
+        // empty chain rather than returning at its first line.
+        let mut payload = chain_payload_padded(0, 0, 8_000);
+        assert!(
+            serde_json::to_string_pretty(&payload).unwrap().len() > 2_000,
+            "the fixture must reach the bounder or this proves nothing"
+        );
+        bound_trace_payload(&mut payload, 2_000);
+        assert_eq!(
+            payload["chain"],
+            serde_json::json!([]),
+            "an empty walk must report itself: {payload}"
+        );
+        assert!(
+            payload.get("elisions").is_none(),
+            "nothing was withheld, so nothing may be claimed: {payload}"
+        );
+        assert!(payload.get("steps_omitted").is_none(), "{payload}");
     }
 
     fn make_entity_in(language: LanguageId, name: &str, file: &str) -> Entity {

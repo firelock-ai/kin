@@ -538,7 +538,10 @@ enum Command {
         #[arg(long = "no-bodies", default_value_t = false)]
         no_bodies: bool,
         /// Serialized characters this response may occupy before the tool cuts
-        /// bodies, and then steps, to fit (default 80000).
+        /// bodies, and then steps, to fit. Defaults to the same budget every
+        /// retrieval tool answers under, and is clamped to the same ceiling; the
+        /// numbers live in one place, `kin_mcp::budget`, rather than being
+        /// written out here to go stale.
         #[arg(long = "max-response-chars", value_name = "C")]
         max_response_chars: Option<usize>,
         /// Walk through a type-annotation edge to a type this repository
