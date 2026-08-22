@@ -2973,6 +2973,157 @@ class Response:
     }
 
     #[test]
+    fn a_type_checking_guarded_import_binds_the_name_its_annotation_uses() {
+        // PEP 484 says an import that exists only for annotations belongs
+        // behind `if TYPE_CHECKING:`, and requests puts
+        // `from .adapters import HTTPAdapter` in `models.py` exactly there. The
+        // import walk read the module's own children only, so the file bound
+        // nothing, the emit filter dropped the annotation, and a class used
+        // only in type positions had zero inbound references anywhere in the
+        // repository.
+        let edges = references_in(
+            "from typing import TYPE_CHECKING\n\nif TYPE_CHECKING:\n    from adapters import HTTPAdapter\n\n\nclass Response:\n    connection: HTTPAdapter\n",
+        );
+        assert!(
+            edges.contains(&("Response".to_string(), "HTTPAdapter".to_string())),
+            "a guarded import must bind the name its annotation reads, got {edges:?}"
+        );
+    }
+
+    #[test]
+    fn an_import_behind_an_import_error_guard_binds_too() {
+        // The optional-dependency spelling of the same shape.
+        let edges = references_in(
+            "try:\n    from fast import Codec\nexcept ImportError:\n    from slow import Codec\n\n\nclass Frame:\n    codec: Codec\n",
+        );
+        assert!(
+            edges.contains(&("Frame".to_string(), "Codec".to_string())),
+            "an import behind an ImportError guard must bind, got {edges:?}"
+        );
+    }
+
+    #[test]
+    fn a_guarded_import_stays_out_of_the_files_import_list() {
+        // The bound, and it is measured rather than stylistic. Feeding a
+        // guarded import into `FileImport` widened the linker tier that settles
+        // a bare method name from the one owner a file imports: real
+        // `sessions.py` imports `HTTPAdapter` at module scope and `BaseAdapter`
+        // under `TYPE_CHECKING`, both declare `send`, and
+        // `Session.send`'s call to `adapter.send(request)` stopped resolving to
+        // anything. A guarded import admits a name for annotations and nothing
+        // else.
+        let adapter = PythonAdapter;
+        let source = b"from typing import TYPE_CHECKING\nfrom adapters import HTTPAdapter\n\nif TYPE_CHECKING:\n    from adapters import BaseAdapter\n\n\nclass Session:\n    fallback: BaseAdapter\n";
+        let tree = adapter.parse(source).unwrap();
+        let output = adapter
+            .extract(&tree, source, &FilePathId::new("sessions.py"))
+            .unwrap();
+        let bound: Vec<&str> = output
+            .imports
+            .iter()
+            .flat_map(|imp| imp.specifiers.iter())
+            .map(|spec| spec.local_name.as_str())
+            .collect();
+        assert!(
+            bound.contains(&"HTTPAdapter"),
+            "a module-scope import is still an import, got {bound:?}"
+        );
+        assert!(
+            !bound.contains(&"BaseAdapter"),
+            "a guarded import must not enter the file's import list, got {bound:?}"
+        );
+        let edges: Vec<(String, String)> = output
+            .relations
+            .iter()
+            .filter(|rel| rel.kind == kin_model::RelationKind::References)
+            .map(|rel| (rel.src_name.clone(), rel.dst_name.clone()))
+            .collect();
+        assert!(
+            edges.contains(&("Session".to_string(), "BaseAdapter".to_string())),
+            "and it must still bind the annotation that reads it, got {edges:?}"
+        );
+    }
+
+    #[test]
+    fn a_function_local_import_is_not_a_module_binding() {
+        // The other side of the bound. An import inside a function body binds
+        // in that scope only, so it must not admit a module-scope annotation.
+        let edges = references_in(
+            "def load():\n    from adapters import HTTPAdapter\n\n    return HTTPAdapter\n\n\nclass Response:\n    connection: HTTPAdapter\n",
+        );
+        assert!(
+            !edges.contains(&("Response".to_string(), "HTTPAdapter".to_string())),
+            "a function-local import must not bind a class-body annotation, got {edges:?}"
+        );
+    }
+
+    #[test]
+    fn a_class_body_annotation_carries_the_attribute_it_declares() {
+        // The declaration half of a two-hop receiver. The reference edge alone
+        // cannot say WHICH attribute holds the type, and without that the
+        // linker cannot join `r.connection.send(...)` under `r: Response`.
+        let adapter = PythonAdapter;
+        let source =
+            b"from adapters import HTTPAdapter\n\n\nclass Response:\n    connection: HTTPAdapter\n";
+        let tree = adapter.parse(source).unwrap();
+        let output = adapter
+            .extract(&tree, source, &FilePathId::new("models.py"))
+            .unwrap();
+        let declared: Vec<(&str, Option<&str>, &str)> = output
+            .relations
+            .iter()
+            .filter(|rel| rel.kind == kin_model::RelationKind::References)
+            .map(|rel| {
+                (
+                    rel.src_name.as_str(),
+                    rel.receiver.as_deref(),
+                    rel.dst_name.as_str(),
+                )
+            })
+            .collect();
+        assert!(
+            declared.contains(&("Response", Some("connection"), "HTTPAdapter")),
+            "the class body's own annotation must name its attribute, got {declared:?}"
+        );
+        assert!(
+            output.relations.iter().any(|rel| {
+                rel.kind == kin_model::RelationKind::References
+                    && rel.dst_name == "HTTPAdapter"
+                    && rel.import_source.as_deref() == Some("adapters")
+            }),
+            "and it must keep the module pin: carrying an attribute on the edge \
+             must not cost it the import_source every other reference gets"
+        );
+    }
+
+    #[test]
+    fn two_attributes_of_one_type_each_name_themselves() {
+        // Matching the declaration to its edge by name alone would stamp both
+        // rows with whichever attribute was seen last, and the linker would
+        // then answer one attribute's join with the other's type.
+        let adapter = PythonAdapter;
+        let source = b"from adapters import HTTPAdapter\n\n\nclass Pair:\n    primary: HTTPAdapter\n    backup: HTTPAdapter\n";
+        let tree = adapter.parse(source).unwrap();
+        let output = adapter
+            .extract(&tree, source, &FilePathId::new("pair.py"))
+            .unwrap();
+        let mut attributes: Vec<&str> = output
+            .relations
+            .iter()
+            .filter(|rel| {
+                rel.kind == kin_model::RelationKind::References && rel.dst_name == "HTTPAdapter"
+            })
+            .filter_map(|rel| rel.receiver.as_deref())
+            .collect();
+        attributes.sort();
+        assert_eq!(
+            attributes,
+            vec!["backup", "primary"],
+            "each annotation must carry its own attribute"
+        );
+    }
+
+    #[test]
     fn a_parameter_annotation_references_the_imported_class() {
         // The reported shape. `ParsedNote` is named only as a parameter type,
         // so before annotations carried an edge this file reported nothing and

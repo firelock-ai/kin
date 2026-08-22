@@ -639,3 +639,106 @@ class Auth:
          name_only; a tier that declines must not leave a proven marker behind"
     );
 }
+
+#[test]
+fn a_guarded_import_does_not_widen_the_bare_name_owner_tier() {
+    // The regression this change caused and this fixture caught. Recording a
+    // TYPE_CHECKING import as an ordinary one gave `sessions.py` two visible
+    // owners of `send`, so the tier that settles a bare method name from the
+    // one owner a file imports correctly declined, and `Session.send`'s real
+    // call to `adapter.send(request)` stopped resolving to anything. Measured
+    // on the pinned requests tree: the edge disappeared while the two-hop edge
+    // appeared, which is trading one crown caller for the other.
+    let files = vec![
+        parse_py(
+            "adapters.py",
+            r#"
+class BaseAdapter:
+    def send(self, request):
+        raise NotImplementedError
+
+
+class HTTPAdapter(BaseAdapter):
+    def send(self, request, stream=False):
+        return request
+"#,
+        ),
+        parse_py(
+            "sessions.py",
+            r#"
+from typing import TYPE_CHECKING
+
+from adapters import HTTPAdapter
+
+if TYPE_CHECKING:
+    from adapters import BaseAdapter
+
+
+class Session:
+    fallback: BaseAdapter
+
+    def send(self, request):
+        adapter = self.get_adapter(request)
+        return adapter.send(request)
+"#,
+        ),
+    ];
+    let target = entity_id(
+        &files,
+        "adapters.py",
+        "HTTPAdapter.send",
+        EntityKind::Method,
+    );
+    let caller = entity_id(&files, "sessions.py", "Session.send", EntityKind::Method);
+
+    let relations = link_cross_file(&files);
+
+    assert!(
+        has_call(&relations, caller, target),
+        "an unannotated receiver must still settle on the one owner the file \
+         IMPORTS; a name a guard binds for annotations is not a second owner \
+         for the bare-name rule"
+    );
+}
+
+#[test]
+fn a_declined_two_hop_call_keeps_the_edge_the_bare_leaf_would_have_had() {
+    // The hand-back invariant, on the shape that exposed it. The parser writes
+    // the owner half from declarations, so a call whose join fails carries a
+    // name the source never spelled. Tier (d) mints its cross-repo placeholder
+    // from `dst_name`, and a dotted name there produced no edge at all: four
+    // real unresolved-receiver edges vanished from the requests measurement
+    // until a declining tier handed the call back unchanged.
+    let files = vec![parse_py(
+        "client.py",
+        r#"
+from vendor import Transport
+
+
+class Session:
+    transport: Transport
+
+
+def run(session: Session, payload):
+    return session.transport.dispatch(payload)
+"#,
+    )];
+    let caller = entity_id(&files, "client.py", "run", EntityKind::Function);
+
+    let relations = link_cross_file(&files);
+
+    let outgoing: Vec<&kin_model::Relation> = relations
+        .iter()
+        .filter(|r| r.kind == RelationKind::Calls && r.src.as_entity() == Some(caller))
+        .collect();
+
+    assert!(
+        outgoing.iter().any(|r| r
+            .evidence
+            .iter()
+            .any(|e| e.token.as_deref() == Some("dispatch"))),
+        "a two-hop call the repository cannot settle must still record the \
+         call it makes, carrying the bare symbol the source read; got \
+         {outgoing:?}"
+    );
+}
