@@ -183,6 +183,18 @@ pub fn repository_profile_for<'a>(
 /// value it adopted, or `None` when it left the environment alone.
 pub fn apply_repository_profile(configured: Option<&str>) -> Option<String> {
     let current = std::env::var(RESOURCE_PROFILE_ENV).ok();
+    // A value this repository already selected in a PARENT process is not an
+    // operator's export, and must not be mistaken for one. The CLI adopts the
+    // profile and then spawns the daemon, so the daemon always inherits a set
+    // variable; without this it read its own parent's repository choice as an
+    // operator override and `kin resources inspect` went back to printing
+    // "(set by operator)" for a profile nobody typed, which is the FIR-2434 lie
+    // this whole area exists to prevent.
+    if inherited_repository_profile(current.as_deref(), |key| std::env::var(key).ok()) {
+        REPOSITORY_CONFIG_SELECTED.store(true, Ordering::Relaxed);
+        PRODUCT_SELECTED.store(false, Ordering::Relaxed);
+        return current;
+    }
     let current_is_product_default =
         inherited_product_default(current.as_deref(), |key| std::env::var(key).ok());
     let adopt = repository_profile_for(configured, current.as_deref(), current_is_product_default)?
@@ -196,6 +208,28 @@ pub fn apply_repository_profile(configured: Option<&str>) -> Option<String> {
     PRODUCT_SELECTED.store(false, Ordering::Relaxed);
     REPOSITORY_CONFIG_SELECTED.store(true, Ordering::Relaxed);
     Some(adopt)
+}
+
+/// Adopt the resource profile recorded by the repository containing `from`, if
+/// there is one, while the process is still single-threaded.
+///
+/// Both binaries call this, and that is the whole point. `kin-daemon` adopting
+/// the repository profile while `kin` did not made the two environments differ
+/// on exactly `KIN_RESOURCE_PROFILE`, which is a `BEHAVIOR_ENV_VARS` member, so
+/// every `kin resources inspect` and `kin embed` in a repository that recorded a
+/// profile printed a divergence warning whose stated remedy cannot work: the
+/// restart it asks for re-adopts the same value from the same file. Under
+/// `KIN_STRICT_BEHAVIOR_ENV` it was not a warning but a hard failure. Using the
+/// feature must not make the tool complain about the machine, which is the
+/// defect class FIR-2504 was opened about in the first place.
+///
+/// Every failure is silent by design: this runs before argument parsing, outside
+/// a repository it has nothing to adopt, and a config that will not parse is
+/// reported with its real message by the command that actually needs it.
+pub fn apply_repository_profile_at(from: &std::path::Path) -> Option<String> {
+    let layout = kin_core::KinLayout::discover(from)?;
+    let config = kin_core::KinConfig::load_or_default(&layout.config_path()).ok()?;
+    apply_repository_profile(config.resources.normalized_profile().as_deref())
 }
 
 /// Whether a value already in effect is one this repository's config selected,
@@ -259,6 +293,41 @@ mod tests {
         assert_eq!(repository_profile_for(None, Some("proof"), false), None);
         assert_eq!(repository_profile_for(Some("  "), None, false), None);
         assert_eq!(repository_profile_for(Some(""), None, false), None);
+    }
+
+    /// The spawn case, which is the one that regressed. The CLI adopts the
+    /// repository profile and then spawns the daemon, so the daemon inherits a
+    /// set variable that looks exactly like an operator's export. It must read
+    /// the marker and keep calling the profile a repository choice.
+    #[test]
+    fn a_child_inheriting_the_repository_marker_keeps_the_repository_provenance() {
+        let _guard = kin_core::test_env::EnvVarGuard::set(RESOURCE_PROFILE_ENV, "ci");
+        let _marker =
+            kin_core::test_env::EnvVarGuard::set(RESOURCE_PROFILE_REPOSITORY_CONFIG_ENV, "ci");
+        let _product = kin_core::test_env::EnvVarGuard::unset(RESOURCE_PROFILE_PRODUCT_DEFAULT_ENV);
+        reset_product_selected_for_tests();
+        reset_repository_config_selected_for_tests();
+
+        // The child passes its own config value; what matters is that it reads
+        // the inherited marker rather than treating the set variable as an
+        // operator's.
+        assert_eq!(apply_repository_profile(Some("ci")), Some("ci".to_string()));
+        assert!(
+            repository_config_selected(),
+            "an inherited repository profile was read as an operator override"
+        );
+        assert!(!product_selected());
+
+        // The direction that makes it mean something: a marker naming a
+        // different value is a stale inheritance and must NOT confer provenance.
+        let _stale =
+            kin_core::test_env::EnvVarGuard::set(RESOURCE_PROFILE_REPOSITORY_CONFIG_ENV, "proof");
+        reset_repository_config_selected_for_tests();
+        apply_repository_profile(Some("ci"));
+        assert!(
+            !repository_config_selected(),
+            "a marker naming another value conferred repository provenance"
+        );
     }
 
     /// The marker has to name the value in effect, or an inherited marker from a

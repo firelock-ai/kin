@@ -1743,6 +1743,16 @@ def check_13(suite):
     """
     res = Result("13", "FIR-2504", "resource knobs survive a daemon restart")
     repo = suite.fixture("incremental")
+    try:
+        return _check_13(suite, res, repo)
+    finally:
+        # The fixture is shared, and several arms return early. Leave no
+        # [resources] section behind for whatever check runs next.
+        suite.kin_run(["resources", "set", "--clear"], repo)
+        suite.kin_run(["daemon", "stop"], repo)
+
+
+def _check_13(suite, res, repo):
 
     rc, out, err = suite.kin_run(
         ["resources", "set", "--profile", "ci", "--embed-batch-size", "16"], repo)
@@ -1824,7 +1834,32 @@ def check_13(suite):
     else:
         res.ok("the restarted daemon's background embed batch is the recorded 16")
 
-    # Arm 5, the negative control.
+    # Arm 5. The knobs are still set from arm 1, which is what this needs.
+    # Using the feature must not make the
+    # tool complain about the machine: kin#1075 shipped the daemon adopting the
+    # repository profile while the CLI did not, so the two environments differed
+    # on KIN_RESOURCE_PROFILE, every command in such a repository printed a
+    # behavior-env divergence whose stated remedy cannot clear it (the restart it
+    # asks for re-adopts the same value from the same file), and under
+    # KIN_STRICT_BEHAVIOR_ENV=1 it was a hard failure rather than a warning.
+    rc, out, err = suite.kin_run(["resources", "inspect"], repo)
+    if "KIN_RESOURCE_PROFILE" in (err or "") and "differs between this command" in (err or ""):
+        res.bad("recording a profile makes the CLI report a behavior-env divergence it "
+                "cannot clear: %s" % " ".join((err or "").split())[:220])
+    else:
+        res.ok("recording a profile produces no behavior-env divergence")
+
+    strict_env = dict(suite.env)
+    strict_env["KIN_STRICT_BEHAVIOR_ENV"] = "1"
+    strict = run([suite.kin, "resources", "inspect"], cwd=repo, env=strict_env)
+    if strict[0] != 0:
+        res.bad("kin resources inspect exits %d under KIN_STRICT_BEHAVIOR_ENV=1 in a "
+                "repository that recorded a profile: %s"
+                % (strict[0], " ".join((strict[2] or strict[1]).split())[:220]))
+    else:
+        res.ok("the same command exits 0 under KIN_STRICT_BEHAVIOR_ENV=1")
+
+    # Arm 6, the negative control.
     rc, out, err = suite.kin_run(["resources", "set", "--clear"], repo)
     if rc != 0:
         res.unknown("kin resources set --clear rc=%d: %s" % (rc, (err or out).strip()[-200:]))
@@ -1848,7 +1883,7 @@ def check_13(suite):
                % (cleared_embed.get("embed_batch_size"),
                   cleared_actual.get("resource_profile_repository_config")))
 
-    # Arm 6: the provenance field has to move in BOTH directions or it is
+    # Arm 7: the provenance field has to move in BOTH directions or it is
     # decoration. Set says this repository chose it, cleared says kin did, and
     # the two cannot both be true of one field.
     if cleared_actual.get("resource_profile_product_selected") is not True:
