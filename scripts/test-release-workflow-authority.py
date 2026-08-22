@@ -1305,6 +1305,11 @@ WINDOWS_REQUIRED_VALIDATOR_CHECKS = {
     "semantic_query_readiness": "unsupported",
     "daemon_running": "unsupported",
     "repo_init": "unsupported",
+    # Nothing recorded and nothing in force on a fresh repo-free install, so
+    # there is no configured projection for the row to report on. Required
+    # rather than tolerated: `misconfigured` here is what failed the real leg
+    # on every release from v0.5.44 through v0.5.47.
+    "projection_mode": "unsupported",
     "mcp_client_claude": "healthy",
     "mcp_client_cursor": "healthy",
     "mcp_client_gemini": "healthy",
@@ -1319,6 +1324,13 @@ WINDOWS_REQUIRED_VALIDATOR_CHECKS = {
 WINDOWS_VALIDATOR_CHECKS = {
     **WINDOWS_REQUIRED_VALIDATOR_CHECKS,
     "retrieval_profile": "unsupported",
+    # The one first-run status the leg tolerates beyond healthy and
+    # not-applicable. A public runner has never fetched the embedding model, so
+    # a correct install reports `pending` here, and the step names this check
+    # and this status rather than accepting `pending` generally. Carried in the
+    # fixture for the reason `retrieval_profile` is: a fixture that omits a
+    # check the real report carries cannot fail the way the real leg does.
+    "embedding_model": "pending",
 }
 
 
@@ -1706,6 +1718,22 @@ def assert_windows_node_validator_behavior(step: str) -> None:
             f"{report_path} degraded retrieval profile",
             fixture_with_check_status(proof, report_path, "retrieval_profile", "stale"),
         )
+        # The first-run pending tolerance is one check and one status, not a
+        # standing pass for `pending`. These two arms are what say so: the
+        # named check may not drift to another non-healthy status, and no other
+        # check may borrow the tolerance by going pending itself. Both preserve
+        # the aggregate and hard-failure predicates, so only the tolerance
+        # sweep can reject them.
+        reject(
+            f"{report_path} embedding model drifts off pending",
+            fixture_with_check_status(proof, report_path, "embedding_model", "stale"),
+        )
+        reject(
+            f"{report_path} a second check borrows the pending tolerance",
+            fixture_with_check_status(
+                proof, report_path, "retrieval_profile", "pending"
+            ),
+        )
         reject(
             f"{report_path} contradictory duplicate check",
             fixture_with_duplicate_check(
@@ -1746,6 +1774,22 @@ def assert_windows_node_validator_behavior(step: str) -> None:
                 config_path,
                 ("mcpServers", "kin", "command"),
                 "/wrong/kin",
+            ),
+        )
+        # FIR-2293, named as its own class rather than left to the drift case
+        # above. `kin setup` recorded the MCP command by joining onto whatever
+        # `KIN_HOME` held, and MSYS bash hands it a forward-slashed `$HOME`, so
+        # a Windows install wrote `C:/Users/u/.kin\bin\kin.exe` against an
+        # installed launcher of `C:\Users\u\.kin\bin\kin.exe`. Windows opens
+        # both, so only a byte comparison against the installed launcher can
+        # tell them apart, and this arm is what keeps that able to fail.
+        reject(
+            f"{config_path} MCP command mixes path separators",
+            invalid_home=fixture_with_json_value(
+                home,
+                config_path,
+                ("mcpServers", "kin", "command"),
+                f"{VALIDATOR_HOME}/.kin\\bin\\kin.exe",
             ),
         )
         reject(

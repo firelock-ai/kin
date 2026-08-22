@@ -3685,6 +3685,35 @@ fn capture_mcp_repair_target_excluding(
     }))
 }
 
+/// Spell a launcher path the way its platform spells it, so what setup records
+/// can be compared against the launcher the installer wrote.
+///
+/// `Path::join` appends the platform separator and never touches what it was
+/// handed, so a `KIN_HOME` that arrived with forward slashes, which is how MSYS
+/// bash and every shell like it spells `$HOME` on Windows, produces
+/// `C:/Users/u/.kin\bin\kin.exe`. Windows opens that happily and no reader can
+/// compare it against the `C:\Users\u\.kin\bin\kin.exe` the installer wrote,
+/// which is why the release install proof reported the MCP entry malformed
+/// against a launcher that was sitting right there. A forward slash is not a
+/// legal character in a Windows filename, so rewriting it loses nothing.
+///
+/// The platform is an argument rather than read from `env::consts::OS` for the
+/// reason [`resolve_home_dir`] gives for the same choice: read ambiently, the
+/// Windows arm could only ever run on the one platform this fleet has no host
+/// for, and a test written on macOS would take the Unix arm and prove nothing
+/// while looking like it did.
+fn launcher_spelling_for(path: &str, os: &str) -> String {
+    if os == "windows" {
+        path.replace('/', "\\")
+    } else {
+        path.to_string()
+    }
+}
+
+fn launcher_spelling(path: &Path) -> String {
+    launcher_spelling_for(&path.to_string_lossy(), env::consts::OS)
+}
+
 pub(crate) fn managed_mcp_launcher() -> Result<String> {
     let name = if cfg!(windows) { "kin.exe" } else { "kin" };
     let path = kin_dir()?.join("bin").join(name);
@@ -3703,7 +3732,7 @@ pub(crate) fn managed_mcp_launcher() -> Result<String> {
             anyhow::bail!("managed Kin launcher is not executable: {}", path.display());
         }
     }
-    Ok(path.to_string_lossy().into_owned())
+    Ok(launcher_spelling(&path))
 }
 
 /// Resolve the stable launcher that ordinary setup, health, and doctor must
@@ -3726,10 +3755,10 @@ pub(crate) fn configured_mcp_launcher() -> Result<String> {
         let current_target = fs::canonicalize(&current).ok();
         if candidate_target.is_some() && candidate_target == current_target {
             validate_running_mcp_launcher(&path_candidate)?;
-            return Ok(path_candidate.to_string_lossy().into_owned());
+            return Ok(launcher_spelling(&path_candidate));
         }
     }
-    Ok(current.to_string_lossy().into_owned())
+    Ok(launcher_spelling(&current))
 }
 
 fn validate_running_mcp_launcher(path: &Path) -> Result<()> {
@@ -15109,6 +15138,44 @@ mod tests {
             requested: false,
         };
         assert!(fix_verdict(std::slice::from_ref(&unrequested)).is_ok());
+    }
+
+    /// FIR-2293, from the artifact the Windows install proof captured. The
+    /// proof runs the config writers with `KIN_HOME="$primary_home/.kin"`, and
+    /// MSYS bash spells `$HOME` as `C:/Users/runneradmin`, so `KIN_HOME`
+    /// reaches the process forward-slashed. `Path::join` then appended
+    /// backslashes and setup recorded `C:/Users/runneradmin/.kin\bin\kin.exe`
+    /// as the MCP command against an installed launcher of
+    /// `C:\Users\runneradmin\.kin\bin\kin.exe`. Windows opens both, so nothing
+    /// broke until a reader tried to compare them, and then the proof called
+    /// the entry malformed against a launcher sitting right where it said.
+    ///
+    /// Nothing exotic reaches this: a Windows user whose `KIN_HOME` came from
+    /// any shell that spells paths with forward slashes got the same entry.
+    #[test]
+    fn a_windows_launcher_is_recorded_the_way_windows_spells_it() {
+        assert_eq!(
+            super::launcher_spelling_for("C:/Users/runneradmin/.kin\\bin\\kin.exe", "windows"),
+            "C:\\Users\\runneradmin\\.kin\\bin\\kin.exe"
+        );
+        // A path that is already canonical comes back byte-identical, so the
+        // rewrite is idempotent and a correct entry is never turned into a
+        // different one on the next setup run.
+        assert_eq!(
+            super::launcher_spelling_for("C:\\Users\\runneradmin\\.kin\\bin\\kin.exe", "windows"),
+            "C:\\Users\\runneradmin\\.kin\\bin\\kin.exe"
+        );
+        // Unix keeps every byte it was handed. The forward slash is the
+        // separator there, and rewriting one would break every path recorded
+        // on the platforms this leg already gates.
+        assert_eq!(
+            super::launcher_spelling_for("/Users/runner/.kin/bin/kin", "macos"),
+            "/Users/runner/.kin/bin/kin"
+        );
+        assert_eq!(
+            super::launcher_spelling_for("/home/u/.kin/bin/kin", "linux"),
+            "/home/u/.kin/bin/kin"
+        );
     }
 
     /// Setup must never record a mount mode it did not engage. The v0.5.41
