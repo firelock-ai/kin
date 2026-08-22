@@ -32802,8 +32802,8 @@ mod tests {
                 "    hist = []  # keep track of history of redirects for this request\n".repeat(18)
             )
         };
-        let make_result = || LocateResult {
-            entities: (0..10)
+        let make_result = |hits: usize| LocateResult {
+            entities: (0..hits)
                 .map(|index| {
                     let mut entity = fused_locate_entity(&format!("resolve_redirects_{index}"));
                     entity.entity_id = format!("0000{index:04}-0000-4000-8000-000000000000");
@@ -32820,16 +32820,43 @@ mod tests {
         let query = "where HTTP redirects are actually resolved and followed";
         let budget = kin_mcp::budget::ResponseBudget::default().less_envelope_reserve();
 
+        // The fixture is sized against the budget rather than pinned at ten
+        // hits. A fixed count stops making this point the moment the default
+        // moves: at a large enough budget both arms fit whole, both keep every
+        // body, and the test passes while proving nothing. Raising the default
+        // from 30000 to 45000 is exactly what did that. Two payloads give the
+        // per-hit cost, and the count puts the arm without the copy just inside
+        // the bound, which is the only place the copy can be shown to evict an
+        // answer.
+        let per_hit = {
+            let one = mcp_result_text(&fused_semantic_locate_payload(
+                make_result(1),
+                query,
+                false,
+                false,
+            ))
+            .len();
+            let two = mcp_result_text(&fused_semantic_locate_payload(
+                make_result(2),
+                query,
+                false,
+                false,
+            ))
+            .len();
+            two.saturating_sub(one).max(1)
+        };
+        let hit_count = ((budget.max_chars * 2 / 3) / per_hit).max(4);
+
         let measure = |snippet_alias: bool| {
             let raw = mcp_result_text(&fused_semantic_locate_payload(
-                make_result(),
+                make_result(hit_count),
                 query,
                 false,
                 snippet_alias,
             ))
             .len();
             let bounded = mcp_result_text(&bound_mcp_tool_result(
-                fused_semantic_locate_payload(make_result(), query, false, snippet_alias),
+                fused_semantic_locate_payload(make_result(hit_count), query, false, snippet_alias),
                 "semantic_locate",
                 &budget,
             ));
@@ -32858,6 +32885,22 @@ mod tests {
         assert!(
             copy_raw > fixed_raw,
             "the copy is what costs: {copy_raw} against {fixed_raw}"
+        );
+        // The premise, asserted rather than assumed. Without the copy the
+        // response fits; with it, it does not. If the fixture ever stops
+        // straddling the bound this fails here, naming the sizes, instead of
+        // passing on a comparison of two whole responses.
+        assert!(
+            fixed_raw <= budget.max_chars,
+            "the arm without the copy must fit or the copy cannot be shown to evict anything: \
+             {fixed_raw} against {}",
+            budget.max_chars
+        );
+        assert!(
+            copy_raw > budget.max_chars,
+            "the arm with the copy must overflow or there is nothing to measure: {copy_raw} \
+             against {}",
+            budget.max_chars
         );
         assert!(
             fixed_with_source > copy_with_source,
