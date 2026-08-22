@@ -114,6 +114,15 @@ jobs:
       - name: Falsify the memory-pressure refusal graders
         run: python3 scripts/acceptance/memory_pressure_refusal.py --self-test
 
+      # FIR-2627, FIR-2628, FIR-2629. The three surfaces a stranger meets before
+      # the graph answers anything: the help text where the write-through
+      # assumption forms, the install line a non-root user cannot run, and the
+      # language-server install that died behind a proxy saying only that it
+      # died. Each grader is handed the text shipped 0.5.49 actually produced
+      # and has to fail on it.
+      - name: Falsify the first-contact honesty graders
+        run: python3 scripts/acceptance/first_contact_honesty.py --self-test
+
       - name: Install Rust toolchain
         uses: ./.github/actions/rust-toolchain
 
@@ -358,6 +367,39 @@ jobs:
             echo "::error title=Memory-pressure refusal suite failed::exit $rc (1 FAIL, 2 UNREADABLE, 3 setup); see the CHECK lines above"
           fi
 
+      # No store, no daemon and no corpus: this one packs the npm package, runs
+      # the README's own leading install block against a global npm prefix it
+      # makes unwritable, and points a real npm at a port nothing listens on so
+      # the installer's own network error is what the classifier is graded
+      # against.
+      - name: First-contact honesty suite
+        id: firstcontact
+        if: always()
+        env:
+          KIN_ACCEPTANCE_LABEL: ${{ github.event_name }}-${{ github.sha }}
+        run: |
+          set -uo pipefail
+          mkdir -p acceptance
+          rc=0
+          python3 scripts/acceptance/first_contact_honesty.py \
+            --kin target/release/kin \
+            --daemon target/release/kin-daemon \
+            --json acceptance/first_contact.json \
+            --label "$KIN_ACCEPTANCE_LABEL" \
+            --verbose >acceptance/first_contact.log 2>&1 || rc=$?
+          cat acceptance/first_contact.log
+          {
+            echo "### First-contact honesty suite (exit $rc)"
+            echo ''
+            echo '```'
+            grep -E '^CHECK ' acceptance/first_contact.log || echo '(no CHECK line was printed)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error title=First-contact honesty suite failed::exit $rc (1 FAIL, 2 UNREADABLE, 3 setup); see the CHECK lines above"
+          fi
+
       # Always, including on a cancelled or timed-out run: the reports are how a
       # failure is diagnosed without re-running the job.
       - name: Upload the acceptance reports
@@ -386,4 +428,5 @@ jobs:
             --report response_budget=acceptance/response_budget.json \
             --report parsehole=acceptance/parsehole.json \
             --report memory_pressure=acceptance/memory_pressure.json \
+            --report first_contact=acceptance/first_contact.json \
             --allow-unreadable 'brownfield:4=FIR-2593: the express app.handle walk comes back truncated=True with clipped_steps=None on ubuntu-latest, so an absent edge cannot be told from a dropped one. Build profile, product code from 0.5.44 through 0.5.46, and the pinned language-server versions are all ruled out; platform and code newer than 0.5.46 are still confounded. The moment the check passes this allowance announces itself stale and can go.'

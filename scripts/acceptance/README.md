@@ -1,7 +1,8 @@
 # Product acceptance suites
 
-Four falsifiable suites that ask whether the product still answers correctly.
-`.github/workflows/acceptance.yml` runs all four on every pull request against
+Falsifiable suites that ask whether the product still answers correctly, and one
+that asks whether it still tells the truth before it answers anything.
+`.github/workflows/acceptance.yml` runs them all on every pull request against
 that pull request's own build. None is release proof; all are regression gates.
 
 Each suite prints one line per check:
@@ -91,6 +92,33 @@ does not fit has to say so in `degradations`. A ceiling is not always reachable,
 because every cut list keeps a floor entry, and that case is fine as long as it is
 never quiet.
 
+`first_contact_honesty.py` covers the three surfaces a stranger meets before the
+graph answers anything, all found by the npm0549 green stranger on shipped
+0.5.49. Check 0 asserts `kin commit --help` carries the same sentence a commit
+prints, that a Kin commit lands in Kin's own authority and `git status` stays
+dirty until `kin eject` or a push, and asserts the CLI reference quotes it too
+(FIR-2627). Check 1 packs `packages/kin`, makes a global npm prefix unwritable,
+proves `npm install -g` is refused there exactly as it is in a container, then
+runs the README's own leading shell block against that machine and requires it to
+reach a working `kin --version` (FIR-2628). Check 2 points a real npm at a port
+nothing listens on and requires the language-server install failure to name the
+environment as the suspected cause, print the proxy variables that would route
+it, and state that Kin runs without the servers (FIR-2629).
+
+Two limits it states rather than hides. Check 1 stubs the archive download with
+`KIN_NO_PROVISION` and a seeded managed binary, so what it proves is that the
+documented first path does not need the prefix that is refused, not that the
+download works; the release install proof owns that half. And check 1 reports
+UNREADABLE rather than PASS when the global install SUCCEEDS against the prefix
+it made unwritable, which is what happens as root, because a probe that cannot
+see its own wall has not passed.
+
+Check 2's network error is npm's own, produced by a real npm against a closed
+port, never a stub printing the words the classifier looks for. When the install
+dies of something that is not the network, the check reports UNREADABLE and says
+which reason it got, because a classifier that was never asked the question has
+not answered it.
+
 `brownfield_repro.py --self-test` and `response_budget_elisions.py --self-test`
 exercise their verdict graders on fixed payloads and need no binary and no
 corpus. Each case is paired with its inverse, so a grader that cannot tell its
@@ -116,6 +144,10 @@ python3 scripts/acceptance/brownfield_repro.py \
 python3 scripts/acceptance/response_budget_elisions.py \
   --kin target/release/kin --daemon target/release/kin-daemon \
   --json acceptance/response_budget.json --verbose
+
+python3 scripts/acceptance/first_contact_honesty.py \
+  --kin target/release/kin --daemon target/release/kin-daemon \
+  --json acceptance/first_contact.json --verbose
 ```
 
 Release, not debug. Release is what ships, so it is what an acceptance answer
