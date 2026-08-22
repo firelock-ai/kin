@@ -21,6 +21,20 @@ can be satisfied by a broken tool:
   3  no ranked list the budget cuts ships empty
   4  a response the budget could not bring under its ceiling says so, and one
      reporting `bounded: false` is one that fits
+  5  a pack cut by its own token budget publishes what it cut, under that
+     budget's name, and leaves no group empty
+  6  a row whose inline source the budget took says so on the row
+  7  `kin context` names the same cut in its lines and in its `--json`
+
+FIR-2482 is checks 5 to 7, and it is the same rule reached through the OTHER
+budget. A context pack is cut twice: its own token budget refuses candidates
+inside the builder, before the response budget sees anything, and only the
+second cut was ever disclosed. A dependency section trimmed from twelve rows to
+six serialized `returned: 6` beside six rows, which is exactly what a focal with
+six dependencies serializes, and `kin context` printed "Dependencies: 6 entries"
+for both. The body case is the same defect one field down: a row that lost its
+source to the budget lost the key outright, which is the shape of a `compact`
+call and of source the graph never had.
 
 FIR-2602 is check 4. `impact_analysis` reported `{"bounded": false,
 "chars_before_budget": 50354, "max_chars": 2000}` and shipped all 50,354
@@ -265,6 +279,187 @@ def grade_budget_accounting(payload):
     return problems
 
 
+# Groups a context pack's own token budget can cut, under the names both
+# `kin context` and `get_context_pack` publish them by. Listed here so a group
+# added to the pack and not to this list is a check that grades less rather than
+# a silent gap: the check reports UNREADABLE when it grades none of them.
+PACK_GROUPS = ["dependencies", "dependents", "transitive_deps", "tests", "contracts"]
+
+# The reason code a row the pack's token budget refused carries. Distinct from
+# `response_budget` on purpose: a caller raises one with `token_budget` and the
+# other with `max_chars`, and being told the wrong lever costs a round trip that
+# cannot help.
+TOKEN_BUDGET_REASON = "token_budget"
+
+
+def grade_pack_token_budget(whole, cut):
+    """Grade a pack cut by its token budget against the pack that was not.
+
+    The inference needs no counter: anything the walk found at the generous
+    budget it still found at the tight one, so a group full at the ceiling and
+    short at the floor was cut by the token budget and by nothing else. Two
+    things would break that, and both are asserted rather than assumed. The
+    caller pins one identical, generous `max_chars` on both calls, so the
+    response budget cannot be the cutter; and the focal's section must ride
+    dependency edges, so the same-file cap cannot be either.
+    """
+    problems = []
+    graded = 0
+    if not isinstance(whole, dict) or not isinstance(cut, dict):
+        return ["a pack response was not an object"], 0
+    source = (cut.get("dependency_selection") or {}).get("source")
+    if source != "dependency_edges":
+        problems.append(
+            "the focal fell back to same-file neighbours (source %r), so the cap and the "
+            "budget cannot be told apart on this fixture" % source
+        )
+    for key in PACK_GROUPS:
+        before = whole.get(key)
+        if not isinstance(before, list) or not before:
+            continue
+        after = cut.get(key)
+        if not isinstance(after, list):
+            problems.append(
+                "`%s` held %d entries at the generous budget and is absent at the tight "
+                "one, which reads as 'the graph found none'" % (key, len(before))
+            )
+            continue
+        if not after:
+            problems.append(
+                "`%s` held %d entries at the generous budget and [] at the tight one, so "
+                "the budget emptied it" % (key, len(before))
+            )
+        if len(after) >= len(before):
+            continue
+        graded += 1
+        elision = (cut.get("elisions") or {}).get(key)
+        if not elision:
+            problems.append(
+                "`%s` fell from %d to %d entries and published no elision"
+                % (key, len(before), len(after))
+            )
+            continue
+        if elision.get("kept") != len(after):
+            problems.append(
+                "elisions.%s.kept is %r and the array carries %d"
+                % (key, elision.get("kept"), len(after))
+            )
+        if elision.get("total") != len(before):
+            problems.append(
+                "elisions.%s.total is %r and the generous budget returned %d"
+                % (key, elision.get("total"), len(before))
+            )
+        if elision.get("elided") != len(before) - len(after):
+            problems.append(
+                "elisions.%s.elided is %r and %d entries went"
+                % (key, elision.get("elided"), len(before) - len(after))
+            )
+        if TOKEN_BUDGET_REASON not in (elision.get("reason") or ""):
+            problems.append(
+                "elisions.%s names %r, so a caller reads this as the response budget and "
+                "raises the wrong lever" % (key, elision.get("reason"))
+            )
+    # The other direction, and it is what gives an absent disclosure its
+    # meaning: a group the tight call returned whole must claim no loss.
+    for key in PACK_GROUPS:
+        before, after = whole.get(key), cut.get(key)
+        if not isinstance(before, list) or not isinstance(after, list):
+            continue
+        if len(after) < len(before):
+            continue
+        elision = (cut.get("elisions") or {}).get(key)
+        if elision and TOKEN_BUDGET_REASON in (elision.get("reason") or ""):
+            problems.append(
+                "`%s` returned all %d entries and still claims %r withheld"
+                % (key, len(before), elision.get("elided"))
+            )
+    return problems, graded
+
+
+def grade_body_elisions(payload):
+    """Grade a pack whose inline source the response budget took.
+
+    A row that simply loses its `body` key is byte-identical to a row from a
+    `compact` call and to one whose source the graph does not hold. Both
+    readings are wrong about a row the budget cut, and a count elsewhere in the
+    response does not correct either: the reader looks at the row.
+    """
+    problems = []
+    rows = [row for row in (payload.get("dependencies") or []) if isinstance(row, dict)]
+    focal = payload.get("focal_entity")
+    if isinstance(focal, dict):
+        rows.append(focal)
+    if not rows:
+        return ["the cut response carried no row to grade"], 0
+    elision = (payload.get("elisions") or {}).get("body")
+    marked = 0
+    for row in rows:
+        if row.get("body") not in (None, ""):
+            continue
+        if not row.get("body_elided") and not row.get("body_unavailable"):
+            problems.append(
+                "row %r carries no source and says nothing about why, which is the shape "
+                "of `compact` and of a graph gap alike" % row.get("name")
+            )
+            continue
+        if row.get("body_elided") and row.get("body_unavailable"):
+            problems.append(
+                "row %r claims the budget took its body AND that the graph never had it"
+                % row.get("name")
+            )
+        if row.get("body_elided"):
+            marked += 1
+    if marked == 0:
+        return problems, 0
+    if not elision:
+        problems.append("%d rows lost their body and no elision was published" % marked)
+        return problems, marked
+    if not elision.get("elided"):
+        problems.append("elisions.body claims nothing was withheld beside %d marked rows" % marked)
+    elif elision["elided"] < marked:
+        problems.append(
+            "elisions.body counts %r withheld and %d rows say they lost one"
+            % (elision.get("elided"), marked)
+        )
+    if not elision.get("reason"):
+        problems.append("elisions.body names no reason")
+    return problems, marked
+
+
+def grade_cli_context(text, doc):
+    """Grade `kin context`, whose rendered lines are the whole of what a reader
+    of that surface sees. A cut those lines do not name is, to that reader, a
+    cut that did not happen."""
+    problems = []
+    elisions = (doc or {}).get("budget_elisions") or {}
+    if not elisions:
+        return problems, 0
+    graded = 0
+    for key, elision in sorted(elisions.items()):
+        graded += 1
+        elided = elision.get("elided")
+        if not elided:
+            problems.append("budget_elisions.%s claims nothing withheld" % key)
+            continue
+        if elision.get("reason") != TOKEN_BUDGET_REASON:
+            problems.append(
+                "budget_elisions.%s names %r rather than the token budget"
+                % (key, elision.get("reason"))
+            )
+        if elision.get("kept", 0) + elided != elision.get("total"):
+            problems.append(
+                "budget_elisions.%s: kept %r plus elided %r is not total %r"
+                % (key, elision.get("kept"), elided, elision.get("total"))
+            )
+        if "%d withheld" % elided not in text:
+            problems.append(
+                "the rendering never names the %d entries withheld from `%s`" % (elided, key)
+            )
+    if graded and "--budget" not in text:
+        problems.append("the rendering names no lever that recovers what was withheld")
+    return problems, graded
+
+
 class McpError(Exception):
     """One MCP call that could not be read. Unreadable is not absent."""
 
@@ -348,6 +543,31 @@ class Suite(object):
         ]
         with open(os.path.join(repo, "src", "chain.py"), "w") as handle:
             handle.write("\n".join(lines))
+
+        # A second focal whose callees cost the pack's TOKEN budget without
+        # costing its response budget much. Every parameter is `a<i>=0`, which
+        # the pack's estimator counts as four tokens across five characters, so
+        # fifty callees run to roughly 23,000 estimated tokens in about 36,000
+        # characters of compact JSON. That ratio is the point: the token budget
+        # has to cut this pack while the response budget, pinned at its ceiling
+        # on both calls, has nothing to do. Nothing here is named `hop`, so the
+        # locate-based checks above rank exactly what they ranked before.
+        params = ", ".join("a%d=0" % index for index in range(100))
+        wide = []
+        for index in range(50):
+            wide += [
+                "def wide_dep_%02d(%s):" % (index, params),
+                '    """A callee sized in tokens, not in characters."""',
+                "    return a0",
+                "",
+                "",
+            ]
+        wide += ["def wide_entry(value):", '    """The focal the pack budget arm packs."""', "    return ("]
+        for index in range(50):
+            wide.append("        wide_dep_%02d()" % index + (" +" if index < 49 else ""))
+        wide += ["    )", ""]
+        with open(os.path.join(repo, "src", "wide.py"), "w") as handle:
+            handle.write("\n".join(wide))
 
         tests = ["from src.chain import hop_0", ""]
         for index in range(24):
@@ -470,6 +690,27 @@ class Suite(object):
             return json.loads(content[0]["text"])
         except ValueError as exc:
             raise McpError("%s payload is not JSON (%s)" % (method, exc))
+
+
+    def entity_id(self, name):
+        """One entity id, resolved the way an agent resolves one.
+
+        `get_context_pack` addresses its focal by id, so a check that drove a
+        name-taking sibling instead would be probing a different surface from
+        the one the claim is about.
+        """
+        payload = self.mcp("semantic_locate", {"query": name, "limit": 20})
+        for row in payload.get("entities") or []:
+            if row.get("name") == name:
+                found = row.get("entity_id") or row.get("id")
+                if found:
+                    return found
+        raise McpError("semantic_locate resolved no entity named %r" % name)
+
+    def cli(self, args, timeout=600):
+        """One `kin ...` invocation in the fixture, returning (rc, stdout)."""
+        proc = self.run([self.kin] + args, timeout=timeout)
+        return proc.returncode, proc.stdout.decode("utf-8", "replace")
 
 
 def grade_buckets(payload, buckets):
@@ -713,7 +954,130 @@ def check_4(suite):
     return res
 
 
-CHECKS = [("0", check_0), ("1", check_1), ("2", check_2), ("3", check_3), ("4", check_4)]
+def check_5(suite):
+    res = Result(
+        "5",
+        "FIR-2482",
+        "a pack cut by its own token budget says what it cut, and empties nothing",
+    )
+    try:
+        focal = suite.entity_id("wide_entry")
+        # One identical, generous `max_chars` on both calls, so the only budget
+        # that differs between them is the pack's own. `compact` keeps inline
+        # source out of the payload for the same reason: the arm is about rows
+        # the token budget refused, and bodies would put the response budget
+        # back in the picture on the generous call.
+        target = {"entity_id": focal, "compact": True, "include_traffic": False}
+        ceiling = dict(target, max_chars=60000, token_budget=200000)
+        floor = dict(target, max_chars=60000, token_budget=8000)
+        whole = suite.mcp("get_context_pack", ceiling)
+        cut = suite.mcp("get_context_pack", floor)
+    except McpError as exc:
+        res.unknown("get_context_pack unreadable: %s" % exc)
+        return res
+
+    # If the response budget touched either call the differential is measuring
+    # two cutters at once, which is exactly the confusion this check exists to
+    # remove. Read off each response's own accounting rather than assumed.
+    for label, payload in (("generous", whole), ("tight", cut)):
+        accounting = ((payload.get("_kin") or {}).get("response")) or {}
+        if accounting.get("bounded"):
+            res.unknown(
+                "the %s call was also cut by the response budget (%s), so the token "
+                "budget cannot be isolated on this fixture"
+                % (label, json.dumps(accounting, sort_keys=True))
+            )
+            return res
+
+    problems, graded = grade_pack_token_budget(whole, cut)
+    for problem in problems:
+        res.bad(problem)
+    if graded == 0:
+        res.unknown("the tight budget cut no group, so the rule was not exercised")
+        return res
+    if not res.failed:
+        res.ok(
+            "%d of %d groups were cut by the token budget and every one kept an entry: %s"
+            % (
+                graded,
+                len([key for key in PACK_GROUPS if whole.get(key)]),
+                json.dumps(cut.get("elisions") or {}, sort_keys=True),
+            )
+        )
+    return res
+
+
+def check_6(suite):
+    res = Result("6", "FIR-2482", "a row whose body the budget took says so on the row")
+    try:
+        focal = suite.entity_id("wide_entry")
+        payload = suite.mcp(
+            "get_context_pack",
+            {
+                "entity_id": focal,
+                "compact": False,
+                "include_traffic": False,
+                "token_budget": 200000,
+                "max_chars": 12000,
+            },
+        )
+    except McpError as exc:
+        res.unknown("get_context_pack unreadable: %s" % exc)
+        return res
+
+    problems, marked = grade_body_elisions(payload)
+    for problem in problems:
+        res.bad(problem)
+    if marked == 0:
+        res.unknown("the budget took no body, so the rule was not exercised")
+        return res
+    if not res.failed:
+        res.ok(
+            "%d rows name the budget that took their source, and elisions.body agrees: %s"
+            % (marked, json.dumps((payload.get("elisions") or {}).get("body"), sort_keys=True))
+        )
+    return res
+
+
+def check_7(suite):
+    res = Result("7", "FIR-2482", "kin context names what its token budget withheld")
+    # `kin context` takes any number, so unlike the MCP tool it can be driven
+    # well below the 8k floor the tool's bucketing imposes.
+    rc_text, text = suite.cli(["context", "wide_entry", "--budget", "2000"])
+    rc_json, raw = suite.cli(["context", "wide_entry", "--budget", "2000", "--json"])
+    if rc_text != 0 or rc_json != 0:
+        res.unknown("kin context exited %d (text) and %d (json)" % (rc_text, rc_json))
+        return res
+    try:
+        doc = json.loads(raw)
+    except ValueError as exc:
+        res.unknown("kin context --json is not JSON (%s)" % exc)
+        return res
+
+    problems, graded = grade_cli_context(text, doc)
+    for problem in problems:
+        res.bad(problem)
+    if graded == 0:
+        res.unknown("the tight budget cut no section, so the rule was not exercised")
+        return res
+    if not res.failed:
+        res.ok(
+            "%d sections report the same cut in the lines and in the json: %s"
+            % (graded, json.dumps(doc.get("budget_elisions") or {}, sort_keys=True))
+        )
+    return res
+
+
+CHECKS = [
+    ("0", check_0),
+    ("1", check_1),
+    ("2", check_2),
+    ("3", check_3),
+    ("4", check_4),
+    ("5", check_5),
+    ("6", check_6),
+    ("7", check_7),
+]
 
 
 def self_test():
@@ -904,6 +1268,177 @@ def self_test():
         len(grade_budget_accounting({"affected_tests": []})) >= 1,
         True,
     )
+
+    # ── FIR-2482: the pack's own token budget ───────────────────────────
+
+    def pack(deps, elisions=None, source="dependency_edges"):
+        doc = {
+            "dependencies": [{"name": "d%d" % index} for index in range(deps)],
+            "dependents": [{"name": "u0"}],
+            "dependency_selection": {"source": source},
+        }
+        if elisions:
+            doc["elisions"] = elisions
+        return doc
+
+    whole_pack = pack(20)
+    honest = pack(
+        6,
+        {"dependencies": {"kept": 6, "elided": 14, "total": 20, "reason": "token_budget"}},
+    )
+    expect("an honest pack cut passes", grade_pack_token_budget(whole_pack, honest)[0], [])
+    expect("an honest pack cut grades one group", grade_pack_token_budget(whole_pack, honest)[1], 1)
+
+    silent = pack(6)
+    expect(
+        "a pack cut with no elision fails",
+        len(grade_pack_token_budget(whole_pack, silent)[0]) >= 1,
+        True,
+    )
+    emptied = pack(
+        0,
+        {"dependencies": {"kept": 0, "elided": 20, "total": 20, "reason": "token_budget"}},
+    )
+    expect(
+        "a pack group emptied by the budget fails",
+        len(grade_pack_token_budget(whole_pack, emptied)[0]) >= 1,
+        True,
+    )
+    absent = {"dependents": [{"name": "u0"}], "dependency_selection": {"source": "dependency_edges"}}
+    expect(
+        "a pack group that vanished entirely fails",
+        len(grade_pack_token_budget(whole_pack, absent)[0]) >= 1,
+        True,
+    )
+    miscounted = pack(
+        6,
+        {"dependencies": {"kept": 9, "elided": 14, "total": 20, "reason": "token_budget"}},
+    )
+    expect(
+        "a pack elision that disagrees with its array fails",
+        len(grade_pack_token_budget(whole_pack, miscounted)[0]) >= 1,
+        True,
+    )
+    misattributed = pack(
+        6,
+        {"dependencies": {"kept": 6, "elided": 14, "total": 20, "reason": "response_budget"}},
+    )
+    expect(
+        "a token-budget cut blamed on the response budget fails",
+        len(grade_pack_token_budget(whole_pack, misattributed)[0]) >= 1,
+        True,
+    )
+    phantom = pack(
+        20,
+        {"dependencies": {"kept": 20, "elided": 3, "total": 23, "reason": "token_budget"}},
+    )
+    expect(
+        "a whole pack claiming a cut fails",
+        len(grade_pack_token_budget(whole_pack, phantom)[0]) >= 1,
+        True,
+    )
+    fallback = pack(
+        6,
+        {"dependencies": {"kept": 6, "elided": 14, "total": 20, "reason": "token_budget"}},
+        source="same_file_fallback",
+    )
+    expect(
+        "a pack whose section came from the cap is not gradeable here",
+        len(grade_pack_token_budget(whole_pack, fallback)[0]) >= 1,
+        True,
+    )
+
+    cut_bodies = {
+        "dependencies": [
+            {"name": "d0", "body": None, "body_elided": ["body"]},
+            {"name": "d1", "body": None, "body_elided": ["body"]},
+        ],
+        "elisions": {"body": {"kept": 0, "elided": 2, "total": 2, "reason": "response_budget"}},
+    }
+    expect("marked bodies pass", grade_body_elisions(cut_bodies)[0], [])
+    expect("marked bodies grade two rows", grade_body_elisions(cut_bodies)[1], 2)
+
+    stripped = {
+        "dependencies": [{"name": "d0"}, {"name": "d1"}],
+        "elisions": {"body": {"kept": 0, "elided": 2, "total": 2, "reason": "response_budget"}},
+    }
+    expect(
+        "a bodiless row that says nothing fails",
+        len(grade_body_elisions(stripped)[0]) >= 1,
+        True,
+    )
+    both = {
+        "dependencies": [
+            {"name": "d0", "body": None, "body_elided": ["body"], "body_unavailable": "gone"}
+        ],
+        "elisions": {"body": {"kept": 0, "elided": 1, "total": 1, "reason": "response_budget"}},
+    }
+    expect(
+        "a row claiming a cut and a gap at once fails",
+        len(grade_body_elisions(both)[0]) >= 1,
+        True,
+    )
+    uncounted = {
+        "dependencies": [{"name": "d0", "body": None, "body_elided": ["body"]}],
+    }
+    expect(
+        "marked rows with no elision fail",
+        len(grade_body_elisions(uncounted)[0]) >= 1,
+        True,
+    )
+    undercounted = {
+        "dependencies": [
+            {"name": "d0", "body": None, "body_elided": ["body"]},
+            {"name": "d1", "body": None, "body_elided": ["body"]},
+        ],
+        "elisions": {"body": {"kept": 0, "elided": 1, "total": 1, "reason": "response_budget"}},
+    }
+    expect(
+        "an elision counting fewer than the rows say fails",
+        len(grade_body_elisions(undercounted)[0]) >= 1,
+        True,
+    )
+    gap_only = {"dependencies": [{"name": "d0", "body": None, "body_unavailable": "generated"}]}
+    expect("a pure graph gap is not a budget cut", grade_body_elisions(gap_only)[1], 0)
+
+    cli_doc = {
+        "budget_elisions": {
+            "dependencies": {"kept": 4, "elided": 46, "total": 50, "reason": "token_budget"}
+        }
+    }
+    cli_text = "  Dependencies: 4 entries (46 withheld by the 2000-token budget)\n  Raise --budget"
+    expect("a rendering that names its cut passes", grade_cli_context(cli_text, cli_doc)[0], [])
+    expect(
+        "a rendering that hides its cut fails",
+        len(grade_cli_context("  Dependencies: 4 entries", cli_doc)[0]) >= 1,
+        True,
+    )
+    expect(
+        "a rendering with no lever fails",
+        len(grade_cli_context("  Dependencies: 4 entries (46 withheld)", cli_doc)[0]) >= 1,
+        True,
+    )
+    expect(
+        "a cut blamed on the wrong budget fails",
+        len(
+            grade_cli_context(
+                cli_text,
+                {
+                    "budget_elisions": {
+                        "dependencies": {
+                            "kept": 4,
+                            "elided": 46,
+                            "total": 50,
+                            "reason": "response_budget",
+                        }
+                    }
+                },
+            )[0]
+        )
+        >= 1,
+        True,
+    )
+    expect("a whole pack grades nothing here", grade_cli_context("  Dependencies: 50 entries", {})[1], 0)
 
     for line in problems:
         print("SELF-TEST FAIL %s" % line)
