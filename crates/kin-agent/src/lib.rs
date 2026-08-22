@@ -41,6 +41,9 @@ pub enum ExitStatus {
     Deadline,
     EndpointError,
     McpError,
+    /// The run produced changes that repository authority never published. The task text
+    /// may read like a success, but nothing landed, so this must never pool with Success.
+    ChangesUnpublished,
 }
 
 impl ExitStatus {
@@ -52,6 +55,7 @@ impl ExitStatus {
             ExitStatus::Deadline => 3,
             ExitStatus::EndpointError => 4,
             ExitStatus::McpError => 5,
+            ExitStatus::ChangesUnpublished => 6,
         }
     }
 
@@ -63,6 +67,7 @@ impl ExitStatus {
             ExitStatus::Deadline => "deadline",
             ExitStatus::EndpointError => "endpoint_error",
             ExitStatus::McpError => "mcp_error",
+            ExitStatus::ChangesUnpublished => "changes_unpublished",
         }
     }
 }
