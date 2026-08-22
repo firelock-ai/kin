@@ -1224,6 +1224,28 @@ mod tests {
         );
     }
 
+    /// A list nothing was taken from must not grow an elision, whatever calls
+    /// the recorder. The ladder guards this at its call site; this guards the
+    /// recorder itself, so a second producer added later cannot publish a loss
+    /// of zero.
+    #[test]
+    fn recording_a_loss_of_nothing_writes_nothing() {
+        let mut payload = json!({ "entities": [] });
+        record_elision(&mut payload, "entities", 0, 0);
+        assert_eq!(payload, json!({ "entities": [] }), "{payload}");
+        record_elision(&mut payload, "entities", 1, 2);
+        assert_eq!(
+            payload["elisions"]["entities"]["elided"],
+            json!(2),
+            "{payload}"
+        );
+        assert_eq!(
+            payload["elisions"]["entities"]["total"],
+            json!(3),
+            "{payload}"
+        );
+    }
+
     /// The ceiling has to be a number a real MCP client accepts, and 400,000 was
     /// not: Claude Code caps one tool result at 25,000 tokens by default, and on
     /// the v0.5.47 candidate a caller who took the advertised ceiling at its word

@@ -4722,6 +4722,20 @@ mod tests {
     /// A chain payload in the shape the generic-`GraphStore` arm builds, sized
     /// so the caller can force a cut.
     fn chain_payload(steps: usize, signature_chars: usize) -> serde_json::Value {
+        chain_payload_padded(steps, signature_chars, 0)
+    }
+
+    /// The same payload with bulk the budget cannot trim, so a walk with an
+    /// empty chain still reaches the bisect. Without it an empty-chain fixture
+    /// is under budget, the bounder returns at its first line, and a test
+    /// asserting what it did not do can never fail. That was measured: the
+    /// unpadded version of the test below passed with the rule deliberately
+    /// broken.
+    fn chain_payload_padded(
+        steps: usize,
+        signature_chars: usize,
+        pad_chars: usize,
+    ) -> serde_json::Value {
         let chain: Vec<serde_json::Value> = (0..steps)
             .map(|index| {
                 serde_json::json!({
@@ -4738,6 +4752,7 @@ mod tests {
             .collect();
         serde_json::json!({
             "focal": "entry",
+            "focal_body": "b".repeat(pad_chars),
             "total_steps": steps,
             "chain": chain,
         })
@@ -4775,7 +4790,13 @@ mod tests {
     /// nothing still answers with an empty chain and claims no elision.
     #[test]
     fn a_walk_that_reached_nothing_still_answers_with_an_empty_chain() {
-        let mut payload = chain_payload(0, 0);
+        // Padded past the budget on purpose, so the bounder runs its bisect on an
+        // empty chain rather than returning at its first line.
+        let mut payload = chain_payload_padded(0, 0, 8_000);
+        assert!(
+            serde_json::to_string_pretty(&payload).unwrap().len() > 2_000,
+            "the fixture must reach the bounder or this proves nothing"
+        );
         bound_trace_payload(&mut payload, 2_000);
         assert_eq!(
             payload["chain"],
