@@ -1587,6 +1587,115 @@ mod tests {
         let _ = init_from_git(Path::new(&source));
     }
 
+    /// An init the kernel could kill leaves a post-mortem the next one reads.
+    ///
+    /// `SIGKILL` is the case, not `SIGTERM`: a signal Kin can catch already
+    /// cleans up after itself, and the one the OOM killer sends cannot be
+    /// caught at all. So this asserts the property no in-process code can
+    /// provide, that the phase was on disk before the process died.
+    #[cfg(unix)]
+    #[test]
+    fn an_init_the_kernel_kills_leaves_a_phase_the_next_run_can_read() {
+        let held = tempfile::tempdir().unwrap();
+        // Canonical throughout, because init canonicalizes its source before it
+        // records anything and a test comparing `/var` against `/private/var`
+        // fails on the symlink rather than on the behaviour.
+        let root = held.path().canonicalize().unwrap();
+        let source = root.join("source");
+        std::fs::create_dir(&source).unwrap();
+        initialize_git(&source);
+        std::fs::write(source.join("README.md"), b"exact source\n").unwrap();
+        git(&source, ["add", "--all"]);
+        git(&source, ["commit", "-m", "initial"]);
+
+        let barrier = root.join("capture-barrier");
+        let mut child = ParkedChild::spawn(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("git_init::tests::interrupted_init_subprocess")
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .env("KIN_INIT_INTERRUPTED_TEST_SOURCE", &source)
+                .env("KIN_INIT_INTERRUPTED_TEST_BARRIER", &barrier),
+        );
+        let staged = wait_for_capture_barrier(&barrier, &mut child);
+
+        // SIGKILL, delivered the way the OOM killer delivers it. Nothing in the
+        // child runs after this line.
+        let pid = child.id() as i32;
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+        let status = child.wait();
+        assert!(
+            !status.success(),
+            "the child must have died of the signal, not finished: {status:?}"
+        );
+        assert!(
+            !source.join(".kin").exists(),
+            "the fixture is the killed case only if no repository was published"
+        );
+        assert!(
+            staged.is_dir(),
+            "a killed init strands its capture directory, which is what makes a post-mortem \
+             possible and is the disk this fix reclaims"
+        );
+
+        let abandoned = crate::init_attempt::abandoned_init_attempts(&root).unwrap();
+        assert_eq!(
+            abandoned.len(),
+            1,
+            "exactly the killed conversion should be reported: {abandoned:?}"
+        );
+        let found = &abandoned[0];
+        assert_eq!(found.capture_path, staged);
+        let record = found
+            .record
+            .as_ref()
+            .unwrap_or_else(|| panic!("no phase record survived the kill: {found:?}"));
+        assert_eq!(
+            record.phase_total, GIT_ADMISSION_PHASES,
+            "the record must carry the ladder it was running"
+        );
+        assert!(
+            record.phase_index >= 1 && record.phase_index <= GIT_ADMISSION_PHASES,
+            "the recorded phase must be one the ladder has: {record:?}"
+        );
+        assert!(
+            !record.phase_label.is_empty(),
+            "the phase must be named, not just numbered: {record:?}"
+        );
+        assert_eq!(
+            Path::new(&record.source),
+            source,
+            "the record must name the repository it was converting"
+        );
+        assert!(
+            found.converted(&source),
+            "and the next run must be able to match it to this repository"
+        );
+        assert!(
+            found.reclaimable_bytes() > 0,
+            "a stranded capture holds bytes, and reporting zero would hide them"
+        );
+        let rendered = crate::init_attempt::post_mortem_lines(found, None).join("\n");
+        assert!(
+            rendered.contains(&format!(
+                "phase {} of {}, {}",
+                record.phase_index, GIT_ADMISSION_PHASES, record.phase_label
+            )),
+            "the post-mortem must quote the recorded phase: {rendered}"
+        );
+
+        // The next init reclaims what the kill stranded and converts anyway.
+        init_from_git(&source).unwrap();
+        assert!(source.join(".kin").exists());
+        assert!(
+            crate::init_attempt::abandoned_init_attempts(&root)
+                .unwrap()
+                .is_empty(),
+            "the re-run must leave no interrupted attempt behind"
+        );
+        assert_no_staging_directories(&root);
+    }
+
     /// A capture directory a previous interrupted init left behind is removed
     /// by the next real init rather than accumulating beside the repository.
     #[test]

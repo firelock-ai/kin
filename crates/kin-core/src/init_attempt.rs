@@ -453,7 +453,6 @@ pub fn human_bytes(bytes: u64) -> String {
 /// be asserted on.
 pub fn post_mortem_lines(
     attempt: &AbandonedInit,
-    now_unix: u64,
     current: Option<&MemoryReading>,
 ) -> Vec<String> {
     let mut lines = Vec::new();
@@ -474,7 +473,7 @@ pub fn post_mortem_lines(
                 },
                 human_seconds(record.seconds_to_last_phase()),
             ));
-            lines.push(memory_line(record, now_unix));
+            lines.push(memory_line(record));
         }
         None => {
             lines.push(format!(
@@ -516,16 +515,15 @@ pub fn post_mortem_lines(
 /// The ceiling clause, kept apart because it has three honest forms and the
 /// difference between them matters: a measured cap, a machine that could not be
 /// read, and a record written by a build that did not measure one.
-fn memory_line(record: &InitAttemptRecord, _now_unix: u64) -> String {
+fn memory_line(record: &InitAttemptRecord) -> String {
     match (record.memory_limit_bytes, &record.memory_source) {
         (Some(limit), Some(source)) => format!(
-            "  the {source} it ran in had a {} memory ceiling when it started",
+            "  it started under a {} memory ceiling, read from the {source}",
             human_bytes(limit)
         ),
-        (Some(limit), None) => format!(
-            "  it started under a {} memory ceiling",
-            human_bytes(limit)
-        ),
+        (Some(limit), None) => {
+            format!("  it started under a {} memory ceiling", human_bytes(limit))
+        }
         _ => "  it could not read a memory ceiling for the machine it ran on".to_string(),
     }
 }
@@ -546,11 +544,21 @@ pub const RESTART_NOTICE: &str = "  this run restarts from phase 1 rather than r
                                   and its bootstrap transaction carries no journal, so none of it \
                                   can be adopted without risking a store no proof would accept";
 
-/// What an operator can do about the ceiling, when the record measured one.
+/// What an operator can do about the ceiling, when there is reason to think the
+/// ceiling is what stopped them.
 ///
-/// Only ever printed with a measured number beside it, so this never invents a
-/// limit nobody read.
-pub fn ceiling_advice(record: &InitAttemptRecord) -> Option<String> {
+/// Gated on the kernel having actually recorded a kill, not merely on a ceiling
+/// having been read. Every machine has a ceiling, so advice keyed on the
+/// ceiling alone would tell an operator who pressed Ctrl-C that they are short
+/// of memory, which is a confident wrong diagnosis dressed as help. The
+/// measured number is only ever quoted, never invented.
+pub fn ceiling_advice(
+    record: &InitAttemptRecord,
+    current: Option<&MemoryReading>,
+) -> Option<String> {
+    if !current.is_some_and(MemoryReading::kernel_has_killed_here) {
+        return None;
+    }
     let limit = record.memory_limit_bytes?;
     Some(format!(
         "  a conversion's peak follows history depth, so give it more than {} or convert a \
@@ -580,9 +588,8 @@ pub fn report_previous_attempts(attempts: &[AbandonedInit], source: &Path) {
     }
     let current = memory_pressure::read();
     let current = current.reading().copied();
-    let now = unix_now();
     for attempt in attempts {
-        let mut lines = post_mortem_lines(attempt, now, current.as_ref());
+        let mut lines = post_mortem_lines(attempt, current.as_ref());
         if let Some(first) = lines.first_mut() {
             *first = format!("warning: {first}");
         }
@@ -596,7 +603,11 @@ pub fn report_previous_attempts(attempts: &[AbandonedInit], source: &Path) {
     let ours = attempts.iter().find(|attempt| attempt.converted(source));
     if let Some(ours) = ours {
         disclose(RESTART_NOTICE);
-        if let Some(advice) = ours.record.as_ref().and_then(ceiling_advice) {
+        if let Some(advice) = ours
+            .record
+            .as_ref()
+            .and_then(|record| ceiling_advice(record, current.as_ref()))
+        {
             disclose(&advice);
         }
     }
@@ -759,7 +770,7 @@ mod tests {
 
     #[test]
     fn a_post_mortem_names_the_phase_the_ceiling_and_the_staging() {
-        let lines = post_mortem_lines(&attempt(Some(record())), 2000, Some(&reading(Some(1))));
+        let lines = post_mortem_lines(&attempt(Some(record())), Some(&reading(Some(1))));
         let rendered = lines.join("\n");
         assert!(
             rendered.contains("phase 13 of 17, commit bootstrap transaction"),
@@ -770,7 +781,7 @@ mod tests {
             "elapsed to the last phase must be reported: {rendered}"
         );
         assert!(
-            rendered.contains("12.0 GB memory ceiling"),
+            rendered.contains("under a 12.0 GB memory ceiling, read from the container"),
             "the measured ceiling must be named: {rendered}"
         );
         assert!(
@@ -793,17 +804,17 @@ mod tests {
     /// covers a conversion an operator killed by hand.
     #[test]
     fn a_cgroup_with_no_kills_is_never_told_it_had_one() {
-        let quiet = post_mortem_lines(&attempt(Some(record())), 2000, Some(&reading(Some(0))));
+        let quiet = post_mortem_lines(&attempt(Some(record())), Some(&reading(Some(0))));
         assert!(
             !quiet.join("\n").contains("out-of-memory"),
             "zero recorded kills must produce no kill sentence: {quiet:?}"
         );
-        let unknown = post_mortem_lines(&attempt(Some(record())), 2000, Some(&reading(None)));
+        let unknown = post_mortem_lines(&attempt(Some(record())), Some(&reading(None)));
         assert!(
             !unknown.join("\n").contains("out-of-memory"),
             "an unreadable kill counter is not evidence of a kill: {unknown:?}"
         );
-        let some = post_mortem_lines(&attempt(Some(record())), 2000, Some(&reading(Some(2))));
+        let some = post_mortem_lines(&attempt(Some(record())), Some(&reading(Some(2))));
         assert!(
             some.join("\n").contains("2 kernel out-of-memory kills"),
             "more than one kill pluralizes: {some:?}"
@@ -817,7 +828,7 @@ mod tests {
     fn staging_without_a_record_is_reported_without_inventing_a_phase() {
         let mut orphan = attempt(None);
         orphan.record_unreadable = Some("it carries no phase record".to_string());
-        let rendered = post_mortem_lines(&orphan, 2000, None).join("\n");
+        let rendered = post_mortem_lines(&orphan, None).join("\n");
         assert!(
             rendered.contains("left staging at /work/.kin-git-capture-abdd7a1c behind"),
             "the path is all this case can name: {rendered}"
@@ -840,18 +851,27 @@ mod tests {
         let mut unmeasured = record();
         unmeasured.memory_limit_bytes = None;
         unmeasured.memory_source = None;
-        let rendered = post_mortem_lines(&attempt(Some(unmeasured.clone())), 2000, None).join("\n");
+        let rendered = post_mortem_lines(&attempt(Some(unmeasured.clone())), None).join("\n");
         assert!(
             rendered.contains("could not read a memory ceiling"),
             "an unmeasured ceiling must be disclosed: {rendered}"
         );
         assert!(
-            ceiling_advice(&unmeasured).is_none(),
+            ceiling_advice(&unmeasured, Some(&reading(Some(1)))).is_none(),
             "advice about a ceiling must never print without the ceiling"
         );
         assert!(
-            ceiling_advice(&record()).is_some_and(|line| line.contains("12.0 GB")),
+            ceiling_advice(&record(), Some(&reading(Some(1))))
+                .is_some_and(|line| line.contains("12.0 GB")),
             "advice quotes the measured ceiling"
+        );
+        assert!(
+            ceiling_advice(&record(), Some(&reading(Some(0)))).is_none(),
+            "a conversion the kernel did not kill gets no advice about memory"
+        );
+        assert!(
+            ceiling_advice(&record(), None).is_none(),
+            "an unreadable machine is not evidence that memory was the problem"
         );
     }
 
@@ -955,6 +975,227 @@ mod tests {
             3000,
             "a symlink out of the tree must not be counted"
         );
+    }
+
+    /// A capture directory a running conversion holds is not a corpse. Two
+    /// sibling repositories under one parent convert at the same time all the
+    /// time, and reporting the live one as an interrupted run would send an
+    /// operator to delete a directory that is in use.
+    #[test]
+    fn a_live_conversions_staging_is_never_reported_as_abandoned() {
+        let root = tempfile::tempdir().unwrap();
+        let live = crate::init_staging::GitCaptureStaging::claim(root.path()).unwrap();
+        let journal = InitAttemptJournal::open(
+            live.path(),
+            Path::new("/work/live"),
+            Path::new("/work/live/.kin"),
+            17,
+        );
+        journal.enter_phase(5, "derive semantic history");
+        assert!(
+            abandoned_init_attempts(root.path()).unwrap().is_empty(),
+            "a held lease means a live init, which must not be reported"
+        );
+
+        // The same directory, once its holder is gone, is exactly what this
+        // reader exists to find. Dropping the handle removes it, so the
+        // abandoned side is built by hand from the same shapes.
+        let corpse = root.path().join(".kin-git-capture-abandoned");
+        std::fs::create_dir(&corpse).unwrap();
+        std::fs::write(corpse.join("capture.lease"), b"").unwrap();
+        std::fs::copy(
+            live.path().join(ATTEMPT_RECORD_NAME),
+            corpse.join(ATTEMPT_RECORD_NAME),
+        )
+        .unwrap();
+        let found = abandoned_init_attempts(root.path()).unwrap();
+        assert_eq!(
+            found.len(),
+            1,
+            "a free lease is the abandoned case: {found:?}"
+        );
+        assert_eq!(found[0].capture_path, corpse);
+        assert_eq!(found[0].record.as_ref().unwrap().phase_index, 5);
+    }
+
+    /// The record names a stage directory that may or may not still be there,
+    /// and the same for its sidecar. Reporting a path that is gone sends an
+    /// operator to delete nothing and makes the size a lie.
+    #[test]
+    fn only_staging_that_still_exists_is_named_and_sized() {
+        let root = tempfile::tempdir().unwrap();
+        let capture = root.path().join(".kin-git-capture-partial");
+        std::fs::create_dir(&capture).unwrap();
+        std::fs::write(capture.join("capture.lease"), b"").unwrap();
+        std::fs::write(capture.join("blob"), vec![0_u8; 4096]).unwrap();
+
+        let stage = root.path().join(".kin.init-11111111-1111-4111-8111-111111111111");
+        let mut written = record();
+        written.stage_path = Some(stage.display().to_string());
+        std::fs::write(
+            capture.join(ATTEMPT_RECORD_NAME),
+            serde_json::to_vec(&written).unwrap(),
+        )
+        .unwrap();
+
+        // The stage never survived the kill.
+        let gone = &abandoned_init_attempts(root.path()).unwrap()[0];
+        assert!(gone.stage_path.is_none(), "an absent stage is not named");
+        assert_eq!(gone.stage_bytes, 0);
+        assert!(gone.owner_path.is_none(), "no stage means no sidecar");
+        assert_eq!(gone.paths().len(), 1);
+        assert!(gone.reclaimable_bytes() >= 4096);
+
+        // The stage survived, its sidecar did not.
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::write(stage.join("body"), vec![0_u8; 2048]).unwrap();
+        let bare = &abandoned_init_attempts(root.path()).unwrap()[0];
+        assert_eq!(bare.stage_path.as_deref(), Some(stage.as_path()));
+        assert_eq!(bare.stage_bytes, 2048);
+        assert!(bare.owner_path.is_none(), "an absent sidecar is not named");
+        assert_eq!(bare.paths().len(), 2);
+
+        // Both survived, which is the shape the stranger found on disk.
+        let owner = owner_sidecar_path(&stage);
+        std::fs::write(&owner, b"{}").unwrap();
+        let whole = &abandoned_init_attempts(root.path()).unwrap()[0];
+        assert_eq!(whole.owner_path.as_deref(), Some(owner.as_path()));
+        assert_eq!(whole.paths().len(), 3);
+    }
+
+    /// A record too large, or one that is not a regular file at all, is refused
+    /// rather than read. Both are the shape of something Kin did not write.
+    #[test]
+    fn a_record_that_is_not_one_is_refused_by_shape_before_it_is_parsed() {
+        let root = tempfile::tempdir().unwrap();
+
+        let huge = root.path().join(".kin-git-capture-huge");
+        std::fs::create_dir(&huge).unwrap();
+        std::fs::write(
+            huge.join(ATTEMPT_RECORD_NAME),
+            vec![b' '; (MAX_RECORD_BYTES + 1) as usize],
+        )
+        .unwrap();
+        let (parsed, why) = read_attempt_record(&huge);
+        assert!(parsed.is_none());
+        assert!(
+            why.is_some_and(|why| why.contains("past the")),
+            "an oversized record is refused by its size"
+        );
+
+        let directory = root.path().join(".kin-git-capture-directory");
+        std::fs::create_dir_all(directory.join(ATTEMPT_RECORD_NAME)).unwrap();
+        let (parsed, why) = read_attempt_record(&directory);
+        assert!(parsed.is_none());
+        assert!(
+            why.is_some_and(|why| why.contains("not a regular file")),
+            "a directory wearing the record's name is not a record"
+        );
+    }
+
+    /// The restart notice belongs to a conversion of the repository being
+    /// converted now. A sibling's corpse is worth naming and is not this run's
+    /// to restart.
+    #[test]
+    fn an_attempt_is_matched_to_the_repository_it_was_converting() {
+        let ours = attempt(Some(record()));
+        assert!(ours.converted(Path::new("/work/requests")));
+        assert!(!ours.converted(Path::new("/work/express")));
+        assert!(
+            !attempt(None).converted(Path::new("/work/requests")),
+            "an attempt with no record cannot claim a repository"
+        );
+    }
+
+    /// Two states the reclaim report has to tell apart: everything came back,
+    /// and something was left in place. Reporting the first when the second
+    /// happened is the silent orphan defect returning under a friendlier line.
+    #[test]
+    fn the_reclaim_report_counts_what_is_actually_gone() {
+        let root = tempfile::tempdir().unwrap();
+        let freed_path = root.path().join(".kin-git-capture-freed");
+        let held_path = root.path().join(".kin-git-capture-held");
+        std::fs::create_dir(&held_path).unwrap();
+
+        let freed = AbandonedInit {
+            capture_path: freed_path,
+            capture_bytes: 1024,
+            record: None,
+            record_unreadable: None,
+            stage_path: None,
+            stage_bytes: 0,
+            owner_path: None,
+        };
+        let held = AbandonedInit {
+            capture_path: held_path.clone(),
+            capture_bytes: 2048,
+            record: None,
+            record_unreadable: None,
+            stage_path: None,
+            stage_bytes: 0,
+            owner_path: None,
+        };
+        // Nothing to say about nothing.
+        report_reclaimed(&[]);
+        // Exercised for their branches; the lines go to stderr, and the states
+        // they distinguish are asserted through the paths themselves.
+        report_reclaimed(&[freed.clone()]);
+        report_reclaimed(&[held.clone()]);
+        report_reclaimed(&[freed, held]);
+        assert!(
+            held_path.exists(),
+            "reporting must never delete what it reports"
+        );
+    }
+
+    /// The doctor row has three shapes and each is a different fact: nothing to
+    /// report, staging that can say where it stopped, and staging that cannot.
+    #[test]
+    fn the_doctor_row_says_only_what_the_records_support() {
+        assert!(
+            doctor_row(&[]).is_none(),
+            "a clean disk gets no attention row"
+        );
+
+        let (detail, fix) = doctor_row(&[attempt(Some(record()))]).expect("a row");
+        assert!(detail.contains("phase 13 of 17, commit bootstrap transaction"), "{detail}");
+        assert!(detail.contains("420.0 MB"), "{detail}");
+        assert!(fix.contains("kin init"), "{fix}");
+        assert!(fix.contains("/work/.kin.init-22ef96e2.owner"), "{fix}");
+
+        let (detail, _) = doctor_row(&[attempt(None)]).expect("a row");
+        assert!(
+            detail.contains("older Kin staged it"),
+            "staging with no record says so rather than inventing a phase: {detail}"
+        );
+        assert!(
+            !detail.contains("stopped in phase"),
+            "an absent record must never render as a phase number: {detail}"
+        );
+
+        let mut unopened = record();
+        unopened.phase_index = 0;
+        unopened.phase_label = String::new();
+        let (detail, _) = doctor_row(&[attempt(Some(unopened))]).expect("a row");
+        assert!(
+            detail.contains("phase 1 of 17, before the first phase opened"),
+            "a kill before any phase opened has its own wording: {detail}"
+        );
+    }
+
+    /// An attempt killed before the ladder opened a phase must not render as
+    /// "phase 0", and must not render as a phase it never reached.
+    #[test]
+    fn a_kill_before_the_first_phase_is_worded_as_one() {
+        let mut unopened = record();
+        unopened.phase_index = 0;
+        unopened.phase_label = String::new();
+        let rendered = post_mortem_lines(&attempt(Some(unopened)), None).join("\n");
+        assert!(
+            rendered.contains("phase 1 of 17, before the first phase opened"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("phase 0"), "{rendered}");
     }
 
     #[test]
