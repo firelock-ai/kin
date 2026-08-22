@@ -545,9 +545,14 @@ fn vfs_status_names_the_bound_root_and_refuses_to_call_an_unserved_one_in_force(
         );
     }
 
-    // FIR-2572: shim mode declares what it cannot project, in the same block.
+    // FIR-2572: shim mode declares what it cannot project, in the same block,
+    // and that is a binary with no libc call to interpose rather than Node.
     assert!(
-        served.contains("Node is not projected in this mode"),
+        served.contains("A binary that reaches the kernel without libc is not projected"),
         "shim mode must declare the raw-syscall gap:\n{served}"
+    );
+    assert!(
+        !served.contains("Node is not projected"),
+        "Node is projected under the shim since FIR-2572:\n{served}"
     );
 }

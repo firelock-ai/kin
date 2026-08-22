@@ -1389,12 +1389,25 @@ fn projection_mode_check_for(
         // projection that was measured outside the repository from one that was
         // only measured inside it.
         let detail = format!("{detail}; {}", outside.evidence());
-        return HealthCheck::new(
+        let check = HealthCheck::new(
             "projection_mode",
             "Projection in force",
             HealthStatus::Healthy,
             detail,
         );
+        // A working mode can still have a limit, and this is the row where a
+        // silent green would hide it. The shim interposes libc, so a binary
+        // that never calls libc reads the working copy while everything else
+        // reads graph truth; that stays true of a shim mode passing every
+        // probe. Carrying it as a platform note rather than a status keeps the
+        // row green, because the limit is a property of the mode rather than a
+        // defect in the install, and puts it in front of a reader who ran
+        // `kin doctor` and would otherwise have to know to run `kin vfs status`
+        // (FIR-2572).
+        return match live.mode.raw_syscall_note() {
+            Some(note) => check.with_platform_note(note),
+            None => check,
+        };
     }
 
     // A recorded mode that is not the one running, or one that is running and
@@ -5187,6 +5200,78 @@ mod tests {
             degraded,
             evidence: vec!["fixture evidence".to_string()],
         }
+    }
+
+    /// FIR-2572. A green projection row still names what its mode cannot do.
+    ///
+    /// The shim interposes libc, so a binary that never calls libc reads the
+    /// working copy while everything else reads graph truth, and that stays
+    /// true of a shim passing every probe this row takes. `kin vfs status`
+    /// said so and `kin doctor` did not, so a reader who ran doctor, saw a
+    /// green projection and stopped had no way to learn the limit existed.
+    ///
+    /// The note rides `platform_note`, so it must not move the status: a limit
+    /// that belongs to the mode is not a defect in the install, and a row that
+    /// went red over one would fail every correct shim install.
+    #[test]
+    fn a_green_shim_row_names_the_limit_and_a_green_mount_row_has_none() {
+        let shim = projection_mode_check_for_macos(&report(
+            Some(ProjectionMode::Shim),
+            &[ProjectionMode::Shim],
+            live(
+                ProjectionMode::Shim,
+                ProjectionMode::Shim,
+                Tri::NotApplicable,
+                Tri::Yes,
+                false,
+            ),
+        ));
+        assert!(
+            matches!(shim.status, HealthStatus::Healthy),
+            "naming the limit must not move the status, got {:?}",
+            shim.status
+        );
+        assert!(
+            !blocks_readiness(&shim),
+            "a mode's limit must never block readiness"
+        );
+        let note = shim
+            .platform_note
+            .as_deref()
+            .expect("a green shim row carries the shim's limit");
+        assert!(
+            note.contains("libc") && note.contains("Go"),
+            "the limit must name what it is about: {note}"
+        );
+        assert!(
+            !note.contains("Node is not projected"),
+            "Node is projected under the shim since FIR-2572: {note}"
+        );
+
+        // The control. A mount is served by the kernel and has no such limit,
+        // so an unconditional note would be a false warning on every mount
+        // host and this assertion is what keeps the note attached to the mode
+        // rather than to the row.
+        let mount = projection_mode_check_for_macos(&report(
+            Some(ProjectionMode::Nfs),
+            &[ProjectionMode::Nfs],
+            live(
+                ProjectionMode::Nfs,
+                ProjectionMode::Nfs,
+                Tri::Yes,
+                Tri::Yes,
+                false,
+            ),
+        ));
+        assert!(
+            matches!(mount.status, HealthStatus::Healthy),
+            "the mount fixture must be green for this control to mean anything, got {:?}",
+            mount.status
+        );
+        assert_eq!(
+            mount.platform_note, None,
+            "a mount projects every process on the host and must carry no such limit"
+        );
     }
 
     /// The three fixtures the row exists to tell apart: everything present, no

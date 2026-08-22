@@ -160,20 +160,28 @@ impl ProjectionMode {
     /// rather than of the host.
     ///
     /// The shim is injected through `LD_PRELOAD` and `DYLD_INSERT_LIBRARIES`,
-    /// which interpose libc and nothing else. A runtime that issues raw
-    /// syscalls goes straight past it: Node's libuv calls `statx` directly, so
-    /// inside a projected repository Node reads raw disk on the same path where
-    /// git, Python and the coreutils read graph truth (FIR-2572). No further
-    /// hook closes that, so the product says it rather than leaving a user to
-    /// find it. A mount has no such gap, because the kernel serves every
+    /// which interpose libc and nothing else, so what it cannot project is a
+    /// binary that reaches the kernel without libc at all. A Go binary built
+    /// the usual way is that binary: it issues its own syscalls, and inside a
+    /// projected repository it reads the working copy on the same path where
+    /// git, Node, Python and the coreutils read graph truth.
+    ///
+    /// This note used to name Node, and named it wrongly. libuv issues `statx`
+    /// itself rather than calling a libc stat entry point, which did put Node
+    /// in this class for a release (FIR-2572), but it reaches the kernel
+    /// through glibc's `syscall(2)` wrapper rather than through the
+    /// instruction, and a wrapper is a symbol the shim can interpose like any
+    /// other. It does now, so Node reads the projection here. A binary with no
+    /// libc call to interpose is the case that remains, and it has no symbol to
+    /// hook. A mount has no such gap at all, because the kernel serves every
     /// process on the host.
     pub(crate) fn raw_syscall_note(self) -> Option<&'static str> {
         match self {
             Self::Shim => Some(
-                "Node is not projected in this mode: the shim interposes libc, and libuv issues \
-                 raw syscalls that no injected library can see, so Node reads raw disk here while \
-                 git, Python and the coreutils read graph truth. The nfs and fuse mounts project \
-                 every process on the host, Node included.",
+                "A binary that reaches the kernel without libc is not projected in this mode: \
+                 the shim interposes libc, so a Go binary making its own syscalls reads the \
+                 working copy here while git, Node, Python and the coreutils read graph truth. \
+                 The nfs and fuse mounts project every process on the host.",
             ),
             Self::Nfs | Self::Fuse | Self::ProjFs => None,
         }
@@ -2366,22 +2374,39 @@ Options:
         );
     }
 
-    /// FIR-2572: the shim cannot interpose a raw syscall, so Node reads raw
-    /// disk inside a projected repository while every libc caller does not.
-    /// The status block has to say so under the shim, and must not say it under
-    /// a mount, where the kernel serves every process.
+    /// FIR-2572: the shim interposes libc, so what it cannot project is a
+    /// binary that never calls libc. The status block has to say so under the
+    /// shim, and must not say it under a mount, where the kernel serves every
+    /// process.
+    ///
+    /// It must also no longer say it about Node. The note named Node for a
+    /// release, correctly at the time, because libuv issued `statx` itself; the
+    /// shim now interposes the `syscall(2)` wrapper libuv reaches it through,
+    /// and a measured static Go binary is the case that remains. A note still
+    /// telling a JavaScript developer their toolchain is unprojected would send
+    /// them to a mount they no longer need, so the old sentence is asserted
+    /// gone rather than merely replaced.
     #[test]
     fn the_status_block_declares_the_shim_raw_syscall_gap_and_only_there() {
         let shim_note = ProjectionMode::Shim
             .raw_syscall_note()
             .expect("the shim mode declares its raw-syscall gap");
         assert!(
-            shim_note.contains("Node"),
-            "the note must name the runtime it is about: {shim_note}"
+            shim_note.contains("libc"),
+            "the note must name what the gap is about: {shim_note}"
+        );
+        assert!(
+            shim_note.contains("Go"),
+            "the note must name a binary actually in the class: {shim_note}"
+        );
+        assert!(
+            !shim_note.contains("Node is not projected"),
+            "Node is projected under the shim since FIR-2572; the note must not send a \
+             JavaScript developer to a mount they do not need: {shim_note}"
         );
         assert!(
             shim_note.contains("nfs") && shim_note.contains("fuse"),
-            "the note must name the modes that do project Node: {shim_note}"
+            "the note must name the modes with no such gap: {shim_note}"
         );
         for mode in [
             ProjectionMode::Nfs,
