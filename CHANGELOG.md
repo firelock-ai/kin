@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.48] - 2026-08-22
+
+### Changed
+
+- Run the product acceptance suites on every pull request (#1054)
+- Key the release evidence to a main commit, so a tag no longer needs a frozen main (#1056)
+- Stop the Windows install proof failing on a projection nobody configured (#1060)
+
+
 ## [0.5.47] - 2026-08-22
 
 ### Changed
