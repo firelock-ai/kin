@@ -1572,24 +1572,11 @@ fn check_interrupted_init() -> HealthCheck {
 
 /// Where a doctor run looks for interrupted-conversion staging.
 ///
-/// Both the working directory and its parent, because init stages beside the
-/// repository rather than inside it: an operator running doctor from the
-/// converted repository needs the parent scanned, and one running it from the
-/// directory that holds their checkouts needs the working directory scanned.
-/// Looking in only one of the two answers correctly for one of those operators
-/// and reports a clean disk to the other.
+/// The choice of directories, and the filesystem access it takes to resolve
+/// them, belong to the init boundary in kin-core rather than to a CLI health
+/// row: doctor asks that boundary where to look and reports what it answers.
 fn interrupted_init_scan_roots(cwd: &Path) -> Vec<PathBuf> {
-    // Canonical, because init canonicalizes its source before recording one and
-    // a fix line naming `/var/...` for a record that says `/private/var/...` is
-    // two paths for one directory in the same paragraph.
-    let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-    let mut roots = vec![cwd.clone()];
-    if let Some(parent) = cwd.parent() {
-        if parent != cwd {
-            roots.push(parent.to_path_buf());
-        }
-    }
-    roots
+    kin_core::init_attempt::staging_scan_roots(cwd)
 }
 
 fn interrupted_init_check_for(roots: &[PathBuf]) -> HealthCheck {
@@ -4298,7 +4285,9 @@ mod tests {
                 "run {where_from}, the row must raise: {found:?}"
             );
             assert!(
-                found.detail.contains("phase 13 of 17, commit bootstrap transaction"),
+                found
+                    .detail
+                    .contains("phase 13 of 17, commit bootstrap transaction"),
                 "run {where_from}, the row must name the phase: {}",
                 found.detail
             );
@@ -4337,7 +4326,11 @@ mod tests {
         let root = interrupted_init_scan_roots(Path::new("/"));
         assert_eq!(root, vec![PathBuf::from("/")], "the root has no parent");
         let nested = interrupted_init_scan_roots(Path::new("/tmp"));
-        assert_eq!(nested.len(), 2, "an ordinary directory scans itself and its parent: {nested:?}");
+        assert_eq!(
+            nested.len(),
+            2,
+            "an ordinary directory scans itself and its parent: {nested:?}"
+        );
         assert_ne!(nested[0], nested[1]);
     }
 

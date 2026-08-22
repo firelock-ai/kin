@@ -268,6 +268,30 @@ impl AbandonedInit {
     }
 }
 
+/// Where a surface should look for interrupted-conversion staging, given the
+/// directory an operator is standing in.
+///
+/// Both that directory and its parent, because init stages beside the
+/// repository rather than inside it: an operator running a check from the
+/// converted repository needs the parent scanned, and one running it from the
+/// directory that holds their checkouts needs the working directory scanned.
+/// Looking in only one answers correctly for one of those operators and reports
+/// a clean disk to the other.
+///
+/// Canonical, because init canonicalizes its source before recording one, and a
+/// surface quoting `/var/...` for a record that says `/private/var/...` prints
+/// two paths for one directory in the same paragraph.
+pub fn staging_scan_roots(cwd: &Path) -> Vec<PathBuf> {
+    let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let mut roots = vec![cwd.clone()];
+    if let Some(parent) = cwd.parent() {
+        if parent != cwd {
+            roots.push(parent.to_path_buf());
+        }
+    }
+    roots
+}
+
 /// Every unfinished conversion staged beside `parent` that no live init owns.
 ///
 /// Read-only, and deliberately so: `kin doctor` has to be able to name what is
@@ -358,7 +382,12 @@ fn read_attempt_record(capture: &Path) -> (Option<InitAttemptRecord>, Option<Str
                 Some("it carries no phase record, so an older Kin staged it".to_string()),
             );
         }
-        Err(error) => return (None, Some(format!("its phase record is unreadable: {error}"))),
+        Err(error) => {
+            return (
+                None,
+                Some(format!("its phase record is unreadable: {error}")),
+            )
+        }
     };
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return (
@@ -377,7 +406,12 @@ fn read_attempt_record(capture: &Path) -> (Option<InitAttemptRecord>, Option<Str
     }
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
-        Err(error) => return (None, Some(format!("its phase record is unreadable: {error}"))),
+        Err(error) => {
+            return (
+                None,
+                Some(format!("its phase record is unreadable: {error}")),
+            )
+        }
     };
     match serde_json::from_slice::<InitAttemptRecord>(&bytes) {
         Ok(record) if record.version == ATTEMPT_RECORD_VERSION => (Some(record), None),
@@ -451,10 +485,7 @@ pub fn human_bytes(bytes: u64) -> String {
 /// running a conversion. `now_unix` and `current` are passed in for the same
 /// reason: a post-mortem that reads the clock and the cgroup for itself cannot
 /// be asserted on.
-pub fn post_mortem_lines(
-    attempt: &AbandonedInit,
-    current: Option<&MemoryReading>,
-) -> Vec<String> {
+pub fn post_mortem_lines(attempt: &AbandonedInit, current: Option<&MemoryReading>) -> Vec<String> {
     let mut lines = Vec::new();
     match &attempt.record {
         Some(record) => {
@@ -1029,7 +1060,9 @@ mod tests {
         std::fs::write(capture.join("capture.lease"), b"").unwrap();
         std::fs::write(capture.join("blob"), vec![0_u8; 4096]).unwrap();
 
-        let stage = root.path().join(".kin.init-11111111-1111-4111-8111-111111111111");
+        let stage = root
+            .path()
+            .join(".kin.init-11111111-1111-4111-8111-111111111111");
         let mut written = record();
         written.stage_path = Some(stage.display().to_string());
         std::fs::write(
@@ -1139,8 +1172,8 @@ mod tests {
         report_reclaimed(&[]);
         // Exercised for their branches; the lines go to stderr, and the states
         // they distinguish are asserted through the paths themselves.
-        report_reclaimed(&[freed.clone()]);
-        report_reclaimed(&[held.clone()]);
+        report_reclaimed(std::slice::from_ref(&freed));
+        report_reclaimed(std::slice::from_ref(&held));
         report_reclaimed(&[freed, held]);
         assert!(
             held_path.exists(),
@@ -1158,7 +1191,10 @@ mod tests {
         );
 
         let (detail, fix) = doctor_row(&[attempt(Some(record()))]).expect("a row");
-        assert!(detail.contains("phase 13 of 17, commit bootstrap transaction"), "{detail}");
+        assert!(
+            detail.contains("phase 13 of 17, commit bootstrap transaction"),
+            "{detail}"
+        );
         assert!(detail.contains("420.0 MB"), "{detail}");
         assert!(fix.contains("kin init"), "{fix}");
         assert!(fix.contains("/work/.kin.init-22ef96e2.owner"), "{fix}");
