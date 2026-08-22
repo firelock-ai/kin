@@ -49,7 +49,15 @@ jobs:
   install-proof:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    # 90 is a runaway backstop, not a ceiling the leg is expected to reach.
+    # v0.5.48's run proved the healthy Windows leg needs more than 45: with the
+    # projection defect fixed it ran deep into the real proof for the first
+    # time and was cancelled at 45m12s, and a timeout lands as CANCELLED, which
+    # the experimental waiver below does not absorb (continue-on-error covers
+    # failure only), so the cancellation skipped npm publish and promotion.
+    # A cap the leg can reach while healthy is therefore a release-killer on
+    # exactly the runs where the leg improves.
+    timeout-minutes: 90
     # The Windows leg runs the full unconditional proof and uploads its
     # artifacts, but its verdict does not yet gate the release. The reason has
     # moved, and this comment is what carries it, so it is worth keeping
