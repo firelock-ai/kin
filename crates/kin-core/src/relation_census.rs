@@ -17,6 +17,27 @@
 //! commit. Both are points where the relation set just changed and the process
 //! doing the changing knows it finished.
 //!
+//! Recording at those moments is necessary and was not sufficient. The rc0547b
+//! stranger run committed 26 lines of docstring to `psf/requests` and the store
+//! went from 1279 `Calls` and 11 `Overrides` edges to 1268 and 10, with the
+//! entity count unmoved at 783. `kin doctor` reported the census green, because
+//! the commit that lost the edges wrote the baseline the next comparison would
+//! be judged against, and both recovery sweeps advanced it again. A detector
+//! whose comparison point is written by the event it exists to catch cannot
+//! catch it.
+//!
+//! Two rules close that, and they are the same rule read from either end.
+//! [`record`] advances the baseline only to a census that did not lose ground
+//! against the one it would replace, so a losing pass leaves the last
+//! verified-good census in place and no later sweep can bury it. And a kind
+//! that slipped while the entity count held or grew is reported rather than
+//! tolerated, because edges disappearing with no code removed is a derivation
+//! defect at any magnitude, while the same slip beside a fallen entity count is
+//! a store that shrank. The entity count is the discriminator, it is already on
+//! the screen directly above the histogram, and without it the only honest
+//! choice is between missing a twelve-edge regression and warning on every
+//! deletion.
+//!
 //! Reads are three-way for the same reason [`crate::last_admission`] reads are.
 //! Absent and unreadable are different answers and neither may present as
 //! "nothing changed": a surface that turns a missing record into a clean bill
@@ -86,6 +107,22 @@ pub struct RelationCensus {
     pub total: u64,
     #[serde(default)]
     pub causes: Vec<String>,
+    /// Entities the graph held when this census was taken.
+    ///
+    /// The discriminator between a store that lost edges and a store that lost
+    /// code. Relation counts alone cannot tell a derivation regression from an
+    /// ordinary deletion, so a rule built on them alone must either tolerate the
+    /// twelve-edge loss this record exists for or warn every time someone
+    /// removes a function.
+    ///
+    /// `Option` rather than a bare count, and the difference is load-bearing.
+    /// A record written before this field existed carries no entity count, and
+    /// reading the absence as zero would make every store that upgraded look
+    /// like one that had just grown its entire graph from nothing. `None` means
+    /// the discriminator is unavailable, and every rule below falls back to the
+    /// magnitude thresholds it used before rather than guessing.
+    #[serde(default)]
+    pub entities: Option<u64>,
 }
 
 impl RelationCensus {
@@ -103,7 +140,14 @@ impl RelationCensus {
             kinds,
             total,
             causes,
+            entities: None,
         }
+    }
+
+    /// Record the entity count the graph held when this census was measured.
+    pub fn with_entities(mut self, entities: u64) -> Self {
+        self.entities = Some(entities);
+        self
     }
 }
 
@@ -274,6 +318,12 @@ pub struct RelationCensusComparison {
     /// Conditions known to reduce relation coverage, active now.
     #[serde(default)]
     pub causes: Vec<String>,
+    /// Entities the previous census recorded, when it recorded any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_entities: Option<u64>,
+    /// Entities the graph holds now, when the caller measured them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_entities: Option<u64>,
 }
 
 impl RelationCensusComparison {
@@ -290,6 +340,8 @@ impl RelationCensusComparison {
                 unavailable: None,
                 changes: compare(&recorded.kinds, current),
                 causes,
+                previous_entities: recorded.entities,
+                current_entities: None,
             },
             RelationCensusRead::Absent => Self {
                 previous_at: None,
@@ -302,6 +354,8 @@ impl RelationCensusComparison {
                 ),
                 changes: Vec::new(),
                 causes,
+                previous_entities: None,
+                current_entities: None,
             },
             RelationCensusRead::Unreadable(reason) => Self {
                 previous_at: None,
@@ -313,8 +367,52 @@ impl RelationCensusComparison {
                 )),
                 changes: Vec::new(),
                 causes,
+                previous_entities: None,
+                current_entities: None,
             },
         }
+    }
+
+    /// Record the entity count the current census was measured beside.
+    ///
+    /// Chained rather than taken by [`Self::build`] so a caller that genuinely
+    /// does not hold an entity count says so by omission, and so the surfaces
+    /// that do hold one all pass the same measurement the histogram above them
+    /// was counted from.
+    pub fn with_current_entities(mut self, entities: u64) -> Self {
+        self.current_entities = Some(entities);
+        self
+    }
+
+    /// Whether the store holds at least as many entities as it did at the
+    /// baseline.
+    ///
+    /// `false` when either count is unknown. A comparison that cannot see the
+    /// entity count must not be able to promote an ordinary slip to a warning,
+    /// so the unknown case reads as "the store may have shrunk" and the
+    /// magnitude thresholds decide alone.
+    pub fn entities_held(&self) -> bool {
+        match (self.previous_entities, self.current_entities) {
+            (Some(previous), Some(current)) => current >= previous,
+            _ => false,
+        }
+    }
+
+    /// Kinds that lost edges while the entity count held or grew.
+    ///
+    /// These are the losses [`SHARP_DROP_FRACTION`] was never going to catch.
+    /// On the rc0547b run `Calls` fell 1279 to 1268, which is 0.9% of the kind
+    /// and nowhere near the threshold, over a graph whose entity count did not
+    /// move at all. No code was removed and eleven call edges were, and there
+    /// is no magnitude at which that is ordinary.
+    pub fn unexplained_slips(&self) -> Vec<&CensusChange> {
+        if !self.entities_held() {
+            return Vec::new();
+        }
+        self.changes
+            .iter()
+            .filter(|change| change.movement == CensusMovement::Slipped)
+            .collect()
     }
 
     /// The kinds that disappeared entirely.
@@ -334,8 +432,13 @@ impl RelationCensusComparison {
     }
 
     /// Whether the pair withholds the all-clear.
+    ///
+    /// A vanished kind and a sharp fall do at any entity count. A slip does
+    /// only when the entity count held, which is what makes it a regression
+    /// rather than a smaller store.
     pub fn reports_loss(&self) -> bool {
         self.changes.iter().any(|change| change.movement.is_loss())
+            || !self.unexplained_slips().is_empty()
     }
 
     /// The clause naming why coverage fell, when the cause is known.
@@ -368,6 +471,15 @@ impl RelationCensusComparison {
             _ => String::new(),
         };
         let cause = self.cause_clause();
+        let entities = match (self.previous_entities, self.current_entities) {
+            (Some(previous), Some(current)) if current == previous => {
+                format!(", while the entity count held at {current}")
+            }
+            (Some(previous), Some(current)) => {
+                format!(", while the entity count grew {previous} to {current}")
+            }
+            _ => String::new(),
+        };
         self.vanished()
             .into_iter()
             .map(|change| {
@@ -382,6 +494,14 @@ impl RelationCensusComparison {
                     "relation kind {} fell beyond {:.0}% of its edges: {}{recorded}{cause}",
                     change.kind,
                     SHARP_DROP_FRACTION * 100.0,
+                    change.describe()
+                )
+            }))
+            .chain(self.unexplained_slips().into_iter().map(|change| {
+                format!(
+                    "relation kind {} lost edges with no entity removed: {}{entities}{recorded}\
+                     {cause}",
+                    change.kind,
                     change.describe()
                 )
             }))
@@ -448,10 +568,15 @@ impl RelationCensusComparison {
     }
 
     fn loss_summary(&self) -> String {
+        let unexplained: Vec<&String> = self
+            .unexplained_slips()
+            .into_iter()
+            .map(|change| &change.kind)
+            .collect();
         let losses: Vec<String> = self
             .changes
             .iter()
-            .filter(|change| change.movement.is_loss())
+            .filter(|change| change.movement.is_loss() || unexplained.contains(&&change.kind))
             .map(|change| change.describe())
             .collect();
         losses.join(", ")
@@ -538,6 +663,68 @@ pub fn write(layout: &KinLayout, recorded: &RelationCensus) -> std::io::Result<(
     }
     sync_directory_metadata(parent)?;
     Ok(())
+}
+
+/// What [`record`] did with the census it was handed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CensusRecordOutcome {
+    /// The census did not lose ground, so it is the new baseline.
+    Advanced,
+    /// The census lost ground, so the previous baseline stays and the loss is
+    /// named. The recorded comparison point is the one in `held_at`.
+    Held {
+        held_at: DateTime<Utc>,
+        held_source: CensusSource,
+        losses: Vec<String>,
+    },
+    /// The record could not be written. The previous baseline stays, which is
+    /// the safe direction: a longer window reports more movement, not less.
+    Failed(String),
+}
+
+/// Record `census` as the store's baseline, unless it lost ground.
+///
+/// This is the write half of the rule the module doc states. A baseline is a
+/// claim that the graph was last known good at that point, so a census holding
+/// fewer edges than the one it would replace is not eligible to become one. A
+/// losing pass leaves the previous record untouched and returns [`Held`], and
+/// every later `kin graph status` and `kin doctor` keeps comparing the live
+/// graph against the last verified-good census until the graph recovers.
+///
+/// That ordering is the whole point. The rc0547b commit measured its own
+/// post-commit census and wrote it, so the next comparison was the losing graph
+/// against itself and found nothing; the two recovery sweeps that followed each
+/// advanced the baseline again over the same loss. Under this rule the commit's
+/// census is refused, the pre-commit sweep census stays the comparison point,
+/// and neither sweep can move it while the store is still short.
+///
+/// It clears itself. Once the graph holds what it held, the next census no
+/// longer loses ground against the baseline and becomes the new one, so
+/// enrichment jitter that dips and recovers costs one held pass rather than a
+/// permanent warning. A store that genuinely shrank advances too, because a
+/// slip beside a fallen entity count is not a loss.
+///
+/// [`Held`]: CensusRecordOutcome::Held
+pub fn record(layout: &KinLayout, census: &RelationCensus) -> CensusRecordOutcome {
+    let previous = read(layout);
+    if let RelationCensusRead::Recorded(recorded) = &previous {
+        let mut comparison =
+            RelationCensusComparison::build(&previous, &census.kinds, census.causes.clone());
+        if let Some(entities) = census.entities {
+            comparison = comparison.with_current_entities(entities);
+        }
+        if comparison.reports_loss() {
+            return CensusRecordOutcome::Held {
+                held_at: recorded.at,
+                held_source: recorded.source,
+                losses: comparison.loss_lines(),
+            };
+        }
+    }
+    match write(layout, census) {
+        Ok(()) => CensusRecordOutcome::Advanced,
+        Err(error) => CensusRecordOutcome::Failed(error.to_string()),
+    }
 }
 
 #[cfg(unix)]
@@ -829,6 +1016,315 @@ mod tests {
             "{}",
             comparison.summary_line()
         );
+    }
+
+    /// The rc0547b case, in its own numbers. A 26-line docstring commit on
+    /// `psf/requests` took `Calls` 1279 to 1268 and `Overrides` 11 to 10 while
+    /// the entity count sat at 783 both times. Neither kind is near
+    /// [`SHARP_DROP_FRACTION`], so magnitude alone reports nothing.
+    #[test]
+    fn a_kind_that_slipped_while_the_entity_count_held_is_reported_as_a_loss() {
+        let recorded = RelationCensus::new(
+            at(1_000_000),
+            CensusSource::Sweep,
+            census(&[("Calls", 1279), ("Overrides", 11), ("UsesType", 1829)]),
+            Vec::new(),
+        )
+        .with_entities(783);
+        let comparison = RelationCensusComparison::build(
+            &RelationCensusRead::Recorded(recorded),
+            &census(&[("Calls", 1268), ("Overrides", 10), ("UsesType", 1829)]),
+            Vec::new(),
+        )
+        .with_current_entities(783);
+
+        assert_eq!(
+            movement_of(&comparison.changes, "Calls"),
+            CensusMovement::Slipped,
+            "0.9% is nowhere near the threshold, which is the point"
+        );
+        assert!(
+            comparison.reports_loss(),
+            "eleven call edges gone with no entity removed is a loss: {:?}",
+            comparison.changes
+        );
+        let lines = comparison.loss_lines();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        let rendered = lines.join("\n");
+        assert!(
+            rendered.contains("Calls slipped 1279 to 1268"),
+            "the kind and both counts are named: {rendered}"
+        );
+        assert!(
+            rendered.contains("Overrides slipped 11 to 10"),
+            "the second kind is named too: {rendered}"
+        );
+        assert!(
+            rendered.contains("the entity count held at 783"),
+            "the discriminator is named beside the loss: {rendered}"
+        );
+        let summary = comparison.summary_line();
+        assert!(
+            summary.contains("Calls slipped 1279 to 1268")
+                && summary.contains("Overrides slipped 11 to 10"),
+            "the one row status always prints names both kinds: {summary}"
+        );
+    }
+
+    /// The arm that keeps the rule above from warning on every deletion. Same
+    /// eleven edges, over a store that lost entities to hold them.
+    #[test]
+    fn a_kind_that_slipped_beside_a_fallen_entity_count_is_a_smaller_store() {
+        let recorded = RelationCensus::new(
+            at(1_000_000),
+            CensusSource::Sweep,
+            census(&[("Calls", 1279)]),
+            Vec::new(),
+        )
+        .with_entities(783);
+        let comparison = RelationCensusComparison::build(
+            &RelationCensusRead::Recorded(recorded),
+            &census(&[("Calls", 1268)]),
+            Vec::new(),
+        )
+        .with_current_entities(770);
+
+        assert!(!comparison.entities_held());
+        assert!(
+            !comparison.reports_loss(),
+            "removing code removes its edges: {:?}",
+            comparison.changes
+        );
+        assert!(comparison.loss_lines().is_empty());
+    }
+
+    /// A record written before the entity count existed cannot answer the
+    /// question, and an unknown count must not read as zero. The old magnitude
+    /// rule decides alone there.
+    #[test]
+    fn a_census_with_no_recorded_entity_count_falls_back_to_the_threshold() {
+        let recorded = RelationCensus::new(
+            at(1_000_000),
+            CensusSource::Sweep,
+            census(&[("Calls", 1279)]),
+            Vec::new(),
+        );
+        assert_eq!(recorded.entities, None);
+        let comparison = RelationCensusComparison::build(
+            &RelationCensusRead::Recorded(recorded),
+            &census(&[("Calls", 1268)]),
+            Vec::new(),
+        )
+        .with_current_entities(783);
+
+        assert!(!comparison.entities_held(), "one side is unknown");
+        assert!(!comparison.reports_loss());
+    }
+
+    /// The defect this record's second rule closes. The commit that lost the
+    /// edges must not be allowed to become the point the loss is judged
+    /// against.
+    #[test]
+    fn a_losing_census_does_not_become_the_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout_in(dir.path());
+        let good = RelationCensus::new(
+            at(1_000_000),
+            CensusSource::Sweep,
+            census(&[("Calls", 1279), ("Overrides", 11)]),
+            Vec::new(),
+        )
+        .with_entities(783);
+        assert_eq!(record(&layout, &good), CensusRecordOutcome::Advanced);
+
+        let after_commit = RelationCensus::new(
+            at(1_000_500),
+            CensusSource::Commit,
+            census(&[("Calls", 1268), ("Overrides", 10)]),
+            Vec::new(),
+        )
+        .with_entities(783);
+        match record(&layout, &after_commit) {
+            CensusRecordOutcome::Held {
+                held_at,
+                held_source,
+                losses,
+            } => {
+                assert_eq!(held_at, at(1_000_000));
+                assert_eq!(held_source, CensusSource::Sweep);
+                assert!(
+                    losses
+                        .iter()
+                        .any(|line| line.contains("Calls slipped 1279 to 1268")),
+                    "the refusal names what it refused: {losses:?}"
+                );
+            }
+            other => panic!("a commit that lost edges must not set the baseline, got {other:?}"),
+        }
+        match read(&layout) {
+            RelationCensusRead::Recorded(recorded) => {
+                assert_eq!(recorded.kinds.get("Calls"), Some(&1279));
+                assert_eq!(recorded.at, at(1_000_000));
+            }
+            other => panic!("the verified-good census stays on disk, got {other:?}"),
+        }
+    }
+
+    /// Every recovery attempt on the rc0547b store advanced the baseline again.
+    /// A sweep that reproduces the loss is not evidence of health either.
+    #[test]
+    fn a_sweep_after_a_losing_commit_cannot_bury_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout_in(dir.path());
+        let good = RelationCensus::new(
+            at(1_000_000),
+            CensusSource::Sweep,
+            census(&[("Calls", 1279)]),
+            Vec::new(),
+        )
+        .with_entities(783);
+        record(&layout, &good);
+        let losing = |secs: i64, source| {
+            RelationCensus::new(at(secs), source, census(&[("Calls", 1268)]), Vec::new())
+                .with_entities(783)
+        };
+        assert!(matches!(
+            record(&layout, &losing(1_000_500, CensusSource::Commit)),
+            CensusRecordOutcome::Held { .. }
+        ));
+        assert!(
+            matches!(
+                record(&layout, &losing(1_000_900, CensusSource::Sweep)),
+                CensusRecordOutcome::Held { .. }
+            ),
+            "the first recovery sweep is refused too"
+        );
+        assert!(
+            matches!(
+                record(&layout, &losing(1_001_400, CensusSource::Sweep)),
+                CensusRecordOutcome::Held { .. }
+            ),
+            "and the second"
+        );
+        match read(&layout) {
+            RelationCensusRead::Recorded(recorded) => assert_eq!(recorded.at, at(1_000_000)),
+            other => panic!("expected the original baseline, got {other:?}"),
+        }
+    }
+
+    /// The hold clears itself, so enrichment jitter costs one refused pass
+    /// rather than a permanent warning.
+    #[test]
+    fn a_recovered_census_becomes_the_baseline_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout_in(dir.path());
+        let good = RelationCensus::new(
+            at(1_000_000),
+            CensusSource::Sweep,
+            census(&[("Calls", 1279)]),
+            Vec::new(),
+        )
+        .with_entities(783);
+        record(&layout, &good);
+        record(
+            &layout,
+            &RelationCensus::new(
+                at(1_000_500),
+                CensusSource::Sweep,
+                census(&[("Calls", 1268)]),
+                Vec::new(),
+            )
+            .with_entities(783),
+        );
+        let recovered = RelationCensus::new(
+            at(1_001_000),
+            CensusSource::Sweep,
+            census(&[("Calls", 1279)]),
+            Vec::new(),
+        )
+        .with_entities(783);
+        assert_eq!(record(&layout, &recovered), CensusRecordOutcome::Advanced);
+        match read(&layout) {
+            RelationCensusRead::Recorded(recorded) => assert_eq!(recorded.at, at(1_001_000)),
+            other => panic!("expected the recovered census, got {other:?}"),
+        }
+    }
+
+    /// A store that legitimately shrank keeps moving. Holding here would pin a
+    /// repository's baseline at its largest historical size forever.
+    #[test]
+    fn a_store_that_shrank_advances_the_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout_in(dir.path());
+        record(
+            &layout,
+            &RelationCensus::new(
+                at(1_000_000),
+                CensusSource::Sweep,
+                census(&[("Calls", 1279)]),
+                Vec::new(),
+            )
+            .with_entities(783),
+        );
+        let smaller = RelationCensus::new(
+            at(1_000_500),
+            CensusSource::Commit,
+            census(&[("Calls", 1268)]),
+            Vec::new(),
+        )
+        .with_entities(770);
+        assert_eq!(record(&layout, &smaller), CensusRecordOutcome::Advanced);
+        match read(&layout) {
+            RelationCensusRead::Recorded(recorded) => assert_eq!(recorded.at, at(1_000_500)),
+            other => panic!("expected the smaller store's census, got {other:?}"),
+        }
+    }
+
+    /// A store with nothing recorded has no ground to lose, so the first census
+    /// is always taken.
+    #[test]
+    fn the_first_census_on_a_store_is_always_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout_in(dir.path());
+        assert_eq!(read(&layout), RelationCensusRead::Absent);
+        let first = RelationCensus::new(
+            at(1),
+            CensusSource::Commit,
+            census(&[("Calls", 1)]),
+            Vec::new(),
+        )
+        .with_entities(1);
+        assert_eq!(record(&layout, &first), CensusRecordOutcome::Advanced);
+    }
+
+    /// A whole kind disappearing is refused whatever the entity count did. A
+    /// deletion that removes 2% of a store does not take 100% of a relation
+    /// kind with it.
+    #[test]
+    fn a_vanished_kind_holds_the_baseline_even_over_a_shrinking_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout_in(dir.path());
+        record(
+            &layout,
+            &RelationCensus::new(
+                at(1_000_000),
+                CensusSource::Sweep,
+                census(&[("Calls", 951), ("UsesType", 94)]),
+                Vec::new(),
+            )
+            .with_entities(783),
+        );
+        let stripped = RelationCensus::new(
+            at(1_000_500),
+            CensusSource::Sweep,
+            census(&[("Calls", 940)]),
+            Vec::new(),
+        )
+        .with_entities(770);
+        assert!(matches!(
+            record(&layout, &stripped),
+            CensusRecordOutcome::Held { .. }
+        ));
     }
 
     #[test]

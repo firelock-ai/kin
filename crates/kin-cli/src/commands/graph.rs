@@ -379,16 +379,36 @@ fn kind_census(counts: &HashMap<RelationKind, usize>) -> BTreeMap<String, u64> {
 /// are the cost `kin graph status` is already known for, and the writers of this
 /// record are a sweep and a commit, neither of which should pay it.
 pub fn measure_relation_census(graph: &kin_db::InMemoryGraph) -> Result<BTreeMap<String, u64>> {
+    Ok(measure_relation_census_with_entities(graph)?.0)
+}
+
+/// The census above, and the entity count it was taken beside.
+///
+/// One walk for both, because the pair is only interpretable if the two numbers
+/// describe the same graph at the same instant. The entity count is partitioned
+/// exactly as the `Entities:` line partitions it, external reference targets
+/// excluded, so "the entity count held at 783" in a census warning names the
+/// number the reader is looking at rather than a second total nothing prints.
+/// Counting external targets here would move this number every time an import
+/// resolved differently and turn that into a claim about this repository's own
+/// code.
+pub fn measure_relation_census_with_entities(
+    graph: &kin_db::InMemoryGraph,
+) -> Result<(BTreeMap<String, u64>, u64)> {
     let mut counts: HashMap<RelationKind, usize> = HashMap::new();
     let mut seen = HashSet::new();
+    let mut defined: u64 = 0;
     for entity in graph.list_all_entities()? {
+        if !kin_index::is_external_reference_target(&entity) {
+            defined += 1;
+        }
         for relation in graph.get_all_relations_for_entity(&entity.id)? {
             if seen.insert(relation.id) {
                 *counts.entry(relation.kind).or_insert(0) += 1;
             }
         }
     }
-    Ok(kind_census(&counts))
+    Ok((kind_census(&counts), defined))
 }
 
 /// The one line that answers "how much of this repository can I query".
@@ -662,11 +682,19 @@ fn build_graph_status_response_for_store(
     // own reading, and it renders in every state, including the two where
     // nothing can be compared. A row that fell silent when it had no previous
     // census would be indistinguishable from one reporting a healthy store.
+    //
+    // The entity count goes in beside the kinds because a relation count alone
+    // cannot say whether edges were lost or code was. A store that removed a
+    // module holds fewer `Calls` edges and should; a store whose entity count
+    // did not move and holds eleven fewer of them lost a derivation, which is
+    // what the rc0547b comment-only commit did. This is the same `entity_count`
+    // the `Entities:` line above prints, from the same walk.
     let census_comparison = kin_core::relation_census::RelationCensusComparison::build(
         &census.previous,
         &kind_census(&relation_counts),
         census.causes.clone(),
-    );
+    )
+    .with_current_entities(entity_count as u64);
     lines.push(census_comparison.summary_line());
 
     // Kind distribution
@@ -1924,6 +1952,230 @@ mod tests {
                 .as_ref()
                 .is_some_and(|census| census.reports_loss()),
             "doctor reads the same verdict structurally rather than by parsing prose"
+        );
+    }
+
+    /// Build a graph holding `calls` call edges and `overrides` override edges
+    /// over one fixed entity set, so two graphs differing only in edge count
+    /// report the same entity count.
+    ///
+    /// The entity set is fixed on purpose. The rule under test turns on whether
+    /// the entity count moved, so a fixture that grew or shrank its entities
+    /// between arms would be testing the escape hatch rather than the rule.
+    fn graph_with_edges(
+        entities: &[Entity],
+        calls: usize,
+        overrides: usize,
+    ) -> kin_db::InMemoryGraph {
+        let graph = kin_db::InMemoryGraph::new();
+        for entity in entities {
+            graph.upsert_entity(entity).unwrap();
+        }
+        let root = entities[0].id;
+        for target in entities.iter().skip(1).take(calls) {
+            graph
+                .upsert_relation(&test_relation(RelationKind::Calls, root, target.id))
+                .unwrap();
+        }
+        for target in entities.iter().skip(1).take(overrides) {
+            graph
+                .upsert_relation(&test_relation(RelationKind::Overrides, target.id, root))
+                .unwrap();
+        }
+        graph
+    }
+
+    /// The rc0547b case end to end, in the shape the run produced it.
+    ///
+    /// A comment-only commit on `psf/requests` took `Calls` 1279 to 1268 and
+    /// `Overrides` 11 to 10 over an entity count that did not move, and every
+    /// surface called the store healthy. Two things had to be true for that:
+    /// each drop was far inside the sharp-fall threshold, and the commit wrote
+    /// the baseline it was about to be judged against. This drives both.
+    #[test]
+    fn a_commit_that_loses_edges_without_losing_entities_is_named_and_cannot_reset_its_own_baseline(
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(temp.path()).unwrap();
+        let layout = initialized.layout.clone();
+        let binding =
+            kin_core::LocalRepositoryAuthorityBinding::from_layout(&initialized.layout).unwrap();
+
+        let entities: Vec<Entity> = (0..10)
+            .map(|index| test_entity(&format!("step_{index}")))
+            .collect();
+        let before = graph_with_edges(&entities, 8, 4);
+        let (kinds, entity_count) = measure_relation_census_with_entities(&before).unwrap();
+        assert_eq!(kinds.get("Calls"), Some(&8), "{kinds:?}");
+        assert_eq!(kinds.get("Overrides"), Some(&4), "{kinds:?}");
+        assert_eq!(entity_count, 10);
+
+        let recorded = kin_core::relation_census::RelationCensus::new(
+            chrono::Utc::now(),
+            kin_core::relation_census::CensusSource::Sweep,
+            kinds,
+            Vec::new(),
+        )
+        .with_entities(entity_count);
+        assert_eq!(
+            kin_core::relation_census::record(&layout, &recorded),
+            kin_core::relation_census::CensusRecordOutcome::Advanced,
+            "the pre-commit sweep census is the verified-good baseline"
+        );
+
+        // The control. Same graph, same entity count, nothing lost.
+        let unchanged = build_graph_status_response(
+            &pinned(&binding),
+            &before,
+            &Default::default(),
+            &Default::default(),
+            &kin_core::relation_census::CensusContext::for_layout(
+                &layout,
+                Vec::<(String, String)>::new(),
+            ),
+        )
+        .unwrap();
+        assert!(
+            unchanged
+                .relation_census
+                .as_ref()
+                .is_some_and(|census| !census.reports_loss()),
+            "the control withholds nothing: {}",
+            unchanged.lines.join("\n")
+        );
+
+        // The commit. One call edge and one override edge gone, every entity
+        // still there. 12.5% and 25% of a kind, so neither is a whole-kind
+        // loss and only one reaches the sharp-fall threshold at all.
+        let after = graph_with_edges(&entities, 7, 3);
+        let (after_kinds, after_entities) = measure_relation_census_with_entities(&after).unwrap();
+        assert_eq!(
+            after_entities, entity_count,
+            "the entity count did not move"
+        );
+
+        // The commit offers its own census. Under the rule this test exists
+        // for, it is refused: a losing pass may not become the point the loss
+        // is judged against.
+        let commit_census = kin_core::relation_census::RelationCensus::new(
+            chrono::Utc::now(),
+            kin_core::relation_census::CensusSource::Commit,
+            after_kinds,
+            Vec::new(),
+        )
+        .with_entities(after_entities);
+        assert!(
+            matches!(
+                kin_core::relation_census::record(&layout, &commit_census),
+                kin_core::relation_census::CensusRecordOutcome::Held { .. }
+            ),
+            "the commit that lost the edges must not become the baseline"
+        );
+        // And the recovery sweep the stranger ran twice cannot bury it either.
+        assert!(
+            matches!(
+                kin_core::relation_census::record(
+                    &layout,
+                    &kin_core::relation_census::RelationCensus::new(
+                        chrono::Utc::now(),
+                        kin_core::relation_census::CensusSource::Sweep,
+                        measure_relation_census(&after).unwrap(),
+                        Vec::new(),
+                    )
+                    .with_entities(after_entities),
+                ),
+                kin_core::relation_census::CensusRecordOutcome::Held { .. }
+            ),
+            "a sweep that reproduces the loss is not evidence of health"
+        );
+
+        let lost = build_graph_status_response(
+            &pinned(&binding),
+            &after,
+            &Default::default(),
+            &Default::default(),
+            &kin_core::relation_census::CensusContext::for_layout(
+                &layout,
+                Vec::<(String, String)>::new(),
+            ),
+        )
+        .unwrap();
+        let rendered = lost.lines.join("\n");
+        assert!(
+            rendered.contains("⚠ relation kind Calls lost edges with no entity removed"),
+            "the loss is raised as a warning, which is what withholds the all-clear: {rendered}"
+        );
+        assert!(
+            rendered.contains("Calls slipped 8 to 7"),
+            "the kind and both counts are named: {rendered}"
+        );
+        assert!(
+            rendered.contains("the entity count held at 10"),
+            "the discriminator is named beside the loss: {rendered}"
+        );
+        assert!(
+            lost.relation_census
+                .as_ref()
+                .is_some_and(|census| census.reports_loss()),
+            "doctor reads the same verdict structurally rather than by parsing prose"
+        );
+    }
+
+    /// The arm that stops the rule above from firing on every deletion. Same
+    /// eleven-edge shape, over a store that removed the code holding them.
+    #[test]
+    fn a_commit_that_removed_entities_reports_no_census_loss() {
+        let temp = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(temp.path()).unwrap();
+        let layout = initialized.layout.clone();
+        let binding =
+            kin_core::LocalRepositoryAuthorityBinding::from_layout(&initialized.layout).unwrap();
+
+        let entities: Vec<Entity> = (0..20)
+            .map(|index| test_entity(&format!("step_{index}")))
+            .collect();
+        let before = graph_with_edges(&entities, 16, 8);
+        let (kinds, entity_count) = measure_relation_census_with_entities(&before).unwrap();
+        kin_core::relation_census::record(
+            &layout,
+            &kin_core::relation_census::RelationCensus::new(
+                chrono::Utc::now(),
+                kin_core::relation_census::CensusSource::Sweep,
+                kinds,
+                Vec::new(),
+            )
+            .with_entities(entity_count),
+        );
+
+        // Two entities deleted, and the edges that hung off them with them.
+        // Both kinds fall 12.5%, inside the sharp-fall threshold, so the only
+        // thing that could report this is the rule under test.
+        let after = graph_with_edges(&entities[..18], 14, 7);
+        let (_, after_entities) = measure_relation_census_with_entities(&after).unwrap();
+        assert!(after_entities < entity_count, "the store shrank");
+
+        let smaller = build_graph_status_response(
+            &pinned(&binding),
+            &after,
+            &Default::default(),
+            &Default::default(),
+            &kin_core::relation_census::CensusContext::for_layout(
+                &layout,
+                Vec::<(String, String)>::new(),
+            ),
+        )
+        .unwrap();
+        let rendered = smaller.lines.join("\n");
+        assert!(
+            !rendered.contains("lost edges with no entity removed"),
+            "removing code removes its edges, which is not a regression: {rendered}"
+        );
+        assert!(
+            smaller
+                .relation_census
+                .as_ref()
+                .is_some_and(|census| !census.reports_loss()),
+            "and doctor stays green: {rendered}"
         );
     }
 

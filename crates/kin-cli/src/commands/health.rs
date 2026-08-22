@@ -4242,6 +4242,88 @@ mod tests {
         );
     }
 
+    /// The same pair as `census_pair`, with an entity count on both sides so
+    /// the row can tell a store that lost edges from one that lost code.
+    fn census_pair_with_entities(
+        previous: &[(&str, u64)],
+        previous_entities: u64,
+        current: &[(&str, u64)],
+        current_entities: u64,
+    ) -> kin_core::relation_census::RelationCensusComparison {
+        let recorded = kin_core::relation_census::RelationCensus::new(
+            chrono::Utc::now(),
+            kin_core::relation_census::CensusSource::Sweep,
+            previous
+                .iter()
+                .map(|(kind, count)| ((*kind).to_string(), *count))
+                .collect(),
+            Vec::new(),
+        )
+        .with_entities(previous_entities);
+        kin_core::relation_census::RelationCensusComparison::build(
+            &kin_core::relation_census::RelationCensusRead::Recorded(recorded),
+            &current
+                .iter()
+                .map(|(kind, count)| ((*kind).to_string(), *count))
+                .collect(),
+            Vec::new(),
+        )
+        .with_current_entities(current_entities)
+    }
+
+    /// The rc0547b shape, at the doctor row. Eleven call edges and one override
+    /// edge gone from `psf/requests` after a docstring commit, over 783
+    /// entities both times, and the row read `✓ Relation census ok`.
+    #[test]
+    fn doctor_reports_edges_lost_over_an_unchanged_entity_count() {
+        let check = relation_census_health(&census_pair_with_entities(
+            &[("Calls", 1279), ("Overrides", 11)],
+            783,
+            &[("Calls", 1268), ("Overrides", 10)],
+            783,
+        ));
+        assert!(
+            matches!(check.status, HealthStatus::Stale),
+            "edges gone with no code removed needs attention: {:?} {}",
+            check.status,
+            check.detail
+        );
+        assert!(
+            check.detail.contains("Calls slipped 1279 to 1268"),
+            "the kind and both counts are named: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("Overrides slipped 11 to 10"),
+            "and the second kind: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("the entity count held at 783"),
+            "the row says why this is a regression rather than a deletion: {}",
+            check.detail
+        );
+    }
+
+    /// The counterpart, so the row above cannot be an unconditional warning on
+    /// any downward movement. The same drop over a store that shrank is a
+    /// store that shrank.
+    #[test]
+    fn doctor_stays_green_when_the_edges_left_with_their_entities() {
+        let check = relation_census_health(&census_pair_with_entities(
+            &[("Calls", 1279), ("Overrides", 11)],
+            783,
+            &[("Calls", 1268), ("Overrides", 10)],
+            770,
+        ));
+        assert!(
+            matches!(check.status, HealthStatus::Healthy),
+            "a smaller store is not a regression: {:?} {}",
+            check.status,
+            check.detail
+        );
+    }
+
     /// A store with no baseline cannot answer the question, and must not read
     /// the same as one that kept its coverage.
     #[test]
