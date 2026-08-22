@@ -365,8 +365,13 @@ impl KinLayout {
     }
 }
 
-/// The global home Kin directory `~/.kin` — the cross-repo registry/cache root,
-/// not a servable repo. Returns `None` when no home directory is resolvable.
+/// The real home's `.kin`, which is an install-root identity rather than a
+/// servable repo. Returns `None` when no home directory is resolvable.
+///
+/// It is not where the cross-repo registry necessarily lives. That file follows
+/// [`crate::registry::managed_kin_home`], so this directory holds it only when
+/// `KIN_HOME` is unset. Callers here are asking what a directory *is*, not
+/// where to read the registry.
 pub fn global_home_kin_dir() -> Option<PathBuf> {
     directories::BaseDirs::new().map(|dirs| dirs.home_dir().join(".kin"))
 }
