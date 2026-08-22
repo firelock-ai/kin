@@ -199,6 +199,7 @@ pub async fn run_health_checks() -> HealthReport {
     checks.push(check_commit_memory_headroom());
     checks.push(check_daemon_kill_record());
     checks.push(check_suspended_sweep());
+    checks.push(check_host_memory_pressure());
     checks.push(check_retrieval_profile());
     checks.push(check_update_policy());
     checks.push(check_binary_assessment_load());
@@ -3710,6 +3711,56 @@ fn suspended_sweep_check_for(suspended: Option<&kin_daemon_spawn::SuspendedSweep
         suspended.cause_sentence(),
     )
     .with_manual_fix(suspended.remediation())
+}
+
+/// Whether this store's daemon has declined heavy work because the machine had
+/// no room for it.
+///
+/// The refusal itself is the product working as intended: Kin measured the
+/// pressure and backed off instead of pushing on until the kernel decided. What
+/// would not be working is a refusal nobody can see. Every counter on every
+/// other surface keeps reporting the work as pending, which reads exactly like
+/// a store that is converging, and the daemon that decided is a process nobody
+/// is watching.
+///
+/// Advisory rather than blocking, for the same reason the kill row and the
+/// suspended-sweep row are: this is the host talking, not the install, and a
+/// `kin doctor` that failed over a busy machine would be reporting the wrong
+/// defect. `Degraded` never blocks readiness.
+fn check_host_memory_pressure() -> HealthCheck {
+    const ID: &str = "host_memory_pressure";
+    const LABEL: &str = "Host memory pressure";
+    let cwd = env::current_dir().unwrap_or_default();
+    let Some(layout) = kin_core::KinLayout::discover(&cwd) else {
+        return HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Unsupported,
+            "not in a Kin repository, so there is no store whose work could have been held back",
+        );
+    };
+    host_memory_pressure_check_for(
+        kin_core::memory_pressure::PressureRefusal::read(layout.root()).as_ref(),
+    )
+}
+
+/// Core of [`check_host_memory_pressure`] with the record as its input, so both
+/// branches are testable without a machine that has actually run out of memory.
+fn host_memory_pressure_check_for(
+    refusal: Option<&kin_core::memory_pressure::PressureRefusal>,
+) -> HealthCheck {
+    const ID: &str = "host_memory_pressure";
+    const LABEL: &str = "Host memory pressure";
+    let Some(refusal) = refusal else {
+        return HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Healthy,
+            "no work has been held back on this store for want of memory",
+        );
+    };
+    HealthCheck::new(ID, LABEL, HealthStatus::Degraded, refusal.cause_sentence())
+        .with_manual_fix(refusal.remediation())
 }
 
 /// How much of what this repository admits a language adapter actually parsed.
@@ -8748,6 +8799,41 @@ mod tests {
                 .contains("fetches the model from huggingface.co"),
             "the fetch is still named without a size: {}",
             check.detail
+        );
+    }
+
+    /// The row reports what the daemon declined and stays quiet otherwise, and
+    /// either way it must not change the verdict of the page.
+    ///
+    /// The second half is the half that could break a release. `kin doctor`'s
+    /// aggregate is what the install proof asserts on, so a row that flipped a
+    /// healthy store to unhealthy on a busy machine would fail the gate over
+    /// the host rather than over the install.
+    #[test]
+    fn the_memory_pressure_row_reports_a_refusal_and_never_blocks_readiness() {
+        let quiet = host_memory_pressure_check_for(None);
+        assert!(matches!(quiet.status, HealthStatus::Healthy));
+        assert!(quiet.manual_fix.is_none());
+        assert!(!blocks_readiness(&quiet));
+
+        let refusal = kin_core::memory_pressure::PressureRefusal {
+            work: "lsp-sweep".to_string(),
+            level: "critical".to_string(),
+            reason: "host memory pressure is critical: 11.5 GiB of the 12.0 GiB this container \
+                     allows is in use, so the language-server enrichment sweep did not start."
+                .to_string(),
+            at_unix: 4_800,
+        };
+        let reported = host_memory_pressure_check_for(Some(&refusal));
+        assert!(matches!(reported.status, HealthStatus::Degraded));
+        assert_eq!(reported.detail, refusal.reason);
+        assert!(reported
+            .manual_fix
+            .as_deref()
+            .is_some_and(|fix| fix.contains("more memory")));
+        assert!(
+            !blocks_readiness(&reported),
+            "a busy machine is not a broken install, and this row must never fail the proof"
         );
     }
 

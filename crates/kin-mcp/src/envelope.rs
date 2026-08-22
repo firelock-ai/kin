@@ -340,6 +340,15 @@ pub struct Degraded {
     /// needing a second event to retract it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sweep_suspended: Option<bool>,
+    /// This store's daemon declined heavy work because the machine had no room
+    /// for it, and this store's own record says so. The work is owed rather
+    /// than lost and Kin resumes it once there is room, but until then the
+    /// producer behind some part of this answer is not running, which is the
+    /// same reading a suspended sweep changes and for the same reason. Set from
+    /// the record the daemon writes and the pass that runs next retires, so it
+    /// clears itself rather than needing a second event to retract it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_pressure: Option<bool>,
 }
 
 impl Degraded {
@@ -353,6 +362,7 @@ impl Degraded {
             self.workspace_mismatch,
             self.daemon_killed_by_memory,
             self.sweep_suspended,
+            self.memory_pressure,
         ]
         .into_iter()
         .any(|flag| flag == Some(true))
@@ -383,6 +393,9 @@ impl Degraded {
         }
         if self.sweep_suspended == Some(true) {
             labels.push("sweep_suspended");
+        }
+        if self.memory_pressure == Some(true) {
+            labels.push("memory_pressure");
         }
         labels
     }
@@ -1510,6 +1523,28 @@ impl Envelope {
     ) -> Self {
         if suspended.is_some() {
             self.degraded.sweep_suspended = Some(true);
+        }
+        self
+    }
+
+    /// Stamp that this store's daemon has held heavy work back for want of
+    /// memory.
+    ///
+    /// A flag rather than prose for the reason [`Self::with_suspended_sweep`]
+    /// is one: the caller acting on it is an agent deciding whether an absence
+    /// it just measured is authoritative, and a gap nothing is working on is a
+    /// different answer from a gap a running pass is about to fill. Only a
+    /// structural signal separates them without parsing a sentence.
+    ///
+    /// Absent rather than `false` when nothing was held back, because `None`
+    /// says this envelope makes no claim and a fabricated `false` would say the
+    /// store was checked and found clear on a call that never looked.
+    pub fn with_memory_pressure(
+        mut self,
+        refusal: Option<&kin_core::memory_pressure::PressureRefusal>,
+    ) -> Self {
+        if refusal.is_some() {
+            self.degraded.memory_pressure = Some(true);
         }
         self
     }
@@ -3102,6 +3137,38 @@ mod tests {
             .degraded
             .active_labels()
             .contains(&"sweep_suspended"));
+    }
+
+    /// An agent certifying an absence has to be able to tell a gap nothing is
+    /// working on from a gap a running pass is about to fill, and work Kin
+    /// declined for want of memory is the first kind.
+    #[test]
+    fn held_back_work_is_stamped_and_a_machine_with_room_claims_nothing() {
+        let clear = Envelope::daemon().with_memory_pressure(None);
+        assert_eq!(clear.degraded.memory_pressure, None);
+        assert!(!clear.degraded.any());
+        assert!(!clear.degraded.active_labels().contains(&"memory_pressure"));
+        let json = serde_json::to_string(&clear.degraded).expect("serialize degraded");
+        assert!(
+            !json.contains("memory_pressure"),
+            "an unobserved flag is absent, never false: {json}"
+        );
+
+        let refusal = kin_core::memory_pressure::PressureRefusal {
+            work: "lsp-sweep".to_string(),
+            level: "critical".to_string(),
+            reason: "host memory pressure is critical".to_string(),
+            at_unix: 4_800,
+        };
+        let held = Envelope::daemon().with_memory_pressure(Some(&refusal));
+        assert_eq!(held.degraded.memory_pressure, Some(true));
+        assert!(held.degraded.any());
+        assert!(held.degraded.active_labels().contains(&"memory_pressure"));
+        let json = serde_json::to_string(&held.degraded).expect("serialize degraded");
+        assert!(
+            json.contains("\"memory_pressure\":true"),
+            "a refusal an agent has to reason about is structural: {json}"
+        );
     }
 
     /// Absent rather than `false` on the wire, for the reason every flag in
