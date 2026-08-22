@@ -1026,3 +1026,117 @@ fn the_incremental_linker_keeps_the_module_off_the_functions_call_edges() {
         "a module is not callable on the live path either"
     );
 }
+
+// ── `Optional[T]` names one type, and now the parser agrees ─────────────────
+
+#[test]
+fn an_optional_parameter_annotation_binds_to_the_type_it_wraps() {
+    // `python_annotation_type_name`'s doc has claimed Optional was handled
+    // since it was written, and it was not: it matched a `subscript`, while
+    // tree-sitter-python parses `Optional[T]` in a TYPE position as a
+    // `generic_type`. So every `Optional`-annotated receiver in every
+    // annotated Python repository kept the bare leaf, which is the most common
+    // annotation shape there is after the bare name.
+    let files = vec![
+        parse_py("adapters.py", ADAPTERS_PY),
+        parse_py(
+            "sessions.py",
+            r#"
+from typing import Optional
+
+from adapters import HTTPAdapter
+
+
+class Session:
+    def send(self, request, adapter: Optional[HTTPAdapter]):
+        return adapter.send(request)
+"#,
+        ),
+    ];
+    let target = entity_id(
+        &files,
+        "adapters.py",
+        "HTTPAdapter.send",
+        EntityKind::Method,
+    );
+    let caller = entity_id(&files, "sessions.py", "Session.send", EntityKind::Method);
+
+    let relations = link_cross_file(&files);
+
+    assert!(
+        has_call(&relations, caller, target),
+        "`Optional[HTTPAdapter]` adds None to one type without changing what a \
+         call through it dispatches to, so the receiver is declared"
+    );
+}
+
+#[test]
+fn a_union_of_two_types_leaves_the_receiver_undecided() {
+    // The bound Optional is allowed to cross and nothing else is. Two arms
+    // means two possible destinations, and picking one is a fabricated edge
+    // where the bare-name rule at least discloses that it guessed.
+    let files = vec![
+        parse_py(
+            "adapters.py",
+            r#"
+class HTTPAdapter:
+    def send(self, request):
+        return request
+
+
+class SocketAdapter:
+    def send(self, request):
+        return request
+"#,
+        ),
+        parse_py(
+            "sessions.py",
+            r#"
+from typing import Union
+
+from adapters import HTTPAdapter, SocketAdapter
+
+
+class Session:
+    def send(self, request, adapter: Union[HTTPAdapter, SocketAdapter]):
+        return adapter.send(request)
+"#,
+        ),
+    ];
+    let http = entity_id(
+        &files,
+        "adapters.py",
+        "HTTPAdapter.send",
+        EntityKind::Method,
+    );
+    let socket = entity_id(
+        &files,
+        "adapters.py",
+        "SocketAdapter.send",
+        EntityKind::Method,
+    );
+    let caller = entity_id(&files, "sessions.py", "Session.send", EntityKind::Method);
+
+    let relations = link_cross_file(&files);
+    let resolutions: Vec<Option<RelationResolution>> = [http, socket]
+        .into_iter()
+        .map(|dst| {
+            relations
+                .iter()
+                .find(|r| {
+                    r.kind == RelationKind::Calls
+                        && r.src.as_entity() == Some(caller)
+                        && r.dst.as_entity() == Some(dst)
+                })
+                .map(RelationResolution::of)
+        })
+        .collect();
+
+    assert!(
+        !resolutions
+            .iter()
+            .any(|r| *r == Some(RelationResolution::TypeResolved)),
+        "a two-armed union decides nothing, so neither arm may be published as \
+         type_resolved; got {resolutions:?}"
+    );
+}

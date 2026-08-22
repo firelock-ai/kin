@@ -796,3 +796,261 @@ class Auth:
          the place to say so deliberately"
     );
 }
+
+#[test]
+fn one_class_declaring_one_attribute_twice_answers_with_neither() {
+    // The ambiguity rule's own fixture. Every other fixture here keys two
+    // declarations under two different classes, so the table's collision
+    // branch never ran and a mutant that kept the first entry instead of
+    // dropping both would have survived every one of them. A class that
+    // declares `connection` twice says two things, and a table that answers
+    // anyway invents an edge from a contradiction.
+    let files = vec![
+        parse_py(
+            "adapters.py",
+            r#"
+class HTTPAdapter:
+    def send(self, request):
+        return request
+
+
+class SocketAdapter:
+    def send(self, request):
+        return request
+"#,
+        ),
+        parse_py(
+            "models.py",
+            r#"
+from adapters import HTTPAdapter, SocketAdapter
+
+
+class Response:
+    connection: HTTPAdapter
+    connection: SocketAdapter
+"#,
+        ),
+        parse_py(
+            "auth.py",
+            r#"
+from models import Response
+
+
+class Auth:
+    def handle(self, r: Response, prep):
+        return r.connection.send(prep)
+"#,
+        ),
+    ];
+    let http_send = entity_id(
+        &files,
+        "adapters.py",
+        "HTTPAdapter.send",
+        EntityKind::Method,
+    );
+    let socket_send = entity_id(
+        &files,
+        "adapters.py",
+        "SocketAdapter.send",
+        EntityKind::Method,
+    );
+    let caller = entity_id(&files, "auth.py", "Auth.handle", EntityKind::Method);
+
+    let relations = link_cross_file(&files);
+
+    assert!(
+        !has_call(&relations, caller, http_send),
+        "two declarations of one attribute contradict each other; answering \
+         with the first is a fabricated edge"
+    );
+    assert!(
+        !has_call(&relations, caller, socket_send),
+        "and answering with the last is the same fabrication wearing the other \
+         name"
+    );
+}
+
+// ── The bounds, each pinned by the mutant that would otherwise pass ─────────
+
+#[test]
+fn a_one_hop_declined_receiver_keeps_the_edges_it_had_before_this_change() {
+    // The hand-back is scoped to a DOTTED owner, meaning a name the parser
+    // built from two declarations. Widening it to every declined receiver also
+    // rewrites the one-hop shape FIR-2500 shipped, where a declared type the
+    // repository does not define produces no cross-repo placeholder because
+    // tier (e) refuses its dotted symbol. Whether that is the right answer is
+    // not this change's question; leaving it alone is.
+    let files = vec![parse_py(
+        "client.py",
+        r#"
+from vendor import Transport
+
+
+def run(t: Transport, payload):
+    return t.dispatch(payload)
+"#,
+    )];
+    let caller = entity_id(&files, "client.py", "run", EntityKind::Function);
+
+    let relations = link_cross_file(&files);
+
+    let tokens: Vec<String> = relations
+        .iter()
+        .filter(|r| r.kind == RelationKind::Calls && r.src.as_entity() == Some(caller))
+        .flat_map(|r| r.evidence.iter())
+        .filter_map(|e| e.token.clone())
+        .collect();
+
+    assert!(
+        !tokens.iter().any(|t| t == "t.dispatch"),
+        "a ONE-hop declined receiver must keep the behaviour it shipped with; \
+         the two-hop hand-back may not reach it, got {tokens:?}"
+    );
+}
+
+#[test]
+fn a_deeper_chain_does_not_bind_to_a_class_that_shares_the_attributes_name() {
+    // Why the one-attribute bound is load-bearing rather than tidy. Admitting
+    // `r.inner.connection` would build the owner `Response.inner.connection`,
+    // and the tier above reads a dotted owner as a module path: binding
+    // `Response`, leaf `connection`. A repository holding a class actually
+    // named `connection` therefore captures the call, and the edge points at a
+    // class the source never mentioned.
+    let files = vec![
+        parse_py("adapters.py", ADAPTERS_PY),
+        parse_py(
+            "models.py",
+            r#"
+from adapters import HTTPAdapter
+
+
+class connection:
+    def send(self, request):
+        return request
+
+
+class Inner:
+    connection: HTTPAdapter
+
+
+class Response:
+    inner: Inner
+"#,
+        ),
+        parse_py(
+            "auth.py",
+            r#"
+from models import Response
+
+
+class Auth:
+    def handle(self, r: Response, prep):
+        return r.inner.connection.send(prep)
+"#,
+        ),
+    ];
+    let decoy = entity_id(&files, "models.py", "connection.send", EntityKind::Method);
+    let caller = entity_id(&files, "auth.py", "Auth.handle", EntityKind::Method);
+
+    let relations = link_cross_file(&files);
+
+    assert!(
+        !has_call(&relations, caller, decoy),
+        "a three-hop receiver must not resolve through a class whose NAME \
+         happens to match the middle attribute; that is a fabricated edge, and \
+         it is what admitting a deeper chain buys"
+    );
+}
+
+#[test]
+fn an_optional_annotation_declares_its_one_type_and_not_its_wrapper() {
+    // Why the declaration is matched to its edge by byte offset. The type walk
+    // emits a reference for EVERY name an annotation carries, so
+    // `Optional[HTTPAdapter]` in a file that imports `Optional` produces two.
+    // Stamping the attribute on both makes the class declare `connection`
+    // twice, the ambiguity rule then drops it, and a call the source spells out
+    // resolves to nothing.
+    let files = vec![
+        parse_py("adapters.py", ADAPTERS_PY),
+        parse_py(
+            "models.py",
+            r#"
+from typing import Optional
+
+from adapters import HTTPAdapter
+
+
+class Response:
+    connection: Optional[HTTPAdapter]
+"#,
+        ),
+        parse_py("auth.py", AUTH_PY),
+    ];
+    let target = entity_id(
+        &files,
+        "adapters.py",
+        "HTTPAdapter.send",
+        EntityKind::Method,
+    );
+    let caller = entity_id(
+        &files,
+        "auth.py",
+        "HTTPDigestAuth.handle_401",
+        EntityKind::Method,
+    );
+
+    let relations = link_cross_file(&files);
+
+    assert!(
+        has_call(&relations, caller, target),
+        "`Optional[HTTPAdapter]` names one type and adds None to it, so the \
+         attribute is declared and the call must bind"
+    );
+}
+
+#[test]
+fn an_import_inside_a_with_block_is_not_admitted_today() {
+    // The guarded-import allowlist is an enumeration, so it is a decision and
+    // needs a fixture saying so. `if`, `elif`, `else`, `try`, `except` and
+    // `finally` are admitted because a type-only or optional import lives
+    // there. A `with` block is not, and widening the walk to every node would
+    // take that on unmeasured. If this starts binding, the allowlist grew and
+    // this is the place to say it was meant to.
+    let files = vec![
+        parse_py("adapters.py", ADAPTERS_PY),
+        parse_py(
+            "models.py",
+            r#"
+import contextlib
+
+with contextlib.suppress(ImportError):
+    from adapters import HTTPAdapter
+
+
+class Response:
+    connection: HTTPAdapter
+"#,
+        ),
+        parse_py("auth.py", AUTH_PY),
+    ];
+    let target = entity_id(
+        &files,
+        "adapters.py",
+        "HTTPAdapter.send",
+        EntityKind::Method,
+    );
+    let caller = entity_id(
+        &files,
+        "auth.py",
+        "HTTPDigestAuth.handle_401",
+        EntityKind::Method,
+    );
+
+    let relations = link_cross_file(&files);
+
+    assert!(
+        !has_call(&relations, caller, target),
+        "a `with`-nested import is outside the admitted guards today; a change \
+         in this answer means the allowlist moved deliberately"
+    );
+}

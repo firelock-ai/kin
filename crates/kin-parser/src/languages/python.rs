@@ -1753,6 +1753,30 @@ fn python_annotation_type_node<'tree>(
     };
     match inner.kind() {
         "identifier" | "attribute" => Some(inner),
+        // `Optional[T]` in a TYPE position is a `generic_type`, never a
+        // `subscript`: tree-sitter-python routes an annotation through its own
+        // `type` rule, whose wrapper form is `identifier` plus
+        // `type_parameter`. The subscript arm below therefore never matched an
+        // annotation, and this function's own doc comment has claimed Optional
+        // was handled since it was written. `Union[T, U]` and every other
+        // multi-argument wrapper still declines here, because a receiver whose
+        // type is undecided must keep the bare-name behaviour.
+        "generic_type" => {
+            let wrapper = inner.named_child(0)?.utf8_text(source).ok()?;
+            if !matches!(wrapper, "Optional" | "typing.Optional") {
+                return None;
+            }
+            let parameters = inner
+                .named_child(1)
+                .filter(|node| node.kind() == "type_parameter")?;
+            let mut cursor = parameters.walk();
+            let mut arguments = parameters.named_children(&mut cursor);
+            let argument = arguments.next()?;
+            if arguments.next().is_some() {
+                return None;
+            }
+            python_annotation_type_node(&argument, source)
+        }
         "subscript" => {
             let value = inner.child_by_field_name("value")?;
             let wrapper = value.utf8_text(source).ok()?;
