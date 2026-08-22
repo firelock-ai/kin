@@ -866,9 +866,7 @@ where
             // budget elision: a cap and a budget are different causes recovered
             // by different levers, and `Elision::reason` exists so one cannot
             // be read as the other.
-            if total_tokens + tokens > budget_max
-                && admitted_groups.contains(group::DEPENDENCIES)
-            {
+            if total_tokens + tokens > budget_max && admitted_groups.contains(group::DEPENDENCIES) {
                 selection.refuse(group::DEPENDENCIES, entity.id);
                 continue;
             }
@@ -906,8 +904,7 @@ where
                 }
                 let content = format_work_item(&item);
                 let tokens = estimate_tokens(&content);
-                if total_tokens + tokens > budget_max
-                    && admitted_groups.contains(group::WORK_ITEMS)
+                if total_tokens + tokens > budget_max && admitted_groups.contains(group::WORK_ITEMS)
                 {
                     selection.refuse(group::WORK_ITEMS, *eid);
                     continue;

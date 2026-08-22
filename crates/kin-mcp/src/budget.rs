@@ -342,11 +342,7 @@ pub fn record_elision_for(
         Some(prior) => {
             let mut merged =
                 Elision::for_reason(kept, prior.elided.saturating_add(elided), &prior.reason);
-            if !merged
-                .reason
-                .split(", ")
-                .any(|already| already == reason)
-            {
+            if !merged.reason.split(", ").any(|already| already == reason) {
                 merged.reason.push_str(", ");
                 merged.reason.push_str(reason);
             }
@@ -745,12 +741,7 @@ fn run_ladder(
             // not what a caller keys on. `elisions` is the one map that answers
             // "did this response lose anything", and until now inline source
             // could go without appearing in it at all.
-            record_elision(
-                payload,
-                "body",
-                carrying.saturating_sub(stripped),
-                stripped,
-            );
+            record_elision(payload, "body", carrying.saturating_sub(stripped), stripped);
         }
         if measure(payload) <= target {
             disclose(payload, budget, started_at, &cuts, &remediations);
@@ -2086,7 +2077,11 @@ mod tests {
         assert_eq!(elision["total"], json!(30), "{payload}");
         assert_eq!(elision["kept"], json!(kept), "{payload}");
         assert_eq!(elision["elided"], json!(30 - kept), "{payload}");
-        assert_eq!(withheld, 30 - kept, "the scalar and the map must agree: {payload}");
+        assert_eq!(
+            withheld,
+            30 - kept,
+            "the scalar and the map must agree: {payload}"
+        );
         let reason = elision["reason"].as_str().unwrap();
         assert!(
             reason.contains(ELISION_REASON_TOKEN_BUDGET) && reason.contains(ELISION_REASON_BUDGET),

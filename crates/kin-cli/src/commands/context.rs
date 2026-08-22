@@ -286,12 +286,7 @@ pub fn build_context_response(
         format!(
             "  Dependencies: {} entries{}",
             dependencies_returned,
-            dependency_selection_note(
-                &selection,
-                dependencies_returned,
-                &elisions,
-                max_tokens
-            )
+            dependency_selection_note(&selection, dependencies_returned, &elisions, max_tokens)
         ),
         format!(
             "  Dependents: {} entries{}",
@@ -322,7 +317,11 @@ pub fn build_context_response(
         lines.push(format!(
             "  Raise --budget above {max_tokens} to recover the {total_elided} \
              {} the token budget withheld.",
-            if total_elided == 1 { "entry" } else { "entries" }
+            if total_elided == 1 {
+                "entry"
+            } else {
+                "entries"
+            }
         ));
     }
     lines.push(String::new());
@@ -935,7 +934,11 @@ mod tests {
     fn a_whole_pack_carries_no_budget_note_at_all() {
         let (graph, _) = calling_graph(2);
         let whole = context_for(&graph, "32k");
-        assert!(whole.budget_elisions.is_empty(), "{:?}", whole.budget_elisions);
+        assert!(
+            whole.budget_elisions.is_empty(),
+            "{:?}",
+            whole.budget_elisions
+        );
         let rendered = whole.lines.join("\n");
         assert!(
             !rendered.contains("withheld by the"),
