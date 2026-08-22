@@ -220,6 +220,10 @@ impl LanguageAdapter for PythonAdapter {
         let mut entities = Vec::new();
         let mut relations = Vec::new();
         let mut imports = Vec::new();
+        // Names a module-scope guard binds. Not `FileImport`s: see
+        // [`collect_python_guarded_imports`] for why admitting them there cost
+        // measured recall on a real repository.
+        let mut guarded_imports: Vec<FileImport> = Vec::new();
         let mut call_audit = PythonCallExtractionAudit::default();
         let mut value_refs = Vec::new();
         let root = tree.root_node();
@@ -242,7 +246,8 @@ impl LanguageAdapter for PythonAdapter {
                 &mut call_audit,
                 &mut value_refs,
             );
-            // Extract imports at top level
+            // Extract imports at top level, plus the guarded ones that only
+            // bind names for annotations.
             match child.kind() {
                 "import_statement" => {
                     if let Some(import) = extract_py_import(&child, source) {
@@ -259,6 +264,7 @@ impl LanguageAdapter for PythonAdapter {
                     // Module-scope statements. `HANDLERS = {"ingest": cmd_ingest}`
                     // at module level names its target exactly as a body statement
                     // would, so the module entity sources those references.
+                    collect_python_guarded_imports(&child, source, &mut guarded_imports);
                     if !module_name.is_empty() {
                         collect_python_value_refs(
                             &child,
@@ -285,6 +291,7 @@ impl LanguageAdapter for PythonAdapter {
         // Build import lookup: local_name -> module_path
         let import_map: std::collections::HashMap<&str, &str> = imports
             .iter()
+            .chain(guarded_imports.iter())
             .flat_map(|imp| {
                 imp.specifiers
                     .iter()
@@ -311,16 +318,26 @@ impl LanguageAdapter for PythonAdapter {
             });
         }
 
-        emit_python_value_references(value_refs, &entities, &imports, &mut relations);
+        emit_python_value_references(
+            value_refs,
+            &entities,
+            &imports,
+            &guarded_imports,
+            &mut relations,
+        );
 
         // Annotate Calls/References relations with import_source.
         //
-        // A receiver-bearing call is skipped: its `dst_name` is an attribute
+        // A receiver-bearing CALL is skipped: its `dst_name` is an attribute
         // read off some object, not the local binding an import introduced, so
         // matching it against the import map pins `obj.get(...)` to whatever
-        // module happened to export a name called `get`.
+        // module happened to export a name called `get`. A receiver on a
+        // `References` edge means something else entirely, the class attribute
+        // whose type the edge declares, and its `dst_name` IS the local binding
+        // the import introduced, so skipping it there dropped the pin that
+        // tells the linker which module the annotated type came from.
         for rel in &mut relations {
-            if rel.receiver.is_some() {
+            if rel.kind == kin_model::RelationKind::Calls && rel.receiver.is_some() {
                 continue;
             }
             if matches!(
@@ -494,12 +511,18 @@ fn extract_py_node(
                             member.kind(),
                             "function_definition" | "class_definition" | "decorated_definition"
                         ) {
+                            let before = value_refs.len();
                             collect_python_value_refs(
                                 &member,
                                 source,
                                 &name,
                                 &std::collections::HashSet::new(),
                                 value_refs,
+                            );
+                            stamp_class_attribute_declaration(
+                                &member,
+                                source,
+                                &mut value_refs[before..],
                             );
                         }
                     }
@@ -628,6 +651,16 @@ struct PythonValueRef {
     /// lines has three reference sites and a row reporting one of them would
     /// under-report while its completeness flag read true.
     site: RelationSite,
+    /// The class attribute this reference DECLARES the type of, set only for a
+    /// class body's own `attribute: Type` annotation.
+    ///
+    /// `class Response: connection: HTTPAdapter` already emitted a reference
+    /// from `Response` to `HTTPAdapter`, and that edge alone cannot say which
+    /// attribute holds that type. Carrying the attribute is what lets the
+    /// linker join `r.connection.send(...)` under `r: Response` to
+    /// `HTTPAdapter.send`: the first hop is declared in the calling scope, the
+    /// second on a class the calling file may never open.
+    attribute: Option<String>,
 }
 
 /// Collect the references made by one `function_definition`, sourced from the
@@ -810,6 +843,7 @@ fn collect_python_value_refs(
                         root: name.to_string(),
                         member: None,
                         site: site_from_node(node),
+                        attribute: None,
                     });
                 }
             }
@@ -831,6 +865,7 @@ fn collect_python_value_refs(
                                 root: root.to_string(),
                                 member: Some(leaf.to_string()),
                                 site: site_from_node(node),
+                                attribute: None,
                             });
                         }
                     }
@@ -939,6 +974,7 @@ fn collect_python_type_refs(
                         root: name.to_string(),
                         member: None,
                         site: site_from_node(node),
+                        attribute: None,
                     });
                 }
             }
@@ -960,6 +996,7 @@ fn collect_python_type_refs(
                                 root: root.to_string(),
                                 member: Some(leaf.to_string()),
                                 site: site_from_node(node),
+                                attribute: None,
                             });
                         }
                     }
@@ -983,6 +1020,7 @@ fn collect_python_type_refs(
                             root: text.to_string(),
                             member: None,
                             site: site_from_node(&content),
+                            attribute: None,
                         });
                     }
                 }
@@ -1027,13 +1065,14 @@ fn emit_python_value_references(
     value_refs: Vec<PythonValueRef>,
     entities: &[ExtractedEntity],
     imports: &[FileImport],
+    guarded_imports: &[FileImport],
     relations: &mut Vec<ExtractedRelation>,
 ) {
     let defined: std::collections::HashSet<&str> =
         entities.iter().map(|e| e.name.as_str()).collect();
     let mut module_bound: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut symbol_bound: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for import in imports {
+    for import in imports.iter().chain(guarded_imports) {
         for spec in &import.specifiers {
             // `import parsing` binds the module itself under its own path;
             // `from parsing import TAG_RE` binds a symbol out of it.
@@ -1076,7 +1115,13 @@ fn emit_python_value_references(
         relations.push(ExtractedRelation {
             site: Some(value_ref.site),
             call_shape: None,
-            receiver: None,
+            // Set only for a class body's own `attribute: Type` annotation,
+            // where it names the attribute whose type this edge declares. The
+            // field is otherwise the receiver a `Calls` edge was written
+            // through; both spellings answer the same question, which holder
+            // does this edge hang off, and reusing it keeps the parser/linker
+            // seam byte-identical rather than versioning it for one join.
+            receiver: value_ref.attribute,
             kind: kin_model::RelationKind::References,
             src_name: value_ref.src_name,
             dst_name: dst,
@@ -1368,8 +1413,18 @@ fn extract_named_callee(
             let declared_owner = receiver_text
                 .as_deref()
                 .and_then(|receiver| receiver_types.get(receiver));
-            match (class_ctx, declared_owner) {
-                (Some(cls), _) if self_or_cls_receiver => PythonNamedCallee {
+            // The two-hop receiver. Nothing here declares `r.connection`, but
+            // the scope declares `r: Response`, so the owner half becomes
+            // `Response.connection`: the class whose body settles the second
+            // hop, and the attribute to ask it about. The linker owns that
+            // lookup because the declaration lives on another class in another
+            // file, which is exactly why the one-hop tier could not see it.
+            let declared_attribute_path = declared_owner
+                .is_none()
+                .then(|| python_declared_attribute_path(receiver_text.as_deref()?, receiver_types))
+                .flatten();
+            match (class_ctx, declared_owner, declared_attribute_path) {
+                (Some(cls), _, _) if self_or_cls_receiver => PythonNamedCallee {
                     name: format!("{cls}.{attr}"),
                     resolution_proven: true,
                     receiver: None,
@@ -1381,9 +1436,21 @@ fn extract_named_callee(
                 // from a written path, so a type the repository does not
                 // define falls back to the bare leaf instead of resolving to
                 // nothing.
-                (_, Some(owner)) => PythonNamedCallee {
+                (_, Some(owner), _) => PythonNamedCallee {
                     name: format!("{owner}.{attr}"),
                     resolution_proven: true,
+                    receiver: receiver_text,
+                },
+                // Only half proven: the parse settles which class and which
+                // attribute to ask, and whether the repository declares that
+                // attribute's type is a question this file cannot answer. So
+                // the call still counts against file call coverage exactly as
+                // the bare leaf it would otherwise have been, and a linker that
+                // finds no declaration hands it straight back to the bare-name
+                // rule.
+                (_, None, Some(path)) => PythonNamedCallee {
+                    name: format!("{path}.{attr}"),
+                    resolution_proven: false,
                     receiver: receiver_text,
                 },
                 _ => PythonNamedCallee {
@@ -1416,6 +1483,91 @@ fn extract_named_callee(
 /// right-hand side, so a name the file never annotates has no entry and its
 /// calls keep the bare-leaf behaviour they had before.
 type PythonReceiverTypes = std::collections::HashMap<String, String>;
+
+/// Collect the imports written inside a module-scope guard, which bind names
+/// the flat top-level walk never sees.
+///
+/// `if TYPE_CHECKING:` is where PEP 484 puts an import that exists only so
+/// annotations can name a class without a runtime cycle, and requests puts
+/// `from .adapters import HTTPAdapter` in `models.py` exactly there. A walk
+/// over the module's own children saw none of them, so the file appeared not to
+/// bind the name at all: [`emit_python_value_references`] admits only what a
+/// file defines or imports, which meant every annotation naming such a class
+/// emitted no edge of any kind. `try: import fast except ImportError: import
+/// slow` is the same shape for an optional dependency.
+///
+/// These are kept OUT of the file's `FileImport` list and used only to admit
+/// the names an annotation may bind, because a guarded import is not
+/// interchangeable with a plain one. Feeding it into the linker's import map
+/// widened the tier that settles a bare method name from the one owner a file
+/// imports: `sessions.py` imports `HTTPAdapter` at module scope and
+/// `BaseAdapter` under `TYPE_CHECKING`, both of which declare `send`, so
+/// `Session.send`'s real call to `adapter.send(request)` stopped resolving at
+/// all. That is a measured recall loss on the real repository, so the binding
+/// is admitted exactly where it is needed and nowhere else.
+///
+/// A function-local import is deliberately not reached. This walks the module's
+/// own statements, where a binding is visible to every annotation in the file;
+/// an import inside a function body binds only in that scope.
+fn collect_python_guarded_imports(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    out: &mut Vec<FileImport>,
+) {
+    match node.kind() {
+        "import_statement" => {
+            if let Some(import) = extract_py_import(node, source) {
+                out.push(import);
+            }
+        }
+        "import_from_statement" => {
+            if let Some(import) = extract_py_from_import(node, source) {
+                out.push(import);
+            }
+        }
+        "if_statement" | "elif_clause" | "else_clause" | "try_statement" | "except_clause"
+        | "finally_clause" | "block" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_python_guarded_imports(&child, source, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `Response.connection` for a call written through `r.connection` where the
+/// scope declares `r: Response`, and `None` for every other receiver.
+///
+/// Exactly one attribute hop is admitted. `r.connection.send(prep)` is the
+/// requests shape both hops of which are written down, `r: Response` in the
+/// signature and `connection: HTTPAdapter` on the class. `a.b.c.send()` needs a
+/// second declaration this returns nothing about, so it declines and the call
+/// keeps the bare leaf it already had.
+///
+/// `self` and `cls` are excluded. The enclosing class's own attributes are
+/// already keyed whole (`self.connection`) by [`python_receiver_types`], and
+/// that entry wins before this is consulted; what the exclusion actually costs
+/// is the rarer `def handle(self: BaseAuth, ...)`, where routing `self` through
+/// the repository-wide table would resolve a call through a class the signature
+/// merely annotates. That is new behaviour rather than a restored edge, this
+/// lane measured no demand for it, and the fixture
+/// `an_annotated_self_receiver_is_left_to_the_enclosing_class` says so, so
+/// widening it later is a decision somebody makes on purpose.
+fn python_declared_attribute_path(
+    receiver: &str,
+    receiver_types: &PythonReceiverTypes,
+) -> Option<String> {
+    let (root, attribute) = receiver.split_once('.')?;
+    if root.is_empty() || attribute.is_empty() || attribute.contains('.') {
+        return None;
+    }
+    if root == "self" || root == "cls" {
+        return None;
+    }
+    let root_type = receiver_types.get(root)?;
+    Some(format!("{root_type}.{attribute}"))
+}
 
 /// Collect the receiver types one `function_definition` can dispatch through.
 ///
@@ -1581,21 +1733,55 @@ fn python_self_attribute_path(node: &tree_sitter::Node, source: &[u8]) -> Option
 /// the receiver's type undecided, and a receiver whose type is undecided must
 /// keep the bare-name behaviour rather than pick one arm of it.
 fn python_annotation_type_name(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let named = python_annotation_type_node(node, source)?;
+    let text = named.utf8_text(source).ok()?;
+    (!text.is_empty() && text.split('.').all(|seg| !seg.is_empty())).then(|| text.to_string())
+}
+
+/// The node inside an annotation that names its one type, or `None` when the
+/// annotation names no single type.
+///
+/// Split out from [`python_annotation_type_name`] because a class-body
+/// attribute annotation has to be matched against the reference edge the type
+/// walk already emitted for it, and only the node's own byte offset identifies
+/// that edge unambiguously when a class declares two attributes of one type.
+/// The admitted shapes are the name's: a bare identifier, a dotted path, and
+/// `Optional[T]`, which adds `None` to `T` without changing what a call
+/// through it dispatches to.
+fn python_annotation_type_node<'tree>(
+    node: &tree_sitter::Node<'tree>,
+    source: &[u8],
+) -> Option<tree_sitter::Node<'tree>> {
     let inner = if node.kind() == "type" {
         node.named_child(0)?
     } else {
         *node
     };
     match inner.kind() {
-        "identifier" => inner
-            .utf8_text(source)
-            .ok()
-            .filter(|name| !name.is_empty())
-            .map(str::to_string),
-        "attribute" => {
-            let text = inner.utf8_text(source).ok()?;
-            (!text.is_empty() && text.split('.').all(|seg| !seg.is_empty()))
-                .then(|| text.to_string())
+        "identifier" | "attribute" => Some(inner),
+        // `Optional[T]` in a TYPE position is a `generic_type`, never a
+        // `subscript`: tree-sitter-python routes an annotation through its own
+        // `type` rule, whose wrapper form is `identifier` plus
+        // `type_parameter`. The subscript arm below therefore never matched an
+        // annotation, and this function's own doc comment has claimed Optional
+        // was handled since it was written. `Union[T, U]` and every other
+        // multi-argument wrapper still declines here, because a receiver whose
+        // type is undecided must keep the bare-name behaviour.
+        "generic_type" => {
+            let wrapper = inner.named_child(0)?.utf8_text(source).ok()?;
+            if !matches!(wrapper, "Optional" | "typing.Optional") {
+                return None;
+            }
+            let parameters = inner
+                .named_child(1)
+                .filter(|node| node.kind() == "type_parameter")?;
+            let mut cursor = parameters.walk();
+            let mut arguments = parameters.named_children(&mut cursor);
+            let argument = arguments.next()?;
+            if arguments.next().is_some() {
+                return None;
+            }
+            python_annotation_type_node(&argument, source)
         }
         "subscript" => {
             let value = inner.child_by_field_name("value")?;
@@ -1608,9 +1794,61 @@ fn python_annotation_type_name(node: &tree_sitter::Node, source: &[u8]) -> Optio
                 .children_by_field_name("subscript", &mut cursor)
                 .collect::<Vec<_>>();
             let argument = arguments.pop().filter(|_| arguments.is_empty())?;
-            python_annotation_type_name(&argument, source)
+            python_annotation_type_node(&argument, source)
         }
         _ => None,
+    }
+}
+
+/// Mark the reference a class body's own `attribute: Type` annotation produced
+/// with the attribute it declares.
+///
+/// The type walk has already pushed a reference for every name the annotation
+/// carries, so this stamps rather than emits: no second edge appears, and the
+/// one that exists gains the half it was missing. Matching is by the type
+/// node's own start byte, because a class declaring `a: T` and `b: T` produces
+/// two references to one type and a name match would stamp both.
+fn stamp_class_attribute_declaration(
+    member: &tree_sitter::Node,
+    source: &[u8],
+    refs: &mut [PythonValueRef],
+) {
+    let statement = if member.kind() == "expression_statement" {
+        match member.named_child(0) {
+            Some(inner) => inner,
+            None => return,
+        }
+    } else {
+        *member
+    };
+    if statement.kind() != "assignment" {
+        return;
+    }
+    let (Some(left), Some(annotation)) = (
+        statement.child_by_field_name("left"),
+        statement.child_by_field_name("type"),
+    ) else {
+        return;
+    };
+    // Only a plain name declares an attribute of THIS class. `self.x: T` in a
+    // class body is not valid there, and a subscript or tuple target declares
+    // no single attribute.
+    if left.kind() != "identifier" {
+        return;
+    }
+    let Ok(attribute) = left.utf8_text(source) else {
+        return;
+    };
+    let Some(named) = python_annotation_type_node(&annotation, source) else {
+        return;
+    };
+    if attribute.is_empty() {
+        return;
+    }
+    for value_ref in refs.iter_mut() {
+        if value_ref.site.start_byte == named.start_byte() {
+            value_ref.attribute = Some(attribute.to_string());
+        }
     }
 }
 
@@ -2762,6 +3000,157 @@ class Response:
             .collect();
         edges.sort();
         edges
+    }
+
+    #[test]
+    fn a_type_checking_guarded_import_binds_the_name_its_annotation_uses() {
+        // PEP 484 says an import that exists only for annotations belongs
+        // behind `if TYPE_CHECKING:`, and requests puts
+        // `from .adapters import HTTPAdapter` in `models.py` exactly there. The
+        // import walk read the module's own children only, so the file bound
+        // nothing, the emit filter dropped the annotation, and a class used
+        // only in type positions had zero inbound references anywhere in the
+        // repository.
+        let edges = references_in(
+            "from typing import TYPE_CHECKING\n\nif TYPE_CHECKING:\n    from adapters import HTTPAdapter\n\n\nclass Response:\n    connection: HTTPAdapter\n",
+        );
+        assert!(
+            edges.contains(&("Response".to_string(), "HTTPAdapter".to_string())),
+            "a guarded import must bind the name its annotation reads, got {edges:?}"
+        );
+    }
+
+    #[test]
+    fn an_import_behind_an_import_error_guard_binds_too() {
+        // The optional-dependency spelling of the same shape.
+        let edges = references_in(
+            "try:\n    from fast import Codec\nexcept ImportError:\n    from slow import Codec\n\n\nclass Frame:\n    codec: Codec\n",
+        );
+        assert!(
+            edges.contains(&("Frame".to_string(), "Codec".to_string())),
+            "an import behind an ImportError guard must bind, got {edges:?}"
+        );
+    }
+
+    #[test]
+    fn a_guarded_import_stays_out_of_the_files_import_list() {
+        // The bound, and it is measured rather than stylistic. Feeding a
+        // guarded import into `FileImport` widened the linker tier that settles
+        // a bare method name from the one owner a file imports: real
+        // `sessions.py` imports `HTTPAdapter` at module scope and `BaseAdapter`
+        // under `TYPE_CHECKING`, both declare `send`, and
+        // `Session.send`'s call to `adapter.send(request)` stopped resolving to
+        // anything. A guarded import admits a name for annotations and nothing
+        // else.
+        let adapter = PythonAdapter;
+        let source = b"from typing import TYPE_CHECKING\nfrom adapters import HTTPAdapter\n\nif TYPE_CHECKING:\n    from adapters import BaseAdapter\n\n\nclass Session:\n    fallback: BaseAdapter\n";
+        let tree = adapter.parse(source).unwrap();
+        let output = adapter
+            .extract(&tree, source, &FilePathId::new("sessions.py"))
+            .unwrap();
+        let bound: Vec<&str> = output
+            .imports
+            .iter()
+            .flat_map(|imp| imp.specifiers.iter())
+            .map(|spec| spec.local_name.as_str())
+            .collect();
+        assert!(
+            bound.contains(&"HTTPAdapter"),
+            "a module-scope import is still an import, got {bound:?}"
+        );
+        assert!(
+            !bound.contains(&"BaseAdapter"),
+            "a guarded import must not enter the file's import list, got {bound:?}"
+        );
+        let edges: Vec<(String, String)> = output
+            .relations
+            .iter()
+            .filter(|rel| rel.kind == kin_model::RelationKind::References)
+            .map(|rel| (rel.src_name.clone(), rel.dst_name.clone()))
+            .collect();
+        assert!(
+            edges.contains(&("Session".to_string(), "BaseAdapter".to_string())),
+            "and it must still bind the annotation that reads it, got {edges:?}"
+        );
+    }
+
+    #[test]
+    fn a_function_local_import_is_not_a_module_binding() {
+        // The other side of the bound. An import inside a function body binds
+        // in that scope only, so it must not admit a module-scope annotation.
+        let edges = references_in(
+            "def load():\n    from adapters import HTTPAdapter\n\n    return HTTPAdapter\n\n\nclass Response:\n    connection: HTTPAdapter\n",
+        );
+        assert!(
+            !edges.contains(&("Response".to_string(), "HTTPAdapter".to_string())),
+            "a function-local import must not bind a class-body annotation, got {edges:?}"
+        );
+    }
+
+    #[test]
+    fn a_class_body_annotation_carries_the_attribute_it_declares() {
+        // The declaration half of a two-hop receiver. The reference edge alone
+        // cannot say WHICH attribute holds the type, and without that the
+        // linker cannot join `r.connection.send(...)` under `r: Response`.
+        let adapter = PythonAdapter;
+        let source =
+            b"from adapters import HTTPAdapter\n\n\nclass Response:\n    connection: HTTPAdapter\n";
+        let tree = adapter.parse(source).unwrap();
+        let output = adapter
+            .extract(&tree, source, &FilePathId::new("models.py"))
+            .unwrap();
+        let declared: Vec<(&str, Option<&str>, &str)> = output
+            .relations
+            .iter()
+            .filter(|rel| rel.kind == kin_model::RelationKind::References)
+            .map(|rel| {
+                (
+                    rel.src_name.as_str(),
+                    rel.receiver.as_deref(),
+                    rel.dst_name.as_str(),
+                )
+            })
+            .collect();
+        assert!(
+            declared.contains(&("Response", Some("connection"), "HTTPAdapter")),
+            "the class body's own annotation must name its attribute, got {declared:?}"
+        );
+        assert!(
+            output.relations.iter().any(|rel| {
+                rel.kind == kin_model::RelationKind::References
+                    && rel.dst_name == "HTTPAdapter"
+                    && rel.import_source.as_deref() == Some("adapters")
+            }),
+            "and it must keep the module pin: carrying an attribute on the edge \
+             must not cost it the import_source every other reference gets"
+        );
+    }
+
+    #[test]
+    fn two_attributes_of_one_type_each_name_themselves() {
+        // Matching the declaration to its edge by name alone would stamp both
+        // rows with whichever attribute was seen last, and the linker would
+        // then answer one attribute's join with the other's type.
+        let adapter = PythonAdapter;
+        let source = b"from adapters import HTTPAdapter\n\n\nclass Pair:\n    primary: HTTPAdapter\n    backup: HTTPAdapter\n";
+        let tree = adapter.parse(source).unwrap();
+        let output = adapter
+            .extract(&tree, source, &FilePathId::new("pair.py"))
+            .unwrap();
+        let mut attributes: Vec<&str> = output
+            .relations
+            .iter()
+            .filter(|rel| {
+                rel.kind == kin_model::RelationKind::References && rel.dst_name == "HTTPAdapter"
+            })
+            .filter_map(|rel| rel.receiver.as_deref())
+            .collect();
+        attributes.sort();
+        assert_eq!(
+            attributes,
+            vec!["backup", "primary"],
+            "each annotation must carry its own attribute"
+        );
     }
 
     #[test]

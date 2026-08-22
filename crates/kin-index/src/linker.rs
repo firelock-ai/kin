@@ -480,6 +480,16 @@ struct LinkContext<'a> {
     /// keyed per file because class names repeat across a repo (django alone
     /// has dozens of `Command` classes).
     class_bases_by_file_class: HashMap<(&'a str, &'a str), Vec<&'a str>>,
+    /// (file, class name, attribute) -> the type name that class's body
+    /// declares for that attribute.
+    ///
+    /// This is the repository-wide half of a two-hop receiver. A call written
+    /// `r.connection.send(...)` under `r: Response` arrives owner-qualified as
+    /// `Response.connection.send`, and the declaration settling `connection`
+    /// lives on `Response` in a file the caller may never open. Keyed per file
+    /// because class names repeat across a repository, and the caller resolves
+    /// its root type to one class before asking.
+    declared_attribute_types: HashMap<(&'a str, &'a str, &'a str), &'a str>,
 }
 
 /// Whether two parser-reported languages may participate in a relation inferred
@@ -681,6 +691,13 @@ fn build_link_context<'a>(
         bases.sort_unstable();
     }
 
+    // Step 4: the declared type of every class attribute, from the reference
+    // edge the annotation already produced. Two declarations of one attribute
+    // leave it out entirely rather than picking one, because an ambiguous
+    // entry answers a two-hop join with a fabricated edge and the missing edge
+    // it replaces is the safer wrong answer.
+    let declared_attribute_types = build_declared_attribute_types(files.iter().copied());
+
     LinkContext {
         sorted_universe,
         entity_by_file_name,
@@ -695,7 +712,76 @@ fn build_link_context<'a>(
         import_map,
         include_graph,
         class_bases_by_file_class,
+        declared_attribute_types,
     }
+}
+
+/// (file, class, attribute) -> declared type name, read off the reference edges
+/// a class body's own annotations produced.
+///
+/// The parser stamps the attribute onto that edge, so nothing is re-parsed
+/// here and no edge is invented: the table is a second index over relations the
+/// graph already holds. An attribute two annotations in one class disagree
+/// about is dropped, which is the same fail-closed rule the base-class index
+/// applies to an ambiguous name.
+fn build_declared_attribute_types<'a, I>(files: I) -> HashMap<(&'a str, &'a str, &'a str), &'a str>
+where
+    I: IntoIterator<Item = &'a FileParseData>,
+{
+    let mut declared: HashMap<(&'a str, &'a str, &'a str), &'a str> = HashMap::new();
+    let mut ambiguous: HashSet<(&'a str, &'a str, &'a str)> = HashSet::new();
+    for file in files {
+        for rel in &file.relations {
+            if rel.kind != RelationKind::References {
+                continue;
+            }
+            let Some(attribute) = rel.receiver.as_deref().filter(|a| !a.is_empty()) else {
+                continue;
+            };
+            if rel.src_name.is_empty() || rel.dst_name.is_empty() {
+                continue;
+            }
+            let key = (file.file_path.as_str(), rel.src_name.as_str(), attribute);
+            match declared.get(&key) {
+                Some(seen) if *seen == rel.dst_name.as_str() => {}
+                Some(_) => {
+                    ambiguous.insert(key);
+                }
+                None => {
+                    declared.insert(key, rel.dst_name.as_str());
+                }
+            }
+        }
+    }
+    for key in ambiguous {
+        declared.remove(&key);
+    }
+    declared
+}
+
+/// The method a two-hop declared receiver dispatches to, or `None` when either
+/// declaration is missing.
+///
+/// Three lookups, each of which must succeed on something the source writes
+/// down. The root type resolves to one class through the CALLING file's
+/// imports; that class's own body must declare the attribute; and the
+/// attribute's type resolves to one class through the DECLARING file's
+/// imports, which is where a type-only import of it lives. Nothing is inferred
+/// from an assignment anywhere along the way, so a repository that annotates
+/// nothing gains no edges and loses none.
+fn resolve_two_hop_declared_method(
+    calling_file: &str,
+    root_type: &str,
+    attribute: &str,
+    method: &str,
+    ctx: &LinkContext<'_>,
+) -> Option<EntityId> {
+    let (root_file, root_class) = locate_base_class(calling_file, root_type, ctx)?;
+    let attribute_type =
+        ctx.declared_attribute_types
+            .get(&(root_file.as_str(), root_class.as_str(), attribute))?;
+    let (owner_file, owner_class) = locate_base_class(&root_file, attribute_type, ctx)?;
+    resolve_declared_method(&owner_file, &owner_class, method, ctx)
 }
 
 /// Resolve the name-based relations of a single file into entity-ID relations.
@@ -934,6 +1020,15 @@ fn resolve_one_file(
         // Dotted callees whose owner is NOT a local class (namespace members
         // like `util.finalize()`) skip this tier untouched.
         let mut dst_lookup: &str = rel.dst_name.as_str();
+        // A tier that declines must hand the call back exactly as it arrived.
+        // The two-hop owner half is a name the PARSER wrote from declarations
+        // (`Response.connection.send`), not a path the source spells, so when
+        // no declaration settles it every tier below has to see the bare leaf
+        // the call would otherwise have carried. Without this the dotted name
+        // reached tier (d), whose cross-repo placeholder refuses a dotted
+        // symbol, and four real unresolved-receiver edges in requests
+        // disappeared instead of one appearing.
+        let mut declined_two_hop: Option<ExtractedRelation> = None;
         if rel.kind == RelationKind::Calls {
             if let Some((owner, method)) = split_owner_method(rel.dst_name.as_str()) {
                 let owner_is_class = ctx
@@ -1002,14 +1097,45 @@ fn resolve_one_file(
                             continue;
                         }
                     }
+                    // (a2c) The two-hop receiver. The owner half is itself
+                    // two-part, `Response.connection`: the declared type of
+                    // the receiver's root and the attribute read off it. The
+                    // tier above could not settle it because the declaration
+                    // that does lives on another class in another file, which
+                    // is the whole shape of `r.connection.send(prep)` in
+                    // requests' `auth.py`. Runs after (a2b) has failed, so a
+                    // path the caller wrote down keeps its answer.
+                    if let Some((root_type, attribute)) = split_owner_method(owner) {
+                        if let Some(dst_id) = resolve_two_hop_declared_method(
+                            &file.file_path,
+                            root_type,
+                            attribute,
+                            method,
+                            ctx,
+                        ) {
+                            accumulate_relation(
+                                &mut resolved,
+                                &mut relation_indices,
+                                make_relation(rel, src_id, dst_id, RECEIVER_TYPE_CONFIDENCE),
+                            );
+                            continue;
+                        }
+                    }
                     // The declared type names nothing this repository defines,
                     // or defines no such method. The call keeps the bare leaf
                     // it arrived with before the type was consulted, so the
                     // disclaimed same-name path below runs exactly as it did.
+                    if owner.contains('.') {
+                        declined_two_hop = Some(ExtractedRelation {
+                            dst_name: method.to_string(),
+                            ..rel.clone()
+                        });
+                    }
                     dst_lookup = method;
                 }
             }
         }
+        let rel = declined_two_hop.as_ref().unwrap_or(rel);
 
         // (b) Import-based cross-file resolution. Skipped for a call through an
         // object: `dst_name` is then a member name read off a value, not the
@@ -5418,6 +5544,7 @@ fn link_cross_file_incremental_internal(
         import_map,
         include_graph,
         class_bases,
+        declared_attribute_types,
     } = build_incremental_link_overlays(files, linker);
 
     // Resolve each file independently: every relation's source entity is owned
@@ -5441,6 +5568,7 @@ fn link_cross_file_incremental_internal(
                 &import_map,
                 &include_graph,
                 &class_bases,
+                &declared_attribute_types,
                 completeness,
             );
             if shows_progress_bar(total_files) {
@@ -5480,12 +5608,14 @@ fn link_cross_file_incremental_internal(
 /// state is a file-local dedup set, so this is pure with respect to other files
 /// and safe to run across files in parallel. Mirrors the batch
 /// [`resolve_one_file`].
+#[allow(clippy::too_many_arguments)]
 fn resolve_one_file_incremental(
     file: &FileParseData,
     linker: &IncrementalLinker,
     import_map: &HashMap<&str, HashMap<&str, (&str, &str)>>,
     include_graph: &HashMap<String, Vec<String>>,
     class_bases: &HashMap<String, Vec<(String, Vec<String>)>>,
+    declared_attribute_types: &HashMap<(&str, &str, &str), &str>,
     completeness: Option<&FileParseCompletenessMap>,
 ) -> Vec<Relation> {
     let mut resolved = Vec::new();
@@ -5707,6 +5837,15 @@ fn resolve_one_file_incremental(
         // Extends chain to the defining ancestor; an unresolvable hierarchy
         // falls back to the bare leaf for the tiers below.
         let mut dst_lookup: &str = rel.dst_name.as_str();
+        // A tier that declines must hand the call back exactly as it arrived.
+        // The two-hop owner half is a name the PARSER wrote from declarations
+        // (`Response.connection.send`), not a path the source spells, so when
+        // no declaration settles it every tier below has to see the bare leaf
+        // the call would otherwise have carried. Without this the dotted name
+        // reached tier (d), whose cross-repo placeholder refuses a dotted
+        // symbol, and four real unresolved-receiver edges in requests
+        // disappeared instead of one appearing.
+        let mut declined_two_hop: Option<ExtractedRelation> = None;
         if rel.kind == RelationKind::Calls {
             if let Some((owner, method)) = split_owner_method(rel.dst_name.as_str()) {
                 let owner_is_class = linker
@@ -5774,10 +5913,41 @@ fn resolve_one_file_incremental(
                             continue;
                         }
                     }
+                    // (a2c) mirrors the batch linker's two-hop tier: an owner
+                    // half that is itself `Type.attribute` joins the calling
+                    // scope's declaration of the root to the class body's
+                    // declaration of the attribute, and falls back to the bare
+                    // leaf when either is missing.
+                    if let Some((root_type, attribute)) = split_owner_method(owner) {
+                        if let Some(dst_id) = resolve_two_hop_declared_method_incremental(
+                            &file.file_path,
+                            root_type,
+                            attribute,
+                            method,
+                            linker,
+                            import_map,
+                            class_bases,
+                            declared_attribute_types,
+                        ) {
+                            accumulate_relation(
+                                &mut resolved,
+                                &mut relation_indices,
+                                make_relation(rel, src_id, dst_id, RECEIVER_TYPE_CONFIDENCE),
+                            );
+                            continue;
+                        }
+                    }
+                    if owner.contains('.') {
+                        declined_two_hop = Some(ExtractedRelation {
+                            dst_name: method.to_string(),
+                            ..rel.clone()
+                        });
+                    }
                     dst_lookup = method;
                 }
             }
         }
+        let rel = declined_two_hop.as_ref().unwrap_or(rel);
 
         // (b) Import-based cross-file resolution. Skipped for a call through
         // an object: `dst_name` is then a member name, not an imported binding.
@@ -6145,6 +6315,44 @@ struct IncrementalLinkOverlays<'a> {
     import_map: HashMap<&'a str, HashMap<&'a str, (&'a str, &'a str)>>,
     include_graph: HashMap<String, Vec<String>>,
     class_bases: HashMap<String, Vec<(String, Vec<String>)>>,
+    /// (file, class, attribute) -> declared type name, for the two-hop
+    /// receiver tier. Step-local like `import_map` above rather than merged
+    /// with persistent state like `class_bases`: both halves of a two-hop join
+    /// are read out of relations, and this step's relations are the ones the
+    /// linker holds. A step that re-links one file therefore joins only
+    /// against declarations that step carries, which is the same bound the
+    /// import overlay beside it already has.
+    declared_attribute_types: HashMap<(&'a str, &'a str, &'a str), &'a str>,
+}
+
+/// The incremental mirror of [`resolve_two_hop_declared_method`]. Same three
+/// lookups against the live-edit indexes, so a running daemon answers a
+/// two-hop receiver exactly as a cold index does.
+#[allow(clippy::too_many_arguments)]
+fn resolve_two_hop_declared_method_incremental(
+    calling_file: &str,
+    root_type: &str,
+    attribute: &str,
+    method: &str,
+    linker: &IncrementalLinker,
+    import_map: &HashMap<&str, HashMap<&str, (&str, &str)>>,
+    class_bases: &HashMap<String, Vec<(String, Vec<String>)>>,
+    declared_attribute_types: &HashMap<(&str, &str, &str), &str>,
+) -> Option<EntityId> {
+    let (root_file, root_class) =
+        locate_base_class_incremental(calling_file, root_type, linker, import_map)?;
+    let attribute_type =
+        declared_attribute_types.get(&(root_file.as_str(), root_class.as_str(), attribute))?;
+    let (owner_file, owner_class) =
+        locate_base_class_incremental(&root_file, attribute_type, linker, import_map)?;
+    resolve_declared_method_incremental(
+        &owner_file,
+        &owner_class,
+        method,
+        linker,
+        import_map,
+        class_bases,
+    )
 }
 
 fn build_incremental_link_overlays<'a>(
@@ -6209,6 +6417,7 @@ fn build_incremental_link_overlays<'a>(
         import_map,
         include_graph,
         class_bases,
+        declared_attribute_types: build_declared_attribute_types(files.iter()),
     }
 }
 
@@ -6271,6 +6480,7 @@ fn link_cross_file_incremental_serial(
         import_map,
         include_graph,
         class_bases,
+        declared_attribute_types,
     } = build_incremental_link_overlays(files, linker);
     let per_file_relations: Vec<Vec<Relation>> = files
         .iter()
@@ -6281,6 +6491,7 @@ fn link_cross_file_incremental_serial(
                 &import_map,
                 &include_graph,
                 &class_bases,
+                &declared_attribute_types,
                 None,
             )
         })
