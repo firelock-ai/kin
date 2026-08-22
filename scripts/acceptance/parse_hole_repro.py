@@ -420,11 +420,17 @@ def main(argv):
     if not args.kin:
         print("kin-parse-hole-repro: no kin binary. Pass --kin or set KIN_BIN.")
         return 3
-    kin = os.path.abspath(args.kin)
+    # Absolute, because every command below runs with cwd inside a fixture in a
+    # temp directory. A relative `--daemon target/release/kin-daemon`, which is
+    # exactly what the CI step passes, resolves against that fixture and not
+    # against the checkout, and `kin` then refuses with "explicit KIN_DAEMON_BIN
+    # does not exist". `--kin` was already absolute here and `--daemon` was not,
+    # which is why the suite ran at all and could not reach a verdict.
+    kin = os.path.abspath(os.path.expanduser(args.kin))
     if not os.path.isfile(kin) or not os.access(kin, os.X_OK):
         print("kin-parse-hole-repro: %s is not an executable file" % kin)
         return 3
-    daemon = args.daemon
+    daemon = args.daemon and os.path.abspath(os.path.expanduser(args.daemon))
     if not daemon:
         beside = os.path.join(os.path.dirname(kin), "kin-daemon")
         daemon = beside if os.path.isfile(beside) else None
