@@ -1020,6 +1020,15 @@ fn resolve_one_file(
         // Dotted callees whose owner is NOT a local class (namespace members
         // like `util.finalize()`) skip this tier untouched.
         let mut dst_lookup: &str = rel.dst_name.as_str();
+        // A tier that declines must hand the call back exactly as it arrived.
+        // The two-hop owner half is a name the PARSER wrote from declarations
+        // (`Response.connection.send`), not a path the source spells, so when
+        // no declaration settles it every tier below has to see the bare leaf
+        // the call would otherwise have carried. Without this the dotted name
+        // reached tier (d), whose cross-repo placeholder refuses a dotted
+        // symbol, and four real unresolved-receiver edges in requests
+        // disappeared instead of one appearing.
+        let mut declined_two_hop: Option<ExtractedRelation> = None;
         if rel.kind == RelationKind::Calls {
             if let Some((owner, method)) = split_owner_method(rel.dst_name.as_str()) {
                 let owner_is_class = ctx
@@ -1116,10 +1125,17 @@ fn resolve_one_file(
                     // or defines no such method. The call keeps the bare leaf
                     // it arrived with before the type was consulted, so the
                     // disclaimed same-name path below runs exactly as it did.
+                    if owner.contains('.') {
+                        declined_two_hop = Some(ExtractedRelation {
+                            dst_name: method.to_string(),
+                            ..rel.clone()
+                        });
+                    }
                     dst_lookup = method;
                 }
             }
         }
+        let rel = declined_two_hop.as_ref().unwrap_or(rel);
 
         // (b) Import-based cross-file resolution. Skipped for a call through an
         // object: `dst_name` is then a member name read off a value, not the
@@ -5821,6 +5837,15 @@ fn resolve_one_file_incremental(
         // Extends chain to the defining ancestor; an unresolvable hierarchy
         // falls back to the bare leaf for the tiers below.
         let mut dst_lookup: &str = rel.dst_name.as_str();
+        // A tier that declines must hand the call back exactly as it arrived.
+        // The two-hop owner half is a name the PARSER wrote from declarations
+        // (`Response.connection.send`), not a path the source spells, so when
+        // no declaration settles it every tier below has to see the bare leaf
+        // the call would otherwise have carried. Without this the dotted name
+        // reached tier (d), whose cross-repo placeholder refuses a dotted
+        // symbol, and four real unresolved-receiver edges in requests
+        // disappeared instead of one appearing.
+        let mut declined_two_hop: Option<ExtractedRelation> = None;
         if rel.kind == RelationKind::Calls {
             if let Some((owner, method)) = split_owner_method(rel.dst_name.as_str()) {
                 let owner_is_class = linker
@@ -5912,10 +5937,17 @@ fn resolve_one_file_incremental(
                             continue;
                         }
                     }
+                    if owner.contains('.') {
+                        declined_two_hop = Some(ExtractedRelation {
+                            dst_name: method.to_string(),
+                            ..rel.clone()
+                        });
+                    }
                     dst_lookup = method;
                 }
             }
         }
+        let rel = declined_two_hop.as_ref().unwrap_or(rel);
 
         // (b) Import-based cross-file resolution. Skipped for a call through
         // an object: `dst_name` is then a member name, not an imported binding.
