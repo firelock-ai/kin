@@ -7339,6 +7339,16 @@ async fn sync_filesystem_with_graph_publishing_inner(
                         warn!(error = %e, "failed to apply synced transaction into primary graph");
                         continue;
                     }
+                    // The file's declarations just moved, so whatever a language
+                    // server said about them was said at positions this delta
+                    // retired. The marker claims the opposite, and until it is
+                    // retired the next sweep skips this file, which is how a
+                    // comment-only commit's edge loss survived two recovery
+                    // sweeps on the rc0547b store (FIR-2598).
+                    crate::daemon::retire_enrichment_marker(
+                        state,
+                        &[semantic_repo_path.to_string()],
+                    );
                     if let Err(e) =
                         state.persist_projection_truth_from_reconcile(&reconciler, &outcome)
                     {
