@@ -99,8 +99,11 @@ impl SemanticGitImportPlan {
     /// still re-derived from raw objects and still compared.
     pub fn validate(&self, blob_store: &BlobStore) -> Result<()> {
         let snapshot = self.raw_snapshot();
-        let mut comparison =
-            HeldPlanComparison::new(self, Enrichment::ReapplyHeldDeltas, DETERMINISTIC_DERIVATION)?;
+        let mut comparison = HeldPlanComparison::new(
+            self,
+            Enrichment::ReapplyHeldDeltas,
+            DETERMINISTIC_DERIVATION,
+        )?;
         let derived = derive_semantic_git_history(
             &snapshot,
             blob_store,
@@ -313,7 +316,11 @@ impl<'a> HeldPlanComparison<'a> {
         })?;
         let mut alias = alias;
         if self.enrichment == Enrichment::ReapplyHeldDeltas {
-            let held = self.plan.changes.get(held_index).ok_or_else(|| self.refuse())?;
+            let held = self
+                .plan
+                .changes
+                .get(held_index)
+                .ok_or_else(|| self.refuse())?;
             let old_id = change.id;
             change.parents = change
                 .parents
@@ -418,7 +425,12 @@ fn derive_semantic_git_history(
     snapshot: &LosslessGitRepository,
     blob_store: &BlobStore,
     retention: TreeRetention,
-    visit: &mut dyn FnMut(GitObjectId, SemanticChange, ExternalChangeAlias, &ResolvedTree) -> Result<()>,
+    visit: &mut dyn FnMut(
+        GitObjectId,
+        SemanticChange,
+        ExternalChangeAlias,
+        &ResolvedTree,
+    ) -> Result<()>,
 ) -> Result<DerivedGitHistory> {
     let bodies = validate_snapshot(snapshot, blob_store)?;
     let records = snapshot

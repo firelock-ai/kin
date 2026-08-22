@@ -118,8 +118,10 @@ impl AdmittedSemanticGitImportPlan {
         // the working set is already largest, to check the first.
         let mut checked = 0usize;
         let mut mismatch = false;
-        let derived =
-            derive_admitted_semantic_git_history(&semantic, blob_store, &mut |_oid, admitted, alias| {
+        let derived = derive_admitted_semantic_git_history(
+            &semantic,
+            blob_store,
+            &mut |_oid, admitted, alias| {
                 if self.changes.get(checked) != Some(&admitted)
                     || self.aliases.get(checked) != Some(&alias)
                 {
@@ -127,7 +129,8 @@ impl AdmittedSemanticGitImportPlan {
                 }
                 checked += 1;
                 Ok(())
-            })?;
+            },
+        )?;
 
         if mismatch
             || checked != derived.commits
@@ -350,15 +353,12 @@ fn build_admitted_semantic_git_import_plan(
 ) -> Result<AdmittedSemanticGitImportPlan> {
     let mut changes = Vec::with_capacity(plan.changes.len());
     let mut aliases = Vec::with_capacity(plan.aliases.len());
-    let derived = derive_admitted_semantic_git_history(
-        plan,
-        blob_store,
-        &mut |_oid, admitted, alias| {
+    let derived =
+        derive_admitted_semantic_git_history(plan, blob_store, &mut |_oid, admitted, alias| {
             changes.push(admitted);
             aliases.push(alias);
             Ok(())
-        },
-    )?;
+        })?;
     if changes.len() != plan.changes.len() || aliases.len() != plan.aliases.len() {
         return Err(GitError::InvalidSnapshot(
             "not every imported commit produced one admitted change, alias, and policy".to_string(),
