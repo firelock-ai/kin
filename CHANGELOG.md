@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.48] - 2026-08-22
+
+### Changed
+
+- Run the product acceptance suites on every pull request (#1054)
+
+
 ## [0.5.47] - 2026-08-22
 
 ### Changed
