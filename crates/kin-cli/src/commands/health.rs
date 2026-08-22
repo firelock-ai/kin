@@ -3765,7 +3765,7 @@ fn parse_coverage_row_for_unread_graph(
             ID,
             LABEL,
             HealthStatus::Unsupported,
-            "n/a — not in a Kin repository",
+            "not in a Kin repository, so there is no admitted file set to measure coverage over",
         )),
         GraphStatusForRun::NoDaemon => Err(HealthCheck::new(
             ID,

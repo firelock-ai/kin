@@ -159,8 +159,16 @@ pub fn build_dead_code_response(
     // the ones that produced no entity. Without it the report reads its own
     // coverage off a population that excludes exactly the files a hole is made
     // of.
-    let coverage = kin_core::reference_coverage::collect_reference_edge_coverage(graph)?
-        .with_parse_coverage(kin_core::reference_coverage::collect_parse_coverage(graph)?);
+    // One entity listing for both halves of the coverage reading. Taking it here
+    // rather than inside each collector is what keeps a single scan from cloning
+    // the whole entity table twice.
+    let entities = graph.list_all_entities()?;
+    let coverage =
+        kin_core::reference_coverage::collect_reference_edge_coverage_from(graph, &entities)?
+            .with_parse_coverage(kin_core::reference_coverage::collect_parse_coverage_from(
+                &graph.resolved_tree(),
+                &entities,
+            ));
     build_dead_code_report(graph, &entry_points, &coverage)
 }
 

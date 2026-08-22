@@ -159,8 +159,9 @@ pub(crate) fn inspect_graph_with_entities(
     // from the entity table, and a file that produced no entity is invisible to
     // it by construction: that is exactly the population a parse hole lives in.
     let reference_edge_coverage =
-        kin_core::reference_coverage::collect_reference_edge_coverage(graph)?
-            .with_parse_coverage(kin_core::reference_coverage::collect_parse_coverage(graph)?);
+        kin_core::reference_coverage::collect_reference_edge_coverage(graph)?.with_parse_coverage(
+            kin_core::reference_coverage::collect_parse_coverage_from(&resolved_tree, entities),
+        );
     Ok(build_graph_health_report(
         &stats,
         &supported_inputs,

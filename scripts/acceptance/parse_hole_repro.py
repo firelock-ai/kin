@@ -386,6 +386,10 @@ def main(argv):
                         help="the kin binary under test")
     parser.add_argument("--daemon", default=os.environ.get("KIN_DAEMON_BIN"),
                         help="the kin-daemon beside it")
+    parser.add_argument("--json", dest="json_path", default=None,
+                        help="write the machine-readable report here, for scripts/acceptance/gate.py")
+    parser.add_argument("--label", default=os.environ.get("KIN_ACCEPTANCE_LABEL"),
+                        help="an opaque run label recorded in the report")
     parser.add_argument("--keep", action="store_true", help="keep the fixtures")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--self-test", action="store_true",
@@ -425,6 +429,26 @@ def main(argv):
         print("kin-parse-hole-repro: %d checks, %d pass, %d FAIL, %d UNREADABLE"
               % (len(results), len(results) - len(failed) - len(unreadable),
                  len(failed), len(unreadable)))
+        if args.json_path:
+            # The gate reads this rather than the exit code, because an exit
+            # status is one lever with two settings and a check blocked on
+            # something outside the change under review needs a third.
+            payload = {
+                "suite": "parse_hole_repro",
+                "ticket": TICKET,
+                "label": args.label,
+                "kin": kin,
+                "results": [
+                    {"id": r.id, "ticket": TICKET, "title": r.title,
+                     "status": r.status, "detail": r.detail, "asserts": r.asserts}
+                    for r in results
+                ],
+            }
+            directory = os.path.dirname(os.path.abspath(args.json_path))
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            with open(args.json_path, "w") as handle:
+                json.dump(payload, handle, indent=2, sort_keys=True)
         if failed:
             return 1
         if unreadable:
