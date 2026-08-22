@@ -762,6 +762,23 @@ pub fn read() -> MemoryPressure {
     probe()
 }
 
+/// The memory ceiling this process runs under, measured, whatever
+/// [`PRESSURE_OVERRIDE_ENV`] is pinned to.
+///
+/// The pin says how much pressure to act as though there is. It says nothing
+/// about how large the machine is, and the two are different facts: a budget
+/// derived from the ceiling is derived from a measurement, and pinning a level
+/// must not silently delete it. Without this, forcing any level left a daemon
+/// with no derived budget at all, which is a lever that quietly turns off a
+/// guard rather than exercising it.
+///
+/// `None` when the machine could not be read, which leaves the derived budget
+/// absent for the same reason every other unknown leaves work alone. An
+/// operator budget does not consult this at all and stands on its own.
+pub fn ceiling_bytes() -> Option<u64> {
+    probe().reading().map(|reading| reading.limit_bytes)
+}
+
 /// The level pinned by [`PRESSURE_OVERRIDE_ENV`], when one is pinned.
 ///
 /// A pinned `unknown` arrives as an ordinary unreadable machine, because that
@@ -1563,6 +1580,25 @@ mod tests {
             sentence.contains("of which 0 MiB is in those child processes"),
             "{sentence}"
         );
+    }
+
+    #[test]
+    fn pinning_a_level_does_not_delete_the_measured_ceiling() {
+        // The pin says how much pressure to act as though there is, not how
+        // large the machine is. A lever that quietly turned off the budget
+        // would exercise nothing and hide a guard.
+        let _guard = crate::test_env::EnvVarGuard::set(PRESSURE_OVERRIDE_ENV, "nominal");
+        assert!(
+            matches!(read(), MemoryPressure::Forced { .. }),
+            "the pin is in force"
+        );
+        assert!(read().reading().is_none(), "and it carries no figures");
+        match ceiling_bytes() {
+            Some(ceiling) => assert!(ceiling > 0, "a measured ceiling is a real size"),
+            // A host this process cannot read has no ceiling to report, which
+            // is the same absence every other unknown produces.
+            None => assert!(matches!(probe(), MemoryPressure::Unknown { .. })),
+        }
     }
 
     #[test]

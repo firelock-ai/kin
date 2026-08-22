@@ -1906,7 +1906,14 @@ fn budget_standing(
     pressure: &kin_core::memory_pressure::MemoryPressure,
 ) -> Option<kin_core::memory_pressure::BudgetStanding> {
     let footprint = sample_tree_footprint()?;
-    let ceiling = pressure.reading().map(|reading| reading.limit_bytes);
+    // The reading's own ceiling when it has one, and the machine's otherwise.
+    // A pinned pressure level carries no figures by design, and deriving the
+    // budget from that absence would let the test lever switch the budget off
+    // rather than exercise it.
+    let ceiling = pressure
+        .reading()
+        .map(|reading| reading.limit_bytes)
+        .or_else(kin_core::memory_pressure::ceiling_bytes);
     let budget = kin_core::memory_pressure::FootprintBudget::resolve(ceiling)?;
     Some(kin_core::memory_pressure::BudgetStanding { footprint, budget })
 }

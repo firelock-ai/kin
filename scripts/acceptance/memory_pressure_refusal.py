@@ -96,6 +96,11 @@ TICKET = "FIR-2614"
 # The doctor row and the durable record this suite is about.
 ROW_ID = "host_memory_pressure"
 RECORD_NAME = "memory-pressure"
+FOOTPRINT_NAME = "daemon-footprint"
+
+# The derived budget's own floor, so a published standing can be told from a
+# leftover with a one-byte operator budget in it.
+GIB = 1024 * 1024 * 1024
 
 
 def tail(text, limit=400):
@@ -308,6 +313,17 @@ class Suite(object):
 
     def record_path(self, repo):
         return os.path.join(repo, ".kin", RECORD_NAME)
+
+    def footprint_path(self, repo):
+        return os.path.join(repo, ".kin", FOOTPRINT_NAME)
+
+    def read_published_footprint(self, repo):
+        """The standing this store's daemon published, or None."""
+        try:
+            with open(self.footprint_path(repo)) as handle:
+                return json.load(handle)
+        except (IOError, OSError, ValueError):
+            return None
 
     def read_record(self, repo):
         """The refusal this store records, or None.
@@ -589,7 +605,10 @@ def check_5(suite):
         "5", TICKET,
         "kin status publishes the daemon's footprint against its budget, children named",
     )
-    repo = suite.fixture("budgeted")
+    # Its own store, never one another check has published into. Sharing the
+    # budgeted fixture let this check pass on the record check 4's one-byte arm
+    # had left behind, which is a check that cannot fail for the reason it names.
+    repo = suite.fixture("published")
     rc, out = suite.restart_daemon(repo, pressure="nominal", budget=None)
     if rc != 0:
         result.unknown("could not start a daemon, exit %d: %s" % (rc, tail(out)))
@@ -603,6 +622,20 @@ def check_5(suite):
                    "ask what Kin thinks it is holding. Output: %s" % tail(out, 900))
     else:
         result.ok("kin status names the footprint, the budget and the children")
+
+    # And the number behind the line is this run's derived budget, not a
+    # leftover. A published standing whose budget is a byte is the shape the
+    # stale record had, and it would satisfy the text grader above.
+    published = suite.read_published_footprint(repo)
+    if published is None:
+        result.bad("no standing was published at %s, so the line above came from somewhere "
+                   "this check did not write" % suite.footprint_path(repo))
+    elif not published.get("budget_is_derived") or published.get("budget_bytes", 0) < GIB:
+        result.bad("the published budget is not this run's derived one: %s"
+                   % json.dumps(published))
+    else:
+        result.ok("the published budget is derived and is %d bytes"
+                  % published.get("budget_bytes"))
     return result
 
 
