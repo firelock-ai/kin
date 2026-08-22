@@ -36,13 +36,20 @@ reading the code.
 
 `parse_hole_repro.py` covers what the other two cannot see: a file the
 repository admits that produced no entity at all. It builds a JavaScript library
-of four mutually-requiring modules plus three files an adapter is registered for
-and reads nothing from, and asserts that `kin graph status` withholds its
-all-clear and names the hole, that `kin doctor` carries a `parse_coverage` row
-needing attention that names a file, and that `kin dead-code` refuses rather
-than printing a zero over it. Each check runs the same probe against a control
-repository with no hole and asserts the opposite verdict, so a surface that
-reported unconditionally fails here rather than passing on the control alone.
+of four modules that declare a function beside three that are valid source and
+declare nothing, then asserts that `kin graph status` publishes the per-language
+ratio and names the silent paths, and that `kin doctor` carries a
+`parse_coverage` row that does the same. Each check runs the same probe against
+a control repository whose files all produce entities and asserts that no file
+is named there, so a surface that reported unconditionally fails here rather
+than passing on the control alone.
+
+It asserts no verdict, deliberately. A file that produced no entity is not on
+its own evidence that anything failed: a side-effect script, a re-export and a
+comment-only file each correctly produce nothing, and no graph-owned signal
+separates those from a file an adapter could not read. The doctor row must stay
+`healthy`, and this suite fails if it does not, because a row that went red on
+the count would go red on most JavaScript repositories.
 
 `brownfield_repro.py` covers reference enrichment on two pinned upstream trees,
 `psf/requests` and `expressjs/express`, replayed as single-commit repositories

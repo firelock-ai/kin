@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Firelock, LLC
-"""NON-CITABLE acceptance suite for parse-hole honesty (FIR-2599).
+"""NON-CITABLE acceptance suite for per-language parse coverage (FIR-2599).
 
 Its output is a regression gate, never proof, never investor-facing and never a
 released claim. It shares the CHECK line format, the exit codes and the
@@ -11,14 +11,25 @@ knows one knows all of them.
 What it is for
 --------------
 The rc0547b brownfield stranger measured expressjs/express on v0.5.47 and found
-75 of 141 admitted files producing no entity, with `lib/express.js` among them.
-Every surface a person or an agent reads said the store was fine: `kin graph
-status` printed `No issues detected.`, `kin doctor` agreed, and `kin dead-code`
-printed zeros over the hole. This suite reproduces that shape against a LOCAL
-kin build in seconds and asserts the three surfaces now say so.
+75 of 141 admitted files producing no entity, with `lib/express.js` among them,
+while every surface a person or an agent reads said the store was fine. The page
+already carried a repository-grain count. What it could not say was WHICH
+language and WHICH files, which is the part a reader can act on, and this suite
+holds that.
 
-Every check is paired with its own control on a repository of the same shape
-with no hole, because a surface that reported a hole unconditionally would pass
+What it deliberately does NOT assert
+------------------------------------
+A verdict. A file that produced no entity is not on its own evidence that
+anything failed: a side-effect script, a re-export and a comment-only file each
+correctly produce nothing, and no graph-owned signal separates those from a file
+an adapter could not read. Measured on a five-file JavaScript repository holding
+one real module beside one of each, the ratio reads 1/5, LOWER than the express
+checkout this was built for. So the doctor row must stay `healthy` and this
+suite fails if it does not, because a row that went red on the count would go
+red on most JavaScript repositories.
+
+Every check is paired with its own control on a repository whose files all
+produce entities, because a surface that named files unconditionally would pass
 the first half of each check and is the failure this suite exists to catch.
 
     CHECK <id> <ticket> PASS|FAIL|UNREADABLE <detail>
