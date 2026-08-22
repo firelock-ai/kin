@@ -13461,7 +13461,13 @@ pub(crate) fn decide_language_server_request(
         // stay quiet about that: the flag was simply dead here before, and
         // `kin doctor --install-language-servers` printed an ordinary report
         // and exited 0 having installed nothing.
-        return LanguageServerDecision::Silent;
+        if !request.requested {
+            return LanguageServerDecision::Silent;
+        }
+        return LanguageServerDecision::Explain(vec![
+            "Nothing installed. `--install-language-servers` only runs under `--fix`.".to_string(),
+            "Run `kin doctor --fix --install-language-servers` to install them.".to_string(),
+        ]);
     }
 
     if gap_observed && !request.missing_on_host.is_empty() {

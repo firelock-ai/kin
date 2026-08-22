@@ -556,3 +556,140 @@ fn vfs_status_names_the_bound_root_and_refuses_to_call_an_unserved_one_in_force(
         "Node is projected under the shim since FIR-2572:\n{served}"
     );
 }
+
+/// FIR-2501, as a user reads it, against the real binary.
+///
+/// Kin's own shell hook wraps the control plane as
+/// `kin() { DYLD_INSERT_LIBRARIES= LD_PRELOAD= command kin "$@"; }`, so `kin
+/// doctor` is the one process on a correctly installed machine that is
+/// guaranteed NOT to be running under the shim. The projection row measured
+/// exactly that, called a correct install STALE, and printed a fix that asked
+/// for a new shell the hook would strip the preload from all over again. Since
+/// FIR-2547 made the readiness line require zero attention rows, that denied
+/// "First-run ready" on every hook-installed machine, and both arms of the
+/// v0.5.43 stranger run hit it.
+///
+/// This builds the machine that was failing: a valid shim, a hook file, a
+/// repository bound as the projection root with a listener answering its
+/// socket, and no preload in `kin`'s own environment, which is precisely what
+/// the hook produces. The row must be green, and the two controls below must
+/// take it off green again.
+#[test]
+fn a_correctly_hooked_shell_reads_the_projection_row_green() {
+    let host = Host::new();
+    host.install_shim();
+
+    // The hook file. Existence is all this arm needs: the bound root below is
+    // the measurement, and it is what proves the hook's activate path ran here.
+    let shell_dir = host.kin_home.join("shell");
+    std::fs::create_dir_all(&shell_dir).expect("create shell dir");
+    std::fs::write(
+        shell_dir.join("kin-vfs.bash"),
+        "# kin-vfs bash integration (fixture)\n",
+    )
+    .expect("write hook");
+    std::fs::write(
+        host.kin_home.join(".bashrc"),
+        "source \"$HOME/.kin/shell/kin-vfs.bash\"\n",
+    )
+    .expect("write rc");
+
+    // The repository the hook would have bound, with something answering its
+    // socket. A socket file outlives its daemon, so the listener is real.
+    let repo = host.cwd.join("notekeeper");
+    std::fs::create_dir_all(repo.join(".kin")).expect("create repo");
+    std::fs::write(
+        repo.join(".kin").join("manifest.json"),
+        br#"{"repo_id":"00000000-0000-4000-8000-000000000000"}"#,
+    )
+    .expect("write manifest");
+    let socket = repo.join(".kin").join("vfs.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind fixture socket");
+
+    // `kin` as the hook runs it: the binding exported, the preload stripped.
+    let doctor = |extra: &[(&str, &str)], hook_present: bool| -> Value {
+        let hook = shell_dir.join("kin-vfs.bash");
+        if hook_present {
+            if !hook.exists() {
+                std::fs::write(&hook, "# kin-vfs bash integration (fixture)\n").expect("hook");
+            }
+        } else {
+            let _ = std::fs::remove_file(&hook);
+        }
+        let mut command = Command::new(env!("CARGO_BIN_EXE_kin"));
+        command
+            .env("KIN_HOME", &host.kin_home)
+            .env("HOME", &host.kin_home)
+            .env("SHELL", "/bin/bash")
+            .env("KIN_VFS_BIN", host.bin.join("kin-vfs"))
+            .env("KIN_VFS_WORKSPACE", &repo)
+            .env("KIN_VFS_SOCK", &socket)
+            .env_remove("KIN_VFS_DISABLE")
+            .env_remove("DYLD_INSERT_LIBRARIES")
+            .env_remove("LD_PRELOAD")
+            .current_dir(&repo)
+            .args(["setup", "status", "--json"]);
+        for (key, value) in extra {
+            command.env(key, value);
+        }
+        let output = command.output().expect("run kin setup status");
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "health JSON: {error}; stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })
+    };
+
+    let projection_row = |report: &Value| -> Value {
+        report["checks"]
+            .as_array()
+            .expect("checks is an array")
+            .iter()
+            .find(|check| check["id"] == "projection_mode")
+            .unwrap_or_else(|| panic!("no projection_mode row in {report}"))
+            .clone()
+    };
+
+    let green = projection_row(&doctor(&[], true));
+    assert_eq!(
+        green["status"], "healthy",
+        "a shim injected by a live hook into everything but `kin` itself is a healthy \
+         projection: {green}"
+    );
+    let detail = green["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("IS injected into the processes this shell starts")
+            && detail.contains("correctly NOT injected into `kin` itself"),
+        "the row must not claim this process is shimmed; it must say the opposite and say it is \
+         correct: {detail}"
+    );
+    assert!(
+        green["manual_fix"].is_null(),
+        "a green row must not ask for a repair, least of all a new shell: {green}"
+    );
+
+    // Control one: the hook's own kill switch. It survives the `kin` wrapper
+    // exactly as the binding does, and it proves nothing was injected.
+    let disabled = projection_row(&doctor(&[("KIN_VFS_DISABLE", "1")], true));
+    assert_ne!(
+        disabled["status"], "healthy",
+        "a shell with the projection switched off has no projection in force: {disabled}"
+    );
+
+    // Control two: the container. Same shim, same repository, no hook file, so
+    // nothing in this shell is injected and the row is advisory again with the
+    // new-shell fix that is right for that machine.
+    let container = projection_row(&doctor(&[], false));
+    assert_eq!(
+        container["status"], "stale",
+        "a shim installed with no hook to inject it is still the container case: {container}"
+    );
+    assert!(
+        container["manual_fix"]
+            .as_str()
+            .is_some_and(|fix| fix.contains("interactive shell")),
+        "the container is the machine a new shell actually helps: {container}"
+    );
+}
