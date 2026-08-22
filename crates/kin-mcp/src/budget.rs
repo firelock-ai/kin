@@ -233,8 +233,31 @@ impl BudgetAccounting {
 /// to parse prose.
 pub const ELISION_REASON_BUDGET: &str = "response_budget";
 
+/// The reason code a row cut by a pack's own token budget carries.
+///
+/// Deliberately not [`ELISION_REASON_BUDGET`]. The two budgets cut at different
+/// times, for different reasons, and are raised by different parameters: a
+/// caller widens the response budget with `max_chars` and the pack's with
+/// `token_budget`. A caller told only that something was withheld cannot act,
+/// and one told the wrong lever acts and gets the same answer back.
+pub const ELISION_REASON_TOKEN_BUDGET: &str = "token_budget";
+
+/// The reason code a dependent withheld by the certified-dependents cap
+/// carries. A cap is not a budget: no budget parameter recovers it, so reading
+/// it as one would send a caller to a lever that cannot help.
+pub const ELISION_REASON_DEPENDENTS_CAP: &str = "dependents_cap";
+
 /// Where a payload publishes what its lists lost.
 pub const ELISIONS_KEY: &str = "elisions";
+
+/// Per-row marker naming the budget that took this row's inline source.
+///
+/// A row that simply loses its `body` key is byte-identical to a row from a
+/// `compact: true` call, and sits beside the context pack's own `body: null`
+/// plus `body_unavailable`, which is its vocabulary for source the graph does
+/// not have. Both readings are wrong about a row the budget cut, and neither is
+/// corrected by a count elsewhere in the response: the reader looks at the row.
+pub const BODY_ELIDED_KEY: &str = "body_elided";
 
 /// What one list lost to the response budget.
 ///
@@ -263,13 +286,18 @@ pub struct Elision {
 }
 
 impl Elision {
-    /// One list's loss, from what survived and what did not.
+    /// One list's loss to the response budget.
     pub fn budget(kept: usize, elided: usize) -> Self {
+        Self::for_reason(kept, elided, ELISION_REASON_BUDGET)
+    }
+
+    /// One list's loss, from what survived, what did not, and what took it.
+    pub fn for_reason(kept: usize, elided: usize, reason: &str) -> Self {
         Self {
             elided,
             kept,
             total: kept.saturating_add(elided),
-            reason: ELISION_REASON_BUDGET.to_string(),
+            reason: reason.to_string(),
         }
     }
 }
@@ -283,10 +311,46 @@ impl Elision {
 /// stay beside it, because a client already reading them must not lose its
 /// counter to this change.
 pub fn record_elision(payload: &mut Value, field: &str, kept: usize, elided: usize) {
+    record_elision_for(payload, field, kept, elided, ELISION_REASON_BUDGET);
+}
+
+/// Record one list's elision under a named cause, merging with any already
+/// standing against that field.
+///
+/// One list can be cut twice. A context pack's own token budget refuses rows
+/// before the response budget ever sees the payload, and the daemon's raw route
+/// cuts once before the stdio path envelopes the result and cuts again. An
+/// entry that overwrote its predecessor would report only the last cut, so
+/// `total` would describe what the second cutter was handed rather than what
+/// the walk found, and the first cause would vanish. The counts add and the
+/// causes are kept in the order they happened.
+pub fn record_elision_for(
+    payload: &mut Value,
+    field: &str,
+    kept: usize,
+    elided: usize,
+    reason: &str,
+) {
     if elided == 0 {
         return;
     }
-    let entry = serde_json::to_value(Elision::budget(kept, elided)).unwrap_or(Value::Null);
+    let prior = payload
+        .get(ELISIONS_KEY)
+        .and_then(|map| map.get(field))
+        .and_then(|entry| serde_json::from_value::<Elision>(entry.clone()).ok());
+    let entry = match prior {
+        Some(prior) => {
+            let mut merged =
+                Elision::for_reason(kept, prior.elided.saturating_add(elided), &prior.reason);
+            if !merged.reason.split(", ").any(|already| already == reason) {
+                merged.reason.push_str(", ");
+                merged.reason.push_str(reason);
+            }
+            merged
+        }
+        None => Elision::for_reason(kept, elided, reason),
+    };
+    let entry = serde_json::to_value(entry).unwrap_or(Value::Null);
     match payload.get_mut(ELISIONS_KEY).and_then(Value::as_object_mut) {
         Some(map) => {
             map.insert(field.to_string(), entry);
@@ -664,7 +728,8 @@ fn run_ladder(
     }
 
     if !shape.body_keys.is_empty() {
-        let stripped = strip_keys(payload, shape, shape.body_keys, &[]);
+        let carrying = rows_carrying(payload, shape, shape.body_keys);
+        let stripped = strip_keys_marking(payload, shape, shape.body_keys, &[], true);
         if stripped > 0 {
             accounting.bounded = true;
             cuts.push(format!(
@@ -672,6 +737,11 @@ fn run_ladder(
                  identity, location, and span"
             ));
             remediations.push("read one body with get_entity_source".to_string());
+            // The prose above has said this since the rung existed, and prose is
+            // not what a caller keys on. `elisions` is the one map that answers
+            // "did this response lose anything", and until now inline source
+            // could go without appearing in it at all.
+            record_elision(payload, "body", carrying.saturating_sub(stripped), stripped);
         }
         if measure(payload) <= target {
             disclose(payload, budget, started_at, &cuts, &remediations);
@@ -825,6 +895,24 @@ fn strip_keys(
     keys: &[&str],
     top_keys: &[&str],
 ) -> usize {
+    strip_keys_marking(payload, shape, keys, top_keys, false)
+}
+
+/// Remove `keys` from every hit, optionally leaving each stripped row a marker
+/// naming what went.
+///
+/// `mark` is what separates a row the budget cut from a row that never had the
+/// field. Diagnostics and duplicate roll-ups do not need it: a caller reads
+/// those as description, and their absence claims nothing about the code. A
+/// missing `body` does claim something, twice over, because it is also the
+/// shape of a `compact` call and of source the graph does not hold.
+fn strip_keys_marking(
+    payload: &mut Value,
+    shape: &ResponseShape,
+    keys: &[&str],
+    top_keys: &[&str],
+    mark: bool,
+) -> usize {
     let mut stripped = 0usize;
     for key in top_keys {
         if let Some(map) = payload.as_object_mut() {
@@ -836,6 +924,27 @@ fn strip_keys(
     if keys.is_empty() {
         return stripped;
     }
+    let strip_row = |map: &mut Map<String, Value>| -> bool {
+        let mut taken: Vec<Value> = Vec::new();
+        for key in keys {
+            if remove_present(map, key) {
+                taken.push(Value::from(*key));
+                // `body` keeps its place as an explicit null rather than
+                // vanishing, so a typed reader still finds the field and finds
+                // it empty, and the marker beside it says who emptied it.
+                if *key == "body" {
+                    map.insert((*key).to_string(), Value::Null);
+                }
+            }
+        }
+        if taken.is_empty() {
+            return false;
+        }
+        if mark {
+            map.insert(BODY_ELIDED_KEY.to_string(), Value::Array(taken));
+        }
+        true
+    };
     for collection in shape.collections {
         let Some(entries) = payload.get_mut(*collection).and_then(Value::as_array_mut) else {
             continue;
@@ -844,13 +953,7 @@ fn strip_keys(
             let Some(map) = entry.as_object_mut() else {
                 continue;
             };
-            let mut touched = false;
-            for key in keys {
-                if remove_present(map, key) {
-                    touched = true;
-                }
-            }
-            if touched {
+            if strip_row(map) {
                 stripped += 1;
             }
         }
@@ -860,18 +963,36 @@ fn strip_keys(
     // largest single body in a response that just dropped every other one.
     for focal in ["focal_entity", "focal"] {
         if let Some(map) = payload.get_mut(focal).and_then(Value::as_object_mut) {
-            let mut touched = false;
-            for key in keys {
-                if remove_present(map, key) {
-                    touched = true;
-                }
-            }
-            if touched {
+            if strip_row(map) {
                 stripped += 1;
             }
         }
     }
     stripped
+}
+
+/// How many rows carry at least one of `keys`, counted before a rung takes
+/// them, so the elision it publishes can say what the response held.
+fn rows_carrying(payload: &Value, shape: &ResponseShape, keys: &[&str]) -> usize {
+    let carries = |value: &Value| -> bool {
+        value.as_object().is_some_and(|map| {
+            keys.iter()
+                .any(|key| !matches!(map.get(*key), None | Some(Value::Null)))
+        })
+    };
+    let in_collections: usize = shape
+        .collections
+        .iter()
+        .filter_map(|collection| payload.get(*collection))
+        .filter_map(Value::as_array)
+        .map(|entries| entries.iter().filter(|entry| carries(entry)).count())
+        .sum();
+    let in_focal = ["focal_entity", "focal"]
+        .iter()
+        .filter_map(|focal| payload.get(*focal))
+        .filter(|value| carries(value))
+        .count();
+    in_collections + in_focal
 }
 
 /// Remove one key when it carries something. A key already absent, or already
@@ -919,7 +1040,16 @@ fn trim_collection(payload: &mut Value, key: &str, target: usize, min_keep: usiz
     payload[key] = Value::Array(full[..kept].to_vec());
     let withheld = full.len() - kept;
     if withheld > 0 {
-        payload[format!("{key}_withheld")] = Value::from(withheld);
+        // Added to, not overwritten. Two arms bound one response and a pack's
+        // own token budget cuts before either, so a list can arrive here having
+        // already lost rows. Assigning would make this scalar describe the last
+        // cut while `elisions` described them all, and the two channels are
+        // asserted against each other.
+        let prior = payload
+            .get(format!("{key}_withheld"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        payload[format!("{key}_withheld")] = Value::from(prior.saturating_add(withheld));
     }
     withheld
 }
@@ -1775,6 +1905,184 @@ mod tests {
                 accounting.chars_after
             );
         }
+    }
+
+    // ── The body a budget takes says so on the row (FIR-2482) ───────────
+
+    /// A context pack of `rows` dependencies, each carrying a body, plus a
+    /// focal that carries one too.
+    fn pack_payload(rows: usize, body_chars: usize) -> Value {
+        let dep = |index: usize| {
+            json!({
+                "id": format!("00000000-0000-0000-0000-{index:012}"),
+                "name": format!("dep_{index}"),
+                "kind": "function",
+                "signature": format!("fn dep_{index}()"),
+                "file_path": format!("src/f{index}.rs"),
+                "start_line": 1,
+                "end_line": 40,
+                "body": "x".repeat(body_chars),
+            })
+        };
+        json!({
+            "focal_entity": {
+                "id": "00000000-0000-0000-0000-ffffffffffff",
+                "name": "focal",
+                "body": "y".repeat(body_chars),
+            },
+            "dependencies": (0..rows).map(dep).collect::<Vec<_>>(),
+            "dependents": [],
+            "token_budget": 16000,
+        })
+    }
+
+    /// Every row of every listed collection, plus the focal, as objects.
+    fn rows_of(payload: &Value, keys: &[&str]) -> Vec<Map<String, Value>> {
+        let mut rows: Vec<Map<String, Value>> = keys
+            .iter()
+            .filter_map(|key| payload.get(*key))
+            .filter_map(Value::as_array)
+            .flat_map(|entries| entries.iter().filter_map(Value::as_object).cloned())
+            .collect();
+        if let Some(focal) = payload.get("focal_entity").and_then(Value::as_object) {
+            rows.push(focal.clone());
+        }
+        rows
+    }
+
+    #[test]
+    fn a_row_whose_body_the_budget_took_says_so() {
+        let mut payload = pack_payload(24, 900);
+        // Sized so shedding the bodies alone brings the response under, and the
+        // ladder never reaches the rung that withholds rows. Both cuts are real
+        // and both are disclosed, but mixing them here would leave the row
+        // count and the body count describing different populations, and this
+        // test is about the rows that stayed.
+        let budget = ResponseBudget {
+            max_chars: 12_000,
+            ..ResponseBudget::default()
+        };
+        enforce(&mut payload, "get_context_pack", &budget).expect("get_context_pack is budgeted");
+        assert_eq!(
+            payload["dependencies"].as_array().map(Vec::len),
+            Some(24),
+            "the body rung alone must have sufficed: {payload}"
+        );
+
+        let rows = rows_of(&payload, &["dependencies"]);
+        assert_eq!(rows.len(), 25, "24 dependencies and the focal: {payload}");
+        for row in &rows {
+            // Removing the key outright is the shape of a `compact: true` call
+            // and of an entity whose source the graph does not hold. A row that
+            // lost its body to the budget must read as neither.
+            assert_eq!(
+                row.get("body"),
+                Some(&Value::Null),
+                "a stripped body keeps its field: {payload}"
+            );
+            assert_eq!(
+                row.get(BODY_ELIDED_KEY),
+                Some(&json!(["body"])),
+                "a stripped row names what the budget took: {payload}"
+            );
+            assert!(
+                row.get("body_unavailable").is_none(),
+                "a budget cut is not a graph gap, and one row cannot be both: {payload}"
+            );
+        }
+        let elision = payload["elisions"]["body"].clone();
+        assert_eq!(elision["elided"], json!(rows.len()), "{payload}");
+        assert_eq!(elision["kept"], json!(0), "{payload}");
+        assert_eq!(elision["reason"], json!(ELISION_REASON_BUDGET), "{payload}");
+    }
+
+    #[test]
+    fn a_row_that_never_had_a_body_is_neither_marked_nor_counted() {
+        let mut payload = pack_payload(24, 900);
+        // One row whose source the graph genuinely does not hold, in the
+        // vocabulary the pack handler uses for it.
+        payload["dependencies"][0]["body"] = Value::Null;
+        payload["dependencies"][0]["body_unavailable"] = json!("generated at build time");
+        let budget = ResponseBudget {
+            max_chars: 4_000,
+            ..ResponseBudget::default()
+        };
+        enforce(&mut payload, "get_context_pack", &budget).expect("get_context_pack is budgeted");
+
+        let gap = payload["dependencies"][0].clone();
+        assert!(
+            gap.get(BODY_ELIDED_KEY).is_none(),
+            "the budget took nothing from this row and must claim nothing: {payload}"
+        );
+        assert_eq!(
+            gap["body_unavailable"],
+            json!("generated at build time"),
+            "the graph gap's own reason survives: {payload}"
+        );
+    }
+
+    #[test]
+    fn a_whole_response_claims_no_body_elision() {
+        let mut payload = pack_payload(2, 40);
+        let budget = ResponseBudget {
+            max_chars: RESPONSE_MAX_MAX_CHARS,
+            ..ResponseBudget::default()
+        };
+        enforce(&mut payload, "get_context_pack", &budget).expect("get_context_pack is budgeted");
+        assert!(
+            payload.get(ELISIONS_KEY).is_none(),
+            "nothing was withheld, so nothing may be claimed: {payload}"
+        );
+        assert_eq!(
+            payload["dependencies"][0]["body"],
+            json!("x".repeat(40)),
+            "an untouched body is still its source: {payload}"
+        );
+    }
+
+    #[test]
+    fn two_cuts_on_one_list_add_up_rather_than_replacing_each_other() {
+        // What a pack's own token budget already recorded before the response
+        // budget ever sees the payload, in the shape the handler writes it.
+        let mut payload = pack_payload(24, 40);
+        record_elision_for(
+            &mut payload,
+            "dependencies",
+            24,
+            6,
+            ELISION_REASON_TOKEN_BUDGET,
+        );
+        payload["dependencies_withheld"] = json!(6);
+
+        let budget = ResponseBudget {
+            max_chars: 2_500,
+            ..ResponseBudget::default()
+        };
+        enforce(&mut payload, "get_context_pack", &budget).expect("get_context_pack is budgeted");
+
+        let kept = payload["dependencies"].as_array().unwrap().len();
+        let elision = payload["elisions"]["dependencies"].clone();
+        let withheld = payload["dependencies_withheld"].as_u64().unwrap() as usize;
+        assert!(
+            kept < 24,
+            "the response budget must cut for this test to mean anything: {payload}"
+        );
+        // 30 candidates existed: the 24 that reached the response and the 6 the
+        // token budget already refused. Overwriting would report `total` as 24
+        // and lose the earlier cause entirely.
+        assert_eq!(elision["total"], json!(30), "{payload}");
+        assert_eq!(elision["kept"], json!(kept), "{payload}");
+        assert_eq!(elision["elided"], json!(30 - kept), "{payload}");
+        assert_eq!(
+            withheld,
+            30 - kept,
+            "the scalar and the map must agree: {payload}"
+        );
+        let reason = elision["reason"].as_str().unwrap();
+        assert!(
+            reason.contains(ELISION_REASON_TOKEN_BUDGET) && reason.contains(ELISION_REASON_BUDGET),
+            "both causes survive the merge, got {reason}: {payload}"
+        );
     }
 
     /// A list nothing was taken from must not grow an elision, whatever calls

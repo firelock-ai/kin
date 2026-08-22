@@ -91,6 +91,24 @@ does not fit has to say so in `degradations`. A ceiling is not always reachable,
 because every cut list keeps a floor entry, and that case is fine as long as it is
 never quiet.
 
+Checks 5 to 7 carry the same rule to the budget that cuts a context pack first
+(FIR-2482). A pack is bounded twice: its own token budget refuses candidates
+inside the builder, before the response budget sees the payload at all, and only
+the second cut was ever disclosed. A dependency section trimmed from twelve rows
+to six serialized six rows beside `returned: 6`, which is what a focal with six
+dependencies serializes, and `kin context` printed "Dependencies: 6 entries" for
+both. Check 5 packs one focal at a generous token budget and again at a tight
+one, with one identical generous `max_chars` on both so the response budget
+cannot be the cutter, and asserts every group that shrank publishes an elision
+naming `token_budget` rather than `response_budget`, because a caller told the
+wrong cause raises the wrong lever. Check 6 is the same defect one field down: a
+row whose inline source the response budget took used to lose the key outright,
+which is the shape of a `compact` call and of source the graph never had, so it
+now keeps a null `body` beside a marker naming what went. Check 7 drives
+`kin context`, whose rendered lines are the whole of what a reader of that
+surface sees, and asserts the lines and `--json` report the same cut and name the
+lever that recovers it.
+
 `memory_pressure_refusal.py` covers the back-off Kin owes a machine it is
 running on, and the disclosure it owes the person running it. A daemon that
 quietly stopped sweeping would look identical to one that had finished, since
