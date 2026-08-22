@@ -7063,6 +7063,255 @@ mod tests {
              file's real age instead"
         );
     }
+
+    /// Build the artifact-to-artifact edge shape the cross-file linker mints
+    /// for a file-level import, which is the class of relation nothing else
+    /// collects when its file is deleted.
+    fn artifact_edge(
+        src: kin_model::ArtifactId,
+        dst: kin_model::ArtifactId,
+        kind: kin_model::RelationKind,
+    ) -> kin_model::Relation {
+        kin_model::Relation {
+            id: kin_model::RelationId::new(),
+            kind,
+            src: kin_model::GraphNodeId::Artifact(src),
+            dst: kin_model::GraphNodeId::Artifact(dst),
+            confidence: 1.0,
+            origin: kin_model::RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        }
+    }
+
+    fn artifact_at(state: &DaemonState, path: &str) -> kin_model::ArtifactId {
+        state
+            .graph
+            .artifact_id_at_path(&test_repo_path(path))
+            .unwrap_or_else(|| panic!("{path} must be admitted before the test asks about it"))
+    }
+
+    /// FIR-2607. A file whose artifact is named by a relation can be deleted.
+    ///
+    /// Both shapes the linker actually produces are covered: the outgoing
+    /// import edge to another artifact, and the parse-coverage self-loop every
+    /// indexed file carries. kin-db validates every relation the graph holds
+    /// against the staged tree on each transaction, so either one left standing
+    /// fails the whole removal, not just the edge. Before the fix this test
+    /// fails with `transaction relation <id> has unadmitted source endpoint
+    /// artifact:<id>`, which is the exact refusal that made a repository unable
+    /// to commit at all until the file was emptied first.
+    #[test]
+    fn a_removal_takes_the_relations_bound_to_the_departing_artifact() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let leaving = repo.path().join("leaving.rs");
+        let staying = repo.path().join("staying.rs");
+        std::fs::write(&leaving, b"pub fn leaving() -> u32 { 1 }\n").unwrap();
+        std::fs::write(&staying, b"pub fn staying() -> u32 { 2 }\n").unwrap();
+        admit_file_event(&state, &FileEvent::Changed(leaving.clone())).unwrap();
+        admit_file_event(&state, &FileEvent::Changed(staying.clone())).unwrap();
+
+        let leaving_id = artifact_at(&state, "leaving.rs");
+        let staying_id = artifact_at(&state, "staying.rs");
+        let import = artifact_edge(leaving_id, staying_id, kin_model::RelationKind::Imports);
+        let coverage = artifact_edge(leaving_id, leaving_id, kin_model::RelationKind::DependsOn);
+        state.graph.upsert_relation(&import).unwrap();
+        state.graph.upsert_relation(&coverage).unwrap();
+
+        std::fs::remove_file(&leaving).unwrap();
+        let admitted = admit_file_event_ambient(&state, &FileEvent::Removed(leaving))
+            .expect("a removal must collect the edges bound to the artifact it drops");
+
+        assert!(matches!(admitted, AdmittedFileEvent::Removed { .. }));
+        assert!(
+            tree_entry(&state, "leaving.rs").is_none(),
+            "the artifact left the tree"
+        );
+        assert!(
+            state
+                .graph
+                .get_all_relations_for_node(&kin_model::GraphNodeId::Artifact(leaving_id))
+                .unwrap()
+                .is_empty(),
+            "and every edge naming it left with it"
+        );
+        assert!(
+            tree_entry(&state, "staying.rs").is_some(),
+            "the destination artifact is untouched: only the departing endpoint's edges go"
+        );
+    }
+
+    /// FIR-2607, the second half. A refusal a user can act on.
+    ///
+    /// The raw storage message names two uuids and offers nothing to do. This
+    /// asserts the surface a user meets names the path being dropped and the
+    /// two-step retirement that clears the edges, so the message is about their
+    /// repository rather than about kin's internals.
+    #[test]
+    fn a_stranded_endpoint_refusal_names_the_path_and_the_way_out() {
+        let raw = DaemonError::Graph(kin_db::KinDbError::StorageError(
+            "transaction relation 6b30c139-1c2a-a133-d17b-2625e60d3df9 has unadmitted source \
+             endpoint artifact:f4d9e1db-d7b2-4fd9-912c-2809f331331b"
+                .to_string(),
+        ));
+        let deltas = vec![TreeDelta::Removed {
+            artifact_id: kin_model::ArtifactId::new(),
+            old: kin_model::LocatedEntry::new(
+                test_repo_path("notekeeper/search.py"),
+                TreeEntry::blob(Hash256::from_bytes([7; 32]), false),
+            ),
+        }];
+
+        let named = name_stranded_endpoint_refusal(raw, &deltas).to_string();
+
+        assert!(
+            named.contains("notekeeper/search.py"),
+            "the refusal names the path being dropped: {named}"
+        );
+        assert!(
+            named.contains("fix: empty the file and commit"),
+            "and carries the retirement that clears the edges: {named}"
+        );
+        assert!(
+            named.contains("6b30c139-1c2a-a133-d17b-2625e60d3df9"),
+            "without losing the identifiers a report needs: {named}"
+        );
+    }
+
+    /// An unrelated failure is handed back untouched, so the naming above can
+    /// never dress up a refusal it does not understand.
+    #[test]
+    fn an_unrelated_refusal_is_not_dressed_up_as_a_stranded_endpoint() {
+        let raw = DaemonError::Graph(kin_db::KinDbError::StorageError(
+            "transaction adds existing entity 1056cc39-df63-5f0b-9d85-a161fb2c882f".to_string(),
+        ));
+
+        let passed_through = name_stranded_endpoint_refusal(raw, &[]).to_string();
+
+        assert!(
+            passed_through.contains("transaction adds existing entity"),
+            "an unrelated storage refusal keeps its own words: {passed_through}"
+        );
+        assert!(
+            !passed_through.contains("fix: empty the file"),
+            "and gains no advice that would not help: {passed_through}"
+        );
+    }
+
+    /// FIR-2606. An admitted source path the graph holds no entities for is
+    /// offered for re-derivation.
+    ///
+    /// This is the state a daemon leaves behind when it ends between a write
+    /// and the commit that would have published the entities: the artifact is
+    /// admitted at exactly the bytes on disk, so no tree delta and no watcher
+    /// event ever names it again, and every query answers about it as an
+    /// absence. Recovering it is what stops that from being permanent.
+    #[test]
+    fn an_admitted_source_path_with_no_entities_is_offered_for_re_derivation() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let source = repo.path().join("stranded.rs");
+        std::fs::write(&source, b"pub fn stranded() -> u32 { 1 }\n").unwrap();
+        admit_file_event(&state, &FileEvent::Changed(source.clone())).unwrap();
+
+        let owed = plan_unenriched_source_events(&state).unwrap();
+
+        // Compared by repository-relative name: the host root reaches this
+        // test through /var and comes back through /private/var, and the
+        // subject here is which path is owed, not how the host spells it.
+        let named = owed
+            .iter()
+            .map(|event| {
+                let (FileEvent::Changed(path) | FileEvent::Removed(path)) = event;
+                path.file_name().unwrap().to_string_lossy().to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            named,
+            vec![source.file_name().unwrap().to_string_lossy().to_string()],
+            "an admitted source path with no entities is exactly what needs re-deriving"
+        );
+    }
+
+    /// The control that keeps the repair narrow: a path whose entities the
+    /// graph already holds is never re-derived, so this cannot become a sweep
+    /// that re-parses the working copy on every daemon start.
+    #[test]
+    fn an_admitted_source_path_that_carries_entities_is_left_alone() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let source = repo.path().join("enriched.rs");
+        std::fs::write(&source, b"pub fn enriched() -> u32 { 1 }\n").unwrap();
+        admit_file_event(&state, &FileEvent::Changed(source)).unwrap();
+        assert_eq!(
+            plan_unenriched_source_events(&state).unwrap().len(),
+            1,
+            "the positive control: before its entities land the path is owed a re-derivation"
+        );
+
+        state
+            .graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: vec![kin_model::EntityDelta::Added {
+                    new: test_entity("enriched", "enriched.rs"),
+                }],
+                relation_deltas: vec![],
+                tree_deltas: vec![],
+                ..TransactionDelta::default()
+            })
+            .unwrap();
+
+        assert!(
+            plan_unenriched_source_events(&state).unwrap().is_empty(),
+            "and once the graph holds an entity for it, nothing is owed"
+        );
+    }
+
+    /// A file no language adapter parses is enriched by a shallow, structured
+    /// or opaque facet instead, so it has no entities by design and must not be
+    /// proposed forever.
+    #[test]
+    fn an_admitted_path_with_no_entity_adapter_is_not_offered() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let notes = repo.path().join("NOTES.txt");
+        std::fs::write(&notes, b"not a language this repository parses\n").unwrap();
+        admit_file_event(&state, &FileEvent::Changed(notes)).unwrap();
+
+        assert!(
+            plan_unenriched_source_events(&state).unwrap().is_empty(),
+            "a path with no entity adapter is not owed a re-parse"
+        );
+    }
+
+    fn test_entity(name: &str, file_path: &str) -> kin_model::Entity {
+        kin_model::Entity {
+            id: kin_model::EntityId::new(),
+            kind: kin_model::EntityKind::Function,
+            name: name.to_string(),
+            language: kin_model::LanguageId::Rust,
+            fingerprint: kin_model::SemanticFingerprint {
+                algorithm: kin_model::FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([1; 32]),
+                signature_hash: Hash256::from_bytes([2; 32]),
+                behavior_hash: Hash256::from_bytes([3; 32]),
+                equivalence_hash: Hash256::from_bytes([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(FilePathId::new(file_path)),
+            span: None,
+            signature: format!("fn {name}()"),
+            visibility: kin_model::Visibility::Public,
+            role: kin_model::EntityRole::Source,
+            doc_summary: None,
+            metadata: kin_model::EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
 }
 
 /// Decide whether a filesystem-sync tick's bulk deletions should be WITHHELD as
@@ -7301,11 +7550,30 @@ async fn sync_filesystem_with_graph_publishing_inner(
     // Recorded before anything below can fail, so a pass that dies part way
     // through enrichment still hands the deferral back to be closed.
     *deferred_out = exact_admission.deferred_tree.take();
-    if exact_admission.deltas.is_empty() {
+    // An admitted source path the graph holds no entities for is re-derived on
+    // this seam too, and it is why the early return below cannot key on the
+    // tree transition alone. Entity derivation is not durable on its own: a
+    // daemon that ends between the write and the commit takes it with it, and
+    // what it leaves behind is an artifact admitted at exactly the bytes on
+    // disk, which produces no tree delta here and no watcher event ever again.
+    // Without this the file stays admitted and unqueryable through every later
+    // commit, which is exactly how one module dropped out of a store and stayed
+    // out (FIR-2606).
+    let unenriched = plan_unenriched_source_events(state)?;
+    if exact_admission.deltas.is_empty() && unenriched.is_empty() {
         drop(graph_mutation);
         return Ok(());
     }
-    let events = exact_admission.semantic_events;
+    if !unenriched.is_empty() {
+        warn!(
+            count = unenriched.len(),
+            "admitted source paths carry no entities, so nothing can query them; re-deriving \
+             them into this change"
+        );
+    }
+    let mut events = exact_admission.semantic_events;
+    events.extend(unenriched);
+    let events = dedup_file_events(events);
 
     info!(
         count = events.len(),
