@@ -53,20 +53,41 @@ const MODULES: usize = 8;
 /// Types defined in each module.
 const ITEMS_PER_MODULE: usize = 4;
 
-/// Ceiling on peak live heap for admitting `COMMITS` commits.
+/// The phase whose entire job is proving, and therefore the one that must not
+/// pay for a copy of history to do it.
 ///
-/// Measured on this fixture at 1176 MiB before the streaming comparison landed
-/// and 515 MiB after, so the ceiling sits at 700 MiB: comfortably above the
-/// post-fix number and far below the pre-fix one. Both numbers are printed on
-/// every run, so drift is visible long before it is a failure.
+/// `source_proof_staged` is proof 1 of 3. It revalidates the plan structurally
+/// and then observes the Git source twice; it keeps nothing at all. Whatever it
+/// adds to the peak is memory the machine has to survive so that a check can
+/// reach a verdict it was always going to reach.
+const PROOF_PHASE: &str = "kin.init.source_proof_staged";
+
+/// Ceiling on what proof 1 may add to the running peak.
 ///
-/// The gap this ceiling exists to catch is a step change, not a trim. A
-/// re-derivation that materializes a second whole history costs roughly what
-/// the first one did, and at this depth that is hundreds of megabytes. If a
-/// future change lands between 515 and 700 MiB, read the phase table rather
-/// than raising the ceiling: the whole point is that the proof no longer scales
-/// with history.
-const PEAK_HEAP_CEILING: usize = 700 * 1024 * 1024;
+/// Measured on this fixture, release, one host, both numbers quoted in the pull
+/// request that introduced this guard: 88,146,432 bytes (84.1 MiB) on the base
+/// commit and 0 bytes after the re-derivation was made to stream. The ceiling
+/// sits at 16 MiB, which is far below the pre-fix figure and far above the
+/// post-fix one, and there is nothing in between that a legitimate change
+/// should produce: either a re-derivation materializes a second history or it
+/// does not.
+///
+/// This is the assertion that carries the class. The total below is a coarser
+/// backstop.
+const PROOF_PEAK_GROWTH_CEILING: usize = 16 * 1024 * 1024;
+
+/// Backstop on total peak live heap for admitting `COMMITS` commits.
+///
+/// Deliberately loose, and deliberately NOT the headline. The total is set by
+/// the bootstrap transaction, which is built and then committed after every
+/// proof has run, so removing a proof's cost moves the phase table without
+/// moving this number: base and the first fix commit both measured 995.3 MiB,
+/// 904 bytes apart. Anyone tuning this constant should read the phase table
+/// first, and should read `PROOF_PEAK_GROWTH_CEILING` as the real guard.
+///
+/// What this one catches is a gross regression: a new whole-history structure
+/// large enough to move even a bootstrap-dominated total.
+const PEAK_HEAP_CEILING: usize = 1400 * 1024 * 1024;
 
 fn git(repo: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -147,18 +168,52 @@ fn proving_deep_history_does_not_cost_another_copy_of_it() {
     kin_core::init_from_git(&repo).expect("admit the fixture repository");
 
     let peak = support::peak().saturating_sub(baseline);
+    let growth = support::peak_growth_by_phase();
+    let proof_growth = growth
+        .iter()
+        .find(|(phase, _, _)| *phase == PROOF_PHASE)
+        .map(|(_, grew, _)| *grew);
+
     println!(
-        "peak live heap admitting {COMMITS} commits: {peak} bytes ({:.1} MiB), ceiling {} MiB",
+        "peak live heap admitting {COMMITS} commits: {peak} bytes ({:.1} MiB), backstop {} MiB",
         peak as f64 / 1024.0 / 1024.0,
         PEAK_HEAP_CEILING / 1024 / 1024
+    );
+    println!(
+        "{PROOF_PHASE} added {} bytes to the peak, ceiling {} MiB",
+        proof_growth
+            .map(|bytes| bytes.to_string())
+            .unwrap_or_else(|| "NO SAMPLE".to_string()),
+        PROOF_PEAK_GROWTH_CEILING / 1024 / 1024
+    );
+
+    // An absent sample is not a pass. If the phase never opened, the guard
+    // measured nothing and has to say so rather than report the zero that a
+    // missing entry would otherwise look like.
+    let proof_growth = proof_growth.unwrap_or_else(|| {
+        panic!(
+            "no {PROOF_PHASE} sample was recorded, so this run proved nothing about \
+             what proving costs. Either the phase span was renamed or the probe was not \
+             installed before the measured call.\n\n{}",
+            support::phase_attribution_table()
+        )
+    });
+    assert!(
+        proof_growth < PROOF_PEAK_GROWTH_CEILING,
+        "proof 1 added {proof_growth} bytes to the peak, over the \
+         {PROOF_PEAK_GROWTH_CEILING} byte ceiling. That phase revalidates the import plan \
+         and keeps nothing, so anything it adds is a second copy of history built to check \
+         the first. This is the defect that put a full-history conversion at the ceiling of \
+         a 12 GiB container.\n\n{}",
+        support::phase_attribution_table()
     );
     assert!(
         peak < PEAK_HEAP_CEILING,
         "admitting {COMMITS} commits peaked at {peak} bytes of live heap, over the \
-         {PEAK_HEAP_CEILING} byte ceiling. At this depth the whole-history structures are \
-         the dominant term, so a breach here means a phase is holding another copy of \
-         history rather than streaming it. That is the class that put a full-history \
-         conversion at the ceiling of a 12 GiB container.\n\n{}\n\
+         {PEAK_HEAP_CEILING} byte backstop. This total is normally set by the bootstrap \
+         transaction rather than by any proof, so a breach here is a gross regression: a \
+         new whole-history structure large enough to move a bootstrap-dominated \
+         number.\n\n{}\n\
          Read the grew column to find which phase moved, and the retained column to tell a \
          structure held too long from allocation churn inside one phase. They need opposite \
          fixes.",

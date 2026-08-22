@@ -329,6 +329,11 @@ jobs:
             echo "::error title=Parse-hole acceptance suite failed::exit $rc (1 FAIL, 2 UNREADABLE, 3 setup); see the CHECK lines above"
           fi
 
+      # FIR-2539. This suite drives the in-tree live-heap guard rather than a
+      # binary: the figure that carries the class is what proof 1 adds to the
+      # peak, and only the counting allocator can see it. Resident set was tried
+      # and rejected, because inside a memory-limited container both a fixed and
+      # an unfixed build report the ceiling rather than their demand.
       - name: Init-memory acceptance suite
         id: initmemory
         if: always()
@@ -339,8 +344,6 @@ jobs:
           mkdir -p acceptance
           rc=0
           python3 scripts/acceptance/init_memory_repro.py \
-            --kin target/release/kin \
-            --daemon target/release/kin-daemon \
             --json acceptance/initmemory.json \
             --label "$KIN_ACCEPTANCE_LABEL" \
             --verbose >acceptance/initmemory.log 2>&1 || rc=$?

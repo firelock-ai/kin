@@ -24,19 +24,26 @@ synthetic fixture, against the local build.
 
 What it measures, and what it does not
 --------------------------------------
-Peak resident set of one `kin init` over a synthetic deep history, against a
-stated cap. Resident set is the number that decides whether a conversion runs on
-a small machine, which is why it is the one asserted here.
+It drives the live-heap guard in `crates/kin-core/tests/` and grades what that
+guard prints. Live heap, through a counting global allocator, moves when and
+only when the code allocates differently; resident set keeps counting pages that
+were freed but not returned, so it is reproducible only within one allocator on
+one platform.
 
-RSS is also allocator-dependent and platform-dependent, so the cap is set to
-catch a STEP CHANGE and not a trim: another whole copy of history is hundreds of
-megabytes at this depth, while ordinary drift is tens. The measured number is
-printed on every run, so drift is visible long before it is a failure. For an
-allocator-exact figure that moves only when allocation moves, use the live-heap
-guard instead:
+Resident set was tried first and rejected on evidence, which is worth recording
+because it looked like the obvious measurement. On this fixture the base commit
+reports 1253.5 MiB of peak RSS and the fix reports 1324.5 MiB, so RSS ranks the
+fix WORSE. Inside a 12 GiB container both builds report `memory.peak` exactly
+equal to `memory.max`, so there the number is the ceiling rather than the demand.
+A cap over either figure would have been a check that cannot fail, or worse, one
+that fails the wrong way.
 
-    cargo test --release -p kin-core --test init_deep_history_heap_ceiling \\
-        -- --ignored --nocapture
+The graded figure is what proof 1 adds to the running peak. That phase
+revalidates the whole import plan and keeps nothing, so anything it adds is a
+second copy of history built to check the first, which is exactly the defect.
+The total peak is graded too, as a coarse backstop: it is normally set by the
+bootstrap transaction rather than by any proof, so it does NOT move when a proof
+stops copying, and it must not be read as the class gate.
 
 Each check prints one line:
 
@@ -64,7 +71,7 @@ import argparse
 import functools
 import json
 import os
-import resource
+import re
 import shutil
 import subprocess
 import sys
@@ -84,15 +91,10 @@ COMMITS = 256
 MODULES = 8
 ITEMS_PER_MODULE = 4
 
-# Cap on peak resident set for admitting COMMITS commits, in MiB.
-#
-# Set from this suite's own falsification rather than from a target: measured
-# on the pre-fix commit and on the fix, both release, both on the same host,
-# with the two numbers quoted in the pull request that introduced the cap. It
-# sits well above the post-fix figure and well below the pre-fix one, because
-# what it exists to catch is another whole copy of history coming back, which
-# is a step change and not a trim.
-PEAK_RSS_CAP_MIB = 700
+# The in-tree guard this suite drives, and how long it may take. The build
+# dominates; the admission itself is a couple of minutes.
+GUARD_TEST = "init_deep_history_heap_ceiling"
+GUARD_TIMEOUT_S = 3600
 
 
 def tail(text, limit=400):
@@ -109,18 +111,29 @@ def run(cmd, cwd=None, env=None, timeout=1800):
     return proc.returncode, proc.stdout
 
 
-def maxrss_bytes():
-    """Peak resident set of every child reaped so far, in bytes.
+PROOF_LINE = re.compile(
+    r"kin\.init\.source_proof_staged added (\d+) bytes to the peak, ceiling (\d+) MiB"
+)
+TOTAL_LINE = re.compile(
+    r"peak live heap admitting (\d+) commits: (\d+) bytes .*backstop (\d+) MiB"
+)
 
-    `ru_maxrss` is kilobytes on Linux and bytes on macOS, which is the kind of
-    difference that turns a cap into a thousandfold false pass on one platform
-    and a thousandfold false failure on the other. Normalising here, once, is
-    cheaper than discovering it from a green run.
+
+def read_guard_output(text):
+    """Pull the two graded figures out of the guard's own printed lines.
+
+    Returns (proof_bytes, proof_cap_mib, total_bytes, total_cap_mib), with None
+    for anything the output did not carry. A missing figure is UNREADABLE
+    downstream and never a pass: a guard that printed nothing measured nothing.
     """
-    raw = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
-    if raw <= 0:
-        return None
-    return raw if sys.platform == "darwin" else raw * 1024
+    proof = PROOF_LINE.search(text or "")
+    total = TOTAL_LINE.search(text or "")
+    return (
+        int(proof.group(1)) if proof else None,
+        int(proof.group(2)) if proof else None,
+        int(total.group(2)) if total else None,
+        int(total.group(3)) if total else None,
+    )
 
 
 class Result(object):
@@ -158,28 +171,36 @@ class Result(object):
         return self.asserts[-1]["detail"] if self.asserts else "no assertion graded"
 
 
-def grade_peak(peak_bytes, cap_mib):
-    """PASS under the cap, FAIL over it, UNREADABLE when nothing was measured.
+def grade_bytes(measured, cap_mib, what):
+    """PASS under the cap, FAIL at or over it, UNREADABLE when nothing was read.
 
-    Split out as a pure function so `--self-test` can drive it against its own
-    inverse without admitting a repository.
+    Pure, so `--self-test` can drive it against its own inverse without
+    admitting a repository. An absent figure is never a pass: a guard that
+    printed no number measured nothing, and that is a different fact from a
+    number under the cap.
     """
-    if peak_bytes is None:
-        return UNREADABLE, "no resident-set figure could be read for the admission"
-    mib = peak_bytes / 1024.0 / 1024.0
+    if measured is None:
+        return UNREADABLE, "the guard printed no %s figure, so nothing was graded" % what
+    if cap_mib is None:
+        return UNREADABLE, "the guard printed no ceiling for %s, so nothing was graded" % what
+    mib = measured / 1024.0 / 1024.0
     if mib >= cap_mib:
-        return FAIL, ("admitting %d commits peaked at %.1f MiB of resident set, at or over "
-                      "the %d MiB cap; a phase is holding another copy of history rather "
-                      "than streaming it" % (COMMITS, mib, cap_mib))
-    return PASS, ("admitting %d commits peaked at %.1f MiB of resident set, under the "
-                  "%d MiB cap" % (COMMITS, mib, cap_mib))
+        return FAIL, ("%s is %.1f MiB, at or over the %d MiB ceiling" % (what, mib, cap_mib))
+    return PASS, ("%s is %.1f MiB, under the %d MiB ceiling" % (what, mib, cap_mib))
 
 
 class Suite(object):
-    def __init__(self, kin, workdir, daemon=None, verbose=False):
-        self.kin = kin
+    """Runs the in-tree live-heap guard against the checkout under test.
+
+    Deliberately thin. The fixture, the measurement and the ceilings all live in
+    `crates/kin-core/tests/init_deep_history_heap_ceiling.rs`, beside the
+    allocator that does the counting, so there is one definition of what the
+    guard measures rather than a Rust one and a Python one drifting apart.
+    """
+
+    def __init__(self, repo_root, workdir, verbose=False):
+        self.repo_root = repo_root
         self.workdir = workdir
-        self.daemon = daemon
         self.verbose = verbose
         self.env = dict(os.environ)
         self.env["KIN_HOME"] = os.path.join(workdir, "kin-home")
@@ -189,115 +210,109 @@ class Suite(object):
         self.env["KIN_VFS_DISABLE"] = "1"
         for leaked in ("KIN_MCP_REPO", "KIN_DIR"):
             self.env.pop(leaked, None)
-        if self.daemon:
-            self.env["KIN_DAEMON_BIN"] = self.daemon
+        self._guard = None
 
-    def git(self, repo, args):
-        env = dict(self.env)
-        env.update({
-            "GIT_CONFIG_GLOBAL": "/dev/null",
-            "GIT_CONFIG_SYSTEM": "/dev/null",
-            "GIT_AUTHOR_NAME": "Kin Fixture",
-            "GIT_AUTHOR_EMAIL": "fixture@firelock.ai",
-            "GIT_COMMITTER_NAME": "Kin Fixture",
-            "GIT_COMMITTER_EMAIL": "fixture@firelock.ai",
-        })
-        code, out = run(["git"] + list(args), cwd=repo, env=env)
-        if code != 0:
-            raise RuntimeError("git %s failed: %s" % (" ".join(args), tail(out)))
+    def guard_output(self):
+        """Run the guard once and reuse it, so both checks grade one run."""
+        if self._guard is None:
+            self._guard = self._run_guard()
+        return self._guard
 
-    def build_history(self):
-        repo = os.path.join(self.workdir, "deep")
-        os.makedirs(os.path.join(repo, "src"))
-        self.git(repo, ["init", "--initial-branch=main"])
-        self.git(repo, ["config", "user.name", "Kin Fixture"])
-        self.git(repo, ["config", "user.email", "fixture@firelock.ai"])
-        with open(os.path.join(repo, "Cargo.toml"), "w") as handle:
-            handle.write("[package]\nname = \"fixture\"\n")
-        for commit in range(COMMITS):
-            # Every commit rewrites the whole module set, so each carries a full
-            # tree delta and a fresh set of entities. A one-file edit per commit
-            # would make the trees nearly free to hold, which is the opposite of
-            # the shape this guard is about.
-            for module in range(MODULES):
-                body = []
-                for item in range(ITEMS_PER_MODULE):
-                    body.append(
-                        "pub struct Item%d_%d_%d { pub field: u32 }\n"
-                        "impl Item%d_%d_%d {\n"
-                        "pub fn build() -> Self { Self { field: %d } }\n"
-                        "pub fn read(&self) -> u32 { self.field }\n"
-                        "}\n" % (module, item, commit, module, item, commit, commit)
-                    )
-                with open(os.path.join(repo, "src", "mod_%d.rs" % module), "w") as handle:
-                    handle.write("".join(body))
-            self.git(repo, ["add", "-A"])
-            self.git(repo, ["commit", "-m", "commit %d" % commit])
-        return repo
+    def _run_guard(self):
+        # Release, because the ceilings are release numbers: optimization
+        # changes which allocations happen, not merely how fast they run, so a
+        # debug figure is not comparable and must not be graded against them.
+        return run([
+            "cargo", "test", "--release", "--locked",
+            "-p", "kin-core", "--test", GUARD_TEST,
+            "--", "--ignored", "--nocapture",
+        ], cwd=self.repo_root, env=self.env, timeout=GUARD_TIMEOUT_S)
 
 
 def check_0(suite):
-    """Admitting a deep history stays under the resident-set cap."""
-    result = Result("0", "deep-history admission stays under the resident-set cap")
-    repo = suite.build_history()
-
-    # Read AFTER the fixture is built, so git's own children are already folded
-    # into the high-water mark and cannot be mistaken for the admission's.
-    before = maxrss_bytes()
-    code, out = run([suite.kin, "init", "--no-enrich"], cwd=repo, env=suite.env)
-    after = maxrss_bytes()
-    if code != 0:
-        result.unknown("kin init exited %d, so no admission was measured: %s" % (code, tail(out)))
+    """Proving the import plan does not cost a copy of it."""
+    result = Result("0", "proof 1 does not allocate a second history")
+    code, out = suite.guard_output()
+    proof, proof_cap, total, total_cap = read_guard_output(out)
+    if proof is None and code != 0 and total is None:
+        result.unknown("the guard produced no figures and exited %d: %s" % (code, tail(out)))
         return result
-    if after is None or (before is not None and after <= before):
-        result.unknown("the admission did not move the child resident-set high-water mark, "
-                       "so the figure read back is some earlier child's")
-        return result
-
-    status, detail = grade_peak(after, PEAK_RSS_CAP_MIB)
+    status, detail = grade_bytes(proof, proof_cap, "proof 1 peak growth")
     {PASS: result.ok, FAIL: result.bad, UNREADABLE: result.unknown}[status](detail)
     return result
 
 
-CHECKS = [check_0]
+def check_1(suite):
+    """Total peak live heap stays under its coarse backstop."""
+    result = Result("1", "total admission peak stays under its backstop")
+    code, out = suite.guard_output()
+    _, _, total, total_cap = read_guard_output(out)
+    if total is None and code != 0:
+        result.unknown("the guard produced no total and exited %d: %s" % (code, tail(out)))
+        return result
+    status, detail = grade_bytes(total, total_cap, "total peak live heap")
+    {PASS: result.ok, FAIL: result.bad, UNREADABLE: result.unknown}[status](detail)
+    return result
+
+
+CHECKS = [check_0, check_1]
 
 
 def self_test():
-    """Falsify this suite's grader against its own inverse."""
+    """Falsify this suite's graders against their own inverses."""
     failures = []
-    cap = 100
     cases = [
-        ("under the cap passes", 50 * 1024 * 1024, PASS),
-        ("at the cap fails", 100 * 1024 * 1024, FAIL),
-        ("over the cap fails", 400 * 1024 * 1024, FAIL),
-        ("nothing measured is unreadable", None, UNREADABLE),
+        ("under the ceiling passes", 50 * 1024 * 1024, 100, PASS),
+        ("at the ceiling fails", 100 * 1024 * 1024, 100, FAIL),
+        ("over the ceiling fails", 400 * 1024 * 1024, 100, FAIL),
+        ("nothing measured is unreadable", None, 100, UNREADABLE),
+        ("no ceiling is unreadable", 1, None, UNREADABLE),
     ]
-    for title, peak, wanted in cases:
-        got, detail = grade_peak(peak, cap)
+    for title, measured, cap, wanted in cases:
+        got, detail = grade_bytes(measured, cap, "probe")
         if got != wanted:
             failures.append("%s: wanted %s, got %s (%s)" % (title, wanted, got, detail))
-    # A cap that cannot fail is not a cap: prove the real one rejects a figure
-    # the size of the defect this suite exists for.
-    got, _ = grade_peak(1176 * 1024 * 1024, PEAK_RSS_CAP_MIB)
+
+    # The parser is the other half that can silently pass. Drive it against the
+    # guard's real output shape, and against output that carries no figures at
+    # all, which is what a crashed or renamed guard produces.
+    good = ("peak live heap admitting 256 commits: 1043605740 bytes (995.3 MiB), "
+            "backstop 1400 MiB\n"
+            "kin.init.source_proof_staged added 0 bytes to the peak, ceiling 16 MiB\n")
+    proof, proof_cap, total, total_cap = read_guard_output(good)
+    if (proof, proof_cap, total, total_cap) != (0, 16, 1043605740, 1400):
+        failures.append("parser misread the guard's own output: %r"
+                        % ((proof, proof_cap, total, total_cap),))
+    if read_guard_output("error: could not compile") != (None, None, None, None):
+        failures.append("parser invented figures from output that carries none")
+    if read_guard_output("") != (None, None, None, None):
+        failures.append("parser invented figures from empty output")
+
+    # A ceiling that cannot reject the defect is not a ceiling. Drive the real
+    # pre-fix figure through the real pre-fix ceiling.
+    got, _ = grade_bytes(88146432, 16, "proof 1 peak growth")
     if got != FAIL:
-        failures.append("the shipped cap does not reject a pre-fix-sized peak")
-    got, _ = grade_peak(515 * 1024 * 1024, PEAK_RSS_CAP_MIB)
+        failures.append("the shipped proof ceiling does not reject the pre-fix figure")
+    got, _ = grade_bytes(0, 16, "proof 1 peak growth")
     if got != PASS:
-        failures.append("the shipped cap rejects a post-fix-sized peak")
+        failures.append("the shipped proof ceiling rejects the post-fix figure")
+
     for failure in failures:
         print("SELFTEST FAIL %s" % failure)
     print("kin-init-memory-repro self-test: %d case(s), %d failure(s)"
-          % (len(cases) + 2, len(failures)))
+          % (len(cases) + 5, len(failures)))
     return 1 if failures else 0
 
 
 def main(argv):
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--kin", default=os.environ.get("KIN_BIN"),
-                        help="the kin binary under test")
-    parser.add_argument("--daemon", default=os.environ.get("KIN_DAEMON_BIN"),
-                        help="the kin-daemon beside it")
+    parser.add_argument("--repo-root", default=None,
+                        help="the kin checkout under test (default: this file's repository)")
+    parser.add_argument("--kin", default=None,
+                        help="accepted and ignored; the guard builds from the checkout")
+    parser.add_argument("--daemon", default=None,
+                        help="accepted and ignored; the guard builds from the checkout")
     parser.add_argument("--json", dest="json_path", default=None,
                         help="write the machine-readable report here, for scripts/acceptance/gate.py")
     parser.add_argument("--label", default=os.environ.get("KIN_ACCEPTANCE_LABEL"),
@@ -311,23 +326,17 @@ def main(argv):
     if args.self_test:
         return self_test()
 
-    if not args.kin:
-        print("kin-init-memory-repro: no kin binary. Pass --kin or set KIN_BIN.")
+    repo_root = args.repo_root or os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+    repo_root = os.path.abspath(os.path.expanduser(repo_root))
+    if not os.path.isfile(os.path.join(repo_root, "Cargo.toml")):
+        print("kin-init-memory-repro: %s is not a cargo workspace root" % repo_root)
         return 3
-    # Absolute, because every command below runs with cwd inside a fixture in a
-    # temp directory, where a relative path resolves against the fixture.
-    kin = os.path.abspath(os.path.expanduser(args.kin))
-    if not os.path.isfile(kin) or not os.access(kin, os.X_OK):
-        print("kin-init-memory-repro: %s is not an executable file" % kin)
-        return 3
-    daemon = args.daemon and os.path.abspath(os.path.expanduser(args.daemon))
-    if not daemon:
-        beside = os.path.join(os.path.dirname(kin), "kin-daemon")
-        daemon = beside if os.path.isfile(beside) else None
 
     workdir = tempfile.mkdtemp(prefix="kin-init-memory-repro-")
     try:
-        suite = Suite(kin, workdir, daemon=daemon, verbose=args.verbose)
+        suite = Suite(repo_root, workdir, verbose=args.verbose)
         results = []
         for check in CHECKS:
             try:
@@ -348,7 +357,7 @@ def main(argv):
                 "suite": "init_memory_repro",
                 "ticket": TICKET,
                 "label": args.label,
-                "kin": kin,
+                "repo_root": repo_root,
                 "results": [
                     {"id": r.id, "ticket": TICKET, "title": r.title,
                      "status": r.status, "detail": r.detail, "asserts": r.asserts}
