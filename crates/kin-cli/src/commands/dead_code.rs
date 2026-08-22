@@ -154,21 +154,7 @@ pub fn build_dead_code_response(
     graph: &kin_db::InMemoryGraph,
 ) -> Result<DeadCodeResponse> {
     let entry_points = collect_declared_entry_points(binding, graph)?;
-    // The parse census rides along, because this scan's enumeration scope is
-    // every file the repository admits and the reference collector cannot see
-    // the ones that produced no entity. Without it the report reads its own
-    // coverage off a population that excludes exactly the files a hole is made
-    // of.
-    // One entity listing for both halves of the coverage reading. Taking it here
-    // rather than inside each collector is what keeps a single scan from cloning
-    // the whole entity table twice.
-    let entities = graph.list_all_entities()?;
-    let coverage =
-        kin_core::reference_coverage::collect_reference_edge_coverage_from(graph, &entities)?
-            .with_parse_coverage(kin_core::reference_coverage::collect_parse_coverage_from(
-                &graph.resolved_tree(),
-                &entities,
-            ));
+    let coverage = kin_core::reference_coverage::collect_reference_edge_coverage(graph)?;
     build_dead_code_report(graph, &entry_points, &coverage)
 }
 
@@ -285,28 +271,8 @@ fn build_dead_code_report(
     let method_row = |entity: &kin_model::Entity| {
         kin_core::reference_coverage::kind_under_resolves_incoming_calls(entity.kind)
     };
-    //
-    // The fifth trigger, and the one that decides a zero. This scan enumerates
-    // the whole repository, so every file the tree admits is inside its scope,
-    // including the ones no adapter parsed. Such a file holds no entity, which
-    // cuts both ways at once: it can never appear in this list, and it can never
-    // supply the edge that would have kept something else off it. On express
-    // that is 75 of 141 admitted files with `lib/express.js` among them, and the
-    // answer built over it was seven live exports reported at `consumer_count:
-    // 0`. No threshold here: one unparsed file in scope is enough, because the
-    // question is whether THIS answer may be read as fact, not whether the store
-    // has drifted far enough for a page to complain.
-    let parse_holes: Vec<String> = coverage
-        .parse
-        .as_ref()
-        .map(kin_core::reference_coverage::ParseCoverageCensus::hole_reasons)
-        .unwrap_or_default();
-    // Covers every row, for the reason an unread manifest does: the caller a
-    // parse hole hides could be in any language, so no row's own language makes
-    // it safe.
     let row_is_unverified = |entity: &kin_model::Entity| {
         manifest_gap.is_some()
-            || !parse_holes.is_empty()
             || name_only_ids.contains(&entity.id)
             || unsupportable.contains_key(&entity.language.to_string())
             || method_row(entity)
@@ -339,32 +305,13 @@ fn build_dead_code_report(
         ));
     }
     unverified_reasons.extend(manifest_gap.clone());
-    unverified_reasons.extend(parse_holes.iter().cloned());
     // The verdict is about the rows this run printed. A gap in a language nothing
     // was listed for is still disclosed below, but it does not make the listed
     // rows unverified: missing edges make this scan over-report, never
     // under-report, so a row whose own language resolved is unaffected by it.
-    // A parse hole makes the run unverified even when it listed nothing, and
-    // that case is the whole point: with no rows there is no row to label, so
-    // without this clause the response's own `verified` field would read true
-    // beside a refusal in its lines.
-    let verified = unverified_rows == 0 && parse_holes.is_empty();
+    let verified = unverified_rows == 0;
 
-    if !parse_holes.is_empty() && unreferenced.is_empty() {
-        // The refusal, and it replaces the two sentences that used to print
-        // here. An empty result over a parse hole is the one answer in this
-        // command that reads as a licence to act: "No dead code found." is a
-        // clean bill, and it was being printed about a repository two thirds of
-        // whose files Kin never read. A caveat under it does not undo it, in the
-        // stranger's words, because 0 is a number while the caveat is a
-        // paragraph.
-        lines.push(
-            "REFUSED: this scan cannot say whether anything here is unreferenced. Files this \
-             repository admits produced no entity, so there was nothing there for this scan to \
-             read and nothing there to hold an edge:"
-                .to_string(),
-        );
-    } else if unreferenced.is_empty() && test_only.is_empty() {
+    if unreferenced.is_empty() && test_only.is_empty() {
         lines.push("No dead code found.".to_string());
     } else if unreferenced.is_empty() {
         lines.push("No unreferenced entities.".to_string());
@@ -931,12 +878,11 @@ mod tests {
         entity
     }
 
-    /// The shipped entry point, not a re-assembly of its parts. A helper that
-    /// collected its own coverage would keep passing after the product stopped
-    /// collecting the same thing, which is how a report and its test come to
-    /// disagree about which graph they read.
     fn scan(graph: &InMemoryGraph) -> DeadCodeResponse {
-        build_dead_code_response(None, graph).unwrap()
+        let coverage =
+            kin_core::reference_coverage::collect_reference_edge_coverage(graph).unwrap();
+        let entry_points = collect_declared_entry_points(None, graph).unwrap();
+        build_dead_code_report(graph, &entry_points, &coverage).unwrap()
     }
 
     /// Whether `kin refs --bulk-json` reports a caller for this entity.
@@ -2006,123 +1952,6 @@ mod tests {
             excluded + listed,
             "every candidate is either excluded with a stated reason or printed as a row: \
              candidates={candidates} excluded={excluded} listed={listed}\n{joined}"
-        );
-    }
-
-    /// The express shape: a repository that admits a library file no adapter
-    /// parsed. Such a file holds no entity, so it can neither be listed here nor
-    /// supply the edge that would keep something else off the list, and the scan
-    /// under-reports and over-reports at once. "No dead code found." over that
-    /// graph is a clean bill about a repository Kin only partly read.
-    ///
-    /// The control is written first and in the same body: the identical graph
-    /// with the library file's layout present must reach the ordinary sentence.
-    /// A renderer that refused unconditionally, or one that read the census
-    /// rather than the hole, passes every other assertion here and fails that
-    /// one.
-    #[test]
-    fn an_empty_scan_over_an_unparsed_admitted_file_refuses_instead_of_printing_a_zero() {
-        /// A repository admitting two JavaScript files. `producing` decides
-        /// whether the second one reached the entity table, which is the only
-        /// difference between the two halves below.
-        fn admitted_graph(producing: bool) -> InMemoryGraph {
-            let graph = InMemoryGraph::new();
-            let caller = measured(make_entity("createApplication", "lib/express.js"), 1, 0);
-            let callee = measured(make_entity("init", "lib/express.js"), 1, 0);
-            graph.upsert_entity(&caller).unwrap();
-            graph.upsert_entity(&callee).unwrap();
-            for (src, dst) in [(&caller, &callee), (&callee, &caller)] {
-                graph
-                    .upsert_relation(&make_relation_at(src.id, dst.id, RelationKind::Calls, 1.0))
-                    .unwrap();
-            }
-            if producing {
-                let router = measured(make_entity("Router", "lib/router.js"), 1, 0);
-                graph.upsert_entity(&router).unwrap();
-                graph
-                    .upsert_relation(&make_relation_at(
-                        caller.id,
-                        router.id,
-                        RelationKind::Calls,
-                        1.0,
-                    ))
-                    .unwrap();
-                graph
-                    .upsert_relation(&make_relation_at(
-                        router.id,
-                        caller.id,
-                        RelationKind::Calls,
-                        1.0,
-                    ))
-                    .unwrap();
-            }
-            // Admission, through the same tree transaction the product uses.
-            // The census counts what the repository tree admits against what
-            // reached the entity table, so a fixture that only upserts entities
-            // has nothing for a hole to be a hole in.
-            graph
-                .apply_transaction_delta(&kin_model::TransactionDelta {
-                    tree_deltas: ["lib/express.js", "lib/router.js"]
-                        .into_iter()
-                        .map(|path| kin_model::TreeDelta::Added {
-                            artifact_id: kin_model::ArtifactId::new(),
-                            new: kin_model::LocatedEntry::new(
-                                kin_model::RepoPath::from_utf8(path).unwrap(),
-                                kin_model::TreeEntry::blob(
-                                    kin_model::Hash256::from_bytes([7u8; 32]),
-                                    false,
-                                ),
-                            ),
-                        })
-                        .collect(),
-                    ..kin_model::TransactionDelta::default()
-                })
-                .unwrap();
-            graph
-        }
-
-        // The control. Both admitted files produced entities, every entity is
-        // referenced, so the scan lists nothing and is entitled to say so.
-        let clean = scan(&admitted_graph(true));
-        let clean_lines = clean.lines.join("\n");
-        assert!(
-            clean_lines.contains("No dead code found."),
-            "a fully parsed store still answers the question: {clean_lines}"
-        );
-        assert!(
-            !clean_lines.contains("REFUSED"),
-            "a fully parsed store must not refuse: {clean_lines}"
-        );
-        assert!(
-            clean.verified,
-            "its empty answer is a verified absence: {:?}",
-            clean.unverified_reasons
-        );
-
-        // The hole. `lib/router.js` is admitted and produced nothing, which is
-        // the express shape: it can neither be listed here nor supply the edge
-        // that would keep something else off the list.
-        let holed = scan(&admitted_graph(false));
-        let holed_lines = holed.lines.join("\n");
-        assert!(
-            holed_lines.contains("REFUSED"),
-            "an empty answer over a parse hole must refuse: {holed_lines}"
-        );
-        assert!(
-            !holed_lines.contains("No dead code found."),
-            "the refusal replaces the clean bill rather than sitting under it: {holed_lines}"
-        );
-        assert!(
-            !holed.verified,
-            "the response's own field must agree with its lines"
-        );
-        assert!(
-            holed.unverified_reasons.iter().any(|reason| {
-                reason.starts_with(kin_core::reference_coverage::PARSE_HOLE_LIMITING_FACTOR)
-                    && reason.contains("lib/router.js")
-            }),
-            "the refusal names the hole it is about: {:?}",
-            holed.unverified_reasons
         );
     }
 }

@@ -51,11 +51,21 @@ FAIL = "FAIL"
 UNREADABLE = "UNREADABLE"
 TICKET = "FIR-2599"
 
-# Four modules an adapter reads, and three files it cannot, all admitted under a
-# .js extension. Three is the express shape in miniature: it clears the file
-# floor the threshold carries, and 3 of 7 is well past its share.
+# Four modules that declare a function, and three that declare nothing, all
+# admitted under a .js extension and all valid UTF-8.
 READABLE = 4
-UNREADABLE_FILES = 3
+SILENT_FILES = 3
+
+
+def tail(text, limit=400):
+    """The END of a command's output, which is where its error is.
+
+    Truncating from the front is how a CI run reported three FAILs whose cause
+    read `Erro`: the suite printed the first 600 characters of an output that
+    opened with two environment warnings.
+    """
+    text = (text or "").strip()
+    return text if len(text) <= limit else "..." + text[-limit:]
 
 
 def run(cmd, cwd=None, env=None, timeout=600):
@@ -108,40 +118,37 @@ class Result(object):
 
 # ------------------------------------------------------------------- graders
 
-def status_withholds_all_clear(text):
-    """Whether `kin graph status` output declines to report a clean store.
+def status_publishes_the_census(text):
+    """Whether `kin graph status` published the per-language section.
 
-    Both halves are required. A page that dropped the all-clear and said nothing
-    about why is not the fix; a page that named the hole under a `✓` is not
-    either.
+    Both halves are required. The section header alone is not the fix, because
+    the repository-grain count already exists on the page above it; the delta is
+    the per-language row and the named paths.
     """
-    named = "parse coverage is incomplete" in text and "produced no entity" in text
-    return named and "No issues detected." not in text
+    return ("Parse coverage (files that produced an entity / files admitted):" in text
+            and "no_entity:" in text)
 
 
-def doctor_row_reports_a_hole(report):
-    """Whether the doctor report's parse row needs attention and names a file.
+def doctor_row_names_the_files(report):
+    """Whether the doctor's parse row published its numbers and its paths.
 
     Reads the structured report rather than the rendered table, because the
-    table's column widths are presentation and the row's status is the verdict.
-    Returns None when the row is absent, which is UNREADABLE rather than a
-    verdict about the store.
+    table's column widths are presentation. Returns None when the row is absent,
+    which is UNREADABLE rather than a verdict about the store.
+
+    The row must stay `healthy`: a count is not a defect, and a doctor row that
+    went red on it would go red on most JavaScript repositories.
     """
     rows = [row for row in report.get("checks", []) if row.get("id") == "parse_coverage"]
     if not rows:
         return None
     row = rows[0]
-    return row.get("status") != "healthy" and ".js" in (row.get("detail") or "")
-
-
-def dead_code_refuses(text):
-    """Whether `kin dead-code` declined to answer rather than printing a zero."""
-    return "REFUSED" in text and "No dead code found." not in text
+    detail = row.get("detail") or ""
+    return row.get("status") == "healthy" and ".js" in detail
 
 
 GRADERS = {
-    "status_withholds_all_clear": status_withholds_all_clear,
-    "dead_code_refuses": dead_code_refuses,
+    "status_publishes_the_census": status_publishes_the_census,
 }
 
 
@@ -179,9 +186,9 @@ class Suite(object):
     def kin_run(self, args, repo, timeout=600):
         return run([self.kin] + args, cwd=repo, env=self.env, timeout=timeout)
 
-    def fixture(self, name, unreadable):
-        """A JavaScript library of `READABLE` modules plus `unreadable` files an
-        adapter is registered for and produces nothing from.
+    def fixture(self, name, silent):
+        """A JavaScript library of `READABLE` modules plus `silent` files that
+        are valid source and declare nothing.
 
         Admitted through `kin init`, the boundary a user crosses, so the census
         reads the same tree and entity table the product does.
@@ -205,13 +212,14 @@ class Suite(object):
                     "function handler%d() {\n  return next;\n}\n"
                     "module.exports = handler%d;\n" % (following, index, index)
                 )
-        for index in range(unreadable):
-            # Bytes no adapter produces an entity from, under an extension that
-            # admits the file as a full-adapter input. The extension is what
-            # puts it in the denominator; the content is what leaves it out of
-            # the entity table.
-            with open(os.path.join(repo, "lib", "unreadable%d.js" % index), "wb") as handle:
-                handle.write(bytes(range(8)))
+        for index in range(silent):
+            # Valid UTF-8 JavaScript that declares nothing. This is the honest
+            # shape: bytes an adapter is registered for, admitted as source, and
+            # holding no entity. NUL bytes would route the file to the opaque
+            # facet instead, which is a different state wearing the same
+            # numbers, and it is what an earlier version of this fixture used.
+            with open(os.path.join(repo, "lib", "silent%d.js" % index), "w") as handle:
+                handle.write("require('./module0');\n// nothing is declared here\n")
         self.git(["add", "--all"], repo)
         rc, out = self.git(["commit", "-m", "a javascript library"], repo)
         if rc != 0:
@@ -226,81 +234,68 @@ class Suite(object):
 # --------------------------------------------------------------------- checks
 
 def check_status(suite):
-    """`kin graph status` withholds its all-clear over a parse hole.
+    """`kin graph status` publishes per-language parse coverage and names files.
 
-    The express page printed "Supported inputs: 141" beside "Files: 66" and then
-    `✓ No issues detected.`, so it held every number a reader needed and drew the
-    one conclusion those numbers refute.
+    The page already carried a repository-grain count before this: "of the N
+    admitted, N carry a full language adapter; M of those produced no entity".
+    What it could not do was say WHICH language and WHICH files, which is the
+    part a reader can act on.
     """
-    result = Result("status", "graph status names a parse hole and withholds the all-clear")
-    for name, unreadable, want in (("holed", UNREADABLE_FILES, True), ("whole", 0, False)):
-        repo = suite.fixture(name, unreadable)
+    result = Result("status", "graph status publishes the per-language census and names files")
+    for name, silent, want in (("holed", SILENT_FILES, True), ("whole", 0, False)):
+        repo = suite.fixture(name, silent)
         rc, out = suite.kin_run(["graph", "status"], repo)
-        if not out.strip():
-            result.unknown("%s: `kin graph status` produced no output (rc=%d)" % (name, rc))
+        if rc != 0:
+            result.unknown("%s: `kin graph status` exited %d: %s" % (name, rc, tail(out)))
             continue
-        got = status_withholds_all_clear(out)
-        if got == want:
-            result.ok("%s: withholds=%s as expected" % (name, got))
+        published = status_publishes_the_census(out)
+        # The section prints in every state, so the holed fixture must name a
+        # file and the whole one must name none. Both halves read the same
+        # grader, and the header alone satisfies neither.
+        named = "no_entity:" in out
+        if published == want or (not want and "Parse coverage (" in out and not named):
+            result.ok("%s: census published=%s named=%s as expected" % (name, published, named))
         else:
-            result.bad("%s: withholds=%s, wanted %s. Output: %s"
-                       % (name, got, want, out.strip()[:600]))
+            result.bad("%s: published=%s named=%s, wanted named=%s. Output: %s"
+                       % (name, published, named, want, tail(out, 700)))
     return result
 
 
 def check_doctor(suite):
-    """`kin doctor` carries a parse-coverage row that needs attention."""
-    result = Result("doctor", "doctor reports a parse-coverage row naming the hole")
-    for name, unreadable, want in (("holed", UNREADABLE_FILES, True), ("whole", 0, False)):
-        repo = suite.fixture(name, unreadable)
+    """`kin doctor` carries a parse-coverage row that reports and never judges."""
+    result = Result("doctor", "doctor publishes a parse-coverage row that stays healthy")
+    for name, silent in (("holed", SILENT_FILES), ("whole", 0)):
+        repo = suite.fixture(name, silent)
         # The row reads the run's one `graph status`, which needs a daemon, and
-        # `kin init` leaves none running. Without this the row reports
-        # "no daemon is serving this repository" and the check grades a fact
-        # about the fixture as a fact about the product.
-        suite.kin_run(["graph", "status"], repo)
+        # `kin init` leaves none running. Without this the row reports "no
+        # daemon is serving this repository" and the check grades a fact about
+        # the fixture as a fact about the product.
+        warm_rc, warm_out = suite.kin_run(["graph", "status"], repo)
+        if warm_rc != 0:
+            result.unknown("%s: could not start a daemon, `kin graph status` exited %d: %s"
+                           % (name, warm_rc, tail(warm_out)))
+            continue
         rc, out = suite.kin_run(["doctor", "--json"], repo)
         try:
             report = json.loads(out[out.index("{"):out.rindex("}") + 1])
         except (ValueError, json.JSONDecodeError):
             result.unknown("%s: `kin doctor --json` payload was not JSON (rc=%d): %s"
-                           % (name, rc, out.strip()[:400]))
+                           % (name, rc, tail(out)))
             continue
-        got = doctor_row_reports_a_hole(report)
+        got = doctor_row_names_the_files(report)
+        rows = [r for r in report.get("checks", []) if r.get("id") == "parse_coverage"]
         if got is None:
             result.unknown("%s: this build's doctor report carries no `parse_coverage` row" % name)
-        elif got == want:
-            result.ok("%s: row reports a hole=%s as expected" % (name, got))
+        elif name == "holed" and got:
+            result.ok("holed: the row is healthy and names a file")
+        elif name == "whole" and rows and rows[0].get("status") == "healthy":
+            result.ok("whole: the row is healthy and names none")
         else:
-            rows = [r for r in report.get("checks", []) if r.get("id") == "parse_coverage"]
-            result.bad("%s: row reports a hole=%s, wanted %s. Row: %s"
-                       % (name, got, want, json.dumps(rows)))
+            result.bad("%s: row did not read as expected. Row: %s" % (name, json.dumps(rows)))
     return result
 
 
-def check_dead_code(suite):
-    """`kin dead-code` refuses rather than printing a zero over the hole.
-
-    The stranger's words: 0 is a number while the caveat is a paragraph. An
-    empty result over a parse hole is the one answer in that command that reads
-    as a licence to act.
-    """
-    result = Result("dead_code", "dead-code refuses over a parse hole and answers without one")
-    for name, unreadable, want in (("holed", UNREADABLE_FILES, True), ("whole", 0, False)):
-        repo = suite.fixture(name, unreadable)
-        rc, out = suite.kin_run(["dead-code"], repo)
-        if not out.strip():
-            result.unknown("%s: `kin dead-code` produced no output (rc=%d)" % (name, rc))
-            continue
-        got = dead_code_refuses(out)
-        if got == want:
-            result.ok("%s: refuses=%s as expected" % (name, got))
-        else:
-            result.bad("%s: refuses=%s, wanted %s. Output: %s"
-                       % (name, got, want, out.strip()[:600]))
-    return result
-
-
-CHECKS = [check_status, check_doctor, check_dead_code]
+CHECKS = [check_status, check_doctor]
 
 
 # ------------------------------------------------------------------ self-test
@@ -314,18 +309,18 @@ def self_test():
     named in seconds rather than after three minutes of compiling.
     """
     cases = [
-        ("status_withholds_all_clear", True,
-         "javascript parse coverage is incomplete: 3 of 7 admitted files produced no entity"),
-        ("status_withholds_all_clear", False, "✓ No issues detected."),
-        # Named AND all-clear is the sabotage that matters: a page that grew the
-        # sentence and kept the tick has not withheld anything.
-        ("status_withholds_all_clear", False,
-         "parse coverage is incomplete: produced no entity\n✓ No issues detected."),
-        # A page that dropped the tick and said nothing is not the fix either.
-        ("status_withholds_all_clear", False, "Entities: 4  |  Files: 4"),
-        ("dead_code_refuses", True, "REFUSED: this scan cannot say whether anything is unreferenced"),
-        ("dead_code_refuses", False, "No dead code found."),
-        ("dead_code_refuses", False, "REFUSED\nNo dead code found."),
+        ("status_publishes_the_census", True,
+         "Parse coverage (files that produced an entity / files admitted):\n"
+         "  javascript: 4/7 (57%)\n  no_entity: 3 of 7 admitted javascript files produced "
+         "no entity, including lib/silent0.js"),
+        # The header alone is not the delta: a repository-grain count already
+        # existed on that page, and the per-language row plus the named paths
+        # are what this suite is about.
+        ("status_publishes_the_census", False,
+         "Parse coverage (files that produced an entity / files admitted):\n"
+         "  javascript: 7/7 (100%)"),
+        ("status_publishes_the_census", False, "no_entity: 3 of 7 admitted javascript files"),
+        ("status_publishes_the_census", False, "Entities: 4  |  Files: 4"),
     ]
     failures = []
     for name, want, text in cases:
@@ -335,23 +330,35 @@ def self_test():
 
     # The doctor grader reads a structure rather than a string.
     doctor_cases = [
-        (True, {"checks": [{"id": "parse_coverage", "status": "stale",
-                            "detail": "3 of 7 admitted files, including lib/unreadable0.js"}]}),
+        (True, {"checks": [{"id": "parse_coverage", "status": "healthy",
+                            "detail": "javascript 4/7; no_entity: 3 of 7, including lib/silent0.js"}]}),
+        # A row that went red on a count is the failure mode this suite exists
+        # to prevent, so the grader must not accept one.
+        (False, {"checks": [{"id": "parse_coverage", "status": "stale",
+                             "detail": "javascript 4/7, including lib/silent0.js"}]}),
         (False, {"checks": [{"id": "parse_coverage", "status": "healthy",
                              "detail": "javascript 7/7"}]}),
-        # A row that needs attention and names no file is not a usable report,
-        # and neither is one whose detail is missing entirely.
-        (False, {"checks": [{"id": "parse_coverage", "status": "stale", "detail": "incomplete"}]}),
-        (False, {"checks": [{"id": "parse_coverage", "status": "stale"}]}),
-        # An absent row is UNREADABLE, never a verdict about the store.
+        (False, {"checks": [{"id": "parse_coverage", "status": "healthy"}]}),
         (None, {"checks": [{"id": "relation_census", "status": "healthy"}]}),
         (None, {"checks": []}),
     ]
     for want, report in doctor_cases:
-        got = doctor_row_reports_a_hole(report)
+        got = doctor_row_names_the_files(report)
         if got != want:
-            failures.append("doctor_row_reports_a_hole(%s) = %s, wanted %s"
+            failures.append("doctor_row_names_the_files(%s) = %s, wanted %s"
                             % (json.dumps(report), got, want))
+
+    # `tail` must keep the END of an output, which is where the error is.
+    tail_cases = [
+        ("short", "short"),
+        ("WARN noise " * 60 + "Error: the real cause", None),
+    ]
+    for text, exact in tail_cases:
+        got = tail(text, 40)
+        if exact is not None and got != exact:
+            failures.append("tail(%r) = %r, wanted %r" % (text, got, exact))
+        if exact is None and not got.endswith("Error: the real cause"):
+            failures.append("tail dropped the end of the output: %r" % got)
 
     # Result.status must never grade a FAIL or an ungraded run as a pass.
     grade_cases = [
@@ -371,7 +378,7 @@ def self_test():
 
     for failure in failures:
         print("SELFTEST FAIL %s" % failure)
-    total = len(cases) + len(doctor_cases) + len(grade_cases)
+    total = len(cases) + len(doctor_cases) + len(tail_cases) + len(grade_cases)
     print("kin-parse-hole-repro: self-test %d/%d cases"
           % (total - len(failures), total))
     return 1 if failures else 0

@@ -3791,15 +3791,18 @@ fn parse_coverage_row_for_unread_graph(
     }
 }
 
-/// Turn the census into a verdict, split from its fetch so the rule is testable
-/// without a daemon.
+/// Turn the census into a row, split from its fetch so it is testable without a
+/// daemon.
 ///
-/// Stale rather than Degraded, and the distinction is the point. Degraded is
-/// this file's word for a shortfall in the machine, and an unparsed library
-/// file is not one: the repository holds ground Kin did not take, and every
-/// answer over those files is short until it does. Stale needs attention and
-/// does not fail readiness, because an install that parsed nine tenths of a
-/// repository is not a broken install.
+/// Healthy in every state, and that is a deliberate retreat rather than an
+/// oversight. A verdict needs a signal that separates a language the extractor
+/// failed on from a file that legitimately declares nothing, and no such signal
+/// exists in graph-owned state today: a side-effect script, a re-export and a
+/// comment-only file each produce no entity and are each perfectly correct.
+/// Measured on a five-file JavaScript repository holding one real module beside
+/// one of each of those, the ratio reads 1/5, which is worse than the express
+/// checkout this census was built for. So the row reports the count and names
+/// the files, and leaves the reading to a person who can open them.
 pub(crate) fn parse_coverage_health(
     census: &kin_core::reference_coverage::ParseCoverageCensus,
 ) -> HealthCheck {
@@ -3827,21 +3830,15 @@ pub(crate) fn parse_coverage_health(
         .collect::<Vec<String>>()
         .join("; ");
 
-    let holes = census.warning_lines();
-    if holes.is_empty() {
+    let silent = census.silent_file_lines();
+    if silent.is_empty() {
         return HealthCheck::new(ID, LABEL, HealthStatus::Healthy, summary);
     }
-
     HealthCheck::new(
         ID,
         LABEL,
-        HealthStatus::Stale,
-        format!("{}; {summary}", holes.join("; ")),
-    )
-    .with_manual_fix(
-        "re-admit the repository so extraction runs again (`kin reconcile --admit`), and treat \
-         any dead-code or consumer-count answer over the named files as unverified until they \
-         parse",
+        HealthStatus::Healthy,
+        format!("{summary}; {}", silent.join("; ")),
     )
 }
 
@@ -8836,19 +8833,18 @@ mod tests {
         );
     }
 
-    /// One census row, so both branches of the parse row are testable without
-    /// a daemon or a store.
+    /// One census row, so the row is testable without a daemon or a store.
     fn parse_census_row(
         language: &str,
         tracked: usize,
-        unparsed: usize,
+        silent: usize,
     ) -> kin_core::reference_coverage::LanguageParseCoverage {
         kin_core::reference_coverage::LanguageParseCoverage {
             language: language.to_string(),
             tracked,
-            with_entities: tracked.saturating_sub(unparsed),
-            unparsed,
-            sample: if unparsed > 0 {
+            with_entities: tracked.saturating_sub(silent),
+            silent,
+            sample: if silent > 0 {
                 vec!["lib/express.js".to_string()]
             } else {
                 Vec::new()
@@ -8856,50 +8852,41 @@ mod tests {
         }
     }
 
-    /// The row exists because this page read healthy while a language's main
-    /// files held no entity. A store the extractor read completely must not
-    /// grow a row that reads like a complaint, or a reader learns to skip the
-    /// one that matters.
+    /// The row reports and never judges. Healthy in both states, because no
+    /// graph-owned signal separates a file an adapter could not read from one
+    /// that correctly declares nothing, and a doctor row that went red on the
+    /// second would go red on most JavaScript repositories. It still has to
+    /// carry the numbers and the paths, or it is a row nobody can act on.
     #[test]
-    fn the_parse_row_reports_a_hole_and_stays_quiet_without_one() {
+    fn the_parse_row_reports_its_numbers_and_never_fails_a_store() {
         let clean = parse_coverage_health(&kin_core::reference_coverage::ParseCoverageCensus {
             languages: vec![parse_census_row("rust", 200, 0)],
         });
         assert!(matches!(clean.status, HealthStatus::Healthy));
         assert!(clean.manual_fix.is_none());
-        assert!(
-            clean.detail.contains("rust 200/200"),
-            "a clean row still reports its numbers: {}",
-            clean.detail
-        );
+        assert!(clean.detail.contains("rust 200/200"), "{}", clean.detail);
 
-        let holed = parse_coverage_health(&kin_core::reference_coverage::ParseCoverageCensus {
+        let silent = parse_coverage_health(&kin_core::reference_coverage::ParseCoverageCensus {
             languages: vec![parse_census_row("javascript", 141, 75)],
         });
         assert!(
-            matches!(holed.status, HealthStatus::Stale),
-            "a hole needs attention: {:?}",
-            holed.status
+            matches!(silent.status, HealthStatus::Healthy),
+            "a count is not a defect: {:?}",
+            silent.status
         );
         for expected in ["75", "141", "lib/express.js"] {
             assert!(
-                holed.detail.contains(expected),
+                silent.detail.contains(expected),
                 "the row must carry {expected}: {}",
-                holed.detail
+                silent.detail
             );
         }
         assert!(
-            holed
-                .manual_fix
-                .as_deref()
-                .is_some_and(|fix| fix.contains("kin reconcile --admit")),
-            "the fix line must name something the reader can do: {:?}",
-            holed.manual_fix
+            silent.manual_fix.is_none(),
+            "a fix line would promise a repair for something not shown to be broken: {:?}",
+            silent.manual_fix
         );
-        assert!(
-            !blocks_readiness(&holed),
-            "an install that parsed nine tenths of a repository is not a broken install"
-        );
+        assert!(!blocks_readiness(&silent));
     }
 
     /// A daemon that never measured parse coverage and a store whose files are
