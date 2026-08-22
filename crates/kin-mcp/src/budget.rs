@@ -197,7 +197,27 @@ pub struct BudgetAccounting {
     /// What the payload measured BEFORE the budget touched it.
     #[serde(rename = "chars_before_budget")]
     pub chars_before: usize,
-    /// True when something was actually removed.
+    /// What the payload measured when the ladder finished with it, which is the
+    /// size the response ships at.
+    ///
+    /// `chars_before` alone cannot say whether the bound held. An
+    /// `impact_analysis` answer reported `bounded: false` beside a
+    /// `chars_before_budget` of 50,354 against a 2,000-character ceiling and
+    /// shipped all 50,354, and nothing in the accounting distinguished that from
+    /// a response whose diagnostics were compacted away and which then fit.
+    /// Publishing the size the response actually shipped at is what separates
+    /// them, and it is the number a caller compares against `max_chars`.
+    ///
+    /// Measured before the envelope's own accounting stanza is rewritten, so it
+    /// is accurate to within the length of that stanza rather than to the byte.
+    #[serde(rename = "chars_after_budget", default)]
+    pub chars_after: usize,
+    /// True when the budget removed hits, bodies or breakdowns under pressure.
+    ///
+    /// False does not by itself mean the response is whole: compaction is the
+    /// documented default shape and is reported by `compact`, not here. What
+    /// false does mean, always, is that the response fits `max_chars`; read
+    /// `chars_after_budget` for the size it fits at.
     pub bounded: bool,
     /// True when explanation and per-signal breakdowns were shed.
     pub compact: bool,
@@ -409,19 +429,54 @@ fn shape_for(tool: &str) -> Option<ResponseShape> {
             bulk_keys: &[],
             narrow_param: "depth",
         },
-        // The four buckets an `ImpactReport` serializes as arrays of raw
-        // entities, most important first. `impacted_entities` was never a key
-        // this response carries, so naming it here left every rung of the ladder
-        // walking an array that does not exist: nothing was stripped and nothing
-        // was trimmed on a 416,567-character answer. `entity_impacts` is
-        // deliberately absent, because its per-entity counts ARE the answer and
-        // they are small.
+        // Every array an `impact_analysis` response carries, ranked by what a
+        // caller loses when it goes, because the ladder trims from the end.
+        //
+        // Naming only the four blast-radius buckets is what FIR-2602 was: a
+        // report over a wide diff can leave all four genuinely empty and still
+        // run to tens of thousands of characters, because `entity_impacts`
+        // carries a row per changed entity and the changed-id and attribution
+        // echoes carry one entry each. The ladder walked its four arrays, found
+        // nothing to cut, and returned 50,354 characters against a 2,000
+        // ceiling while reporting itself unbounded. A key the table does not
+        // name is a key the bounder cannot count, so the table names them all.
+        //
+        // The ranking, most important first:
+        //
+        // `entity_impacts` is the verdict. `proven_consumer_count` and
+        // `covering_tests` are what a caller reads to decide whether something
+        // is safe to change, and they were once left out on the grounds that
+        // they are small, which is true per row and false per report.
+        //
+        // The four blast-radius buckets come next, in the order kin#1062 fixed
+        // them in: callers before dependents, dependents before contract
+        // consumers, tests last of the four.
+        //
+        // Then the governance and input echoes. `unreviewed_agent_changes` is a
+        // judgment a caller cannot reconstruct; `changed_ids` is the target the
+        // caller named, so it is the one list the caller already holds.
+        //
+        // Then provenance and side channels: `actor_attribution` is answered in
+        // full by `kin_provenance_query`, and work items and annotations are
+        // adjacent records rather than blast radius.
+        //
+        // Ambient context sheds first. `cross_repo_impact` and `active_traffic`
+        // answer "who else is nearby", and `active_traffic` is already optional
+        // on the call.
         "impact_analysis" => ResponseShape {
             collections: &[
+                "entity_impacts",
                 "affected_callers",
                 "affected_dependents",
                 "affected_contract_consumers",
                 "affected_tests",
+                "unreviewed_agent_changes",
+                "changed_ids",
+                "actor_attribution",
+                "affected_work_items",
+                "affected_annotations",
+                "cross_repo_impact",
+                "active_traffic",
             ],
             body_keys: &["body"],
             explain_keys: &[],
@@ -485,9 +540,36 @@ pub fn enforce(
     let mut accounting = BudgetAccounting {
         max_chars: budget.max_chars,
         chars_before,
+        chars_after: chars_before,
         bounded: false,
         compact: budget.compact,
     };
+    run_ladder(payload, &shape, budget, &mut accounting);
+    accounting.chars_after = measure(payload);
+
+    // A response the ladder could not bring under its ceiling is the case
+    // FIR-2602 shipped silently: every rung ran, nothing was left to cut, and
+    // the accounting reported a whole answer. The ceiling is not always
+    // reachable, because a bound is not a refusal and every list keeps an entry,
+    // but the caller has to be told which of the two it is holding.
+    if accounting.chars_after > budget.max_chars {
+        disclose_residual(payload, budget);
+        accounting.chars_after = measure(payload);
+    }
+    Some(accounting)
+}
+
+/// Run the ladder over one payload, recording what it cost in `accounting`.
+///
+/// Split from [`enforce`] so the size the response ships at is measured on one
+/// path rather than on each of the ladder's several exits, which is what let a
+/// rung return early without anything measuring the result.
+fn run_ladder(
+    payload: &mut Value,
+    shape: &ResponseShape,
+    budget: &ResponseBudget,
+    accounting: &mut BudgetAccounting,
+) {
     let mut cuts: Vec<String> = Vec::new();
     let mut remediations: Vec<String> = Vec::new();
 
@@ -497,12 +579,12 @@ pub fn enforce(
     // This one is not disclosed as a cut, because it is the documented default
     // shape rather than something the budget took away under pressure.
     if budget.compact {
-        strip_keys(payload, &shape, shape.explain_keys, shape.top_explain_keys);
-        strip_keys(payload, &shape, shape.bulk_keys, &[]);
+        strip_keys(payload, shape, shape.explain_keys, shape.top_explain_keys);
+        strip_keys(payload, shape, shape.bulk_keys, &[]);
     }
 
     if measure(payload) <= budget.max_chars {
-        return Some(accounting);
+        return;
     }
 
     // The reserve holds room for the disclosure the cut adds, but it can never
@@ -518,7 +600,7 @@ pub fn enforce(
     // The disclosure names what happened; silence would leave the caller reading
     // an explain-less response it had explicitly asked to explain.
     if !budget.compact {
-        let stripped = strip_keys(payload, &shape, shape.explain_keys, shape.top_explain_keys);
+        let stripped = strip_keys(payload, shape, shape.explain_keys, shape.top_explain_keys);
         if stripped > 0 {
             accounting.bounded = true;
             cuts.push(format!(
@@ -528,7 +610,7 @@ pub fn enforce(
         // Bulk identity is shed here too. A caller that turned compaction off
         // asked to see the ranking, not to be served a response its client
         // refuses because every row carries four hash arrays.
-        let stripped = strip_keys(payload, &shape, shape.bulk_keys, &[]);
+        let stripped = strip_keys(payload, shape, shape.bulk_keys, &[]);
         if stripped > 0 {
             accounting.bounded = true;
             cuts.push(format!(
@@ -538,12 +620,12 @@ pub fn enforce(
         }
         if measure(payload) <= target {
             disclose(payload, budget, &cuts, &remediations);
-            return Some(accounting);
+            return;
         }
     }
 
     if !shape.duplicate_keys.is_empty() {
-        let stripped = strip_keys(payload, &shape, shape.duplicate_keys, &[]);
+        let stripped = strip_keys(payload, shape, shape.duplicate_keys, &[]);
         if stripped > 0 {
             accounting.bounded = true;
             cuts.push(format!(
@@ -554,12 +636,12 @@ pub fn enforce(
         }
         if measure(payload) <= target {
             disclose(payload, budget, &cuts, &remediations);
-            return Some(accounting);
+            return;
         }
     }
 
     if !shape.body_keys.is_empty() {
-        let stripped = strip_keys(payload, &shape, shape.body_keys, &[]);
+        let stripped = strip_keys(payload, shape, shape.body_keys, &[]);
         if stripped > 0 {
             accounting.bounded = true;
             cuts.push(format!(
@@ -570,7 +652,7 @@ pub fn enforce(
         }
         if measure(payload) <= target {
             disclose(payload, budget, &cuts, &remediations);
-            return Some(accounting);
+            return;
         }
     }
 
@@ -621,7 +703,45 @@ pub fn enforce(
     }
 
     disclose(payload, budget, &cuts, &remediations);
-    Some(accounting)
+}
+
+/// The reason code a response that stayed over its ceiling carries.
+pub const OVER_BUDGET_REASON: &str = "response_over_budget";
+
+/// Record that the ladder finished with the payload still over its ceiling.
+///
+/// Every list the budget cuts keeps at least one entry, so a response whose
+/// surviving entries alone exceed the budget cannot be cut further without
+/// producing the empty array FIR-2600 exists to prevent. That case is rare and
+/// it is real, and the only wrong answer is a quiet one: FIR-2602 shipped
+/// 50,354 characters against a 2,000-character ceiling and reported nothing at
+/// all. This says so in the channel the other cuts already use.
+///
+/// The note carries no size of its own. Appending it changes the size it would
+/// be reporting, so any number written here is stale the moment it is written;
+/// the accounting's `chars_after_budget` is measured after this note lands and
+/// is the one that holds.
+fn disclose_residual(payload: &mut Value, budget: &ResponseBudget) {
+    let max_chars = budget.max_chars;
+    let entry = json!({
+        "component": "response_budget",
+        "reason": OVER_BUDGET_REASON,
+        "detail": format!(
+            "the response did not reach its {max_chars}-character budget: every list the budget \
+             cuts keeps at least one entry, and what survived does not fit. Read the size it \
+             ships at from `_kin.response.chars_after_budget`, or from the bytes received"
+        ),
+        "remediation": "narrow the request, or raise max_chars if the caller's own result \
+                        limit accepts a larger payload",
+        "max_chars": max_chars,
+    });
+    match payload
+        .get_mut("degradations")
+        .and_then(Value::as_array_mut)
+    {
+        Some(existing) => existing.push(entry),
+        None => payload["degradations"] = Value::Array(vec![entry]),
+    }
 }
 
 /// Remove `keys` from every hit in every collection, and `top_keys` from the
@@ -1222,6 +1342,228 @@ mod tests {
             payload.get("affected_tests_withheld").is_none(),
             "nothing was withheld: {payload}"
         );
+    }
+
+    /// An impact response shaped the way the measured one was: every
+    /// `affected_*` bucket genuinely empty, and every byte of the payload in the
+    /// per-entity attribution, the changed-id echo and the actor attribution.
+    ///
+    /// That shape is what an `impact_analysis` over a wide diff returns. The
+    /// blast-radius buckets can be empty and the report still runs to tens of
+    /// thousands of characters, because `entity_impacts` carries one row per
+    /// changed entity and each row carries its consumer files.
+    fn impact_payload_bulk_outside_the_buckets(rows: usize) -> Value {
+        let entity_id = |index: usize| format!("9b9f577c-2cb3-43fd-a59b-ced58218{index:04}");
+        json!({
+            "affected_callers": [],
+            "affected_dependents": [],
+            "affected_contract_consumers": [],
+            "affected_tests": [],
+            "affected_work_items": [],
+            "affected_annotations": [],
+            "changed_ids": (0..rows).map(entity_id).collect::<Vec<_>>(),
+            "unreviewed_agent_changes": (0..rows / 2).map(entity_id).collect::<Vec<_>>(),
+            "actor_attribution": (0..rows)
+                .map(|index| json!([entity_id(index), "Assistant"]))
+                .collect::<Vec<_>>(),
+            "entity_impacts": (0..rows)
+                .map(|index| json!({
+                    "entity_id": entity_id(index),
+                    "consumer_count": index % 7,
+                    "strong_consumer_count": index % 5,
+                    "proven_consumer_count": index % 3,
+                    "contract_consumer_count": 0,
+                    "consumer_files": (0..6)
+                        .map(|file| format!(
+                            "src/requests/adapters/session_{index}_{file}.py"
+                        ))
+                        .collect::<Vec<_>>(),
+                    "covering_tests": index % 4,
+                    "consumers_migrated_in_diff": 0,
+                    "call_shapes": {
+                        "caller_keyword_names": ["stream", "timeout", "verify"],
+                        "any_var_keyword_caller": false,
+                        "all_consumers_shaped_calls": true,
+                    },
+                }))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    /// FIR-2602. The shape table listed only the four blast-radius buckets, so a
+    /// report whose bulk sits anywhere else walked every rung of the ladder
+    /// untouched: nothing was stripped, nothing was trimmed, and the accounting
+    /// reported `bounded: false` on a payload 25 times over its ceiling. Measured
+    /// through MCP on a build carrying kin#1062 as `{"bounded": false,
+    /// "chars_before_budget": 50354, "max_chars": 2000}` with all four buckets
+    /// genuinely empty.
+    ///
+    /// Both ceilings are asserted, because they prove different halves. At the
+    /// 2,000 the measured call used, twelve lists each keeping their floor entry
+    /// cannot fit and the response says so rather than shipping quiet. At a
+    /// ceiling a real call gets, the same report fits inside it.
+    #[test]
+    fn impact_bulk_outside_the_blast_radius_buckets_is_counted_and_bounded() {
+        const FLOOR: usize = RESPONSE_MIN_MAX_CHARS;
+        let mut payload = impact_payload_bulk_outside_the_buckets(60);
+        let before = measure(&payload);
+        assert!(
+            before > FLOOR * 10,
+            "the fixture must reproduce the measured overrun, not a near miss: {before}"
+        );
+        for bucket in [
+            "affected_callers",
+            "affected_dependents",
+            "affected_contract_consumers",
+            "affected_tests",
+        ] {
+            assert!(
+                payload[bucket].as_array().expect("bucket").is_empty(),
+                "the measured response had every blast-radius bucket empty"
+            );
+        }
+
+        let budget = ResponseBudget {
+            max_chars: FLOOR,
+            ..ResponseBudget::default()
+        };
+        let accounting = enforce(&mut payload, "impact_analysis", &budget).expect("budgeted");
+        assert_eq!(accounting.chars_before, before);
+        assert_eq!(
+            accounting.chars_after,
+            measure(&payload),
+            "the accounting must report the size the response actually shipped at"
+        );
+        assert!(
+            accounting.bounded,
+            "a response the budget had to cut cannot report itself unbounded: {payload}"
+        );
+        assert!(
+            accounting.chars_after < before / 10,
+            "the widened table must count the bulk it could not see before: \
+             {before} to {}",
+            accounting.chars_after
+        );
+        // Twelve lists at their floor plus the disclosure do not fit 2,000, and
+        // that is the one outcome that must never be silent.
+        assert!(
+            accounting.chars_after > budget.max_chars,
+            "this assertion guards the branch below; a fit here means the fixture changed"
+        );
+        let residual = payload["degradations"]
+            .as_array()
+            .expect("a cut is disclosed")
+            .iter()
+            .find(|entry| entry["reason"] == json!(OVER_BUDGET_REASON));
+        assert!(
+            residual.is_some(),
+            "a response still over its ceiling must say so: {payload}"
+        );
+
+        // The same report at a ceiling a real call gets fits inside it.
+        let mut payload = impact_payload_bulk_outside_the_buckets(60);
+        let budget = ResponseBudget::default();
+        let accounting = enforce(&mut payload, "impact_analysis", &budget).expect("budgeted");
+        assert!(
+            accounting.chars_after <= budget.max_chars,
+            "the response shipped {} characters against a {} ceiling: {payload}",
+            accounting.chars_after,
+            budget.max_chars
+        );
+        assert!(
+            payload["degradations"]
+                .as_array()
+                .map_or(true, |entries| entries
+                    .iter()
+                    .all(|entry| entry["reason"] != json!(OVER_BUDGET_REASON))),
+            "a response that reached its ceiling must not claim it did not: {payload}"
+        );
+    }
+
+    /// The elision half of the same case: the widened table must cut with counts
+    /// rather than by emptying, on every list it newly reaches.
+    #[test]
+    fn a_widened_impact_table_elides_with_counts_and_empties_nothing() {
+        const BUDGET: usize = 2_000;
+        let mut payload = impact_payload_bulk_outside_the_buckets(60);
+        let found: Vec<(String, usize)> = payload
+            .as_object()
+            .expect("object")
+            .iter()
+            .filter_map(|(key, value)| {
+                value
+                    .as_array()
+                    .filter(|rows| !rows.is_empty())
+                    .map(|rows| (key.clone(), rows.len()))
+            })
+            .collect();
+        assert!(
+            found.len() >= 3,
+            "the fixture must fill several lists or this proves nothing: {found:?}"
+        );
+        let budget = ResponseBudget {
+            max_chars: BUDGET,
+            ..ResponseBudget::default()
+        };
+        enforce(&mut payload, "impact_analysis", &budget).expect("budgeted");
+
+        let mut cut_any = false;
+        for (key, before) in found {
+            let kept = payload[&key].as_array().expect("list survives").len();
+            assert!(
+                kept > 0,
+                "`{key}` was emptied by the budget, which reads as \"the walk found none\": \
+                 {payload}"
+            );
+            if kept == before {
+                continue;
+            }
+            cut_any = true;
+            let elision = &payload["elisions"][&key];
+            assert_eq!(elision["kept"], json!(kept), "{payload}");
+            assert_eq!(elision["elided"], json!(before - kept), "{payload}");
+            assert_eq!(elision["total"], json!(before), "{payload}");
+            assert_eq!(elision["reason"], json!(ELISION_REASON_BUDGET), "{payload}");
+        }
+        assert!(
+            cut_any,
+            "a 2000-character ceiling must have cut something: {payload}"
+        );
+    }
+
+    /// The invariant the two tests above are instances of, held across every
+    /// budgeted tool rather than on one fixture: an accounting that reports
+    /// `bounded: false` is asserting the response fits, so it must fit.
+    ///
+    /// This is the check that would have caught FIR-2602 in any tool, because
+    /// the defect was never about impact reports. It was about a shape table
+    /// that could fall behind the payload it describes without anything saying
+    /// so.
+    #[test]
+    fn an_unbounded_accounting_always_describes_a_response_that_fits() {
+        const BUDGET: usize = 2_000;
+        let budget = ResponseBudget {
+            max_chars: BUDGET,
+            ..ResponseBudget::default()
+        };
+        let cases: Vec<(&str, Value)> = vec![
+            (
+                "impact_analysis",
+                impact_payload_bulk_outside_the_buckets(60),
+            ),
+            ("impact_analysis", impact_payload(33)),
+            ("semantic_locate", locate_payload(30, 400)),
+            ("semantic_locate", locate_payload(1, 4)),
+        ];
+        for (tool, mut payload) in cases {
+            let accounting = enforce(&mut payload, tool, &budget).expect("budgeted");
+            assert_eq!(accounting.chars_after, measure(&payload), "{tool}");
+            assert!(
+                accounting.bounded || accounting.chars_after <= BUDGET,
+                "{tool} reported bounded false at {} characters against a {BUDGET} ceiling",
+                accounting.chars_after
+            );
+        }
     }
 
     /// A list nothing was taken from must not grow an elision, whatever calls

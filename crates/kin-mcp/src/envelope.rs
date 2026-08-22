@@ -1979,6 +1979,10 @@ fn apply_response_budget(annotated: &mut Value, tool_name: &str, budget: &Respon
     let mut accounting = crate::budget::BudgetAccounting {
         max_chars: budget.max_chars,
         chars_before,
+        // The placeholder carries a number of the same magnitude as the one that
+        // replaces it, so the stanza written first is the width of the stanza
+        // that ships and the ladder charges the budget for the right bytes.
+        chars_after: chars_before,
         bounded: false,
         compact: budget.compact,
     };
