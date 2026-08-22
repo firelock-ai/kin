@@ -345,6 +345,17 @@ pub enum HeavyWork {
     EmbedBatch,
     /// One ambient admission tick: a complete working-copy walk planned into a
     /// tree transition, from a host event nobody asked for.
+    ///
+    /// Measured and never refused. Holding it is not the same trade as holding
+    /// the two above: a sweep held costs relations the next sweep restores and
+    /// a batch held costs vectors the next batch restores, while admission held
+    /// costs the thing itself, since it is the path by which a written file
+    /// becomes queryable at all. On a machine that stays loaded the tick that
+    /// would admit never comes, so the file stays invisible for as long as the
+    /// machine is busy. Neither measured failure implicated it, and it is one
+    /// bounded walk over a working copy. It keeps its place here because the
+    /// reconcile loop is the cheapest cadence in the daemon to publish the
+    /// footprint standing from, and a labelled call is what publishes it.
     AmbientAdmission,
 }
 
@@ -624,11 +635,18 @@ impl Verdict {
                 describe(work, level, pressure.reading(), did)
             }
         };
+        // Admission is measured and never refused, at any rung. See
+        // [`HeavyWork::AmbientAdmission`] for why holding it is a different
+        // trade from holding the two passes that actually spend the machine.
+        if work == HeavyWork::AmbientAdmission {
+            return Verdict::Proceed;
+        }
         match level {
             PressureLevel::Unknown | PressureLevel::Nominal => Verdict::Proceed,
             PressureLevel::Elevated => match work {
                 HeavyWork::EmbedBatch => Verdict::Shrink { reason: reason() },
-                HeavyWork::LspSweep | HeavyWork::AmbientAdmission => Verdict::Proceed,
+                HeavyWork::LspSweep => Verdict::Proceed,
+                HeavyWork::AmbientAdmission => unreachable!("returned above"),
             },
             PressureLevel::Critical => Verdict::Refuse { reason: reason() },
         }
@@ -1332,16 +1350,50 @@ mod tests {
                 "absence of evidence is not pressure"
             );
         }
+        assert_eq!(unknown.unknown_reason().is_some(), true);
+    }
+
+    /// Admission is measured and never refused, at any rung.
+    ///
+    /// It was refused when this seam landed and that was FIR-2632's sibling
+    /// half: on a machine that stays loaded the tick that would admit never
+    /// comes, so a file somebody wrote stops being queryable for as long as
+    /// their machine is busy. The model says so here, so it cannot drift from
+    /// the loop that obeys it.
+    #[test]
+    fn ambient_admission_is_never_refused_at_any_rung() {
+        let bars = Thresholds::default();
+        for pressure in [
+            MemoryPressure::Known(reading(12 * GIB, GIB)),
+            MemoryPressure::Known(reading(12 * GIB, 9 * GIB + GIB / 2)),
+            MemoryPressure::Known(reading(12 * GIB, 11 * GIB + GIB / 2)),
+            MemoryPressure::Forced {
+                level: PressureLevel::Critical,
+            },
+        ] {
+            assert_eq!(
+                Verdict::for_reading(HeavyWork::AmbientAdmission, &pressure, &bars),
+                Verdict::Proceed,
+                "a written file must not stop being queryable because the machine is busy"
+            );
+        }
+        // Including when this daemon's own tree is far over its budget.
+        let over = standing(32 * GIB, 0, 0, 8 * GIB);
+        assert_eq!(
+            Verdict::decide(
+                HeavyWork::AmbientAdmission,
+                &MemoryPressure::Known(reading(128 * GIB, 8 * GIB)),
+                Some(&over),
+                &bars
+            ),
+            Verdict::Proceed
+        );
     }
 
     #[test]
     fn critical_pressure_refuses_every_heavy_work_with_a_named_reason() {
         let pressure = MemoryPressure::Known(reading(12 * GIB, 11 * GIB + GIB / 2));
-        for work in [
-            HeavyWork::LspSweep,
-            HeavyWork::EmbedBatch,
-            HeavyWork::AmbientAdmission,
-        ] {
+        for work in [HeavyWork::LspSweep, HeavyWork::EmbedBatch] {
             let verdict = Verdict::for_reading(work, &pressure, &Thresholds::default());
             assert!(
                 verdict.refused(),

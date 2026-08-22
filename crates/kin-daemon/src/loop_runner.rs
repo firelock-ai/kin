@@ -2423,10 +2423,6 @@ pub async fn run_loop_armed(
     // larger than `batch_size` is deferred instead of silently discarded.
     let mut pending_events: VecDeque<FileEvent> = VecDeque::new();
     let mut backlog_warning_active = false;
-    // The pressure level this loop has already spoken about, so a machine that
-    // stays critical is disclosed once instead of on every tick it holds work
-    // back.
-    let mut announced_pressure: Option<kin_core::memory_pressure::PressureLevel> = None;
     // The admission policy the last complete pass planned against, kept so the
     // event filter below costs no authority load of its own. `None` until the
     // first pass resolves one, which is the safe direction: nothing is dropped
@@ -2780,41 +2776,35 @@ pub async fn run_loop_armed(
             "processing file events (after dedup)"
         );
 
-        // Ask the machine before walking the working copy. An ambient tick is
-        // a complete scan planned into a tree transition, from a host event
-        // nobody asked for, and it is the one admission that can wait: the
-        // events go back on the queue and nothing about them is lost, because
-        // this tick publishes nothing and the last complete admission stays
-        // where it was, so the startup catch-up window still covers every path
-        // held back here.
+        // Sample what this daemon is holding, and publish it. This loop turns
+        // on its own interval whether or not there is anything to admit, which
+        // makes it the cheapest cadence in the daemon to hang the standing on.
         //
-        // The explicit seams are deliberately not gated. A commit is a command
-        // a person ran, and refusing it would trade a machine Kin might have
-        // saved for work the user asked for and would have to do again.
+        // It does NOT gate admission, and that is FIR-2632's sibling half.
+        // Ambient admission was gated here when the seam landed, on the
+        // reasoning that a tick can wait because its events go back on the
+        // queue. That reasoning holds for one tick and fails for a machine that
+        // stays loaded: the tick that would admit never comes, and a file
+        // somebody wrote stops being queryable for as long as their machine is
+        // busy. On this fleet's own box that is hours.
+        //
+        // Admission is different in kind from the passes this seam exists to
+        // hold. A sweep held costs cross-file relations that the next sweep
+        // restores. An embed batch held costs vectors the next batch restores.
+        // Admission held costs the thing itself: it is the path by which a
+        // written file becomes queryable at all, and withholding it is the
+        // FIR-2606 failure class arriving by a new route, this time with a
+        // warning line nobody reads instead of silence. Neither measured
+        // failure implicated it either: the sweep peaked at 18.2 GB and the
+        // full-history init died in conversion, and an ambient tick is one
+        // bounded walk over a working copy.
+        //
+        // So the machine is measured here and never obeyed here. The passes
+        // that actually spend it, the cold sweep and the embedding batch, keep
+        // their gates.
         let pressure =
             crate::daemon::pressure_verdict(kin_core::memory_pressure::HeavyWork::AmbientAdmission);
         crate::daemon::publish_footprint_standing(&state, &pressure);
-        if let kin_core::memory_pressure::Verdict::Refuse { reason } = &pressure.verdict {
-            if announced_pressure != Some(pressure.level) {
-                crate::daemon::disclose_pressure_refusal(
-                    &state,
-                    kin_core::memory_pressure::HeavyWork::AmbientAdmission,
-                    &pressure,
-                    reason,
-                );
-                announced_pressure = Some(pressure.level);
-            }
-            enqueue_file_events(&mut pending_events, watcher_batch);
-            state
-                .reconciliation_status
-                .store(RECON_IDLE, Ordering::Relaxed);
-            tokio::time::sleep(interval).await;
-            continue;
-        }
-        if announced_pressure.is_some_and(|level| level != pressure.level) {
-            crate::daemon::clear_pressure_refusal(&state);
-        }
-        announced_pressure = Some(pressure.level);
 
         // Serialize exact-tree admission and semantic enrichment with every
         // other graph-authority mutation, including commit and checkout. The

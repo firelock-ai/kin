@@ -947,12 +947,35 @@ pub(crate) fn auto_embed_enabled() -> bool {
 /// daemon eligible for idle shutdown: a backlog no worker will drain must not
 /// read as work in flight.
 fn start_or_defer_background_embed(state: &DaemonState) -> bool {
-    // Asked before the queue is built rather than after, because building it
+    // The opt-out is asked FIRST, and this order is the whole of FIR-2632.
+    //
+    // Pressure is a question about work somebody wants done. An operator who
+    // turned background embedding off wants none of it, so on a loaded host the
+    // earlier order answered a question nobody had asked: it declined the pass
+    // for memory, wrote a refusal into the store, and put "background embedding
+    // did not start" on `kin doctor`, `kin graph status` and the MCP envelope,
+    // about a pass that was never going to start for a reason that had nothing
+    // to do with memory. The opt-out's own line never printed, so an operator
+    // checking that their opt-out took effect saw a memory complaint instead.
+    //
+    // It hid because it needs a loaded host to appear at all. Quiet CI is never
+    // near the bar, so `a_cli_spawned_daemon_honours_the_background_embed_opt_out`
+    // was green there and red on any busy machine.
+    if !auto_embed_enabled() {
+        state.pause_background_embed();
+        warn!(
+            trigger = AUTO_EMBED_ENV,
+            "background embedding deferred by operator opt-out: no vectors will be generated, and semantic coverage stays as it is until an explicit embed request runs"
+        );
+        return false;
+    }
+    // Now that the pass is genuinely wanted, ask whether the machine has room
+    // for it. Before the queue is built rather than after, because building it
     // walks the graph for everything the index is missing and a machine with no
     // room should not pay for a queue nothing is going to drain. The pass is
-    // deferred exactly the way an operator opt-out defers it, so a daemon that
-    // declines here stays eligible for idle shutdown instead of reading as
-    // work in flight.
+    // deferred exactly the way the opt-out above defers it, so a daemon that
+    // declines here stays eligible for idle shutdown instead of reading as work
+    // in flight.
     let call = pressure_verdict(kin_core::memory_pressure::HeavyWork::EmbedBatch);
     publish_footprint_standing(state, &call);
     if let kin_core::memory_pressure::Verdict::Refuse { reason } = &call.verdict {
@@ -963,14 +986,6 @@ fn start_or_defer_background_embed(state: &DaemonState) -> bool {
             kin_core::memory_pressure::HeavyWork::EmbedBatch,
             &call,
             &reason,
-        );
-        return false;
-    }
-    if !auto_embed_enabled() {
-        state.pause_background_embed();
-        warn!(
-            trigger = AUTO_EMBED_ENV,
-            "background embedding deferred by operator opt-out: no vectors will be generated, and semantic coverage stays as it is until an explicit embed request runs"
         );
         return false;
     }
@@ -7406,6 +7421,55 @@ mod memory_pressure_tests {
         );
     }
 
+    /// FIR-2632. An opted-out daemon on a full machine says the opt-out, and
+    /// says nothing about memory.
+    ///
+    /// Pressure is a question about work somebody wants done. Asking it first
+    /// meant an operator who had turned background embedding off got a memory
+    /// refusal written into their store and printed on `kin doctor`,
+    /// `kin graph status` and the MCP envelope, about a pass that was never
+    /// going to run for a reason that had nothing to do with memory, while the
+    /// opt-out's own line never printed at all.
+    ///
+    /// Both halves are asserted, because the disclosure is the part that
+    /// reached three surfaces and the return value alone would have passed
+    /// throughout.
+    #[test]
+    fn an_opted_out_daemon_on_a_full_machine_discloses_no_memory_refusal() {
+        let _lock = crate::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let state = open_store(dir.path());
+        let _forced = EnvVarGuard::set("KIN_MEMORY_PRESSURE", "critical");
+        let _opted_out = EnvVarGuard::set(super::AUTO_EMBED_ENV, "0");
+
+        assert!(
+            !start_or_defer_background_embed(&state),
+            "the pass is deferred either way; what differs is why"
+        );
+        assert!(
+            PressureRefusal::read(state.layout.root()).is_none(),
+            "work nobody asked for must not be reported as work memory prevented: {:?}",
+            PressureRefusal::read(state.layout.root())
+        );
+    }
+
+    /// The same machine with the opt-out absent still refuses for memory, so
+    /// the fix above is a precedence change and not a way of turning the gate
+    /// off.
+    #[test]
+    fn a_wanted_pass_on_the_same_full_machine_still_refuses_for_memory() {
+        let _lock = crate::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let state = open_store(dir.path());
+        let _forced = EnvVarGuard::set("KIN_MEMORY_PRESSURE", "critical");
+        let _wanted = EnvVarGuard::unset(super::AUTO_EMBED_ENV);
+
+        assert!(!start_or_defer_background_embed(&state));
+        let record = PressureRefusal::read(state.layout.root())
+            .expect("a pass somebody wanted, declined for memory, is disclosed");
+        assert_eq!(record.work, "embed-batch");
+    }
+
     #[test]
     fn a_critical_machine_defers_the_background_embedding_pass() {
         let _lock = crate::test_env_lock();
@@ -7484,21 +7548,30 @@ mod memory_pressure_tests {
         assert_eq!(embed_batch_under_pressure(512, &call.verdict), 512);
     }
 
+    /// FIR-2632's sibling half, at the seam the reconcile loop reads.
+    ///
+    /// Admission is measured and never held. It was held when this landed, on
+    /// the reasoning that a tick can wait because its events go back on the
+    /// queue, and that holds for one tick and fails for a machine that stays
+    /// loaded: the tick that would admit never comes and a written file stops
+    /// being queryable for as long as the machine is busy.
     #[test]
-    fn ambient_admission_is_refused_while_the_explicit_seam_is_not_gated_here() {
-        // The ambient tick can wait: its events go back on the queue and the
-        // last complete admission stays where it was. A commit is a command
-        // someone ran, and this module never refuses one.
+    fn ambient_admission_is_measured_and_never_held() {
         let _lock = crate::test_env_lock();
         let _budget = super::budget_no_test_can_fill();
         let _forced = EnvVarGuard::set("KIN_MEMORY_PRESSURE", "critical");
         let ambient = pressure_verdict(HeavyWork::AmbientAdmission);
-        assert!(matches!(ambient.verdict, Verdict::Refuse { .. }));
-        assert!(ambient
-            .verdict
-            .reason()
-            .expect("refused")
-            .contains("nothing is lost"));
+        assert_eq!(
+            ambient.verdict,
+            Verdict::Proceed,
+            "a file somebody wrote must not wait on a busy machine"
+        );
+        // The call still carries the level, which is what the reconcile loop
+        // publishes the footprint standing from.
+        assert_eq!(
+            ambient.level,
+            kin_core::memory_pressure::PressureLevel::Critical
+        );
     }
 }
 
