@@ -732,13 +732,16 @@ def run(session: Session, payload):
         .filter(|r| r.kind == RelationKind::Calls && r.src.as_entity() == Some(caller))
         .collect();
 
+    // Tier (e) builds its token as `{receiver}.{symbol}` and refuses a symbol
+    // that carries a dot of its own, so the parser's `Session.transport.dispatch`
+    // reached it as a symbol it could not use and no edge was recorded at all.
     assert!(
         outgoing.iter().any(|r| r
             .evidence
             .iter()
-            .any(|e| e.token.as_deref() == Some("dispatch"))),
+            .any(|e| e.token.as_deref() == Some("session.transport.dispatch"))),
         "a two-hop call the repository cannot settle must still record the \
-         call it makes, carrying the bare symbol the source read; got \
-         {outgoing:?}"
+         call it makes, through the receiver the source wrote and the bare \
+         symbol it read; got {outgoing:?}"
     );
 }
