@@ -63,9 +63,10 @@ pub use linker::{
     INCREMENTAL_LINKER_CHECKPOINT_VERSION, KIN_INDEX_CRATE_VERSION,
 };
 pub use linker::{
-    is_external_import_placeholder, is_unresolved_receiver_placeholder,
-    split_unresolved_receiver_token, unresolved_receiver_display_name,
-    EXTERNAL_IMPORT_REFERENCE_RULE, UNRESOLVED_RECEIVER_CALL_RULE,
+    is_external_import_placeholder, is_raise_target_edge, is_unresolved_receiver_placeholder,
+    split_unresolved_receiver_token, trace_crossing_for, unresolved_receiver_display_name,
+    TraceCrossing, EXTERNAL_IMPORT_REFERENCE_RULE, RAISE_TARGET_CALL_RULE,
+    UNRESOLVED_RECEIVER_CALL_RULE,
 };
 pub use overlay::{apply_file_removal, apply_to_graph, ApplyResult};
 pub use pipeline::{
