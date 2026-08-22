@@ -214,14 +214,145 @@ pub fn cgroup_memory() -> CgroupMemory {
     }
 }
 
-/// Bytes charged to this cgroup right now, or `None` off Linux or when neither
-/// hierarchy publishes the counter.
+/// This process's own cgroup path, relative to the hierarchy root, out of a
+/// `/proc/self/cgroup` body.
+///
+/// Reading only `/sys/fs/cgroup/memory.max` was FIR-2638: that path is the
+/// hierarchy ROOT, and a process is only ever at the root when it shares the
+/// host's cgroup namespace with nothing between. A container started without a
+/// private cgroup namespace, and any nested runner, sits at a path like
+/// `/docker/<id>` or `/kubepods/.../<id>`, whose `memory.max` carries the cap
+/// while the root's reads `max`. So the reader saw no cap, fell through to the
+/// host figure, and reported nineteen gigabytes of headroom to a process that
+/// could use twelve. The kernel then killed it with nothing disclosed.
+///
+/// cgroup v2 publishes one unified line, `0::/<path>`. v1 publishes one line
+/// per controller, and the memory controller's is the one that matters here.
+/// The v2 line wins when both are present, matching the kernel's own
+/// precedence.
+#[cfg(any(target_os = "linux", test))]
+fn parse_proc_self_cgroup(contents: &str) -> Option<String> {
+    let mut v1_memory = None;
+    for line in contents.lines() {
+        // `hierarchy-ID:controller-list:cgroup-path`, and a path may itself
+        // contain colons, so the split is bounded at two.
+        let mut parts = line.splitn(3, ':');
+        let (Some(id), Some(controllers), Some(path)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if id == "0" && controllers.is_empty() {
+            return normalize_cgroup_path(path);
+        }
+        if controllers.split(',').any(|name| name == "memory") {
+            v1_memory = normalize_cgroup_path(path);
+        }
+    }
+    v1_memory
+}
+
+/// A cgroup path as a relative fragment, or `None` when it names the root.
+///
+/// The root is `None` rather than an empty string so a caller cannot join it
+/// and read the same file twice under two names.
+#[cfg(any(target_os = "linux", test))]
+fn normalize_cgroup_path(path: &str) -> Option<String> {
+    let trimmed = path.trim().trim_start_matches('/');
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Every directory to consult for a limit, from this process's own cgroup up to
+/// the hierarchy root.
+///
+/// Upwards because a limit on an ancestor binds this process just as tightly as
+/// one on its own cgroup, and the effective ceiling is the smallest of them. A
+/// pod with a 12 GiB limit containing a container with none is capped at 12
+/// GiB, and reading only the leaf would report no cap at all.
+#[cfg(any(target_os = "linux", test))]
+fn cgroup_search_dirs(mount: &str, relative: Option<&str>) -> Vec<String> {
+    let mut dirs = Vec::new();
+    if let Some(relative) = relative {
+        let mut segments: Vec<&str> = relative.split('/').filter(|s| !s.is_empty()).collect();
+        while !segments.is_empty() {
+            dirs.push(format!("{mount}/{}", segments.join("/")));
+            segments.pop();
+        }
+    }
+    dirs.push(mount.to_string());
+    dirs
+}
+
+/// The binding memory limit and the usage of the cgroup that binds it.
+///
+/// Pure over a file reader so every layout this has to survive is testable on
+/// any host: a v2 container at a nested path, a v2 root reading `max`, a v1
+/// tree, a pod whose parent is tighter than its child, and a `/proc/self/cgroup`
+/// that cannot be read at all.
+///
+/// The usage comes from the SAME cgroup that supplied the limit. Taking the
+/// limit from one level and the usage from another produces a fraction of two
+/// unrelated numbers, which is worse than reporting nothing.
+#[cfg(any(target_os = "linux", test))]
+fn resolve_cgroup_memory(read: &dyn Fn(&str) -> Option<String>) -> (Option<u64>, Option<u64>) {
+    let relative = read("/proc/self/cgroup").and_then(|body| parse_proc_self_cgroup(&body));
+    let mut binding: Option<(u64, String)> = None;
+    for dir in cgroup_search_dirs("/sys/fs/cgroup", relative.as_deref()) {
+        if let Some(limit) = read(&format!("{dir}/memory.max")).and_then(|raw| parse_v2_memory_max(&raw))
+        {
+            if binding.as_ref().is_none_or(|(held, _)| limit < *held) {
+                binding = Some((limit, dir.clone()));
+            }
+        }
+    }
+    // v1 keeps the memory controller in its own subtree, and its unconstrained
+    // sentinel is a huge number rather than the word `max`. Consulted only when
+    // v2 yielded nothing, which is also what makes a v2 root reading `max` fall
+    // through here instead of ending the search.
+    if binding.is_none() {
+        let v1_mount = "/sys/fs/cgroup/memory";
+        for dir in cgroup_search_dirs(v1_mount, relative.as_deref()) {
+            if let Some(limit) = read(&format!("{dir}/memory.limit_in_bytes"))
+                .and_then(|raw| raw.trim().parse::<u64>().ok())
+                .and_then(parse_v1_memory_limit)
+            {
+                if binding.as_ref().is_none_or(|(held, _)| limit < *held) {
+                    binding = Some((limit, dir.clone()));
+                }
+            }
+        }
+    }
+    let Some((limit, dir)) = binding else {
+        return (None, None);
+    };
+    let current = read(&format!("{dir}/memory.current"))
+        .or_else(|| read(&format!("{dir}/memory.usage_in_bytes")))
+        .and_then(|raw| raw.trim().parse::<u64>().ok());
+    (Some(limit), current)
+}
+
+#[cfg(target_os = "linux")]
+fn read_cgroup_file(path: &str) -> Option<String> {
+    fs::read_to_string(path).ok()
+}
+
+/// Effective memory limit in bytes for the cgroup that binds this process, or
+/// `None` when unlimited, unset, unparsable, or off Linux.
+#[cfg(target_os = "linux")]
+fn cgroup_memory_limit_bytes() -> Option<u64> {
+    resolve_cgroup_memory(&read_cgroup_file).0
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cgroup_memory_limit_bytes() -> Option<u64> {
+    None
+}
+
+/// Bytes charged to the cgroup that binds this process, or `None` off Linux or
+/// when no accounting is readable.
 #[cfg(target_os = "linux")]
 fn cgroup_memory_current_bytes() -> Option<u64> {
-    cgroup_counter_bytes(&[
-        "/sys/fs/cgroup/memory.current",
-        "/sys/fs/cgroup/memory/memory.usage_in_bytes",
-    ])
+    resolve_cgroup_memory(&read_cgroup_file).1
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -237,52 +368,24 @@ fn cgroup_memory_current_bytes() -> Option<u64> {
 /// never an error: the peak sharpens a diagnosis and nothing decides on it.
 #[cfg(target_os = "linux")]
 fn cgroup_memory_peak_bytes() -> Option<u64> {
-    cgroup_counter_bytes(&[
-        "/sys/fs/cgroup/memory.peak",
-        "/sys/fs/cgroup/memory/memory.max_usage_in_bytes",
-    ])
-}
-
-#[cfg(not(target_os = "linux"))]
-fn cgroup_memory_peak_bytes() -> Option<u64> {
-    None
-}
-
-/// First parsable byte counter among `paths`, or `None` when none of them can
-/// be read.
-///
-/// One helper for both counters so the v2-then-v1 order is written once. The
-/// files hold a single decimal, and an unparsable body reads as absent for the
-/// same reason an absent file does: this process could not ask.
-#[cfg(target_os = "linux")]
-fn cgroup_counter_bytes(paths: &[&str]) -> Option<u64> {
-    for path in paths {
-        if let Ok(contents) = fs::read_to_string(path) {
-            if let Ok(value) = contents.trim().parse::<u64>() {
-                return Some(value);
+    let relative =
+        read_cgroup_file("/proc/self/cgroup").and_then(|body| parse_proc_self_cgroup(&body));
+    for mount in ["/sys/fs/cgroup", "/sys/fs/cgroup/memory"] {
+        for dir in cgroup_search_dirs(mount, relative.as_deref()) {
+            for name in ["memory.peak", "memory.max_usage_in_bytes"] {
+                if let Some(value) = read_cgroup_file(&format!("{dir}/{name}"))
+                    .and_then(|raw| raw.trim().parse::<u64>().ok())
+                {
+                    return Some(value);
+                }
             }
         }
     }
     None
 }
 
-/// Effective memory limit in bytes from a container memory cap, or `None` when
-/// unlimited, unset, unparsable, or off Linux.
-#[cfg(target_os = "linux")]
-fn cgroup_memory_limit_bytes() -> Option<u64> {
-    if let Ok(contents) = fs::read_to_string("/sys/fs/cgroup/memory.max") {
-        return parse_v2_memory_max(&contents);
-    }
-    let raw: u64 = fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    parse_v1_memory_limit(raw)
-}
-
 #[cfg(not(target_os = "linux"))]
-fn cgroup_memory_limit_bytes() -> Option<u64> {
+fn cgroup_memory_peak_bytes() -> Option<u64> {
     None
 }
 
@@ -291,16 +394,21 @@ fn cgroup_memory_limit_bytes() -> Option<u64> {
 /// file is present).
 ///
 /// Both hierarchies publish the counter under the same key, in different files:
-/// cgroup v2 in `memory.events`, v1 in `memory.oom_control`.
+/// cgroup v2 in `memory.events`, v1 in `memory.oom_control`. Searched from this
+/// process's own cgroup upwards for the reason the limit is: at the root there
+/// is nothing to count.
 #[cfg(target_os = "linux")]
 fn cgroup_oom_kill_count() -> Option<u64> {
-    for path in [
-        "/sys/fs/cgroup/memory.events",
-        "/sys/fs/cgroup/memory/memory.oom_control",
-    ] {
-        if let Ok(contents) = fs::read_to_string(path) {
-            if let Some(count) = parse_oom_kill_count(&contents) {
-                return Some(count);
+    let relative =
+        read_cgroup_file("/proc/self/cgroup").and_then(|body| parse_proc_self_cgroup(&body));
+    for mount in ["/sys/fs/cgroup", "/sys/fs/cgroup/memory"] {
+        for dir in cgroup_search_dirs(mount, relative.as_deref()) {
+            for name in ["memory.events", "memory.oom_control"] {
+                if let Some(count) =
+                    read_cgroup_file(&format!("{dir}/{name}")).and_then(|raw| parse_oom_kill_count(&raw))
+                {
+                    return Some(count);
+                }
             }
         }
     }
@@ -7444,6 +7552,174 @@ mod tests {
     }
 
     // ── Kills nobody explained ──────────────────────────────────────────
+
+    /// A file reader over a fixed layout, so every cgroup shape this has to
+    /// survive is testable on a host that has no cgroups at all.
+    fn fake_fs(entries: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: std::collections::HashMap<String, String> = entries
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        move |path: &str| map.get(path).cloned()
+    }
+
+    /// FIR-2638, in the layout that produced it.
+    ///
+    /// The rc0550 brown arm ran in a 12 GiB container that did not have a
+    /// private cgroup namespace, so its own cgroup sat at a nested path while
+    /// `/sys/fs/cgroup/memory.max` was the host root and read `max`. Reading
+    /// only the root saw no cap, fell through to the host figure, and reported
+    /// nineteen gigabytes of headroom to a process that could use twelve. The
+    /// kernel killed the init at the wall with nothing refused and nothing
+    /// disclosed.
+    #[test]
+    fn a_container_at_a_nested_path_reads_its_own_cap_not_the_hosts() {
+        const TWELVE: u64 = 12 * 1024 * 1024 * 1024;
+        let fs = fake_fs(&[
+            ("/proc/self/cgroup", "0::/docker/9f2c1e\n"),
+            ("/sys/fs/cgroup/memory.max", "max\n"),
+            ("/sys/fs/cgroup/docker/9f2c1e/memory.max", "12884901888\n"),
+            ("/sys/fs/cgroup/docker/9f2c1e/memory.current", "8589934592\n"),
+        ]);
+        let (limit, current) = resolve_cgroup_memory(&fs);
+        assert_eq!(limit, Some(TWELVE), "the container's own cap, not the root's");
+        assert_eq!(current, Some(8 * 1024 * 1024 * 1024));
+    }
+
+    /// The usage comes from the cgroup that supplied the limit.
+    ///
+    /// A fraction built from one level's limit and another's usage is two
+    /// unrelated numbers divided, which is worse than reporting nothing.
+    #[test]
+    fn usage_is_read_from_the_cgroup_that_bound_the_limit() {
+        let fs = fake_fs(&[
+            ("/proc/self/cgroup", "0::/pod/container\n"),
+            ("/sys/fs/cgroup/memory.current", "999999999\n"),
+            ("/sys/fs/cgroup/pod/memory.max", "4294967296\n"),
+            ("/sys/fs/cgroup/pod/memory.current", "1073741824\n"),
+            ("/sys/fs/cgroup/pod/container/memory.max", "max\n"),
+            ("/sys/fs/cgroup/pod/container/memory.current", "536870912\n"),
+        ]);
+        let (limit, current) = resolve_cgroup_memory(&fs);
+        assert_eq!(limit, Some(4 * 1024 * 1024 * 1024), "the parent binds");
+        assert_eq!(
+            current,
+            Some(1024 * 1024 * 1024),
+            "and its usage is the one that belongs beside it"
+        );
+    }
+
+    /// An ancestor's tighter limit binds this process just as hard as its own.
+    #[test]
+    fn the_smallest_limit_in_the_chain_wins() {
+        let fs = fake_fs(&[
+            ("/proc/self/cgroup", "0::/a/b/c\n"),
+            ("/sys/fs/cgroup/a/memory.max", "8589934592\n"),
+            ("/sys/fs/cgroup/a/b/memory.max", "2147483648\n"),
+            ("/sys/fs/cgroup/a/b/c/memory.max", "4294967296\n"),
+            ("/sys/fs/cgroup/a/b/memory.current", "1073741824\n"),
+        ]);
+        let (limit, current) = resolve_cgroup_memory(&fs);
+        assert_eq!(limit, Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(current, Some(1024 * 1024 * 1024));
+    }
+
+    /// A v2 root that reads `max` must not end the search.
+    ///
+    /// The earlier reader returned as soon as `/sys/fs/cgroup/memory.max` could
+    /// be opened, so a successful read yielding no cap blocked the v1 fallback
+    /// entirely. That is the second half of FIR-2638 and it hides wherever both
+    /// hierarchies are mounted.
+    #[test]
+    fn a_v2_root_reading_max_falls_through_to_v1() {
+        let fs = fake_fs(&[
+            ("/proc/self/cgroup", "9:memory:/docker/abc\n"),
+            ("/sys/fs/cgroup/memory.max", "max\n"),
+            (
+                "/sys/fs/cgroup/memory/docker/abc/memory.limit_in_bytes",
+                "12884901888\n",
+            ),
+            (
+                "/sys/fs/cgroup/memory/docker/abc/memory.usage_in_bytes",
+                "6442450944\n",
+            ),
+        ]);
+        let (limit, current) = resolve_cgroup_memory(&fs);
+        assert_eq!(limit, Some(12 * 1024 * 1024 * 1024));
+        assert_eq!(current, Some(6 * 1024 * 1024 * 1024));
+    }
+
+    /// A bare host reports no cap, which is what keeps this off the host path's
+    /// behaviour entirely.
+    #[test]
+    fn an_uncapped_host_still_reports_nothing() {
+        let fs = fake_fs(&[
+            ("/proc/self/cgroup", "0::/\n"),
+            ("/sys/fs/cgroup/memory.max", "max\n"),
+        ]);
+        assert_eq!(resolve_cgroup_memory(&fs), (None, None));
+        // And a host with no cgroup files at all.
+        assert_eq!(resolve_cgroup_memory(&fake_fs(&[])), (None, None));
+    }
+
+    /// An unreadable `/proc/self/cgroup` degrades to the root rather than to
+    /// nothing, because the root is still the right answer when this process
+    /// really is at it.
+    #[test]
+    fn an_unreadable_proc_entry_still_consults_the_root() {
+        let fs = fake_fs(&[
+            ("/sys/fs/cgroup/memory.max", "12884901888\n"),
+            ("/sys/fs/cgroup/memory.current", "1073741824\n"),
+        ]);
+        let (limit, current) = resolve_cgroup_memory(&fs);
+        assert_eq!(limit, Some(12 * 1024 * 1024 * 1024));
+        assert_eq!(current, Some(1024 * 1024 * 1024));
+    }
+
+    #[test]
+    fn proc_self_cgroup_prefers_the_unified_line_and_survives_a_colon() {
+        assert_eq!(
+            parse_proc_self_cgroup("12:pids:/x\n9:memory:/v1path\n0::/v2path\n").as_deref(),
+            Some("v2path"),
+            "v2's unified line wins, matching the kernel's own precedence"
+        );
+        assert_eq!(
+            parse_proc_self_cgroup("9:memory:/only/v1\n").as_deref(),
+            Some("only/v1")
+        );
+        assert_eq!(
+            parse_proc_self_cgroup("9:cpu,memory:/shared\n").as_deref(),
+            Some("shared"),
+            "the memory controller is often listed beside others"
+        );
+        // A path may contain a colon, so the split is bounded at two.
+        assert_eq!(
+            parse_proc_self_cgroup("0::/machine.slice/x:y.scope\n").as_deref(),
+            Some("machine.slice/x:y.scope")
+        );
+        // The root is None rather than an empty fragment, so nothing joins it
+        // and reads the same file under two names.
+        assert_eq!(parse_proc_self_cgroup("0::/\n"), None);
+        assert_eq!(parse_proc_self_cgroup("nonsense"), None);
+        assert_eq!(parse_proc_self_cgroup(""), None);
+    }
+
+    #[test]
+    fn the_search_runs_from_the_leaf_up_to_the_root() {
+        assert_eq!(
+            cgroup_search_dirs("/sys/fs/cgroup", Some("a/b/c")),
+            vec![
+                "/sys/fs/cgroup/a/b/c".to_string(),
+                "/sys/fs/cgroup/a/b".to_string(),
+                "/sys/fs/cgroup/a".to_string(),
+                "/sys/fs/cgroup".to_string(),
+            ]
+        );
+        assert_eq!(
+            cgroup_search_dirs("/sys/fs/cgroup", None),
+            vec!["/sys/fs/cgroup".to_string()]
+        );
+    }
 
     #[test]
     fn v2_memory_max_parses_bytes_and_unlimited() {
