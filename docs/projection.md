@@ -50,13 +50,22 @@ process reading raw disk. Nothing crashes when that happens, which is exactly
 why it needs to be reported rather than assumed.
 
 One gap is not about refusal at all. The shim interposes libc and nothing else,
-so a runtime that issues raw syscalls goes straight around it. Node is the one
-most people hit: libuv calls `statx` directly, so inside a projected repository
-Node reads raw disk on the same path where git, Python and the coreutils read
-graph truth. No further hook closes that, so `kin vfs status` prints the limit
-under `shim` rather than leaving you to find it. The `nfs` and `fuse` mounts
-have no such gap, because the kernel serves every process on the host. If your
-toolchain is Node, prefer a mount.
+so a binary that reaches the kernel without libc goes straight around it. A Go
+binary built the usual way is that binary: it issues its own syscalls, and
+inside a projected repository it reads the working copy on the same path where
+git, Node, Python and the coreutils read graph truth. Nothing can hook a call
+that names no symbol, so `kin vfs status` prints the limit under `shim` rather
+than leaving you to find it. The `nfs` and `fuse` mounts have no such gap,
+because the kernel serves every process on the host. If your toolchain is Go,
+prefer a mount.
+
+Node used to be in that class and no longer is, which is worth knowing if you
+read the older advice. libuv issues `statx` itself rather than calling a libc
+stat entry point, so for a release `node` answered a stat from the working copy
+where every libc caller got the fail-closed error. It reaches the kernel through
+glibc's `syscall(2)` wrapper rather than through the instruction, though, and a
+wrapper is a symbol like any other, so the shim interposes it and Node now reads
+the projection here.
 
 Between the two mounts, each platform's native one comes first. macOS carries an
 NFS client in the base system while FUSE there needs FUSE-T or macFUSE
