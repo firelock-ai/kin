@@ -352,8 +352,8 @@ fn build_dead_code_report(
         // paragraph.
         lines.push(
             "REFUSED: this scan cannot say whether anything here is unreferenced. Files this \
-             repository admits produced no parsed layout, so they hold no entity this scan could \
-             have read:"
+             repository admits produced no entity, so there was nothing there for this scan to \
+             read and nothing there to hold an edge:"
                 .to_string(),
         );
     } else if unreferenced.is_empty() && test_only.is_empty() {
