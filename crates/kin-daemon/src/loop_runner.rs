@@ -2157,11 +2157,13 @@ pub(crate) struct LayoutBackfill {
     pub(crate) published: usize,
     /// Artifacts whose bytes could not be read or parsed, left with no layout.
     pub(crate) unreadable: usize,
+    /// Artifacts another facet already owns, which this pass must not touch.
+    pub(crate) other_facet: usize,
 }
 
 impl LayoutBackfill {
     fn observed(&self) -> usize {
-        self.already_published + self.published + self.unreadable
+        self.already_published + self.published + self.unreadable + self.other_facet
     }
 }
 
@@ -2226,6 +2228,19 @@ pub(crate) fn backfill_missing_file_layouts(state: &DaemonState) -> Result<Layou
         let file_id = FilePathId::new(path);
         if state.graph.get_file_layout(&file_id)?.is_some() {
             report.already_published += 1;
+            continue;
+        }
+        // Another facet already owns this path. The four are mutually exclusive
+        // per file and the watcher seam enforces that
+        // ([`clear_incompatible_facets_in`]), so publishing a layout beside one
+        // would leave the store holding two answers to how the file is tracked.
+        // The gap this pass closes is a path carrying no facet at all, which is
+        // exactly what a Git import leaves behind.
+        if state.graph.get_shallow_file(&file_id)?.is_some()
+            || state.graph.get_structured_artifact(&file_id)?.is_some()
+            || state.graph.get_opaque_artifact(&file_id)?.is_some()
+        {
+            report.other_facet += 1;
             continue;
         }
 
@@ -2554,6 +2569,7 @@ pub async fn run_loop_armed(
                         observed = report.observed(),
                         already_published = report.already_published,
                         unreadable = report.unreadable,
+                        other_facet = report.other_facet,
                         "every admitted source file already carries its parse observation"
                     );
                 }
@@ -2562,6 +2578,7 @@ pub async fn run_loop_armed(
                         published = report.published,
                         already_published = report.already_published,
                         unreadable = report.unreadable,
+                        other_facet = report.other_facet,
                         observed = report.observed(),
                         "published the per-file parse observation for admitted source files that \
                          carried none, so an enumeration over them can be certified"
