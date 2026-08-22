@@ -4319,6 +4319,26 @@ mod tests {
             "the Value tree {view_and_tree} is no longer larger than the encoding \
              it produces ({encoded_len}); re-price the fix before removing either"
         );
+        // The improvement itself, asserted rather than only reported.
+        //
+        // Without this the three assertions above all pass with the fix undone:
+        // they price the whole-tree path, which this file still measures on
+        // purpose, and say nothing about which path `canonical_hash` takes. A
+        // revert to `hash_serialized` over the whole view would put `whole_hash`
+        // back at `tree_and_encoding` and leave the test green.
+        //
+        // Calibrated against the whole-tree figure measured in the SAME run
+        // rather than against a constant, so it cannot drift with serde and
+        // cannot be satisfied by the encoder getting cheaper for other reasons.
+        // Measured 2_161_152 against 8_765_641, a factor of four; the factor of
+        // two here is the margin, and a revert makes the two figures equal.
+        assert!(
+            whole_hash * 2 < tree_and_encoding,
+            "hashing a transaction cost {whole_hash} bytes against {tree_and_encoding} \
+             for the whole-tree path it is supposed to avoid. `canonical_hash` is \
+             building the document's `serde_json::Value` tree again rather than one \
+             array element's at a time."
+        );
     }
 
     /// Transaction identity must not depend on the order a caller built its
