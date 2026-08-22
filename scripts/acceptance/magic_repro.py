@@ -2035,7 +2035,13 @@ def check_15(suite):
         pkg/broken.py  parsed=absent tier=none certifies=False total=2
         pkg/empty.py   parsed=absent tier=none certifies=False total=1
 
-    Three files, three genuinely different states, one answer.
+    Three files, three genuinely different states, one answer. After the fix,
+    on the same fixture:
+
+        pkg/parsed.py  parsed=full    tier=entity_source certifies=True
+        pkg/broken.py  parsed=partial tier=entity_source certifies=False
+                       detail="2 parse error range(s) during indexing"
+        pkg/empty.py   parsed=full    tier=entity_source certifies=True
 
     Four arms. The first three read each shape on its own terms. The fourth is
     the one that makes the check falsifiable rather than decorative: it asserts
@@ -2058,6 +2064,7 @@ def check_15(suite):
                           % sorted(payload.keys())[:12])
         cov = dict(cov)
         cov["total_in_file"] = payload.get("total_in_file")
+        cov["entities"] = payload.get("entities") or []
         return cov, None
 
     readings = {}
@@ -2098,16 +2105,27 @@ def check_15(suite):
                 "distinguish an adapter failure from a file nothing ever parsed"
                 % (THREE_STATE_FILES["broken"], broken.get("parsed")))
 
+    # The declares-nothing arm. Python's adapter emits a module entity for every
+    # file it reads, so "declares nothing" is the absence of a function or a
+    # class rather than an empty list, and asserting an empty list here would be
+    # asserting something no Python file can satisfy.
     empty = readings["empty"]
+    declarations = [entity.get("name") for entity in empty.get("entities", [])
+                    if entity.get("kind") in ("function", "class", "method")]
     if empty.get("parsed") == "full" and empty.get("certifies_enumeration") is True \
-            and empty.get("total_in_file") == 0:
-        res.ok("%s parsed completely, declares nothing, and says so: an enumeration over it "
-               "is certified and empty" % THREE_STATE_FILES["empty"])
+            and not declarations:
+        res.ok("%s parsed completely and declares nothing, and its enumeration is certified "
+               "anyway, which is what separates it from a file an adapter failed on"
+               % THREE_STATE_FILES["empty"])
+    elif declarations:
+        res.unknown("%s was written to declare nothing but the graph holds %s for it, so this "
+                    "arm cannot test what it is for"
+                    % (THREE_STATE_FILES["empty"], declarations[:4]))
     else:
-        res.bad("%s declares nothing and parses cleanly, so its empty enumeration should be "
-                "certified; it reads parsed=%r certifies_enumeration=%r total_in_file=%r"
+        res.bad("%s declares nothing and parses cleanly, so an enumeration over it is complete "
+                "and should say so; it reads parsed=%r certifies_enumeration=%r"
                 % (THREE_STATE_FILES["empty"], empty.get("parsed"),
-                   empty.get("certifies_enumeration"), empty.get("total_in_file")))
+                   empty.get("certifies_enumeration")))
 
     # The arm that makes the other three falsifiable. Without it, a build that
     # answered `full`/`true` for everything would satisfy two of the three

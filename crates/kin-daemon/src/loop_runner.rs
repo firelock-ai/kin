@@ -2251,20 +2251,20 @@ pub(crate) fn backfill_missing_file_layouts(state: &DaemonState) -> Result<Layou
             continue;
         }
 
-        let completeness = match pipeline.index_file_content_with_tests(&file_id, &content, body_hash)
-        {
-            Ok(indexed) => indexed.indexed_file.file_layout.parse_completeness,
-            Err(error) => {
-                debug!(
-                    file = %file_id,
-                    error = %error,
-                    "graph-owned source could not be indexed, so its parse observation stays \
-                     unpublished rather than being guessed"
-                );
-                report.unreadable += 1;
-                continue;
-            }
-        };
+        let completeness =
+            match pipeline.index_file_content_with_tests(&file_id, &content, body_hash) {
+                Ok(indexed) => indexed.indexed_file.file_layout.parse_completeness,
+                Err(error) => {
+                    debug!(
+                        file = %file_id,
+                        error = %error,
+                        "graph-owned source could not be indexed, so its parse observation stays \
+                         unpublished rather than being guessed"
+                    );
+                    report.unreadable += 1;
+                    continue;
+                }
+            };
 
         let mut entities = state.graph.query_entities(&EntityFilter {
             file_path: Some(file_id.clone()),
