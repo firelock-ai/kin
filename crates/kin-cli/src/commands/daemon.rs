@@ -799,10 +799,11 @@ fn current_repo_status() -> Option<CurrentRepoStatus> {
 
 /// Which daemons a `--all` sweep is entitled to stop.
 ///
-/// The supervisor is a machine-level singleton: its directory hangs off
-/// `registry_path()`, which resolves from the real home, while `KIN_HOME` moves
-/// only store and install state. One supervisor therefore holds daemons from
-/// several managed homes, and an unscoped `--all` reaches every one of them.
+/// The supervisor is a machine-level singleton: its directory comes from
+/// `supervisor_root()`, which resolves from the real home, while `KIN_HOME`
+/// moves store and install state, the cross-repo registry included. One
+/// supervisor therefore holds daemons from several managed homes, and an
+/// unscoped `--all` reaches every one of them.
 /// That is how a pinned session stopped daemons it did not own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StopScope {
