@@ -1261,6 +1261,92 @@ mod tests {
         );
     }
 
+    /// The seeded scan's own verdict (FIR-2524 rung three).
+    ///
+    /// `find_dead_code_seeded` traverses no edge: its seed is a name and kind
+    /// filter over the entity index, so an empty candidate list says nothing
+    /// MATCHED rather than that nothing is unreachable. That is a language-scoped
+    /// claim gated exactly the way `semantic_search`'s is, which is the gate
+    /// FIR-2430 exists because of.
+    ///
+    /// The response is serialized rather than printed, so the qualifier travels
+    /// as data beside `candidates` where a caller reading an empty array meets it
+    /// in the same object.
+    #[test]
+    fn a_seeded_scan_that_matched_nothing_says_so_on_a_degraded_daemon() {
+        let graph = InMemoryGraph::new();
+        let only = make_entity("unrelated_symbol", "src/a.rs");
+        graph.upsert_entity(&only).unwrap();
+
+        let degraded = kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 1,
+            "graph_generation": 1,
+            "embed_worker_failed": true,
+        }));
+        let response = build_dead_code_seeded_response(
+            &graph,
+            &DeadCodeSeededRequest {
+                query: "no_such_seed_anywhere".to_string(),
+                limit: Some(10),
+                name_pattern: None,
+            },
+            &degraded,
+        )
+        .unwrap();
+
+        assert!(
+            response.candidates.is_empty(),
+            "the seed must match nothing or this test asserts nothing: {:?}",
+            response.candidates
+        );
+        let said = response.absence_qualifier.join("\n");
+        assert!(
+            said.contains("Kin cannot rule out seed matches it did not see"),
+            "an empty seeded scan on a degraded daemon must carry its own noun rather than \
+             impact's 'dependents': {said}"
+        );
+    }
+
+    /// The noise control for the seeded surface. A scan that matched entities is
+    /// not an absence claim, so it carries no qualifier however degraded the
+    /// daemon. Without this, stamping every seeded response uncertain would pass.
+    #[test]
+    fn a_seeded_scan_that_matched_stays_unqualified_even_when_degraded() {
+        let graph = InMemoryGraph::new();
+        let found = make_entity("probe_seed_match", "src/a.rs");
+        graph.upsert_entity(&found).unwrap();
+
+        let degraded = kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 1,
+            "graph_generation": 1,
+            "embed_worker_failed": true,
+        }));
+        let response = build_dead_code_seeded_response(
+            &graph,
+            &DeadCodeSeededRequest {
+                query: "probe_seed_match".to_string(),
+                limit: Some(10),
+                name_pattern: None,
+            },
+            &degraded,
+        )
+        .unwrap();
+
+        assert!(
+            !response.candidates.is_empty(),
+            "the seed must match or this control is exercising the empty path"
+        );
+        assert!(
+            response.absence_qualifier.is_empty(),
+            "a seeded scan holding candidates is not an absence claim: {:?}",
+            response.absence_qualifier
+        );
+    }
+
     #[test]
     fn seeded_dead_code_marks_unreferenced_first_and_sets_dead_flag() {
         let graph = InMemoryGraph::new();
