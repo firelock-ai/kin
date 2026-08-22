@@ -220,6 +220,10 @@ impl LanguageAdapter for PythonAdapter {
         let mut entities = Vec::new();
         let mut relations = Vec::new();
         let mut imports = Vec::new();
+        // Names a module-scope guard binds. Not `FileImport`s: see
+        // [`collect_python_guarded_imports`] for why admitting them there cost
+        // measured recall on a real repository.
+        let mut guarded_imports: Vec<FileImport> = Vec::new();
         let mut call_audit = PythonCallExtractionAudit::default();
         let mut value_refs = Vec::new();
         let root = tree.root_node();
@@ -242,16 +246,25 @@ impl LanguageAdapter for PythonAdapter {
                 &mut call_audit,
                 &mut value_refs,
             );
-            // Extract imports at module scope, including the guards a
-            // type-only or optional import is written behind.
-            collect_python_module_imports(&child, source, &mut imports);
+            // Extract imports at top level, plus the guarded ones that only
+            // bind names for annotations.
             match child.kind() {
-                "import_statement" | "import_from_statement" => {}
+                "import_statement" => {
+                    if let Some(import) = extract_py_import(&child, source) {
+                        imports.push(import);
+                    }
+                }
+                "import_from_statement" => {
+                    if let Some(import) = extract_py_from_import(&child, source) {
+                        imports.push(import);
+                    }
+                }
                 "function_definition" | "class_definition" | "decorated_definition" => {}
                 _ => {
                     // Module-scope statements. `HANDLERS = {"ingest": cmd_ingest}`
                     // at module level names its target exactly as a body statement
                     // would, so the module entity sources those references.
+                    collect_python_guarded_imports(&child, source, &mut guarded_imports);
                     if !module_name.is_empty() {
                         collect_python_value_refs(
                             &child,
@@ -278,6 +291,7 @@ impl LanguageAdapter for PythonAdapter {
         // Build import lookup: local_name -> module_path
         let import_map: std::collections::HashMap<&str, &str> = imports
             .iter()
+            .chain(guarded_imports.iter())
             .flat_map(|imp| {
                 imp.specifiers
                     .iter()
@@ -304,7 +318,13 @@ impl LanguageAdapter for PythonAdapter {
             });
         }
 
-        emit_python_value_references(value_refs, &entities, &imports, &mut relations);
+        emit_python_value_references(
+            value_refs,
+            &entities,
+            &imports,
+            &guarded_imports,
+            &mut relations,
+        );
 
         // Annotate Calls/References relations with import_source.
         //
@@ -1045,13 +1065,14 @@ fn emit_python_value_references(
     value_refs: Vec<PythonValueRef>,
     entities: &[ExtractedEntity],
     imports: &[FileImport],
+    guarded_imports: &[FileImport],
     relations: &mut Vec<ExtractedRelation>,
 ) {
     let defined: std::collections::HashSet<&str> =
         entities.iter().map(|e| e.name.as_str()).collect();
     let mut module_bound: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut symbol_bound: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for import in imports {
+    for import in imports.iter().chain(guarded_imports) {
         for spec in &import.specifiers {
             // `import parsing` binds the module itself under its own path;
             // `from parsing import TAG_RE` binds a symbol out of it.
@@ -1463,22 +1484,32 @@ fn extract_named_callee(
 /// calls keep the bare-leaf behaviour they had before.
 type PythonReceiverTypes = std::collections::HashMap<String, String>;
 
-/// Collect the imports one module-scope statement carries, descending into the
-/// guards an import is idiomatically written behind.
+/// Collect the imports written inside a module-scope guard, which bind names
+/// the flat top-level walk never sees.
 ///
 /// `if TYPE_CHECKING:` is where PEP 484 puts an import that exists only so
 /// annotations can name a class without a runtime cycle, and requests puts
-/// `from .adapters import HTTPAdapter` exactly there. A flat walk over the
-/// module's own children saw none of them, so the file appeared to import
-/// nothing: [`emit_python_value_references`] binds only what a file defines or
-/// imports, which meant every annotation naming such a class emitted no edge at
-/// all. `try: import fast except ImportError: import slow` is the same shape for
-/// an optional dependency.
+/// `from .adapters import HTTPAdapter` in `models.py` exactly there. A walk
+/// over the module's own children saw none of them, so the file appeared not to
+/// bind the name at all: [`emit_python_value_references`] admits only what a
+/// file defines or imports, which meant every annotation naming such a class
+/// emitted no edge of any kind. `try: import fast except ImportError: import
+/// slow` is the same shape for an optional dependency.
+///
+/// These are kept OUT of the file's `FileImport` list and used only to admit
+/// the names an annotation may bind, because a guarded import is not
+/// interchangeable with a plain one. Feeding it into the linker's import map
+/// widened the tier that settles a bare method name from the one owner a file
+/// imports: `sessions.py` imports `HTTPAdapter` at module scope and
+/// `BaseAdapter` under `TYPE_CHECKING`, both of which declare `send`, so
+/// `Session.send`'s real call to `adapter.send(request)` stopped resolving at
+/// all. That is a measured recall loss on the real repository, so the binding
+/// is admitted exactly where it is needed and nowhere else.
 ///
 /// A function-local import is deliberately not reached. This walks the module's
 /// own statements, where a binding is visible to every annotation in the file;
 /// an import inside a function body binds only in that scope.
-fn collect_python_module_imports(
+fn collect_python_guarded_imports(
     node: &tree_sitter::Node,
     source: &[u8],
     out: &mut Vec<FileImport>,
@@ -1498,7 +1529,7 @@ fn collect_python_module_imports(
         | "finally_clause" | "block" => {
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
-                collect_python_module_imports(&child, source, out);
+                collect_python_guarded_imports(&child, source, out);
             }
         }
         _ => {}
