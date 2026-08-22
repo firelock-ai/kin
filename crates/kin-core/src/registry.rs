@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! Global Kin registry at `~/.kin/registry.toml`.
+//! Cross-repo Kin registry at `<managed Kin home>/registry.toml`.
 //!
 //! Lets MCP servers and cross-repo queries discover all Kin repositories on
-//! disk regardless of where they live.
+//! disk regardless of where they live. The file is store state, so `KIN_HOME`
+//! bounds it like the rest of the store: see [`registry_path`].
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -180,7 +181,7 @@ pub struct RegisteredRepo {
 }
 
 impl KinRegistry {
-    /// Load from `~/.kin/registry.toml`, or return empty if it doesn't exist.
+    /// Load from [`registry_path`], or return empty if it doesn't exist.
     ///
     /// Acquires a shared (read) lock to prevent reading a partially-written file.
     pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
@@ -208,7 +209,7 @@ impl KinRegistry {
         }
     }
 
-    /// Save to `~/.kin/registry.toml`.
+    /// Save to [`registry_path`].
     ///
     /// Acquires an exclusive lock, writes atomically (tmp → rename).
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -241,7 +242,7 @@ impl KinRegistry {
         }
     }
 
-    /// Update `~/.kin/registry.toml` under one exclusive read-modify-write lock.
+    /// Update [`registry_path`] under one exclusive read-modify-write lock.
     ///
     /// Registry writers must use this API instead of a separate `load` followed
     /// by `save`; keeping the lock across the caller's mutation prevents one
@@ -1579,30 +1580,84 @@ fn write_registry_atomically(
     Ok(())
 }
 
-/// `~/.kin/registry.toml` path (cross-platform).
+/// The cross-repo registry this process is bounded by: `KIN_REGISTRY_PATH`, or
+/// `registry.toml` inside the managed Kin home.
 ///
-/// This also fixes the supervisor directory, which is this path's parent. That
-/// makes the supervisor a machine-level singleton keyed on the real home (or an
-/// explicit `KIN_REGISTRY_PATH`), deliberately *not* on `KIN_HOME`: see
+/// The registry is store state, so it honors `KIN_HOME` exactly as the rest of
+/// the store does. A process pinned to a scratch home discovers only the
+/// repositories that home registered, and the operator's real registry is
+/// reachable only from the real home. Without that, a fixture daemon under a
+/// scratch home pinned sibling authority for every repository on the box, so
+/// tests observed machine state and could be perturbed by it.
+///
+/// The supervisor directory is deliberately *not* this path's parent. It is a
+/// machine-level singleton and comes from [`supervisor_root`]; see
 /// [`managed_kin_home`] for the boundary each variable actually draws.
 pub fn registry_path() -> PathBuf {
-    if let Some(path) = std::env::var_os("KIN_REGISTRY_PATH") {
+    resolve_registry_path(|key| std::env::var_os(key), managed_kin_home)
+}
+
+/// The policy behind [`registry_path`], with the environment and the managed
+/// home taken as arguments.
+///
+/// Taking both by argument is what lets the split between this and
+/// [`resolve_supervisor_root`] be proven from one fixed environment, rather than
+/// by mutating a process-global table that every other test also reads.
+pub(crate) fn resolve_registry_path(
+    var_os: impl Fn(&str) -> Option<std::ffi::OsString>,
+    managed_home: impl FnOnce() -> PathBuf,
+) -> PathBuf {
+    if let Some(path) = var_os("KIN_REGISTRY_PATH") {
         return PathBuf::from(path);
     }
 
-    directories::BaseDirs::new()
-        .map(|b| b.home_dir().to_path_buf())
+    managed_home().join("registry.toml")
+}
+
+/// Directory of the machine-level daemon supervisor.
+///
+/// Keyed on the real home, or on the parent of an explicit `KIN_REGISTRY_PATH`,
+/// deliberately *not* on `KIN_HOME`. One supervisor holds daemons launched under
+/// several managed homes, so every daemon records [`managed_kin_home`] and the
+/// census partitions on it. Moving the supervisor with `KIN_HOME` would hide
+/// from a pinned session the daemons it shares the box with, which is the
+/// opposite of what that variable is for.
+pub fn supervisor_root() -> PathBuf {
+    resolve_supervisor_root(
+        |key| std::env::var_os(key),
+        || directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf()),
+    )
+}
+
+/// The policy behind [`supervisor_root`], with the environment and the OS home
+/// lookup taken as arguments.
+///
+/// This reproduces, case for case, what the supervisor directory was before the
+/// registry moved into the managed home: the parent of an explicit
+/// `KIN_REGISTRY_PATH`, or `<real home>/.kin`.
+pub(crate) fn resolve_supervisor_root(
+    var_os: impl Fn(&str) -> Option<std::ffi::OsString>,
+    base_dirs_home: impl FnOnce() -> Option<PathBuf>,
+) -> PathBuf {
+    if let Some(path) = var_os("KIN_REGISTRY_PATH") {
+        return PathBuf::from(path)
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from(".kin"));
+    }
+
+    base_dirs_home()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".kin")
-        .join("registry.toml")
 }
 
 /// The managed Kin install root this process resolves: `KIN_HOME`, then the
 /// `KIN_DIR` compatibility alias, then `<home>/.kin`.
 ///
 /// This is the boundary `KIN_HOME` genuinely draws. It bounds store and install
-/// state; it does not move the supervisor, whose directory comes from
-/// [`registry_path`] and therefore from the real home. One supervisor can
+/// state, the cross-repo [`registry_path`] included; it does not move the
+/// supervisor, whose directory comes from [`supervisor_root`] and therefore
+/// from the real home. One supervisor can
 /// consequently hold daemons launched under several managed homes, so every
 /// daemon records the value this returns and the census partitions on it.
 ///
@@ -2602,18 +2657,103 @@ mod tests {
         );
     }
 
-    /// The distinction the supervisor scoping contract rests on: a pinned
-    /// `KIN_HOME` moves the managed home while the supervisor's own directory,
-    /// which hangs off [`registry_path`], stays put.
-    #[test]
-    fn pinning_kin_home_does_not_move_the_registry_path() {
-        let pinned = managed_home_with(false, &[("KIN_HOME", "/scratch/home")]);
-        let unpinned = managed_home_with(false, &[]);
-        assert_ne!(pinned, unpinned);
+    /// A fake environment, so the split below is proven without writing to the
+    /// process-global table every other test in this binary also reads.
+    fn fake_env(env: &[(&str, &str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+        let owned: Vec<(String, String)> = env
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        move |key| {
+            owned
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| std::ffi::OsString::from(value))
+        }
+    }
 
-        // `registry_path` reads only `KIN_REGISTRY_PATH` and the real home, so
-        // no value of `KIN_HOME` can appear in it.
-        assert!(!registry_path().starts_with("/scratch/home"));
+    /// The split this seam exists to draw, read from one fixed environment: a
+    /// pinned `KIN_HOME` moves the registry with the rest of the store, and does
+    /// not move the machine-level supervisor.
+    ///
+    /// FIR-2467. Before this, both hung off the real home, so a daemon under a
+    /// scratch home pinned sibling authority for every repository on the box.
+    #[test]
+    fn pinning_kin_home_moves_the_registry_and_not_the_supervisor() {
+        let env = [("KIN_HOME", "/scratch/home")];
+        let managed = managed_home_with(false, &env);
+        assert_eq!(managed, PathBuf::from("/scratch/home"));
+
+        let registry = resolve_registry_path(fake_env(&env), || managed.clone());
+        assert_eq!(registry, PathBuf::from("/scratch/home/registry.toml"));
+
+        let supervisor =
+            resolve_supervisor_root(fake_env(&env), || Some(PathBuf::from("/base-home")));
+        assert_eq!(supervisor, PathBuf::from("/base-home/.kin"));
+        assert!(!supervisor.starts_with("/scratch/home"));
+    }
+
+    /// With no `KIN_HOME`, the two land where they always did: side by side in
+    /// the real home. The default install is the case this fix must not move.
+    #[test]
+    fn an_unpinned_home_keeps_the_registry_beside_the_supervisor() {
+        let managed = managed_home_with(false, &[]);
+        assert_eq!(managed, PathBuf::from("/base-home/.kin"));
+
+        let registry = resolve_registry_path(fake_env(&[]), || managed.clone());
+        let supervisor =
+            resolve_supervisor_root(fake_env(&[]), || Some(PathBuf::from("/base-home")));
+
+        assert_eq!(registry, PathBuf::from("/base-home/.kin/registry.toml"));
+        assert_eq!(supervisor, PathBuf::from("/base-home/.kin"));
+        assert_eq!(registry.parent(), Some(supervisor.as_path()));
+    }
+
+    /// `KIN_REGISTRY_PATH` still names the file outright and still carries the
+    /// supervisor to its parent, which is how every isolated harness in this
+    /// fleet pins both today.
+    #[test]
+    fn an_explicit_registry_path_still_carries_the_supervisor() {
+        let env = [
+            ("KIN_REGISTRY_PATH", "/pinned/dir/registry.toml"),
+            ("KIN_HOME", "/scratch/home"),
+        ];
+        assert_eq!(
+            resolve_registry_path(fake_env(&env), || PathBuf::from("/scratch/home")),
+            PathBuf::from("/pinned/dir/registry.toml")
+        );
+        assert_eq!(
+            resolve_supervisor_root(fake_env(&env), || Some(PathBuf::from("/base-home"))),
+            PathBuf::from("/pinned/dir")
+        );
+    }
+
+    /// The edge answers the previous `registry_path().parent()` derivation
+    /// produced, kept exactly rather than tidied.
+    ///
+    /// A bare filename's parent is the empty path, not `.kin`: only an empty
+    /// `KIN_REGISTRY_PATH`, whose parent is `None`, ever reached that fallback.
+    /// Both are odd, and both are what shipped, so both are asserted here. This
+    /// test is the reason to believe the supervisor did not move: it failed on
+    /// the first run, against an expectation that had guessed rather than read.
+    #[test]
+    fn the_supervisor_keeps_its_old_answers_at_the_edges() {
+        assert_eq!(
+            resolve_supervisor_root(fake_env(&[("KIN_REGISTRY_PATH", "registry.toml")]), || {
+                Some(PathBuf::from("/base-home"))
+            }),
+            PathBuf::from("")
+        );
+        assert_eq!(
+            resolve_supervisor_root(fake_env(&[("KIN_REGISTRY_PATH", "")]), || Some(
+                PathBuf::from("/base-home")
+            )),
+            PathBuf::from(".kin")
+        );
+        assert_eq!(
+            resolve_supervisor_root(fake_env(&[]), || None),
+            PathBuf::from("./.kin")
+        );
     }
 
     #[test]

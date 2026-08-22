@@ -3470,10 +3470,7 @@ where
 }
 
 fn supervisor_dir() -> PathBuf {
-    kin_core::registry::registry_path()
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from(".kin"))
+    kin_core::registry::supervisor_root()
 }
 
 const SUPERVISOR_PID_FILE: &str = "supervisor.pid";
