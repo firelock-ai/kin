@@ -1288,6 +1288,102 @@ mod tests {
         );
     }
 
+    /// The federation guard must not swallow a REAL gap, and this is the state
+    /// where it could.
+    ///
+    /// Two rounds of falsification to find it. Widening the guard to fire on any
+    /// trust reason left every refs test green, including the degraded-daemon
+    /// one, because a degraded daemon publishes a `degraded_signals` array and
+    /// that arm is matched BEFORE the guard is ever consulted. The guard is only
+    /// reachable when there is no absent class AND no degraded signal, so the
+    /// only way to catch an over-broad one is a gap that lives in neither.
+    ///
+    /// `focal_resolution_ambiguous` is exactly that gap and it is not exotic: a
+    /// repository holding two entities with one name, queried by that name,
+    /// answers for one of them and says so. Coverage is complete here so the
+    /// absent-class path cannot fire, and the daemon is sound so no signal is
+    /// disclosed, which leaves the ambiguity as the one thing to say.
+    #[test]
+    fn an_ambiguous_focal_still_speaks_on_a_sound_coverage_complete_store() {
+        use kin_model::relation::{Relation, RelationOrigin};
+        use kin_model::{EntityStore, GraphNodeId};
+
+        let (graph, layout, _dir) = orphan_fixture();
+        let pick = |name: &str| {
+            EntityStore::query_entities(
+                &graph,
+                &kin_model::graph::EntityFilter {
+                    name_pattern: Some(name.to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("fixture entity")
+        };
+        let first = pick("orphan");
+        // A second entity carrying the same name, in another file. The query
+        // resolves one and the other is what it could not speak for.
+        let mut twin = first.clone();
+        twin.id = kin_model::EntityId::new();
+        twin.file_origin = Some(kin_model::FilePathId::new("src/twin.rs"));
+        EntityStore::upsert_entity(&graph, &twin).unwrap();
+
+        let caller = pick("caller");
+        let callee = pick("callee");
+        for kind in [
+            RelationKind::Calls,
+            RelationKind::Imports,
+            RelationKind::References,
+        ] {
+            graph
+                .upsert_relation(&Relation {
+                    id: kin_model::ids::RelationId::new(),
+                    kind,
+                    src: GraphNodeId::Entity(caller.id),
+                    dst: GraphNodeId::Entity(callee.id),
+                    confidence: 1.0,
+                    origin: RelationOrigin::Parsed,
+                    created_in: None,
+                    import_source: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        }
+
+        let response = build_refs_response(
+            &layout,
+            &graph,
+            &RefsRequest {
+                entity: "orphan".to_string(),
+                kind: "all".to_string(),
+            },
+            &refs_test_envelope(),
+        )
+        .expect("refs response");
+        let rendered = response.lines.join("\n");
+        let verdict = response
+            .negative
+            .as_ref()
+            .expect("an empty refs answer carries a verdict");
+        let reason = verdict["trust_reason"].as_str().unwrap_or_default();
+
+        assert!(
+            reason.contains("focal_resolution_ambiguous"),
+            "the fixture must reach the ambiguity gap or this test asserts nothing: {reason}"
+        );
+        assert!(
+            !rendered.contains("holds no cross-file"),
+            "coverage is complete, so the absent-class path must not fire: {rendered}"
+        );
+        assert!(
+            rendered.contains("Kin cannot rule out references it did not see"),
+            "an ambiguous focal is a real gap and must be spoken, or the federation guard has \
+             widened into silencing everything it was never meant to touch: {rendered}"
+        );
+    }
+
     /// The federation guard must not swallow a REAL gap.
     ///
     /// Written because falsification found the hole rather than because the
