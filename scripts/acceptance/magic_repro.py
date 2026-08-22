@@ -323,6 +323,35 @@ class Suite(object):
         self._kin_init(repo)
         self._kin_commit(repo, "Add the sessions module")
 
+    def _build_reexport(self, repo):
+        """A store holding a file that legitimately declares nothing.
+
+        `src/prelude.rs` re-exports one name and declares none of its own, which
+        is an ordinary Rust public surface. It reaches the store as an admitted
+        file that produced no entity, which is exactly how a file no adapter
+        could read reaches it, and the two are not the same thing. Rust is the
+        language for this fixture and Python is not: kin mints a Module entity
+        for every Python file, so no Python file is ever a file that produced
+        nothing, and the same fixture written in Python cannot hold the shape
+        this check is about.
+
+        Built through git and converted by `kin init`, because that is the path
+        that emits cross-file edges. Without them `load` reads as unreferenced
+        too, and the check could no longer tell a scan that answered from one
+        that withheld its answer.
+        """
+        self.git(["init", "-q", "."], repo)
+        self._write(repo, ".gitignore", "target/\n")
+        self._write(repo, "Cargo.toml", REEXPORT_CARGO_TOML)
+        self._write(repo, "src/lib.rs", REEXPORT_LIB_RS)
+        self._write(repo, "src/core.rs", REEXPORT_CORE_RS)
+        self._write(repo, REEXPORT_BENIGN_FILE, REEXPORT_PRELUDE_RS)
+        self.git(["add", "-A"], repo)
+        rc, out, err = self.git(["commit", "-q", "-m", "initial reexport fixture"], repo)
+        if rc != 0:
+            raise RuntimeError("git commit failed: %s" % (err or out)[-300:])
+        self._kin_init(repo)
+
     def _build_venv(self, repo):
         self.git(["init", "-q", "."], repo)
         self._write(repo, ".gitignore", "*.log\n")
@@ -683,6 +712,58 @@ class Session(SessionRedirectMixin):
 MIXIN_DOCSTRING = ('"""Session and redirect handling.\n'
                    + "".join("Redirect flow note %d.\n" % i for i in range(1, 24))
                    + '"""\n\n')
+
+
+# The fixture behind check 12. `src/prelude.rs` is the whole point: a file that
+# declares nothing and that no adapter failed on. Measured on kin 0.5.48, the
+# store reads "of the 5 admitted, 3 carry a full language adapter; 1 of those
+# produced no entity", and that one is the prelude.
+REEXPORT_BENIGN_FILE = "src/prelude.rs"
+REEXPORT_DEAD_FUNCTION = "legacy_shim"
+
+REEXPORT_CARGO_TOML = '''[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2021"
+'''
+
+REEXPORT_LIB_RS = '''pub mod core;
+pub mod prelude;
+
+pub fn entry(text: &str) -> String {
+    core::load(text)
+}
+'''
+
+REEXPORT_CORE_RS = '''pub fn normalize(text: &str) -> String {
+    text.trim().to_lowercase()
+}
+
+pub fn load(text: &str) -> String {
+    normalize(text)
+}
+
+/// Nothing calls this, here or in any other file.
+pub fn legacy_shim(text: &str) -> String {
+    text.chars().rev().collect()
+}
+'''
+
+REEXPORT_PRELUDE_RS = '''pub use crate::core::load;
+'''
+
+# The verdict sentence `kin dead-code` opens with. A run whose output matches
+# none of these is unreadable rather than passing: the check cannot grade an
+# answer it cannot find.
+DEAD_CODE_VERDICT = re.compile(
+    r"^(REFUSED\b|UNVERIFIED\b|No dead code found\.|No unreferenced entities\.|"
+    r"Found \d+ unreferenced entit)")
+
+# A row, with the optional label the renderer puts in front of one it cannot
+# stand behind. Suite.dead_code's own row pattern does not tolerate that prefix,
+# and a labeled row read as an absent row would report the wrong defect.
+DEAD_CODE_ROW = re.compile(
+    r"^\s*(\[unverified[^\]]*\]\s+)?(\S+)\s+\((\w+),\s*(\w+)\)\s+-\s+(\S.*?)\s*$")
 
 
 class Result(object):
@@ -1490,6 +1571,102 @@ def check_11(suite):
     return res
 
 
+def check_12(suite):
+    """FIR-2605: a file that declares nothing must not cost the scan its answer.
+
+    A pure re-export file imports names and declares none of its own, so it
+    reaches the store as an admitted file that produced no entity, which is
+    exactly how a file no adapter could read reaches it. On 2026-08-22 lane
+    parseloud's branch treated the two alike and withheld every `kin dead-code`
+    row over a store holding one. Every parity run on that branch stayed green,
+    because no fixture in this suite held such a file. This is that fixture.
+
+    Four arms, and the third is what makes the others falsifiable. The scan
+    answers ordinarily; the benign file is named nowhere in the answer; the one
+    function nothing calls is still listed, so the check cannot pass by the
+    scan reporting nothing at all; and that row carries no label saying the
+    graph cannot stand behind it.
+    """
+    res = Result("12", "FIR-2605", "dead-code answers over a benign re-export file")
+    repo = suite.fixture("reexport")
+
+    def listed_rows(scan):
+        found = {}
+        for line in scan["raw"].splitlines():
+            match = DEAD_CODE_ROW.match(line)
+            if match:
+                found[match.group(2)] = (match.group(1) or "").strip()
+        return found
+
+    dead = suite.dead_code(repo)
+    listed = listed_rows(dead)
+    if not listed:
+        # A conversion's enrichment lands asynchronously, so a scan fired
+        # immediately after `kin init` can read a graph that has not resolved
+        # the fixture's one cross-file call yet. Bounded, and a scan that
+        # withholds its answer keeps withholding it across the retry.
+        time.sleep(3)
+        dead = suite.dead_code(repo)
+        listed = listed_rows(dead)
+    text = dead["raw"]
+
+    verdict = ""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if DEAD_CODE_VERDICT.match(stripped):
+            verdict = stripped
+            break
+    if not verdict:
+        # The daemon's environment-override WARN lines land in this text and are
+        # the last thing in it, so an excerpt taken off the end would be nothing
+        # but them. The exit status is reported beside the excerpt either way.
+        excerpt = " / ".join(line.strip() for line in text.splitlines()
+                             if line.strip() and "WARN" not in line)
+        res.unknown("kin dead-code rc=%d printed no verdict sentence this suite can read: %s"
+                    % (dead["rc"], excerpt[-300:] or "(no output)"))
+        return res
+
+    # The first arm. REFUSED replaces the answer outright and an UNVERIFIED
+    # opener withholds the whole list. The mixed "Found N, M of them UNVERIFIED"
+    # form withholds only some rows, and the fourth arm reads that one per row.
+    if verdict.startswith("REFUSED") or verdict.startswith("UNVERIFIED"):
+        res.bad("kin dead-code withheld its answer over a store whose only unusual file is a "
+                "pure re-export: %s" % verdict)
+    else:
+        res.ok("kin dead-code answered ordinarily: %s" % verdict)
+
+    # The second arm. The benign file holds no entity, so it can be neither a
+    # row nor a reason; naming it at all means the scan read "declares nothing"
+    # as "could not be read".
+    blamed = [line.strip() for line in text.splitlines()
+              if REEXPORT_BENIGN_FILE in line]
+    if blamed:
+        res.bad("the scan names %s, a file that declares nothing and that no adapter failed "
+                "on: %s" % (REEXPORT_BENIGN_FILE, blamed[0][:200]))
+    else:
+        res.ok("%s is named nowhere in the answer" % REEXPORT_BENIGN_FILE)
+
+    # The third arm, the positive one. Without it every assertion above is
+    # satisfied by a scan that found nothing and said so.
+    if REEXPORT_DEAD_FUNCTION not in listed:
+        res.bad("%s is unreferenced in this fixture and was not listed, so this check would "
+                "pass over a scan that reports nothing at all. Listed: %s"
+                % (REEXPORT_DEAD_FUNCTION, ", ".join(sorted(listed)) or "(nothing)"))
+        return res
+    res.ok("the one function nothing calls is listed (%d row(s): %s)"
+           % (len(listed), ", ".join(sorted(listed))))
+
+    # The fourth arm. A row the scan cannot stand behind is a candidate rather
+    # than a find, and nothing about this fixture makes that true.
+    label = listed[REEXPORT_DEAD_FUNCTION]
+    if label:
+        res.bad("the row for %s is labeled %s over a store whose only unusual file declares "
+                "nothing" % (REEXPORT_DEAD_FUNCTION, label))
+    else:
+        res.ok("the row for %s carries no unverified label" % REEXPORT_DEAD_FUNCTION)
+    return res
+
+
 CHECKS = [
     ("0", check_0),
     ("1", check_1),
@@ -1503,6 +1680,7 @@ CHECKS = [
     ("9", check_9),
     ("10", check_10),
     ("11", check_11),
+    ("12", check_12),
 ]
 
 
