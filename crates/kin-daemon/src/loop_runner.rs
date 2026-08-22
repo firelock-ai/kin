@@ -7600,7 +7600,21 @@ async fn sync_filesystem_with_graph_publishing_inner(
     // Without this the file stays admitted and unqueryable through every later
     // commit, which is exactly how one module dropped out of a store and stayed
     // out (FIR-2606).
-    let unenriched = plan_unenriched_source_events(state)?;
+    //
+    // A repair, so it never fails the pass carrying it. A commit that would
+    // have succeeded must not start failing because the recovery beside it
+    // could not plan; the path it would have recovered simply stays owed.
+    let unenriched = match plan_unenriched_source_events(state) {
+        Ok(events) => events,
+        Err(error) => {
+            warn!(
+                error = %error,
+                "could not plan the enrichment repair, so any admitted path missing its entities \
+                 stays unqueryable until it is edited"
+            );
+            Vec::new()
+        }
+    };
     if exact_admission.deltas.is_empty() && unenriched.is_empty() {
         drop(graph_mutation);
         return Ok(());
