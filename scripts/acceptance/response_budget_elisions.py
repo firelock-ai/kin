@@ -92,6 +92,27 @@ IMPACT_LISTS = [
 # The reason code a response still over its ceiling publishes.
 OVER_BUDGET_REASON = "response_over_budget"
 
+# The reason code a cut made by the response budget carries. Checks 0 to 4 drive
+# tools that have no pack token budget at all, so a cut there can only have come
+# from this one, and an elision naming anything else is a misattribution rather
+# than a second cause. Asserted because the graders were one-sided without it: a
+# build that stamped every elision `token_budget` passed all of them, which sends
+# a caller to raise a lever that tool does not have.
+RESPONSE_BUDGET_REASON = "response_budget"
+
+
+def grade_reason(label, elision):
+    """Grade one elision's cause on a tool the pack token budget cannot reach."""
+    reason = elision.get("reason") or ""
+    if not reason:
+        return ["%s names no reason" % label]
+    if reason != RESPONSE_BUDGET_REASON:
+        return [
+            "%s names %r, and this tool has no budget but the response budget, so a "
+            "caller reads it as one it cannot raise" % (label, reason)
+        ]
+    return []
+
 # Callees on the wide focal. Sized so the whole pack clears the pack token
 # budget's 8,000 floor several times over while the serialized response stays
 # well under the 60,000-character response ceiling, which is what lets check 5
@@ -185,8 +206,7 @@ def grade_cut_walk(payload):
             "elisions.chain.total is %r and kept plus elided is %d"
             % (elision.get("total"), len(chain) + omitted)
         )
-    if not elision.get("reason"):
-        problems.append("elisions.chain names no reason")
+    problems.extend(grade_reason("elisions.chain", elision))
     return problems
 
 
@@ -809,8 +829,7 @@ def grade_buckets(payload, buckets):
                 "elisions.%s.total is %r and kept plus elided is %d"
                 % (key, elision.get("total"), len(rows) + (elision.get("elided") or 0))
             )
-        if not elision.get("reason"):
-            problems.append("elisions.%s names no reason" % key)
+        problems.extend(grade_reason("elisions.%s" % key, elision))
     return problems, graded
 
 
@@ -1191,6 +1210,43 @@ def self_test():
         "elisions": {"chain": {"kept": 1, "elided": 3, "total": 4}},
     }
     expect("an elision with no reason fails", len(grade_cut_walk(reasonless)) >= 1, True)
+
+    # The fires-always mutant for the cause: a build that stamps every elision
+    # `token_budget` used to pass every grader here, because they asked only
+    # whether a reason was present. These tools have no pack token budget, so
+    # that reason cannot be true of them, and a caller who believes it raises a
+    # lever the tool does not have.
+    misattributed_walk = {
+        "chain": [{"step": 1}],
+        "steps_omitted": 3,
+        "elisions": {"chain": {"kept": 1, "elided": 3, "total": 4, "reason": "token_budget"}},
+    }
+    expect(
+        "a response-budget cut claiming the token budget fails",
+        len(grade_cut_walk(misattributed_walk)) >= 1,
+        True,
+    )
+    misattributed_bucket = {
+        "entities": [{"a": 1}],
+        "entities_withheld": 5,
+        "elisions": {
+            "entities": {"kept": 1, "elided": 5, "total": 6, "reason": "token_budget"}
+        },
+    }
+    expect(
+        "the same misattribution fails on a ranked list",
+        len(grade_buckets(misattributed_bucket, ["entities"])[0]) >= 1,
+        True,
+    )
+    honest_bucket = dict(misattributed_bucket)
+    honest_bucket["elisions"] = {
+        "entities": {"kept": 1, "elided": 5, "total": 6, "reason": "response_budget"}
+    }
+    expect(
+        "the honest cause still passes",
+        grade_buckets(honest_bucket, ["entities"])[0],
+        [],
+    )
 
     uncut = {"chain": [{"step": 1}], "steps_omitted": 0}
     expect("an uncut walk proves nothing", len(grade_cut_walk(uncut)) >= 1, True)

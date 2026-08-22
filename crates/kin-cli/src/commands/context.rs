@@ -970,5 +970,16 @@ mod tests {
             !rendered.contains("Raise --budget"),
             "no lever is offered for a cut that did not happen: {rendered}"
         );
+        // The other side of the over-budget note. Without this the note could
+        // fire on every pack and every test here would still pass, which is a
+        // fixture sitting entirely on one side of the branch.
+        assert!(
+            !rendered.contains("over budget"),
+            "a pack inside its budget must not report itself over one: {rendered}"
+        );
+        assert!(
+            whole.pack.as_ref().unwrap().actual_tokens <= 32_000,
+            "the fixture must actually fit, or the assertion above proves nothing"
+        );
     }
 }
