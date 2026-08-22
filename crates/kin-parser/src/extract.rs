@@ -191,6 +191,24 @@ pub struct CallArgShape {
 ///
 /// Adapters that do not record sites leave [`ExtractedRelation::site`] `None`,
 /// and the edge is stored exactly as it was before, without a span.
+/// The syntactic position a relation's site occupies, when it changes what the
+/// relation means to a reader.
+///
+/// One variant today, and the channel exists because a `raise` target is a call
+/// edge that is real evidence and is NOT a hop a value travels along. A trace
+/// walking data flow has to tell them apart, and only the parser can: by the
+/// time the linker sees the edge, `raise SSLError(...)` and `SSLError(...)` are
+/// the same call to the same class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelationSyntacticRole {
+    /// The call is the value a `raise` throws. Only the DIRECT operand:
+    /// `raise Wrapper(build())` marks the wrapper, and `build()` stays an
+    /// ordinary call, because demoting a real hop for its neighbour's syntax
+    /// would cost exactly the recall this marker exists to protect.
+    RaiseTarget,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelationSite {
     pub start_byte: usize,
@@ -199,6 +217,11 @@ pub struct RelationSite {
     pub start_col: u32,
     pub end_line: u32,
     pub end_col: u32,
+    /// What this site is syntactically, when that changes what the relation
+    /// means. Absent for every ordinary site, and for every adapter that does
+    /// not classify one, so an unset role reads exactly as it always did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub syntactic_role: Option<RelationSyntacticRole>,
 }
 
 impl RelationSite {
