@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (493 total, 338 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (494 total, 338 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -116,6 +116,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_DAEMON_IDLE_FLUSH_SECS` | seconds>=0 | 2 | operational | idle debounce before a full-graph persistence flush |
 | `KIN_DAEMON_IDLE_TIMEOUT_SECS` | seconds>=0 | 3600 | operational | auto-shutdown after this idle period; 0 disables idle shutdown |
 | `KIN_DAEMON_LOCATE_ONLY` | bool | false | correctness | daemon serves locate-only from a snapshot, changing what it answers |
+| `KIN_DAEMON_MEMORY_BUDGET_BYTES` | usize | *(unset)* | operational | the most one repository daemon and the processes it starts may hold before heavy work backs off, in bytes. Unset derives it as half the memory available here, held between 1 GiB and 8 GiB, because a repository daemon holding more than eight gigabytes is pathological whatever the machine has spare. An operator value wins outright and is not clamped; zero or an unparseable value is ignored, since a budget of zero would refuse every background pass forever |
 | `KIN_DAEMON_PERIODIC_FLUSH_SECS` | seconds>=0 | 30 | operational | maximum interval before dirty graph state is flushed |
 | `KIN_DAEMON_READY_TIMEOUT_SECS` | seconds>=0 | 300 | operational | how long to wait for a starting daemon to become ready |
 | `KIN_DAEMON_REQUIRE_TOKEN` | bool | true | operational | require a bearer token for all daemon requests; set falsy to opt out |

@@ -3758,25 +3758,46 @@ fn check_host_memory_pressure() -> HealthCheck {
     };
     host_memory_pressure_check_for(
         kin_core::memory_pressure::PressureRefusal::read(layout.root()).as_ref(),
+        kin_core::memory_pressure::DaemonFootprint::read(layout.root()).as_ref(),
     )
 }
 
-/// Core of [`check_host_memory_pressure`] with the record as its input, so both
-/// branches are testable without a machine that has actually run out of memory.
+/// Core of [`check_host_memory_pressure`] with both records as its input, so
+/// every branch is testable without a machine that has actually run out of
+/// memory.
+///
+/// The healthy branch reports the standing rather than only the absence of a
+/// refusal. "No work has been held back" is true and unusable: a reader whose
+/// daemon is backing off wants to know how close it is, and a reader on a
+/// machine Kin grades wrongly has nothing to look at and no way to know a
+/// threshold needs moving. The numbers are already published, so printing them
+/// costs nothing and turns the row from a bell into a gauge.
 fn host_memory_pressure_check_for(
     refusal: Option<&kin_core::memory_pressure::PressureRefusal>,
+    footprint: Option<&kin_core::memory_pressure::DaemonFootprint>,
 ) -> HealthCheck {
     const ID: &str = "host_memory_pressure";
     const LABEL: &str = "Host memory pressure";
+    let standing = footprint.map(|footprint| {
+        footprint.line(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_secs())
+                .unwrap_or_default(),
+        )
+    });
     let Some(refusal) = refusal else {
-        return HealthCheck::new(
-            ID,
-            LABEL,
-            HealthStatus::Healthy,
-            "no work has been held back on this store for want of memory",
-        );
+        let detail = match standing {
+            Some(standing) => format!("no work has been held back on this store; {standing}"),
+            None => "no work has been held back on this store for want of memory".to_string(),
+        };
+        return HealthCheck::new(ID, LABEL, HealthStatus::Healthy, detail);
     };
-    HealthCheck::new(ID, LABEL, HealthStatus::Degraded, refusal.cause_sentence())
+    let detail = match standing {
+        Some(standing) => format!("{} Also: {standing}", refusal.cause_sentence()),
+        None => refusal.cause_sentence(),
+    };
+    HealthCheck::new(ID, LABEL, HealthStatus::Degraded, detail)
         .with_manual_fix(refusal.remediation())
 }
 
@@ -8900,10 +8921,37 @@ mod tests {
     /// the host rather than over the install.
     #[test]
     fn the_memory_pressure_row_reports_a_refusal_and_never_blocks_readiness() {
-        let quiet = host_memory_pressure_check_for(None);
+        let quiet = host_memory_pressure_check_for(None, None);
         assert!(matches!(quiet.status, HealthStatus::Healthy));
         assert!(quiet.manual_fix.is_none());
         assert!(!blocks_readiness(&quiet));
+
+        // With a standing published, the healthy row is a gauge rather than a
+        // bell: it says how close the daemon is, so a reader on a machine Kin
+        // grades wrongly has something to look at.
+        let published = kin_core::memory_pressure::DaemonFootprint {
+            footprint: kin_core::memory_pressure::TreeFootprint {
+                own_bytes: 2 * 1024 * 1024 * 1024,
+                children_bytes: 512 * 1024 * 1024,
+                child_count: 1,
+            },
+            budget_bytes: 8 * 1024 * 1024 * 1024,
+            budget_is_derived: true,
+            level: "nominal".to_string(),
+            pid: 4103,
+            at_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_secs())
+                .unwrap_or_default(),
+        };
+        let gauge = host_memory_pressure_check_for(None, Some(&published));
+        assert!(matches!(gauge.status, HealthStatus::Healthy));
+        assert!(!blocks_readiness(&gauge));
+        assert!(
+            gauge.detail.contains("it is allowed") && gauge.detail.contains("child processes"),
+            "the healthy row reports the standing and names the children: {}",
+            gauge.detail
+        );
 
         let refusal = kin_core::memory_pressure::PressureRefusal {
             work: "lsp-sweep".to_string(),
@@ -8913,7 +8961,7 @@ mod tests {
                 .to_string(),
             at_unix: 4_800,
         };
-        let reported = host_memory_pressure_check_for(Some(&refusal));
+        let reported = host_memory_pressure_check_for(Some(&refusal), None);
         assert!(matches!(reported.status, HealthStatus::Degraded));
         assert_eq!(reported.detail, refusal.reason);
         assert!(reported

@@ -981,8 +981,36 @@ pub async fn run(json: bool, wait_quiesce: std::time::Duration) -> Result<()> {
             "{}",
             crate::commands::projection::status_line(layout.root())
         );
+        // What the daemon serving this repository is holding, and what it is
+        // allowed to hold. Appended here for exactly the reason store size and
+        // the projection line are: the report above is authority truth and must
+        // not move with the machine, and this is a measurement of the machine.
+        //
+        // Read from the store rather than asked of the daemon, so the line
+        // appears when the daemon has since gone and so the status wire
+        // contract does not move. `StatusReportWire` denies unknown fields, so
+        // a new key there would make an older CLI reject a newer daemon's
+        // report outright; putting the budget in the payload is a v4 decision
+        // for someone to take deliberately rather than a field to slip in.
+        if let Some(line) = daemon_memory_line(layout.root()) {
+            println!("{line}");
+        }
     }
     Ok(())
+}
+
+/// The daemon footprint line, when this store carries a published standing.
+///
+/// Silent when nothing has been published: no daemon has run under a build that
+/// publishes one, and inventing a figure for it would be worse than the blank
+/// this replaces.
+fn daemon_memory_line(kin_root: &std::path::Path) -> Option<String> {
+    let published = kin_core::memory_pressure::DaemonFootprint::read(kin_root)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default();
+    Some(format!("Daemon memory: {}", published.line(now)))
 }
 
 pub fn build_command_status_response(

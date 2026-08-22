@@ -396,6 +396,176 @@ pub enum Verdict {
     Refuse { reason: String },
 }
 
+/// What a daemon's process tree is holding right now.
+///
+/// A tree rather than a process, because the thing that killed the daemon was
+/// not the daemon. The cold sweep peaked at 18.2 GB while its pyright child
+/// held another 1.93 GiB in a process of its own, and every per-pid view of
+/// that daemon was blind to the second number. A language server is started by
+/// the daemon, lives as long as the sweep does, and is charged to the same
+/// container; a budget that cannot see it is a budget that is wrong by
+/// whatever the servers happen to hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct TreeFootprint {
+    /// The daemon process's own resident set.
+    pub own_bytes: u64,
+    /// Every descendant's resident set, summed.
+    pub children_bytes: u64,
+    /// How many descendants were counted, so a reading of zero children can be
+    /// told from a reading that found them and they were small.
+    pub child_count: usize,
+}
+
+impl TreeFootprint {
+    /// What the whole tree holds.
+    pub fn total_bytes(&self) -> u64 {
+        self.own_bytes.saturating_add(self.children_bytes)
+    }
+}
+
+/// Where a budget's number came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetSource {
+    /// Derived from the ceiling this process runs under.
+    Derived,
+    /// An operator named it outright.
+    Operator,
+}
+
+impl BudgetSource {
+    /// How a disclosure describes the number's provenance.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BudgetSource::Derived => "derived from the memory available here",
+            BudgetSource::Operator => "set by an operator",
+        }
+    }
+}
+
+/// Where an operator names the budget outright, in bytes.
+pub const FOOTPRINT_BUDGET_ENV: &str = "KIN_DAEMON_MEMORY_BUDGET_BYTES";
+
+/// The most a derived budget will ever allow one repository daemon to hold.
+///
+/// This constant is the lever that would have caught the measured failure, and
+/// it is a judgement rather than a measurement, so it is written where a reader
+/// can find and argue with it. The sweep that killed the daemon peaked at 18.2
+/// GB on a store of about one gigabyte, on a host with 128 GiB. Any budget
+/// derived only as a fraction of the ceiling would have allowed it: half of 128
+/// GiB is 64. A repository daemon holding more than eight gigabytes is
+/// pathological for any store a person is working in, whatever the host has
+/// spare, so the derived budget is capped here regardless of how large the
+/// machine is.
+pub const DERIVED_BUDGET_CEILING_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// The least a derived budget will ever allow.
+///
+/// A budget smaller than this would make a daemon back off before it could do
+/// anything useful, which is worse than no budget at all: the store never
+/// converges and the disclosure blames a machine that was merely small.
+pub const DERIVED_BUDGET_FLOOR_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// What a daemon is allowed to hold, and where the number came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FootprintBudget {
+    pub bytes: u64,
+    pub source: BudgetSource,
+}
+
+impl FootprintBudget {
+    /// The budget this process runs under, given the ceiling it runs under.
+    ///
+    /// An operator value wins outright and is not clamped: someone who names a
+    /// number has said what they want, and silently moving it would be the
+    /// same silence this whole module exists to remove. A value that will not
+    /// parse, or is zero, is ignored rather than obeyed, because a budget of
+    /// zero refuses everything forever.
+    pub fn resolve(ceiling_bytes: Option<u64>) -> Option<Self> {
+        if let Some(bytes) = std::env::var(FOOTPRINT_BUDGET_ENV)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .filter(|bytes| *bytes > 0)
+        {
+            return Some(Self {
+                bytes,
+                source: BudgetSource::Operator,
+            });
+        }
+        ceiling_bytes.map(|ceiling| Self {
+            bytes: derive_budget(ceiling),
+            source: BudgetSource::Derived,
+        })
+    }
+
+    /// Half the ceiling, held between the floor and the ceiling constant.
+    ///
+    /// Half because a daemon is not the only thing on the machine, and the
+    /// other half is the user's editor, their language servers outside Kin,
+    /// their browser and their build.
+    pub fn derived_from(ceiling_bytes: u64) -> u64 {
+        derive_budget(ceiling_bytes)
+    }
+}
+
+fn derive_budget(ceiling_bytes: u64) -> u64 {
+    (ceiling_bytes / 2).clamp(DERIVED_BUDGET_FLOOR_BYTES, DERIVED_BUDGET_CEILING_BYTES)
+}
+
+/// How a daemon's tree stands against its budget.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BudgetStanding {
+    pub footprint: TreeFootprint,
+    pub budget: FootprintBudget,
+}
+
+impl BudgetStanding {
+    /// How much of the budget the tree is holding, in `0.0..`.
+    ///
+    /// Not clamped at one. A tree that has passed its budget is over it, and a
+    /// surface that reported 100% for both a small overrun and a fourfold one
+    /// would hide the difference that matters.
+    pub fn used_fraction(&self) -> f64 {
+        if self.budget.bytes == 0 {
+            return 0.0;
+        }
+        self.footprint.total_bytes() as f64 / self.budget.bytes as f64
+    }
+
+    /// The rung this standing sits at, on the same scale host pressure uses.
+    ///
+    /// The same two bars, so an operator learns one set of numbers rather than
+    /// two, and so the four consultation points can take the worse of the two
+    /// without translating between scales.
+    pub fn level_under(&self, thresholds: &Thresholds) -> PressureLevel {
+        let fraction = self.used_fraction();
+        if fraction >= thresholds.critical {
+            PressureLevel::Critical
+        } else if fraction >= thresholds.elevated {
+            PressureLevel::Elevated
+        } else {
+            PressureLevel::Nominal
+        }
+    }
+
+    /// What this standing is, in one sentence, with the children named.
+    ///
+    /// The child figure is always printed, including when it is zero, because
+    /// its absence is the defect this exists to fix: a reader who cannot see a
+    /// child line cannot tell a daemon with no language servers from a reading
+    /// that never looked for them.
+    pub fn sentence(&self) -> String {
+        format!(
+            "this repository's daemon and the {} process(es) it started hold {} of the {} it is \
+             allowed ({}), of which {} is in those child processes",
+            self.footprint.child_count,
+            human_bytes(self.footprint.total_bytes()),
+            human_bytes(self.budget.bytes),
+            self.budget.source.as_str(),
+            human_bytes(self.footprint.children_bytes),
+        )
+    }
+}
+
 impl Verdict {
     /// The verdict for one piece of work under one reading.
     ///
@@ -410,19 +580,57 @@ impl Verdict {
         pressure: &MemoryPressure,
         thresholds: &Thresholds,
     ) -> Self {
-        let level = pressure.level_under(thresholds);
-        let reading = pressure.reading();
+        Self::decide(work, pressure, None, thresholds)
+    }
+
+    /// The verdict for one piece of work under both constraints a daemon has.
+    ///
+    /// Two questions, one answer. The host reading asks whether the machine has
+    /// room; the standing asks whether this daemon is entitled to more of it.
+    /// They fail in different situations and neither implies the other: a
+    /// daemon whose tree has ballooned to eighteen gigabytes on a host with a
+    /// hundred spare is inside every host bar and still the thing that is about
+    /// to die, and a daemon holding a modest amount on a machine somebody else
+    /// has filled is inside its budget and still must not start.
+    ///
+    /// So the worse rung wins, and the sentence names the one that produced
+    /// it. Reporting the wrong constraint would send the reader to add memory
+    /// when the fix is to let a sweep finish, or the other way round.
+    pub fn decide(
+        work: HeavyWork,
+        pressure: &MemoryPressure,
+        standing: Option<&BudgetStanding>,
+        thresholds: &Thresholds,
+    ) -> Self {
+        let host_level = pressure.level_under(thresholds);
+        let budget_level = standing.map(|standing| standing.level_under(thresholds));
+        // `Unknown` is the lowest rung and can never win this comparison, which
+        // is what keeps an unreadable host from overriding a budget that was
+        // measured, and an unmeasurable tree from overriding a host that was.
+        let level = budget_level.map_or(host_level, |budget| host_level.max(budget));
+        let by_budget = budget_level == Some(level) && level > host_level;
+        let did = match level {
+            PressureLevel::Elevated => "runs in smaller batches",
+            _ => "did not start",
+        };
+        let reason = || {
+            if by_budget {
+                describe_budget(
+                    work,
+                    standing.expect("a budget level implies a standing"),
+                    did,
+                )
+            } else {
+                describe(work, level, pressure.reading(), did)
+            }
+        };
         match level {
             PressureLevel::Unknown | PressureLevel::Nominal => Verdict::Proceed,
             PressureLevel::Elevated => match work {
-                HeavyWork::EmbedBatch => Verdict::Shrink {
-                    reason: describe(work, level, reading, "runs in smaller batches"),
-                },
+                HeavyWork::EmbedBatch => Verdict::Shrink { reason: reason() },
                 HeavyWork::LspSweep | HeavyWork::AmbientAdmission => Verdict::Proceed,
             },
-            PressureLevel::Critical => Verdict::Refuse {
-                reason: describe(work, level, reading, "did not start"),
-            },
+            PressureLevel::Critical => Verdict::Refuse { reason: reason() },
         }
     }
 
@@ -494,6 +702,29 @@ fn describe(
     sentence
 }
 
+/// The disclosure sentence when it was this daemon's own budget that bit, in
+/// the same register and with the children named.
+fn describe_budget(work: HeavyWork, standing: &BudgetStanding, did: &'static str) -> String {
+    format!(
+        "{}, so {} {}. {}.",
+        standing.sentence(),
+        work.label(),
+        did,
+        work.consequence()
+    )
+}
+
+/// What the reader can do about a budget the daemon has reached.
+///
+/// Different advice from [`PRESSURE_REMEDY`] on purpose. A machine with no room
+/// is the user's to fix; a daemon that has outgrown its own budget is Kin's,
+/// and the honest thing to say is what the number is and how to move it, not to
+/// send someone out to buy memory they already have.
+pub const BUDGET_REMEDY: &str =
+    "This is Kin's own limit on itself, not the machine running out. Restarting the daemon \
+     releases what it holds, and KIN_DAEMON_MEMORY_BUDGET_BYTES raises the limit if this \
+     repository genuinely needs more.";
+
 /// What the reader can do about a pressure refusal.
 ///
 /// Deliberately short of naming a command that would clear it, because none
@@ -529,6 +760,23 @@ pub fn read() -> MemoryPressure {
         return forced;
     }
     probe()
+}
+
+/// The memory ceiling this process runs under, measured, whatever
+/// [`PRESSURE_OVERRIDE_ENV`] is pinned to.
+///
+/// The pin says how much pressure to act as though there is. It says nothing
+/// about how large the machine is, and the two are different facts: a budget
+/// derived from the ceiling is derived from a measurement, and pinning a level
+/// must not silently delete it. Without this, forcing any level left a daemon
+/// with no derived budget at all, which is a lever that quietly turns off a
+/// guard rather than exercising it.
+///
+/// `None` when the machine could not be read, which leaves the derived budget
+/// absent for the same reason every other unknown leaves work alone. An
+/// operator budget does not consult this at all and stands on its own.
+pub fn ceiling_bytes() -> Option<u64> {
+    probe().reading().map(|reading| reading.limit_bytes)
 }
 
 /// The level pinned by [`PRESSURE_OVERRIDE_ENV`], when one is pinned.
@@ -860,6 +1108,111 @@ impl PressureRefusal {
     }
 }
 
+/// File a daemon publishes its current footprint standing into.
+pub const FOOTPRINT_RECORD_FILE_NAME: &str = "daemon-footprint";
+
+/// Where `kin_root` keeps it.
+pub fn footprint_record_path(kin_root: &Path) -> PathBuf {
+    kin_root.join(FOOTPRINT_RECORD_FILE_NAME)
+}
+
+/// How old a published standing may be before a surface stops calling it
+/// current.
+///
+/// The daemon republishes on a slower cadence than it samples, so a reader can
+/// always find a recent standing without the daemon writing a file every
+/// second. Past this age the number is still printed and is labelled as the
+/// last one published, because a standing from two minutes ago is a fact about
+/// this daemon and a blank line is not.
+pub const FOOTPRINT_RECORD_FRESH_FOR_SECS: u64 = 90;
+
+/// What this repository's daemon last published about what it is holding.
+///
+/// Durable for the reason a refusal is: the process that measures is a daemon
+/// nobody is watching, and every surface that reports it runs later and in
+/// another process. `kin status` reads this rather than asking the daemon,
+/// which keeps the status wire contract unchanged and lets the line appear even
+/// when the daemon has since gone.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DaemonFootprint {
+    /// What the tree held when this was published.
+    pub footprint: TreeFootprint,
+    /// What it was allowed to hold, in bytes.
+    pub budget_bytes: u64,
+    /// Whether that number was derived or named by an operator.
+    pub budget_is_derived: bool,
+    /// The rung it sat at.
+    pub level: String,
+    /// The pid that published it, so a reader can tell one daemon's record from
+    /// its successor's.
+    pub pid: u32,
+    /// When it was published, in unix seconds.
+    pub at_unix: u64,
+}
+
+impl DaemonFootprint {
+    /// Publish this standing for this store.
+    pub fn record(kin_root: &Path, standing: &BudgetStanding, level: PressureLevel, pid: u32) {
+        let record = Self {
+            footprint: standing.footprint,
+            budget_bytes: standing.budget.bytes,
+            budget_is_derived: standing.budget.source == BudgetSource::Derived,
+            level: level.as_str().to_string(),
+            pid,
+            at_unix: unix_now(),
+        };
+        if let Ok(body) = serde_json::to_vec(&record) {
+            let _ = std::fs::write(footprint_record_path(kin_root), body);
+        }
+    }
+
+    /// What this store records, or `None` when it records nothing readable.
+    pub fn read(kin_root: &Path) -> Option<Self> {
+        let raw = std::fs::read(footprint_record_path(kin_root)).ok()?;
+        serde_json::from_slice(&raw).ok()
+    }
+
+    /// Retire the record, because the daemon that published it is going away.
+    pub fn clear(kin_root: &Path) {
+        let _ = std::fs::remove_file(footprint_record_path(kin_root));
+    }
+
+    /// How old this reading is, in seconds, against a clock the caller supplies.
+    ///
+    /// Saturating rather than signed: a record stamped in the future is a clock
+    /// that moved, not a reading from the future, and reporting a negative age
+    /// would be the strangest line on the page.
+    pub fn age_secs(&self, now_unix: u64) -> u64 {
+        now_unix.saturating_sub(self.at_unix)
+    }
+
+    /// The standing as one line, labelled with its age when it is no longer
+    /// current.
+    pub fn line(&self, now_unix: u64) -> String {
+        let age = self.age_secs(now_unix);
+        let standing = BudgetStanding {
+            footprint: self.footprint,
+            budget: FootprintBudget {
+                bytes: self.budget_bytes,
+                source: if self.budget_is_derived {
+                    BudgetSource::Derived
+                } else {
+                    BudgetSource::Operator
+                },
+            },
+        };
+        if age <= FOOTPRINT_RECORD_FRESH_FOR_SECS {
+            standing.sentence()
+        } else {
+            format!(
+                "{} (last published {age}s ago, by pid {})",
+                standing.sentence(),
+                self.pid
+            )
+        }
+    }
+}
+
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1150,6 +1503,265 @@ mod tests {
             swap: 1.0,
         };
         assert_eq!(forced.level_under(&odd), PressureLevel::Critical);
+    }
+
+    // ---- the per-daemon footprint budget ---------------------------------
+
+    const MIB: u64 = 1024 * 1024;
+
+    fn standing(own: u64, children: u64, child_count: usize, budget: u64) -> BudgetStanding {
+        BudgetStanding {
+            footprint: TreeFootprint {
+                own_bytes: own,
+                children_bytes: children,
+                child_count,
+            },
+            budget: FootprintBudget {
+                bytes: budget,
+                source: BudgetSource::Derived,
+            },
+        }
+    }
+
+    /// The measured failure, in the numbers it actually had, asserted as the
+    /// decision rather than as the rung.
+    ///
+    /// The sweep peaked at 18.2 GB while pyright held 1.93 GiB in a process of
+    /// its own, and counting only the daemon is what made every surface blind
+    /// to the second number. What the blindness costs is not a different label
+    /// on a dial, it is a different answer to "may this sweep start": with the
+    /// child counted the tree is over budget and the sweep is refused, and with
+    /// the child dropped the identical moment is merely elevated, which lets a
+    /// sweep run because a sweep has no smaller size. Reverting this to a
+    /// per-pid reading restores exactly the run that died.
+    #[test]
+    fn the_language_server_child_is_counted_and_is_what_refuses_the_sweep() {
+        let bars = Thresholds::default();
+        let budget = 8 * GIB;
+        let roomy_host = MemoryPressure::Known(reading(128 * GIB, 8 * GIB));
+
+        let with_child = standing(6 * GIB + 512 * MIB, 1930 * MIB, 1, budget);
+        assert!(
+            with_child.used_fraction() > 1.0,
+            "6.5 GiB of daemon plus 1.93 GiB of pyright is over an 8 GiB budget"
+        );
+        assert_eq!(with_child.level_under(&bars), PressureLevel::Critical);
+        assert!(
+            Verdict::decide(HeavyWork::LspSweep, &roomy_host, Some(&with_child), &bars).refused(),
+            "the tree is over its budget, so the pass that killed the daemon does not start"
+        );
+
+        // The per-pid view of the identical moment, which is the blindness this
+        // is built to end.
+        let per_pid_only = standing(6 * GIB + 512 * MIB, 0, 0, budget);
+        assert_eq!(
+            per_pid_only.level_under(&bars),
+            PressureLevel::Elevated,
+            "the daemon alone is inside the budget it is about to blow through"
+        );
+        assert_eq!(
+            Verdict::decide(HeavyWork::LspSweep, &roomy_host, Some(&per_pid_only), &bars),
+            Verdict::Proceed,
+            "counting only the daemon lets the sweep start, which is how the daemon died"
+        );
+    }
+
+    #[test]
+    fn the_sentence_names_the_children_even_when_there_are_none() {
+        // A reader who cannot see a child line cannot tell a daemon with no
+        // language servers from a reading that never looked for them.
+        let quiet = standing(2 * GIB, 0, 0, 8 * GIB);
+        let sentence = quiet.sentence();
+        assert!(
+            sentence.contains("the 0 process(es) it started"),
+            "{sentence}"
+        );
+        assert!(
+            sentence.contains("of which 0 MiB is in those child processes"),
+            "{sentence}"
+        );
+    }
+
+    #[test]
+    fn pinning_a_level_does_not_delete_the_measured_ceiling() {
+        // The pin says how much pressure to act as though there is, not how
+        // large the machine is. A lever that quietly turned off the budget
+        // would exercise nothing and hide a guard.
+        let _guard = crate::test_env::EnvVarGuard::set(PRESSURE_OVERRIDE_ENV, "nominal");
+        assert!(
+            matches!(read(), MemoryPressure::Forced { .. }),
+            "the pin is in force"
+        );
+        assert!(read().reading().is_none(), "and it carries no figures");
+        match ceiling_bytes() {
+            Some(ceiling) => assert!(ceiling > 0, "a measured ceiling is a real size"),
+            // A host this process cannot read has no ceiling to report, which
+            // is the same absence every other unknown produces.
+            None => assert!(matches!(probe(), MemoryPressure::Unknown { .. })),
+        }
+    }
+
+    #[test]
+    fn a_derived_budget_is_half_the_ceiling_between_its_floor_and_its_cap() {
+        assert_eq!(FootprintBudget::derived_from(12 * GIB), 6 * GIB);
+        // The case the cap exists for: half of a 128 GiB host is 64 GiB, which
+        // would have allowed the 18.2 GB sweep without a murmur.
+        assert_eq!(
+            FootprintBudget::derived_from(128 * GIB),
+            DERIVED_BUDGET_CEILING_BYTES
+        );
+        // And the case the floor exists for: a daemon on a 1 GiB container
+        // must still be allowed to do something.
+        assert_eq!(
+            FootprintBudget::derived_from(512 * MIB),
+            DERIVED_BUDGET_FLOOR_BYTES
+        );
+    }
+
+    #[test]
+    fn a_budget_of_zero_reads_as_no_pressure_rather_than_total_pressure() {
+        // Same asymmetry the zero ceiling gets: a number nobody set must not
+        // refuse every piece of work on the machine.
+        let impossible = standing(GIB, 0, 0, 0);
+        assert_eq!(impossible.used_fraction(), 0.0);
+        assert_eq!(
+            impossible.level_under(&Thresholds::default()),
+            PressureLevel::Nominal
+        );
+    }
+
+    #[test]
+    fn an_overrun_is_reported_past_one_rather_than_clamped() {
+        // A surface reporting 100% for both a small overrun and a fourfold one
+        // would hide the difference that matters.
+        let quadruple = standing(32 * GIB, 0, 0, 8 * GIB);
+        assert_eq!(quadruple.used_fraction(), 4.0);
+    }
+
+    #[test]
+    fn the_worse_of_the_two_constraints_wins_and_the_sentence_names_it() {
+        let bars = Thresholds::default();
+        // A machine with room, a daemon that has outgrown its budget. Every
+        // host bar is clear and this is still the thing about to die.
+        let roomy = MemoryPressure::Known(reading(128 * GIB, 8 * GIB));
+        let over = standing(6 * GIB, 3 * GIB, 2, 8 * GIB);
+        let verdict = Verdict::decide(HeavyWork::LspSweep, &roomy, Some(&over), &bars);
+        let reason = verdict.reason().expect("refused");
+        assert!(verdict.refused());
+        assert!(
+            reason.contains("it is allowed") && reason.contains("child processes"),
+            "the budget is what bit, so the budget is what the sentence names: {reason}"
+        );
+        assert!(
+            !reason.contains("host memory pressure"),
+            "sending the reader to add memory they already have: {reason}"
+        );
+
+        // The reverse: a daemon well inside its budget on a machine somebody
+        // else has filled.
+        let full = MemoryPressure::Known(reading(12 * GIB, 11 * GIB + GIB / 2));
+        let small = standing(512 * MIB, 0, 0, 6 * GIB);
+        let verdict = Verdict::decide(HeavyWork::LspSweep, &full, Some(&small), &bars);
+        let reason = verdict.reason().expect("refused");
+        assert!(
+            reason.contains("host memory pressure is critical"),
+            "the host is what bit: {reason}"
+        );
+        assert!(!reason.contains("it is allowed"), "{reason}");
+    }
+
+    #[test]
+    fn an_unmeasurable_tree_leaves_the_host_verdict_exactly_as_it_was() {
+        // Absence of evidence again, on the second axis. A daemon that could
+        // not read its own process table must behave as it did before P2.
+        let bars = Thresholds::default();
+        for pressure in [
+            MemoryPressure::Known(reading(12 * GIB, GIB)),
+            MemoryPressure::Known(reading(12 * GIB, 11 * GIB + GIB / 2)),
+            MemoryPressure::Unknown {
+                reason: "unreadable".to_string(),
+            },
+        ] {
+            assert_eq!(
+                Verdict::decide(HeavyWork::LspSweep, &pressure, None, &bars),
+                Verdict::for_reading(HeavyWork::LspSweep, &pressure, &bars),
+            );
+        }
+    }
+
+    #[test]
+    fn a_measured_budget_is_not_overridden_by_an_unreadable_host() {
+        // `Unknown` is the lowest rung and must never win the comparison, or an
+        // unreadable host would silence a budget that was measured.
+        let bars = Thresholds::default();
+        let unknown = MemoryPressure::Unknown {
+            reason: "unreadable".to_string(),
+        };
+        let over = standing(9 * GIB, 0, 0, 8 * GIB);
+        let verdict = Verdict::decide(HeavyWork::LspSweep, &unknown, Some(&over), &bars);
+        assert!(verdict.refused(), "a measured overrun still refuses");
+    }
+
+    #[test]
+    fn an_operator_budget_wins_outright_and_is_not_clamped() {
+        let _guard = crate::test_env::EnvVarGuard::set(FOOTPRINT_BUDGET_ENV, "17179869184");
+        let resolved = FootprintBudget::resolve(Some(12 * GIB)).expect("a budget");
+        assert_eq!(resolved.bytes, 16 * GIB);
+        assert_eq!(resolved.source, BudgetSource::Operator);
+    }
+
+    #[test]
+    fn a_budget_of_zero_or_junk_is_ignored_rather_than_obeyed() {
+        // A budget of zero refuses everything forever, which is the one value
+        // an operator cannot have meant.
+        for raw in ["0", "not-a-number", ""] {
+            let _guard = crate::test_env::EnvVarGuard::set(FOOTPRINT_BUDGET_ENV, raw);
+            let resolved = FootprintBudget::resolve(Some(12 * GIB)).expect("a budget");
+            assert_eq!(resolved.bytes, 6 * GIB, "raw {raw:?} should be ignored");
+            assert_eq!(resolved.source, BudgetSource::Derived);
+        }
+    }
+
+    #[test]
+    fn a_published_standing_survives_a_round_trip_and_ages() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        assert!(DaemonFootprint::read(dir.path()).is_none());
+        let over = standing(6 * GIB, 1930 * MIB, 1, 8 * GIB);
+        DaemonFootprint::record(dir.path(), &over, PressureLevel::Critical, 4103);
+        let published = DaemonFootprint::read(dir.path()).expect("a published standing");
+        assert_eq!(published.footprint.child_count, 1);
+        assert_eq!(published.budget_bytes, 8 * GIB);
+        assert!(published.budget_is_derived);
+
+        // Fresh reads as itself; stale says how old it is and whose it was.
+        let fresh = published.line(published.at_unix + 10);
+        assert!(!fresh.contains("last published"), "{fresh}");
+        let stale = published.line(published.at_unix + FOOTPRINT_RECORD_FRESH_FOR_SECS + 60);
+        assert!(
+            stale.contains("last published") && stale.contains("pid 4103"),
+            "{stale}"
+        );
+
+        DaemonFootprint::clear(dir.path());
+        assert!(DaemonFootprint::read(dir.path()).is_none());
+    }
+
+    #[test]
+    fn a_record_stamped_in_the_future_ages_to_zero_rather_than_backwards() {
+        let over = standing(GIB, 0, 0, 8 * GIB);
+        let record = DaemonFootprint {
+            footprint: over.footprint,
+            budget_bytes: over.budget.bytes,
+            budget_is_derived: true,
+            level: "nominal".to_string(),
+            pid: 1,
+            at_unix: 5_000,
+        };
+        assert_eq!(
+            record.age_secs(4_000),
+            0,
+            "a clock that moved is not a reading from the future"
+        );
     }
 
     #[test]

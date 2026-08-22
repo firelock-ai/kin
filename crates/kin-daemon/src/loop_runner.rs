@@ -2793,6 +2793,7 @@ pub async fn run_loop_armed(
         // saved for work the user asked for and would have to do again.
         let pressure =
             crate::daemon::pressure_verdict(kin_core::memory_pressure::HeavyWork::AmbientAdmission);
+        crate::daemon::publish_footprint_standing(&state, &pressure);
         if let kin_core::memory_pressure::Verdict::Refuse { reason } = &pressure.verdict {
             if announced_pressure != Some(pressure.level) {
                 crate::daemon::disclose_pressure_refusal(
