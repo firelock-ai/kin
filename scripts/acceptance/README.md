@@ -1,7 +1,7 @@
 # Product acceptance suites
 
-Four falsifiable suites that ask whether the product still answers correctly.
-`.github/workflows/acceptance.yml` runs all four on every pull request against
+Six falsifiable suites that ask whether the product still answers correctly.
+`.github/workflows/acceptance.yml` runs all six on every pull request against
 that pull request's own build. None is release proof; all are regression gates.
 
 Each suite prints one line per check:
@@ -91,6 +91,30 @@ does not fit has to say so in `degradations`. A ceiling is not always reachable,
 because every cut list keeps a floor entry, and that case is fine as long as it is
 never quiet.
 
+`memory_pressure_refusal.py` covers the back-off Kin owes a machine it is
+running on, and the disclosure it owes the person running it. A daemon that
+quietly stopped sweeping would look identical to one that had finished, since
+every counter on every surface keeps reporting the unenriched files as pending
+work, so each check grades the refusal and the disclosure together and pairs
+both with an unpressured control (FIR-2614).
+
+`registry_home_isolation.py` covers the boundary `KIN_HOME` is supposed to draw.
+The cross-repo registry is store state, and it used to sit outside that boundary
+because the registry file's parent doubled as the machine-level supervisor
+directory, so a daemon under a scratch home read the operator's registry and
+pinned sibling authority for every repository on the box (FIR-2467). The suite
+builds two homes, registers repositories into each, and asks `kin deps`, `kin
+registry list` and a scratch-home daemon's own log what they can see. Every check
+carries the control that keeps it from passing for the wrong reason, including
+one that requires an unbindable sibling in the scratch home to still draw the pin
+warning, so a sealed reading is a sealed daemon and not a daemon that stopped
+pinning anything. Check 3 asserts the other half: the registry moves with
+`KIN_HOME` and the supervisor does not, because one supervisor holds daemons from
+several managed homes and following `KIN_HOME` would hide from a pinned session
+the daemons it shares the box with. Every probe leaves `KIN_REGISTRY_PATH` unset
+on purpose, since an explicit pin wins on both sides of that fix and a probe that
+kept one could not fail.
+
 `brownfield_repro.py --self-test` and `response_budget_elisions.py --self-test`
 exercise their verdict graders on fixed payloads and need no binary and no
 corpus. Each case is paired with its inverse, so a grader that cannot tell its
@@ -116,6 +140,10 @@ python3 scripts/acceptance/brownfield_repro.py \
 python3 scripts/acceptance/response_budget_elisions.py \
   --kin target/release/kin --daemon target/release/kin-daemon \
   --json acceptance/response_budget.json --verbose
+
+python3 scripts/acceptance/registry_home_isolation.py \
+  --kin target/release/kin --daemon target/release/kin-daemon \
+  --json acceptance/registry_isolation.json --verbose
 ```
 
 Release, not debug. Release is what ships, so it is what an acceptance answer
@@ -129,7 +157,9 @@ walked whole (FIR-2593).
 REGRESSION rather than plain FAIL. `brownfield_repro.py` also takes `--offline`,
 which refuses to fetch and requires the corpus cache to already carry both pinned
 commits. `response_budget_elisions.py` builds its own fixture, fetches nothing,
-and takes `--workdir` and `--verbose`.
+and takes `--workdir` and `--verbose`. `registry_home_isolation.py` builds both
+of its homes and all four of its repositories itself, fetches nothing, and takes
+`--keep` and `--verbose`.
 
 The magic suite's fixtures commit through kin, and kin refuses to invent an
 author, so the machine running them needs a git identity. That refusal is
