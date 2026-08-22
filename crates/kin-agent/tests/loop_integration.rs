@@ -124,9 +124,13 @@ fn write_fake_mcp_server(dir: &Path) -> PathBuf {
 }
 
 const FAKE_SERVER: &str = r#"#!/usr/bin/env python3
-import json, sys
+import json, os, sys
 
 LOG = sys.argv[1]
+
+# Staged operations per transaction, so a commit publishes what was staged rather than
+# answering yes to anything. The server runs with the repository as its cwd.
+STAGED = {}
 
 TOOLS = [
     {"name": "semantic_locate", "description": "Find entities by meaning.",
@@ -185,11 +189,35 @@ def call(name, args):
             if op.get("target") in TRACKED:
                 return payload({"error": "path " + op.get("target") + " is already tracked",
                                 "_kin": ENVELOPE}, is_error=True)
+        STAGED.setdefault(args.get("transaction_id"), []).extend(args.get("operations", []))
         return payload({"staged": len(args.get("operations", [])),
                         "transaction_id": "txn-fixture-1", "_kin": ENVELOPE})
     if name == "kin_transaction_commit":
-        return payload({"committed": True, "transaction_id": "txn-fixture-1", "_kin": ENVELOPE})
+        # The real daemon refuses to publish onto an untracked working-copy path, and
+        # materialises the file itself when it does publish. A stand-in that always
+        # answers "committed" cannot fail the way the product fails, which is how
+        # FIR-2624 shipped: the harness wrote the file first and every real commit was
+        # refused while this suite stayed green.
+        operations = STAGED.pop(args.get("transaction_id"), [])
+        for op in operations:
+            target = op.get("target")
+            if op.get("verb") in ("create", "add", "insert") and os.path.exists(target):
+                return payload({"message": "repository projection conflict: untracked "
+                                           "working-copy path " + os.path.abspath(target) +
+                                           " conflicts with exact workspace target " + target,
+                                "_kin": ENVELOPE}, is_error=True)
+        for op in operations:
+            target = op.get("target")
+            if op.get("verb") in ("create", "add", "insert"):
+                parent = os.path.dirname(target)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                with open(target, "w") as fh:
+                    fh.write(op.get("body", ""))
+        return payload({"committed": True, "published": len(operations),
+                        "transaction_id": "txn-fixture-1", "_kin": ENVELOPE})
     if name == "kin_transaction_abort":
+        STAGED.pop(args.get("transaction_id"), None)
         return payload({"aborted": True, "_kin": ENVELOPE})
     return payload({"error": "unknown tool " + name}, is_error=True)
 
@@ -617,6 +645,159 @@ fn a_new_file_is_staged_as_a_create_and_then_committed() {
     assert_eq!(staged["body_bytes"], body.len());
 }
 
+/// FIR-2624: a created file must be published by repository authority, not written to the
+/// working copy ahead of the commit.
+///
+/// The daemon refuses to publish onto an untracked working-copy path sitting on its exact
+/// workspace target, so a harness that writes first turns every commit into a refusal and
+/// lands nothing. The scripted server refuses on the same ground, which is what makes this
+/// test able to fail: restore the old ordering and the run ends `ChangesUnpublished` with
+/// the projection conflict in its trace.
+#[test]
+fn a_created_file_is_published_by_authority_rather_than_written_before_the_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(dir.path());
+    let out = dir.path().join("out");
+    let server = write_fake_mcp_server(dir.path());
+    let log = dir.path().join("mcp-calls.jsonl");
+    let body = "def shout(text):\n    return text.upper()\n";
+
+    let endpoint = FakeEndpoint::start(vec![
+        completion(
+            "Adding the helper.",
+            Some(tool_call(
+                "c1",
+                "write_file",
+                json!({ "path": "src/shout.py", "content": body }),
+            )),
+        ),
+        completion("src/shout.py now holds shout.", None),
+    ]);
+    let base_url = endpoint.base_url.clone();
+
+    let outcome = kin_agent::run(config(&repo, &out, &base_url, mcp_command(&server, &log)))
+        .expect("the run completes");
+
+    assert_eq!(outcome.status, ExitStatus::Success);
+    assert_eq!(outcome.result["kin_agent"]["unpublished_changes"], 0);
+    // The bytes are on disk, and the only writer was the commit.
+    assert_eq!(
+        std::fs::read_to_string(repo.join("src/shout.py")).unwrap(),
+        body
+    );
+
+    let calls = mcp_log(&log);
+    let names: Vec<&str> = calls
+        .iter()
+        .map(|call| call["tool"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"kin_transaction_commit"),
+        "the create must be committed, not aborted: {names:?}"
+    );
+    assert!(
+        !names.contains(&"kin_transaction_abort"),
+        "a create the daemon can publish must never abort: {names:?}"
+    );
+
+    let trace = read_jsonl(&outcome.trace_path);
+    let write = trace
+        .iter()
+        .find(|row| row["tool"] == "write_file")
+        .expect("the local write is traced");
+    assert_eq!(write["provenance"]["bracketed"], true);
+    assert_eq!(
+        write["provenance"]["closed_with"], "kin_transaction_commit",
+        "the bracket must close by committing"
+    );
+    assert_eq!(
+        write["provenance"]["closed_cleanly"], true,
+        "the commit must be accepted, not refused on the harness's own file"
+    );
+
+    // The model is told publication happened, so it can tell a landed change from a file
+    // left sitting on disk.
+    let requests = endpoint.requests();
+    let observation = requests[1]["messages"].as_array().unwrap().last().unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        observation.contains("published it through repository authority"),
+        "the model must be told the change landed: {observation}"
+    );
+}
+
+/// FIR-2625: a run whose change repository authority never published must not report
+/// success, and the reason must survive into the trace instead of being spent on the
+/// `_kin` envelope.
+#[test]
+fn a_refused_commit_downgrades_the_run_and_keeps_its_reason_in_the_trace() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(dir.path());
+    let out = dir.path().join("out");
+    let server = write_fake_mcp_server(dir.path());
+    let log = dir.path().join("mcp-calls.jsonl");
+
+    // README.md is tracked in the fixture graph, so the scripted server refuses the stage
+    // by name, exactly as the daemon does.
+    let endpoint = FakeEndpoint::start(vec![
+        completion(
+            "Rewriting the readme.",
+            Some(tool_call(
+                "c1",
+                "write_file",
+                json!({ "path": "README.md", "content": "# again\n" }),
+            )),
+        ),
+        completion("Readme rewritten.", None),
+    ]);
+    let base_url = endpoint.base_url.clone();
+
+    let outcome = kin_agent::run(config(&repo, &out, &base_url, mcp_command(&server, &log)))
+        .expect("the run completes");
+
+    // The model's closing paragraph reads like a success. The run does not.
+    assert_eq!(outcome.status, ExitStatus::ChangesUnpublished);
+    assert_eq!(outcome.status.code(), 6);
+    assert_eq!(outcome.result["subtype"], "changes_unpublished");
+    assert_eq!(outcome.result["is_error"], true);
+    assert_eq!(outcome.result["kin_agent"]["unpublished_changes"], 1);
+
+    // The reason reaches the trace. The `_kin` envelope alone is longer than the 300
+    // character budget, so truncating the raw answer dropped the message entirely.
+    let trace = read_jsonl(&outcome.trace_path);
+    let staged = trace
+        .iter()
+        .find(|row| row["tool"] == "kin_transaction_stage")
+        .expect("the stage call is traced");
+    assert_eq!(staged["is_error"], true);
+    let detail = staged["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("already tracked"),
+        "the refusal reason must survive truncation, got: {detail}"
+    );
+    assert!(
+        !detail.contains("envelope_version"),
+        "the envelope must not be what the budget was spent on: {detail}"
+    );
+
+    // The model's work is not lost, and the model is told it did not land.
+    assert_eq!(
+        std::fs::read_to_string(repo.join("README.md")).unwrap(),
+        "# again\n"
+    );
+    let requests = endpoint.requests();
+    let observation = requests[1]["messages"].as_array().unwrap().last().unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        observation.contains("did not publish it"),
+        "the model must be told the change did not land: {observation}"
+    );
+}
+
 /// A `write_file` over a path the graph already tracks is refused by repository authority
 /// rather than by the harness looking at the disk, and the refusal aborts the transaction.
 #[test]
@@ -642,7 +823,11 @@ fn a_write_over_a_tracked_path_is_refused_by_the_graph_and_aborts() {
 
     let outcome = kin_agent::run(config(&repo, &out, &base_url, mcp_command(&server, &log)))
         .expect("the run completes");
-    assert_eq!(outcome.status, ExitStatus::Success);
+    // Nothing was published, so the run does not get to call itself a success. The model
+    // still keeps its work: the harness falls back to the local write when the bracket
+    // could not publish, which is the only reason the file below exists.
+    assert_eq!(outcome.status, ExitStatus::ChangesUnpublished);
+    assert_eq!(outcome.result["kin_agent"]["unpublished_changes"], 1);
     assert_eq!(
         std::fs::read_to_string(repo.join("README.md")).unwrap(),
         "# rewritten\n"
