@@ -1667,6 +1667,295 @@ def check_12(suite):
     return res
 
 
+def check_13(suite):
+    """FIR-2504: the memory knobs an operator sets must outlive the daemon.
+
+    The rc0543b stranger set `kin embed --batch-size 16` and exported
+    KIN_RESOURCE_PROFILE=ci on a 12 GiB host, restarted the daemon exactly as
+    Kin instructed, and got neither back. The batch reverted to 512 on every
+    daemon start, which on that host was every OOM kill, and inspect kept
+    reporting `interactive`. The corrected mechanism is worse than the report,
+    because the flag DOES take effect for its own pass, so the knob looks like
+    it works right up until the restart that needed it.
+
+    Six arms. The fifth is the negative control: without it every assertion
+    below is satisfied by a build that hardcodes ci and 16.
+    """
+    res = Result("13", "FIR-2504", "resource knobs survive a daemon restart")
+    repo = suite.fixture("incremental")
+
+    rc, out, err = suite.kin_run(
+        ["resources", "set", "--profile", "ci", "--embed-batch-size", "16"], repo)
+    if rc != 0:
+        res.unknown("kin resources set rc=%d: %s" % (rc, (err or out).strip()[-200:]))
+        return res
+    res.ok("kin resources set recorded both knobs")
+
+    # Arm 1: the file, because nothing else proves the knob outlived the
+    # process that set it.
+    config_path = os.path.join(repo, ".kin", "config.toml")
+    try:
+        with open(config_path) as handle:
+            config_text = handle.read()
+    except IOError as error:
+        res.unknown("could not read %s: %s" % (config_path, error))
+        return res
+    if "[resources]" not in config_text:
+        res.bad("kin resources set wrote no [resources] section to .kin/config.toml: %s"
+                % config_text.strip()[-200:])
+        return res
+    if 'profile = "ci"' not in config_text or "embed_batch_size = 16" not in config_text:
+        res.bad("[resources] does not carry both knobs: %s" % config_text.strip()[-300:])
+        return res
+    res.ok("both knobs are recorded in .kin/config.toml")
+
+    def inspect_after_restart():
+        suite.kin_run(["daemon", "stop"], repo)
+        time.sleep(1)
+        rc, out, err = suite.kin_run(["resources", "inspect", "--json"], repo)
+        for line in (out or "").splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    return json.loads(line)
+                except ValueError:
+                    continue
+        raise McpError("kin resources inspect --json rc=%d printed no JSON object: %s"
+                       % (rc, ((err or out) or "").strip()[-200:]))
+
+    try:
+        report = inspect_after_restart()
+    except McpError as error:
+        res.unknown(str(error))
+        return res
+
+    # Arm 2: the line the stranger read wrong.
+    profile = report.get("profile")
+    if profile != "ci":
+        res.bad("a daemon restarted with profile=ci recorded plans under %r instead"
+                % profile)
+    else:
+        res.ok("the restarted daemon plans under ci")
+
+    # Arm 3: provenance. A config choice reported as an operator override is
+    # FIR-2434's lie in a new costume.
+    actual = report.get("actual") or {}
+    if actual.get("resource_profile_repository_config") is not True:
+        res.bad("the restarted daemon does not report the profile as this repository's "
+                "choice: %s" % json.dumps({k: actual.get(k) for k in
+                                           ("resource_profile_env",
+                                            "resource_profile_product_selected",
+                                            "resource_profile_repository_config")}))
+    elif actual.get("resource_profile_env") != "ci":
+        res.bad("the provenance says repository config but the selector reads %r"
+                % actual.get("resource_profile_env"))
+    else:
+        res.ok("the profile is reported as this repository's recorded choice")
+
+    # Arm 4: the batch size the background queue is actually running with.
+    embed_runtime = report.get("embed_runtime") or {}
+    if "embed_batch_size" not in embed_runtime:
+        res.unknown("kin resources inspect --json reports no embed_batch_size, so whether "
+                    "the batch knob took cannot be read at all")
+        return res
+    if embed_runtime.get("embed_batch_size") != 16:
+        res.bad("the restarted daemon's background embed batch is %r, not the recorded 16"
+                % embed_runtime.get("embed_batch_size"))
+    else:
+        res.ok("the restarted daemon's background embed batch is the recorded 16")
+
+    # Arm 5, the negative control.
+    rc, out, err = suite.kin_run(["resources", "set", "--clear"], repo)
+    if rc != 0:
+        res.unknown("kin resources set --clear rc=%d: %s" % (rc, (err or out).strip()[-200:]))
+        return res
+    try:
+        cleared = inspect_after_restart()
+    except McpError as error:
+        res.unknown("after --clear: %s" % error)
+        return res
+    cleared_actual = cleared.get("actual") or {}
+    cleared_embed = cleared.get("embed_runtime") or {}
+    if cleared_actual.get("resource_profile_repository_config") is True:
+        res.bad("--clear left the repository still claiming the profile: %r"
+                % cleared_actual.get("resource_profile_env"))
+    elif cleared_embed.get("embed_batch_size") == 16:
+        res.bad("--clear left the background embed batch at 16, so the arms above would "
+                "pass over a build that hardcodes it")
+    else:
+        res.ok("--clear returns the daemon to its defaults (batch %r, repository profile %r), "
+               "so the arms above read a knob rather than a constant"
+               % (cleared_embed.get("embed_batch_size"),
+                  cleared_actual.get("resource_profile_repository_config")))
+
+    # Arm 6: the provenance field has to move in BOTH directions or it is
+    # decoration. Set says this repository chose it, cleared says kin did, and
+    # the two cannot both be true of one field.
+    if cleared_actual.get("resource_profile_product_selected") is not True:
+        res.bad("after --clear the profile is neither this repository's nor kin's own "
+                "default, so the provenance field does not track the knob: %s"
+                % json.dumps({k: cleared_actual.get(k) for k in
+                              ("resource_profile_env",
+                               "resource_profile_product_selected",
+                               "resource_profile_repository_config")}))
+    else:
+        res.ok("the provenance field moves both ways: repository while set, kin's own "
+               "default once cleared")
+    return res
+
+
+def check_14(suite):
+    """FIR-2135: the health tool must answer while the box is busy.
+
+    dg-baseline saw kin_graph_status fail 11 of 11 with an instruction to
+    retry, under exactly the reconcile churn someone would be running it to
+    diagnose. A status surface that requires a quiet system answers precisely
+    when nobody needs it. The fix answers with the last settled reading of the
+    same selected graph, labelled as of that instant, and keeps a bare retry
+    instruction as no caller's only path.
+
+    The deterministic proof is in the daemon unit tests, where the blocking
+    state is held rather than raced. This check probes the shipped surface: the
+    quiet shape, a burst under real mutation, the agent-facing contract, and
+    that the degraded shape is not sticky.
+    """
+    res = Result("14", "FIR-2135", "graph status answers instead of refusing")
+    repo = suite.fixture("incremental")
+
+    def status(label):
+        payload, _ = suite.mcp(repo, "kin_graph_status", {})
+        if not isinstance(payload, dict):
+            raise McpError("%s: kin_graph_status payload is not an object" % label)
+        return payload
+
+    # Arm 1, the positive control: without it every arm below is satisfied by a
+    # probe that is reading the wrong surface.
+    try:
+        quiet = status("quiet")
+    except McpError as error:
+        res.unknown(str(error))
+        return res
+    if quiet.get("sampling") != "point_in_time_selected_graph":
+        res.bad("a quiet store's status is not a live sample: sampling=%r"
+                % quiet.get("sampling"))
+        return res
+    if quiet.get("stale") is not None:
+        res.bad("a live sample carries a stale disclosure: %s"
+                % json.dumps(quiet.get("stale"))[:200])
+        return res
+    res.ok("a quiet store answers with a live point-in-time sample and no stale block")
+
+    # Arm 2: a burst fired while the graph is being mutated. Whether contention
+    # actually lands is the host's business; what must never happen is a
+    # refusal, and the stale count prints every run so a burst that never
+    # contended is visible rather than silently green.
+    for index in range(6):
+        suite._write(repo, "churn_%d.py" % index,
+                     "def churn_%d():\n    return %d\n" % (index, index))
+    commit = subprocess.Popen(
+        [suite.kin, "commit", "-m", "churn the graph"],
+        cwd=repo, env=suite.env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    refusals = []
+    stale = []
+    live = 0
+    try:
+        for attempt in range(6):
+            try:
+                payload = status("burst %d" % attempt)
+            except McpError as error:
+                # An MCP-level error IS the refusal shape this ticket is about.
+                refusals.append(str(error)[:200])
+                continue
+            sampling = payload.get("sampling")
+            if sampling == "last_settled_selected_graph":
+                stale.append(payload)
+            elif sampling == "point_in_time_selected_graph":
+                live += 1
+            else:
+                refusals.append("unknown sampling %r" % sampling)
+    finally:
+        try:
+            commit.communicate(timeout=300)
+        except subprocess.TimeoutExpired:
+            commit.kill()
+            commit.communicate()
+
+    bare_retry = [text for text in refusals if "retry kin_graph_status" in text]
+    if bare_retry:
+        res.bad("status still answers a busy store with a bare retry instruction: %s"
+                % bare_retry[0])
+    elif refusals:
+        res.bad("status refused %d of 6 calls under mutation: %s"
+                % (len(refusals), refusals[0]))
+    else:
+        res.ok("6 of 6 status calls under mutation answered (%d live, %d as-of-earlier)"
+               % (live, len(stale)))
+
+    # Every stale answer has to carry the disclosure that makes it honest.
+    for payload in stale:
+        block = payload.get("stale") or {}
+        missing = [key for key in
+                   ("reason", "settled_age_ms", "live_attempts", "note")
+                   if block.get(key) in (None, "")]
+        if missing:
+            res.bad("an as-of-earlier reading is missing its disclosure fields %s: %s"
+                    % (", ".join(missing), json.dumps(block)[:200]))
+            break
+    else:
+        if stale:
+            res.ok("every as-of-earlier reading carries reason, age, attempts and a note")
+
+    # The pairing, asserted here on the wire in BOTH directions rather than left
+    # to the report's own validation. A replay that forgot to disclose itself
+    # reads as a live sample, and a live sample carrying a disclosure reads as
+    # stale when it is not; neither may ever reach a caller.
+    mismatched = ["stale block under sampling=%r" % payload.get("sampling")
+                  for payload in stale
+                  if payload.get("sampling") != "last_settled_selected_graph"]
+    if quiet.get("stale") is not None:
+        mismatched.append("live sample carrying a stale block")
+    if mismatched:
+        res.bad("sampling and stale disagree on the wire: %s" % "; ".join(mismatched))
+    else:
+        res.ok("sampling and stale agree in both directions across %d response(s)"
+               % (1 + len(stale) + live))
+
+    # Arm 3, the contract an agent reads before it trusts the answer.
+    try:
+        tools, _ = suite.mcp(repo, "tools/list", {})
+    except McpError as error:
+        res.unknown("tools/list: %s" % error)
+        return res
+    description = ""
+    for tool in (tools.get("tools") or []):
+        if tool.get("name") == "kin_graph_status":
+            description = tool.get("description") or ""
+            break
+    if not description:
+        res.unknown("tools/list carries no kin_graph_status description")
+        return res
+    if "last_settled_selected_graph" not in description:
+        res.bad("the kin_graph_status description does not tell a caller a reading as of an "
+                "earlier instant is possible, so an agent cannot know to read `stale`")
+    else:
+        res.ok("the tool description names the as-of-earlier shape and its stale block")
+
+    # Arm 4: the degraded shape is not sticky.
+    try:
+        settled = status("settled")
+    except McpError as error:
+        res.unknown("after the burst: %s" % error)
+        return res
+    if settled.get("sampling") != "point_in_time_selected_graph" or settled.get("stale"):
+        res.bad("status did not go back to a live sample once the store settled: "
+                "sampling=%r stale=%s"
+                % (settled.get("sampling"), json.dumps(settled.get("stale"))[:160]))
+    else:
+        res.ok("status is live again once the store settles")
+    return res
+
+
 CHECKS = [
     ("0", check_0),
     ("1", check_1),
@@ -1681,6 +1970,8 @@ CHECKS = [
     ("10", check_10),
     ("11", check_11),
     ("12", check_12),
+    ("13", check_13),
+    ("14", check_14),
 ]
 
 
