@@ -1090,6 +1090,21 @@ pub fn collect_parse_coverage(
 
 /// The census rule with both graph readings as inputs, so every branch is
 /// testable without a store.
+///
+/// The two readings are not fenced against each other, and the caller decides
+/// the order. Reading the tree FIRST is the safe order: a file admitted between
+/// the two reads is then absent from the tree and present in the entity list,
+/// which under-reports silence. The reverse order puts it in the tree and not
+/// in the entity list, which invents a silent file that parsed fine.
+/// `collect_parse_coverage` below takes them in the safe order.
+/// `graph_health` takes its entity listing from the response renderer before it
+/// clones the tree, so it takes them in the other one.
+///
+/// That is recorded rather than fixed because the cost of being wrong here is
+/// now one transient row in a disclosure, and it was a refusal only while this
+/// module carried a verdict. Fixing it properly means fencing both reads behind
+/// one epoch the way `mcp_graph_status_with_stable_authority` does, which is a
+/// change to the report's whole read discipline rather than to this function.
 pub fn collect_parse_coverage_from(
     resolved_tree: &kin_model::ResolvedTree,
     entities: &[Entity],
@@ -1123,6 +1138,18 @@ pub fn collect_parse_coverage_from(
             .extension()
             .and_then(|extension| extension.to_str())
             .unwrap_or_default();
+        // `.h` is left out rather than guessed at. Ingest resolves the C/C++
+        // collision by reading the file (`get_by_extension_and_content`), and
+        // this census reads no file, so the only answer available here is the
+        // one the extension gives: C. Counting a C++ project's headers under a
+        // `c` row would name a language the repository does not hold, one line
+        // above a reference-edge section keying on the entity's own language
+        // that shows `cpp` and no `c` row at all. Worse, adding real C files
+        // would dilute the same header shortfall out of the report. A number
+        // that cannot be attributed is left out rather than attributed wrongly.
+        if extension == "h" {
+            continue;
+        }
         let Some(adapter) = registry.get_by_extension(extension) else {
             continue;
         };
@@ -1986,6 +2013,29 @@ mod tests {
             "an entity on an unadmitted path credits nothing"
         );
         assert_eq!(row.silent, 1);
+    }
+
+    /// A `.h` file is left out of every row, because the census reads no file
+    /// and the extension alone cannot say whether a header is C or C++. The
+    /// alternative is a `c` row on a repository holding no C.
+    #[test]
+    fn a_header_is_left_out_rather_than_attributed_to_the_wrong_language() {
+        let tree = tree_of(&["src/widget.h", "src/widget.cpp", "src/other.cpp"]);
+        let census = collect_parse_coverage_from(&tree, &[]);
+        assert_eq!(census.languages.len(), 1, "{census:?}");
+        let row = &census.languages[0];
+        assert_eq!(row.language, "cpp", "the .cpp files are attributable");
+        assert_eq!(
+            row.tracked, 2,
+            "widget.h is in no row, so no c row exists to dilute or mislabel: {census:?}"
+        );
+        assert!(
+            !census
+                .languages
+                .iter()
+                .any(|language| language.language == "c"),
+            "{census:?}"
+        );
     }
 
     /// Ordering is a claim the store can back, and "biggest" is not one: the
