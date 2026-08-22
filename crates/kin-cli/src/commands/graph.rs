@@ -944,6 +944,7 @@ fn build_graph_status_response_for_store(
     if let Some(suspended) = kin_root.and_then(kin_daemon_spawn::SuspendedSweep::read) {
         warnings.push(suspended.summary());
     }
+    warnings.extend(parse_coverage_warnings(&health.reference_edge_coverage));
     if warnings.is_empty() && criticals.is_empty() {
         lines.push(String::new());
         lines.push("✓ No issues detected.".to_string());
@@ -977,6 +978,29 @@ fn build_graph_status_response_for_store(
         reference_edge_coverage: Some(health.reference_edge_coverage.clone()),
         relation_census: Some(census_comparison),
     })
+}
+
+/// Languages this store admits files for and did not parse, as warning
+/// sentences.
+///
+/// A free function with the census as its only input, so the rule is testable
+/// without a store and so this file's one call site stays a single line.
+///
+/// A warning rather than a critical, for the reason every issue class added to
+/// this page since has been one: `criticals` sets the response error and would
+/// turn `kin graph status` nonzero for every caller scripting it. Killing the
+/// false all-clear is what this closes; moving an exit code is a separate
+/// decision nobody asked for.
+///
+/// The counters above this line cannot report the fact on their own. "Supported
+/// inputs: 141" is what an adapter COULD parse and "Files: 66" is what produced
+/// an entity, and the page prints both without ever subtracting one from the
+/// other, so an express checkout whose `lib/express.js` was never parsed prints
+/// both numbers and then the all-clear.
+fn parse_coverage_warnings(
+    coverage: &kin_core::reference_coverage::ReferenceEdgeCoverage,
+) -> Vec<String> {
+    coverage.parse_warning_lines()
 }
 
 /// Render a health report's notes in the single form every graph reporting

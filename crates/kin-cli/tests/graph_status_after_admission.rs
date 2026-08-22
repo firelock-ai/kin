@@ -1006,3 +1006,121 @@ fn a_converted_store_reports_its_admission_rather_than_unknown_freshness() {
         "{graph_stdout}"
     );
 }
+
+/// `kin graph status` prints two file counts and never subtracts one from the
+/// other: "Supported inputs" is what a full adapter COULD parse and "Files" is
+/// what produced an entity. On the express checkout that was 141 against 66
+/// under a `✓ No issues detected.`, so the page held every number a reader
+/// needed and drew the one conclusion those numbers refute.
+///
+/// The control is written first and in the same body, and it is what makes this
+/// test able to fail: the same repository with every admitted file producing
+/// entities must reach the all-clear. A renderer that warned unconditionally,
+/// or one that read the admitted count rather than the shortfall, passes every
+/// other assertion here.
+#[test]
+fn graph_status_refuses_the_all_clear_over_a_language_it_did_not_parse() {
+    let root = tempdir().expect("temp root");
+
+    // The control: four JavaScript files, all of them parseable.
+    let whole = root.path().join("whole");
+    seed_javascript_repository(&whole, 0);
+    let whole_admitted = admit_seeded(&whole);
+    let whole_graph = workspace_query_graph(&whole_admitted.binding);
+    let before = graph_status(&whole_admitted.binding, &whole_graph);
+    let before_lines = before.lines.join("\n");
+    assert!(
+        !before_lines.contains("parse coverage is incomplete"),
+        "a repository whose files all produced entities must not be warned about: {before_lines}"
+    );
+    assert!(
+        before_lines.contains("✓ No issues detected.")
+            || !before_lines.contains("parse coverage"),
+        "the control must not be carrying the warning under another name: {before_lines}"
+    );
+
+    // The hole: the same shape with three files an adapter cannot read, which
+    // is the express shape in miniature. They are admitted, they are JavaScript,
+    // and they produce nothing.
+    let holed = root.path().join("holed");
+    seed_javascript_repository(&holed, 3);
+    let holed_admitted = admit_seeded(&holed);
+    let holed_graph = workspace_query_graph(&holed_admitted.binding);
+    let after = graph_status(&holed_admitted.binding, &holed_graph);
+    let after_lines = after.lines.join("\n");
+
+    assert!(
+        !after_lines.contains("✓ No issues detected."),
+        "a store whose admitted files produced no entity is not issue-free: {after_lines}"
+    );
+    let warning = after
+        .lines
+        .iter()
+        .find(|line| line.contains("parse coverage is incomplete"))
+        .unwrap_or_else(|| panic!("no parse coverage warning in:\n{after_lines}"));
+    assert!(
+        warning.starts_with('⚠'),
+        "a warning rather than a notice is what withholds the all-clear, and the prefix is the \
+         only thing that proves which list it joined: {warning}"
+    );
+    assert!(
+        warning.contains("produced no entity"),
+        "the warning says what happened rather than naming a bare ratio: {warning}"
+    );
+    assert!(
+        warning.contains("unreadable0.js"),
+        "the warning names the files it is about: {warning}"
+    );
+    assert!(
+        after_lines.contains("Parse coverage (files that produced an entity / files admitted):"),
+        "the census section prints beside the warning: {after_lines}"
+    );
+    assert!(
+        after.error.is_none(),
+        "withholding the all-clear must not turn the command nonzero for every caller scripting \
+         it: {:?}",
+        after.error
+    );
+}
+
+/// A repository of `total` JavaScript files, `unreadable` of which hold bytes
+/// no adapter produces an entity from.
+///
+/// Admitted through the real boundary, so the census reads the same tree and
+/// entity table the product does.
+fn seed_javascript_repository(repo: &Path, unreadable: usize) {
+    fs::create_dir_all(repo.join("lib")).expect("create lib directory");
+    run_git(repo, &["init", "--initial-branch=main"]);
+    run_git(repo, &["config", "user.email", "kin@example.invalid"]);
+    run_git(repo, &["config", "user.name", "Kin"]);
+    for index in 0..4 {
+        fs::write(
+            repo.join(format!("lib/module{index}.js")),
+            format!("function handler{index}() {{\n  return {index};\n}}\nmodule.exports = handler{index};\n"),
+        )
+        .expect("write a parseable module");
+    }
+    for index in 0..unreadable {
+        // Bytes an adapter is registered for and produces no entity from. The
+        // extension is what admits it as a JavaScript input; the content is what
+        // leaves the entity table empty for it.
+        fs::write(
+            repo.join(format!("lib/unreadable{index}.js")),
+            b"\x00\x01\x02\x03\x04\x05\x06\x07",
+        )
+        .expect("write an unreadable module");
+    }
+    run_git(repo, &["add", "--all"]);
+    run_git(repo, &["commit", "-m", "a javascript library"]);
+}
+
+/// `admit` without its own seeding, for a fixture that wrote its own tree.
+fn admit_seeded(repo: &Path) -> AdmittedRepository {
+    let result = kin_core::init_from_git(repo).expect("admit exact Git repository authority");
+    let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&result.layout)
+        .expect("bind published repository authority");
+    AdmittedRepository {
+        layout: result.layout,
+        binding,
+    }
+}

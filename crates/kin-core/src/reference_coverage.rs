@@ -453,6 +453,16 @@ pub struct ReferenceEdgeCoverage {
     /// surface may render a zero for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub totals: Option<GraphRelationTotals>,
+    /// Parse coverage of the same graph, when the caller measured it.
+    ///
+    /// Carried here rather than beside this type because this module is the one
+    /// graph-completeness vocabulary, and a reader arriving at a status page
+    /// with "why does Kin not know about this file" must not be handed two
+    /// sections with two denominators. `None` means nobody counted, which is
+    /// not the same as a graph whose files are all parsed, so no surface may
+    /// render an all-clear for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parse: Option<ParseCoverageCensus>,
 }
 
 impl ReferenceEdgeCoverage {
@@ -460,6 +470,30 @@ impl ReferenceEdgeCoverage {
     pub fn with_totals(mut self, totals: GraphRelationTotals) -> Self {
         self.totals = Some(totals);
         self
+    }
+
+    /// Attach the parse census the caller collected from the repository tree.
+    ///
+    /// Kept off the collector for the reason [`Self::with_language_servers`] is:
+    /// this module's collector starts from the entity table and a file with no
+    /// entities is invisible to it by construction, which is precisely the
+    /// population a parse hole lives in. The census reads the repository tree
+    /// and the layout table instead, and [`collect_parse_coverage`] is where it
+    /// comes from.
+    pub fn with_parse_coverage(mut self, parse: ParseCoverageCensus) -> Self {
+        self.parse = Some(parse);
+        self
+    }
+
+    /// Languages whose parse coverage withholds this store's all-clear.
+    ///
+    /// Empty when nobody measured, because an unmeasured census has not shown a
+    /// hole any more than it has shown coverage.
+    pub fn parse_warning_lines(&self) -> Vec<String> {
+        self.parse
+            .as_ref()
+            .map(ParseCoverageCensus::warning_lines)
+            .unwrap_or_default()
     }
 
     /// Fill in each language's enrichment state from the readiness a caller
@@ -536,6 +570,15 @@ impl ReferenceEdgeCoverage {
     /// denominators the other was using.
     pub fn summary_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
+        // Parse coverage first, because it is the denominator every line under
+        // it inherits. A language whose files never reached an adapter has no
+        // parsed call site to resolve and no entity to hold an edge, so a
+        // resolved-edge ratio computed over it describes the part of the
+        // repository Kin managed to read rather than the repository.
+        if let Some(parse) = self.parse.as_ref() {
+            lines.extend(parse.summary_lines());
+            lines.push(String::new());
+        }
         if let Some(totals) = self.totals {
             lines.push(format!(
                 "Cross-file entity relations: {} of {} across all relation kinds ({} artifact \
@@ -860,6 +903,7 @@ where
         .collect();
 
     Ok(ReferenceEdgeCoverage {
+        parse: None,
         languages,
         totals: None,
     })
@@ -899,6 +943,331 @@ fn read_count(entity: &Entity, key: &str) -> Option<u64> {
         .get(key)
         .and_then(|value| value.as_u64())
 }
+
+/// Share of one language's tracked files that may produce no parsed layout
+/// before the store stops reading as healthy, in percent.
+///
+/// Chosen from what the store itself holds rather than from a preference. The
+/// two readings this rule has to separate are both in the ticket: an express
+/// checkout where 75 of 141 admitted files produce no entity and
+/// `lib/express.js` is one of them, and a repository carrying one stray script
+/// no adapter claims. At a tenth, the first is a hole a reader cannot close by
+/// hand and the second is not: below this share a reader can open every
+/// unparsed file and see for themselves, and above it they cannot, which is
+/// exactly when a surface has to say so instead of leaving it to them.
+///
+/// The number is a shouting threshold and nothing rests on its precision. No
+/// answer is certified by it: [`ParseCoverageCensus::hole_reasons`] consults no
+/// threshold at all and refuses on any file in scope that produced nothing,
+/// whatever this says, so a store one file under the line still cannot certify
+/// an absence over that file.
+pub const PARSE_HOLE_SHARE_PERCENT: usize = 10;
+
+/// Unparsed files a language needs before the share above is consulted.
+///
+/// A share alone cannot separate the two readings on a small repository, where
+/// one stray script out of eight is 12 percent and is still one stray script.
+/// Three is the count the ticket's own evidence names on the failing side
+/// (`lib/application.js`, `lib/express.js`, `test/exports.js` on express), and
+/// one or two files is the case it names on the passing side, so the floor sits
+/// between them rather than between two numbers nothing measured.
+pub const PARSE_HOLE_MIN_FILES: usize = 3;
+
+/// Unparsed paths named on a status line before it stops being readable.
+const PARSE_HOLE_SAMPLE: usize = 5;
+
+/// Whether a language's parse coverage is incomplete enough for a surface to
+/// withhold its all-clear.
+///
+/// Both conditions are read off the store: how many files of this language the
+/// repository tree admits, and how many of those carry a layout. Stated once
+/// here because the status line, the doctor row and the tests must not each
+/// re-derive it from two integers.
+pub fn parse_coverage_is_materially_incomplete(tracked: usize, unparsed: usize) -> bool {
+    unparsed >= PARSE_HOLE_MIN_FILES
+        && tracked > 0
+        && unparsed.saturating_mul(100) >= tracked.saturating_mul(PARSE_HOLE_SHARE_PERCENT)
+}
+
+/// How much of one language the extractor actually parsed.
+///
+/// The denominator is the repository tree's own admitted file set, not the set
+/// of files that produced an entity, and that is the whole point of the type.
+/// Every other counter in this module starts from an entity and therefore
+/// cannot see a file that produced none, which is the exact population a parse
+/// hole lives in: on express, `lib/express.js` is admitted, is JavaScript, has
+/// a full adapter registered for its extension, and holds no layout at all.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LanguageParseCoverage {
+    pub language: String,
+    /// Files of this language the repository tree admits and a full adapter is
+    /// registered for.
+    pub tracked: usize,
+    /// Of those, how many produced at least one entity.
+    pub with_entities: usize,
+    /// Of those, how many produced none. This is the population
+    /// `list_file_entities` reports one file at a time as `tier: "none"`, and
+    /// the count the express run quoted as 75 of 141.
+    pub unparsed: usize,
+    /// Unparsed paths, shallowest first, then alphabetical.
+    ///
+    /// Shallowest rather than largest, and the ordering is named on the line
+    /// that prints it. The repository tree records a blob hash per path and no
+    /// size, so a "biggest files" ranking would be the one part of this report
+    /// a reader could not check against the store. Path depth is a real
+    /// property of the tree and puts a library root above a deep fixture, which
+    /// is the ordering the question actually wants.
+    pub sample: Vec<String>,
+}
+
+impl LanguageParseCoverage {
+    /// Percent of this language's admitted files that produced an entity.
+    pub fn parsed_percent(&self) -> Option<usize> {
+        (self.tracked > 0).then(|| self.with_entities.saturating_mul(100) / self.tracked)
+    }
+
+    /// Whether this language's parse coverage withholds a store-wide all-clear.
+    pub fn is_materially_incomplete(&self) -> bool {
+        parse_coverage_is_materially_incomplete(self.tracked, self.unparsed)
+    }
+
+    /// The one sentence a status line or a doctor row prints for this language.
+    pub fn hole_sentence(&self) -> String {
+        let percent = self
+            .parsed_percent()
+            .map(|percent| format!("{percent}%"))
+            .unwrap_or_else(|| "no".to_string());
+        let named = if self.sample.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ", including {} (shallowest paths first)",
+                self.sample.join(", ")
+            )
+        };
+        format!(
+            "{} parse coverage is incomplete: {} of {} admitted files produced no entity, so \
+             {percent} of this language reached the graph{named}",
+            self.language, self.unparsed, self.tracked
+        )
+    }
+}
+
+/// Parse coverage of a whole graph, one row per language.
+///
+/// Collected from the repository tree and the layout table rather than from the
+/// entity table, so it can count the files every other counter here is blind
+/// to. See [`collect_parse_coverage`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParseCoverageCensus {
+    pub languages: Vec<LanguageParseCoverage>,
+}
+
+impl ParseCoverageCensus {
+    /// Languages whose parse coverage withholds an all-clear, worst share first.
+    pub fn materially_incomplete(&self) -> Vec<&LanguageParseCoverage> {
+        let mut rows: Vec<&LanguageParseCoverage> = self
+            .languages
+            .iter()
+            .filter(|language| language.is_materially_incomplete())
+            .collect();
+        rows.sort_by_key(|language| language.parsed_percent().unwrap_or(0));
+        rows
+    }
+
+    /// One warning sentence per language a surface must not report clean.
+    pub fn warning_lines(&self) -> Vec<String> {
+        self.materially_incomplete()
+            .into_iter()
+            .map(LanguageParseCoverage::hole_sentence)
+            .collect()
+    }
+
+    /// Terminal rendering, one line per language that admits a file.
+    ///
+    /// Rendered in every state, including the whole-clean one. A section that
+    /// fell silent when coverage was complete would be indistinguishable from a
+    /// build that never measured it, which is the reading this census exists to
+    /// end.
+    pub fn summary_lines(&self) -> Vec<String> {
+        if self.languages.is_empty() {
+            return vec![
+                "Parse coverage: the repository tree admits no file a full adapter parses"
+                    .to_string(),
+            ];
+        }
+        let mut lines =
+            vec!["Parse coverage (files that produced an entity / files admitted):".to_string()];
+        for language in &self.languages {
+            let percent = language
+                .parsed_percent()
+                .map(|percent| format!(" ({percent}%)"))
+                .unwrap_or_default();
+            lines.push(format!(
+                "  {}: {}/{}{percent}",
+                language.language, language.with_entities, language.tracked
+            ));
+        }
+        lines.push(
+            "  An admitted file that produced no entity is absent from every enumeration, \
+             caller count and dead-code answer over it, rather than reported as a gap in one. \
+             It cannot be listed as unreferenced and it cannot supply the edge that would keep \
+             something else off that list."
+                .to_string(),
+        );
+        lines
+    }
+
+    /// Whether any language in this census holds an unparsed file.
+    pub fn holds_a_parse_hole(&self) -> bool {
+        self.languages.iter().any(|language| language.unparsed > 0)
+    }
+
+    /// Why an answer computed over this whole graph cannot certify an absence,
+    /// one reason per language, or empty when every admitted file was parsed.
+    ///
+    /// Consults no threshold, and that is deliberate. [`Self::warning_lines`]
+    /// decides when a store-wide page stops reading clean and needs a line a
+    /// reader will not learn to skip; this decides whether one answer may print
+    /// a zero, and a single unparsed file is enough to make that zero a claim
+    /// about Kin's parse coverage rather than about the code. A surface that
+    /// shouted on one stray script would be ignored; an answer that certified
+    /// over one would be wrong.
+    pub fn hole_reasons(&self) -> Vec<String> {
+        self.languages
+            .iter()
+            .filter(|language| language.unparsed > 0)
+            .map(|language| {
+                let named = if language.sample.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", language.sample.join(", "))
+                };
+                format!(
+                    "{PARSE_HOLE_LIMITING_FACTOR}: {} of {} admitted {} files produced no \
+                     entity{named}, so they hold no entity for this scan to have found and no \
+                     edge for one to have kept off the list",
+                    language.unparsed, language.tracked, language.language
+                )
+            })
+            .collect()
+    }
+}
+
+/// Measure parse coverage against graph truth alone.
+///
+/// Two graph-owned reads and no filesystem walk. The repository tree says which
+/// paths this graph admits; the entity table says which of them produced
+/// anything. `kin_index::FileClassifier` and the adapter registry are consulted
+/// about the path STRING the tree already holds, which is the same
+/// classification `collect_supported_inputs` performs to print the admitted
+/// count, and neither opens a file.
+///
+/// The signal is entity presence rather than a parsed layout, and that was
+/// measured rather than assumed. A correctly admitted repository whose entities
+/// all extracted carries ZERO rows in `list_file_layouts`: the layout table is
+/// not part of the workspace graph snapshot a query is answered from, so a
+/// census keyed on it would report every healthy store as a total parse hole
+/// and could never do anything else. Entity presence is the reading the express
+/// run itself quoted ("75 of 141 files produce no entity") and the one every
+/// query actually answers from.
+pub fn collect_parse_coverage(
+    graph: &kin_db::InMemoryGraph,
+) -> Result<ParseCoverageCensus, kin_db::KinDbError> {
+    let resolved_tree = graph.resolved_tree();
+    let entities = graph.list_all_entities()?;
+    Ok(collect_parse_coverage_from(&resolved_tree, &entities))
+}
+
+/// The census rule with both graph readings as inputs, so every branch is
+/// testable without a store.
+pub fn collect_parse_coverage_from(
+    resolved_tree: &kin_model::ResolvedTree,
+    entities: &[Entity],
+) -> ParseCoverageCensus {
+    let registry = kin_parser::AdapterRegistry::new();
+    let producing: HashSet<&str> = entities
+        .iter()
+        .filter(|entity| !kin_index::is_external_reference_target(entity))
+        .filter_map(|entity| entity.file_origin.as_ref().map(|file| file.0.as_str()))
+        .collect();
+    let mut tallies: BTreeMap<String, ParseTally> = BTreeMap::new();
+
+    for artifact in resolved_tree.artifacts_by_path() {
+        if !matches!(artifact.entry, kin_model::TreeEntry::Blob { .. }) {
+            continue;
+        }
+        let Some(path) = artifact.path.as_utf8() else {
+            continue;
+        };
+        // Only files a FULL adapter is registered for. A shallow-syntax file
+        // produces no entity by construction, so counting one as a hole would
+        // report a gap where the design says there is none, and the express
+        // shape is entirely inside the full-adapter set.
+        if !matches!(
+            kin_index::FileClassifier::classify(std::path::Path::new(path)),
+            kin_index::FileClassification::EntitySource
+        ) {
+            continue;
+        }
+        let extension = std::path::Path::new(path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default();
+        let Some(adapter) = registry.get_by_extension(extension) else {
+            continue;
+        };
+        let tally = tallies.entry(adapter.language_id().to_string()).or_default();
+        tally.tracked += 1;
+        if producing.contains(path) {
+            tally.with_entities += 1;
+        } else {
+            tally.unparsed += 1;
+            tally.unparsed_paths.push(path.to_string());
+        }
+    }
+
+    ParseCoverageCensus {
+        languages: tallies
+            .into_iter()
+            .map(|(language, tally)| tally.into_row(language))
+            .collect(),
+    }
+}
+
+#[derive(Default)]
+struct ParseTally {
+    tracked: usize,
+    with_entities: usize,
+    unparsed: usize,
+    unparsed_paths: Vec<String>,
+}
+
+impl ParseTally {
+    fn into_row(mut self, language: String) -> LanguageParseCoverage {
+        // Shallowest first, then alphabetical, so the ordering is total and the
+        // same store always names the same files. `lib/express.js` sorts above
+        // `test/fixtures/blog/index.js` because a library root is what a reader
+        // asking "what did Kin miss" means by the biggest one.
+        self.unparsed_paths.sort_by(|left, right| {
+            let depth = |path: &String| path.matches('/').count();
+            depth(left).cmp(&depth(right)).then_with(|| left.cmp(right))
+        });
+        self.unparsed_paths.truncate(PARSE_HOLE_SAMPLE);
+        LanguageParseCoverage {
+            language,
+            tracked: self.tracked,
+            with_entities: self.with_entities,
+            unparsed: self.unparsed,
+            sample: self.unparsed_paths,
+        }
+    }
+}
+
+/// The tag every parse-hole sentence opens with, for a surface with room for
+/// a label but not a sentence, and for a caller keying on the class rather
+/// than reading the prose.
+pub const PARSE_HOLE_LIMITING_FACTOR: &str = "parse_hole";
 
 #[cfg(test)]
 mod tests {
@@ -1299,6 +1668,7 @@ mod tests {
     #[test]
     fn one_section_carries_both_scopes_and_names_which_is_which() {
         let coverage = ReferenceEdgeCoverage {
+            parse: None,
             languages: vec![LanguageReferenceCoverage {
                 language: "python".to_string(),
                 files: 12,
@@ -1382,6 +1752,7 @@ mod tests {
     #[test]
     fn language_server_state_is_attached_rather_than_assumed() {
         let unfilled = ReferenceEdgeCoverage {
+            parse: None,
             languages: vec![
                 language_row("python", ReferenceEnrichment::Unknown),
                 language_row("go", ReferenceEnrichment::Unknown),
@@ -1464,6 +1835,7 @@ mod tests {
         row.parsed_import_statements = Some(8);
         row.resolved_import_edges = 2;
         let coverage = ReferenceEdgeCoverage {
+            parse: None,
             languages: vec![row],
             totals: None,
         };
@@ -1544,5 +1916,276 @@ mod tests {
 
         let coverage = collect_reference_edge_coverage(&graph).unwrap();
         assert!(coverage.absence_is_supportable());
+    }
+
+    /// A repository tree admitting exactly these paths as blobs.
+    fn tree_of(paths: &[&str]) -> kin_model::ResolvedTree {
+        kin_model::ResolvedTree::from_artifacts(paths.iter().map(|path| {
+            kin_model::ResolvedArtifact::new(
+                kin_model::ArtifactId::new(),
+                kin_model::RepoPath::from_utf8(*path).expect("utf8 path"),
+                kin_model::TreeEntry::blob(Hash256::from_bytes([0u8; 32]), false),
+            )
+        }))
+        .expect("build tree")
+    }
+
+    /// One row, built by hand, so the threshold rule is testable without a
+    /// store. `sample` carries the paths a surface names.
+    fn parse_row(language: &str, tracked: usize, unparsed: usize) -> LanguageParseCoverage {
+        LanguageParseCoverage {
+            language: language.to_string(),
+            tracked,
+            with_entities: tracked.saturating_sub(unparsed),
+            unparsed,
+            sample: (0..unparsed.min(PARSE_HOLE_SAMPLE))
+                .map(|index| format!("lib/file{index}.js"))
+                .collect(),
+        }
+    }
+
+    /// The two readings the threshold exists to separate, and they are the two
+    /// the ticket names. The express shape is a language most of whose admitted
+    /// files never reached an adapter; the passing shape is a repository
+    /// carrying one script no adapter claims. A rule that cannot tell them
+    /// apart is either a page nobody reads or a page that never fires.
+    #[test]
+    fn the_express_shape_trips_the_threshold_and_a_stray_script_does_not() {
+        // express as the run measured it: 141 admitted files, 75 of them with
+        // no entity, `lib/express.js` among them.
+        let express = parse_row("javascript", 141, 75);
+        assert!(
+            express.is_materially_incomplete(),
+            "the shape this ticket was filed about must withhold the all-clear: {express:?}"
+        );
+
+        // One stray script, on a repository of any size. This is the case the
+        // ticket says must stay quiet, and it stays quiet on the count alone,
+        // so no repository is small enough to make one file trip it.
+        for tracked in [1, 8, 141, 5000] {
+            let stray = parse_row("javascript", tracked, 1);
+            assert!(
+                !stray.is_materially_incomplete(),
+                "one unparsed file out of {tracked} is not a hole a page should shout about"
+            );
+        }
+    }
+
+    /// The two conditions are independent, and each is the only thing standing
+    /// between a real store and a wrong verdict. Without the count, a small
+    /// repository's two stray scripts read as a 20% hole; without the share, a
+    /// large repository's three stray scripts out of five thousand read as one.
+    #[test]
+    fn each_half_of_the_threshold_is_load_bearing_on_its_own() {
+        // Share satisfied, count not: 2 of 8 is 25% and is still two files.
+        let small = parse_row("javascript", 8, 2);
+        assert_eq!(small.parsed_percent(), Some(75));
+        assert!(
+            !small.is_materially_incomplete(),
+            "the file floor is what keeps a small repository's strays quiet"
+        );
+
+        // Count satisfied, share not: 3 of 5000 is three files.
+        let large = parse_row("javascript", 5_000, 3);
+        assert!(
+            !large.is_materially_incomplete(),
+            "the share is what keeps a large repository's strays quiet"
+        );
+
+        // Both satisfied at the exact boundary: 3 of 30 is 10% and three files.
+        let boundary = parse_row("javascript", 30, 3);
+        assert_eq!(boundary.parsed_percent(), Some(90));
+        assert!(
+            boundary.is_materially_incomplete(),
+            "the rule is at-or-above the share, not above it"
+        );
+    }
+
+    /// A census with a hole must name it, and a census without one must not
+    /// invent a warning. The sentence carries the count, the denominator and
+    /// the paths, because a warning a reader cannot check is a warning they
+    /// learn to skip.
+    #[test]
+    fn the_warning_names_the_count_the_denominator_and_the_files() {
+        let clean = ParseCoverageCensus {
+            languages: vec![parse_row("rust", 200, 0)],
+        };
+        assert!(
+            clean.warning_lines().is_empty(),
+            "a fully parsed store gets no warning"
+        );
+        assert!(
+            !clean.holds_a_parse_hole(),
+            "a fully parsed store holds no hole"
+        );
+        assert!(
+            clean.hole_reasons().is_empty(),
+            "a fully parsed store refuses nothing"
+        );
+
+        let holed = ParseCoverageCensus {
+            languages: vec![parse_row("javascript", 141, 75)],
+        };
+        let warnings = holed.warning_lines();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let warning = &warnings[0];
+        for expected in ["javascript", "75", "141", "lib/file0.js"] {
+            assert!(
+                warning.contains(expected),
+                "the warning must carry {expected}: {warning}"
+            );
+        }
+    }
+
+    /// The refusal reads the hole itself and never the threshold. A store one
+    /// file under the shouting line still cannot certify an absence over that
+    /// file, because the question an answer asks is whether the scope it was
+    /// computed over was whole.
+    #[test]
+    fn a_hole_too_small_to_warn_still_refuses_an_absence() {
+        let census = ParseCoverageCensus {
+            languages: vec![parse_row("javascript", 5_000, 1)],
+        };
+        assert!(
+            census.warning_lines().is_empty(),
+            "one file of five thousand is under the shouting line"
+        );
+        assert!(
+            census.holds_a_parse_hole(),
+            "it is still a hole, and an answer over it is still uncertified"
+        );
+        let reasons = census.hole_reasons();
+        assert_eq!(reasons.len(), 1, "{reasons:?}");
+        assert!(
+            reasons[0].starts_with(PARSE_HOLE_LIMITING_FACTOR),
+            "the tag is what a caller keys on: {}",
+            reasons[0]
+        );
+        assert!(
+            reasons[0].contains("lib/file0.js"),
+            "the refusal names the file it is about: {}",
+            reasons[0]
+        );
+    }
+
+    /// The census counts the repository tree against the entity table, and that
+    /// is the whole reason it exists: every other counter here starts from an
+    /// entity, so a file that produced none is invisible to it, and that is
+    /// exactly what a parse hole is. The fixture is the express shape in
+    /// miniature, with the library files silent and the root file producing.
+    #[test]
+    fn the_census_counts_admitted_files_that_produced_no_entity() {
+        let tree = tree_of(&[
+            "lib/express.js",
+            "lib/application.js",
+            "lib/router/index.js",
+            "index.js",
+            "README.md",
+        ]);
+        let produced = [
+            entity("createApplication", "index.js", None, None),
+            entity("handle", "lib/router/index.js", None, None),
+        ];
+
+        let census = collect_parse_coverage_from(&tree, &produced);
+        assert_eq!(census.languages.len(), 1, "{census:?}");
+        let row = &census.languages[0];
+        assert_eq!(row.language, "javascript");
+        assert_eq!(row.tracked, 4, "README.md is not a full-adapter input");
+        assert_eq!(row.with_entities, 2);
+        assert_eq!(row.unparsed, 2);
+        assert_eq!(
+            row.sample,
+            vec![
+                "lib/application.js".to_string(),
+                "lib/express.js".to_string()
+            ],
+            "shallowest first, then alphabetical"
+        );
+        assert_eq!(row.parsed_percent(), Some(50));
+    }
+
+    /// A file the tree does not admit cannot be a hole in it, and a file the
+    /// tree admits that no adapter is registered for is not one either. Both
+    /// halves keep the denominator honest: without the first a stale entity
+    /// would inflate coverage, and without the second every Markdown file in a
+    /// repository would read as an unparsed one.
+    #[test]
+    fn only_admitted_files_a_full_adapter_claims_are_counted() {
+        let tree = tree_of(&["lib/express.js", "README.md", "Makefile"]);
+        // An entity whose file the tree no longer admits.
+        let stale = [entity("gone", "lib/removed.js", None, None)];
+        let census = collect_parse_coverage_from(&tree, &stale);
+        let row = &census.languages[0];
+        assert_eq!(
+            row.tracked, 1,
+            "only lib/express.js is a full-adapter input: {census:?}"
+        );
+        assert_eq!(
+            row.with_entities, 0,
+            "an entity on an unadmitted path credits nothing"
+        );
+        assert_eq!(row.unparsed, 1);
+    }
+
+    /// Ordering is a claim the store can back, and "biggest" is not one: the
+    /// repository tree records a blob hash per path and no size. A library root
+    /// must outrank a deep fixture, and the same store must always name the
+    /// same files in the same order.
+    #[test]
+    fn the_named_files_are_ordered_by_path_depth_and_never_by_a_size_nobody_recorded() {
+        let tree = tree_of(&[
+            "test/fixtures/blog/deep/a.js",
+            "lib/express.js",
+            "test/exports.js",
+            "lib/application.js",
+        ]);
+        let census = collect_parse_coverage_from(&tree, &[]);
+        let row = &census.languages[0];
+        assert_eq!(
+            row.sample,
+            vec![
+                "lib/application.js".to_string(),
+                "lib/express.js".to_string(),
+                "test/exports.js".to_string(),
+                "test/fixtures/blog/deep/a.js".to_string(),
+            ],
+            "a library root outranks a deep fixture"
+        );
+    }
+
+    /// A store the extractor read completely must not grow a section that reads
+    /// like a complaint, and a store nobody measured must not read like one
+    /// that was measured and found clean.
+    #[test]
+    fn an_unmeasured_census_is_not_an_all_clear() {
+        let unmeasured = ReferenceEdgeCoverage::default();
+        assert!(
+            unmeasured.parse.is_none(),
+            "nobody counted, so there is nothing to render"
+        );
+        assert!(
+            unmeasured.parse_warning_lines().is_empty(),
+            "an unmeasured census has not shown a hole"
+        );
+        assert!(
+            !unmeasured
+                .summary_lines()
+                .iter()
+                .any(|line| line.contains("Parse coverage")),
+            "an unmeasured census prints no parse section at all"
+        );
+
+        let measured = ReferenceEdgeCoverage::default().with_parse_coverage(ParseCoverageCensus {
+            languages: vec![parse_row("rust", 200, 0)],
+        });
+        assert!(
+            measured
+                .summary_lines()
+                .iter()
+                .any(|line| line.contains("rust: 200/200")),
+            "a measured and clean census still prints its section: {:?}",
+            measured.summary_lines()
+        );
     }
 }
