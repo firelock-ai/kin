@@ -269,6 +269,15 @@ fn init_from_git_with_hooks(
     };
 
     progress.begin("apply admission policy");
+    // Both this phase and the proof after it re-derive the whole history from
+    // raw objects, one commit at a time, and on a mature repository that is
+    // minutes of silence. Naming the count is the difference between a
+    // conversion that looks wedged and one whose remaining work an operator can
+    // estimate.
+    progress.detail(format_args!(
+        "re-deriving {} commits",
+        semantic_plan.changes.len()
+    ));
     let admitted = {
         let _span = info_span!("kin.init.admit_semantic_import").entered();
         admit_semantic_git_import(&semantic_plan, &capture_store).map_err(|error| {
@@ -288,6 +297,10 @@ fn init_from_git_with_hooks(
     // of the three that revalidates the plan structurally, which is what the
     // other two reuse rather than repeat.
     progress.begin("prove Git source");
+    progress.detail(format_args!(
+        "re-deriving {} commits",
+        semantic_plan.changes.len()
+    ));
     let source_proof = {
         let _span = info_span!("kin.init.source_proof_staged").entered();
         preflight_git_migration(&source, &snapshot, &semantic_plan, &capture_store)
