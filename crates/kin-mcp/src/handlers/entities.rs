@@ -2049,7 +2049,7 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     // an explicit assurance that there was nothing to disambiguate (FIR-2475).
     let resolution = focal_resolution_for(
         store,
-        target,
+        &target,
         if addressed_by_name {
             resolution_query.as_deref()
         } else {

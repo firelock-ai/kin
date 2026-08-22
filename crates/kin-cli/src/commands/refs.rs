@@ -182,10 +182,18 @@ pub fn build_refs_response(
     envelope: &kin_mcp::Envelope,
 ) -> Result<RefsResponse> {
     let relation_kinds = parse_relation_kinds(&request.kind)?;
-    let target = if let Ok(uuid) = uuid::Uuid::parse_str(request.entity.trim()) {
+    let addressed_by_id = uuid::Uuid::parse_str(request.entity.trim()).ok();
+    let target = if let Some(uuid) = addressed_by_id {
         graph.get_entity(&EntityId(uuid))?
     } else {
         entity_ranking::select_best_entity(graph, &request.entity)?
+    };
+    // `None` means the focal was pinned by id, which is the rule the shared
+    // producer switches on. Kept beside the resolution so the two cannot drift.
+    let resolved_by_name = if addressed_by_id.is_some() {
+        None
+    } else {
+        Some(request.entity.trim())
     };
     let Some(target) = target else {
         // Not an absence claim about references: the focal never resolved, so
@@ -216,11 +224,21 @@ pub fn build_refs_response(
             "No incoming {} relations.",
             relation_kinds_label(&relation_kinds)
         ));
-        let negative = refs_absence_verdict(graph, target, &relation_kinds, envelope);
+        // How the CALLER addressed the focal decides the ambiguity rule, and
+        // taking it against the winner's own name is FIR-2475. `kin refs` takes
+        // a uuid or a name, and `resolved_by_name` recorded which.
+        let negative = refs_absence_verdict(
+            graph,
+            target,
+            &relation_kinds,
+            resolved_by_name,
+            envelope,
+        );
         lines.extend(refs_absence_qualifier(
             graph,
             target,
             &relation_kinds,
+            resolved_by_name,
             envelope,
         ));
         let neighbors = declaration_neighbors::collect(graph, target, &relation_kinds)?;
@@ -338,11 +356,12 @@ fn refs_absence_verdict(
     graph: &kin_db::InMemoryGraph,
     target: &Entity,
     relation_kinds: &[RelationKind],
+    addressed_by_name: Option<&str>,
     envelope: &kin_mcp::Envelope,
 ) -> Option<serde_json::Value> {
     kin_mcp::negative::negative_for(
         "find_references",
-        &refs_absence_payload(graph, target, relation_kinds),
+        &refs_absence_payload(graph, target, relation_kinds, addressed_by_name),
         envelope,
         &[],
     )
@@ -358,11 +377,12 @@ fn refs_absence_qualifier(
     graph: &kin_db::InMemoryGraph,
     target: &Entity,
     relation_kinds: &[RelationKind],
+    addressed_by_name: Option<&str>,
     envelope: &kin_mcp::Envelope,
 ) -> Vec<String> {
     crate::commands::absence_qualifier::qualify(
         "find_references",
-        &refs_absence_payload(graph, target, relation_kinds),
+        &refs_absence_payload(graph, target, relation_kinds, addressed_by_name),
         envelope,
         "",
     )
@@ -388,20 +408,40 @@ fn refs_absence_payload(
     graph: &kin_db::InMemoryGraph,
     target: &Entity,
     relation_kinds: &[RelationKind],
+    addressed_by_name: Option<&str>,
 ) -> serde_json::Value {
     let coverage = kin_mcp::edge_coverage::observe_cross_file_reference_coverage_for_languages(
         graph,
         &[target.language],
         relation_kinds,
     );
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "references": [],
         "relation_kinds": relation_kinds
             .iter()
             .map(|kind| relation_kind_label(*kind))
             .collect::<Vec<_>>(),
+        // `kin refs` reads one local store and queries no spine, so this is the
+        // truthful value rather than a stub. It is also load-bearing: the gate
+        // REFUSES a `find_references` absence whose payload reports no
+        // cross-repo authority at all, and reporting none is a different claim
+        // from reporting that none is configured.
+        "cross_repo": { "status": "not_configured" },
         kin_mcp::EDGE_COVERAGE_KEY: coverage,
-    })
+    });
+    // Required, not optional. A payload with no `focal_resolution` is the
+    // REFUSING arm of the gate rather than an exemption, so omitting it would
+    // make every `kin refs` absence read uncertain for a reason that has nothing
+    // to do with this store. Produced by the same function the MCP handler
+    // calls, so the two surfaces count ambiguity by one rule (FIR-2475).
+    if let Ok(resolution) = kin_mcp::handlers::entities::focal_resolution_for(
+        graph,
+        target,
+        addressed_by_name,
+    ) {
+        payload["focal_resolution"] = resolution;
+    }
+    payload
 }
 
 fn reference_sites_label(entry: &ReferenceEntry) -> String {
@@ -991,6 +1031,271 @@ mod tests {
         parse_relation_kinds, refs_not_found_guidance, BulkRefsRequest, BulkRefsResponse,
         ReferenceLinesAbsent, RefsRequest, RelationResolution,
     };
+
+
+    /// THE SPINE (FIR-2524 rung three). A degraded daemon must make `kin refs`
+    /// inherit the MCP verdict for that degradation.
+    ///
+    /// The same case that made rung one choose the expensive wiring. A thin
+    /// envelope built from what the route knows locally carries no degraded
+    /// signal, and under it the CLI would say nothing here while
+    /// `find_references` refused on the same daemon at the same instant: the
+    /// human surface more confident than the agent surface, which is the
+    /// divergence this ticket exists to close, reintroduced by its own fix.
+    ///
+    /// It asserts INHERITANCE rather than wording: the same `negative_for` call
+    /// on the same payload must reach the same `safe_to_conclude_absent`, and
+    /// the rendered line must name the signal the verdict disclosed rather than
+    /// inventing a cause.
+    #[test]
+    fn a_degraded_daemon_makes_the_refs_cli_inherit_the_mcp_verdict() {
+        let (graph, layout, _dir) = orphan_fixture();
+        let degraded = kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 3,
+            "graph_generation": 1,
+            "embed_worker_failed": true,
+        }));
+
+        let response = build_refs_response(
+            &layout,
+            &graph,
+            &RefsRequest {
+                entity: "orphan".to_string(),
+                kind: "all".to_string(),
+            },
+            &degraded,
+        )
+        .expect("refs response");
+        let rendered = response.lines.join("\n");
+
+        let verdict = response
+            .negative
+            .as_ref()
+            .expect("an empty refs answer must carry a verdict");
+        assert_eq!(
+            verdict["safe_to_conclude_absent"],
+            serde_json::json!(false),
+            "the verdict must refuse on a degraded daemon, or this test asserts nothing: {verdict}"
+        );
+        assert!(
+            rendered.contains("Kin cannot rule out references it did not see"),
+            "the CLI must inherit the refusal and name ITS OWN noun, not impact's: {rendered}"
+        );
+        assert!(
+            rendered.contains("embed_worker_failed") || rendered.contains("holds no cross-file"),
+            "the line names what the verdict disclosed rather than inventing a cause: {rendered}"
+        );
+    }
+
+    /// The machine half, byte for byte (FIR-2478 defect 2, FIR-2524).
+    ///
+    /// `--json` must carry the object the gate returned rather than a second
+    /// opinion about it. A rendered sentence with no field beside it is still a
+    /// false clean at exit 0 for anything parsing the payload.
+    #[test]
+    fn an_empty_refs_answer_carries_the_same_verdict_in_prose_and_in_the_payload() {
+        let (graph, layout, _dir) = orphan_fixture();
+        let degraded = kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 3,
+            "graph_generation": 1,
+            "embed_worker_failed": true,
+        }));
+        let response = build_refs_response(
+            &layout,
+            &graph,
+            &RefsRequest {
+                entity: "orphan".to_string(),
+                kind: "all".to_string(),
+            },
+            &degraded,
+        )
+        .expect("refs response");
+
+        let target = kin_model::EntityStore::query_entities(
+            &graph,
+            &kin_model::graph::EntityFilter {
+                name_pattern: Some("orphan".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("focal");
+        let kinds = parse_relation_kinds("all").unwrap();
+        let mcp = kin_mcp::negative::negative_for(
+            "find_references",
+            &super::refs_absence_payload(&graph, &target, &kinds, Some("orphan")),
+            &degraded,
+            &[],
+        );
+        assert_eq!(
+            response.negative, mcp,
+            "the CLI field must BE the gate's object, not a recomputation of it"
+        );
+    }
+
+    /// The noise control, and the arm that would catch this degrading into
+    /// stamping every answer uncertain (the FIR-2404 failure in its opposite
+    /// costume, which this rollout's own falsification list forbids).
+    ///
+    /// An answer holding rows is not an absence, so it carries no verdict and no
+    /// sentence, even on a daemon degraded exactly as the spine's is.
+    #[test]
+    fn a_refs_answer_that_finds_rows_stays_unqualified_even_when_degraded() {
+        use kin_model::relation::{Relation, RelationOrigin};
+        use kin_model::{EntityStore, GraphNodeId};
+
+        let (graph, layout, _dir) = orphan_fixture();
+        let target = EntityStore::query_entities(
+            &graph,
+            &kin_model::graph::EntityFilter {
+                name_pattern: Some("orphan".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("focal");
+        let caller = EntityStore::query_entities(
+            &graph,
+            &kin_model::graph::EntityFilter {
+                name_pattern: Some("caller".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("caller");
+        graph
+            .upsert_relation(&Relation {
+                id: kin_model::ids::RelationId::new(),
+                kind: RelationKind::Calls,
+                src: GraphNodeId::Entity(caller.id),
+                dst: GraphNodeId::Entity(target.id),
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+
+        let degraded = kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 3,
+            "graph_generation": 1,
+            "embed_worker_failed": true,
+        }));
+        let response = build_refs_response(
+            &layout,
+            &graph,
+            &RefsRequest {
+                entity: "orphan".to_string(),
+                kind: "all".to_string(),
+            },
+            &degraded,
+        )
+        .expect("refs response");
+        let rendered = response.lines.join("\n");
+
+        assert!(
+            response.negative.is_none(),
+            "a populated answer is not an absence and carries no verdict: {:?}",
+            response.negative
+        );
+        assert!(
+            !rendered.contains("Kin cannot rule out"),
+            "a populated answer must stay unqualified, however degraded the daemon: {rendered}"
+        );
+    }
+
+    /// A focal that never resolved is a lookup failure, not a finding, so it
+    /// carries no verdict. Qualifying it would tell a reader their graph lacks
+    /// coverage when what it lacks is the name they typed.
+    #[test]
+    fn an_unresolved_focal_carries_no_absence_verdict() {
+        let (graph, layout, _dir) = orphan_fixture();
+        let response = build_refs_response(
+            &layout,
+            &graph,
+            &RefsRequest {
+                entity: "no_such_symbol_anywhere".to_string(),
+                kind: "all".to_string(),
+            },
+            &refs_test_envelope(),
+        )
+        .expect("refs response");
+        assert!(response.negative.is_none());
+        assert!(!response.lines.join("\n").contains("Kin cannot rule out"));
+    }
+
+    /// A three-entity fixture whose focal has no incoming edges, with a
+    /// same-file neighbour so the coverage observation has something to read.
+    fn orphan_fixture() -> (kin_db::InMemoryGraph, kin_core::KinLayout, tempfile::TempDir) {
+        use kin_model::{
+            Entity, EntityId, EntityKind, EntityMetadata, EntityRole, EntityStore, FilePathId,
+            FingerprintAlgorithm, Hash256, LanguageId, SemanticFingerprint, Visibility,
+        };
+
+        fn entity(name: &str, rel_path: &str) -> Entity {
+            Entity {
+                id: EntityId::new(),
+                kind: EntityKind::Function,
+                name: name.to_string(),
+                language: LanguageId::Rust,
+                fingerprint: SemanticFingerprint {
+                    algorithm: FingerprintAlgorithm::V1TreeSitter,
+                    ast_hash: Hash256::from_bytes([0; 32]),
+                    signature_hash: Hash256::from_bytes([0; 32]),
+                    behavior_hash: Hash256::from_bytes([0; 32]),
+                    equivalence_hash: Hash256::from_bytes([0; 32]),
+                    stability_score: 1.0,
+                },
+                file_origin: Some(FilePathId::new(rel_path)),
+                span: None,
+                signature: name.to_string(),
+                visibility: Visibility::Public,
+                role: EntityRole::Source,
+                doc_summary: None,
+                metadata: EntityMetadata::default(),
+                lineage_parent: None,
+                created_in: None,
+                superseded_by: None,
+            }
+        }
+
+        let graph = kin_db::InMemoryGraph::new();
+        for (name, path) in [
+            ("orphan", "src/orphan.rs"),
+            ("caller", "src/a.rs"),
+            ("callee", "src/b.rs"),
+        ] {
+            let e = entity(name, path);
+            EntityStore::upsert_entity(&graph, &e).unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        (graph, layout, dir)
+    }
+
+    /// A substrate in good health, so a test asserting refs CONTENT is not also
+    /// asserting the absence verdict. The refusing direction gets its own tests.
+    fn refs_test_envelope() -> kin_mcp::Envelope {
+        kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 4,
+            "graph_generation": 1,
+        }))
+    }
     use kin_model::RelationKind;
 
     /// FIR-1552. The bulk row and the printed answer read one collector so their
@@ -1309,6 +1614,7 @@ mod tests {
                 entity: "probe_symbol".to_string(),
                 kind: "all".to_string(),
             },
+        &refs_test_envelope(),
         )
         .unwrap();
         let joined = response.lines.join("\n");
@@ -1468,6 +1774,7 @@ mod tests {
                 entity: target.id.to_string(),
                 kind: "calls".to_string(),
             },
+        &refs_test_envelope(),
         )
         .unwrap();
         let cli_text = cli.lines.join("\n");
@@ -1654,6 +1961,7 @@ mod tests {
                 entity: "probe_symbol".to_string(),
                 kind: "all".to_string(),
             },
+        &refs_test_envelope(),
         )
         .unwrap();
         let joined = response.lines.join("\n");
@@ -1874,6 +2182,7 @@ mod tests {
                 entity: target.id.to_string(),
                 kind: "all".to_string(),
             },
+        &refs_test_envelope(),
         )
         .unwrap_err();
         assert!(
@@ -2019,6 +2328,7 @@ mod tests {
                 entity: "probe_symbol".to_string(),
                 kind: "all".to_string(),
             },
+        &refs_test_envelope(),
         )
         .unwrap();
         let joined = response.lines.join("\n");

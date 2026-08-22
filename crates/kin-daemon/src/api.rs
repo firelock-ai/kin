@@ -3811,9 +3811,15 @@ async fn command_dead_code(
     let repository_authority = state
         .local_repository_authority_binding()
         .map_err(repository_authority_error)?;
+    // The substrate reading the verdict rests on, built here because only the
+    // daemon holds it (FIR-2524). A clean "No dead code found." off a degraded
+    // daemon is the one way that line can lie, and a thinner envelope is exactly
+    // what would hide it.
+    let envelope = kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state));
     let response = kin_cli::commands::dead_code::build_dead_code_response(
         Some(&repository_authority),
         graph.as_ref(),
+        &envelope,
     )
     .map_err(internal_error)?;
     Ok(Json(response))
@@ -3842,9 +3848,13 @@ async fn command_dead_code_seeded(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let response =
-        kin_cli::commands::dead_code::build_dead_code_seeded_response(graph.as_ref(), &request)
-            .map_err(internal_error)?;
+    let envelope = kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state));
+    let response = kin_cli::commands::dead_code::build_dead_code_seeded_response(
+        graph.as_ref(),
+        &request,
+        &envelope,
+    )
+    .map_err(internal_error)?;
     Ok(Json(response))
 }
 
@@ -8954,9 +8964,13 @@ async fn mcp_tools_call_inner(
             limit,
             name_pattern,
         };
+        // Same substrate reading the CLI route gets, so this MCP path and
+        // `kin dead-code <query>` cannot reach different verdicts on one store.
+        let envelope = kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state));
         let result = match kin_cli::commands::dead_code::build_dead_code_seeded_response(
             graph.as_ref(),
             &req,
+            &envelope,
         ) {
             Ok(response) => match serde_json::to_string_pretty(&response) {
                 Ok(json) => kin_mcp::ToolCallResult::text(json),

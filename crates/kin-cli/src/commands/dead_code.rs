@@ -79,6 +79,15 @@ pub struct DeadCodeSeededResponse {
     pub query: String,
     pub total_searched: usize,
     pub candidates: Vec<DeadCodeSeededCandidate>,
+    /// Why an empty candidate list is not evidence the seed matches nothing, or
+    /// empty when the verdict certifies (FIR-2524 rung three).
+    ///
+    /// Carried as data rather than rendered at the source because this command's
+    /// only output IS the serialized response, so a caller reading
+    /// `candidates: []` meets the qualifier in the same object. Same shape
+    /// `DaemonSearchResponse::absence_qualifier` uses, for the same reason.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub absence_qualifier: Vec<String>,
 }
 
 pub async fn run() -> Result<()> {
@@ -152,13 +161,15 @@ async fn run_daemon_dead_code_seeded(
 pub fn build_dead_code_response(
     binding: Option<&kin_core::LocalRepositoryAuthorityBinding>,
     graph: &kin_db::InMemoryGraph,
+    envelope: &kin_mcp::Envelope,
 ) -> Result<DeadCodeResponse> {
     let entry_points = collect_declared_entry_points(binding, graph)?;
     let coverage = kin_core::reference_coverage::collect_reference_edge_coverage(graph)?;
-    build_dead_code_report(graph, &entry_points, &coverage)
+    build_dead_code_report(envelope, graph, &entry_points, &coverage)
 }
 
 fn build_dead_code_report(
+    envelope: &kin_mcp::Envelope,
     graph: &kin_db::InMemoryGraph,
     entry_points: &kin_core::entry_points::DeclaredEntryPoints,
     coverage: &kin_core::reference_coverage::ReferenceEdgeCoverage,
@@ -313,6 +324,22 @@ fn build_dead_code_report(
 
     if unreferenced.is_empty() && test_only.is_empty() {
         lines.push("No dead code found.".to_string());
+        // Rung three of FIR-2524. This scan's absence is the INVERSE claim, so
+        // `kin_mcp::negative` gives `dead_code` no cross-file classes and no
+        // language scope: a class this build cannot resolve produces MORE
+        // candidates rather than fewer, and grading the claim on coverage would
+        // stamp every clean scan uncertain, which is the FIR-2404 failure in its
+        // opposite costume. What DOES still endanger it is the substrate the
+        // scan ran against, and that gate is real: a degraded daemon or an empty
+        // graph can produce this same clean line with nothing behind it. So the
+        // verdict is asked for, and on a sound store it certifies and this says
+        // nothing at all.
+        lines.extend(crate::commands::absence_qualifier::qualify(
+            "dead_code",
+            &serde_json::json!([]),
+            envelope,
+            "  ",
+        ));
     } else if unreferenced.is_empty() {
         lines.push("No unreferenced entities.".to_string());
     } else if verified {
@@ -656,6 +683,7 @@ fn satisfies_trait_contract(graph: &impl GraphStore, entity_id: &EntityId) -> Re
 pub fn build_dead_code_seeded_response(
     graph: &kin_db::InMemoryGraph,
     request: &DeadCodeSeededRequest,
+    envelope: &kin_mcp::Envelope,
 ) -> Result<DeadCodeSeededResponse> {
     let query = request.query.trim();
     if query.is_empty() {
@@ -693,12 +721,13 @@ pub fn build_dead_code_seeded_response(
         show_body: false,
         body_limit: None,
     };
-    // `dead_code` consumes this response programmatically rather than printing
-    // it, so it wants no absence qualifier and asserts no substrate reading. An
-    // envelope with no health is exactly that claim: `negative_for` refuses to
-    // certify on it, the qualifier stays unrendered here, and nothing about
-    // dead-code's own output changes. Rung three gives this command its own
-    // verdict on its own terms (FIR-2524 rollout).
+    // The inner search is consumed programmatically rather than printed, so it
+    // still wants no absence qualifier of its own and asserts no substrate
+    // reading: an envelope with no health is exactly that claim, `negative_for`
+    // refuses to certify on it, and nothing about this command's output comes
+    // from it. Rung three of FIR-2524 gives this command its OWN verdict on its
+    // own terms below, under `find_dead_code_seeded`, which is the claim this
+    // command actually makes.
     let search_response =
         collect_daemon_search_response(graph, &search_request, &kin_mcp::Envelope::daemon())?;
 
@@ -768,10 +797,37 @@ pub fn build_dead_code_seeded_response(
             .then_with(|| a.id.cmp(&b.id))
     });
 
+    // Its seed is a name/kind filter over the entity index and it traverses no
+    // edge, so an empty candidate list says nothing MATCHED the seed rather than
+    // that nothing is unreachable. That is a language-scoped claim, gated the
+    // same way `semantic_search`'s is, and it is the claim FIR-2430 proved a
+    // tool must not certify on a language whose declarations never landed.
+    let absence_qualifier = if candidates.is_empty() {
+        let scoped = graph
+            .query_entities(&kin_model::graph::EntityFilter::default())
+            .unwrap_or_default();
+        let payload = serde_json::json!({
+            "candidates": [],
+            kin_mcp::EDGE_COVERAGE_KEY: kin_mcp::edge_coverage::observe_absence_scope(
+                &kin_mcp::edge_coverage::languages_of(&scoped),
+                Some(scoped.len()),
+            ),
+        });
+        crate::commands::absence_qualifier::qualify(
+            "find_dead_code_seeded",
+            &payload,
+            envelope,
+            "",
+        )
+    } else {
+        Vec::new()
+    };
+
     Ok(DeadCodeSeededResponse {
         query: query.to_string(),
         total_searched: candidates.len(),
         candidates,
+        absence_qualifier,
     })
 }
 
@@ -811,6 +867,134 @@ fn count_incoming_references(
 
 #[cfg(test)]
 mod tests {
+
+    /// THE SPINE for the whole-repo scan (FIR-2524 rung three).
+    ///
+    /// "No dead code found." is the INVERSE claim, so `kin_mcp::negative` gives
+    /// `dead_code` no cross-file classes and no language scope, and that is
+    /// right: a class this build cannot resolve produces MORE candidates, never
+    /// fewer. What still endangers the claim is the SUBSTRATE, and that gate is
+    /// real. A degraded daemon produces this same clean line with nothing behind
+    /// it, and before rung three it said so to MCP and not to a person.
+    #[test]
+    fn a_degraded_daemon_makes_the_clean_dead_code_scan_say_so() {
+        let graph = InMemoryGraph::new();
+        let caller = measured(make_entity("probe_caller", "src/a.rs"), 1, 0);
+        let live = measured(make_entity("probe_live", "src/a.rs"), 0, 0);
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&live).unwrap();
+        // Mutually referenced, so NOTHING is unreferenced and the scan reaches
+        // the clean arm. A one-way edge leaves the caller itself unreferenced,
+        // which is a populated answer and a different test.
+        graph
+            .upsert_relation(&make_relation_at(caller.id, live.id, RelationKind::Calls, 0.9))
+            .unwrap();
+        graph
+            .upsert_relation(&make_relation_at(live.id, caller.id, RelationKind::Calls, 0.9))
+            .unwrap();
+
+        let degraded = kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 2,
+            "graph_generation": 1,
+            "embed_worker_failed": true,
+        }));
+        let coverage =
+            kin_core::reference_coverage::collect_reference_edge_coverage(&graph).unwrap();
+        let response =
+            build_dead_code_report(&degraded, &graph, &Default::default(), &coverage).unwrap();
+        let output = response.lines.join("\n");
+
+        assert!(
+            output.contains("No dead code found."),
+            "the fixture must reach the clean arm or this test asserts nothing: {output}"
+        );
+        assert!(
+            output.contains("Kin cannot rule out unreachable entities it did not see"),
+            "a clean scan off a degraded daemon must say the substrate was in doubt, and must \
+             use ITS OWN noun rather than impact's 'dependents': {output}"
+        );
+    }
+
+    /// The positive control, and the arm that stops this from becoming the
+    /// FIR-2404 failure in its opposite costume. On a sound substrate the clean
+    /// scan certifies, so it says nothing extra. Silence IS the certified case.
+    #[test]
+    fn a_clean_dead_code_scan_on_a_sound_substrate_stays_unqualified() {
+        let graph = InMemoryGraph::new();
+        let caller = measured(make_entity("probe_caller", "src/a.rs"), 1, 0);
+        let live = measured(make_entity("probe_live", "src/a.rs"), 0, 0);
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&live).unwrap();
+        // Mutually referenced, so NOTHING is unreferenced and the scan reaches
+        // the clean arm. A one-way edge leaves the caller itself unreferenced,
+        // which is a populated answer and a different test.
+        graph
+            .upsert_relation(&make_relation_at(caller.id, live.id, RelationKind::Calls, 0.9))
+            .unwrap();
+        graph
+            .upsert_relation(&make_relation_at(live.id, caller.id, RelationKind::Calls, 0.9))
+            .unwrap();
+
+        let coverage =
+            kin_core::reference_coverage::collect_reference_edge_coverage(&graph).unwrap();
+        let response = build_dead_code_report(
+            &dead_code_test_envelope(),
+            &graph,
+            &Default::default(),
+            &coverage,
+        )
+        .unwrap();
+        let output = response.lines.join("\n");
+
+        assert!(output.contains("No dead code found."), "{output}");
+        assert!(
+            !output.contains("Kin cannot rule out"),
+            "a sound substrate certifies, so the clean scan says nothing extra: {output}"
+        );
+    }
+
+    /// The noise control. A scan that LISTED rows is not an absence claim about
+    /// the repository, so it carries no qualifier however degraded the daemon.
+    /// Its rows already carry their own per-row honesty from kin#924.
+    #[test]
+    fn a_dead_code_scan_that_lists_rows_stays_unqualified_even_when_degraded() {
+        let graph = InMemoryGraph::new();
+        let orphan = measured(make_entity("probe_orphan", "src/a.rs"), 0, 0);
+        graph.upsert_entity(&orphan).unwrap();
+
+        let degraded = kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 1,
+            "graph_generation": 1,
+            "embed_worker_failed": true,
+        }));
+        let coverage =
+            kin_core::reference_coverage::collect_reference_edge_coverage(&graph).unwrap();
+        let response =
+            build_dead_code_report(&degraded, &graph, &Default::default(), &coverage).unwrap();
+        let output = response.lines.join("\n");
+
+        assert!(output.contains("probe_orphan"), "{output}");
+        assert!(
+            !output.contains("Kin cannot rule out"),
+            "a populated scan is not an absence claim and must stay unqualified: {output}"
+        );
+    }
+
+    /// A substrate in good health, so a test asserting dead-code CONTENT is not
+    /// also asserting the absence verdict. The refusing direction has its own.
+    fn dead_code_test_envelope() -> kin_mcp::Envelope {
+        kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 4,
+            "graph_generation": 1,
+        }))
+    }
+
     use super::*;
     use kin_db::InMemoryGraph;
     use kin_model::entity::{
@@ -882,7 +1066,8 @@ mod tests {
         let coverage =
             kin_core::reference_coverage::collect_reference_edge_coverage(graph).unwrap();
         let entry_points = collect_declared_entry_points(None, graph).unwrap();
-        build_dead_code_report(graph, &entry_points, &coverage).unwrap()
+        build_dead_code_report(&dead_code_test_envelope(),
+            graph, &entry_points, &coverage).unwrap()
     }
 
     /// Whether `kin refs --bulk-json` reports a caller for this entity.
@@ -1086,6 +1271,7 @@ mod tests {
                 limit: Some(10),
                 name_pattern: None,
             },
+        &dead_code_test_envelope(),
         )
         .unwrap();
 
@@ -1488,7 +1674,8 @@ mod tests {
             manifests_read: Vec::new(),
             manifests_unreadable: vec!["pyproject.toml".to_string()],
         };
-        let response = build_dead_code_report(&graph, &entry_points, &coverage).unwrap();
+        let response = build_dead_code_report(&dead_code_test_envelope(),
+            &graph, &entry_points, &coverage).unwrap();
 
         assert!(!response.verified, "{:?}", response.lines);
         assert!(
@@ -1523,7 +1710,8 @@ mod tests {
             manifests_read: vec!["pyproject.toml".to_string()],
             manifests_unreadable: Vec::new(),
         };
-        let response = build_dead_code_report(&graph, &entry_points, &coverage).unwrap();
+        let response = build_dead_code_report(&dead_code_test_envelope(),
+            &graph, &entry_points, &coverage).unwrap();
         let joined = response.lines.join("\n");
 
         assert!(response.verified, "{:?}", response.unverified_reasons);
@@ -1552,6 +1740,7 @@ mod tests {
                 limit: Some(5),
                 name_pattern: None,
             },
+        &dead_code_test_envelope(),
         )
         .unwrap_err();
         assert!(err.to_string().contains("non-empty query"));
