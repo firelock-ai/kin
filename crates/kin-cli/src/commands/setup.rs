@@ -15986,10 +15986,20 @@ wait
             install_shell_hook("bash").unwrap();
         }
 
-        let login_shell_path = || {
+        // One probe, three facts: what PATH the login shell carries, whether
+        // `kin` resolves there, and whether the projection hook was sourced into
+        // it. The last one is why the seed's interactivity guard exists, so it
+        // is asserted rather than assumed.
+        let probe = || {
             let out = std::process::Command::new("/bin/bash")
                 .arg("-lc")
-                .arg(r#"printf '%s\n' "$PATH""#)
+                .arg(concat!(
+                    r#"printf 'KFR_PATH=%s\n' "$PATH""#,
+                    "\n",
+                    r#"if command -v kin > /dev/null 2>&1; then printf 'KFR_KIN=%s\n' "$(command -v kin)"; else printf 'KFR_KIN=none\n'; fi"#,
+                    "\n",
+                    r#"if declare -F _kin_vfs_prompt_command > /dev/null 2>&1; then printf 'KFR_HOOK=yes\n'; else printf 'KFR_HOOK=no\n'; fi"#,
+                ))
                 .env("HOME", &home)
                 .env("PATH", "/usr/bin:/bin")
                 .env_remove("KIN_HOME")
@@ -16003,25 +16013,69 @@ wait
                 "the probe shell itself failed: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
+            let text = String::from_utf8_lossy(&out.stdout).to_string();
+            let field = |name: &str| -> String {
+                text.lines()
+                    .find_map(|line| line.strip_prefix(name))
+                    .unwrap_or_else(|| panic!("the probe printed no {name} line: {text}"))
+                    .trim()
+                    .to_string()
+            };
+            (field("KFR_PATH="), field("KFR_KIN="), field("KFR_HOOK="))
         };
         let carries_bin = |path: &str| path.split(':').any(|entry| Path::new(entry) == bin_dir);
 
-        let after = login_shell_path();
+        let (after, resolved, hook) = probe();
         assert!(
             carries_bin(&after),
             "a bash login shell does not carry {} on its PATH, so `bash -lc` \
              cannot find kin on a fresh install: {after}",
             bin_dir.display()
         );
+        assert_eq!(
+            Path::new(&resolved).parent(),
+            Some(bin_dir.as_path()),
+            "`bash -lc 'command -v kin'` did not resolve into this install: {resolved}"
+        );
+        assert_eq!(
+            hook, "no",
+            "the projection hook reached a non-interactive login shell, which is \
+             what the seed's `case $- in *i*)` guard exists to prevent: every \
+             `bash -lc` would activate the VFS overlay"
+        );
 
-        // Falsification: the pre-fix layout, `.bashrc` and nothing else.
+        // Falsification for the guard itself: drop it from the created file and
+        // the hook fires in the same non-interactive login shell.
+        let seeded = fs::read_to_string(home.join(".bash_profile")).unwrap();
+        assert!(seeded.contains("case $- in"), "{seeded}");
+        let unguarded = seeded
+            .lines()
+            .filter(|line| !line.starts_with("case $- in") && !line.starts_with("esac"))
+            .map(|line| {
+                if line.trim_start().starts_with("*i*)") {
+                    "[ -f \"$HOME/.bashrc\" ] && . \"$HOME/.bashrc\"".to_string()
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(home.join(".bash_profile"), format!("{unguarded}\n")).unwrap();
+        let (_, _, mutant_hook) = probe();
+        assert_eq!(
+            mutant_hook, "yes",
+            "removing the guard did not let the hook through, so the assertion \
+             above cannot fail and proves nothing about the guard"
+        );
+
+        // Falsification for the PATH line: the pre-fix layout, `.bashrc` and
+        // nothing else.
         fs::remove_file(home.join(".bash_profile")).unwrap();
         assert!(
             home.join(".bashrc").exists(),
             "the falsification has to leave the pre-fix file in place"
         );
-        let without = login_shell_path();
+        let (without, _, _) = probe();
         assert!(
             !carries_bin(&without),
             "with the login file gone the login shell still carries {}, so this \
@@ -16054,10 +16108,11 @@ wait
         }
 
         let profile = fs::read_to_string(home.join(".bash_profile")).unwrap();
-        assert!(
-            profile.starts_with(mine),
-            "an existing login file keeps what its owner put there, unchanged and \
-             in place: {profile}"
+        assert_eq!(
+            profile,
+            format!("{mine}{}", rc_path_block("bash", &bin_dir)),
+            "an existing login file keeps its owner's bytes exactly and gains \
+             nothing but Kin's own block: {profile}"
         );
         assert!(
             profile.contains(&rc_path_line("bash", &bin_dir)),
@@ -18772,6 +18827,33 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         let bash_after = fs::read_to_string(&bash).unwrap();
         assert_eq!(zsh_after, "export KEEP=1\nalias k='kin'\n");
         assert_eq!(bash_after, "# user heading\n");
+    }
+
+    /// The bash login file is swept too, and the sweep is exact there as well.
+    /// A user's own PATH export in the same file is not Kin's to remove, and
+    /// telling the two apart is the whole reason the cleanup matches the block
+    /// rather than the directory name.
+    #[test]
+    #[serial]
+    fn the_bash_login_sweep_removes_only_the_block_kin_wrote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let install_root = home.join(".kin");
+        fs::create_dir_all(&home).unwrap();
+        let _profile = EnvVarGuard::unset("PROFILE");
+
+        let block = rc_path_block("bash", &install_root.join("bin"));
+        let mine = "# user heading\nexport PATH=\"$HOME/bin:$PATH\"\n";
+        let login = home.join(".bash_profile");
+        fs::write(&login, format!("{mine}{block}")).unwrap();
+
+        let removed = cleanup_legacy_shell_path_blocks(&home, &install_root, false).unwrap();
+        assert_eq!(removed.len(), 1);
+        assert_eq!(
+            fs::read_to_string(&login).unwrap(),
+            mine,
+            "the sweep took something that was not Kin's block"
+        );
     }
 
     #[test]
