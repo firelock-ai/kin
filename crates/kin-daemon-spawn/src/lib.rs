@@ -237,8 +237,7 @@ fn parse_proc_self_cgroup(contents: &str) -> Option<String> {
         // `hierarchy-ID:controller-list:cgroup-path`, and a path may itself
         // contain colons, so the split is bounded at two.
         let mut parts = line.splitn(3, ':');
-        let (Some(id), Some(controllers), Some(path)) =
-            (parts.next(), parts.next(), parts.next())
+        let (Some(id), Some(controllers), Some(path)) = (parts.next(), parts.next(), parts.next())
         else {
             continue;
         };
@@ -298,7 +297,8 @@ fn resolve_cgroup_memory(read: &dyn Fn(&str) -> Option<String>) -> (Option<u64>,
     let relative = read("/proc/self/cgroup").and_then(|body| parse_proc_self_cgroup(&body));
     let mut binding: Option<(u64, String)> = None;
     for dir in cgroup_search_dirs("/sys/fs/cgroup", relative.as_deref()) {
-        if let Some(limit) = read(&format!("{dir}/memory.max")).and_then(|raw| parse_v2_memory_max(&raw))
+        if let Some(limit) =
+            read(&format!("{dir}/memory.max")).and_then(|raw| parse_v2_memory_max(&raw))
         {
             if binding.as_ref().is_none_or(|(held, _)| limit < *held) {
                 binding = Some((limit, dir.clone()));
@@ -404,8 +404,8 @@ fn cgroup_oom_kill_count() -> Option<u64> {
     for mount in ["/sys/fs/cgroup", "/sys/fs/cgroup/memory"] {
         for dir in cgroup_search_dirs(mount, relative.as_deref()) {
             for name in ["memory.events", "memory.oom_control"] {
-                if let Some(count) =
-                    read_cgroup_file(&format!("{dir}/{name}")).and_then(|raw| parse_oom_kill_count(&raw))
+                if let Some(count) = read_cgroup_file(&format!("{dir}/{name}"))
+                    .and_then(|raw| parse_oom_kill_count(&raw))
                 {
                     return Some(count);
                 }
@@ -7579,10 +7579,17 @@ mod tests {
             ("/proc/self/cgroup", "0::/docker/9f2c1e\n"),
             ("/sys/fs/cgroup/memory.max", "max\n"),
             ("/sys/fs/cgroup/docker/9f2c1e/memory.max", "12884901888\n"),
-            ("/sys/fs/cgroup/docker/9f2c1e/memory.current", "8589934592\n"),
+            (
+                "/sys/fs/cgroup/docker/9f2c1e/memory.current",
+                "8589934592\n",
+            ),
         ]);
         let (limit, current) = resolve_cgroup_memory(&fs);
-        assert_eq!(limit, Some(TWELVE), "the container's own cap, not the root's");
+        assert_eq!(
+            limit,
+            Some(TWELVE),
+            "the container's own cap, not the root's"
+        );
         assert_eq!(current, Some(8 * 1024 * 1024 * 1024));
     }
 
