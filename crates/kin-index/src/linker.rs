@@ -3912,6 +3912,112 @@ const UNRESOLVED_RECEIVER_KIND_TAG: &str = "UnresolvedReceiver";
 /// nothing this repository defines.
 pub const UNRESOLVED_RECEIVER_CALL_RULE: &str = "unresolved_receiver_call";
 
+/// Evidence marker for a call the parser read as the operand of a `raise`.
+///
+/// `raise SSLError(...)` in an `except` block is a call edge like any other and
+/// is genuinely evidence, but it is a throw site rather than a hop a value
+/// travels along. A trace walking data flow needs to tell the two apart: on a
+/// converted `psf/requests`, nine of the twelve depth-1 slots a stranger's
+/// trace returned were exception constructors, and they crowded out the hop
+/// that governs connection reuse. Carried as a `parser_rule` because that field
+/// is already persisted on relation evidence, so no schema in `kin-model` moves.
+pub const RAISE_TARGET_CALL_RULE: &str = "raise_target_call";
+
+/// What lies on the other side of a boundary step, or an explicit statement
+/// that the graph does not know.
+///
+/// An external record used to carry identity and nothing else, so `router.handle`
+/// arrived as a bare symbol with no way to tell an npm package from a Node
+/// builtin from a typo. The graph knows a boundary exists; when it also knows
+/// the specifier the importing file named, saying it costs nothing, and when it
+/// does not, saying THAT is the answer. Silence is the one option that reads
+/// like an in-repo entity.
+///
+/// Lives here rather than on either surface because `trace_data_flow` has two
+/// implementations, the CLI one the daemon route serves and the MCP one the
+/// in-process arm serves, and a boundary rule that differs by whether a daemon
+/// is up is the divergence class FIR-2507 was filed about.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceCrossing {
+    /// `named` when the graph holds the specifier, `unknown` when it holds only
+    /// the fact of the boundary.
+    pub status: String,
+    /// The module specifier the importing file named (`router`, `urllib3`),
+    /// when an edge into this symbol recorded one. Absent under `unknown`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub specifier: Option<String>,
+    /// The receiver the call was written through, when the edge recorded one
+    /// and no specifier is available. `this.router` says more than nothing
+    /// about where to look without claiming to name a package.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver: Option<String>,
+    /// Why the status reads the way it does, in a sentence a caller can act on.
+    pub note: String,
+}
+
+/// Whether this edge is a call the parser read as the operand of a `raise`.
+///
+/// Reads the marker the linker persisted on the edge's own evidence, so a
+/// language whose adapter does not record raise sites reports `false` and its
+/// traces rank exactly as they did.
+pub fn is_raise_target_edge(rel: &Relation) -> bool {
+    rel.kind == RelationKind::Calls
+        && rel
+            .evidence
+            .iter()
+            .any(|evidence| evidence.parser_rule.as_deref() == Some(RAISE_TARGET_CALL_RULE))
+}
+
+/// The crossing record for a step, built from the edge that reached it.
+///
+/// Reads only what the graph already persisted: `import_source`, set by the
+/// cross-repo tier when the parser pinned the module a symbol came from, and
+/// the unresolved-receiver evidence token, which carries the receiver as source
+/// spells it. Nothing is inferred from a name, so a symbol the graph cannot
+/// place reports `unknown` rather than a guess.
+pub fn trace_crossing_for(entity: &Entity, reached_by: Option<&Relation>) -> Option<TraceCrossing> {
+    if entity.file_origin.is_some() {
+        return None;
+    }
+    let specifier = reached_by
+        .and_then(|rel| rel.import_source.as_deref())
+        .map(str::trim)
+        .filter(|source| !source.is_empty())
+        .map(str::to_string);
+    if let Some(specifier) = specifier {
+        return Some(TraceCrossing {
+            note: format!(
+                "the importing file named `{specifier}`; the graph holds no entities for what that resolves to"
+            ),
+            status: "named".to_string(),
+            specifier: Some(specifier),
+            receiver: None,
+        });
+    }
+    let receiver = reached_by
+        .and_then(|rel| {
+            rel.evidence
+                .iter()
+                .find(|e| e.parser_rule.as_deref() == Some(UNRESOLVED_RECEIVER_CALL_RULE))
+        })
+        .and_then(|e| e.token.as_deref())
+        .and_then(|token| token.rsplit_once('.').map(|(receiver, _)| receiver))
+        .filter(|receiver| !receiver.is_empty())
+        .map(str::to_string);
+    let note = match receiver.as_deref() {
+        Some(receiver) => format!(
+            "the call was written through `{receiver}` and no edge records which module it comes from, so this symbol could be a package, a builtin or a typo"
+        ),
+        None => "no edge into this symbol records a module, so this symbol could be a package, a builtin or a typo".to_string(),
+    };
+    Some(TraceCrossing {
+        status: "unknown".to_string(),
+        specifier: None,
+        receiver,
+        note,
+    })
+}
+
 /// Returns whether a relation exactly matches the linker's external-import
 /// placeholder contract. This does not inspect graph membership; callers must
 /// separately establish that the destination is absent from the local entity
