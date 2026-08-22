@@ -79,6 +79,18 @@ advertised budget sits under what a real MCP client accepts. Check 3 runs one
 query at the ceiling and again at the floor and asserts nothing full in the first
 is empty in the second, which needs no counter to be true.
 
+Check 4 covers the rule underneath that one: a response has to be counted before
+it can be cut. `impact_analysis` reported `bounded: false` beside a
+`chars_before_budget` of 50,354 against a 2,000-character ceiling and shipped all
+50,354, because the budget's shape table named only the four `affected_*` buckets
+and the bulk of an impact report is not in them (FIR-2602). The check runs one
+impact query at the ceiling and again at the floor over every list the report can
+carry, asserts none of them was emptied, and reads the response's own accounting:
+`bounded: false` asserts the response fits, so it has to fit, and a response that
+does not fit has to say so in `degradations`. A ceiling is not always reachable,
+because every cut list keeps a floor entry, and that case is fine as long as it is
+never quiet.
+
 `brownfield_repro.py --self-test` and `response_budget_elisions.py --self-test`
 exercise their verdict graders on fixed payloads and need no binary and no
 corpus. Each case is paired with its inverse, so a grader that cannot tell its
