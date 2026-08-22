@@ -267,7 +267,21 @@ pub fn build_context_response(
 
     let mut lines = vec![
         format!("Context pack for '{}' ({:?}):", target.name, target.kind),
-        format!("  Budget: {}/{} tokens", pack.actual_tokens, max_tokens),
+        format!(
+            "  Budget: {}/{} tokens{}",
+            pack.actual_tokens,
+            max_tokens,
+            // A pack over its own budget is not a bug and not a rounding
+            // error: every section that had a candidate keeps one, so a
+            // section can never render as empty when the graph found rows.
+            // Saying so is cheaper than leaving a reader to explain a number
+            // that looks wrong.
+            if pack.actual_tokens > max_tokens {
+                " (over budget: every section keeps a row)"
+            } else {
+                ""
+            }
+        ),
         format!("  Focal: {} entries", pack.focal_entities.len()),
         format!(
             "  Dependencies: {} entries{}",

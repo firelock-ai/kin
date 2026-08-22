@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use kin_model::{
     relation::RelationKind, Annotation, AnnotationEntry, ArtifactContextEntry, ArtifactContextKind,
@@ -747,6 +747,9 @@ where
     let mut transitive_entries = Vec::new();
     let mut test_entries = Vec::new();
     let mut contract_entries = Vec::new();
+    // Groups already holding a row, so the never-empty floor below admits a
+    // group's first candidate and only its first.
+    let mut admitted_groups: HashSet<&'static str> = HashSet::new();
 
     // Codex benefits from reserving budget for the focal entity.
     let transitive_budget = match opts.assistant_hint {
@@ -801,7 +804,8 @@ where
         };
         let fits = match section {
             AssemblySection::Transitive => {
-                total_tokens + tokens <= budget_max && transitive_tokens + tokens <= transitive_budget
+                total_tokens + tokens <= budget_max
+                    && transitive_tokens + tokens <= transitive_budget
             }
             _ => total_tokens + tokens <= budget_max,
         };
@@ -811,10 +815,20 @@ where
         // here, at the only place that knows a row was ever a candidate, so
         // both surfaces can say what the budget took instead of rendering the
         // loss as absence.
-        if !fits {
+        //
+        // Every group that had a candidate keeps one, whatever it costs. A
+        // bound is not a refusal, and a caller handed an empty group cannot
+        // tell it from "the graph found none": that is the reading kin#1062
+        // removed from the response budget's own ladder, and the same reading
+        // arrives here through the earlier budget. Candidates are walked in
+        // weight order, so the row a group keeps is its most important one. The
+        // overshoot this can cost is bounded by one row per group and is
+        // reported, because `actual_tokens` is measured rather than assumed.
+        if !fits && admitted_groups.contains(target_group) {
             selection.refuse(target_group, entity_id);
             continue;
         }
+        admitted_groups.insert(target_group);
         total_tokens += tokens;
         let entry = ContextEntry {
             entity_id,
@@ -852,10 +866,13 @@ where
             // budget elision: a cap and a budget are different causes recovered
             // by different levers, and `Elision::reason` exists so one cannot
             // be read as the other.
-            if total_tokens + tokens > budget_max {
+            if total_tokens + tokens > budget_max
+                && admitted_groups.contains(group::DEPENDENCIES)
+            {
                 selection.refuse(group::DEPENDENCIES, entity.id);
                 continue;
             }
+            admitted_groups.insert(group::DEPENDENCIES);
             total_tokens += tokens;
             selection.same_file_neighbors.push(entity.id);
             dep_entries.push(ContextEntry {
@@ -889,10 +906,13 @@ where
                 }
                 let content = format_work_item(&item);
                 let tokens = estimate_tokens(&content);
-                if total_tokens + tokens > budget_max {
+                if total_tokens + tokens > budget_max
+                    && admitted_groups.contains(group::WORK_ITEMS)
+                {
                     selection.refuse(group::WORK_ITEMS, *eid);
                     continue;
                 }
+                admitted_groups.insert(group::WORK_ITEMS);
                 total_tokens += tokens;
                 work_entries.push(WorkItemEntry {
                     work_item: item,
@@ -912,10 +932,13 @@ where
                 }
                 let content = format_annotation(&ann);
                 let tokens = estimate_tokens(&content);
-                if total_tokens + tokens > budget_max {
+                if total_tokens + tokens > budget_max
+                    && admitted_groups.contains(group::ANNOTATIONS)
+                {
                     selection.refuse(group::ANNOTATIONS, *eid);
                     continue;
                 }
+                admitted_groups.insert(group::ANNOTATIONS);
                 total_tokens += tokens;
                 annotation_entries.push(AnnotationEntry {
                     annotation: ann,
@@ -3325,6 +3348,36 @@ mod tests {
             selection.budget_elided_unrecovered(group::DEPENDENCIES, |_| true),
             0,
             "a row the caller recovered elsewhere is not a row the answer lost"
+        );
+    }
+
+    #[test]
+    fn a_budget_too_small_for_any_row_still_keeps_one() {
+        let (store, focal) = calling_store(40);
+        // One token. Nothing fits, including the focal, so every candidate is
+        // a refusal and the group would have serialized as `[]`.
+        let opts = ContextOptions {
+            budget: TokenBudget::Custom(1),
+            ..ContextOptions::default()
+        };
+        let (pack, selection) =
+            build_context_pack_with_provenance(&store, &focal.id, &opts).unwrap();
+        assert_eq!(
+            pack.dependency_signatures.len(),
+            1,
+            "a group with candidates keeps one, so an empty group means the graph found none"
+        );
+        assert_eq!(
+            selection.budget_elided(group::DEPENDENCIES),
+            39,
+            "and says how many it could not keep"
+        );
+        assert!(
+            pack.actual_tokens > opts.budget.max_tokens(),
+            "the row it kept costs more than the budget, and the count says so rather \
+             than hiding it: {} against {}",
+            pack.actual_tokens,
+            opts.budget.max_tokens()
         );
     }
 
