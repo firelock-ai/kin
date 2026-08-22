@@ -2745,9 +2745,9 @@ mod tests {
             PathBuf::from("")
         );
         assert_eq!(
-            resolve_supervisor_root(fake_env(&[("KIN_REGISTRY_PATH", "")]), || Some(PathBuf::from(
-                "/base-home"
-            ))),
+            resolve_supervisor_root(fake_env(&[("KIN_REGISTRY_PATH", "")]), || Some(
+                PathBuf::from("/base-home")
+            )),
             PathBuf::from(".kin")
         );
         assert_eq!(
