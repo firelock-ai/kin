@@ -17,7 +17,7 @@ use serde_json::Value;
 use crate::commands::auth::default_base_url_for_health;
 use crate::commands::setup::{
     check_binary_in_path, configured_mcp_launcher, detect_shell, detected_ai_client_names,
-    home_dir, hook_filename, kin_dir, shell_path_rc, shell_rc, shim_filename,
+    home_dir, hook_filename, kin_dir, shell_path_rcs, shell_rc, shim_filename,
     CANONICAL_NPM_MCP_COMMAND, CANONICAL_NPM_MCP_PACKAGE,
 };
 use crate::daemon_client::{InstalledStartupProtocol, SupervisorStartupSentinel};
@@ -1693,15 +1693,19 @@ fn check_shell_path() -> HealthCheck {
     let rc_sources = rc_content.contains("kin-vfs");
 
     // The PATH line does not always live beside the hook. zsh's belongs in
-    // `.zshenv`, which is the file a non-interactive shell reads, so reading
-    // only the hook's file would report a correctly installed host as missing
-    // its PATH. Both are read and either satisfies the check, which also keeps
-    // an install that predates the split reading healthy.
-    let path_rc_content = shell_path_rc(shell)
-        .ok()
+    // `.zshenv`, which is the file a non-interactive shell reads, and bash's
+    // lives in the login file as well as `.bashrc`, so reading only the hook's
+    // file would report a correctly installed host as missing its PATH. Every
+    // file the PATH line is written to is read and any of them satisfies the
+    // check, which also keeps an install that predates either split reading
+    // healthy.
+    let path_rc_content = shell_path_rcs(shell)
+        .unwrap_or_default()
+        .into_iter()
         .filter(|path| Some(path) != rc_path.as_ref())
-        .and_then(|rc| std::fs::read_to_string(rc).ok())
-        .unwrap_or_default();
+        .filter_map(|rc| std::fs::read_to_string(rc).ok())
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let bin_display = bin_dir.to_string_lossy();
     let declares_bin = |content: &str| {

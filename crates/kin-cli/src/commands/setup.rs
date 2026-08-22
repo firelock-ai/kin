@@ -1447,8 +1447,61 @@ pub(crate) fn shell_rc(shell: &str) -> Result<PathBuf> {
     }
 }
 
-/// Where this shell's PATH line belongs, which is not always where its hook
-/// belongs.
+/// The files bash reads for a login shell, in the order bash reads them.
+///
+/// bash runs the FIRST of these that it can read and none of the rest, and
+/// `.bashrc` is not among them at all: a login bash reads `.bashrc` only when
+/// one of these files sources it. So a PATH line written to `.bashrc` alone is
+/// invisible to `bash -lc`, to an ssh login, and to a macOS Terminal tab, which
+/// opens a login shell by default.
+const BASH_LOGIN_RCS: [&str; 3] = [".bash_profile", ".bash_login", ".profile"];
+
+/// What Kin seeds a `.bash_profile` with when it has to create one.
+///
+/// A home with none of [`BASH_LOGIN_RCS`] gives a login bash no user file to
+/// read, so Kin creating `.bash_profile` is what puts the PATH line somewhere a
+/// login shell will find it. Pairing it with the conventional source line keeps
+/// an interactive login shell equivalent to an interactive non-login one, which
+/// is what a bash user expects of a home that has both files.
+///
+/// The interactivity guard is deliberate and is the same rule [`shell_rc`]
+/// follows for zsh. `.bashrc` carries the projection hook, which activates the
+/// VFS overlay on entry, and `bash -lc` is a login shell that is not
+/// interactive, so an unguarded source line here would inject the shim into
+/// every scripted login shell.
+///
+/// Kin writes this only into a file it creates. An existing `.bash_profile`,
+/// `.bash_login` or `.profile` keeps whatever semantics its owner gave it and
+/// receives nothing but the PATH block.
+const BASH_PROFILE_SEED: &str = "\
+# Created by kin setup.
+#
+# A login bash reads .bash_profile, .bash_login or .profile, the first one only,
+# and never .bashrc, so Kin's PATH line below has to live here. Sourcing
+# ~/.bashrc keeps an interactive login shell equivalent to an interactive
+# non-login one; the guard keeps it out of `bash -lc`, which is not interactive.
+case $- in
+    *i*) [ -f \"$HOME/.bashrc\" ] && . \"$HOME/.bashrc\" ;;
+esac
+";
+
+/// The login file bash will actually read in `home`.
+///
+/// Mirrors bash's own resolution: first existing wins. When none exists there is
+/// nothing to append to, and `.bash_profile` is the file to create, because it
+/// is the one bash looks at first and the one that belongs to bash alone.
+/// `.profile` is shared with `sh` and every other POSIX shell, so Kin never
+/// conjures that one.
+fn bash_login_rc_in(home: &Path) -> PathBuf {
+    BASH_LOGIN_RCS
+        .iter()
+        .map(|name| home.join(name))
+        .find(|path| path.exists())
+        .unwrap_or_else(|| home.join(BASH_LOGIN_RCS[0]))
+}
+
+/// Every file this shell's PATH line belongs in, which is not always the one its
+/// hook belongs in, and for bash is not one file.
 ///
 /// zsh reads `.zshenv` on every launch and `.zshrc` only when the shell is
 /// interactive, so a PATH line written to `.zshrc` alone leaves `kin` unfindable
@@ -1456,19 +1509,28 @@ pub(crate) fn shell_rc(shell: &str) -> Result<PathBuf> {
 /// or an agent shelling out. Those are exactly the callers a semantic repo
 /// substrate is meant to serve.
 ///
-/// The hook must not move with it. Sourcing the projection hook from `.zshenv`
-/// would inject the shim into every non-interactive shell, which is the opposite
-/// of what the hook's own exclusion wrappers exist for, so [`shell_rc`] keeps the
-/// hook in the interactive file and this decides the PATH line separately.
+/// bash splits the same way along a different seam. `.bashrc` serves an
+/// interactive non-login shell and nothing else, so the PATH line needs a second
+/// home in the file a login shell reads, chosen by [`bash_login_rc_in`]. Both
+/// get it: dropping it from `.bashrc` would take `kin` away from the terminal
+/// that opens a non-login shell, which is most of Linux.
 ///
-/// Every other shell reads one file for both, so this returns [`shell_rc`] for
+/// The hook must not move with either. Sourcing the projection hook from
+/// `.zshenv` or from a bash login file would inject the shim into every
+/// non-interactive shell, which is the opposite of what the hook's own exclusion
+/// wrappers exist for, so [`shell_rc`] keeps the hook in the interactive file and
+/// this decides the PATH line separately.
+///
+/// fish and PowerShell read one file for both, so this returns [`shell_rc`] for
 /// them, and the arms below mirror that function's exactly, including its
 /// treatment of an unrecognized shell as zsh.
-pub(crate) fn shell_path_rc(shell: &str) -> Result<PathBuf> {
-    match shell {
-        "bash" | "fish" | "powershell" => shell_rc(shell),
-        _ => Ok(home_dir()?.join(".zshenv")),
-    }
+pub(crate) fn shell_path_rcs(shell: &str) -> Result<Vec<PathBuf>> {
+    let home = home_dir()?;
+    Ok(match shell {
+        "bash" => vec![home.join(".bashrc"), bash_login_rc_in(&home)],
+        "fish" | "powershell" => vec![shell_rc(shell)?],
+        _ => vec![home.join(".zshenv")],
+    })
 }
 
 pub(crate) fn hook_filename(shell: &str) -> &'static str {
@@ -2410,21 +2472,26 @@ fn install_shell_hook(shell_name: &str) -> Result<(PathBuf, String)> {
 
     let source_line = rc_source_line(shell_name, &hook_file);
 
-    for (rc_path, blocks) in rc_write_plan(shell_name)? {
-        let rc_content = if rc_path.exists() {
-            fs::read_to_string(&rc_path)?
+    for target in rc_write_plan(shell_name)? {
+        let rc_path = target.path.as_path();
+        let existed = rc_path.exists();
+        let rc_content = if existed {
+            fs::read_to_string(rc_path)?
         } else {
-            String::new()
+            // A file Kin creates from nothing may owe the user something before
+            // Kin's own blocks. A `.bash_profile` that exists only because Kin
+            // wrote it still has to behave like one a bash user would recognize.
+            target.seed_when_absent.unwrap_or_default().to_string()
         };
 
         let update = plan_rc_update(
             &rc_content,
             shell_name,
             &source_line,
-            &rc_path,
+            rc_path,
             &bin_dir,
             bin_dir.is_dir(),
-            blocks,
+            target.blocks,
         );
         for line in update.already_present.iter().chain(&update.skipped) {
             println!("{line}");
@@ -2434,8 +2501,15 @@ fn install_shell_hook(shell_name: &str) -> Result<(PathBuf, String)> {
                 fs::create_dir_all(parent)
                     .with_context(|| format!("failed to create {}", parent.display()))?;
             }
-            fs::write(&rc_path, &update.content)
+            fs::write(rc_path, &update.content)
                 .with_context(|| format!("failed to update {}", rc_path.display()))?;
+            if !existed && target.seed_when_absent.is_some() {
+                println!(
+                    "  Created {}, which is the file a bash login shell reads; \
+                     it sources ~/.bashrc when the shell is interactive",
+                    rc_path.display()
+                );
+            }
             for line in &update.applied {
                 println!("{line}");
             }
@@ -2447,19 +2521,50 @@ fn install_shell_hook(shell_name: &str) -> Result<(PathBuf, String)> {
 
 /// The files this shell's integration is written to, and what each one carries.
 ///
-/// One entry for a shell that reads a single file, two for zsh, whose PATH line
-/// belongs in `.zshenv` so a non-interactive shell can find `kin` at all while
-/// the hook stays in `.zshrc` so the shim is not injected into one.
-fn rc_write_plan(shell_name: &str) -> Result<Vec<(PathBuf, RcBlocks)>> {
+/// One entry for a shell that reads a single file for both. Two for zsh, whose
+/// PATH line belongs in `.zshenv` so a non-interactive shell can find `kin` at
+/// all while the hook stays in `.zshrc` so the shim is not injected into one.
+/// Two for bash along a different seam: `.bashrc` carries both, because it is
+/// the file an interactive non-login shell reads, and the login file carries the
+/// PATH line a second time, because bash reads one or the other and never both
+/// unless the login file says so.
+fn rc_write_plan(shell_name: &str) -> Result<Vec<RcTarget>> {
     let hook_rc = shell_rc(shell_name)?;
-    let path_rc = shell_path_rc(shell_name)?;
-    if path_rc == hook_rc {
-        return Ok(vec![(hook_rc, RcBlocks::HookAndPath)]);
+    let mut plan = vec![RcTarget {
+        path: hook_rc.clone(),
+        blocks: RcBlocks::HookOnly,
+        seed_when_absent: None,
+    }];
+    for path_rc in shell_path_rcs(shell_name)? {
+        if path_rc == hook_rc {
+            plan[0].blocks = RcBlocks::HookAndPath;
+            continue;
+        }
+        // Only a file Kin creates from nothing gets a seed, and `.bash_profile`
+        // is the only one Kin ever creates: an existing login file keeps the
+        // semantics its owner gave it, and `.profile` belongs to every POSIX
+        // shell rather than to bash.
+        let creates_bash_profile = shell_name == "bash"
+            && path_rc.file_name().and_then(|name| name.to_str()) == Some(BASH_LOGIN_RCS[0]);
+        plan.push(RcTarget {
+            path: path_rc,
+            blocks: RcBlocks::PathOnly,
+            seed_when_absent: creates_bash_profile.then_some(BASH_PROFILE_SEED),
+        });
     }
-    Ok(vec![
-        (hook_rc, RcBlocks::HookOnly),
-        (path_rc, RcBlocks::PathOnly),
-    ])
+    Ok(plan)
+}
+
+/// One file setup writes to, what it is responsible for, and what Kin owes it
+/// if Kin is the one bringing it into existence.
+#[derive(Clone, Debug)]
+struct RcTarget {
+    path: PathBuf,
+    blocks: RcBlocks,
+    /// Content to start the file with when it does not exist yet. `None` for a
+    /// file whose absence needs nothing but Kin's own blocks. Never applied to a
+    /// file that already exists, so no user's semantics are rewritten.
+    seed_when_absent: Option<&'static str>,
 }
 
 /// Which of the two blocks one rc file is responsible for.
@@ -12576,12 +12681,15 @@ fn record_setup_ledger(
                         ));
                     }
 
-                    // The PATH line is recorded against the file it was
+                    // The PATH line is recorded against every file it was
                     // actually written to, which for zsh is `.zshenv` rather
-                    // than the file carrying the hook. Recording it against the
-                    // hook's file would leave uninstall excising a block from
-                    // one file while the real one stayed behind.
-                    if let Ok(path_rc) = shell_path_rc(shell_name) {
+                    // than the file carrying the hook and for bash is the login
+                    // file as well as `.bashrc`. Recording it against the hook's
+                    // file alone would leave uninstall excising a block from one
+                    // file while the real ones stayed behind. The entries share
+                    // a target name and differ by path, which is what the
+                    // ledger's `(kind, target, path)` identity is for.
+                    for path_rc in shell_path_rcs(shell_name).unwrap_or_default() {
                         let bin_dir = kin_home.join("bin");
                         let path_block = rc_path_block(shell_name, &bin_dir);
                         let path_present = fs::read_to_string(&path_rc)
@@ -13990,6 +14098,15 @@ fn legacy_shell_path_targets(home: &Path) -> Vec<(String, PathBuf)> {
     // would leave the export behind pointing at a directory it had removed.
     targets.insert(("zsh".to_string(), home.join(".zshenv")));
     targets.insert(("bash".to_string(), home.join(".bashrc")));
+    // bash's PATH line also lives in whichever login file bash reads, and which
+    // one that is depends on what existed when setup ran. An uninstall that
+    // swept only `.bashrc` would leave the export behind in the file a login
+    // shell is the one reading, so all three candidates are swept. Sweeping a
+    // file Kin never wrote to costs nothing: the cleanup removes only exact
+    // occurrences of Kin's own block and skips a file carrying none.
+    for name in BASH_LOGIN_RCS {
+        targets.insert(("bash".to_string(), home.join(name)));
+    }
     targets.insert(("fish".to_string(), home.join(".config/fish/config.fish")));
     targets.insert((
         "powershell".to_string(),
@@ -15824,6 +15941,226 @@ wait
         );
     }
 
+    /// The defect a bash user hits in the first ten minutes. `kin setup` wrote
+    /// the PATH line only to `.bashrc`, which a login shell never reads, so on a
+    /// fresh install `bash -lc` could not find `kin` at all. FIR-2596.
+    ///
+    /// This drives the real writer against a throwaway home and then asks a real
+    /// `bash -lc` what its PATH carries. The assertion is on the install's own
+    /// bin directory rather than on which `kin` wins, because a login shell runs
+    /// `/etc/profile` first and macOS's `path_helper` puts the system
+    /// directories back in front; on a host that already has a `kin` in
+    /// `/usr/local/bin`, asserting on the winner would measure the operator's
+    /// machine instead of this install.
+    ///
+    /// The falsification is the second half: delete the login file the fix
+    /// writes, leaving exactly the pre-fix layout of `.bashrc` and nothing else,
+    /// and the same probe loses the directory again.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn a_bash_login_shell_finds_kin_after_setup() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if !Path::new("/bin/bash").is_file() {
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let kin_home = tmp.path().join("kin-home");
+        let bin_dir = kin_home.join("bin");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&bin_dir).unwrap();
+
+        // The binary the launcher-provisioned layout puts in ~/.kin/bin. Only
+        // where it sits matters here; the probe asks what PATH carries.
+        let stub = bin_dir.join("kin");
+        fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
+        let _kin_dir = EnvVarGuard::unset("KIN_DIR");
+        {
+            let _home = EnvVarGuard::set("HOME", &home);
+            install_shell_hook("bash").unwrap();
+        }
+
+        let login_shell_path = || {
+            let out = std::process::Command::new("/bin/bash")
+                .arg("-lc")
+                .arg(r#"printf '%s\n' "$PATH""#)
+                .env("HOME", &home)
+                .env("PATH", "/usr/bin:/bin")
+                .env_remove("KIN_HOME")
+                .env_remove("KIN_DIR")
+                .env_remove("BASH_ENV")
+                .current_dir(&home)
+                .output()
+                .expect("could not run /bin/bash -lc");
+            assert!(
+                out.status.success(),
+                "the probe shell itself failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let carries_bin = |path: &str| path.split(':').any(|entry| Path::new(entry) == bin_dir);
+
+        let after = login_shell_path();
+        assert!(
+            carries_bin(&after),
+            "a bash login shell does not carry {} on its PATH, so `bash -lc` \
+             cannot find kin on a fresh install: {after}",
+            bin_dir.display()
+        );
+
+        // Falsification: the pre-fix layout, `.bashrc` and nothing else.
+        fs::remove_file(home.join(".bash_profile")).unwrap();
+        assert!(
+            home.join(".bashrc").exists(),
+            "the falsification has to leave the pre-fix file in place"
+        );
+        let without = login_shell_path();
+        assert!(
+            !carries_bin(&without),
+            "with the login file gone the login shell still carries {}, so this \
+             check cannot fail and is not evidence: {without}",
+            bin_dir.display()
+        );
+    }
+
+    /// An existing login file belongs to whoever wrote it. Kin appends its PATH
+    /// block there and nothing else: no seed, no source line, no reordering of
+    /// what was already in it.
+    #[test]
+    #[serial]
+    fn an_existing_bash_login_file_keeps_its_own_semantics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let kin_home = tmp.path().join("kin-home");
+        let bin_dir = kin_home.join("bin");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&bin_dir).unwrap();
+
+        let mine = "# mine\nexport EDITOR=vi\n";
+        fs::write(home.join(".bash_profile"), mine).unwrap();
+
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
+        let _kin_dir = EnvVarGuard::unset("KIN_DIR");
+        {
+            let _home = EnvVarGuard::set("HOME", &home);
+            install_shell_hook("bash").unwrap();
+        }
+
+        let profile = fs::read_to_string(home.join(".bash_profile")).unwrap();
+        assert!(
+            profile.starts_with(mine),
+            "an existing login file keeps what its owner put there, unchanged and \
+             in place: {profile}"
+        );
+        assert!(
+            profile.contains(&rc_path_line("bash", &bin_dir)),
+            "the PATH line still has to reach the file a login shell reads: {profile}"
+        );
+        assert!(
+            !profile.contains("Created by kin setup"),
+            "the seed is for a file Kin creates, never for one it found: {profile}"
+        );
+        assert!(
+            !profile.contains("kin-vfs"),
+            "the projection hook belongs in the interactive file only; a login \
+             file carrying it would inject the shim into every `bash -lc`: {profile}"
+        );
+
+        // The hook's own file is untouched by any of that.
+        let bashrc = fs::read_to_string(home.join(".bashrc")).unwrap();
+        assert!(bashrc.contains("kin-vfs"), "{bashrc}");
+        assert!(
+            bashrc.contains(&rc_path_line("bash", &bin_dir)),
+            "an interactive non-login bash reads only `.bashrc`, so the PATH line \
+             stays here too: {bashrc}"
+        );
+    }
+
+    /// A second `kin setup` run must not append a second export to either file.
+    #[test]
+    #[serial]
+    fn a_second_bash_setup_run_appends_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let kin_home = tmp.path().join("kin-home");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(kin_home.join("bin")).unwrap();
+
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
+        let _kin_dir = EnvVarGuard::unset("KIN_DIR");
+        let _home = EnvVarGuard::set("HOME", &home);
+
+        install_shell_hook("bash").unwrap();
+        let first: Vec<String> = [".bashrc", ".bash_profile"]
+            .iter()
+            .map(|name| fs::read_to_string(home.join(name)).unwrap())
+            .collect();
+        install_shell_hook("bash").unwrap();
+        let second: Vec<String> = [".bashrc", ".bash_profile"]
+            .iter()
+            .map(|name| fs::read_to_string(home.join(name)).unwrap())
+            .collect();
+
+        assert_eq!(first, second, "a re-run rewrote the rc files");
+    }
+
+    /// Uninstall can only excise what setup recorded, so every file the bash
+    /// PATH line lands in has to reach the ledger. Recording only `.bashrc`
+    /// would leave the export behind in the file a login shell is the one
+    /// reading, pointing at a directory the same run had just removed.
+    #[test]
+    #[serial]
+    fn the_ledger_records_both_files_the_bash_path_line_lands_in() {
+        use crate::commands::setup_ledger::{ledger_path, ArtifactKind, SetupLedger};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let kin_home = tmp.path().join("kin-home");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(kin_home.join("bin")).unwrap();
+        fs::create_dir_all(kin_home.join("config")).unwrap();
+
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
+        let _kin_dir = EnvVarGuard::unset("KIN_DIR");
+        let _home = EnvVarGuard::set("HOME", &home);
+
+        install_shell_hook("bash").unwrap();
+        let plan = SetupPlan {
+            install_shell_hook: true,
+            configure_mcp: false,
+            mcp_assistant_indices: Vec::new(),
+            inject_discovery_reminders: false,
+            auto_daemon: false,
+            show_editor_hint: false,
+            show_hosted_hint: false,
+        };
+        record_setup_ledger(&plan, "bash", &[]);
+
+        let ledger = SetupLedger::load(&ledger_path().unwrap()).unwrap();
+        let recorded: Vec<&std::path::PathBuf> = ledger
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == ArtifactKind::ShellPathLine)
+            .map(|entry| &entry.path)
+            .collect();
+        assert!(
+            recorded.contains(&&home.join(".bash_profile")),
+            "the login file carrying the PATH line is unrecorded, so uninstall \
+             cannot remove it: {recorded:?}"
+        );
+        assert!(
+            recorded.contains(&&home.join(".bashrc")),
+            "the interactive file's PATH line stopped being recorded: {recorded:?}"
+        );
+    }
+
     /// Setup wrote `~/.claude.json` and a global `~/.claude/CLAUDE.md` block and
     /// called it "Claude Code configured". "Configured" is a claim about a
     /// client that is installed; for one that is not, the only new thing is the
@@ -17293,10 +17630,10 @@ printf 'LD=[%s]\n' "$LD_PRELOAD"
 
         let hook = plan
             .iter()
-            .find(|(_, blocks)| *blocks == RcBlocks::HookOnly)
+            .find(|target| target.blocks == RcBlocks::HookOnly)
             .expect("zsh writes a hook-only file");
         assert_eq!(
-            hook.0.file_name().and_then(|name| name.to_str()),
+            hook.path.file_name().and_then(|name| name.to_str()),
             Some(".zshrc"),
             "the hook moved out of the interactive file, which would inject the \
              shim into every non-interactive shell"
@@ -17304,26 +17641,121 @@ printf 'LD=[%s]\n' "$LD_PRELOAD"
 
         let path = plan
             .iter()
-            .find(|(_, blocks)| *blocks == RcBlocks::PathOnly)
+            .find(|target| target.blocks == RcBlocks::PathOnly)
             .expect("zsh writes a path-only file");
         assert_eq!(
-            path.0.file_name().and_then(|name| name.to_str()),
+            path.path.file_name().and_then(|name| name.to_str()),
             Some(".zshenv"),
             "the PATH line is back in a file only an interactive zsh reads, so a \
              script or an agent cannot find kin at all"
         );
+        assert!(
+            path.seed_when_absent.is_none(),
+            "zsh's `.zshenv` needs nothing but Kin's own block: {path:?}"
+        );
     }
 
-    /// Every other shell reads one file for both, and splitting them there would
-    /// write a second block nothing reads.
+    /// fish and PowerShell read one file for both, and splitting them there
+    /// would write a second block nothing reads.
     #[test]
     fn a_shell_that_reads_one_file_still_gets_one_plan() {
-        for shell in ["bash", "fish", "powershell"] {
+        for shell in ["fish", "powershell"] {
             let plan = rc_write_plan(shell).unwrap();
             assert_eq!(plan.len(), 1, "{shell}: {plan:?}");
-            assert_eq!(plan[0].1, RcBlocks::HookAndPath, "{shell}");
-            assert_eq!(plan[0].0, shell_rc(shell).unwrap(), "{shell}");
+            assert_eq!(plan[0].blocks, RcBlocks::HookAndPath, "{shell}");
+            assert_eq!(plan[0].path, shell_rc(shell).unwrap(), "{shell}");
+            assert!(plan[0].seed_when_absent.is_none(), "{shell}");
         }
+    }
+
+    /// bash reads `.bashrc` only for an interactive non-login shell. A login
+    /// shell reads `.bash_profile`, `.bash_login` or `.profile`, the first one
+    /// only, and never `.bashrc` unless one of them sources it, so a PATH line
+    /// written to `.bashrc` alone is invisible to `bash -lc`, to an ssh login and
+    /// to a macOS Terminal tab. This is FIR-2596.
+    #[test]
+    #[serial]
+    fn bash_writes_its_path_line_where_a_login_shell_reads_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let _home = EnvVarGuard::set("HOME", &home);
+
+        let plan = rc_write_plan("bash").unwrap();
+        assert_eq!(plan.len(), 2, "{plan:?}");
+
+        let interactive = plan
+            .iter()
+            .find(|target| target.path == home.join(".bashrc"))
+            .expect("bash still writes to the file an interactive shell reads");
+        assert_eq!(
+            interactive.blocks,
+            RcBlocks::HookAndPath,
+            "dropping the PATH line from `.bashrc` would take kin away from every \
+             terminal that opens a non-login shell: {interactive:?}"
+        );
+
+        let login = plan
+            .iter()
+            .find(|target| target.path == home.join(".bash_profile"))
+            .expect("a home with no login file gets `.bash_profile`");
+        assert_eq!(
+            login.blocks,
+            RcBlocks::PathOnly,
+            "the projection hook must not reach a login file, where `bash -lc` \
+             would source it: {login:?}"
+        );
+        assert_eq!(
+            login.seed_when_absent,
+            Some(BASH_PROFILE_SEED),
+            "a `.bash_profile` Kin creates has to pair with `.bashrc` the way a \
+             bash user expects: {login:?}"
+        );
+    }
+
+    /// Which login file bash reads is decided by what exists, first one wins, so
+    /// Kin has to append to that one rather than to a file bash will skip.
+    #[test]
+    #[serial]
+    fn the_bash_login_file_follows_bash_own_resolution_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+
+        assert_eq!(
+            bash_login_rc_in(&home),
+            home.join(".bash_profile"),
+            "with none of the three present there is nothing to append to, and \
+             `.bash_profile` is the one bash looks at first"
+        );
+
+        fs::write(home.join(".profile"), "# mine\n").unwrap();
+        assert_eq!(bash_login_rc_in(&home), home.join(".profile"));
+
+        fs::write(home.join(".bash_login"), "# mine\n").unwrap();
+        assert_eq!(
+            bash_login_rc_in(&home),
+            home.join(".bash_login"),
+            "`.bash_login` outranks `.profile` in bash's own order"
+        );
+
+        fs::write(home.join(".bash_profile"), "# mine\n").unwrap();
+        assert_eq!(
+            bash_login_rc_in(&home),
+            home.join(".bash_profile"),
+            "`.bash_profile` outranks both, and appending anywhere else would \
+             write to a file this login shell never opens"
+        );
+
+        // The seed is for a file Kin creates. This one exists, so the plan must
+        // not offer to rewrite what its owner put there.
+        let _home_guard = EnvVarGuard::set("HOME", &home);
+        let login = rc_write_plan("bash")
+            .unwrap()
+            .into_iter()
+            .find(|target| target.blocks == RcBlocks::PathOnly)
+            .expect("bash writes a path-only login file");
+        assert_eq!(login.path, home.join(".bash_profile"));
     }
 
     /// Each half of the plan writes its own block and nothing else. Without
@@ -17424,6 +17856,32 @@ printf 'LD=[%s]\n' "$LD_PRELOAD"
             targets
                 .iter()
                 .any(|(shell, path)| shell == "zsh" && path == &home.join(".zshrc")),
+            "{targets:?}"
+        );
+    }
+
+    /// Same rule for bash, whose PATH line lands in whichever login file bash
+    /// reads. Which one that was depends on what existed when setup ran, so
+    /// uninstall sweeps all three candidates; the cleanup removes only exact
+    /// occurrences of Kin's own block, so a file Kin never wrote to costs
+    /// nothing.
+    #[test]
+    fn uninstall_sweeps_the_files_a_bash_login_shell_reads() {
+        let home = Path::new("/home/u");
+        let targets = legacy_shell_path_targets(home);
+        for name in BASH_LOGIN_RCS {
+            assert!(
+                targets
+                    .iter()
+                    .any(|(shell, path)| shell == "bash" && path == &home.join(name)),
+                "{name} is unswept, so an uninstall leaves the export behind in \
+                 the file a login shell reads: {targets:?}"
+            );
+        }
+        assert!(
+            targets
+                .iter()
+                .any(|(shell, path)| shell == "bash" && path == &home.join(".bashrc")),
             "{targets:?}"
         );
     }

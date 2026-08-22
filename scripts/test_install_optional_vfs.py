@@ -59,6 +59,8 @@ class OptionalVfsInstallerTests(unittest.TestCase):
         seed_launcher_stamp: bool = False,
         archive_owner: tuple[int, int] | None = None,
         tar_stub: str | None = None,
+        home_files: dict[str, str] | None = None,
+        shell: str = "/bin/sh",
     ) -> tuple[subprocess.CompletedProcess[str], Path]:
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
@@ -121,6 +123,8 @@ class OptionalVfsInstallerTests(unittest.TestCase):
 
         home = root / "home"
         home.mkdir()
+        for name, body in (home_files or {}).items():
+            (home / name).write_text(body, encoding="utf-8")
         kin_home = home / ".kin"
         if seed_current_install:
             (kin_home / "bin").mkdir(parents=True)
@@ -150,7 +154,7 @@ class OptionalVfsInstallerTests(unittest.TestCase):
                 "KIN_HOME": str(kin_home),
                 "KIN_NO_SETUP": "1",
                 "KIN_VERSION": VERSION,
-                "SHELL": "/bin/sh",
+                "SHELL": shell,
             }
         )
         fake_bin = root / "fake-bin"
@@ -235,6 +239,121 @@ class OptionalVfsInstallerTests(unittest.TestCase):
                 text=True,
             )
         return result, kin_home
+
+    def login_shell_path(self, home: Path) -> str:
+        """What PATH a real `bash -lc` carries in this home."""
+
+        probe = subprocess.run(
+            ["/bin/bash", "-lc", 'printf \'%s\\n\' "$PATH"'],
+            env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+            cwd=str(home),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        return probe.stdout.strip()
+
+    def test_installer_puts_kin_on_path_for_a_bash_login_shell(self) -> None:
+        """FIR-2596. bash reads .bashrc only for an interactive non-login shell.
+
+        A login shell reads .bash_profile, .bash_login or .profile, the first
+        one only, and never .bashrc, so the installer writing .bashrc alone left
+        `bash -lc 'command -v kin'` empty on a fresh install. The assertion is
+        on the install's own bin directory rather than on which kin wins,
+        because a login shell runs /etc/profile first and macOS's path_helper
+        puts the system directories back in front.
+        """
+
+        result, kin_home = self.run_installer(
+            vfs_exit=0, shell="/bin/bash", home_files={".bashrc": "# mine\n"}
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        home = kin_home.parent
+        bin_dir = str(kin_home / "bin")
+
+        profile = home / ".bash_profile"
+        self.assertTrue(
+            profile.is_file(),
+            "a home with no login file gets one, or a login shell reads nothing",
+        )
+        profile_text = profile.read_text(encoding="utf-8")
+        self.assertIn(bin_dir, profile_text)
+        self.assertIn(
+            "case $- in",
+            profile_text,
+            "the created file pairs with ~/.bashrc only when interactive; "
+            "unguarded it would source the projection hook into every bash -lc",
+        )
+        self.assertIn(
+            bin_dir,
+            (home / ".bashrc").read_text(encoding="utf-8"),
+            "an interactive non-login bash reads only .bashrc, so the line stays "
+            "there too",
+        )
+
+        if not Path("/bin/bash").is_file():
+            return
+        self.assertIn(
+            bin_dir,
+            self.login_shell_path(home).split(":"),
+            "a real bash login shell still does not carry the install's bin "
+            "directory",
+        )
+
+        # Falsification: the pre-fix layout, .bashrc and nothing else.
+        profile.unlink()
+        self.assertNotIn(
+            bin_dir,
+            self.login_shell_path(home).split(":"),
+            "with the login file gone a login shell still carries the bin "
+            "directory, so this check cannot fail and is not evidence",
+        )
+
+    def test_installer_appends_to_the_login_file_bash_would_read(self) -> None:
+        """bash stops at the first login file that exists, so the installer has
+        to append to that one rather than create a file bash will skip."""
+
+        result, kin_home = self.run_installer(
+            vfs_exit=0,
+            shell="/bin/bash",
+            home_files={".bashrc": "# mine\n", ".profile": "# mine\n"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        home = kin_home.parent
+        bin_dir = str(kin_home / "bin")
+
+        profile_text = (home / ".profile").read_text(encoding="utf-8")
+        self.assertTrue(
+            profile_text.startswith("# mine\n"),
+            f"an existing login file keeps what its owner put there: {profile_text}",
+        )
+        self.assertIn(bin_dir, profile_text)
+        self.assertFalse(
+            (home / ".bash_profile").exists(),
+            "creating .bash_profile beside an existing .profile takes over "
+            "which file bash reads, which is not the installer's call",
+        )
+
+    def test_installer_writes_no_bash_file_for_a_home_that_runs_zsh(self) -> None:
+        """The control. A bash arm that fires unconditionally would pass the two
+        checks above while conjuring dotfiles in every zsh user's home."""
+
+        result, kin_home = self.run_installer(
+            vfs_exit=0, shell="/bin/zsh", home_files={".zshrc": "# mine\n"}
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        home = kin_home.parent
+        for name in (".bashrc", ".bash_profile", ".bash_login", ".profile"):
+            self.assertFalse(
+                (home / name).exists(),
+                f"the installer created {name} in a home that runs zsh",
+            )
+        self.assertIn(
+            str(kin_home / "bin"),
+            (home / ".zshenv").read_text(encoding="utf-8"),
+            "the zsh arm still has to do its own job",
+        )
 
     def test_reports_projection_only_when_vfs_is_executable(self) -> None:
         result, kin_home = self.run_installer(vfs_exit=0)
