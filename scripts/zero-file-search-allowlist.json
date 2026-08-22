@@ -240,7 +240,10 @@
         "let _ = fs::remove_file(kin_root.join(APPROACHING_COMMIT_FILE_NAME));",
         "if let Ok(contents) = fs::read_to_string(\"/sys/fs/cgroup/memory.max\") {",
         "let raw: u64 = fs::read_to_string(\"/sys/fs/cgroup/memory/memory.limit_in_bytes\")",
-        "if let Ok(contents) = fs::read_to_string(path) {",
+        {
+          "expr": "if let Ok(contents) = fs::read_to_string(path) {",
+          "count": 2
+        },
         "let raw = fs::read_to_string(kin_root.join(KILL_RECORD_FILE_NAME)).ok()?;",
         "let _ = fs::remove_file(kin_root.join(KILL_RECORD_FILE_NAME));",
         "let candidate_root = candidate_root.canonicalize()?;",
@@ -433,6 +436,18 @@
           "fn": "sync_directory_metadata",
           "count": 2
         }
+      ]
+    },
+    {
+      "file": "crates/kin-core/src/memory_pressure.rs",
+      "reason": "Host-environment probe and a durable disclosure marker, neither an answer authority. Two classes of pin, checked individually. (1) The host reading: /proc/meminfo is this machine's own memory accounting, read so heavy work can decide whether to start; the cgroup half of the same reading goes through kin_daemon_spawn::cgroup_memory rather than opening /sys/fs/cgroup a second time, and the macOS half is a pair of syscalls with no filesystem access at all. The file names no entity, carries no repository content, and a reader that lied in either direction would change how much work Kin does and never what a locate, search, context, trace, review or xref returns. (2) The refusal record: .kin/memory-pressure holds the most recent piece of heavy work this store's daemon declined and the sentence it declined it with, written by the daemon that decided and read by kin doctor, kin graph status and the MCP envelope, which run later and in other processes. It sits beside the sweep-interruption tally in kin-daemon-spawn and exists for the same reason: the process that made the decision is not the process that has to report it, and a daemon-log WARN reaches nobody. Last writer wins and an unparsable record reads as absent, so it can withhold no answer and produce none. Pinned by exact expression rather than whole-file so the grading rule, the thresholds and the disclosure wording stay scanned, and so any added occurrence fails closed.",
+      "owner": "kin-core",
+      "expiration": "2026-12-31",
+      "allow_match": [
+        "let contents = std::fs::read_to_string(\"/proc/meminfo\")",
+        "let _ = std::fs::write(pressure_record_path(kin_root), body);",
+        "let raw = std::fs::read(pressure_record_path(kin_root)).ok()?;",
+        "let _ = std::fs::remove_file(pressure_record_path(kin_root));"
       ]
     },
     {

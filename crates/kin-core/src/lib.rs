@@ -31,6 +31,7 @@ mod init_staging;
 pub mod last_admission;
 pub mod layout;
 pub mod manifest;
+pub mod memory_pressure;
 pub mod ranking;
 pub mod ref_view;
 pub mod reference_coverage;

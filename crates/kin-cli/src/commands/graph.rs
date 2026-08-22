@@ -944,6 +944,16 @@ fn build_graph_status_response_for_store(
     if let Some(suspended) = kin_root.and_then(kin_daemon_spawn::SuspendedSweep::read) {
         warnings.push(suspended.summary());
     }
+    // Work the daemon declined for want of memory is invisible in the same way
+    // and for the same reason: the counters above report it as pending, and the
+    // process that declined it left nothing behind but this record.
+    if let Some(refusal) = kin_root.and_then(kin_core::memory_pressure::PressureRefusal::read) {
+        warnings.push(format!(
+            "{} {}",
+            refusal.cause_sentence(),
+            kin_core::memory_pressure::PRESSURE_REMEDY
+        ));
+    }
     if warnings.is_empty() && criticals.is_empty() {
         lines.push(String::new());
         lines.push("✓ No issues detected.".to_string());
