@@ -568,8 +568,16 @@ pub fn enforce(
     // but the caller has to be told which of the two it is holding.
     if accounting.chars_after > budget.max_chars {
         disclose_residual(payload, budget);
-        accounting.chars_after = measure(payload);
+    } else {
+        // The other direction, and it is reachable: the first arm cuts under
+        // the budget less the envelope reserve, so it can miss a ceiling this
+        // arm clears once the reserve it was holding back turns out to be
+        // larger than the envelope that landed. A note saying the response did
+        // not fit, on a response that does, is the same false report in
+        // reverse.
+        clear_residual(payload);
     }
+    accounting.chars_after = measure(payload);
     Some(accounting)
 }
 
@@ -789,6 +797,22 @@ fn disclose_residual(payload: &mut Value, budget: &ResponseBudget) {
             existing.push(entry);
         }
         None => payload["degradations"] = Value::Array(vec![entry]),
+    }
+}
+
+/// Withdraw a residual note an earlier arm left on a response that now fits.
+fn clear_residual(payload: &mut Value) {
+    let Some(entries) = payload
+        .get_mut("degradations")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    entries.retain(|entry| entry.get("reason").and_then(Value::as_str) != Some(OVER_BUDGET_REASON));
+    if entries.is_empty() {
+        if let Some(map) = payload.as_object_mut() {
+            map.remove("degradations");
+        }
     }
 }
 
@@ -1612,6 +1636,59 @@ mod tests {
                 .count();
             assert_eq!(notes, 1, "pass {pass} left {notes} copies: {payload}");
         }
+    }
+
+    /// The residual note is withdrawn when a later arm clears the ceiling the
+    /// earlier one missed. The first arm cuts under the budget less the envelope
+    /// reserve, so it can miss a ceiling the second arm clears once the envelope
+    /// that lands is smaller than the reserve held back for it. A note saying
+    /// the response did not fit, on a response that does, is the same false
+    /// report in reverse.
+    #[test]
+    fn a_residual_note_is_withdrawn_by_an_arm_that_fits() {
+        let mut payload = impact_payload_bulk_outside_the_buckets(60);
+        let tight = ResponseBudget {
+            max_chars: RESPONSE_MIN_MAX_CHARS,
+            ..ResponseBudget::default()
+        };
+        let cut = enforce(&mut payload, "impact_analysis", &tight).expect("budgeted");
+        assert!(
+            cut.chars_after > tight.max_chars,
+            "the first arm must miss its ceiling, or this proves nothing"
+        );
+        assert!(
+            has_residual(&payload),
+            "the first arm must have left a note: {payload}"
+        );
+
+        let loose = ResponseBudget {
+            max_chars: 20_000,
+            ..ResponseBudget::default()
+        };
+        let again = enforce(&mut payload, "impact_analysis", &loose).expect("budgeted");
+        assert!(
+            again.chars_after <= loose.max_chars,
+            "the second arm must clear its ceiling, or this proves nothing"
+        );
+        assert!(
+            !has_residual(&payload),
+            "a response that fits must not claim it does not: {payload}"
+        );
+        assert!(
+            again.bounded,
+            "the cut the first arm made is still a cut: {payload}"
+        );
+    }
+
+    fn has_residual(payload: &Value) -> bool {
+        payload
+            .get("degradations")
+            .and_then(Value::as_array)
+            .is_some_and(|entries| {
+                entries
+                    .iter()
+                    .any(|entry| entry["reason"] == json!(OVER_BUDGET_REASON))
+            })
     }
 
     /// The elision half of the same case: the widened table must cut with counts
