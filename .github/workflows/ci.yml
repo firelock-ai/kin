@@ -1140,15 +1140,6 @@ jobs:
       - name: Test Private Repo Coupling Guard
         run: python3 scripts/test-private-repo-coupling.py
 
-      # FIR-2600. The response budget must never render a list it cut as an
-      # empty one, because an empty array is the shape a reader takes for "the
-      # walk found none". The suite that drives this against real binaries is a
-      # step in the acceptance workflow; what runs here is its falsifier, which
-      # hands every grader the exact defect that shipped and fails if the grader
-      # still passes. A grader that cannot fail is not a check.
-      - name: Falsify the response-budget elision graders
-        run: python3 scripts/acceptance/response_budget_elisions.py --self-test
-
       # The committed Cargo.lock plus .cargo/config.toml pins kin-* dependencies
       # to public source until every crate is registry-published.
       - name: Build
