@@ -2039,11 +2039,17 @@ fn plan_catch_up_events(state: &DaemonState, since: SystemTime) -> Result<Vec<Fi
 /// `kin graph status` counting it among the files that "produced no entity".
 ///
 /// This asks the graph rather than the host: an admitted path whose language
-/// has a full adapter and which no entity names is either genuinely empty of
-/// definitions, which costs one parse to re-confirm, or lost enrichment, which
-/// this recovers. Every path goes back through the ordinary tick, so the same
-/// bounded observation, policy filter and compare-and-swap apply as for an edit
-/// a watcher saw.
+/// has a full adapter, which no entity names, and which carries no parsed
+/// layout either, has never been parsed by this daemon. Every path goes back
+/// through the ordinary tick, so the same bounded observation, policy filter and
+/// compare-and-swap apply as for an edit a watcher saw.
+///
+/// The layout is what keeps this from repeating. A file that genuinely declares
+/// nothing, an empty `__init__.py` among them, produces no entity however often
+/// it is parsed, and offering it on every pass would re-parse it on every commit
+/// forever while warning about a fault that is not one. Parsing registers a
+/// layout whether or not it found a declaration, so one pass answers the
+/// question for the rest of this daemon's life.
 fn plan_unenriched_source_events(state: &DaemonState) -> Result<Vec<FileEvent>> {
     use kin_model::EntityStore;
 
@@ -2065,6 +2071,9 @@ fn plan_unenriched_source_events(state: &DaemonState) -> Result<Vec<FileEvent>> 
             continue;
         };
         if enriched.contains(&file_id) {
+            continue;
+        }
+        if state.graph.get_file_layout(&file_id)?.is_some() {
             continue;
         }
         let Ok(host_path) = kin_index::host_path_from_repo_path(working_dir, &artifact.path) else {
@@ -7264,6 +7273,42 @@ mod tests {
         assert!(
             plan_unenriched_source_events(&state).unwrap().is_empty(),
             "and once the graph holds an entity for it, nothing is owed"
+        );
+    }
+
+    /// A source file that declares nothing produces no entity however often it
+    /// is parsed. Parsing registers its layout, and that is what stops the
+    /// repair re-parsing it on every commit for the rest of the daemon's life
+    /// while warning about a fault that is not one.
+    #[test]
+    fn a_source_path_that_parsed_to_no_declarations_is_offered_once() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let empty = repo.path().join("declares_nothing.rs");
+        std::fs::write(&empty, b"// nothing here\n").unwrap();
+        admit_file_event(&state, &FileEvent::Changed(empty)).unwrap();
+        assert_eq!(
+            plan_unenriched_source_events(&state).unwrap().len(),
+            1,
+            "the positive control: an unparsed source path is owed one pass"
+        );
+
+        state
+            .graph
+            .upsert_file_layout(&kin_model::FileLayout {
+                file_id: FilePathId::new("declares_nothing.rs"),
+                parse_completeness: kin_model::ParseCompleteness::Full,
+                imports: kin_model::ImportSection {
+                    byte_range: 0..0,
+                    items: Vec::new(),
+                },
+                regions: Vec::new(),
+            })
+            .unwrap();
+
+        assert!(
+            plan_unenriched_source_events(&state).unwrap().is_empty(),
+            "and a parsed layout with no entity in it answers the question for good"
         );
     }
 
