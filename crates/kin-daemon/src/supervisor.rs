@@ -187,10 +187,7 @@ impl SupervisorState {
 }
 
 fn supervisor_dir() -> PathBuf {
-    kin_core::registry::registry_path()
-        .parent()
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from(".kin"))
+    kin_core::registry::supervisor_root()
 }
 
 #[derive(Debug)]
