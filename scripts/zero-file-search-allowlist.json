@@ -89,7 +89,10 @@
         "std::fs::File::open(path)?",
         "std::fs::read_dir(&runs_dir)",
         "let hook_installed = hook_path.exists();",
-        ".and_then(|rc| std::fs::read_to_string(rc).ok())",
+        {
+          "expr": ".and_then(|rc| std::fs::read_to_string(rc).ok())",
+          "count": 2
+        },
         ".filter_map(|rc| std::fs::read_to_string(rc).ok())",
         "if alt.exists() && !primary.exists()",
         "match std::fs::read_to_string(path) {",
