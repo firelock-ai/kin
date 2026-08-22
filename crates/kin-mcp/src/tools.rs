@@ -3,6 +3,70 @@
 
 use crate::types::{ToolAnnotations, ToolDefinition, ToolsListResult};
 
+/// The `max_chars` property every retrieval tool advertises, built from the
+/// budget's own constants.
+///
+/// Nine tools carried a byte-identical copy of this block with the numbers
+/// written out, so moving the ceiling meant editing ten homes and a release read
+/// whichever one was missed. The stranger who asked for 120,000 characters was
+/// reading one of those copies, which advertised 400,000 while a real client
+/// refused 117,313. There is one home now, and it is the constant.
+fn max_chars_property() -> serde_json::Value {
+    serde_json::json!({
+        "type": "integer",
+        "description": format!(
+            "Serialized characters this response may occupy (default {default}, clamped \
+             {min}..{max}). The ceiling is what a real MCP client accepts, not what this server \
+             could build. The tool enforces the budget itself: it sheds ranking explanation, then \
+             duplicated hit shapes, then inline source, and only then withholds entries, and it \
+             never empties a list it cut. A list the budget cut keeps at least one entry and is \
+             reported under `elisions` with what it kept, what it lost, and why, so an empty array \
+             always means the walk found none. Any cut is also reported in `degradations` and in \
+             `_kin.response`, which carries the size the response had before the budget.",
+            default = crate::budget::RESPONSE_DEFAULT_MAX_CHARS,
+            min = crate::budget::RESPONSE_MIN_MAX_CHARS,
+            max = crate::budget::RESPONSE_MAX_MAX_CHARS,
+        ),
+        "default": crate::budget::RESPONSE_DEFAULT_MAX_CHARS,
+        "minimum": crate::budget::RESPONSE_MIN_MAX_CHARS,
+        "maximum": crate::budget::RESPONSE_MAX_MAX_CHARS,
+    })
+}
+
+/// `trace_data_flow`'s own spelling of the same budget.
+fn trace_max_chars_property() -> serde_json::Value {
+    serde_json::json!({
+        "type": "integer",
+        "description": format!(
+            "Serialized characters this response may occupy (default {default}, clamped \
+             {min}..{max}, the same budget every retrieval tool answers under). The tool enforces \
+             it itself, dropping bodies before edges, and it never returns an empty chain for a \
+             walk that found steps: a cut chain keeps at least one step and reports the rest under \
+             `elisions.chain` and `steps_omitted`. `max_chars` is the same parameter under the \
+             name the other retrieval tools use.",
+            default = crate::budget::RESPONSE_DEFAULT_MAX_CHARS,
+            min = crate::budget::RESPONSE_MIN_MAX_CHARS,
+            max = crate::budget::RESPONSE_MAX_MAX_CHARS,
+        ),
+        "default": crate::budget::RESPONSE_DEFAULT_MAX_CHARS,
+        "minimum": crate::budget::RESPONSE_MIN_MAX_CHARS,
+        "maximum": crate::budget::RESPONSE_MAX_MAX_CHARS,
+    })
+}
+
+/// The alias spelling, which carries the same numbers so a caller cannot read
+/// two ceilings off one tool.
+fn trace_max_chars_alias_property() -> serde_json::Value {
+    serde_json::json!({
+        "type": "integer",
+        "description": "Alias for max_response_chars, the spelling shared with the other \
+                        retrieval tools.",
+        "default": crate::budget::RESPONSE_DEFAULT_MAX_CHARS,
+        "minimum": crate::budget::RESPONSE_MIN_MAX_CHARS,
+        "maximum": crate::budget::RESPONSE_MAX_MAX_CHARS,
+    })
+}
+
 /// A tool that only reads graph truth.
 ///
 /// `openWorldHint` is false on every tool this crate defines: the whole surface
@@ -308,7 +372,7 @@ fn registered_tools() -> ToolsListResult {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "max_chars": { "type": "integer", "description": "Serialized characters this response may occupy (default 30000, clamped 2000..400000). The tool enforces it itself: it sheds ranking explanation, then duplicated hit shapes, then inline source, and only then withholds hits, so a result is never refused for being too large. Any cut is reported in `degradations` and in `_kin.response`, which also carries the size the response had before the budget. Raise it only if your client accepts a larger tool result.", "default": 30000, "minimum": 2000, "maximum": 400000 },
+                        "max_chars": max_chars_property(),
                         "query": { "type": "string", "description": "Name pattern to search for" },
                         "kind": { "type": "string", "description": "Entity kind filter (function, class, etc.)" },
                         "language": { "type": "string", "description": "Language filter (rust, typescript, etc.)" },
@@ -325,7 +389,7 @@ fn registered_tools() -> ToolsListResult {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "max_chars": { "type": "integer", "description": "Serialized characters this response may occupy (default 30000, clamped 2000..400000). The tool enforces it itself: it sheds ranking explanation, then duplicated hit shapes, then inline source, and only then withholds hits, so a result is never refused for being too large. Any cut is reported in `degradations` and in `_kin.response`, which also carries the size the response had before the budget. Raise it only if your client accepts a larger tool result.", "default": 30000, "minimum": 2000, "maximum": 400000 },
+                        "max_chars": max_chars_property(),
                         "compact": { "type": "boolean", "description": "If true (default), omit ranking explanation and per-signal breakdowns and return one shape per hit. Pass false (or explain: true) to get the breakdowns back.", "default": true },
                         "query": { "type": "string", "description": "Natural-language description of the code to find. Optional when paging with `cursor`." },
                         "queries": {
@@ -449,7 +513,7 @@ fn registered_tools() -> ToolsListResult {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "max_chars": { "type": "integer", "description": "Serialized characters this response may occupy (default 30000, clamped 2000..400000). The tool enforces it itself: it sheds ranking explanation, then duplicated hit shapes, then inline source, and only then withholds hits, so a result is never refused for being too large. Any cut is reported in `degradations` and in `_kin.response`, which also carries the size the response had before the budget. Raise it only if your client accepts a larger tool result.", "default": 30000, "minimum": 2000, "maximum": 400000 },
+                        "max_chars": max_chars_property(),
                         "entity_id": { "type": "string", "description": "Focal entity UUID" },
                         "token_budget": { "type": "integer", "description": "Token budget (8000, 16000, or 32000)", "default": 16000 },
                         "depth": { "type": "integer", "description": "Dependency traversal depth", "default": 2 },
@@ -466,7 +530,7 @@ fn registered_tools() -> ToolsListResult {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "max_chars": { "type": "integer", "description": "Serialized characters this response may occupy (default 30000, clamped 2000..400000). The tool enforces it itself: it sheds ranking explanation, then duplicated hit shapes, then inline source, and only then withholds hits, so a result is never refused for being too large. Any cut is reported in `degradations` and in `_kin.response`, which also carries the size the response had before the budget. Raise it only if your client accepts a larger tool result.", "default": 30000, "minimum": 2000, "maximum": 400000 },
+                        "max_chars": max_chars_property(),
                         "entity_id": { "type": "string", "description": "Focal entity UUID. Required if `query` is not given." },
                         "query": { "type": "string", "description": "Exact entity name to resolve to a focal entity. Required if `entity_id` is not given." },
                         "depth": { "type": "integer", "description": "Dependency traversal depth across the trace neighborhood", "default": 3 },
@@ -506,20 +570,8 @@ fn registered_tools() -> ToolsListResult {
                             "description": "Walk THROUGH a type-annotation edge to a type this repository defines (default false). A dataclass field typed with a repo class is a real flow into that class, so the hop is available; it is off by default because a shared type name otherwise joins every entity that annotates with it to every other one. An annotation target the repository does not define stays a leaf either way.",
                             "default": false
                         },
-                        "max_response_chars": {
-                            "type": "integer",
-                            "description": "Serialized characters this response may occupy (default 30000, the same default every retrieval tool answers under). The tool enforces it itself, dropping bodies before edges and reporting the cut in degradations, so a result is never refused for size. `max_chars` is the same parameter under the name the other retrieval tools use.",
-                            "default": 30000,
-                            "minimum": 2000,
-                            "maximum": 400000
-                        },
-                        "max_chars": {
-                            "type": "integer",
-                            "description": "Alias for max_response_chars, the spelling shared with the other retrieval tools.",
-                            "default": 30000,
-                            "minimum": 2000,
-                            "maximum": 400000
-                        }
+                        "max_response_chars": trace_max_chars_property(),
+                        "max_chars": trace_max_chars_alias_property()
                     },
                     "required": ["focal"]
                 }),
@@ -531,7 +583,7 @@ fn registered_tools() -> ToolsListResult {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "max_chars": { "type": "integer", "description": "Serialized characters this response may occupy (default 30000, clamped 2000..400000). The tool enforces it itself: it sheds ranking explanation, then duplicated hit shapes, then inline source, and only then withholds hits, so a result is never refused for being too large. Any cut is reported in `degradations` and in `_kin.response`, which also carries the size the response had before the budget. Raise it only if your client accepts a larger tool result.", "default": 30000, "minimum": 2000, "maximum": 400000 },
+                        "max_chars": max_chars_property(),
                         "compact": { "type": "boolean", "description": "If true (default), omit ranking explanation and per-signal breakdowns and return one shape per hit. Pass false (or explain: true) to get the breakdowns back.", "default": true },
                         "entity_id": { "type": "string", "description": "Exact entity UUID. Optional if query is provided." },
                         "query": { "type": "string", "description": "Exact symbol name to resolve. Optional if entity_id is provided." },
@@ -555,7 +607,7 @@ fn registered_tools() -> ToolsListResult {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "max_chars": { "type": "integer", "description": "Serialized characters this response may occupy (default 30000, clamped 2000..400000). The tool enforces it itself: it sheds ranking explanation, then duplicated hit shapes, then inline source, and only then withholds hits, so a result is never refused for being too large. Any cut is reported in `degradations` and in `_kin.response`, which also carries the size the response had before the budget. Raise it only if your client accepts a larger tool result.", "default": 30000, "minimum": 2000, "maximum": 400000 },
+                        "max_chars": max_chars_property(),
                         "entity_ids": {
                             "type": "array",
                             "description": "Entity UUIDs to classify. Minimum 1, maximum 200.",
@@ -585,7 +637,7 @@ fn registered_tools() -> ToolsListResult {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "max_chars": { "type": "integer", "description": "Serialized characters this response may occupy (default 30000, clamped 2000..400000). The tool enforces it itself: it sheds ranking explanation, then duplicated hit shapes, then inline source, and only then withholds hits, so a result is never refused for being too large. Any cut is reported in `degradations` and in `_kin.response`, which also carries the size the response had before the budget. Raise it only if your client accepts a larger tool result.", "default": 30000, "minimum": 2000, "maximum": 400000 },
+                        "max_chars": max_chars_property(),
                         "compact": { "type": "boolean", "description": "If true (default), omit ranking explanation and per-signal breakdowns and return one shape per hit. Pass false (or explain: true) to get the breakdowns back.", "default": true },
                         "base": { "type": "string", "description": "Base semantic change ID (hex)" },
                         "head": { "type": "string", "description": "Head semantic change ID (hex)" },
@@ -668,7 +720,7 @@ fn registered_tools() -> ToolsListResult {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "max_chars": { "type": "integer", "description": "Serialized characters this response may occupy (default 30000, clamped 2000..400000). The tool enforces it itself: it sheds ranking explanation, then duplicated hit shapes, then inline source, and only then withholds hits, so a result is never refused for being too large. Any cut is reported in `degradations` and in `_kin.response`, which also carries the size the response had before the budget. Raise it only if your client accepts a larger tool result.", "default": 30000, "minimum": 2000, "maximum": 400000 },
+                        "max_chars": max_chars_property(),
                         "compact": { "type": "boolean", "description": "If true (default), omit ranking explanation and per-signal breakdowns and return one shape per hit. Pass false (or explain: true) to get the breakdowns back.", "default": true },
                         "query": {
                             "type": "string",
@@ -704,7 +756,7 @@ fn registered_tools() -> ToolsListResult {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "max_chars": { "type": "integer", "description": "Serialized characters this response may occupy (default 30000, clamped 2000..400000). The tool enforces it itself: it sheds ranking explanation, then duplicated hit shapes, then inline source, and only then withholds hits, so a result is never refused for being too large. Any cut is reported in `degradations` and in `_kin.response`, which also carries the size the response had before the budget. Raise it only if your client accepts a larger tool result.", "default": 30000, "minimum": 2000, "maximum": 400000 },
+                        "max_chars": max_chars_property(),
                         "compact": { "type": "boolean", "description": "If true (default), omit ranking explanation and per-signal breakdowns and return one shape per hit. Pass false (or explain: true) to get the breakdowns back.", "default": true },
                         "entity_id": { "type": "string", "description": "Entity UUID" },
                         "depth": { "type": "integer", "description": "Traversal depth", "default": 2 },
@@ -1453,6 +1505,61 @@ pub fn context_bench_tool_names() -> &'static [&'static str] {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    /// Every budget number a tool advertises has to be the number the budget
+    /// enforces. Nine schemas carried byte-identical copies of the default, the
+    /// floor and the ceiling written out, and one of those copies said 400,000
+    /// while a real client refused 117,313. A caller who reads a schema and gets
+    /// its result thrown away was told the wrong number by this file.
+    ///
+    /// This walks every declared tool rather than the ones known to carry the
+    /// parameter, so a schema added later with a hand-written number fails here.
+    #[test]
+    fn every_advertised_budget_matches_the_enforced_one() {
+        use crate::budget::{
+            RESPONSE_DEFAULT_MAX_CHARS, RESPONSE_MAX_MAX_CHARS, RESPONSE_MIN_MAX_CHARS,
+        };
+        let mut checked = 0usize;
+        for tool in &tool_definitions().tools {
+            let Some(properties) = tool.input_schema.get("properties") else {
+                continue;
+            };
+            for key in ["max_chars", "max_response_chars"] {
+                let Some(property) = properties.get(key) else {
+                    continue;
+                };
+                checked += 1;
+                assert_eq!(
+                    property["default"].as_u64(),
+                    Some(RESPONSE_DEFAULT_MAX_CHARS as u64),
+                    "{}.{key} advertises a default the budget does not serve: {property}",
+                    tool.name
+                );
+                assert_eq!(
+                    property["minimum"].as_u64(),
+                    Some(RESPONSE_MIN_MAX_CHARS as u64),
+                    "{}.{key} advertises a floor the budget does not serve: {property}",
+                    tool.name
+                );
+                assert_eq!(
+                    property["maximum"].as_u64(),
+                    Some(RESPONSE_MAX_MAX_CHARS as u64),
+                    "{}.{key} advertises a ceiling the budget does not serve: {property}",
+                    tool.name
+                );
+                let description = property["description"].as_str().unwrap_or_default();
+                assert!(
+                    !description.contains("400000"),
+                    "{}.{key} still names the ceiling that got a result refused: {description}",
+                    tool.name
+                );
+            }
+        }
+        assert!(
+            checked >= 11,
+            "the sweep found only {checked} budget parameters, so it is not reaching the schemas"
+        );
+    }
 
     #[test]
     fn all_tools_have_names_and_descriptions() {

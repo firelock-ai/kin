@@ -22,7 +22,7 @@ use kin_ranking::entity_ranking::{
     trace_terminal_named, trace_walk_terminal, TraceExpansion, TraceTerminal,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::commands::graph::{graph_source_record_from, GraphSourceRecord};
@@ -37,6 +37,7 @@ const DEFAULT_LIMIT_PER_STEP: usize = 5;
 const MAX_LIMIT_PER_STEP: usize = 25;
 const MAX_TOTAL_STEPS: usize = 200;
 
+use kin_mcp::budget::Elision;
 /// Serialized characters one response may occupy before this walk cuts its own
 /// payload, and the floor and ceiling a caller may move it to.
 ///
@@ -505,6 +506,19 @@ pub struct TraceDataFlowResponse {
     pub bodies_omitted: usize,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub steps_omitted: usize,
+    /// Every list the response budget cut, keyed by the field it cut, with what
+    /// survived, what was withheld, and why.
+    ///
+    /// `steps_omitted` said the same thing about `chain` and was not enough. A
+    /// reader looks at the array first, and a budget that cut a chain to nothing
+    /// handed back `"chain": []`, which is the shape that means the walk reached
+    /// nothing. So the chain now keeps at least one step and this map says what
+    /// it lost, and an empty `chain` means one thing only.
+    ///
+    /// Empty — and omitted — for a response that fit as built, so a walk the
+    /// budget never touched is unchanged by this.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub elisions: BTreeMap<String, Elision>,
     /// Steps this response reached through a `name_only` edge, out of
     /// `total_steps`.
     ///
@@ -1108,6 +1122,7 @@ pub fn build_trace_data_flow_response_within(
         clipped_steps,
         bodies_omitted: 0,
         steps_omitted: 0,
+        elisions: BTreeMap::new(),
         unproven_steps: 0,
         external_identities_merged,
         terminal_external_steps: 0,
@@ -1466,9 +1481,16 @@ fn enforce_response_budget(response: &mut TraceDataFlowResponse) {
     if measure_response(response) > target {
         // Bisected rather than popped one step at a time: the same answer, in a
         // handful of serializations instead of one per dropped step.
+        //
+        // The floor is one step, not zero. A walk that reached 200 steps and
+        // returns `"chain": []` is indistinguishable from a walk that reached
+        // none, and no counter elsewhere in the response outranks the empty
+        // array for a reader. One surviving step plus the elision beside it says
+        // both what was reached and what was withheld.
         let full = std::mem::take(&mut response.chain);
-        let mut kept = 0usize;
-        let mut low = 0usize;
+        let floor = usize::from(!full.is_empty());
+        let mut kept = floor;
+        let mut low = floor;
         let mut high = full.len();
         while low <= high {
             let mid = (low + high) / 2;
@@ -1477,7 +1499,7 @@ fn enforce_response_budget(response: &mut TraceDataFlowResponse) {
             if measure_response(response) <= target {
                 kept = mid;
                 low = mid + 1;
-            } else if mid == 0 {
+            } else if mid <= floor {
                 break;
             } else {
                 high = mid - 1;
@@ -1488,6 +1510,12 @@ fn enforce_response_budget(response: &mut TraceDataFlowResponse) {
         response.total_steps = kept;
         response.steps_omitted = steps_omitted;
         if steps_omitted > 0 {
+            // The same loss in the shape every budgeted list reports it in, so a
+            // caller reads one key whether the tool cut a chain or a bucket of
+            // tests.
+            response
+                .elisions
+                .insert("chain".to_string(), Elision::budget(kept, steps_omitted));
             // Dropped steps are edges the caller did not receive, which is what
             // this flag has always meant. Dropped bodies are not.
             response.truncated = true;
@@ -1528,10 +1556,12 @@ fn enforce_response_budget(response: &mut TraceDataFlowResponse) {
                 "the response exceeded its {ceiling}-character budget, so {cut}; bodies are cut \
                  before edges, so the chain's shape survives a cut that its source cannot"
             ),
-            remediation: "ask for the shape directly with include_body: false, or narrow the walk \
-                          with a smaller depth or limit_per_step; raise max_response_chars only if \
-                          the caller's own result limit accepts a larger payload"
-                .to_string(),
+            remediation: format!(
+                "ask for the shape directly with include_body: false, or narrow the walk with a \
+                 smaller depth or limit_per_step; raise max_response_chars, up to the {} this \
+                 server will build, only if the caller's own result limit accepts a larger payload",
+                kin_mcp::handlers::common::TRACE_MAX_MAX_RESPONSE_CHARS
+            ),
         },
     );
 }
@@ -2472,6 +2502,7 @@ mod tests {
             clipped_steps: Vec::new(),
             bodies_omitted: 0,
             steps_omitted: 0,
+            elisions: BTreeMap::new(),
             unproven_steps: 0,
             external_identities_merged: 0,
             terminal_external_steps: 0,
@@ -2570,6 +2601,68 @@ mod tests {
         assert!(
             serde_json::to_string_pretty(&response).unwrap().len() <= response.max_response_chars,
             "the payload must end up inside the budget it reports"
+        );
+    }
+
+    /// The defect FIR-2600 names, on the arm the daemon actually runs. A walk
+    /// that reached 200 steps and comes back with `"chain": []` is
+    /// indistinguishable from a walk that reached none, and `steps_omitted`
+    /// three fields away does not outrank the empty array for a reader. One step
+    /// survives, and `elisions.chain` says what the budget took and why.
+    #[test]
+    fn a_budget_never_returns_an_empty_chain_for_a_walk_that_found_steps() {
+        let mut response = fat_response(200, 2_000);
+        // The floor of the clamp, where the disclosure is a large fraction of the
+        // whole budget and the ladder would otherwise strip the chain to nothing
+        // to make room for the note explaining that it had.
+        response.max_response_chars = kin_mcp::handlers::common::TRACE_MIN_MAX_RESPONSE_CHARS;
+
+        enforce_response_budget(&mut response);
+
+        assert!(
+            !response.chain.is_empty(),
+            "the budget emptied a chain of 200 steps: {}",
+            serde_json::to_string_pretty(&response).unwrap()
+        );
+        let kept = response.chain.len();
+        assert_eq!(kept + response.steps_omitted, 200);
+        assert_eq!(response.total_steps, kept);
+        let elision = response
+            .elisions
+            .get("chain")
+            .expect("a cut chain publishes what it lost");
+        assert_eq!(elision.kept, kept);
+        assert_eq!(elision.elided, response.steps_omitted);
+        assert_eq!(elision.total, 200);
+        assert_eq!(elision.reason, kin_mcp::budget::ELISION_REASON_BUDGET);
+        assert!(response.truncated);
+    }
+
+    /// The direction that makes the rule worth having. A walk that reached
+    /// nothing answers with an empty chain and claims no elision, so an empty
+    /// `chain` means one thing. Without this, "never empty" could be satisfied
+    /// by inventing a step.
+    #[test]
+    fn a_walk_that_reached_nothing_still_answers_with_an_empty_chain() {
+        let mut response = fat_response(0, 0);
+        response.max_response_chars = kin_mcp::handlers::common::TRACE_MIN_MAX_RESPONSE_CHARS;
+
+        enforce_response_budget(&mut response);
+
+        assert!(
+            response.chain.is_empty(),
+            "an empty walk must report itself"
+        );
+        assert_eq!(response.total_steps, 0);
+        assert_eq!(response.steps_omitted, 0);
+        assert!(
+            response.elisions.is_empty(),
+            "nothing was withheld, so nothing may be claimed"
+        );
+        let rendered = serde_json::to_string_pretty(&response).unwrap();
+        assert!(
+            !rendered.contains("elisions"),
+            "an untouched response must not grow a key: {rendered}"
         );
     }
 
