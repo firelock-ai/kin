@@ -1047,6 +1047,11 @@ pub fn handle_get_context_pack<G: GraphStore>(
             // pack sees an arriving edge of a class that authority does not
             // read, and when the cap below withholds one.
             "certified_dependents": certified_ids.len(),
+            // The cap's own number, and only the cap's. The top-level
+            // `dependents_withheld` counts every cause together, because a
+            // caller asking "how many rows am I not seeing" wants one answer;
+            // this one stays because a caller already reading it must not have
+            // its meaning changed underneath it.
             "dependents_withheld": dependents_withheld,
             "same_file_candidates": selection.same_file_candidates(),
             "same_file_dropped": selection.same_file_dropped(),
