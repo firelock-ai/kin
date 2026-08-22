@@ -89,7 +89,7 @@ Create an exact semantic and artifact commit
 
 The commit lands in Kin's own authority, not in Git. Nothing is written to `.git`, so `git status` still lists every file this commit recorded and `git log` does not move. That is the design rather than a gap: Kin holds the change, and `kin log`, `kin diff` and `kin review` read it. Hand it back to Git when you want it there, with `kin eject` for the working tree or a push to a Kin remote. Until then, tools that read Git, including CI, hooks and reviewers, see an unchanged repository with a dirty tree. `kin commit` prints the same fact after every commit:
 
-> Recorded in Kin authority, not in git — `git status` stays dirty until you run `kin eject` or push this branch to a Kin remote.
+> Recorded in Kin authority, not in git. `git status` stays dirty until you run `kin eject` or push this branch to a Kin remote.
 
 ```
 kin commit [options]

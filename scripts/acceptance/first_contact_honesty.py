@@ -18,8 +18,11 @@ suites that grade answers:
                       install path itself not needing the prefix that is refused.
   CHECK 2 (FIR-2629)  `kin doctor --fix --install-language-servers` failed behind
                       a proxy without naming the environment as the cause, the
-                      variables that would route it, or the fact that Kin works
-                      without the servers.
+                      variables that would route it, the offline route to a
+                      working server, or the fact that Kin works without one.
+                      Probed through `kin setup --install-language-servers`,
+                      which reaches the same installer without needing a store;
+                      check 2's own docstring says why and what pins the rest.
 
 A new suite rather than three rows bolted onto the graph suites, for one reason:
 none of these needs a store, a daemon or a corpus, and all three are minutes
@@ -137,7 +140,7 @@ class Result(object):
 # emits: a grader that rebuilt it from parts would keep passing while the two
 # surfaces drifted, which is the whole defect FIR-2627 reports.
 AUTHORITY_LINE = (
-    "Recorded in Kin authority, not in git — `git status` stays dirty until "
+    "Recorded in Kin authority, not in git. `git status` stays dirty until "
     "you run `kin eject` or push this branch to a Kin remote."
 )
 
@@ -186,6 +189,9 @@ def grade_commit_help(help_text):
 NETWORK_DIAGNOSIS = "the network refusing"
 PROXY_VARIABLES = ("HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY")
 DEGRADED_MODE = "Kin runs without this server"
+# The other half the ticket asks for by name: a way to a working server that
+# does not need the network that just refused.
+OFFLINE_PATH = "no registry is needed either"
 
 # The failure line itself. Without it the run never reached the install path and
 # the absence of a diagnosis says nothing about the classifier.
@@ -205,6 +211,14 @@ PERMISSION_REMEDY = "npm config set prefix"
 NETWORK_SIGNATURES = (
     "ECONNREFUSED", "ETIMEDOUT", "ENOTFOUND", "EAI_AGAIN", "ECONNRESET",
     "network request to", "ERR_SOCKET_TIMEOUT",
+)
+
+
+# The offline-path line as the product prints it, held here so the self-test
+# can delete exactly it and require the grader to notice.
+OFFLINE_FIXTURE_LINE = (
+    "      no registry is needed either: Kin looks for `pyright-langserver` or "
+    "`pylsp` on PATH and starts whichever it finds\n"
 )
 
 
@@ -239,6 +253,12 @@ def grade_network_diagnosis(output):
         return False, (
             "nothing states that Kin works without the servers, so a reader "
             "cannot tell whether this failure ended their install"
+        )
+    if OFFLINE_PATH not in flat:
+        return False, (
+            "the degraded mode is stated but not the offline path, so a reader "
+            "on a host that will never reach the registry is left with no route "
+            "to a working server at all"
         )
     if PERMISSION_REMEDY in flat:
         return False, (
@@ -447,8 +467,24 @@ def check_1(suite):
 
 
 def check_2(suite):
-    """FIR-2629: a language-server install that dies on the network says so."""
-    res = Result("2", "FIR-2629", "a black-holed network gets the named diagnosis and the degraded mode")
+    """FIR-2629: a language-server install that dies on the network says so.
+
+    Driven through `kin setup --install-language-servers`, not through the
+    `kin doctor --fix --install-language-servers` the ticket names, and every
+    CHECK line this returns says so. Doctor only reaches the installer when its
+    `reference_edge_coverage` row is Pending or Stale, which needs a Kin
+    repository, a daemon and an observed gap; outside one the row is
+    Unsupported and no install is attempted, so a doctor probe here would grade
+    silence. Both surfaces call one `apply_language_server_provisioning`, whose
+    remediation is pinned separately by the unit tests in
+    `crates/kin-cli/src/commands/language_servers.rs`. What this check owns is
+    that a real installer, refused by a real closed port, reaches that
+    remediation and prints it.
+    """
+    res = Result(
+        "2", "FIR-2629",
+        "a black-holed network gets the named diagnosis and the degraded mode, "
+        "through kin setup --install-language-servers")
     npm = shutil.which("npm")
     if not npm:
         res.unknown("npm is not on PATH, so no install can be attempted or fail")
@@ -488,6 +524,9 @@ def check_2(suite):
         cwd=work, env=env, timeout=1800,
     )
     ok, detail = grade_network_diagnosis(out + "\n" + err)
+    # Every verdict names the surface it was taken on, because the ticket is
+    # written about `kin doctor` and this is not that command.
+    detail = "%s [surface: kin setup --install-language-servers]" % detail
     if ok is None:
         res.unknown(detail)
     elif ok:
@@ -610,7 +649,8 @@ def self_test():
         "the package: a connection that never completed\n"
         "      export HTTPS_PROXY=http://proxy.example:3128 HTTP_PROXY=http://proxy.example:3128\n"
         "      export NO_PROXY=localhost,127.0.0.1\n"
-        "      Kin runs without this server. Parsing, search, history, review and "
+        + OFFLINE_FIXTURE_LINE
+        + "      Kin runs without this server. Parsing, search, history, review and "
         "commits are unaffected.\n"
     )
     expect("the shipped bare failure must FAIL", grade_network_diagnosis(bare)[0], False)
@@ -627,6 +667,8 @@ def self_test():
            grade_network_diagnosis(
                named.replace("Kin runs without this server. ", "")
            )[0], False)
+    expect("a diagnosis missing the offline path must FAIL",
+           grade_network_diagnosis(named.replace(OFFLINE_FIXTURE_LINE, ""))[0], False)
     expect("a network failure handed the permission remedy must FAIL",
            grade_network_diagnosis(named + "      npm config set prefix ~/.npm-global\n")[0],
            False)

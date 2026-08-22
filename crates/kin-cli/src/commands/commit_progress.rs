@@ -337,7 +337,7 @@ pub const COMMIT_MEMORY_REMEDY: &str =
 /// the sentence by hand is a surface that drifts.
 macro_rules! authority_not_git_note {
     () => {
-        "Recorded in Kin authority, not in git — `git status` stays dirty until you run `kin \
+        "Recorded in Kin authority, not in git. `git status` stays dirty until you run `kin \
          eject` or push this branch to a Kin remote."
     };
 }
@@ -385,8 +385,8 @@ mod tests {
     /// the two stop matching and this fails.
     #[test]
     fn the_cli_reference_quotes_the_commit_authority_line_verbatim() {
-        let page = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../docs/cli-reference.md");
+        let page =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/cli-reference.md");
         let text = std::fs::read_to_string(&page)
             .unwrap_or_else(|error| panic!("{} must be readable: {error}", page.display()));
 

@@ -103,7 +103,8 @@ runs the README's own leading shell block against that machine and requires it t
 reach a working `kin --version` (FIR-2628). Check 2 points a real npm at a port
 nothing listens on and requires the language-server install failure to name the
 environment as the suspected cause, print the proxy variables that would route
-it, and state that Kin runs without the servers (FIR-2629).
+it, name the offline route to a working server, and state that Kin runs
+without the servers (FIR-2629).
 
 Two limits it states rather than hides. Check 1 stubs the archive download with
 `KIN_NO_PROVISION` and a seeded managed binary, so what it proves is that the
