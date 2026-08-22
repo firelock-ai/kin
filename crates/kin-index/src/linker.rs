@@ -20,7 +20,7 @@ use kin_model::{
 };
 use kin_parser::{
     is_call_extraction_incomplete_marker, is_python_builtin_name, CallArgShape, ExtractedRelation,
-    FileImport,
+    FileImport, RelationSyntacticRole,
 };
 
 use crate::error::{IndexError, Result as IndexResult};
@@ -3821,14 +3821,25 @@ pub(crate) fn relation_evidence(
         return evidence;
     };
     let span = site.to_source_span(caller_file);
+    // The syntactic role the adapter classified, carried onto the persisted
+    // evidence so a consumer that never sees the parse can still tell a throw
+    // site from a hop. `parser_rule` is the field that already exists for
+    // exactly this, and it is what the trace surfaces read.
+    let rule = site.syntactic_role.map(|role| match role {
+        RelationSyntacticRole::RaiseTarget => RAISE_TARGET_CALL_RULE.to_string(),
+    });
     if evidence.is_empty() {
         return vec![RelationEvidence {
             source_span: Some(span),
+            parser_rule: rule,
             ..RelationEvidence::default()
         }];
     }
     for record in &mut evidence {
         record.source_span = Some(span.clone());
+        if record.parser_rule.is_none() {
+            record.parser_rule.clone_from(&rule);
+        }
     }
     evidence
 }
