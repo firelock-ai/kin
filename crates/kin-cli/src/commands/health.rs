@@ -1440,6 +1440,81 @@ fn projection_mode_check_for(
     let advisory = live.mode == ProjectionMode::Shim
         && shim_usable
         && live.readable == crate::commands::projection::Tri::Yes;
+
+    // Nothing recorded and nothing in force is not a misconfiguration. It is
+    // an ordinary host where nobody has engaged a projection yet, and the
+    // recorded-mode branch above has already returned for every host where
+    // somebody did, so reaching here with nothing recorded means the mode in
+    // `detail` is one the chooser named rather than one a person picked.
+    // Calling that `misconfigured` reports a defect against a choice nobody
+    // made: every fresh native Windows install read exactly that in `kin
+    // doctor`, one line under `kin setup` printing that projfs was available
+    // and needed `kin vfs on` to engage, and the two surfaces contradicted
+    // each other about the same probe. Reserving `misconfigured` for a
+    // RECORDED mode that is not running is what keeps this row diagnostic on
+    // the day it fires.
+    //
+    // The row still names what is engageable rather than reporting an absence,
+    // because a host that can run a projection and is not running one has
+    // something a reader can act on. The advisory shim case keeps its own
+    // status ahead of this one: an installed shim that is simply not injected
+    // into this process is the more specific answer, and it is the more useful
+    // thing to tell that user.
+    //
+    // A projection that is installed and DEAD is not an unconfigured host,
+    // even with nothing recorded. Somebody put it there and the loader will
+    // not run it, which is the container case one branch up: every process on
+    // the box reads raw disk while the install looks intact. That keys on the
+    // evidence of breakage, the loader's refusal or an installed shim no probe
+    // can use, rather than on a driver merely being present, because a driver
+    // sitting on disk for a mount mode nobody engaged is the ordinary state
+    // this branch is about.
+    let installed_and_dead =
+        report.driver.refusal.is_some() || (report.shim.installed && !shim_usable);
+    if report.recorded.is_none() && !advisory && !installed_and_dead {
+        let engageable = report
+            .modes
+            .iter()
+            .find(|probe| probe.available)
+            .map(|probe| probe.mode);
+        let route = match engageable {
+            Some(mode) => format!(
+                "{mode} is available here, and `kin vfs on --mode {mode}` engages it and records \
+                 it once it is running"
+            ),
+            // Not "nothing is missing". Where no mode can be engaged yet there
+            // is still usually something the reader can do, and on Windows
+            // there always is: ProjFS ships on every SKU and only needs
+            // enabling. So the row names the first remedy a probe produced
+            // rather than reporting a bare absence, and `kin vfs status`,
+            // named in the fix below, carries the rest.
+            None => report
+                .modes
+                .iter()
+                .find_map(|probe| {
+                    probe.remedy.clone().map(|remedy| {
+                        format!("nothing is engageable yet: {} needs {remedy}", probe.mode)
+                    })
+                })
+                .unwrap_or_else(|| {
+                    "nothing is engageable here, and no probe named a remedy".to_string()
+                }),
+        };
+        return HealthCheck::new(
+            "projection_mode",
+            "Projection in force",
+            HealthStatus::Unsupported,
+            format!(
+                "no projection is configured and none is in force; the CLI and daemon answer \
+                 from the graph without one; {route}; {evidence}"
+            ),
+        )
+        .with_manual_fix(
+            "run `kin vfs on` to engage a projection and record it, or `kin vfs status` for what \
+             each mode would need here",
+        );
+    }
+
     let status = if advisory {
         HealthStatus::Stale
     } else {
@@ -4795,6 +4870,37 @@ mod tests {
         }
     }
 
+    /// The same fixture shaped like a real Windows host: the probes are the
+    /// two modes `fallback_order("windows")` returns, so there is a projfs row
+    /// carrying the `Enable-WindowsOptionalFeature` remedy and no shim row at
+    /// all. `report` above builds the Unix three, and a Windows assertion made
+    /// against those probes would be asserting about a machine that cannot
+    /// exist.
+    fn windows_report(
+        recorded: Option<ProjectionMode>,
+        available: &[ProjectionMode],
+        live: LiveProjection,
+    ) -> ProjectionReport {
+        ProjectionReport {
+            recorded,
+            modes: [ProjectionMode::ProjFs, ProjectionMode::Nfs]
+                .into_iter()
+                .map(|mode| mode_probe(mode, available.contains(&mode)))
+                .collect(),
+            driver: DriverProbe {
+                path: None,
+                refusal: None,
+                subcommands: None,
+            },
+            shim: ShimPresence {
+                path: PathBuf::from("C:/Users/u/.kin/lib/kin_vfs_shim.dll"),
+                installed: false,
+                engaged: false,
+            },
+            live,
+        }
+    }
+
     fn live(
         intent: ProjectionMode,
         mode: ProjectionMode,
@@ -5029,19 +5135,134 @@ mod tests {
             assert!(!is_failing(&check.status));
         }
 
-        let windows = projection_mode_check_for(&bare, "windows", &not_probed());
+        // Windows keeps no sanctioned absence, and what proves it moved. It
+        // used to be the status: the row read `misconfigured` there, which
+        // FIR-2460 removed, because a status is the wrong place to carry "you
+        // could enable something" and reporting a defect against a mode nobody
+        // chose is what made every fresh native Windows install read a fault
+        // in `kin doctor`. What the row must never do is tell a Windows user
+        // that nothing is missing, and that obligation now lives where it
+        // always belonged, in the text. So the assertion is that the row names
+        // the ProjFS remedy a user can paste, on the real Windows probes
+        // rather than on the Unix three.
+        let windows_off = windows_report(
+            None,
+            &[],
+            live(
+                ProjectionMode::ProjFs,
+                ProjectionMode::ProjFs,
+                Tri::No,
+                Tri::No,
+                true,
+            ),
+        );
+        let windows = projection_mode_check_for(&windows_off, "windows", &not_probed());
         assert!(
-            !matches!(windows.status, HealthStatus::Unsupported),
-            "Windows has no sanctioned skip, got {:?}",
+            !is_failing(&windows.status),
+            "a mode nobody chose is not a defect, got {:?}",
             windows.status
         );
         assert!(
-            !windows.detail.contains("none is configured")
-                && windows
-                    .platform_note
-                    .as_deref()
-                    .is_none_or(|note| !note.contains("would need")),
-            "Windows must not be told that nothing is missing: {windows:?}"
+            windows.detail.contains("nothing is engageable yet")
+                && windows.detail.contains("fixture remedy for projfs"),
+            "Windows must be told what it can still enable: {}",
+            windows.detail
+        );
+        // Falsification for the line above: strip every remedy the probes
+        // carry and the row can no longer name one, so the assertion is about
+        // the remedy reaching the text and not about the phrasing around it.
+        let mut remedyless = windows_off.clone();
+        for probe in &mut remedyless.modes {
+            probe.remedy = None;
+        }
+        let bare_windows = projection_mode_check_for(&remedyless, "windows", &not_probed());
+        assert!(
+            !bare_windows.detail.contains("fixture remedy for projfs"),
+            "the remedy must come from the probes: {}",
+            bare_windows.detail
+        );
+    }
+
+    /// FIR-2460, taken from the release run the Windows install-proof leg
+    /// failed on. Nothing is recorded, because setup records only a mode that
+    /// is in force by installation alone and Windows has no shim to install.
+    /// Nothing is mounted, because nobody ran `kin vfs on`. The chooser still
+    /// names projfs, since it is what this host could run, and the row used to
+    /// report that guess as `misconfigured`. A fault the reader did not cause
+    /// and cannot act on is not a diagnosis, and `kin setup` printed the
+    /// opposite about the same probe one screen earlier.
+    #[test]
+    fn nothing_recorded_and_nothing_in_force_is_not_a_misconfiguration() {
+        let fresh = windows_report(
+            None,
+            &[ProjectionMode::ProjFs],
+            live(
+                ProjectionMode::ProjFs,
+                ProjectionMode::ProjFs,
+                Tri::No,
+                Tri::No,
+                true,
+            ),
+        );
+        let check = projection_mode_check_for(&fresh, "windows", &not_probed());
+        assert!(
+            matches!(check.status, HealthStatus::Unsupported),
+            "an unconfigured host has no projection in force to report on, got {:?}",
+            check.status
+        );
+        assert!(!is_failing(&check.status));
+        assert!(
+            check.detail.contains("projfs is available here")
+                && check.detail.contains("kin vfs on --mode projfs"),
+            "the row must name the mode and the command that engages it: {}",
+            check.detail
+        );
+
+        // The control that keeps this row worth reading. Record the same mode
+        // and change nothing else: it is now a projection somebody configured
+        // that is not running, which is the one state this row exists to
+        // report, and it must still fail.
+        let mut recorded = fresh.clone();
+        recorded.recorded = Some(ProjectionMode::ProjFs);
+        let configured = projection_mode_check_for(&recorded, "windows", &not_probed());
+        assert!(
+            matches!(configured.status, HealthStatus::Misconfigured),
+            "a recorded mode that is not running must still fail, got {:?}",
+            configured.status
+        );
+        assert!(
+            configured
+                .detail
+                .contains("is recorded but is not what is running"),
+            "the failing row must say what it is failing about: {}",
+            configured.detail
+        );
+
+        // Not a Windows special case. macOS reaches the same state whenever the
+        // chooser prefers a mount mode and no shim was installed to record
+        // instead, which is the combination that failed the v0.5.41 release
+        // install proof on all three non-Linux legs.
+        let mac_fresh = report(
+            None,
+            &[ProjectionMode::Nfs],
+            live(
+                ProjectionMode::Nfs,
+                ProjectionMode::Nfs,
+                Tri::No,
+                Tri::No,
+                true,
+            ),
+        );
+        let mac = projection_mode_check_for(&mac_fresh, "macos", &not_probed());
+        assert!(
+            !is_failing(&mac.status),
+            "the same unconfigured state is not a defect on macOS either, got {:?}",
+            mac.status
+        );
+        assert!(
+            mac.detail.contains("nfs is available here"),
+            "the macOS row names its own mode: {}",
+            mac.detail
         );
     }
 
