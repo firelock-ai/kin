@@ -432,17 +432,67 @@ def grade_body_elisions(payload):
     return problems, marked
 
 
-def grade_cli_context(text, doc):
+def pack_sections(doc):
+    """Row counts per section of a `kin context --json` pack, by the same group
+    names the MCP tool publishes."""
+    pack = (doc or {}).get("pack") or {}
+    selection = (doc or {}).get("dependency_selection") or {}
+    dependents = selection.get("dependents_returned") or 0
+    signatures = pack.get("dependency_signatures")
+    counts = {}
+    if isinstance(signatures, list):
+        counts["dependencies"] = len(signatures) - dependents
+        counts["dependents"] = dependents
+    for key, field in (
+        ("transitive_deps", "transitive_deps"),
+        ("tests", "tests"),
+        ("contracts", "contracts"),
+    ):
+        rows = pack.get(field)
+        if isinstance(rows, list):
+            counts[key] = len(rows)
+    return counts
+
+
+def grade_cli_context(whole, cut, text):
     """Grade `kin context`, whose rendered lines are the whole of what a reader
     of that surface sees. A cut those lines do not name is, to that reader, a
-    cut that did not happen."""
+    cut that did not happen.
+
+    Graded off the same differential check 5 uses rather than off the
+    disclosure alone: a section full at a generous `--budget` and short at a
+    tight one was cut, whatever the response says about it. Grading only what
+    the disclosure claims would let a build that discloses nothing report that
+    nothing was cut, which is the defect wearing the check's own costume.
+    """
     problems = []
-    elisions = (doc or {}).get("budget_elisions") or {}
-    if not elisions:
-        return problems, 0
+    elisions = (cut or {}).get("budget_elisions") or {}
+    before, after = pack_sections(whole), pack_sections(cut)
     graded = 0
-    for key, elision in sorted(elisions.items()):
+    for key, full in sorted(before.items()):
+        if not full or after.get(key, 0) >= full:
+            continue
         graded += 1
+        kept = after.get(key, 0)
+        if key not in elisions:
+            problems.append(
+                "`%s` fell from %d rows to %d and the response publishes no elision for it"
+                % (key, full, kept)
+            )
+            continue
+        if elisions[key].get("total") != full:
+            problems.append(
+                "budget_elisions.%s.total is %r and the generous budget returned %d"
+                % (key, elisions[key].get("total"), full)
+            )
+        if elisions[key].get("kept") != kept:
+            problems.append(
+                "budget_elisions.%s.kept is %r and the pack carries %d"
+                % (key, elisions[key].get("kept"), kept)
+            )
+    if graded == 0:
+        return problems, 0
+    for key, elision in sorted(elisions.items()):
         elided = elision.get("elided")
         if not elided:
             problems.append("budget_elisions.%s claims nothing withheld" % key)
@@ -1053,19 +1103,27 @@ def check_6(suite):
 def check_7(suite):
     res = Result("7", "FIR-2482", "kin context names what its token budget withheld")
     # `kin context` takes any number, so unlike the MCP tool it can be driven
-    # well below the 8k floor the tool's bucketing imposes.
+    # well below the 8k floor the tool's bucketing imposes. The generous call is
+    # the control: a section full there and short here was cut by the token
+    # budget, which is true whether or not the response admits it.
+    rc_whole, raw_whole = suite.cli(
+        ["context", "wide_entry", "--budget", "200000", "--json"]
+    )
+    rc_json, raw_cut = suite.cli(["context", "wide_entry", "--budget", "2000", "--json"])
     rc_text, text = suite.cli(["context", "wide_entry", "--budget", "2000"])
-    rc_json, raw = suite.cli(["context", "wide_entry", "--budget", "2000", "--json"])
-    if rc_text != 0 or rc_json != 0:
-        res.unknown("kin context exited %d (text) and %d (json)" % (rc_text, rc_json))
+    if rc_whole != 0 or rc_json != 0 or rc_text != 0:
+        res.unknown(
+            "kin context exited %d (generous), %d (json), %d (text)"
+            % (rc_whole, rc_json, rc_text)
+        )
         return res
     try:
-        doc = json.loads(raw)
+        whole, cut = json.loads(raw_whole), json.loads(raw_cut)
     except ValueError as exc:
         res.unknown("kin context --json is not JSON (%s)" % exc)
         return res
 
-    problems, graded = grade_cli_context(text, doc)
+    problems, graded = grade_cli_context(whole, cut, text)
     for problem in problems:
         res.bad(problem)
     if graded == 0:
@@ -1074,7 +1132,7 @@ def check_7(suite):
     if not res.failed:
         res.ok(
             "%d sections report the same cut in the lines and in the json: %s"
-            % (graded, json.dumps(doc.get("budget_elisions") or {}, sort_keys=True))
+            % (graded, json.dumps(cut.get("budget_elisions") or {}, sort_keys=True))
         )
     return res
 
@@ -1412,44 +1470,99 @@ def self_test():
     gap_only = {"dependencies": [{"name": "d0", "body": None, "body_unavailable": "generated"}]}
     expect("a pure graph gap is not a budget cut", grade_body_elisions(gap_only)[1], 0)
 
-    cli_doc = {
-        "budget_elisions": {
-            "dependencies": {"kept": 4, "elided": 46, "total": 50, "reason": "token_budget"}
+    def cli_doc(rows, elisions=None):
+        doc = {
+            "pack": {"dependency_signatures": [{"entity_id": "e%d" % i} for i in range(rows)]},
+            "dependency_selection": {"dependents_returned": 0},
         }
-    }
+        if elisions:
+            doc["budget_elisions"] = elisions
+        return doc
+
+    cli_whole = cli_doc(50)
+    honest_cut = cli_doc(
+        4, {"dependencies": {"kept": 4, "elided": 46, "total": 50, "reason": "token_budget"}}
+    )
     cli_text = "  Dependencies: 4 entries (46 withheld by the 2000-token budget)\n  Raise --budget"
-    expect("a rendering that names its cut passes", grade_cli_context(cli_text, cli_doc)[0], [])
     expect(
-        "a rendering that hides its cut fails",
-        len(grade_cli_context("  Dependencies: 4 entries", cli_doc)[0]) >= 1,
+        "a rendering that names its cut passes",
+        grade_cli_context(cli_whole, honest_cut, cli_text)[0],
+        [],
+    )
+    expect(
+        "a rendering that names its cut grades one section",
+        grade_cli_context(cli_whole, honest_cut, cli_text)[1],
+        1,
+    )
+    expect(
+        "a cut section disclosing nothing at all fails",
+        len(grade_cli_context(cli_whole, cli_doc(4), "  Dependencies: 4 entries")[0]) >= 1,
+        True,
+    )
+    expect(
+        "a rendering that hides a cut it disclosed fails",
+        len(grade_cli_context(cli_whole, honest_cut, "  Dependencies: 4 entries")[0]) >= 1,
         True,
     )
     expect(
         "a rendering with no lever fails",
-        len(grade_cli_context("  Dependencies: 4 entries (46 withheld)", cli_doc)[0]) >= 1,
+        len(
+            grade_cli_context(
+                cli_whole, honest_cut, "  Dependencies: 4 entries (46 withheld)"
+            )[0]
+        )
+        >= 1,
         True,
     )
     expect(
         "a cut blamed on the wrong budget fails",
         len(
             grade_cli_context(
-                cli_text,
-                {
-                    "budget_elisions": {
+                cli_whole,
+                cli_doc(
+                    4,
+                    {
                         "dependencies": {
                             "kept": 4,
                             "elided": 46,
                             "total": 50,
                             "reason": "response_budget",
                         }
-                    }
-                },
+                    },
+                ),
+                cli_text,
             )[0]
         )
         >= 1,
         True,
     )
-    expect("a whole pack grades nothing here", grade_cli_context("  Dependencies: 50 entries", {})[1], 0)
+    expect(
+        "an elision that disagrees with the generous run fails",
+        len(
+            grade_cli_context(
+                cli_whole,
+                cli_doc(
+                    4,
+                    {
+                        "dependencies": {
+                            "kept": 4,
+                            "elided": 6,
+                            "total": 10,
+                            "reason": "token_budget",
+                        }
+                    },
+                ),
+                cli_text,
+            )[0]
+        )
+        >= 1,
+        True,
+    )
+    expect(
+        "a whole pack grades nothing here",
+        grade_cli_context(cli_whole, cli_doc(50), "  Dependencies: 50 entries")[1],
+        0,
+    )
 
     for line in problems:
         print("SELF-TEST FAIL %s" % line)
