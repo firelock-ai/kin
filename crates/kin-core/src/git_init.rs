@@ -193,6 +193,20 @@ fn init_from_git_with_hooks(
 ) -> Result<InitResult> {
     let source = canonical_new_repository_root(working_dir)?;
     require_git_boundary(&source)?;
+    let source_parent = source.parent().ok_or_else(|| {
+        KinError::Other(format!(
+            "repository root has no parent for isolated Git capture: {}",
+            source.display()
+        ))
+    })?;
+    let final_kin_dir = source.join(".kin");
+
+    // Ahead of the ladder, because a conversion the kernel killed says nothing
+    // for itself: `SIGKILL` runs no destructor and prints no error, so the only
+    // account of it is the one this run reads back off disk. Read before the
+    // claim below, which reaps exactly the directories being reported.
+    let leftovers = crate::init_attempt::abandoned_init_attempts(source_parent).unwrap_or_default();
+    crate::init_attempt::report_previous_attempts(&leftovers, &source);
 
     let mut progress = PhaseProgress::new(GIT_ADMISSION_PHASES);
 
@@ -210,13 +224,23 @@ fn init_from_git_with_hooks(
     let manifest = KinManifest::new();
     let repository_id = RepositoryId::new(manifest.repo_id.clone())
         .map_err(|error| KinError::Other(format!("invalid repository identity: {error}")))?;
-    let source_parent = source.parent().ok_or_else(|| {
-        KinError::Other(format!(
-            "repository root has no parent for isolated Git capture: {}",
-            source.display()
-        ))
-    })?;
+    // Claiming reaps every abandoned capture directory beside this one. The
+    // repository stages a killed init left are reclaimed here too rather than
+    // at their own phase eight, so the disk comes back before the minutes are
+    // spent instead of after.
     let capture_dir = crate::init_staging::GitCaptureStaging::claim(source_parent)?;
+    let _ = crate::init::recover_orphaned_repository_stages(source_parent, &final_kin_dir);
+    crate::init_attempt::report_reclaimed(&leftovers);
+
+    // The ladder now stamps every phase it opens into the capture directory, so
+    // the next command can name where a kill landed.
+    let journal = std::sync::Arc::new(crate::init_attempt::InitAttemptJournal::open(
+        capture_dir.path(),
+        &source,
+        &final_kin_dir,
+        GIT_ADMISSION_PHASES,
+    ));
+    progress.attach_journal(journal);
     // The capture store lives and dies inside this call, so its bodies are
     // written without device barriers. Its root is the per-init `capture_dir`
     // above, removed when that handle drops, when a terminating signal reaches
@@ -307,8 +331,12 @@ fn init_from_git_with_hooks(
             .map_err(|error| git_boundary_error("prove mutable Git workspace", error))?
     };
 
-    let final_kin_dir = source.join(".kin");
     let staging_dir = source_parent.join(format!(".kin.init-{}", uuid::Uuid::new_v4()));
+    // Recorded before the directory exists rather than after, so a kill during
+    // its creation still leaves a post-mortem that names it.
+    if let Some(journal) = progress.journal() {
+        journal.record_stage_path(&staging_dir);
+    }
     let config = config_for_source(&snapshot, &source_proof.remote_mapping)?;
 
     progress.begin("stage repository layout");
