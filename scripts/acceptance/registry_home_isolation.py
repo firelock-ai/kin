@@ -98,6 +98,21 @@ def run(cmd, cwd=None, env=None, timeout=600):
     return proc.returncode, proc.stdout
 
 
+def run_split(cmd, cwd=None, env=None, timeout=600):
+    """Like `run`, with stderr kept apart from stdout.
+
+    kin writes a correctness-relevant-override warning to stderr on every command
+    this suite runs, because the suite pins the embedding backend. Merged into
+    stdout that line sits in front of the JSON payload and no parser reaches it,
+    which reads as an unreadable product rather than an unreadable probe.
+    """
+    proc = subprocess.run(
+        cmd, cwd=cwd, env=env, timeout=timeout,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    return proc.returncode, proc.stdout, proc.stderr
+
+
 def registry_entries(path):
     """Every id-to-path pair a registry file names, or None when unreadable.
 
@@ -139,9 +154,12 @@ def deps_ids(output):
         return None
     ids = set()
     for repo in repositories:
-        if not isinstance(repo, dict) or "id" not in repo:
+        # `kin.deps.v1` names the field `repo_id`. A payload that does not carry
+        # it is a schema this probe does not understand, which is unreadable and
+        # never an empty answer.
+        if not isinstance(repo, dict) or "repo_id" not in repo:
             return None
-        ids.add(str(repo["id"]))
+        ids.add(str(repo["repo_id"]))
     return ids
 
 
@@ -325,6 +343,10 @@ class Suite(object):
     def kin_run(self, args, repo=None, timeout=600):
         return run([self.kin] + args, cwd=repo or self.probe, env=self.env, timeout=timeout)
 
+    def kin_run_split(self, args, repo=None, timeout=600):
+        return run_split([self.kin] + args, cwd=repo or self.probe, env=self.env,
+                         timeout=timeout)
+
     def daemon_log(self):
         return os.path.join(self.probe, ".kin", "daemon.log")
 
@@ -417,9 +439,9 @@ def check_0(suite):
     if both is None:
         return res
     scratch, _real, foreign = both
-    rc, out = suite.kin_run(["deps", "--all", "--json"])
+    rc, out, err = suite.kin_run_split(["deps", "--all", "--json"])
     if rc != 0:
-        res.unknown("kin deps --all --json exited %d: %s" % (rc, tail(out)))
+        res.unknown("kin deps --all --json exited %d: %s" % (rc, tail(err or out)))
         return res
     grade_view(res, "kin deps --all --json", deps_ids(out), scratch, foreign,
                id_for_path(scratch, suite.roommate))
@@ -427,17 +449,20 @@ def check_0(suite):
 
 
 def check_1(suite):
-    """`kin registry list` is bounded by the same home as every other surface."""
-    res = Result("1", TICKET, "kin registry list is bounded by KIN_HOME")
+    """`kin registry` is bounded by the same home as every other surface."""
+    res = Result("1", TICKET, "kin registry is bounded by KIN_HOME")
     both = homes(suite, res)
     if both is None:
         return res
     scratch, _real, foreign = both
-    rc, out = suite.kin_run(["registry", "list"])
+    # `kin registry` with no subcommand IS the listing; `registry list` is not a
+    # subcommand and exits 2. The first draft of this probe asked for one and got
+    # UNREADABLE, which is that outcome working.
+    rc, out, err = suite.kin_run_split(["registry"])
     if rc != 0:
-        res.unknown("kin registry list exited %d: %s" % (rc, tail(out)))
+        res.unknown("kin registry exited %d: %s" % (rc, tail(err or out)))
         return res
-    grade_view(res, "kin registry list", listed_ids(out), scratch, foreign,
+    grade_view(res, "kin registry", listed_ids(out), scratch, foreign,
                id_for_path(scratch, suite.roommate))
     return res
 
@@ -574,17 +599,22 @@ def self_test():
     def case(name, got, want):
         cases.append((name, got, want))
 
-    listing = json.dumps({"schema": "x", "repositories": [{"id": "a"}, {"id": "b"}]})
+    listing = json.dumps({"schema": "kin.deps.v1",
+                          "repositories": [{"repo_id": "a"}, {"repo_id": "b"}]})
     case("deps ids read", deps_ids(listing), {"a", "b"})
+    case("a deps payload behind a log line is unreadable",
+         deps_ids("WARN correctness-relevant override active\n" + listing), None)
+    case("the pre-rename field name is not accepted",
+         deps_ids(json.dumps({"repositories": [{"id": "a"}]})), None)
     case("deps empty reads empty",
          deps_ids(json.dumps({"schema": "x", "repositories": []})), set())
     case("deps non-json is unreadable", deps_ids("not json at all"), None)
     case("deps without repositories is unreadable",
          deps_ids(json.dumps({"schema": "x"})), None)
-    case("deps row without an id is unreadable",
+    case("deps row without a repo_id is unreadable",
          deps_ids(json.dumps({"repositories": [{"entities": 1}]})), None)
 
-    text = "Registered repositories:\n  probe    42 entities  now  -\n"
+    text = "Registered repositories:\n  probe                 2 entities  (no deps)  11s ago\n"
     case("listing ids read", listed_ids(text), {"probe"})
     case("listing ids read through colour",
          listed_ids("Registered repositories:\n  \x1b[32mprobe\x1b[0m    42 entities\n"),
