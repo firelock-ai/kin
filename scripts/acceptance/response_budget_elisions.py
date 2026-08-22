@@ -18,6 +18,15 @@ can be satisfied by a broken tool:
      elision, so an empty array means exactly one thing
   2  the budget the tool advertises is the budget it enforces, and its ceiling is
      one a real MCP client accepts
+  3  no ranked list the budget cuts ships empty
+  4  a response the budget could not bring under its ceiling says so, and one
+     reporting `bounded: false` is one that fits
+
+FIR-2602 is check 4. `impact_analysis` reported `{"bounded": false,
+"chars_before_budget": 50354, "max_chars": 2000}` and shipped all 50,354
+characters, because the shape table named only the four `affected_*` buckets and
+the bulk of an impact report is not in them. A bucket the table does not name is
+a bucket the bounder cannot count, and nothing in the response said so.
 
 Exit status is 0 when every check passed, 1 when one failed, 2 when one could not
 be read, and 3 when the run could not be set up. `--self-test` exercises every
@@ -45,6 +54,29 @@ print = functools.partial(print, flush=True)
 # The ceiling this server advertises has to sit below it, or the tool is telling
 # callers to ask for a result their client will throw away.
 REFUSED_BY_A_REAL_CLIENT = 117313
+
+
+# Every list an `impact_analysis` response carries, mirroring the shape table in
+# crates/kin-mcp/src/budget.rs. Listed here so a key added to the response and
+# not to the table is a check that grades nothing rather than a silent gap: the
+# check reports UNREADABLE when it grades none of them.
+IMPACT_LISTS = [
+    "entity_impacts",
+    "affected_callers",
+    "affected_dependents",
+    "affected_contract_consumers",
+    "affected_tests",
+    "unreviewed_agent_changes",
+    "changed_ids",
+    "actor_attribution",
+    "affected_work_items",
+    "affected_annotations",
+    "cross_repo_impact",
+    "active_traffic",
+]
+
+# The reason code a response still over its ceiling publishes.
+OVER_BUDGET_REASON = "response_over_budget"
 
 
 class SetupError(Exception):
@@ -178,6 +210,57 @@ def grade_advertised_budget(schema):
         problems.append(
             "the advertised default %d does not sit inside %d..%d"
             % (default, floor, ceiling)
+        )
+    return problems
+
+
+def grade_budget_accounting(payload):
+    """Grade one response's own account of what the budget did to it.
+
+    Two claims, both readable off the response alone:
+
+      * `bounded: false` asserts the response fits, so it has to fit. This is
+        the FIR-2602 defect exactly: false beside a size 25 times the ceiling.
+      * a response that does NOT fit says so in `degradations`, because every
+        list keeps a floor entry and a ceiling is not always reachable. Rare and
+        real is fine; quiet is not.
+    """
+    problems = []
+    accounting = ((payload.get("_kin") or {}).get("response")) or {}
+    if not accounting:
+        return ["the response carries no `_kin.response` accounting"]
+    max_chars = accounting.get("max_chars")
+    before = accounting.get("chars_before_budget")
+    after = accounting.get("chars_after_budget")
+    if not isinstance(max_chars, int) or not isinstance(before, int):
+        return ["the accounting names no max_chars or no chars_before_budget"]
+    if not isinstance(after, int):
+        return [
+            "the accounting reports no chars_after_budget, so nothing in the response "
+            "says what size it shipped at"
+        ]
+    bounded = accounting.get("bounded")
+    if bounded is not True and bounded is not False:
+        problems.append("the accounting reports bounded %r" % bounded)
+    if bounded is False and after > max_chars:
+        problems.append(
+            "the accounting reports bounded false at %d characters against a %d ceiling"
+            % (after, max_chars)
+        )
+    reasons = [
+        entry.get("reason")
+        for entry in (payload.get("degradations") or [])
+        if isinstance(entry, dict)
+    ]
+    if after > max_chars and OVER_BUDGET_REASON not in reasons:
+        problems.append(
+            "the response measures %d against a %d ceiling and publishes no %s "
+            "degradation" % (after, max_chars, OVER_BUDGET_REASON)
+        )
+    if after <= max_chars and OVER_BUDGET_REASON in reasons:
+        problems.append(
+            "the response fits at %d against a %d ceiling and claims it does not"
+            % (after, max_chars)
         )
     return problems
 
@@ -559,7 +642,78 @@ def check_3(suite):
     return res
 
 
-CHECKS = [("0", check_0), ("1", check_1), ("2", check_2), ("3", check_3)]
+def check_4(suite):
+    res = Result(
+        "4",
+        "FIR-2602",
+        "an impact response is counted whole, and never reports a bound it did not hold",
+    )
+    target = {"files": ["src/chain.py"], "include_traffic": False}
+    try:
+        whole = suite.mcp("impact_analysis", dict(target, max_chars=60000))
+        cut = suite.mcp("impact_analysis", dict(target, max_chars=2000))
+    except McpError as exc:
+        res.unknown("impact_analysis unreadable: %s" % exc)
+        return res
+
+    for label, payload in (("ceiling", whole), ("floor", cut)):
+        for problem in grade_budget_accounting(payload):
+            res.bad("%s call: %s" % (label, problem))
+
+    # The bulk of this fixture's impact report is outside the four `affected_*`
+    # buckets, which is the shape FIR-2602 was measured on. A list full at the
+    # ceiling and empty at the floor was emptied by the budget and by nothing
+    # else, and needs no counter to be true.
+    populated = [key for key in IMPACT_LISTS if whole.get(key)]
+    if not populated:
+        res.unknown("the ceiling call filled no impact list, so the rule was not exercised")
+        return res
+    outside = [
+        key
+        for key in populated
+        if not key.startswith("affected_") or key in ("affected_work_items", "affected_annotations")
+    ]
+    if not outside:
+        res.unknown(
+            "every populated list is a blast-radius bucket, so the FIR-2602 shape was "
+            "not reproduced"
+        )
+        return res
+    for key in populated:
+        rows = cut.get(key)
+        if not isinstance(rows, list) or not rows:
+            res.bad(
+                "`%s` held %d entries at the ceiling and %r at the floor, so the budget "
+                "emptied it" % (key, len(whole[key]), rows)
+            )
+
+    problems, graded = grade_buckets(cut, IMPACT_LISTS)
+    for problem in problems:
+        res.bad(problem)
+    if graded == 0:
+        res.unknown("the floor call cut no impact list, so the elision rule was not exercised")
+        return res
+
+    if not res.failed:
+        accounting = cut["_kin"]["response"]
+        res.ok(
+            "the report measured %d characters and was cut to %d against a %d ceiling; "
+            "%d of %d lists were cut and every one kept an entry, %d of them outside the "
+            "blast-radius buckets: %s"
+            % (
+                accounting["chars_before_budget"],
+                accounting["chars_after_budget"],
+                accounting["max_chars"],
+                graded,
+                len(populated),
+                len(outside),
+                json.dumps(cut.get("elisions") or {}, sort_keys=True),
+            )
+        )
+    return res
+
+
+CHECKS = [("0", check_0), ("1", check_1), ("2", check_2), ("3", check_3), ("4", check_4)]
 
 
 def self_test():
@@ -669,6 +823,86 @@ def self_test():
         "an untouched bucket is not graded",
         grade_buckets(untouched, ["affected_tests"]),
         ([], 0),
+    )
+
+    fitting = {
+        "_kin": {
+            "response": {
+                "max_chars": 2000,
+                "chars_before_budget": 50354,
+                "chars_after_budget": 1840,
+                "bounded": True,
+            }
+        }
+    }
+    expect("a response that fits passes", grade_budget_accounting(fitting), [])
+
+    shipped = {
+        "_kin": {
+            "response": {
+                "max_chars": 2000,
+                "chars_before_budget": 50354,
+                "chars_after_budget": 50354,
+                "bounded": False,
+            }
+        }
+    }
+    expect(
+        "the FIR-2602 shape fails",
+        len(grade_budget_accounting(shipped)) >= 1,
+        True,
+    )
+
+    silent = {
+        "_kin": {
+            "response": {
+                "max_chars": 2000,
+                "chars_before_budget": 50354,
+                "chars_after_budget": 2574,
+                "bounded": True,
+            }
+        }
+    }
+    expect(
+        "a response still over its ceiling and saying nothing fails",
+        len(grade_budget_accounting(silent)) >= 1,
+        True,
+    )
+    disclosed = dict(silent)
+    disclosed["degradations"] = [{"reason": OVER_BUDGET_REASON}]
+    expect("the same response, disclosed, passes", grade_budget_accounting(disclosed), [])
+
+    overclaimed = {
+        "_kin": {
+            "response": {
+                "max_chars": 2000,
+                "chars_before_budget": 50354,
+                "chars_after_budget": 1840,
+                "bounded": True,
+            }
+        },
+        "degradations": [{"reason": OVER_BUDGET_REASON}],
+    }
+    expect(
+        "a response that fits and claims it does not fails",
+        len(grade_budget_accounting(overclaimed)) >= 1,
+        True,
+    )
+
+    sizeless = {
+        "_kin": {
+            "response": {"max_chars": 2000, "chars_before_budget": 50354, "bounded": False}
+        }
+    }
+    expect(
+        "an accounting with no shipped size fails",
+        len(grade_budget_accounting(sizeless)) >= 1,
+        True,
+    )
+    expect(
+        "a response with no accounting at all fails",
+        len(grade_budget_accounting({"affected_tests": []})) >= 1,
+        True,
     )
 
     for line in problems:
