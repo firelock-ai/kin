@@ -4683,7 +4683,7 @@ pub(crate) fn validate_health_repo(health: &HealthResponse, working_dir: &Path) 
         warn!(
             repo_root = health.repo_root.as_deref().unwrap_or("<unknown>"),
             "daemon is up and serving but reports health=attention (degraded); \
-             continuing to use it. Run `kin status` for details."
+             continuing to use it. Run `kin doctor` for details."
         );
     }
     Ok(())
