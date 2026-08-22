@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Run the product acceptance suites on every pull request (#1054)
+- Key the release evidence to a main commit, so a tag no longer needs a frozen main (#1056)
 
 
 ## [0.5.47] - 2026-08-22
