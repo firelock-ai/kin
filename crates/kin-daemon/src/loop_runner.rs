@@ -855,12 +855,15 @@ fn exact_tree_admission(
         // while its entities keep ranking is the exposure this ordering exists
         // to prevent.
         evict_enrichment_for_removed_paths(state, &deltas)?;
-        state.graph.apply_transaction_delta(&TransactionDelta {
-            entity_deltas: Vec::new(),
-            relation_deltas: Vec::new(),
-            tree_deltas: deltas.clone(),
-            ..TransactionDelta::default()
-        })?;
+        state
+            .graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: deltas.clone(),
+                ..TransactionDelta::default()
+            })
+            .map_err(|error| name_stranded_endpoint_refusal(DaemonError::Graph(error), &deltas))?;
     }
 
     if observation.is_none() {
@@ -1211,6 +1214,79 @@ fn announce_retraction(retracted: &kin_index::IgnoredTrackedPaths) {
     );
 }
 
+/// Retire every relation bound to an artifact node that is leaving the tree.
+///
+/// An artifact-class endpoint is not reachable from any entity, so clearing a
+/// path's entities leaves these edges standing: the file-level `Imports` and
+/// `Includes` edges the cross-file linker mints, its parse-coverage self-loop,
+/// and the `DerivedFrom` edges projection markers produce. kin-db validates
+/// every relation the graph holds against the staged tree on each transaction,
+/// so one surviving edge makes the removal of its artifact fail with
+/// `transaction relation <id> has unadmitted source endpoint artifact:<id>`,
+/// and it fails the whole transaction rather than the one edge. That is how a
+/// deleted file could take the entire commit path down with it: nothing else
+/// collects these, and only emptying the file first, which routes the retirement
+/// through the linker's own re-derivation, ever cleared them.
+fn retire_artifact_node_relations(
+    graph: &kin_db::InMemoryGraph,
+    artifact_id: kin_model::ArtifactId,
+) -> Result<()> {
+    let node = kin_model::GraphNodeId::Artifact(artifact_id);
+    let bound = graph.get_all_relations_for_node(&node)?;
+    if bound.is_empty() {
+        return Ok(());
+    }
+    let retired: Vec<kin_model::RelationId> = bound.iter().map(|relation| relation.id).collect();
+    let borrowed: Vec<&kin_model::RelationId> = retired.iter().collect();
+    graph.remove_relations_batch(&borrowed)?;
+    debug!(
+        ?artifact_id,
+        retired = retired.len(),
+        "retired the relations bound to a departing artifact node"
+    );
+    Ok(())
+}
+
+/// Say what a refused tree transition was about when kin-db reports one of its
+/// relations still naming a node the staged tree no longer carries.
+///
+/// The storage message names a relation uuid and an artifact uuid and nothing
+/// else. Neither maps to a file, the refusal is of the whole transaction rather
+/// than of the edge, and the surface a user meets is a commit that cannot run at
+/// all. Name the paths this transition drops and the two-step retirement that
+/// clears the edges, so the message a user reads is about their repository
+/// rather than about kin's internals.
+pub(crate) fn name_stranded_endpoint_refusal(
+    error: DaemonError,
+    deltas: &[TreeDelta],
+) -> DaemonError {
+    let message = error.to_string();
+    if !message.contains("unadmitted source endpoint")
+        && !message.contains("unadmitted destination endpoint")
+    {
+        return error;
+    }
+    let removed = deltas
+        .iter()
+        .filter_map(|delta| match delta {
+            TreeDelta::Removed { old, .. } => Some(old.path.to_string()),
+            TreeDelta::Added { .. } | TreeDelta::Updated { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    let dropped = if removed.is_empty() {
+        "this transition".to_string()
+    } else {
+        removed.join(", ")
+    };
+    DaemonError::IncompatibleRepo(format!(
+        "refusing to drop {dropped}: the graph still holds a relation whose endpoint is the \
+         artifact being removed, and kin-db refuses a transition that strands one ({message}). \
+         fix: empty the file and commit, which retires the edges through the linker, then delete \
+         the empty file and commit again. Report this: a removal is supposed to collect these \
+         edges itself"
+    ))
+}
+
 /// Remove the enrichment derived from every path a tree transition drops.
 ///
 /// Entities, their relations, and their text and vector index presence are what
@@ -1219,6 +1295,10 @@ fn announce_retraction(retracted: &kin_index::IgnoredTrackedPaths) {
 /// strand one. Clearing here is what lets a removal of any kind, a deleted file
 /// or a newly ignored one, take the whole artifact out rather than only its
 /// tree entry.
+///
+/// Artifact-class edges go with it. They have no entity endpoint, so the entity
+/// cleanup below cannot see them, and kin-db refuses the tree transition that
+/// strands one exactly as it refuses a stranded entity.
 pub(crate) fn evict_enrichment_for_removed_paths(
     state: &DaemonState,
     deltas: &[TreeDelta],
@@ -1227,6 +1307,7 @@ pub(crate) fn evict_enrichment_for_removed_paths(
         let TreeDelta::Removed { old, .. } = delta else {
             continue;
         };
+        retire_artifact_node_relations(state.graph.as_ref(), delta.artifact_id())?;
         let Some(file_id) = semantic_file_id(&old.path) else {
             continue;
         };
@@ -6884,6 +6965,142 @@ mod tests {
             at,
             "the stamp has to have applied, or every assertion resting on it is about the \
              file's real age instead"
+        );
+    }
+
+    /// Build the artifact-to-artifact edge shape the cross-file linker mints
+    /// for a file-level import, which is the class of relation nothing else
+    /// collects when its file is deleted.
+    fn artifact_edge(
+        src: kin_model::ArtifactId,
+        dst: kin_model::ArtifactId,
+        kind: kin_model::RelationKind,
+    ) -> kin_model::Relation {
+        kin_model::Relation {
+            id: kin_model::RelationId::new(),
+            kind,
+            src: kin_model::GraphNodeId::Artifact(src),
+            dst: kin_model::GraphNodeId::Artifact(dst),
+            confidence: 1.0,
+            origin: kin_model::RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        }
+    }
+
+    fn artifact_at(state: &DaemonState, path: &str) -> kin_model::ArtifactId {
+        state
+            .graph
+            .artifact_id_at_path(&test_repo_path(path))
+            .unwrap_or_else(|| panic!("{path} must be admitted before the test asks about it"))
+    }
+
+    /// FIR-2607. A file whose artifact is named by a relation can be deleted.
+    ///
+    /// Both shapes the linker actually produces are covered: the outgoing
+    /// import edge to another artifact, and the parse-coverage self-loop every
+    /// indexed file carries. kin-db validates every relation the graph holds
+    /// against the staged tree on each transaction, so either one left standing
+    /// fails the whole removal, not just the edge. Before the fix this test
+    /// fails with `transaction relation <id> has unadmitted source endpoint
+    /// artifact:<id>`, which is the exact refusal that made a repository unable
+    /// to commit at all until the file was emptied first.
+    #[test]
+    fn a_removal_takes_the_relations_bound_to_the_departing_artifact() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let leaving = repo.path().join("leaving.rs");
+        let staying = repo.path().join("staying.rs");
+        std::fs::write(&leaving, b"pub fn leaving() -> u32 { 1 }\n").unwrap();
+        std::fs::write(&staying, b"pub fn staying() -> u32 { 2 }\n").unwrap();
+        admit_file_event(&state, &FileEvent::Changed(leaving.clone())).unwrap();
+        admit_file_event(&state, &FileEvent::Changed(staying.clone())).unwrap();
+
+        let leaving_id = artifact_at(&state, "leaving.rs");
+        let staying_id = artifact_at(&state, "staying.rs");
+        let import = artifact_edge(leaving_id, staying_id, kin_model::RelationKind::Imports);
+        let coverage = artifact_edge(leaving_id, leaving_id, kin_model::RelationKind::DependsOn);
+        state.graph.upsert_relation(&import).unwrap();
+        state.graph.upsert_relation(&coverage).unwrap();
+
+        std::fs::remove_file(&leaving).unwrap();
+        let admitted = admit_file_event_ambient(&state, &FileEvent::Removed(leaving))
+            .expect("a removal must collect the edges bound to the artifact it drops");
+
+        assert!(matches!(admitted, AdmittedFileEvent::Removed { .. }));
+        assert!(
+            tree_entry(&state, "leaving.rs").is_none(),
+            "the artifact left the tree"
+        );
+        assert!(
+            state
+                .graph
+                .get_all_relations_for_node(&kin_model::GraphNodeId::Artifact(leaving_id))
+                .unwrap()
+                .is_empty(),
+            "and every edge naming it left with it"
+        );
+        assert!(
+            tree_entry(&state, "staying.rs").is_some(),
+            "the destination artifact is untouched: only the departing endpoint's edges go"
+        );
+    }
+
+    /// FIR-2607, the second half. A refusal a user can act on.
+    ///
+    /// The raw storage message names two uuids and offers nothing to do. This
+    /// asserts the surface a user meets names the path being dropped and the
+    /// two-step retirement that clears the edges, so the message is about their
+    /// repository rather than about kin's internals.
+    #[test]
+    fn a_stranded_endpoint_refusal_names_the_path_and_the_way_out() {
+        let raw = DaemonError::Graph(kin_db::KinDbError::StorageError(
+            "transaction relation 6b30c139-1c2a-a133-d17b-2625e60d3df9 has unadmitted source \
+             endpoint artifact:f4d9e1db-d7b2-4fd9-912c-2809f331331b"
+                .to_string(),
+        ));
+        let deltas = vec![TreeDelta::Removed {
+            artifact_id: kin_model::ArtifactId::new(),
+            old: kin_model::LocatedEntry::new(
+                test_repo_path("notekeeper/search.py"),
+                TreeEntry::blob(Hash256::from_bytes([7; 32]), false),
+            ),
+        }];
+
+        let named = name_stranded_endpoint_refusal(raw, &deltas).to_string();
+
+        assert!(
+            named.contains("notekeeper/search.py"),
+            "the refusal names the path being dropped: {named}"
+        );
+        assert!(
+            named.contains("fix: empty the file and commit"),
+            "and carries the retirement that clears the edges: {named}"
+        );
+        assert!(
+            named.contains("6b30c139-1c2a-a133-d17b-2625e60d3df9"),
+            "without losing the identifiers a report needs: {named}"
+        );
+    }
+
+    /// An unrelated failure is handed back untouched, so the naming above can
+    /// never dress up a refusal it does not understand.
+    #[test]
+    fn an_unrelated_refusal_is_not_dressed_up_as_a_stranded_endpoint() {
+        let raw = DaemonError::Graph(kin_db::KinDbError::StorageError(
+            "transaction adds existing entity 1056cc39-df63-5f0b-9d85-a161fb2c882f".to_string(),
+        ));
+
+        let passed_through = name_stranded_endpoint_refusal(raw, &[]).to_string();
+
+        assert!(
+            passed_through.contains("transaction adds existing entity"),
+            "an unrelated storage refusal keeps its own words: {passed_through}"
+        );
+        assert!(
+            !passed_through.contains("fix: empty the file"),
+            "and gains no advice that would not help: {passed_through}"
         );
     }
 }
