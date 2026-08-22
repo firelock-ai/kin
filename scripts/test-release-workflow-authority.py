@@ -1687,6 +1687,22 @@ def assert_windows_node_validator_behavior(step: str) -> None:
                 "/wrong/kin",
             ),
         )
+        # FIR-2293, named as its own class rather than left to the drift case
+        # above. `kin setup` recorded the MCP command by joining onto whatever
+        # `KIN_HOME` held, and MSYS bash hands it a forward-slashed `$HOME`, so
+        # a Windows install wrote `C:/Users/u/.kin\bin\kin.exe` against an
+        # installed launcher of `C:\Users\u\.kin\bin\kin.exe`. Windows opens
+        # both, so only a byte comparison against the installed launcher can
+        # tell them apart, and this arm is what keeps that able to fail.
+        reject(
+            f"{config_path} MCP command mixes path separators",
+            invalid_home=fixture_with_json_value(
+                home,
+                config_path,
+                ("mcpServers", "kin", "command"),
+                f"{VALIDATOR_HOME}/.kin\\bin\\kin.exe",
+            ),
+        )
         reject(
             f"{config_path} MCP args drift",
             invalid_home=fixture_with_json_value(
