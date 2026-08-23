@@ -518,6 +518,17 @@ impl DaemonKillRecord {
     pub fn cause_sentence(&self) -> String {
         let since = hhmm_utc(self.first_unix);
         let opening = match (self.memory_kills, self.kills, self.last_cause) {
+            // Signal zero is the record saying it has no signal, not a signal
+            // numbered zero, and it is what an unwatched death carries: nobody
+            // waited on the process, so its exit status is gone. Rendering that
+            // as "killed by signal 0" states a fact about the kernel that no
+            // kernel ever reported, which is the same failure as the idle
+            // window one turn smaller.
+            (0, kills, DaemonKillCause::Unattributed { signal: 0 }) => format!(
+                "the daemon for this store was killed {kills} time(s) since {since} with nothing \
+                 waiting on it, so its exit signal is gone, and this host publishes no memory \
+                 accounting, so nothing here attributes that to memory"
+            ),
             (0, kills, DaemonKillCause::Unattributed { signal }) => format!(
                 "the daemon for this store was killed by signal {signal} {kills} time(s) since \
                  {since}, and this host publishes no memory accounting, so nothing here \
@@ -8274,6 +8285,42 @@ mod tests {
             !record.attributed_to_memory(),
             "nothing here attributed it to memory"
         );
+    }
+
+    /// A death nobody waited on has no signal, and must not be given one.
+    ///
+    /// An unwatched kill is recorded with signal zero, which is the record
+    /// saying it has no signal rather than a signal numbered zero. Printed as
+    /// "killed by signal 0" it states something about the kernel that no kernel
+    /// reported, which is the same defect as the idle window one turn smaller.
+    /// Found by running the FIR-2650 surfaces against a real SIGKILL on macOS,
+    /// where nothing can attribute a kill.
+    #[test]
+    fn a_death_with_no_observed_signal_does_not_invent_one() {
+        let record = DaemonKillRecord {
+            kills: 1,
+            memory_kills: 0,
+            first_unix: 1_787_000_000,
+            last_unix: 1_787_000_000,
+            last_pid: Some(4103),
+            last_cause: DaemonKillCause::Unattributed { signal: 0 },
+            limit_bytes: None,
+            last_rss_bytes: None,
+        };
+        let sentence = record.cause_sentence();
+        assert!(
+            !sentence.contains("signal 0"),
+            "signal zero is the absence of a signal, not one: {sentence}"
+        );
+        assert!(
+            sentence.contains("killed"),
+            "it is still a kill and still has to say so: {sentence}"
+        );
+        assert!(
+            sentence.contains("nothing waiting on it"),
+            "why the signal is missing is the whole of what is known: {sentence}"
+        );
+        assert!(sentence.contains("no memory accounting"), "{sentence}");
     }
 
     /// Every action in the remediation is one the caller can perform, and the
