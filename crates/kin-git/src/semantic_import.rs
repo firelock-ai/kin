@@ -9,7 +9,9 @@
 //! byte-exact projection, while semantic changes and resolved trees become the
 //! graph-owned runtime authority.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use kin_blobs::BlobStore;
@@ -55,6 +57,51 @@ pub struct GitWorkspaceSeed {
     pub base_tree_hash: Option<Hash256>,
 }
 
+/// One imported change's historical semantics, owned or lent.
+///
+/// The deltas exist twice at the moment they are bound: once in whatever
+/// derived them and once in the plan they are written into. Both callers that
+/// run at whole-repository scale used to pay for that, and they cannot pay for
+/// it the same way. The enrichment fold owns what it derived and never reads it
+/// again, so it can hand the deltas over; the admitted plan's self-check reads
+/// them out of the very structure it is checking, so it must lend them and must
+/// not copy the structure to do it. `Cow` is what lets one signature serve both
+/// with exactly one copy where there were two.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistoricalSemanticBinding<'a> {
+    pub change_id: SemanticChangeId,
+    pub entity_deltas: Cow<'a, [EntityDelta]>,
+    pub relation_deltas: Cow<'a, [RelationDelta]>,
+}
+
+impl<'a> HistoricalSemanticBinding<'a> {
+    /// Hand over deltas this caller will not read again.
+    pub fn owned(
+        change_id: SemanticChangeId,
+        entity_deltas: Vec<EntityDelta>,
+        relation_deltas: Vec<RelationDelta>,
+    ) -> Self {
+        Self {
+            change_id,
+            entity_deltas: Cow::Owned(entity_deltas),
+            relation_deltas: Cow::Owned(relation_deltas),
+        }
+    }
+
+    /// Lend deltas that stay where they are.
+    pub fn borrowed(
+        change_id: SemanticChangeId,
+        entity_deltas: &'a [EntityDelta],
+        relation_deltas: &'a [RelationDelta],
+    ) -> Self {
+        Self {
+            change_id,
+            entity_deltas: Cow::Borrowed(entity_deltas),
+            relation_deltas: Cow::Borrowed(relation_deltas),
+        }
+    }
+}
+
 /// Deterministic, transaction-ready import of one lossless Git snapshot.
 ///
 /// `changes` are parent-first. `commit_trees` contains the exact resolved tree
@@ -67,7 +114,13 @@ pub struct SemanticGitImportPlan {
     pub external_objects: Vec<ExternalObjectRecord>,
     pub changes: Vec<SemanticChange>,
     pub aliases: Vec<ExternalChangeAlias>,
-    pub commit_trees: BTreeMap<GitObjectId, ResolvedTree>,
+    /// Shared, never copied. The admitted form of this plan carries the same
+    /// trees and is live beside it for five phases of the admission ladder, so
+    /// owning them twice put the largest whole-history structure in memory
+    /// twice for the whole of that window. Nothing mutates a tree after
+    /// derivation, so sharing changes no value and no comparison: two plans
+    /// derived separately still hold separate maps and still compare in full.
+    pub commit_trees: Arc<BTreeMap<GitObjectId, ResolvedTree>>,
     pub refs: RepositoryRefState,
     pub head: WorkspaceHead,
     pub workspace_seed: GitWorkspaceSeed,
@@ -118,7 +171,7 @@ impl SemanticGitImportPlan {
     pub fn with_historical_semantics(
         self,
         blob_store: &BlobStore,
-        deltas: &[(SemanticChangeId, Vec<EntityDelta>, Vec<RelationDelta>)],
+        bindings: Vec<HistoricalSemanticBinding<'_>>,
     ) -> Result<Self> {
         let snapshot = LosslessGitRepository {
             repository_id: self.repository_id.clone(),
@@ -135,7 +188,7 @@ impl SemanticGitImportPlan {
             &mut |oid, change, alias, tree| comparison.check_commit(oid, change, alias, tree),
         )?;
         comparison.finish(&derived)?;
-        apply_historical_semantic_deltas_unchecked(self, deltas)
+        apply_historical_semantic_deltas_unchecked(self, bindings)
     }
 }
 
@@ -149,12 +202,13 @@ pub fn plan_semantic_git_import(
 
 fn apply_historical_semantic_deltas_unchecked(
     mut plan: SemanticGitImportPlan,
-    deltas: &[(SemanticChangeId, Vec<EntityDelta>, Vec<RelationDelta>)],
+    bindings: Vec<HistoricalSemanticBinding<'_>>,
 ) -> Result<SemanticGitImportPlan> {
     let mut delta_by_change = BTreeMap::new();
-    for (change_id, entity_deltas, relation_deltas) in deltas {
+    for binding in bindings {
+        let change_id = binding.change_id;
         if delta_by_change
-            .insert(*change_id, (entity_deltas, relation_deltas))
+            .insert(change_id, (binding.entity_deltas, binding.relation_deltas))
             .is_some()
         {
             return Err(GitError::InvalidSnapshot(format!(
@@ -190,8 +244,21 @@ fn apply_historical_semantic_deltas_unchecked(
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        change.entity_deltas = delta.0.clone();
-        change.relation_deltas = delta.1.clone();
+        // `into_owned` is a move for an owned binding and a copy for a lent
+        // one, so each caller pays exactly once for the copy it cannot avoid
+        // and nothing pays twice.
+        //
+        // Shrunk because moving preserves capacity where copying did not. A
+        // derived vector was grown by pushing, so it carries whatever slack the
+        // doubling left, and these vectors are retained for the rest of the
+        // conversion. Measured on psf/requests at 6731 commits, that slack was
+        // 108.1 MiB, and it is live from here to the last phase, so taking the
+        // move without this made the whole conversion's peak WORSE by exactly
+        // that much while the phase's own peak fell by 1081.4 MiB.
+        change.entity_deltas = delta.0.into_owned();
+        change.entity_deltas.shrink_to_fit();
+        change.relation_deltas = delta.1.into_owned();
+        change.relation_deltas.shrink_to_fit();
         change.id = placeholder_change_id();
         change.id = compute_semantic_change_id(&change)?;
         validate_semantic_change_id(&change)?;
@@ -666,7 +733,7 @@ fn build_semantic_git_import_plan(
         external_objects: snapshot.objects.clone(),
         changes,
         aliases,
-        commit_trees: derived.commit_trees,
+        commit_trees: Arc::new(derived.commit_trees),
         refs: snapshot.refs.clone(),
         head: snapshot.head.clone(),
         workspace_seed: derived.workspace_seed,
@@ -1872,6 +1939,17 @@ mod tests {
 
         assert_eq!(admitted.external_objects, semantic.external_objects);
         assert_eq!(admitted.commit_trees, semantic.commit_trees);
+        // Equal is not the assertion that matters here. The admitted plan is
+        // live beside the plan it was derived from for five phases of the
+        // admission ladder, and resolved trees are the largest whole-history
+        // structure either of them holds, so an equal-but-separate map is a
+        // second copy of the repository's history in memory for the whole of
+        // that window. Pointer identity is the only form of this check that
+        // fails when the copy comes back, because a copy still compares equal.
+        assert!(
+            Arc::ptr_eq(&admitted.commit_trees, &semantic.commit_trees),
+            "admission copied the resolved trees instead of sharing them"
+        );
         assert_eq!(admitted.refs, semantic.refs);
         assert_eq!(admitted.head, semantic.head);
         assert_eq!(admitted.workspace_seed, semantic.workspace_seed);

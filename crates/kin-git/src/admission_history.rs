@@ -9,6 +9,7 @@
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use kin_blobs::BlobStore;
 use kin_model::{
@@ -22,7 +23,9 @@ use kin_model::{
 
 use crate::error::{GitError, Result};
 use crate::lossless::{GitObjectFormat, LosslessGitRepository};
-use crate::semantic_import::{plan_semantic_git_import, GitWorkspaceSeed, SemanticGitImportPlan};
+use crate::semantic_import::{
+    plan_semantic_git_import, GitWorkspaceSeed, HistoricalSemanticBinding, SemanticGitImportPlan,
+};
 
 /// A deterministic semantic Git import whose every commit carries the exact
 /// shared admission-policy transition derived from that commit's resolved
@@ -38,7 +41,8 @@ pub struct AdmittedSemanticGitImportPlan {
     pub external_objects: Vec<ExternalObjectRecord>,
     pub changes: Vec<SemanticChange>,
     pub aliases: Vec<ExternalChangeAlias>,
-    pub commit_trees: BTreeMap<GitObjectId, ResolvedTree>,
+    /// The same trees the pre-admission plan holds, shared with it.
+    pub commit_trees: Arc<BTreeMap<GitObjectId, ResolvedTree>>,
     /// Effective shared policy at every imported commit.
     pub commit_policies: BTreeMap<GitObjectId, SharedAdmissionPolicy>,
     pub refs: RepositoryRefState,
@@ -94,7 +98,13 @@ impl AdmittedSemanticGitImportPlan {
                 )));
             }
         }
-        let deltas = semantic
+        // Lent, not copied. These deltas live in `self`, which outlives the
+        // call, and the enrichment fold below only reads them on its way into
+        // the derived plan. Collecting them into owned vectors here put a whole
+        // history's entity and relation deltas in memory a second time, at the
+        // one phase in the ladder where the working set is already largest, and
+        // the copy was dropped a few lines later without ever being read again.
+        let bindings = semantic
             .changes
             .iter()
             .map(|base_change| {
@@ -106,15 +116,14 @@ impl AdmittedSemanticGitImportPlan {
                         "admitted semantic Git import is missing commit {oid}"
                     ))
                 })?;
-                Ok((
+                Ok(HistoricalSemanticBinding::borrowed(
                     base_change.id,
-                    admitted.entity_deltas.clone(),
-                    admitted.relation_deltas.clone(),
+                    &admitted.entity_deltas,
+                    &admitted.relation_deltas,
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
-        let semantic = semantic.with_historical_semantics(blob_store, &deltas)?;
-        drop(deltas);
+        let semantic = semantic.with_historical_semantics(blob_store, bindings)?;
 
         // Compared commit by commit as the admitted history is re-derived, and
         // each derived commit dropped once checked. Same values, same
@@ -379,7 +388,7 @@ fn build_admitted_semantic_git_import_plan(
         external_objects: plan.external_objects.clone(),
         changes,
         aliases,
-        commit_trees: plan.commit_trees.clone(),
+        commit_trees: Arc::clone(&plan.commit_trees),
         commit_policies: derived.commit_policies,
         refs: plan.refs.clone(),
         head: plan.head.clone(),

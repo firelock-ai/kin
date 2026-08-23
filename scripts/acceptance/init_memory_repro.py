@@ -117,6 +117,10 @@ PROOF_LINE = re.compile(
 TOTAL_LINE = re.compile(
     r"peak live heap admitting (\d+) commits: (\d+) bytes .*backstop (\d+) MiB"
 )
+BIND_LINE = re.compile(
+    r"kin\.init\.bind_historical_semantics grew the peak by (\d+) bytes "
+    r"while retaining (\d+) bytes, ceiling (\d+) percent"
+)
 
 
 def read_guard_output(text):
@@ -134,6 +138,40 @@ def read_guard_output(text):
         int(total.group(2)) if total else None,
         int(total.group(3)) if total else None,
     )
+
+
+def read_bind_figures(text):
+    """Pull the binding phase's growth, what it retained, and its ceiling.
+
+    Separate from `read_guard_output` because it grades a ratio rather than a
+    byte count, and because it exists so a guard that fails on THIS assertion
+    cannot be reported as a pass. Every figure the guard prints is printed
+    before any assertion runs, so a suite that grades only the first two would
+    report both of them PASS over a red guard.
+    """
+    bind = BIND_LINE.search(text or "")
+    if not bind:
+        return (None, None, None)
+    return (int(bind.group(1)), int(bind.group(2)), int(bind.group(3)))
+
+
+def grade_ratio(grew, retained, cap_percent):
+    """PASS under the ceiling, FAIL at or over it, UNREADABLE with no denominator.
+
+    A phase that retained nothing gives the ratio no denominator, so the
+    comparison would pass on any growth at all. That is UNREADABLE, not a pass.
+    """
+    if grew is None or retained is None or cap_percent is None:
+        return UNREADABLE, "the guard printed no binding-phase figures, so nothing was graded"
+    if retained == 0:
+        return UNREADABLE, ("the binding phase retained nothing, so its growth had nothing "
+                            "to be measured against and this graded nothing")
+    percent = grew * 100 // retained
+    detail = ("binding historical semantics grew the peak by %d percent of what it retained "
+              "(%d over %d bytes), ceiling %d percent" % (percent, grew, retained, cap_percent))
+    if percent >= cap_percent:
+        return FAIL, detail
+    return PASS, detail
 
 
 class Result(object):
@@ -255,7 +293,21 @@ def check_1(suite):
     return result
 
 
-CHECKS = [check_0, check_1]
+def check_2(suite):
+    """Binding historical semantics keeps one copy of what it derives, not two."""
+    result = Result("2", "binding historical semantics does not hold two copies")
+    code, out = suite.guard_output()
+    grew, retained, cap = read_bind_figures(out)
+    if grew is None and code != 0:
+        result.unknown("the guard produced no binding figures and exited %d: %s"
+                       % (code, tail(out)))
+        return result
+    status, detail = grade_ratio(grew, retained, cap)
+    {PASS: result.ok, FAIL: result.bad, UNREADABLE: result.unknown}[status](detail)
+    return result
+
+
+CHECKS = [check_0, check_1, check_2]
 
 
 def self_test():
@@ -297,10 +349,33 @@ def self_test():
     if got != PASS:
         failures.append("the shipped proof ceiling rejects the post-fix figure")
 
+    # The ratio grader and its parser, falsified the same way. A phase that
+    # retained nothing is the case that would otherwise pass on any growth.
+    ratio_cases = [
+        ("one copy passes", 103226981, 100882320, 175, PASS),
+        ("two copies fail", 197043712, 90177536, 175, FAIL),
+        ("exactly at the ceiling fails", 175, 100, 175, FAIL),
+        ("nothing retained is unreadable", 100, 0, 175, UNREADABLE),
+        ("nothing measured is unreadable", None, None, None, UNREADABLE),
+    ]
+    for title, grew, retained, cap, wanted in ratio_cases:
+        got, detail = grade_ratio(grew, retained, cap)
+        if got != wanted:
+            failures.append("%s: wanted %s, got %s (%s)" % (title, wanted, got, detail))
+
+    bind_line = ("kin.init.bind_historical_semantics grew the peak by 103226981 bytes "
+                 "while retaining 100882320 bytes, ceiling 175 percent\n")
+    if read_bind_figures(bind_line) != (103226981, 100882320, 175):
+        failures.append("parser misread the binding line: %r" % (read_bind_figures(bind_line),))
+    if read_bind_figures("error: could not compile") != (None, None, None):
+        failures.append("parser invented binding figures from output that carries none")
+    if read_bind_figures("") != (None, None, None):
+        failures.append("parser invented binding figures from empty output")
+
     for failure in failures:
         print("SELFTEST FAIL %s" % failure)
     print("kin-init-memory-repro self-test: %d case(s), %d failure(s)"
-          % (len(cases) + 5, len(failures)))
+          % (len(cases) + len(ratio_cases) + 8, len(failures)))
     return 1 if failures else 0
 
 
