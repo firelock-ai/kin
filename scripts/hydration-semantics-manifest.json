@@ -75,7 +75,7 @@
     {
       "file": "crates/kin-git/src/semantic_import.rs",
       "function": "apply_historical_semantic_deltas_unchecked",
-      "digest": "sha256:15927de5fd0b8b261b61d13de24fc2f636b00421e3c32484cbac22dd8633aa94",
+      "digest": "sha256:00011e7492e9b4ef835399341902828cd7f2b2d6a9c9acd6ed9cb30736740599",
       "reason": "Writes the derived deltas onto the imported changes and recomputes their identities. This is the step that makes replayed semantics the persisted historical record.",
       "owner": "kin-git"
     },
