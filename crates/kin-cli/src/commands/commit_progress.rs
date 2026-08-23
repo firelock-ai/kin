@@ -323,11 +323,22 @@ fn memory_attribution(
 ///
 /// Stated once and shared with the `kin doctor` check that reports the same
 /// headroom before a commit is attempted, so the two surfaces cannot drift into
-/// describing the same cost differently.
+/// describing the same cost differently. It also reaches `kin commit --help`
+/// through `authority_not_git_note!`, so a wrong sentence here is wrong in three
+/// places at once, which is what happened.
+///
+/// FIR-2643: this used to assert that a commit's peak "follows the size of the
+/// store rather than the size of the edit". That is the claim the rc0550
+/// stranger measured against and it did not hold: a docstring-only commit on a
+/// 500 MiB store cost about 0.9 GB over an 8.16 GB resident baseline, while the
+/// store-size model predicted a 10.6 GiB floor. The sentence now says what is
+/// actually known and stops explaining a mechanism the one measurement that
+/// separated the terms contradicts.
 pub const COMMIT_MEMORY_REMEDY: &str =
-    "A commit prepares the whole repository successor in memory, so its peak follows the size of \
-     the store rather than the size of the edit. Re-run it with more memory available; \
-     `kin doctor` reports this headroom before a commit is attempted.";
+    "How much a commit costs is not yet modelled well enough to predict from the store alone; \
+     the one measurement that separated the terms found a small edit costing far less than the \
+     store size suggests. Re-run it with more memory available, or make the edit smaller; \
+     `kin doctor` reports the headroom it can measure before a commit is attempted.";
 
 /// The words both the commit line and `kin commit --help` are built from.
 ///

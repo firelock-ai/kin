@@ -7,7 +7,9 @@
 //! preserve graph authority:
 //!
 //! 1. A persisted `.kidx` read index for fast CLI queries.
-//! 2. A registry entry in `~/.kin/registry.toml`.
+//! 2. A registry entry in the registry this home resolves to
+//!    (`KIN_REGISTRY_PATH`, else `<KIN_HOME>/registry.toml`, else
+//!    `~/.kin/registry.toml`).
 //! 3. A best-effort LSP cold-sweep trigger.
 //!
 use std::path::Path;
@@ -46,7 +48,7 @@ pub fn build_and_save_kidx(snapshot_path: &Path, graph: &kin_db::InMemoryGraph) 
     Ok(())
 }
 
-/// Register the repo in `~/.kin/registry.toml` with its entity count.
+/// Register the repo in this home's resolved registry with its entity count.
 pub fn update_registry(repo_root: &Path, entity_count: usize) -> Result<()> {
     let repo_id = repo_root
         .file_name()
@@ -97,7 +99,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         // Point the registry authority at a path whose parent directory does
         // not exist yet. That is the condition under test, and it keeps the
-        // test off the real `~/.kin/registry.toml`: writing there mutates the
+        // test off the operator's real resolved registry: writing there mutates the
         // developer's own repo list, and the exclusive lock it takes has no
         // timeout, so a `kin` process holding that lock would block this test
         // forever.

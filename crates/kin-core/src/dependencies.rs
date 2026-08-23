@@ -38,7 +38,10 @@ pub fn detect_dependencies(repo_path: &Path) -> Vec<RepoDependency> {
 
 /// Registry-aware version of [`detect_dependencies`].
 ///
-/// `registry_repo_ids` is the list of known repo IDs from `~/.kin/registry.toml`.
+/// `registry_repo_ids` is the list of known repo IDs from the registry this
+/// home resolves to ([`crate::registry::registry_path`]), which is
+/// `~/.kin/registry.toml` only when neither `KIN_REGISTRY_PATH` nor `KIN_HOME`
+/// is set.
 /// Dependencies whose names match a registry repo ID (with crate-name normalization:
 /// `kin-db` ↔ `kin_db`) get their `provider_repo` set automatically.
 pub fn detect_dependencies_with_registry(
