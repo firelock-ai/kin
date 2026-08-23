@@ -1569,11 +1569,17 @@ def check_9(suite):
 
     # Arm three: ordering. A raise target above a row the value travels through is
     # the mechanism, and it is what a revert of the ranking change restores.
+    # Grouped by parent_step, not by depth. The per-step cap cuts ONE node's
+    # fan-out, which is the list sort_trace_candidates orders, and depth mixes the
+    # fan-outs of every node at that level into an order nothing ever sorted. An
+    # earlier draft of this arm grouped by depth and passed on bytes that had never
+    # been fixed, which is the failure mode this suite exists to refuse.
     misordered = []
-    by_depth = {}
+    by_parent = {}
     for index, step in enumerate(steps):
-        by_depth.setdefault(step.get("depth"), []).append((index, step))
-    for depth, rows in sorted(by_depth.items(), key=lambda item: (item[0] is None, item[0])):
+        by_parent.setdefault(step.get("parent_step"), []).append((index, step))
+    for parent, rows in sorted(by_parent.items(),
+                               key=lambda item: (item[0] is None, item[0])):
         last_flow = None
         for position, (_index, step) in enumerate(rows):
             if str(step.get("entity_name") or "") not in TRACE_RAISE_TARGETS:
@@ -1583,10 +1589,11 @@ def check_9(suite):
         for position, (_index, step) in enumerate(rows[:last_flow]):
             name = str(step.get("entity_name") or "")
             if name in TRACE_RAISE_TARGETS:
-                misordered.append((depth, position, name))
+                misordered.append((parent, position, name))
     if misordered:
-        sample = ", ".join("%s at depth %s position %d" % (name, depth, position)
-                           for depth, position, name in misordered[:6])
+        sample = ", ".join("%s in the fan-out of step %s at position %d"
+                           % (name, parent, position)
+                           for parent, position, name in misordered[:6])
         res.bad("%d raise target(s) rank above a row the value travels through: %s. "
                 "These are `raise` operands in `except` blocks, not data flow, and "
                 "at a bounded budget they take the slots the chain needs"
