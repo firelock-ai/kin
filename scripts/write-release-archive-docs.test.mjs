@@ -69,6 +69,40 @@ test('every archive states the memory a commit needs before a reader picks a mac
   }
 });
 
+// FIR-2643: the same wrong model had three homes, and this was the one shipped
+// inside the archive. The requirement itself is grounded, a margin over a total
+// that has actually been observed, but the sentence that justified it explained
+// the cost as following repository size, which is the claim the one measurement
+// separating the terms contradicts: a docstring-only edit on a 500 MiB store
+// cost about 0.9 GB while the store-size reading implied a 10.6 GiB floor. A
+// requirement a reader disbelieves is a requirement they stop reading.
+test('the memory requirement does not explain itself with a model the measurement contradicts', () => {
+  for (const target of TARGETS) {
+    const { install } = generate(target);
+    assert.doesNotMatch(
+      install,
+      /peak follows\s+the size of the repository/,
+      `${target}: INSTALL.md still derives the commit cost from repository size`,
+    );
+    assert.doesNotMatch(
+      install,
+      /rather than the size of the edit/,
+      `${target}: INSTALL.md still contrasts store size against edit size as the model`,
+    );
+    // Positive controls: deleting the paragraph passes both assertions above.
+    assert.match(
+      install,
+      /not modelled/,
+      `${target}: INSTALL.md drops the requirement instead of stating its uncertainty`,
+    );
+    assert.match(
+      install,
+      /observed/,
+      `${target}: INSTALL.md states a figure with nothing observed behind it`,
+    );
+  }
+});
+
 // Requirements that arrive after the install steps are requirements nobody
 // used. The reader has already chosen the machine by then.
 test('the requirement is stated before the install steps', () => {

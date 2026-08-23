@@ -370,6 +370,33 @@ impl CapabilityDetection {
     }
 }
 
+/// Which reading supplied the ceiling in [`MemoryEvidence`].
+///
+/// A row that warns about running out of memory has to be able to say which
+/// number it read, because the two answers can differ by far more than the
+/// margin they get compared against. That is FIR-2638 in one sentence: the
+/// probe read the host figure for a process capped at twelve gigabytes,
+/// reported nineteen, and the kernel killed it with nothing disclosed. A reader
+/// inside a container cannot tell those apart from the byte count alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryLimitSource {
+    /// A cgroup memory cap, found by walking up from this process's own
+    /// `/proc/self/cgroup` path rather than by reading the hierarchy root.
+    ContainerLimit,
+    /// This host's physical RAM, because no cgroup cap binds tighter than it.
+    HostRam,
+}
+
+impl MemoryLimitSource {
+    /// How to name this ceiling to somebody deciding where to run a write.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::ContainerLimit => "this container's memory cap",
+            Self::HostRam => "this host's RAM",
+        }
+    }
+}
+
 /// What the host can say about memory pressure, for a command that has to
 /// decide whether a failure it just saw was the machine running out of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -377,6 +404,9 @@ pub struct MemoryEvidence {
     /// The ceiling this process actually runs under: the container limit when
     /// one is set, otherwise the host's physical RAM.
     pub limit_bytes: u64,
+    /// Which of those two `limit_bytes` came from, so a surface quoting it can
+    /// name what it read instead of leaving a reader to guess.
+    pub limit_source: MemoryLimitSource,
     /// Kernel OOM kills accounted to this cgroup. `None` means no accounting
     /// was readable, which is "not observed" and never "did not happen".
     pub cgroup_oom_kills: Option<u64>,
@@ -384,18 +414,30 @@ pub struct MemoryEvidence {
 
 /// Read what this host will say about memory pressure right now.
 pub fn memory_evidence() -> MemoryEvidence {
+    let (limit_bytes, limit_source) =
+        resolve_memory_limit(host_ram_bytes(), cgroup_memory_limit_bytes());
     MemoryEvidence {
-        limit_bytes: effective_memory_limit_bytes(),
+        limit_bytes,
+        limit_source,
         cgroup_oom_kills: cgroup_oom_kill_count(),
     }
 }
 
-/// The memory ceiling a Kin process runs under, in bytes.
-fn effective_memory_limit_bytes() -> u64 {
-    let host = (host_ram_gb() * 1024.0 * 1024.0 * 1024.0) as u64;
-    match cgroup_memory_limit_bytes() {
-        Some(limit) => host.min(limit),
-        None => host,
+fn host_ram_bytes() -> u64 {
+    (host_ram_gb() * 1024.0 * 1024.0 * 1024.0) as u64
+}
+
+/// The memory ceiling a Kin process runs under, and which reading supplied it.
+///
+/// Pure over both readings so the tie and both orderings are testable on any
+/// host. A cap equal to the host figure is attributed to the host, because the
+/// cap constrains nothing that the physical memory did not already constrain,
+/// and naming a container cap that binds nothing invites a reader to raise a
+/// limit that was never the wall.
+fn resolve_memory_limit(host: u64, cgroup: Option<u64>) -> (u64, MemoryLimitSource) {
+    match cgroup {
+        Some(limit) if limit < host => (limit, MemoryLimitSource::ContainerLimit),
+        _ => (host, MemoryLimitSource::HostRam),
     }
 }
 
@@ -660,5 +702,61 @@ mod tests {
         );
         assert_eq!(parse_meminfo_total_gb("MemFree: 100 kB\n"), None);
         assert_eq!(parse_meminfo_total_gb("MemTotal:       nope kB\n"), None);
+    }
+
+    /// The ceiling has to carry which reading produced it, in both directions.
+    ///
+    /// A byte count alone cannot tell a reader inside a container whether their
+    /// cap was seen at all, which is the shape FIR-2638 shipped: the host figure
+    /// answered for a capped process and the disclosure stayed silent through
+    /// the kill. A surface that quotes this number quotes the source beside it,
+    /// so it can only do that if the source travels with the number.
+    ///
+    /// Falsify by returning `HostRam` unconditionally, which leaves the byte
+    /// count correct and every band unchanged: only the first case below fails.
+    #[test]
+    fn the_memory_ceiling_names_which_reading_bound_it() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(
+            resolve_memory_limit(19 * GIB, Some(12 * GIB)),
+            (12 * GIB, MemoryLimitSource::ContainerLimit),
+            "a cap under the host figure is the wall, and saying so is the FIR-2638 disclosure"
+        );
+        assert_eq!(
+            resolve_memory_limit(8 * GIB, Some(64 * GIB)),
+            (8 * GIB, MemoryLimitSource::HostRam),
+            "a cap the host cannot reach binds nothing"
+        );
+        assert_eq!(
+            resolve_memory_limit(16 * GIB, None),
+            (16 * GIB, MemoryLimitSource::HostRam),
+            "no cgroup accounting means the host figure, named as the host figure"
+        );
+        assert_eq!(
+            resolve_memory_limit(12 * GIB, Some(12 * GIB)),
+            (12 * GIB, MemoryLimitSource::HostRam),
+            "a cap level with the host constrains nothing the host did not, and pointing a \
+             reader at raising it would send them at the wrong wall"
+        );
+    }
+
+    /// Both names have to read as an answer to "which number is this".
+    #[test]
+    fn each_ceiling_source_names_itself_to_a_reader() {
+        assert!(
+            MemoryLimitSource::ContainerLimit
+                .describe()
+                .contains("container"),
+            "a capped process is told it is capped"
+        );
+        assert!(
+            MemoryLimitSource::HostRam.describe().contains("host"),
+            "an uncapped process is told it is reading the machine"
+        );
+        assert_ne!(
+            MemoryLimitSource::ContainerLimit.describe(),
+            MemoryLimitSource::HostRam.describe(),
+            "two sources that print the same words disclose nothing"
+        );
     }
 }

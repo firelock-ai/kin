@@ -907,16 +907,16 @@ mod tests {
         let bindings = first
             .iter()
             .map(|delta| {
-                (
+                kin_git::HistoricalSemanticBinding::borrowed(
                     delta.change_id,
-                    delta.entity_deltas.clone(),
-                    delta.relation_deltas.clone(),
+                    &delta.entity_deltas,
+                    &delta.relation_deltas,
                 )
             })
             .collect::<Vec<_>>();
         let enriched = plan
             .clone()
-            .with_historical_semantics(&blob_store, &bindings)
+            .with_historical_semantics(&blob_store, bindings)
             .unwrap();
         enriched.validate(&blob_store).unwrap();
         let admitted = admit_semantic_git_import(&enriched, &blob_store).unwrap();
@@ -1043,14 +1043,14 @@ mod tests {
         let bindings = deltas
             .iter()
             .map(|delta| {
-                (
+                kin_git::HistoricalSemanticBinding::borrowed(
                     delta.change_id,
-                    delta.entity_deltas.clone(),
-                    delta.relation_deltas.clone(),
+                    &delta.entity_deltas,
+                    &delta.relation_deltas,
                 )
             })
             .collect::<Vec<_>>();
-        plan.with_historical_semantics(&blob_store, &bindings)
+        plan.with_historical_semantics(&blob_store, bindings)
             .unwrap()
             .validate(&blob_store)
             .unwrap();
@@ -1114,15 +1114,15 @@ mod tests {
         let bindings = deltas
             .iter()
             .map(|delta| {
-                (
+                kin_git::HistoricalSemanticBinding::borrowed(
                     delta.change_id,
-                    delta.entity_deltas.clone(),
-                    delta.relation_deltas.clone(),
+                    &delta.entity_deltas,
+                    &delta.relation_deltas,
                 )
             })
             .collect::<Vec<_>>();
         let enriched = plan
-            .with_historical_semantics(&blob_store, &bindings)
+            .with_historical_semantics(&blob_store, bindings)
             .unwrap();
         enriched.validate(&blob_store).unwrap();
         let admitted = admit_semantic_git_import(&enriched, &blob_store).unwrap();
