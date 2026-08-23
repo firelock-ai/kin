@@ -3994,6 +3994,34 @@ mod tests {
         empty_collections.external_objects = Vec::new();
         empty_collections.ref_mutations = Vec::new();
 
+        // `canonical_preimage` has two conditional branches, for the tail
+        // fields that skip independently, and no shape above reaches either.
+        // Hash-level coverage exists in
+        // `the_canonical_view_matches_across_every_optional_tail_combination`,
+        // but the offset reporter is the instrument that caught the
+        // reason/ref_mutations ordering bug, and it can only report on shapes
+        // it is given. An independent review pointed this out.
+        let with_tails = |merge: bool, sealed: bool| {
+            let mut transaction = canonicalizable_transaction();
+            if merge {
+                let workspace_id = transaction
+                    .workspace_mutation
+                    .as_ref()
+                    .unwrap()
+                    .workspace_id;
+                transaction.merge_transaction_delta = Some(MergeTransactionDelta::open(
+                    crate::merge::tests::sample_record(
+                        transaction.repository_id.clone(),
+                        workspace_id,
+                    ),
+                ));
+            }
+            if sealed {
+                transaction.sealed_observation = Some(sealed_observation());
+            }
+            transaction
+        };
+
         vec![
             ("workspace_only", workspace_transaction()),
             ("canonicalizable", canonicalizable_transaction()),
@@ -4001,6 +4029,9 @@ mod tests {
             ("one_change", wide),
             ("unicode_message", unicode),
             ("sixteen_changes", large_transaction(16)),
+            ("merge_only", with_tails(true, false)),
+            ("sealed_only", with_tails(false, true)),
+            ("merge_and_sealed", with_tails(true, true)),
         ]
     }
 
@@ -4010,7 +4041,7 @@ mod tests {
     /// here is a change to what a transaction identity commits to, which every
     /// store already on disk depends on. It is a decision to make and version,
     /// never a value to regenerate.
-    const PINNED_PREIMAGE_DIGESTS: [(&str, &str); 6] = [
+    const PINNED_PREIMAGE_DIGESTS: [(&str, &str); 9] = [
         (
             "workspace_only",
             "87c06b3a2f89a7f7ca9cf1e45207a9b425b1e40c07d6d78ab43ea8625acb69a8",
@@ -4034,6 +4065,18 @@ mod tests {
         (
             "sixteen_changes",
             "e03347ebd49b1da8bb3779259c4cebb030c2749437b5fddb7259ec6266a13229",
+        ),
+        (
+            "merge_only",
+            "71b64e2e9588e879c6885960dfaa51a701e1ecf545c67e165b7c9b939c14f434",
+        ),
+        (
+            "sealed_only",
+            "668b8184c7e82a24c8969b64ea5f0fb18c028a816c53861640543e8271a99792",
+        ),
+        (
+            "merge_and_sealed",
+            "ba3d8e459829fcdf514938d327a5540677544d0ae6ba4fbfdae99730f3a65d3c",
         ),
     ];
 
@@ -4101,6 +4144,120 @@ mod tests {
     /// Checked against what the serialization actually produces rather than
     /// against a second hand-written list, because two hand-written lists drift
     /// together.
+    /// The keys of a canonical object, decoded from the encoding itself.
+    ///
+    /// Written because the first version of the drift guard below searched the
+    /// whole encoding for a length-prefixed key and called that "written". A
+    /// nested object carrying the same key name satisfies that search even when
+    /// the top-level field is gone, so the guard could pass with a field
+    /// dropped. An independent review found it; the corpus's empty shapes are
+    /// the only reason its mutant run went red, which is luck wearing a green
+    /// checkmark.
+    ///
+    /// Decoding is exact where matching was approximate, and it costs a walker
+    /// over a five-tag grammar. It also asserts the encoding is well formed and
+    /// ends where it says it does, which the old search could not see at all.
+    fn top_level_object_keys(encoded: &[u8]) -> Vec<String> {
+        // Every read is bounds-checked with a sentence rather than left to
+        // slice indexing. A field dropped from the writer leaves the object
+        // header promising more fields than were written; the decoder then
+        // reads a length out of value bytes and runs off the end. Panicking
+        // there catches the bug and names nothing, leaving a reader an index
+        // and no idea the header disagreed with the body.
+        fn need(bytes: &[u8], at: usize, want: usize, what: &str) {
+            assert!(
+                at + want <= bytes.len(),
+                "the preimage ended while reading {what}: wanted {want} byte(s) at \
+                 offset {at} of {}. The object header and the fields actually \
+                 written disagree.",
+                bytes.len()
+            );
+        }
+
+        fn read_len(bytes: &[u8], at: &mut usize) -> usize {
+            need(bytes, *at, 8, "a length prefix");
+            let mut buffer = [0_u8; 8];
+            buffer.copy_from_slice(&bytes[*at..*at + 8]);
+            *at += 8;
+            usize::try_from(u64::from_le_bytes(buffer)).expect("a canonical length fits usize")
+        }
+
+        fn skip_value(bytes: &[u8], at: &mut usize) {
+            need(bytes, *at, 1, "a value tag");
+            let tag = bytes[*at];
+            *at += 1;
+            match tag {
+                0 => {}
+                1 => {
+                    need(bytes, *at, 1, "a boolean body");
+                    *at += 1;
+                }
+                2 | 3 => {
+                    let len = read_len(bytes, at);
+                    need(bytes, *at, len, "a number or string body");
+                    *at += len;
+                }
+                4 => {
+                    let items = read_len(bytes, at);
+                    for _ in 0..items {
+                        skip_value(bytes, at);
+                    }
+                }
+                5 => {
+                    let fields = read_len(bytes, at);
+                    for _ in 0..fields {
+                        let len = read_len(bytes, at);
+                        need(bytes, *at, len, "a nested object key");
+                        *at += len;
+                        skip_value(bytes, at);
+                    }
+                }
+                other => panic!("unknown canonical tag {other} at offset {}", *at - 1),
+            }
+        }
+
+        let mut at = 0;
+        need(encoded, at, 1, "the object tag");
+        assert_eq!(encoded[at], 5, "a transaction preimage must be an object");
+        at += 1;
+        let fields = read_len(encoded, &mut at);
+        let mut keys = Vec::with_capacity(fields);
+        for index in 0..fields {
+            let len = read_len(encoded, &mut at);
+            need(
+                encoded,
+                at,
+                len,
+                &format!("top-level key {} of {fields}", index + 1),
+            );
+            keys.push(
+                String::from_utf8(encoded[at..at + len].to_vec())
+                    .expect("a canonical key is UTF-8"),
+            );
+            at += len;
+            skip_value(encoded, &mut at);
+        }
+        assert_eq!(
+            at,
+            encoded.len(),
+            "the preimage carries {} bytes after its object ends",
+            encoded.len() - at
+        );
+        keys
+    }
+
+    /// The hand-written field list is the serialized field set, exactly.
+    ///
+    /// `canonical_preimage` writes its own keys, so a field added to the
+    /// `Serialize` impl and not to it would silently drop out of every
+    /// transaction identity, and a field added only to it would silently
+    /// invent one. Neither shows up as a compile error.
+    ///
+    /// Checked against what the serialization actually produces rather than
+    /// against a second hand-written list, because two hand-written lists drift
+    /// together. Both sides are ordered, so this covers the byte-wise key
+    /// ordering too: `serde_json::Map` yields sorted keys and the decoded side
+    /// is in emission order.
     #[test]
     fn the_preimage_field_set_matches_the_serialized_one() {
         for (name, transaction) in preimage_corpus() {
@@ -4108,25 +4265,13 @@ mod tests {
             let serde_json::Value::Object(serialized) = serde_json::to_value(&view).unwrap() else {
                 panic!("`{name}` does not serialize as an object");
             };
-            let serialized_keys: Vec<&str> = serialized.keys().map(String::as_str).collect();
-
-            let mut written = Vec::new();
-            let mut probe = Vec::new();
-            for key in &serialized_keys {
-                probe.clear();
-                crate::identity::append_canonical_key(&mut probe, key).unwrap();
-                let encoded = view.canonical_preimage().unwrap();
-                if encoded
-                    .windows(probe.len())
-                    .any(|window| window == probe.as_slice())
-                {
-                    written.push(*key);
-                }
-            }
+            let serialized_keys: Vec<String> = serialized.keys().cloned().collect();
+            let written = top_level_object_keys(&view.canonical_preimage().unwrap());
             assert_eq!(
                 written, serialized_keys,
                 "`{name}` serializes {serialized_keys:?} but its preimage writes \
-                 {written:?}; a field is in one and not the other"
+                 {written:?}; a field is in one and not the other, or they are \
+                 written in different orders"
             );
         }
     }
