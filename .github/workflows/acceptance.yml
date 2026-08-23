@@ -96,6 +96,16 @@ jobs:
       - name: Falsify the acceptance gate
         run: python3 scripts/acceptance/gate.py --self-test
 
+      # A green suite step is not a verdict, and this makes that a rule rather
+      # than a reading: every suite-run step must say the verdict comes from the
+      # gate step, keep its exit-code capture, and stay loud on failure, and
+      # exactly one step may carry the verdict name. The scanner is driven
+      # against its own mutants first, so a rule that cannot fail fails here.
+      - name: Falsify and enforce the workflow step visibility rule
+        run: |
+          python3 scripts/acceptance/test_workflow_step_visibility.py --self-test
+          python3 scripts/acceptance/test_workflow_step_visibility.py
+
       # FIR-2600. The budget must never render a list it cut as an empty one,
       # because an empty array is the shape a reader takes for "the walk found
       # none". Each grader is handed the exact defect that shipped and has to
@@ -246,7 +256,7 @@ jobs:
       # afterwards, rather than piping into tee. A pipeline's exit status is its
       # last stage's, and `tee` exits 0 on input it never read, so a piped run
       # can report success for a suite that failed.
-      - name: Magic acceptance suite
+      - name: Magic acceptance suite (verdict comes from the gate step)
         id: magic
         env:
           KIN_ACCEPTANCE_LABEL: ${{ github.event_name }}-${{ github.sha }}
@@ -273,7 +283,7 @@ jobs:
             echo "::error title=Magic acceptance suite failed::exit $rc (1 FAIL, 2 UNREADABLE, 3 setup); see the CHECK lines above"
           fi
 
-      - name: Brownfield acceptance suite
+      - name: Brownfield acceptance suite (verdict comes from the gate step)
         id: brownfield
         if: always()
         env:
@@ -302,7 +312,7 @@ jobs:
             echo "::error title=Brownfield acceptance suite failed::exit $rc (1 FAIL, 2 UNREADABLE, 3 setup); see the CHECK lines above"
           fi
 
-      - name: Response budget elision suite
+      - name: Response budget elision suite (verdict comes from the gate step)
         id: response_budget
         if: always()
         env:
@@ -330,7 +340,7 @@ jobs:
             echo "::error title=Response budget elision suite failed::exit $rc (1 FAIL, 2 UNREADABLE, 3 setup); see the CHECK lines above"
           fi
 
-      - name: Parse-hole acceptance suite
+      - name: Parse-hole acceptance suite (verdict comes from the gate step)
         id: parsehole
         if: always()
         env:
@@ -358,7 +368,7 @@ jobs:
             echo "::error title=Parse-hole acceptance suite failed::exit $rc (1 FAIL, 2 UNREADABLE, 3 setup); see the CHECK lines above"
           fi
 
-      - name: Memory-pressure refusal suite
+      - name: Memory-pressure refusal suite (verdict comes from the gate step)
         id: memorypressure
         if: always()
         env:
@@ -391,7 +401,7 @@ jobs:
       # peak, and only the counting allocator can see it. Resident set was tried
       # and rejected, because inside a memory-limited container both a fixed and
       # an unfixed build report the ceiling rather than their demand.
-      - name: Init-memory acceptance suite
+      - name: Init-memory acceptance suite (verdict comes from the gate step)
         id: initmemory
         if: always()
         env:
@@ -417,7 +427,7 @@ jobs:
             echo "::error title=Init-memory acceptance suite failed::exit $rc (1 FAIL, 2 UNREADABLE, 3 setup); see the CHECK lines above"
           fi
 
-      - name: Registry home isolation suite
+      - name: Registry home isolation suite (verdict comes from the gate step)
         id: registryisolation
         if: always()
         env:
@@ -450,7 +460,7 @@ jobs:
       # makes unwritable, and points a real npm at a port nothing listens on so
       # the installer's own network error is what the classifier is graded
       # against.
-      - name: First-contact honesty suite
+      - name: First-contact honesty suite (verdict comes from the gate step)
         id: firstcontact
         if: always()
         env:
@@ -489,6 +499,12 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+      # THE VERDICT LIVES HERE AND ONLY HERE. Every suite step above captures its
+      # own exit code and ends green by design, so all suites run and allowance
+      # semantics stay with the gate; a green suite step is not evidence of
+      # anything, which is why each one's name says the verdict comes from this
+      # step. scripts/acceptance/test_workflow_step_visibility.py enforces the
+      # naming so a reader cannot mistake a run step for the answer.
       # The gate is its own step so both suites run and both upload even when the
       # first one fails, and it reads the reports rather than the exit codes.
       # A suite's exit status is one lever with two settings, demand a clean
@@ -497,7 +513,7 @@ jobs:
       # with no allowance possible, fails on any UNREADABLE that is not named
       # here with a reason, and refuses an allowance that points at a check the
       # report does not carry.
-      - name: Gate on the acceptance suites
+      - name: Acceptance verdict, gated on the suite reports
         if: always()
         run: |
           python3 scripts/acceptance/gate.py \

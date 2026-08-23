@@ -97,6 +97,19 @@ impl AdmittedContentClosure for SemanticGitImportPlan {
     }
 }
 
+impl AdmittedContentClosure for crate::semantic_import::ProvedImportClosure {
+    fn closure_repository_id(&self) -> &RepositoryId {
+        &self.repository_id
+    }
+
+    fn admitted_trees(&self) -> Vec<&ResolvedTree> {
+        self.commit_trees
+            .values()
+            .chain(std::iter::once(&self.workspace_seed.base_tree))
+            .collect()
+    }
+}
+
 impl AdmittedContentClosure for AdmittedSemanticGitImportPlan {
     fn closure_repository_id(&self) -> &RepositoryId {
         &self.repository_id

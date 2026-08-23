@@ -128,6 +128,154 @@ pub struct SemanticGitImportPlan {
     pub default_ref_mutation: Option<DefaultRefMutation>,
 }
 
+/// The plan fields every Git source proof reads.
+///
+/// Every proof in a conversion reads the same nine things out of an import
+/// plan: the five raw-snapshot fields it must stay bound to, the change ids and
+/// aliases and commit trees its fingerprint covers, and the workspace seed the
+/// index and worktree observations are taken against. None of them is a change
+/// BODY. Naming that set as a trait is what lets one proof hold a whole plan
+/// and the proofs after it hold only the closure, without the two ever
+/// computing a fingerprint from different inputs.
+pub trait ProvedPlanFacts {
+    fn proved_repository_id(&self) -> &RepositoryId;
+    fn proved_object_format(&self) -> GitObjectFormat;
+    fn proved_external_objects(&self) -> &[ExternalObjectRecord];
+    /// How many changes the plan carries, hashed before the ids themselves.
+    fn proved_change_count(&self) -> usize;
+    /// Change ids in the plan's own parent-first order.
+    fn proved_change_ids(&self) -> impl Iterator<Item = SemanticChangeId> + '_;
+    fn proved_aliases(&self) -> &[ExternalChangeAlias];
+    fn proved_commit_trees(&self) -> &BTreeMap<GitObjectId, ResolvedTree>;
+    fn proved_refs(&self) -> &RepositoryRefState;
+    fn proved_head(&self) -> &WorkspaceHead;
+    fn proved_workspace_seed(&self) -> &GitWorkspaceSeed;
+}
+
+impl ProvedPlanFacts for SemanticGitImportPlan {
+    fn proved_repository_id(&self) -> &RepositoryId {
+        &self.repository_id
+    }
+    fn proved_object_format(&self) -> GitObjectFormat {
+        self.object_format
+    }
+    fn proved_external_objects(&self) -> &[ExternalObjectRecord] {
+        &self.external_objects
+    }
+    fn proved_change_count(&self) -> usize {
+        self.changes.len()
+    }
+    fn proved_change_ids(&self) -> impl Iterator<Item = SemanticChangeId> + '_ {
+        self.changes.iter().map(|change| change.id)
+    }
+    fn proved_aliases(&self) -> &[ExternalChangeAlias] {
+        &self.aliases
+    }
+    fn proved_commit_trees(&self) -> &BTreeMap<GitObjectId, ResolvedTree> {
+        &self.commit_trees
+    }
+    fn proved_refs(&self) -> &RepositoryRefState {
+        &self.refs
+    }
+    fn proved_head(&self) -> &WorkspaceHead {
+        &self.head
+    }
+    fn proved_workspace_seed(&self) -> &GitWorkspaceSeed {
+        &self.workspace_seed
+    }
+}
+
+/// What a conversion still needs from its import plan once the first source
+/// proof has been taken.
+///
+/// A conversion holds its `SemanticGitImportPlan` from the phase that derives
+/// it to the phase that seals the published repository, and after the first
+/// proof nothing reads a change's body again. Every later reader was checked by
+/// name: the plan fingerprint hashes each change's ID, the snapshot binding
+/// reads the five raw-snapshot fields, the index and worktree observations read
+/// the workspace seed, and the published seal reads the commit trees and the
+/// seed tree. What stays behind is `entity_deltas`, `relation_deltas` and
+/// `tree_deltas` for every commit in history, live across the conversion's
+/// peak, answering no question.
+///
+/// This is a type rather than a mutation on purpose. Emptying the plan's
+/// vectors in place would leave a structure that still looks whole and would
+/// answer a future reader with silence, which is the failure class this whole
+/// area keeps producing. A closure that never carried the bodies cannot.
+///
+/// It is built by consuming the plan, so the bodies are freed at the call
+/// rather than copied out beside them, and `commit_trees` moves as the shared
+/// pointer it already is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProvedImportClosure {
+    pub repository_id: RepositoryId,
+    pub object_format: GitObjectFormat,
+    pub external_objects: Vec<ExternalObjectRecord>,
+    /// Change ids in the plan's parent-first order, which is every byte any
+    /// proof after the first ever took from `changes`.
+    pub change_ids: Vec<SemanticChangeId>,
+    pub aliases: Vec<ExternalChangeAlias>,
+    pub commit_trees: Arc<BTreeMap<GitObjectId, ResolvedTree>>,
+    pub refs: RepositoryRefState,
+    pub head: WorkspaceHead,
+    pub workspace_seed: GitWorkspaceSeed,
+}
+
+impl ProvedImportClosure {
+    /// Take from a proved plan exactly what the proofs after it read.
+    ///
+    /// Consuming rather than borrowing is the point: the change bodies are
+    /// dropped at this call instead of living on beside a copy of everything
+    /// else.
+    pub fn from_proved_plan(plan: SemanticGitImportPlan) -> Self {
+        let change_ids = plan.changes.iter().map(|change| change.id).collect();
+        Self {
+            repository_id: plan.repository_id,
+            object_format: plan.object_format,
+            external_objects: plan.external_objects,
+            change_ids,
+            aliases: plan.aliases,
+            commit_trees: plan.commit_trees,
+            refs: plan.refs,
+            head: plan.head,
+            workspace_seed: plan.workspace_seed,
+        }
+    }
+}
+
+impl ProvedPlanFacts for ProvedImportClosure {
+    fn proved_repository_id(&self) -> &RepositoryId {
+        &self.repository_id
+    }
+    fn proved_object_format(&self) -> GitObjectFormat {
+        self.object_format
+    }
+    fn proved_external_objects(&self) -> &[ExternalObjectRecord] {
+        &self.external_objects
+    }
+    fn proved_change_count(&self) -> usize {
+        self.change_ids.len()
+    }
+    fn proved_change_ids(&self) -> impl Iterator<Item = SemanticChangeId> + '_ {
+        self.change_ids.iter().copied()
+    }
+    fn proved_aliases(&self) -> &[ExternalChangeAlias] {
+        &self.aliases
+    }
+    fn proved_commit_trees(&self) -> &BTreeMap<GitObjectId, ResolvedTree> {
+        &self.commit_trees
+    }
+    fn proved_refs(&self) -> &RepositoryRefState {
+        &self.refs
+    }
+    fn proved_head(&self) -> &WorkspaceHead {
+        &self.head
+    }
+    fn proved_workspace_seed(&self) -> &GitWorkspaceSeed {
+        &self.workspace_seed
+    }
+}
+
 impl SemanticGitImportPlan {
     /// This plan's own raw Git state, which every re-derivation starts from.
     fn raw_snapshot(&self) -> LosslessGitRepository {

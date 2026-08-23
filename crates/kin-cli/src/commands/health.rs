@@ -4016,7 +4016,13 @@ fn check_daemon_kill_record() -> HealthCheck {
             "not in a Kin repository, so there is no store whose daemons could have been killed",
         );
     };
-    daemon_kill_record_check_for(kin_daemon_spawn::read_daemon_kill_record(layout.root()).as_ref())
+    // The store's tally OR a death it has not settled yet. The tally alone
+    // leaves a window this row exists to close: a daemon killed with nothing
+    // watching is settled by the NEXT daemon start, and a reader who runs
+    // `kin doctor` before starting one is exactly the reader who just watched a
+    // command die. This row would have told them no daemon serving this store
+    // has ever been killed.
+    daemon_kill_record_check_for(crate::daemon_death::recorded_for_store(layout.root()).as_ref())
 }
 
 /// Core of [`check_daemon_kill_record`] with the record as its input, so both

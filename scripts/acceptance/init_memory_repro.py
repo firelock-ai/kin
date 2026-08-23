@@ -121,6 +121,10 @@ BIND_LINE = re.compile(
     r"kin\.init\.bind_historical_semantics grew the peak by (\d+) bytes "
     r"while retaining (\d+) bytes, ceiling (\d+) percent"
 )
+RELEASE_LINE = re.compile(
+    r"kin\.init\.release_plan_bodies gave back (\d+) bytes of the (\d+) bytes "
+    r"kin\.init\.bind_historical_semantics retained, floor (\d+) percent"
+)
 
 
 def read_guard_output(text):
@@ -170,6 +174,42 @@ def grade_ratio(grew, retained, cap_percent):
     detail = ("binding historical semantics grew the peak by %d percent of what it retained "
               "(%d over %d bytes), ceiling %d percent" % (percent, grew, retained, cap_percent))
     if percent >= cap_percent:
+        return FAIL, detail
+    return PASS, detail
+
+
+def read_release_figures(text):
+    """Pull what the release phase gave back, against what binding retained.
+
+    Separate from the two readers above for the same reason they are separate
+    from each other: it grades a FLOOR rather than a ceiling, and a suite that
+    graded only the earlier figures would report them PASS over a guard that
+    went red on this one.
+    """
+    release = RELEASE_LINE.search(text or "")
+    if not release:
+        return (None, None, None)
+    return (int(release.group(1)), int(release.group(2)), int(release.group(3)))
+
+
+def grade_floor(given_back, retained, floor_percent):
+    """PASS at or over the floor, FAIL under it, UNREADABLE with no denominator.
+
+    The direction is the opposite of `grade_ratio` on purpose. This one asks
+    whether enough memory came BACK, so more is better and the comparison is
+    the other way round. A phase that retained nothing gives the ratio no
+    denominator, which is UNREADABLE rather than a pass, exactly as there.
+    """
+    if given_back is None or retained is None or floor_percent is None:
+        return UNREADABLE, "the guard printed no release-phase figures, so nothing was graded"
+    if retained == 0:
+        return UNREADABLE, ("the binding phase retained nothing, so there was nothing for the "
+                            "release to give back and this graded nothing")
+    percent = given_back * 100 // retained
+    detail = ("releasing the plan's change bodies gave back %d percent of what binding "
+              "retained (%d of %d bytes), floor %d percent"
+              % (percent, given_back, retained, floor_percent))
+    if percent < floor_percent:
         return FAIL, detail
     return PASS, detail
 
@@ -307,7 +347,21 @@ def check_2(suite):
     return result
 
 
-CHECKS = [check_0, check_1, check_2]
+def check_3(suite):
+    """The import plan's change bodies are given back once proof 1 has read them."""
+    result = Result("3", "the plan's change bodies are released after proof 1")
+    code, out = suite.guard_output()
+    given_back, retained, floor = read_release_figures(out)
+    if given_back is None and code != 0:
+        result.unknown("the guard produced no release figures and exited %d: %s"
+                       % (code, tail(out)))
+        return result
+    status, detail = grade_floor(given_back, retained, floor)
+    {PASS: result.ok, FAIL: result.bad, UNREADABLE: result.unknown}[status](detail)
+    return result
+
+
+CHECKS = [check_0, check_1, check_2, check_3]
 
 
 def self_test():
@@ -372,10 +426,45 @@ def self_test():
     if read_bind_figures("") != (None, None, None):
         failures.append("parser invented binding figures from empty output")
 
+    # The floor grader runs the comparison the other way round, so its own
+    # inverse is the case that would pass if the direction were flipped: a
+    # release that gave back nothing.
+    floor_cases = [
+        ("everything given back passes", 87404386, 86996112, 50, PASS),
+        ("exactly at the floor passes", 50, 100, 50, PASS),
+        ("nothing given back fails", 0, 86996112, 50, FAIL),
+        ("under the floor fails", 40, 100, 50, FAIL),
+        ("nothing retained is unreadable", 100, 0, 50, UNREADABLE),
+        ("nothing measured is unreadable", None, None, None, UNREADABLE),
+    ]
+    for title, given_back, retained, floor, wanted in floor_cases:
+        got, detail = grade_floor(given_back, retained, floor)
+        if got != wanted:
+            failures.append("%s: wanted %s, got %s (%s)" % (title, wanted, got, detail))
+
+    release_line = ("kin.init.release_plan_bodies gave back 87404386 bytes of the 86996112 "
+                    "bytes kin.init.bind_historical_semantics retained, floor 50 percent\n")
+    if read_release_figures(release_line) != (87404386, 86996112, 50):
+        failures.append("parser misread the release line: %r"
+                        % (read_release_figures(release_line),))
+    if read_release_figures("error: could not compile") != (None, None, None):
+        failures.append("parser invented release figures from output that carries none")
+    if read_release_figures("") != (None, None, None):
+        failures.append("parser invented release figures from empty output")
+
+    # A floor that cannot reject the defect is not a floor. Drive the measured
+    # pre-fix and post-fix figures through the shipped floor.
+    got, _ = grade_floor(0, 86996112, 50)
+    if got != FAIL:
+        failures.append("the shipped release floor does not reject the pre-fix figure")
+    got, _ = grade_floor(87404386, 86996112, 50)
+    if got != PASS:
+        failures.append("the shipped release floor rejects the post-fix figure")
+
     for failure in failures:
         print("SELFTEST FAIL %s" % failure)
     print("kin-init-memory-repro self-test: %d case(s), %d failure(s)"
-          % (len(cases) + len(ratio_cases) + 8, len(failures)))
+          % (len(cases) + len(ratio_cases) + len(floor_cases) + 13, len(failures)))
     return 1 if failures else 0
 
 

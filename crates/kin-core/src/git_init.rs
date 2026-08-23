@@ -18,8 +18,8 @@ use kin_git::{
     check_git_admission_blockers, plan_semantic_git_import, preflight_git_migration,
     reprove_git_migration, reprove_git_migration_after_publication,
     seal_all_content_observation_observed, AdmittedContentClosure, GitLocalIgnoreSourceKind,
-    GitMigrationPreflightProof, LosslessGitRepository, SealedContentObservation,
-    SealedContentSource,
+    GitMigrationPreflightProof, LosslessGitRepository, ProvedImportClosure,
+    SealedContentObservation, SealedContentSource,
 };
 use kin_model::{
     compute_resolved_tree_hash, AdmissionCase, AuthorId, ChangeStore,
@@ -329,6 +329,23 @@ fn init_from_git_with_hooks(
         let _span = info_span!("kin.init.source_proof_staged").entered();
         preflight_git_migration(&source, &snapshot, &semantic_plan, &capture_store)
             .map_err(|error| git_boundary_error("prove mutable Git workspace", error))?
+    };
+
+    // Proof 1 is the last reader of a change's BODY. Everything after it reads
+    // the plan's proved facts, and every one of those readers was checked by
+    // name: the plan fingerprint hashes each change's id, the snapshot binding
+    // reads the five raw-snapshot fields, the index and worktree observations
+    // read the workspace seed, and the published seal reads the commit trees
+    // and the seed tree. What the plan still held past this line was an entity,
+    // relation and tree delta set for every commit in history, live across the
+    // conversion's peak inside the bootstrap commit, answering nothing.
+    //
+    // Consuming the plan is what frees them. The closure carries the facts and
+    // never carried the bodies, so a future reader that wants one has to say so
+    // rather than be handed silence.
+    let semantic_plan = {
+        let _span = info_span!("kin.init.release_plan_bodies").entered();
+        ProvedImportClosure::from_proved_plan(semantic_plan)
     };
 
     let staging_dir = source_parent.join(format!(".kin.init-{}", uuid::Uuid::new_v4()));

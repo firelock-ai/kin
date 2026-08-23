@@ -854,11 +854,21 @@ fn render_human_result(
             writeln!(out, "  Workspace: empty exact tree")?;
         }
     }
+    // Read here rather than remembered from the enrichment phase, because the
+    // death this looks for happens during that phase and leaves nothing in this
+    // process. The daemon publishes a serving record at start and retires it as
+    // it exits on its own terms, so a surviving record beside a dead pid is the
+    // only trace an unwatched kill leaves, and this is the summary a reader is
+    // already looking at when they need it.
+    let daemon_death = crate::daemon_death::recorded_for_store(result.layout.root());
     writeln!(
         out,
         "  Semantic enrichment: {}",
-        render_semantic_enrichment(semantic_enrichment)
+        render_semantic_enrichment(semantic_enrichment, daemon_death.as_ref())
     )?;
+    if let Some(warning) = enrichment_kill_warning(daemon_death.as_ref()) {
+        writeln!(out, "{warning}")?;
+    }
     if let Some(notice) = semantic_absence_notice(semantic_enrichment) {
         writeln!(out, "{notice}")?;
     }
@@ -1018,18 +1028,47 @@ fn semantic_absence_notice(enrichment: &SemanticEnrichmentStatus) -> Option<Stri
     )
 }
 
-fn render_semantic_enrichment(enrichment: &SemanticEnrichmentStatus) -> String {
+/// The enrichment line, and the one word in it that used to hide a kill.
+///
+/// "Completion not attested" is a true statement about every store, which is
+/// exactly the problem FIR-2650 names. On the measured run the daemon had been
+/// OOM-killed inside its enrichment commit, and the summary carried that as a
+/// parenthetical inside a success line: same counts, same presence, same
+/// caveat, indistinguishable from a store whose enrichment simply has not been
+/// certified yet. A reader saw exit 0, a 1.1 GB store, and no signal at all.
+///
+/// The counts stay, because they are still true. What changes is that when the
+/// store can prove one of its daemons was killed, the caveat says so, and
+/// [`enrichment_kill_warning`] carries the cause and the remedy on a line of
+/// its own rather than in a parenthesis.
+fn render_semantic_enrichment(
+    enrichment: &SemanticEnrichmentStatus,
+    death: Option<&kin_daemon_spawn::DaemonKillRecord>,
+) -> String {
     let presence = match enrichment.presence {
         SemanticEnrichmentPresence::Absent => "absent",
         SemanticEnrichmentPresence::Present => "present",
     };
     format!(
-        "{presence} ({} entities, {} relations, {} changes in durable authority generation {}; completion not attested)",
+        "{presence} ({} entities, {} relations, {} changes in durable authority generation {}; {})",
         enrichment.entity_count,
         enrichment.relation_count,
         enrichment.semantic_change_count,
-        enrichment.authority_generation
+        enrichment.authority_generation,
+        crate::daemon_death::enrichment_clause(death)
     )
+}
+
+/// The warning line a store whose daemon was killed carries beneath its
+/// enrichment counts.
+///
+/// A warning rather than a parenthetical, and beneath the counts rather than
+/// inside them, because the counts describe what was derived and this describes
+/// whether anything more was coming. It quotes the record's own summary so this
+/// surface says what `kin graph status` and `kin doctor` say about the same
+/// store, word for word.
+fn enrichment_kill_warning(death: Option<&kin_daemon_spawn::DaemonKillRecord>) -> Option<String> {
+    Some(format!("  ⚠ {}", death?.summary()))
 }
 
 fn initialized_default_ref(result: &kin_core::InitResult) -> Option<&kin_model::RefName> {
@@ -1277,6 +1316,71 @@ mod tests {
             semantic_change_count: 0,
             completion_attested: false,
         }
+    }
+
+    /// The measured FIR-2650 summary, and the two stores it could not tell
+    /// apart.
+    ///
+    /// `kin init` exited 0 over a 1.1 GB store and summarized the enrichment as
+    /// "present (... ; completion not attested)" while the daemon that would
+    /// have finished it lay OOM-killed. Every word of that is also true of a
+    /// healthy store nobody has certified yet, so the reader had no signal at
+    /// all. This surface prints once per repository, which no scripted check can
+    /// re-ask, so the rendering is pinned here.
+    ///
+    /// The quiet arm is not decoration. A build that named a kill
+    /// unconditionally would pass the killed arm and alarm every ordinary user.
+    #[test]
+    fn a_killed_daemon_changes_the_enrichment_summary_and_nothing_else_does() {
+        let status = enrichment(SemanticEnrichmentPresence::Present, 1058);
+
+        let quiet = render_semantic_enrichment(&status, None);
+        assert!(
+            quiet.contains("completion not attested"),
+            "the caveat is true of every store and stays: {quiet}"
+        );
+        assert!(
+            !quiet.contains("killed"),
+            "a store that lost no daemon must not report one: {quiet}"
+        );
+        assert!(
+            enrichment_kill_warning(None).is_none(),
+            "and it carries no warning line at all"
+        );
+
+        let record = kin_daemon_spawn::DaemonKillRecord {
+            kills: 1,
+            memory_kills: 1,
+            first_unix: 1_787_000_000,
+            last_unix: 1_787_000_000,
+            last_pid: Some(4103),
+            last_cause: kin_daemon_spawn::DaemonKillCause::MemoryLimit {
+                kernel_oom_kills: 1,
+            },
+            limit_bytes: Some(12 * 1024 * 1024 * 1024),
+            last_rss_bytes: Some(11 * 1024 * 1024 * 1024),
+        };
+        let killed = render_semantic_enrichment(&status, Some(&record));
+        assert!(
+            killed.contains("1058 entities"),
+            "the counts are still true and still printed: {killed}"
+        );
+        assert!(
+            killed.contains("completion not attested") && killed.contains("killed"),
+            "the caveat alone was the defect, so both halves are required: {killed}"
+        );
+
+        let warning = enrichment_kill_warning(Some(&record))
+            .expect("a store with a kill on record carries the line that explains it");
+        assert!(warning.contains("memory limit"), "{warning}");
+        assert!(
+            warning.contains("12.0 GiB"),
+            "a kill named without its figure is not actionable: {warning}"
+        );
+        assert!(
+            warning.contains("To recover:"),
+            "and a cause with no remedy is most of the way back to the parenthetical: {warning}"
+        );
     }
 
     /// The non-empty-directory refusal offers "commit the exact files to Git"
