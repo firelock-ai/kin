@@ -2355,11 +2355,32 @@ struct XrefGraphReadAttempt {
     mutation_epoch: u64,
 }
 
+/// Whether this process was asked to treat every stable reference read as
+/// contended.
+///
+/// Acceptance-only, declared in `kin_core::env_registry` as
+/// `KIN_XREF_FORCE_CONTENTION`, and read once so a run cannot change behavior
+/// halfway through. The exhausted-read refusal is otherwise reachable only by
+/// winning a race against the daemon's own writer, and a check that can only
+/// be raced is a check that reports green on a build it never exercised. Off by
+/// default; nothing in the product sets it.
+fn xref_contention_is_forced() -> bool {
+    static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FORCED.get_or_init(|| {
+        std::env::var("KIN_XREF_FORCE_CONTENTION")
+            .map(|value| value.trim() == "1")
+            .unwrap_or(false)
+    })
+}
+
 fn prepare_xref_graph_read(
     state: &DaemonState,
     selected_graph: &Arc<kin_db::InMemoryGraph>,
     authority: RequestGraphAuthority,
 ) -> Option<XrefGraphReadAttempt> {
+    if xref_contention_is_forced() {
+        return None;
+    }
     let mutation_epoch = state.stable_graph_authority_epoch()?;
     match authority {
         RequestGraphAuthority::Head => {

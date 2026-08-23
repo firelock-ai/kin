@@ -132,14 +132,14 @@ class Suite(object):
                 "-c", "commit.gpgsign=false"]
         return run(base + args, cwd=repo, env=self.env)
 
-    def mcp(self, repo, tool, args, timeout=300):
+    def mcp(self, repo, tool, args, timeout=300, env=None):
         """One tools/call over kin's stdio MCP server.
 
         The MCP path is the surface that applies the negative/completeness
         envelope, so envelope claims are probed here rather than on the raw
         daemon route, which wraps a payload carrying no such envelope.
         """
-        env = dict(self.env)
+        env = dict(env if env is not None else self.env)
         env["KIN_MCP_REPO"] = repo
         proc = subprocess.Popen(
             [self.kin, "mcp", "start", "--repo", repo],
@@ -2434,6 +2434,88 @@ def check_17(suite):
     return res
 
 
+# The three surfaces that share one stable-read loop, with the argument shape
+# each needs. Listed here so a surface added to that loop without a refusal is a
+# check that grades less rather than a silent gap.
+XREF_SURFACES = [
+    ("find_references", {"entity_name": "normalize_title"}),
+    ("bulk_check_references", {"entity_names": ["normalize_title"]}),
+]
+
+# What an exhausted reference read may never say. It used to say exactly this,
+# after spending the very budget it was prescribing (FIR-2633), and dg-baseline
+# measured that failing 0 for 8.
+BARE_RETRY = re.compile(r"\bretry\b|\btry again\b", re.I)
+
+
+def check_18(suite):
+    """FIR-2633: an exhausted reference read refuses with something actionable.
+
+    Both directions on one fixture, because either half alone is satisfiable by
+    a broken build. Under forced contention every surface must refuse without
+    prescribing the retrying it just spent, and must name the state that blocked
+    it and the condition that clears it. With contention off the same calls must
+    answer normally, so the refusal is a response to contention rather than the
+    tool's new resting state.
+
+    Contention is forced through `KIN_XREF_FORCE_CONTENTION`, declared in
+    kin_core's env registry. Racing the daemon's own writer would leave a check
+    that reports green on a build it never exercised, which is the shape this
+    suite exists to remove.
+    """
+    res = Result("18", "FIR-2633", "an exhausted reference read never prescribes a retry")
+    repo = suite.fixture("incremental")
+
+    contended = dict(suite.env)
+    contended["KIN_XREF_FORCE_CONTENTION"] = "1"
+
+    graded = 0
+    for tool, args in XREF_SURFACES:
+        # The control first: uncontended, this call answers. Without it a build
+        # that refused everything would pass the rule below for the wrong
+        # reason, and the fixture would sit on one side of the branch.
+        try:
+            suite.mcp(repo, tool, args)
+        except McpError as exc:
+            res.unknown("%s is unreadable even uncontended, so contention proves nothing: %s"
+                        % (tool, exc))
+            return res
+
+        try:
+            payload = suite.mcp(repo, tool, args, env=contended)
+        except McpError as exc:
+            refusal = str(exc)
+        else:
+            res.bad("%s answered under forced contention (%s), so the refusal arm was "
+                    "never reached and this check grades nothing"
+                    % (tool, json.dumps(payload)[:120]))
+            continue
+
+        graded += 1
+        if BARE_RETRY.search(refusal):
+            res.bad("%s still tells the caller to redo the retries it just spent: %s"
+                    % (tool, refusal[:400]))
+            continue
+        missing = []
+        if tool not in refusal:
+            missing.append("the surface it came from")
+        if "attempts" not in refusal:
+            missing.append("how many attempts it spent")
+        if "succeeds once" not in refusal:
+            missing.append("the condition that clears it")
+        if "as of an earlier instant" not in refusal:
+            missing.append("why no stale answer is offered")
+        if missing:
+            res.bad("%s refuses without naming %s: %s"
+                    % (tool, ", ".join(missing), refusal[:400]))
+        else:
+            res.ok("%s refused naming what it tried and what clears it" % tool)
+
+    if graded == 0:
+        res.unknown("no surface reached its refusal, so the rule was not exercised")
+    return res
+
+
 CHECKS = [
     ("0", check_0),
     ("1", check_1),
@@ -2453,6 +2535,7 @@ CHECKS = [
     ("15", check_15),
     ("16", check_16),
     ("17", check_17),
+    ("18", check_18),
 ]
 
 
