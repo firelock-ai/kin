@@ -831,13 +831,53 @@ mod tests {
     }
 
     fn score(entity: &Entity) -> TraceFanoutScore {
+        scored(entity, false)
+    }
+
+    /// The same key with the raise-target signal set, so the tests below can
+    /// compare a throw site against the hop it used to outrank.
+    fn scored(entity: &Entity, raise_target: bool) -> TraceFanoutScore {
         trace_fanout_score(
             entity,
             RelationKind::Calls,
             Some("src/requests/sessions.py"),
             Some("src/requests"),
             1.0,
+            raise_target,
         )
+    }
+
+    #[test]
+    fn a_raise_target_loses_to_a_data_flow_hop_it_would_otherwise_outrank() {
+        // FIR-2642. Locality is what let this go wrong: an exception class
+        // beside the code that throws it wins same-file and same-directory
+        // against the callee that carries the value onward. The signal sits
+        // above both so that comparison can no longer come out the wrong way.
+        let thrown = fanout_entity("SSLError", Some("src/requests/sessions.py"));
+        let hop = fanout_entity("build_pool_key", Some("src/requests/adapters.py"));
+        assert!(
+            scored(&thrown, false) > scored(&hop, false),
+            "the fixture's premise: without the signal the same-file throw \
+             site wins"
+        );
+        assert!(
+            scored(&hop, false) > scored(&thrown, true),
+            "with it, the hop the value travels along wins"
+        );
+    }
+
+    #[test]
+    fn demoting_a_raise_target_orders_it_and_never_removes_it() {
+        // The recall half, at the level the ordering is defined. Two throw
+        // sites still compare against each other by every signal below, so a
+        // step wide enough to hold them reports them in a stable order rather
+        // than collapsing them.
+        let first = fanout_entity("SSLError", Some("src/requests/sessions.py"));
+        let second = fanout_entity("InvalidURL", Some("src/other/exceptions.py"));
+        assert!(
+            scored(&first, true) > scored(&second, true),
+            "same-file still decides between two throw sites"
+        );
     }
 
     #[test]
@@ -875,6 +915,7 @@ mod tests {
             Some("src/requests/sessions.py"),
             Some("src/requests"),
             1.0,
+            false,
         );
         let referenced = trace_fanout_score(
             &entity,
@@ -882,6 +923,7 @@ mod tests {
             Some("src/requests/sessions.py"),
             Some("src/requests"),
             1.0,
+            false,
         );
         assert!(called > referenced);
     }
@@ -895,6 +937,7 @@ mod tests {
             Some("src/requests/sessions.py"),
             Some("src/requests"),
             1.0,
+            false,
         );
         let guessed = trace_fanout_score(
             &entity,
@@ -902,6 +945,7 @@ mod tests {
             Some("src/requests/sessions.py"),
             Some("src/requests"),
             0.4,
+            false,
         );
         assert!(certain > guessed);
     }
