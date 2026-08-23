@@ -83,10 +83,12 @@ exists. No binary is built by this script.
 import argparse
 import json
 import os
+import signal
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 PASS = "PASS"
 FAIL = "FAIL"
@@ -230,6 +232,41 @@ def status_publishes_the_standing(text):
     return "Daemon memory:" in text and "it is allowed" in text and "child processes" in text
 
 
+def names_a_death(text):
+    """Whether the text says the daemon died, rather than offering the idle window.
+
+    Both halves are required and the second is the point. The measured sentence
+    named an idle window and told the reader to re-run, which is advice that
+    cannot terminate when the cause is an OOM at that repository size. A text
+    that names a death AND still leads with the idle window has not fixed
+    anything.
+    """
+    text = text or ""
+    # The phrases the product actually produces for a daemon that died, from
+    # `daemon_loss_explanation` and the kill record's own summary. Listed rather
+    # than guessed at, because a grader matching a phrase nothing emits passes
+    # every build.
+    return any(phrase in text for phrase in (
+        "is gone",
+        "was terminated",
+        "killed",
+        "stopped beating",
+    ))
+
+
+def names_memory_with_a_figure(text):
+    """Whether the text names an out-of-memory kill and quotes a ceiling.
+
+    "The daemon died" invites a re-run. "It ran out of memory at 12.0 GiB" does
+    not, and the figure is what makes the difference actionable, so a mention
+    with no number does not count.
+    """
+    text = text or ""
+    named = "out-of-memory" in text or "out of memory" in text or "memory limit" in text
+    has_figure = "GiB" in text or "MiB" in text
+    return named and has_figure
+
+
 def status_discloses_the_refusal(text):
     """Whether `kin graph status` printed the refusal beside its counters.
 
@@ -240,6 +277,8 @@ def status_discloses_the_refusal(text):
 
 
 GRADERS = {
+    "names_a_death": names_a_death,
+    "names_memory_with_a_figure": names_memory_with_a_figure,
     "row_reports_a_refusal": row_reports_a_refusal,
     "row_blocks_readiness": row_blocks_readiness,
     "status_discloses_the_refusal": status_discloses_the_refusal,
@@ -313,6 +352,28 @@ class Suite(object):
 
     def record_path(self, repo):
         return os.path.join(repo, ".kin", RECORD_NAME)
+
+    def pid_path(self, repo):
+        return os.path.join(repo, ".kin", "daemon.pid")
+
+    def kill_record_path(self, repo):
+        return os.path.join(repo, ".kin", "daemon.kills.json")
+
+    def daemon_pid(self, repo):
+        """The pid this store publishes, or None."""
+        try:
+            with open(self.pid_path(repo)) as handle:
+                return int(handle.read().strip().splitlines()[0])
+        except (IOError, OSError, ValueError, IndexError):
+            return None
+
+    def read_kill_record(self, repo):
+        """The kill record this store carries, or None."""
+        try:
+            with open(self.kill_record_path(repo)) as handle:
+                return json.load(handle)
+        except (IOError, OSError, ValueError):
+            return None
 
     def footprint_path(self, repo):
         return os.path.join(repo, ".kin", FOOTPRINT_NAME)
@@ -639,8 +700,160 @@ def check_5(suite):
     return result
 
 
+def check_6(suite):
+    """FIR-2650: a daemon that was killed must not be reported as an idle exit.
+
+    Measured by the liaison on the kin-db 0.7.51 pin, psf/requests at full
+    history inside a 12 GiB container. `kin init` completed, exit 0, and the
+    daemon was then OOM-killed inside its post-init enrichment commit: its log
+    ends mid-commit with no shutdown line, the cgroup recorded `oom_kill 1`, and
+    `docker inspect` read `OOMKilled=true`. Kin reported that death as
+
+        the kin daemon at http://... stopped answering while the lsp sweep
+        status request was in flight; it exits after its idle window, so re-run
+        the command and kin will start a fresh one
+
+    That sentence is built from the endpoint and the request name alone and asks
+    nothing about whether the daemon is alive. The truth was on two independent
+    surfaces and Kin used neither.
+
+    It matters past the wording. An idle exit is a normal event and its advice
+    is to re-run; an OOM kill at that repository size recurs on every attempt,
+    so the reader is sent around a loop that cannot terminate.
+
+    This arm kills a real daemon with SIGKILL, which is the signal the OOM
+    killer sends, and then asks Kin something. The answer must say the daemon
+    died. It must not offer the idle window as the explanation.
+    """
+    result = Result(
+        "6", TICKET,
+        "a killed daemon is reported as a death, not as an idle-window exit",
+    )
+    repo = suite.fixture("killed")
+    rc, out = suite.restart_daemon(repo, pressure="nominal")
+    if rc != 0:
+        result.unknown("could not start a daemon, exit %d: %s" % (rc, tail(out)))
+        return result
+    pid = suite.daemon_pid(repo)
+    if pid is None:
+        result.unknown("no daemon pid was published at %s" % suite.pid_path(repo))
+        return result
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError as error:
+        result.unknown("could not kill the daemon at pid %s: %s" % (pid, error))
+        return result
+    # The reaper in the process that spawned it records the death. Give it the
+    # moment that takes; a bounded wait separates "not yet" from "never".
+    for _ in range(40):
+        time.sleep(0.25)
+        if suite.read_kill_record(repo) is not None:
+            break
+
+    record = suite.read_kill_record(repo)
+    if record is None:
+        result.bad("a daemon killed with SIGKILL left no record at %s, so no surface can "
+                   "name the death and every one of them is free to call it an idle exit"
+                   % suite.kill_record_path(repo))
+        return result
+    result.ok("the store records the kill (kills=%s last_cause=%s)"
+              % (record.get("kills"), list((record.get("last_cause") or {}).keys())[:1]))
+
+    rc, out = suite.kin_run(["graph", "status"], repo, pressure="nominal")
+    if names_a_death(out):
+        result.ok("kin graph status names the death rather than an idle window")
+    else:
+        result.bad("kin graph status says nothing about a daemon this store recorded as "
+                   "killed. Output: %s" % tail(out, 700))
+
+    rc, out = suite.kin_run(["doctor", "--json"], repo, pressure="nominal")
+    row = None
+    try:
+        report = json.loads(out[out.index("{"):out.rindex("}") + 1])
+        row = next((r for r in report.get("checks", [])
+                    if r.get("id") == "daemon_kill_record"), None)
+    except (ValueError, json.JSONDecodeError):
+        result.unknown("`kin doctor --json` payload was not JSON: %s" % tail(out))
+        return result
+    if row is None:
+        result.unknown("this build's doctor report carries no `daemon_kill_record` row")
+    elif row.get("status") == "healthy":
+        result.bad("the doctor row reads healthy on a store whose daemon was killed: %s"
+                   % json.dumps(row))
+    else:
+        result.ok("the doctor row reports the kill (status=%s)" % row.get("status"))
+    return result
+
+
+def check_7(suite):
+    """FIR-2650: an OOM kill is named as one, with the figure, on every surface.
+
+    Check 6 proves a death is not called an idle exit. This proves the other
+    half: when the kernel's own counter attributed the kill to memory, every
+    surface says so and quotes the ceiling, because "the daemon died" invites a
+    re-run while "it ran out of memory at 12.0 GiB" does not.
+
+    The evidence is planted rather than produced. Attributing a kill to memory
+    needs a cgroup counter that moved, which no macOS host has and no CI runner
+    reliably offers, so this writes the record a real OOM leaves and asks the
+    surfaces to read it. That is the half FIR-2650 is about: on the measured run
+    the truth was already on two surfaces and Kin used neither. What it does not
+    prove is the recording, which check 6 covers on the killing side and which a
+    capped container covers end to end.
+    """
+    result = Result(
+        "7", TICKET,
+        "a kill the kernel attributed to memory is named as one, with the ceiling",
+    )
+    repo = suite.fixture("oomnamed")
+    rc, out = suite.restart_daemon(repo, pressure="nominal")
+    if rc != 0:
+        result.unknown("could not start a daemon, exit %d: %s" % (rc, tail(out)))
+        return result
+    run([suite.kin, "daemon", "stop"], cwd=repo, env=suite.env, timeout=180)
+
+    twelve_gib = 12 * 1024 * 1024 * 1024
+    planted = {
+        "kills": 1,
+        "memory_kills": 1,
+        "first_unix": 1787000000,
+        "last_unix": 1787000000,
+        "last_pid": 4103,
+        "last_cause": {"MemoryLimit": {"kernel_oom_kills": 1}},
+        "limit_bytes": twelve_gib,
+        "last_rss_bytes": twelve_gib - 5 * 1024 * 1024,
+    }
+    with open(suite.kill_record_path(repo), "w") as handle:
+        json.dump(planted, handle)
+
+    rc, out = suite.kin_run(["graph", "status"], repo, pressure="nominal")
+    if names_memory_with_a_figure(out):
+        result.ok("kin graph status names the memory kill and quotes the ceiling")
+    else:
+        result.bad("kin graph status does not name an out-of-memory kill with its figure on "
+                   "a store whose record carries the kernel's own attribution. Output: %s"
+                   % tail(out, 700))
+
+    rc, out = suite.kin_run(["doctor", "--json"], repo, pressure="nominal")
+    try:
+        report = json.loads(out[out.index("{"):out.rindex("}") + 1])
+    except (ValueError, json.JSONDecodeError):
+        result.unknown("`kin doctor --json` payload was not JSON: %s" % tail(out))
+        return result
+    row = next((r for r in report.get("checks", [])
+                if r.get("id") == "daemon_kill_record"), None)
+    if row is None:
+        result.unknown("this build's doctor report carries no `daemon_kill_record` row")
+    elif names_memory_with_a_figure(row.get("detail") or ""):
+        result.ok("the doctor row names the memory kill and quotes the ceiling")
+    else:
+        result.bad("the doctor row does not name an out-of-memory kill with its figure: %s"
+                   % json.dumps(row))
+    return result
+
+
 CHECKS = [("0", check_0), ("1", check_1), ("2", check_2), ("3", check_3),
-          ("4", check_4), ("5", check_5)]
+          ("4", check_4), ("5", check_5), ("6", check_6), ("7", check_7)]
 
 
 # ------------------------------------------------------------------ self-test
@@ -744,6 +957,38 @@ def self_test():
             failures.append("status_publishes_the_standing(%r) = %s, wanted %s"
                             % (text, got, want))
 
+    death_cases = [
+        (True, "the daemon serving this repository (pid 41) is gone; it was committing"),
+        (True, "a daemon serving this store was killed 1 time(s)"),
+        (True, "the daemon serving this repository was terminated while the request was in flight"),
+        # The measured sentence, which is the thing this grader must reject.
+        (False, "the kin daemon at http://127.0.0.1:39767 stopped answering while the lsp "
+                "sweep status request was in flight; it exits after its idle window, so "
+                "re-run the command and kin will start a fresh one"),
+        (False, "Semantic enrichment: present (1058 entities; completion not attested)"),
+        (False, ""),
+        (False, None),
+    ]
+    for want, text in death_cases:
+        got = names_a_death(text)
+        if got != want:
+            failures.append("names_a_death(%r) = %s, wanted %s" % (text, got, want))
+
+    memory_cases = [
+        (True, "this machine's kernel recorded 1 out-of-memory kill(s) against the 12.0 GiB "
+               "available here"),
+        (True, "killed by the memory limit; 512 MiB resident at its last beat"),
+        # Named without a figure is not actionable, and a figure without the
+        # cause is not this defect either.
+        (False, "the daemon ran out of memory"),
+        (False, "the daemon was terminated; 12.0 GiB available here"),
+        (False, ""),
+    ]
+    for want, text in memory_cases:
+        got = names_memory_with_a_figure(text)
+        if got != want:
+            failures.append("names_memory_with_a_figure(%r) = %s, wanted %s" % (text, got, want))
+
     # `tail` must keep the END of an output, which is where the error is.
     tail_cases = [
         ("short", "short"),
@@ -775,7 +1020,8 @@ def self_test():
     for failure in failures:
         print("SELFTEST FAIL %s" % failure)
     total = (len(row_cases) + len(healthy_cases) + len(status_cases)
-             + len(budget_cases) + len(standing_cases) + len(tail_cases) + len(grade_cases))
+             + len(budget_cases) + len(standing_cases) + len(death_cases)
+             + len(memory_cases) + len(tail_cases) + len(grade_cases))
     print("kin-memory-pressure-repro: self-test %d/%d cases"
           % (total - len(failures), total))
     return 1 if failures else 0
