@@ -2355,22 +2355,37 @@ struct XrefGraphReadAttempt {
     mutation_epoch: u64,
 }
 
-/// Whether this process was asked to treat every stable reference read as
-/// contended.
+/// Whether this daemon will honour a request that asks to be served as though
+/// the graph authority were moving.
 ///
-/// Acceptance-only, declared in `kin_core::env_registry` as
-/// `KIN_XREF_FORCE_CONTENTION`, and read once so a run cannot change behavior
-/// halfway through. The exhausted-read refusal is otherwise reachable only by
-/// winning a race against the daemon's own writer, and a check that can only
-/// be raced is a check that reports green on a build it never exercised. Off by
-/// default; nothing in the product sets it.
-fn xref_contention_is_forced() -> bool {
-    static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FORCED.get_or_init(|| {
-        std::env::var("KIN_XREF_FORCE_CONTENTION")
+/// Acceptance-only, and gated in two layers on purpose. The request carries the
+/// ask, so determinism survives any process lifetime; this gate is captured at
+/// daemon start the way every other behavior lever is
+/// (`kin_core::behavior_env`), so a production daemon is deaf to the field
+/// however a client sets it. Read once, so a daemon cannot change its mind
+/// halfway through a run.
+///
+/// The exhausted-read refusal is otherwise reachable only by winning a race
+/// against the daemon's own writer, and a check that can only be raced is a
+/// check that reports green on a build it never exercised.
+fn xref_forced_contention_allowed() -> bool {
+    static ALLOWED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ALLOWED.get_or_init(|| {
+        std::env::var("KIN_XREF_ALLOW_FORCED_CONTENTION")
             .map(|value| value.trim() == "1")
             .unwrap_or(false)
     })
+}
+
+/// Whether one request asked to be served as contended, and this daemon allows
+/// it. Both halves are required, so neither the field alone nor the gate alone
+/// changes what any caller is served.
+fn request_forces_contention(arguments: &HashMap<String, serde_json::Value>) -> bool {
+    arguments
+        .get("force_contention")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        && xref_forced_contention_allowed()
 }
 
 fn prepare_xref_graph_read(
@@ -2378,9 +2393,6 @@ fn prepare_xref_graph_read(
     selected_graph: &Arc<kin_db::InMemoryGraph>,
     authority: RequestGraphAuthority,
 ) -> Option<XrefGraphReadAttempt> {
-    if xref_contention_is_forced() {
-        return None;
-    }
     let mutation_epoch = state.stable_graph_authority_epoch()?;
     match authority {
         RequestGraphAuthority::Head => {
@@ -2576,11 +2588,20 @@ where
     // Initialize once outside the stamped interval: lazy spine hydration and
     // registration can be expensive, but it is not part of the graph read.
     let spine = state.ensure_spine();
+    // This route carries no arguments map, so nothing can ask it to be
+    // served as contended. Its refusal is the same one, guarded by the unit
+    // test that drives this function directly.
+    let forced_contention = false;
     // Which condition blocked the read, carried across the loop so the refusal
     // names the state rather than whichever check happened to fail last.
     let mut blocked = XrefBlocked::SelectedGraphChanging;
     for attempt_number in 0..XREF_STABLE_READ_ATTEMPTS {
-        let Some(attempt) = prepare_xref_graph_read(state, &selected_graph, authority) else {
+        let read = if forced_contention {
+            None
+        } else {
+            prepare_xref_graph_read(state, &selected_graph, authority)
+        };
+        let Some(attempt) = read else {
             // Spend the attempt rather than the caller's round trip. This arm
             // used to `continue` with no wait at all, so the whole budget burned
             // in microseconds against a writer that needs milliseconds, and the
@@ -2640,11 +2661,17 @@ where
     }
     let spine = state.ensure_spine();
     let repository_authority = mcp_repository_authority_source(state)?;
+    let forced_contention = request_forces_contention(arguments);
     // Which condition blocked the read, carried across the loop so the refusal
     // names the state rather than whichever check happened to fail last.
     let mut blocked = XrefBlocked::SelectedGraphChanging;
     for attempt_number in 0..XREF_STABLE_READ_ATTEMPTS {
-        let Some(attempt) = prepare_xref_graph_read(state, &selected_graph, authority) else {
+        let read = if forced_contention {
+            None
+        } else {
+            prepare_xref_graph_read(state, &selected_graph, authority)
+        };
+        let Some(attempt) = read else {
             // Spend the attempt rather than the caller's round trip. This arm
             // used to `continue` with no wait at all, so the whole budget burned
             // in microseconds against a writer that needs milliseconds, and the
@@ -2799,11 +2826,17 @@ where
     F: FnMut(usize),
 {
     let spine = state.ensure_spine();
+    let forced_contention = request_forces_contention(arguments);
     // Which condition blocked the read, carried across the loop so the refusal
     // names the state rather than whichever check happened to fail last.
     let mut blocked = XrefBlocked::SelectedGraphChanging;
     for attempt_number in 0..XREF_STABLE_READ_ATTEMPTS {
-        let Some(attempt) = prepare_xref_graph_read(state, &selected_graph, authority) else {
+        let read = if forced_contention {
+            None
+        } else {
+            prepare_xref_graph_read(state, &selected_graph, authority)
+        };
+        let Some(attempt) = read else {
             // Spend the attempt rather than the caller's round trip. This arm
             // used to `continue` with no wait at all, so the whole budget burned
             // in microseconds against a writer that needs milliseconds, and the

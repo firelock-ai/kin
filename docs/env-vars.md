@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (494 total, 338 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (495 total, 339 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -97,6 +97,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_WORKSPACE_DIR` | path | *(unset)* | operational | docker-entrypoint workspace override for both storage modes; unset uses /tmp/kin-workspace (backed by an emptyDir in k8s); set to /workspace to opt into a legacy mounted volume |
 | `KIN_WORKSPACE_ROOT` | path | *(unset)* | operational | workspace root override for orchestration commands |
 | `KIN_WRITE_VETO` | enum | warn | correctness | write-veto mode: 'warn' (default) annotates would-be vetoes into foreign-held scopes, 'enforce' rejects them with a 409, 'off' disables |
+| `KIN_XREF_ALLOW_FORCED_CONTENTION` | bool | false | correctness | acceptance-only gate: allows a request to ask a stable reference read (command xref, find_references, bulk_check_references) to observe a moving graph authority, so the exhausted-read refusal can be exercised deterministically instead of raced. Captured at daemon start like every other behavior lever, so a production daemon is deaf to the request field however it is set. Off by default and never set by the product; the literal 1 turns it on |
 
 ## Daemon
 

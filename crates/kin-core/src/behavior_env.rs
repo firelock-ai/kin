@@ -50,6 +50,11 @@ pub const BEHAVIOR_ENV_VARS: &[&str] = &[
     "KIN_DAEMON_MEMORY_BUDGET_BYTES",
     "KIN_COCHANGE_MAX_FAN_OUT",
     "EMBED_MAX_SEQ_LEN",
+    // Acceptance-only. Listed here for the same reason as the rest: its effect
+    // is decided in the worker at start, so a CLI that sets it against an
+    // already-running daemon gets the old value, and the divergence has to be
+    // loud rather than silent.
+    "KIN_XREF_ALLOW_FORCED_CONTENTION",
 ];
 
 /// A snapshot of the behavior-env surface: variable name → `Some(value)` when

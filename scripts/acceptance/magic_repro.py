@@ -2463,7 +2463,10 @@ def check_17(suite):
 
 # The three surfaces that share one stable-read loop, with the argument shape
 # each needs. Listed here so a surface added to that loop without a refusal is a
-# check that grades less rather than a silent gap.
+# check that grades less rather than a silent gap. `command xref` is absent on
+# purpose: its route carries no arguments map, so nothing can ask it to be
+# served as contended, and its refusal is guarded by a kin-daemon unit test that
+# drives the function directly.
 XREF_SURFACES = [
     ("find_references", {"entity_name": "normalize_title"}),
     ("bulk_check_references", {"entity_names": ["normalize_title"]}),
@@ -2474,30 +2477,37 @@ XREF_SURFACES = [
 # measured that failing 0 for 8.
 BARE_RETRY = re.compile(r"\bretry\b|\btry again\b", re.I)
 
+# The daemon's own per-attempt record. Reading it is what separates "the budget
+# was spent" from "the loop short-circuited and the message improved": the
+# client sees one refusal either way.
+XREF_ATTEMPT_LOG = re.compile(
+    r"graph authority changed during (MCP )?(find_references|bulk_check_references); retrying"
+)
+
 
 def check_18(suite):
     """FIR-2633: an exhausted reference read refuses with something actionable.
 
     Both directions on one fixture, because either half alone is satisfiable by
-    a broken build. Under forced contention every surface must refuse without
-    prescribing the retrying it just spent, and must name the state that blocked
-    it and the condition that clears it. With contention off the same calls must
-    answer normally, so the refusal is a response to contention rather than the
-    tool's new resting state.
+    a broken build. Uncontended these calls must answer. Asked to be served as
+    contended they must spend the whole attempt budget and then refuse without
+    prescribing the retrying they just spent, naming the state that blocked them
+    and the condition that clears it.
 
-    Contention is forced through `KIN_XREF_FORCE_CONTENTION`, declared in
-    kin_core's env registry. Racing the daemon's own writer would leave a check
-    that reports green on a build it never exercised, which is the shape this
-    suite exists to remove.
+    Contention is asked for by the request and allowed by the daemon, never by
+    the client alone: the field travels with the call so determinism survives
+    any process lifetime, and `KIN_XREF_ALLOW_FORCED_CONTENTION` is captured at
+    daemon start like every other behavior lever, so a production daemon is deaf
+    to the field however it is set. Racing the daemon's own writer instead would
+    leave a check that reports green on a build it never exercised.
+
+    The verdict is read from the daemon's side as well as the client's. The
+    daemon is the surface the claim is about, and its log is what shows the
+    budget was spent rather than short-circuited.
     """
     res = Result("18", "FIR-2633", "an exhausted reference read never prescribes a retry")
     repo = suite.fixture("incremental")
-
-    contended = dict(suite.env)
-    contended["KIN_XREF_FORCE_CONTENTION"] = "1"
-    # The lever reaches the daemon only if the daemon is started with it, so
-    # every call below stops the fixture's daemon first and lets the next one
-    # spawn carrying the environment that call needs.
+    log_path = os.path.join(repo, ".kin", "daemon.log")
 
     graded = 0
     for tool, args in XREF_SURFACES:
@@ -2512,14 +2522,20 @@ def check_18(suite):
                         % (tool, exc))
             return res
 
+        # A daemon captures its environment at process start, so the gate has to
+        # be in the environment of the command that spawns it, not of the call
+        # that uses it.
         suite.stop_daemon(repo)
+        gated = dict(suite.env)
+        gated["KIN_XREF_ALLOW_FORCED_CONTENTION"] = "1"
+        before = os.path.getsize(log_path) if os.path.exists(log_path) else 0
         try:
-            payload = suite.mcp(repo, tool, args, env=contended)
+            payload = suite.mcp(repo, tool, dict(args, force_contention=True), env=gated)
         except McpError as exc:
             refusal = str(exc)
         else:
-            res.bad("%s answered under forced contention (%s), so the refusal arm was "
-                    "never reached and this check grades nothing"
+            res.bad("%s answered while asking to be served as contended (%s), so the "
+                    "refusal arm was never reached and this check grades nothing"
                     % (tool, json.dumps(payload)[:120]))
             continue
 
@@ -2540,8 +2556,25 @@ def check_18(suite):
         if missing:
             res.bad("%s refuses without naming %s: %s"
                     % (tool, ", ".join(missing), refusal[:400]))
-        else:
-            res.ok("%s refused naming what it tried and what clears it" % tool)
+            continue
+
+        # The daemon's own witness. A loop that returned at the first contended
+        # read would produce the same client-side refusal, so the count of
+        # per-attempt records is what says the budget was actually spent.
+        if not os.path.exists(log_path):
+            res.unknown("no daemon log at %s, so the attempt budget cannot be witnessed"
+                        % log_path)
+            continue
+        with open(log_path, "rb") as handle:
+            handle.seek(before)
+            tail = strip_ansi(handle.read().decode("utf-8", "replace"))
+        attempts = len(XREF_ATTEMPT_LOG.findall(tail))
+        if attempts < 1:
+            res.bad("%s refused but the daemon logged no per-attempt record, so the "
+                    "budget was not spent: %s" % (tool, refusal[:200]))
+            continue
+        res.ok("%s spent %d logged attempt(s) then refused naming what it tried and what "
+               "clears it" % (tool, attempts))
 
     if graded == 0:
         res.unknown("no surface reached its refusal, so the rule was not exercised")
