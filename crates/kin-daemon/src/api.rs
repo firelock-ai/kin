@@ -2021,6 +2021,21 @@ async fn resolve_session_source_scope(
 }
 
 const XREF_STABLE_READ_ATTEMPTS: usize = 3;
+/// How long a contended reference read waits before trying again.
+///
+/// The same 25 ms base and the same doubling the status arm uses, deliberately
+/// shared so the two cannot drift into different ideas of how long a writer
+/// needs. Before FIR-2633 this loop waited nothing at all: a contended attempt
+/// returned `None` from [`prepare_xref_graph_read`] and the loop `continue`d
+/// immediately, so all three attempts burned as fast as the CPU could snapshot
+/// the graph, against a writer that needs milliseconds to reach its next
+/// lock-point. The budget existed and was never spent, which is why the surface
+/// measured 0 for 8 rather than something intermittent.
+///
+/// FIR-2416's constraint binds here as it does there: the wait is bounded, it
+/// doubles, and nothing is held across it, so the daemon yields to the writer
+/// whose progress is the thing that unblocks the read.
+const XREF_ATTEMPT_BACKOFF: Duration = Duration::from_millis(25);
 const GRAPH_STATUS_STABLE_READ_ATTEMPTS: usize = 3;
 const GRAPH_STATUS_WRITER_SETTLE_FLOOR: Duration = Duration::from_millis(50);
 /// How long a contended status attempt waits before trying again.
@@ -2442,6 +2457,90 @@ async fn xref_graph_read_is_still_current(
     }
 }
 
+/// What blocked a stable reference read, carried across the attempt loop so the
+/// refusal names the state rather than the last thing that happened to fail.
+///
+/// The reference surfaces get the refusal arm alone and never a replayed
+/// answer, which is where they part company with `kin_graph_status`. A status
+/// reading as of an earlier instant is still a true statement about a measured
+/// instant, and its callers poll it to watch a number move. A reference set is
+/// acted on: renamed against, deleted against, refactored against. One that
+/// omits a caller added four seconds ago is not slightly old, it is wrong in
+/// the direction that costs the caller work, and it is wrong while looking
+/// complete. That is the reading kin#1062, kin#1068 and kin#1084 each removed
+/// from a different surface, and replaying a stale set here would manufacture
+/// it deliberately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XrefBlocked {
+    /// No stable authority epoch was available to stamp the read.
+    AuthorityEpochUnavailable,
+    /// A snapshot was taken and the graph moved under it before the read could
+    /// be revalidated.
+    SelectedGraphChanging,
+}
+
+impl XrefBlocked {
+    fn state_sentence(self) -> &'static str {
+        match self {
+            Self::AuthorityEpochUnavailable => {
+                "the selected graph had no settled authority epoch to stamp the read against"
+            }
+            Self::SelectedGraphChanging => {
+                "the selected graph's root moved between taking the snapshot and revalidating it"
+            }
+        }
+    }
+
+    fn what_would_change_it(self) -> &'static str {
+        match self {
+            Self::AuthorityEpochUnavailable => {
+                "The read succeeds once the daemon publishes a settled authority epoch, which \
+                 happens when the in-flight graph mutation commits; `kin graph status` reports \
+                 whether one is in flight, and the daemon log's reconcile records show what is \
+                 moving."
+            }
+            Self::SelectedGraphChanging => {
+                "The read succeeds once graph mutation quiesces; the daemon's reconcile activity \
+                 is what is moving the root, and `kin graph status` reports whether it is still \
+                 running."
+            }
+        }
+    }
+
+    /// The refusal one exhausted reference read returns.
+    ///
+    /// Names the surface, the budget it actually spent, the state that blocked
+    /// it and the condition that changes the outcome. What it must never carry
+    /// is an instruction to retry, because retrying is precisely what the loop
+    /// just finished doing `attempts` times.
+    fn refusal(self, surface: &str, attempts: usize) -> String {
+        format!(
+            "{surface} could not read the selected graph at a stable authority: \
+             {} across {attempts} attempts, each followed by a bounded wait for the writer to \
+             settle. No reference answer is reported as of an earlier instant, because a \
+             reference set that omits a caller added since is wrong rather than merely old. {}",
+            self.state_sentence(),
+            self.what_would_change_it(),
+        )
+    }
+}
+
+/// Wait a bounded, doubling moment between contended reference attempts.
+///
+/// Nothing is held across it: the snapshot is already dropped and the answer
+/// has not been built, so this yields the daemon to the writer whose progress
+/// is the thing that unblocks the read.
+async fn xref_attempt_backoff(attempt: usize) {
+    tokio::task::yield_now().await;
+    // Nothing follows the final attempt but the refusal, so sleeping after it
+    // delays the caller without giving the writer another chance to finish.
+    if attempt + 1 >= XREF_STABLE_READ_ATTEMPTS {
+        return;
+    }
+    let shift = u32::try_from(attempt).unwrap_or(u32::MAX).min(4);
+    tokio::time::sleep(XREF_ATTEMPT_BACKOFF.saturating_mul(1 << shift)).await;
+}
+
 async fn command_xref_with_stable_authority<F>(
     state: &DaemonState,
     session_id: Option<&SessionId>,
@@ -2456,8 +2555,17 @@ where
     // Initialize once outside the stamped interval: lazy spine hydration and
     // registration can be expensive, but it is not part of the graph read.
     let spine = state.ensure_spine();
+    // Which condition blocked the read, carried across the loop so the refusal
+    // names the state rather than whichever check happened to fail last.
+    let mut blocked = XrefBlocked::SelectedGraphChanging;
     for attempt_number in 0..XREF_STABLE_READ_ATTEMPTS {
         let Some(attempt) = prepare_xref_graph_read(state, &selected_graph, authority) else {
+            // Spend the attempt rather than the caller's round trip. This arm
+            // used to `continue` with no wait at all, so the whole budget burned
+            // in microseconds against a writer that needs milliseconds, and the
+            // caller was then told to do the retrying the loop was built to do.
+            blocked = XrefBlocked::AuthorityEpochUnavailable;
+            xref_attempt_backoff(attempt_number).await;
             continue;
         };
         after_root(attempt_number);
@@ -2474,14 +2582,16 @@ where
         {
             return response.map_err(internal_error);
         }
+        blocked = XrefBlocked::SelectedGraphChanging;
         tracing::warn!(
             attempt = attempt_number + 1,
             "graph authority changed during command xref; retrying"
         );
+        xref_attempt_backoff(attempt_number).await;
     }
     Err((
         StatusCode::SERVICE_UNAVAILABLE,
-        "graph authority changed repeatedly during command xref; retry".to_string(),
+        blocked.refusal("command xref", XREF_STABLE_READ_ATTEMPTS),
     ))
 }
 
@@ -2509,8 +2619,17 @@ where
     }
     let spine = state.ensure_spine();
     let repository_authority = mcp_repository_authority_source(state)?;
+    // Which condition blocked the read, carried across the loop so the refusal
+    // names the state rather than whichever check happened to fail last.
+    let mut blocked = XrefBlocked::SelectedGraphChanging;
     for attempt_number in 0..XREF_STABLE_READ_ATTEMPTS {
         let Some(attempt) = prepare_xref_graph_read(state, &selected_graph, authority) else {
+            // Spend the attempt rather than the caller's round trip. This arm
+            // used to `continue` with no wait at all, so the whole budget burned
+            // in microseconds against a writer that needs milliseconds, and the
+            // caller was then told to do the retrying the loop was built to do.
+            blocked = XrefBlocked::AuthorityEpochUnavailable;
+            xref_attempt_backoff(attempt_number).await;
             continue;
         };
         after_root(attempt_number);
@@ -2530,13 +2649,15 @@ where
         {
             return result;
         }
+        blocked = XrefBlocked::SelectedGraphChanging;
         tracing::warn!(
             attempt = attempt_number + 1,
             "graph authority changed during MCP find_references; retrying"
         );
+        xref_attempt_backoff(attempt_number).await;
     }
     Err(kin_mcp::McpError::Other(
-        "graph authority changed repeatedly during find_references; retry".to_string(),
+        blocked.refusal("find_references", XREF_STABLE_READ_ATTEMPTS),
     ))
 }
 
@@ -2657,8 +2778,17 @@ where
     F: FnMut(usize),
 {
     let spine = state.ensure_spine();
+    // Which condition blocked the read, carried across the loop so the refusal
+    // names the state rather than whichever check happened to fail last.
+    let mut blocked = XrefBlocked::SelectedGraphChanging;
     for attempt_number in 0..XREF_STABLE_READ_ATTEMPTS {
         let Some(attempt) = prepare_xref_graph_read(state, &selected_graph, authority) else {
+            // Spend the attempt rather than the caller's round trip. This arm
+            // used to `continue` with no wait at all, so the whole budget burned
+            // in microseconds against a writer that needs milliseconds, and the
+            // caller was then told to do the retrying the loop was built to do.
+            blocked = XrefBlocked::AuthorityEpochUnavailable;
+            xref_attempt_backoff(attempt_number).await;
             continue;
         };
         after_root(attempt_number);
@@ -2676,13 +2806,15 @@ where
         {
             return result;
         }
+        blocked = XrefBlocked::SelectedGraphChanging;
         tracing::warn!(
             attempt = attempt_number + 1,
             "graph authority changed during MCP bulk_check_references; retrying"
         );
+        xref_attempt_backoff(attempt_number).await;
     }
     Err(kin_mcp::McpError::Other(
-        "graph authority changed repeatedly during bulk_check_references; retry".to_string(),
+        blocked.refusal("bulk_check_references", XREF_STABLE_READ_ATTEMPTS),
     ))
 }
 
