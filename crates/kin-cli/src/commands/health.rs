@@ -198,6 +198,7 @@ pub async fn run_health_checks() -> HealthReport {
     checks.push(check_embedding_model().await);
     checks.push(check_commit_memory_headroom());
     checks.push(check_daemon_kill_record());
+    checks.push(check_interrupted_init());
     checks.push(check_suspended_sweep());
     checks.push(check_host_memory_pressure());
     checks.push(check_retrieval_profile());
@@ -1823,6 +1824,58 @@ fn projection_mode_check_for(
              available here"
         },
     )
+}
+
+/// Report staging an interrupted `kin init` left on disk, and where it stopped.
+///
+/// A conversion the kernel kills for memory runs no destructor: the shell gets
+/// exit 137, `.kin` never appears, and hundreds of megabytes of staging sit
+/// beside the repository with nothing pointing at them. The rc0550 stranger met
+/// that and deleted it by hand after guessing what it was. This row is the
+/// answer to the question that operator had no way to ask.
+///
+/// Reports, never reaps. An operator asking what is on their disk has not asked
+/// Kin to delete anything, and the reclaim already happens on the next `kin
+/// init` in that repository, which the fix line names.
+fn check_interrupted_init() -> HealthCheck {
+    let cwd = env::current_dir().unwrap_or_default();
+    interrupted_init_check_for(&interrupted_init_scan_roots(&cwd))
+}
+
+/// Where a doctor run looks for interrupted-conversion staging.
+///
+/// The choice of directories, and the filesystem access it takes to resolve
+/// them, belong to the init boundary in kin-core rather than to a CLI health
+/// row: doctor asks that boundary where to look and reports what it answers.
+fn interrupted_init_scan_roots(cwd: &Path) -> Vec<PathBuf> {
+    kin_core::init_attempt::staging_scan_roots(cwd)
+}
+
+fn interrupted_init_check_for(roots: &[PathBuf]) -> HealthCheck {
+    let mut attempts = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for root in roots {
+        for attempt in kin_core::init_attempt::abandoned_init_attempts(root).unwrap_or_default() {
+            if seen.insert(attempt.capture_path.clone()) {
+                attempts.push(attempt);
+            }
+        }
+    }
+    match kin_core::init_attempt::doctor_row(&attempts) {
+        Some((detail, fix)) => HealthCheck::new(
+            "interrupted_init",
+            "Interrupted conversion",
+            HealthStatus::Degraded,
+            detail,
+        )
+        .with_manual_fix(fix),
+        None => HealthCheck::new(
+            "interrupted_init",
+            "Interrupted conversion",
+            HealthStatus::Healthy,
+            "no `kin init` staging is waiting to be reclaimed here",
+        ),
+    }
 }
 
 fn check_repo_init() -> HealthCheck {
@@ -4454,6 +4507,105 @@ mod tests {
     /// Falsify by comparing against `store.bytes` instead of the measured peak,
     /// or by returning `Healthy` unconditionally: the constrained arm then
     /// passes silently, which is the state this check exists to end.
+    /// The row has to find staging whether doctor is run from the repository
+    /// being converted or from the directory that holds it, because init stages
+    /// beside the repository and an operator stands in either place.
+    #[test]
+    fn the_interrupted_conversion_row_scans_the_working_directory_and_its_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let repo = root.join("requests");
+        std::fs::create_dir(&repo).unwrap();
+
+        let clean = interrupted_init_check_for(&interrupted_init_scan_roots(&repo));
+        assert!(
+            matches!(clean.status, HealthStatus::Healthy),
+            "a disk with no staging on it must not raise a row: {clean:?}"
+        );
+        assert!(clean.manual_fix.is_none());
+
+        // The shape a killed init leaves: a leased capture directory carrying a
+        // phase record, beside the repository rather than inside it.
+        let capture = root.join(".kin-git-capture-abdd7a1c");
+        std::fs::create_dir(&capture).unwrap();
+        std::fs::write(capture.join("capture.lease"), b"").unwrap();
+        std::fs::write(capture.join("body"), vec![0_u8; 4096]).unwrap();
+        let record = serde_json::json!({
+            "version": 1,
+            "source": repo.display().to_string(),
+            "destination": repo.join(".kin").display().to_string(),
+            "pid": 41,
+            "started_unix": 1000,
+            "phase_index": 13,
+            "phase_total": 17,
+            "phase_label": "commit bootstrap transaction",
+            "phase_started_unix": 1707,
+            "memory_limit_bytes": 12884901888_u64,
+            "memory_source": "container",
+            "stage_path": serde_json::Value::Null,
+        });
+        std::fs::write(
+            capture.join("init-attempt.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+
+        for (where_from, cwd) in [("inside the repository", &repo), ("beside it", &root)] {
+            let found = interrupted_init_check_for(&interrupted_init_scan_roots(cwd));
+            assert!(
+                matches!(found.status, HealthStatus::Degraded),
+                "run {where_from}, the row must raise: {found:?}"
+            );
+            assert!(
+                found
+                    .detail
+                    .contains("phase 13 of 17, commit bootstrap transaction"),
+                "run {where_from}, the row must name the phase: {}",
+                found.detail
+            );
+            assert!(
+                found.detail.contains(" KB of staging"),
+                "run {where_from}, the row must name the size in bytes it measured: {}",
+                found.detail
+            );
+            let fix = found
+                .manual_fix
+                .as_deref()
+                .unwrap_or_else(|| panic!("run {where_from}, the row must carry a fix line"));
+            assert!(
+                fix.contains(&capture.display().to_string()),
+                "run {where_from}, the fix must name the path to delete: {fix}"
+            );
+        }
+
+        // One directory, reachable from two scan roots, is one finding.
+        let both = interrupted_init_check_for(&interrupted_init_scan_roots(&repo));
+        assert!(
+            both.detail.contains("from 1 interrupted"),
+            "a capture found through both roots must be counted once: {}",
+            both.detail
+        );
+        assert!(
+            capture.exists(),
+            "doctor reports and must never reap what it reports"
+        );
+    }
+
+    /// A working directory with no parent is the filesystem root, and asking
+    /// for one must not produce a duplicate scan of the same directory.
+    #[test]
+    fn the_scan_roots_never_repeat_a_directory() {
+        let root = interrupted_init_scan_roots(Path::new("/"));
+        assert_eq!(root, vec![PathBuf::from("/")], "the root has no parent");
+        let nested = interrupted_init_scan_roots(Path::new("/tmp"));
+        assert_eq!(
+            nested.len(),
+            2,
+            "an ordinary directory scans itself and its parent: {nested:?}"
+        );
+        assert_ne!(nested[0], nested[1]);
+    }
+
     #[test]
     fn doctor_reads_a_ceiling_below_a_measured_commit_peak_as_degraded() {
         let check =
