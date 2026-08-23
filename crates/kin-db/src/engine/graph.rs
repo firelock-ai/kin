@@ -373,20 +373,32 @@ fn tree_state_error(error: TreeStateError) -> KinDbError {
     KinDbError::StorageError(format!("repository tree transition rejected: {error}"))
 }
 
-fn topologically_order_changes<I>(changes: I) -> Vec<SemanticChange>
+/// Order a change DAG parents-first, borrowing rather than copying it.
+///
+/// The order is what callers need; the change bodies are not theirs to own.
+/// Taking them by value meant a caller with a whole history in hand cloned it
+/// once to hand it over and this function cloned it a second time into the
+/// ordered vector, so ordering a history cost two more copies of it than
+/// existed before the call. Both callers here run at whole-repository scale
+/// during a conversion, and on a mid-size repository each of those copies is
+/// over a gigabyte held at the moment the working set is already largest.
+fn topologically_order_changes<'a, I>(changes: I) -> Vec<&'a SemanticChange>
 where
-    I: IntoIterator<Item = (SemanticChangeId, SemanticChange)>,
+    I: IntoIterator<Item = (&'a SemanticChangeId, &'a SemanticChange)>,
 {
-    let changes: HashMap<SemanticChangeId, SemanticChange> = changes.into_iter().collect();
+    let changes: HashMap<SemanticChangeId, &'a SemanticChange> = changes
+        .into_iter()
+        .map(|(id, change)| (*id, change))
+        .collect();
 
     let mut ids = changes.keys().copied().collect::<Vec<_>>();
     ids.sort_by_key(|id| id.to_string());
 
     let mut visited = HashSet::new();
     let mut ordered = Vec::with_capacity(ids.len());
-    enum Frame {
+    enum Frame<'a> {
         Visit(SemanticChangeId),
-        Emit(SemanticChange),
+        Emit(&'a SemanticChange),
     }
     for id in ids {
         let mut stack = vec![Frame::Visit(id)];
@@ -396,10 +408,10 @@ where
                     if !visited.insert(change_id) {
                         continue;
                     }
-                    let Some(change) = changes.get(&change_id) else {
+                    let Some(change) = changes.get(&change_id).copied() else {
                         continue;
                     };
-                    stack.push(Frame::Emit(change.clone()));
+                    stack.push(Frame::Emit(change));
                     for parent in change.parents.iter().rev() {
                         stack.push(Frame::Visit(*parent));
                     }
@@ -454,7 +466,7 @@ fn push_entity_revision(
 ///
 /// `ordered` must list parents before children.
 fn derive_entity_revisions_across_history(
-    ordered: Vec<SemanticChange>,
+    ordered: Vec<&SemanticChange>,
 ) -> Result<HashMap<EntityId, Vec<EntityRevision>>, KinDbError> {
     let mut pending_children: HashMap<SemanticChangeId, usize> = HashMap::new();
     for change in &ordered {
@@ -569,8 +581,8 @@ fn derive_entity_revisions_across_history(
     Ok(revisions)
 }
 
-fn find_artifact_revision(
-    changes: impl IntoIterator<Item = (SemanticChangeId, SemanticChange)>,
+fn find_artifact_revision<'a>(
+    changes: impl IntoIterator<Item = (&'a SemanticChangeId, &'a SemanticChange)>,
     target: ArtifactRevisionId,
 ) -> Option<ArtifactRevision> {
     let mut active_by_change =
@@ -2565,9 +2577,14 @@ impl InMemoryGraph {
         } = snapshot;
         let entity_revisions: HashMap<EntityId, Vec<EntityRevision>> =
             if entity_revisions.is_empty() && !changes.is_empty() {
-                derive_entity_revisions_across_history(topologically_order_changes(
-                    changes.iter().map(|(id, change)| (*id, change.clone())),
-                ))?
+                // Named because it is the largest thing a conversion's
+                // workspace lap does and it was invisible inside that lap.
+                let _span = tracing::info_span!(
+                    "kindb.graph.derive_entity_revisions",
+                    changes = changes.len()
+                )
+                .entered();
+                derive_entity_revisions_across_history(topologically_order_changes(changes.iter()))?
             } else {
                 entity_revisions.into_iter().collect()
             };
@@ -2931,9 +2948,12 @@ impl InMemoryGraph {
         let entity_data = EntityData {
             entities,
             entity_revisions: if entity_revisions.is_empty() && !changes.is_empty() {
-                derive_entity_revisions_across_history(topologically_order_changes(
-                    changes.iter().map(|(id, change)| (*id, change.clone())),
-                ))?
+                let _span = tracing::info_span!(
+                    "kindb.graph.derive_entity_revisions",
+                    changes = changes.len()
+                )
+                .entered();
+                derive_entity_revisions_across_history(topologically_order_changes(changes.iter()))?
             } else {
                 entity_revisions
             },
@@ -4359,10 +4379,7 @@ impl InMemoryGraph {
             }
             RetrievalKey::ArtifactRevision(rev_id) => {
                 let chg = self.changes.read();
-                let revision = find_artifact_revision(
-                    chg.changes.iter().map(|(id, change)| (*id, change.clone())),
-                    *rev_id,
-                )?;
+                let revision = find_artifact_revision(chg.changes.iter(), *rev_id)?;
                 let file_id = file_path_for_repo_path(&revision.path)?;
                 let syntax_hash = revision.entry.blob_identity()?;
                 Some(ResolvedRetrievalItem::ShallowFile(ShallowTrackedFile {
