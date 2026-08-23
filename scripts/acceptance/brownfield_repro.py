@@ -102,7 +102,7 @@ Options:
     --corpus-cache PATH  pinned upstream clones (default: ~/.cache/kin-brownfield-repro)
     --offline            refuse to fetch; the cache must already carry both pins
     --label NAME         label recorded in the JSON report
-    --only IDS           comma-separated check ids to run, 0 through 9 (default: all)
+    --only IDS           comma-separated check ids to run, 0 through 10 (default: all)
     --json PATH          write machine-readable results here
     --compare PATH       a prior run's --json; a check that passed there and fails
                          here reads REGRESSION rather than plain FAIL
@@ -1737,7 +1737,7 @@ def check_10(suite):
     the hop that mattered. The stranger's verdict, quoted: "If I had trusted the Kin
     arm alone I would have written a wrong answer."
 
-    Four arms.
+    Five arms.
 
     The first is the answer itself: the walk must contain _urllib3_request_context.
     The second distinguishes the two ways that can fail, because blaming ranking for
@@ -1746,13 +1746,18 @@ def check_10(suite):
     this a ranking failure. If the wider walk misses it too, the edge is not in the
     graph and that is a different defect, reported UNREADABLE rather than FAIL.
 
-    The third is the ordering that causes it: no raise target may rank above a row
-    the value actually travels through, at the same depth. It demotes rather than
-    filters, so their presence is fine and their position is not.
+    The third is the ordering: no raise target may rank above a row the value
+    actually travels through, in the same node's fan-out. It demotes rather than
+    filters, so their presence is fine and their position is not. Measured on both
+    builds this arm passes, because `declaration_kind_rank` already sorted Class
+    below Function; it is a regression guard rather than the falsifying arm, and
+    saying otherwise would be inventing a result.
 
-    The fourth is half two of the ticket: every external node the answer touches
-    must name its crossing, so a caller can tell an npm package from a builtin from
-    a typo instead of reading a bare symbol.
+    The fourth and fifth are half two of the ticket, on both corpora: every external
+    node an answer touches must name its crossing, so a caller can tell an npm
+    package from a builtin from a typo instead of reading a bare symbol. The fifth
+    reads the express walk check 4 already runs, because task 5 is where the
+    complaint came from and a Python walk alone is thin evidence for it.
     """
     res = Result("10", "FIR-2642", "the trace reaches the pool-key hop and names "
                                   "every boundary it touches")
@@ -1868,6 +1873,52 @@ def check_10(suite):
         statuses = sorted({str(step["crossing"].get("status")) for step in external})
         res.ok("all %d external node(s) name their crossing (status %s)"
                % (len(external), "/".join(statuses)))
+
+    # Arm five: half two on the corpus the stranger actually filed it from. The
+    # requests walk above is a Python one and, once the budget narrows it, touches
+    # only a couple of boundary nodes, so it is thin evidence on its own. Task 5
+    # is where the complaint came from: `router.handle` arrived as an external
+    # node with nothing tying it to `require('router')` or to `router@^2.2.0`,
+    # and the stranger closed the gap with one grep. Same walk check 4 already
+    # runs, so the payload is cached and this arm costs no extra call.
+    try:
+        js = suite.cached(suite.fixture("express"), "trace_data_flow",
+                          {"focal": APP_HANDLE, "direction": "calls",
+                           "depth": 2, "include_body": False,
+                           "limit_per_step": 25, "max_chars": 200000})
+        js_steps = trace_steps(js) or []
+    except ProbeError as exc:
+        js_steps = None
+        res.note("the express boundary arm could not run: %s" % exc)
+    if js_steps is None:
+        pass
+    elif not js_steps:
+        res.unknown("the express walk on %s returned zero steps, so its boundaries "
+                    "cannot be judged" % APP_HANDLE)
+    else:
+        js_external = [step for step in js_steps if step.get("external") is True]
+        js_mute = []
+        for step in js_external:
+            crossing = step.get("crossing")
+            if (not isinstance(crossing, dict)
+                    or not str(crossing.get("status") or "").strip()):
+                js_mute.append(str(step.get("entity_name") or "?"))
+        if not js_external:
+            res.ok("the express walk touched no external node, so no crossing was "
+                   "owed there either")
+        elif js_mute:
+            res.bad("on express, %d of %d external node(s) name no crossing (%s); "
+                    "this is the task-5 shape, where the graph knows a boundary "
+                    "exists and nothing about the other side of it"
+                    % (len(js_mute), len(js_external),
+                       ", ".join(sorted(set(js_mute))[:6])))
+        else:
+            named = sorted({str(step["crossing"].get("specifier"))
+                            for step in js_external
+                            if step["crossing"].get("specifier")})
+            res.ok("on express, all %d external node(s) name their crossing%s"
+                   % (len(js_external),
+                      " (specifiers %s)" % ", ".join(named[:6]) if named else ""))
 
 
     return res
