@@ -7913,7 +7913,10 @@ mod tests {
         // Taking the record is what stops a second start counting it again.
         assert!(read_serving_daemon(dir.path()).is_none());
         assert!(settle_unwatched_daemon_death(dir.path()).is_none());
-        assert_eq!(read_daemon_kill_record(dir.path()).map(|r| r.kills), Some(1));
+        assert_eq!(
+            read_daemon_kill_record(dir.path()).map(|r| r.kills),
+            Some(1)
+        );
     }
 
     /// A daemon that is still serving is not a death.

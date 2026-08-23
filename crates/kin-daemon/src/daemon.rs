@@ -3350,9 +3350,7 @@ pub async fn run_with_authority_on(
     // outlived its spawner and was then killed was observed by nobody and every
     // surface downstream was free to call the silence an idle exit. That is
     // what let a measured OOM be reported as a normal retirement.
-    if let Some(record) =
-        kin_daemon_spawn::settle_unwatched_daemon_death(state.layout.root())
-    {
+    if let Some(record) = kin_daemon_spawn::settle_unwatched_daemon_death(state.layout.root()) {
         warn!(
             kills = record.kills,
             memory_kills = record.memory_kills,
