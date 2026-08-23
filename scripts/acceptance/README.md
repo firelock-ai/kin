@@ -66,7 +66,12 @@ control on JavaScript import specifiers. Checks 2 through 8 cover the two real
 callers of `HTTPAdapter.send`, the `app.handle` walk in express, one verdict per
 payload, `find_references` and `graph_neighborhood` agreeing on one entity, an
 express export nothing may certify as unused, and `semantic_search` refusing to
-certify a false absence.
+certify a false absence. Check 9 kills a `kin init` mid-conversion and asserts the
+next command names the kill, the re-run says whether it resumes or restarts, and
+nothing is orphaned silently. Check 10 replays the rc0550 brown stranger's task 3
+verbatim, at that run's own budget, and requires the walk to reach the hop that
+folds `verify` into the urllib3 pool key and every external node it touches to
+name what it crosses into.
 
 The brownfield fixtures are one commit each, so its recall results are
 one-commit-shape results. The suite prints that scope on every run and records it

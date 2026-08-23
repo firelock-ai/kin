@@ -22,7 +22,7 @@ use kin_ranking::entity_ranking::{
     trace_terminal_named, trace_walk_terminal, TraceExpansion, TraceTerminal,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::commands::graph::{graph_source_record_from, GraphSourceRecord};
@@ -377,6 +377,16 @@ pub struct TraceEntityRecord {
     /// Whether the span that cut `body` was proven to describe those exact bytes.
     /// Null whenever no body was served, since the pairing is what it describes.
     pub span_coherence: Option<String>,
+    /// Where the in-repo graph ends, for a step sitting on the boundary.
+    /// Non-null on exactly the records `external` is true for; a step the
+    /// repository owns crosses nothing and carries an explicit null.
+    ///
+    /// Always serialized, never skipped: this array's keys are uniform by
+    /// contract, and a sometimes-absent key is the shape that broke a
+    /// consumer's parser twice. `every_step_carries_the_same_keys_admitted_or_external`
+    /// caught this field trying to become the third time.
+    #[serde(default)]
+    pub crossing: Option<kin_index::TraceCrossing>,
 }
 
 /// One step in the data-flow chain.
@@ -506,6 +516,17 @@ pub struct TraceDataFlowResponse {
     pub bodies_omitted: usize,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub steps_omitted: usize,
+    /// How many of `steps_omitted` went as whole branches the budget narrowed
+    /// away, rather than off the end of the chain. Zero — and omitted — when
+    /// the suffix fallback did the cutting or when nothing was cut at all.
+    ///
+    /// Worth its own count because the two losses are different answers. A
+    /// narrowed chain still reaches as deep as the walk did and lists fewer
+    /// neighbours per node; an amputated one is shallower than the walk was,
+    /// and a reader who cannot tell them apart cannot tell whether the far end
+    /// of the answer is missing.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub fanout_narrowed: usize,
     /// Every list the response budget cut, keyed by the field it cut, with what
     /// survived, what was withheld, and why.
     ///
@@ -749,7 +770,7 @@ pub fn build_trace_data_flow_response_within(
     let focal_record = bodies_included
         .then(|| source_record_or_none(projection.as_ref(), &focal_entity))
         .flatten();
-    let focal_entity_record = entity_record(&focal_entity, focal_record.as_ref());
+    let focal_entity_record = entity_record(&focal_entity, focal_record.as_ref(), None);
 
     // The kinds a data-flow claim actually rests on.
     let reference_kinds = [
@@ -912,6 +933,27 @@ pub fn build_trace_data_flow_response_within(
                             candidate.confidence = rel.confidence;
                             candidate.resolution = RelationResolution::of(rel);
                         }
+                        // These two accumulate across EVERY edge rather than
+                        // moving with the strongest one. A class reached by a
+                        // `raise` and also by an ordinary call is on the data
+                        // path, and a boundary one edge can name stays named
+                        // when a weaker anonymous edge arrives beside it.
+                        candidate.call_edges +=
+                            usize::from(kin_index::is_raise_classifiable_call_edge(rel));
+                        candidate.raise_call_edges +=
+                            usize::from(kin_index::is_raise_target_edge(rel));
+                        if candidate
+                            .crossing
+                            .as_ref()
+                            .is_none_or(|crossing| crossing.specifier.is_none())
+                        {
+                            if let Some(named) =
+                                kin_index::trace_crossing_for(&candidate.entity, Some(rel))
+                                    .filter(|crossing| crossing.specifier.is_some())
+                            {
+                                candidate.crossing = Some(named);
+                            }
+                        }
                     }
                     None => {
                         let Some(entity) = graph
@@ -921,12 +963,18 @@ pub fn build_trace_data_flow_response_within(
                             continue;
                         };
                         candidate_index.insert((next_id, role), candidates.len());
+                        let crossing = kin_index::trace_crossing_for(&entity, Some(rel));
                         candidates.push(FanoutCandidate {
+                            call_edges: usize::from(kin_index::is_raise_classifiable_call_edge(
+                                rel,
+                            )),
+                            raise_call_edges: usize::from(kin_index::is_raise_target_edge(rel)),
                             entity,
                             role,
                             relation_kind: rel.kind,
                             confidence: rel.confidence,
                             resolution: RelationResolution::of(rel),
+                            crossing,
                         });
                     }
                 }
@@ -1009,7 +1057,11 @@ pub fn build_trace_data_flow_response_within(
                             .then(|| source_record_or_none(projection.as_ref(), &candidate.entity))
                             .flatten();
                         let promoted = &mut chain[existing - 1];
-                        promoted.entity = entity_record(&candidate.entity, source.as_ref());
+                        promoted.entity = entity_record(
+                            &candidate.entity,
+                            source.as_ref(),
+                            candidate.crossing.clone(),
+                        );
                         // A promoted record is located by construction, so the
                         // external boundary no longer applies to it; the edge
                         // that reached it is unchanged, so the annotation one
@@ -1070,7 +1122,11 @@ pub fn build_trace_data_flow_response_within(
                     resolution: candidate.resolution.as_str().to_string(),
                     parent_step: node.step,
                     depth: next_depth,
-                    entity: entity_record(&candidate.entity, source.as_ref()),
+                    entity: entity_record(
+                        &candidate.entity,
+                        source.as_ref(),
+                        candidate.crossing.clone(),
+                    ),
                     fanout_truncated: false,
                     fanout_dropped: 0,
                     terminal: terminal.map(|terminal| terminal.as_str().to_string()),
@@ -1122,6 +1178,7 @@ pub fn build_trace_data_flow_response_within(
         clipped_steps,
         bodies_omitted: 0,
         steps_omitted: 0,
+        fanout_narrowed: 0,
         elisions: BTreeMap::new(),
         unproven_steps: 0,
         external_identities_merged,
@@ -1367,6 +1424,37 @@ struct FanoutCandidate {
     /// the same neighbor replaces them, so the step reports what the edge it
     /// names actually proved.
     resolution: RelationResolution,
+    /// Where the in-repo graph ends, when this candidate sits on the boundary.
+    /// Read off the edge that reached it, because the edge is where the module
+    /// pin and the receiver text live; the entity carries only identity.
+    crossing: Option<kin_index::TraceCrossing>,
+    /// Call edges into this candidate, and how many of them were the operand of
+    /// a `raise`. A candidate is a throw site when it has call edges and every
+    /// one of them is a raise: a class that is also constructed normally is on
+    /// the data path and must not be demoted.
+    ///
+    /// Counted rather than folded into a bool, because a bool was order-
+    /// dependent and measurably wrong. Folding with `&&` meant whichever edge
+    /// happened to create the candidate set the starting value, so one
+    /// reference edge arriving first left the flag false for the whole
+    /// candidate. On a converted `psf/requests` that was every exception class
+    /// in `HTTPAdapter.send`'s fan-out, so the demotion this field exists for
+    /// never once fired on the corpus it was written from, and a check that
+    /// inverted the ordering could not tell the difference.
+    call_edges: usize,
+    raise_call_edges: usize,
+}
+
+impl FanoutCandidate {
+    /// Whether this candidate is only ever thrown, never called for its value.
+    ///
+    /// Only parse-authored call edges vote. An LSP call-hierarchy edge cannot
+    /// see a `raise`, so its silence is not a claim that the call was ordinary,
+    /// and counting it made this answer `false` for every candidate on any
+    /// repository with a language server installed.
+    fn is_raise_target(&self) -> bool {
+        self.call_edges > 0 && self.raise_call_edges == self.call_edges
+    }
 }
 
 /// Order one side of a node's fan-out by relevance, most relevant first.
@@ -1382,6 +1470,7 @@ fn sort_by_relevance(candidates: &mut [FanoutCandidate], node: &FrontierNode) {
             node.file.as_deref(),
             node.dir.as_deref(),
             left.confidence,
+            left.is_raise_target(),
         );
         let right_score = kin_ranking::entity_ranking::trace_fanout_score(
             &right.entity,
@@ -1389,6 +1478,7 @@ fn sort_by_relevance(candidates: &mut [FanoutCandidate], node: &FrontierNode) {
             node.file.as_deref(),
             node.dir.as_deref(),
             right.confidence,
+            right.is_raise_target(),
         );
         right_score
             .cmp(&left_score)
@@ -1403,7 +1493,11 @@ fn sort_by_relevance(candidates: &mut [FanoutCandidate], node: &FrontierNode) {
 /// entirely for a shape query). When it is absent the span still comes from the
 /// entity's own graph span, because a caller asking for the shape of a chain
 /// still needs to know where each step lives.
-fn entity_record(entity: &Entity, source: Option<&GraphSourceRecord>) -> TraceEntityRecord {
+fn entity_record(
+    entity: &Entity,
+    source: Option<&GraphSourceRecord>,
+    crossing: Option<kin_index::TraceCrossing>,
+) -> TraceEntityRecord {
     let (start_line, end_line) = match (source, entity.span.as_ref()) {
         (Some(record), _) => (Some(record.start_line), Some(record.end_line)),
         (None, Some(span)) => {
@@ -1424,6 +1518,7 @@ fn entity_record(entity: &Entity, source: Option<&GraphSourceRecord>) -> TraceEn
         signature: (!entity.signature.is_empty()).then(|| entity.signature.clone()),
         body: source.map(|record| record.body.clone()),
         span_coherence: source.map(|record| record.span_coherence.clone()),
+        crossing,
     }
 }
 
@@ -1448,8 +1543,33 @@ fn measure_response(response: &TraceDataFlowResponse) -> usize {
 /// still answers "what does this reach"; a chain missing edges answers a
 /// different, smaller question, and a caller cannot tell which question was
 /// answered unless the cut says so. Bodies go first, then the focal's body, then
-/// steps from the tail — a suffix, because the chain is discovery-ordered, so
-/// removing the end never orphans a surviving step's parent.
+/// steps.
+///
+/// ## Why the step cut narrows before it amputates
+///
+/// A suffix cut is safe, because the chain is discovery-ordered and removing
+/// the end never orphans a surviving step's parent. It is also what produced a
+/// wrong answer. Discovery order is breadth-first, so the tail of the chain is
+/// its DEEPEST steps, and cutting a suffix spends the whole budget on the
+/// shallow fan-out and amputates the far end, which is where a trace stops
+/// being a list of neighbours and becomes an answer.
+///
+/// Measured on a converted `psf/requests` by the rc0550 stranger at the
+/// documented cheap settings (`depth: 3`, `limit_per_step: 12`,
+/// `include_body: false`): 67 of 117 steps went, and the survivors did not
+/// include `_urllib3_request_context`, one hop past
+/// `build_connection_pool_key_attributes`, which is the function that folds
+/// `verify` into the urllib3 pool key. Read alone the answer said `verify`
+/// reaches TLS at `cert_verify` and stopped, missing the half that governs
+/// connection reuse. The stranger's words: "If I had trusted the Kin arm alone
+/// I would have written a wrong answer." The edge was in the graph the whole
+/// time.
+///
+/// So the cut now gives up whole branches, least relevant first, and only falls
+/// back to the suffix when nothing is left to narrow, so a pathological walk is
+/// still answered rather than refused. The rule itself is
+/// [`kin_mcp::budget::narrow_fanout_to_fit`], shared with the MCP arm so the
+/// two surfaces cannot drift.
 fn enforce_response_budget(response: &mut TraceDataFlowResponse) {
     let ceiling = response.max_response_chars;
     if measure_response(response) <= ceiling {
@@ -1479,52 +1599,83 @@ fn enforce_response_budget(response: &mut TraceDataFlowResponse) {
 
     let mut steps_omitted = 0usize;
     if measure_response(response) > target {
-        // Bisected rather than popped one step at a time: the same answer, in a
-        // handful of serializations instead of one per dropped step.
-        //
-        // The floor is one step, not zero. A walk that reached 200 steps and
-        // returns `"chain": []` is indistinguishable from a walk that reached
-        // none, and no counter elsewhere in the response outranks the empty
-        // array for a reader. One surviving step plus the elision beside it says
-        // both what was reached and what was withheld.
         let full = std::mem::take(&mut response.chain);
-        let floor = usize::from(!full.is_empty());
-        let mut kept = floor;
-        let mut low = floor;
-        let mut high = full.len();
-        while low <= high {
-            let mid = (low + high) / 2;
-            response.chain = full[..mid].to_vec();
-            response.total_steps = mid;
-            if measure_response(response) <= target {
-                kept = mid;
-                low = mid + 1;
-            } else if mid <= floor {
-                break;
-            } else {
-                high = mid - 1;
+        // Narrow first. Every candidate the shared rule offers is measured the
+        // way this response will be sent, so the arithmetic is the budget's own
+        // rather than an estimate of it.
+        let narrowed = kin_mcp::budget::narrow_fanout_to_fit(
+            &full,
+            &|step: &TraceStep| step.step as u64,
+            &|step: &TraceStep| Some(step.parent_step as u64),
+            &mut |kept: &[TraceStep]| {
+                response.chain = kept.to_vec();
+                response.total_steps = kept.len();
+                measure_response(response) <= target
+            },
+        );
+        let kept_chain = match narrowed {
+            Some(kept) => {
+                response.fanout_narrowed = full.len() - kept.len();
+                kept
             }
-        }
-        steps_omitted = full.len() - kept;
-        response.chain = full[..kept].to_vec();
-        response.total_steps = kept;
+            None => {
+                // Nothing narrow enough fits, so fall back to the suffix, which
+                // always terminates.
+                //
+                // Bisected rather than popped one step at a time: the same
+                // answer, in a handful of serializations instead of one per
+                // dropped step.
+                //
+                // The floor is one step, not zero. A walk that reached 200 steps
+                // and returns `"chain": []` is indistinguishable from a walk
+                // that reached none, and no counter elsewhere in the response
+                // outranks the empty array for a reader. One surviving step plus
+                // the elision beside it says both what was reached and what was
+                // withheld.
+                let floor = usize::from(!full.is_empty());
+                let mut kept = floor;
+                let mut low = floor;
+                let mut high = full.len();
+                while low <= high {
+                    let mid = (low + high) / 2;
+                    response.chain = full[..mid].to_vec();
+                    response.total_steps = mid;
+                    if measure_response(response) <= target {
+                        kept = mid;
+                        low = mid + 1;
+                    } else if mid <= floor {
+                        break;
+                    } else {
+                        high = mid - 1;
+                    }
+                }
+                full[..kept].to_vec()
+            }
+        };
+        steps_omitted = full.len() - kept_chain.len();
+        response.chain = kept_chain;
+        response.total_steps = response.chain.len();
         response.steps_omitted = steps_omitted;
         if steps_omitted > 0 {
             // The same loss in the shape every budgeted list reports it in, so a
             // caller reads one key whether the tool cut a chain or a bucket of
             // tests.
-            response
-                .elisions
-                .insert("chain".to_string(), Elision::budget(kept, steps_omitted));
+            response.elisions.insert(
+                "chain".to_string(),
+                Elision::budget(response.chain.len(), steps_omitted),
+            );
             // Dropped steps are edges the caller did not receive, which is what
             // this flag has always meant. Dropped bodies are not.
             response.truncated = true;
             // A clip recorded against a step that is no longer here would send a
-            // caller re-querying a node the response does not name.
-            let kept_steps = response.chain.len();
+            // caller re-querying a node the response does not name. Membership
+            // rather than `clip.step <= kept`: a narrowed chain is no longer a
+            // prefix, so a bound on the index would keep clips for steps that
+            // went and drop clips for steps that stayed.
+            let surviving: BTreeSet<usize> = response.chain.iter().map(|step| step.step).collect();
             response
                 .clipped_steps
-                .retain(|clip| clip.step <= kept_steps);
+                .retain(|clip| clip.step == 0 || surviving.contains(&clip.step));
         }
     }
 
@@ -1536,15 +1687,24 @@ fn enforce_response_budget(response: &mut TraceDataFlowResponse) {
     } else {
         "bodies_omitted"
     };
+    // Named for HOW the steps went, because "from the end of the chain" and
+    // "as whole branches" leave a caller in different places: the first says
+    // the far end of the answer is missing, the second says every node lists
+    // fewer neighbours and the depth is intact.
+    let how = if response.fanout_narrowed > 0 {
+        "as whole branches, least relevant first"
+    } else {
+        "from the end of the chain"
+    };
     let cut = match (
         bodies_omitted + usize::from(focal_body_omitted),
         steps_omitted,
     ) {
         (bodies, 0) => format!("{bodies} inlined bodies were dropped"),
-        (0, steps) => format!("{steps} steps were dropped from the end of the chain"),
+        (0, steps) => format!("{steps} steps were dropped {how}"),
         (bodies, steps) => format!(
-            "{bodies} inlined bodies were dropped, and {steps} steps after that were dropped from \
-             the end of the chain"
+            "{bodies} inlined bodies were dropped, and {steps} steps after that were dropped \
+             {how}"
         ),
     };
     record_degradation(
@@ -1644,7 +1804,7 @@ mod tests {
     use kin_model::relation::{Relation, RelationOrigin};
     use std::sync::Arc;
 
-    fn make_entity(name: &str, file: &str) -> Entity {
+    pub(super) fn make_entity(name: &str, file: &str) -> Entity {
         Entity {
             id: EntityId::new(),
             kind: EntityKind::Function,
@@ -1684,7 +1844,7 @@ mod tests {
 
     /// The shape a symbol the graph owns no file for actually has: identity, no
     /// location, no span, and (in the measured repository) `Module` kind.
-    fn make_external_entity(name: &str) -> Entity {
+    pub(super) fn make_external_entity(name: &str) -> Entity {
         let mut entity = make_entity(name, "unused");
         entity.kind = EntityKind::Module;
         entity.file_origin = None;
@@ -1709,7 +1869,7 @@ mod tests {
         }
     }
 
-    fn step_names(response: &TraceDataFlowResponse) -> Vec<String> {
+    pub(super) fn step_names(response: &TraceDataFlowResponse) -> Vec<String> {
         response
             .chain
             .iter()
@@ -1733,7 +1893,8 @@ mod tests {
 
     /// Synthesize an absent repository authority. The body itself isn't
     /// required for the chain-shape tests; we only assert on identity fields.
-    fn empty_binding() -> (tempfile::TempDir, kin_core::LocalRepositoryAuthorityBinding) {
+    pub(super) fn empty_binding() -> (tempfile::TempDir, kin_core::LocalRepositoryAuthorityBinding)
+    {
         let temp = tempfile::tempdir().unwrap();
         let kin_root = temp.path().join(".kin");
         std::fs::create_dir_all(kin_root.join("objects")).unwrap();
@@ -2468,7 +2629,7 @@ mod tests {
         let mut chain = Vec::new();
         for index in 1..=steps {
             let step_entity = make_entity(&format!("step_{index}"), "src/step.rs");
-            let mut record = entity_record(&step_entity, None);
+            let mut record = entity_record(&step_entity, None, None);
             record.body = Some("x".repeat(body_chars));
             record.span_coherence = Some("verified".to_string());
             chain.push(TraceStep {
@@ -2490,7 +2651,7 @@ mod tests {
             focal_name: entity.name.clone(),
             focal_kind: "Function".to_string(),
             focal_file: Some("src/focal.rs".to_string()),
-            focal_entity: entity_record(&entity, None),
+            focal_entity: entity_record(&entity, None, None),
             direction: "calls".to_string(),
             depth: 1,
             limit_per_step: 25,
@@ -2502,6 +2663,7 @@ mod tests {
             clipped_steps: Vec::new(),
             bodies_omitted: 0,
             steps_omitted: 0,
+            fanout_narrowed: 0,
             elisions: BTreeMap::new(),
             unproven_steps: 0,
             external_identities_merged: 0,
@@ -2601,6 +2763,210 @@ mod tests {
         assert!(
             serde_json::to_string_pretty(&response).unwrap().len() <= response.max_response_chars,
             "the payload must end up inside the budget it reports"
+        );
+    }
+
+    /// The measured shape, in miniature: a focal with a wide fan-out, one deep
+    /// branch hanging off its FIRST child, and steps numbered in discovery
+    /// order, which is breadth-first, so the deep steps are last.
+    ///
+    /// `psf/requests` gave `HTTPAdapter.send` twelve depth-1 children and put
+    /// `_urllib3_request_context` at depth 3, which is where the tail is.
+    fn wide_then_deep_response(
+        width: usize,
+        deep: usize,
+        pad_chars: usize,
+    ) -> TraceDataFlowResponse {
+        let mut response = fat_response(0, 0);
+        let mut chain: Vec<TraceStep> = Vec::new();
+        let push = |chain: &mut Vec<TraceStep>, name: String, parent: usize, depth: usize| {
+            let entity = make_entity(&name, "src/step.rs");
+            let mut record = entity_record(&entity, None, None);
+            record.signature = Some("s".repeat(pad_chars));
+            chain.push(TraceStep {
+                step: chain.len() + 1,
+                role: "callee".to_string(),
+                relation_kind: "Calls".to_string(),
+                resolution: RelationResolution::TypeResolved.as_str().to_string(),
+                parent_step: parent,
+                depth,
+                entity: record,
+                fanout_truncated: false,
+                fanout_dropped: 0,
+                terminal: None,
+            });
+        };
+        for index in 1..=width {
+            push(&mut chain, format!("neighbour_{index}"), 0, 1);
+        }
+        let mut parent = 1usize;
+        for level in 0..deep {
+            push(&mut chain, format!("deep_{level}"), parent, level + 2);
+            parent = chain.len();
+        }
+        response.bodies_included = false;
+        response.total_steps = chain.len();
+        response.chain = chain;
+        response
+    }
+
+    /// The smallest payload narrowing can produce for [`wide_then_deep_response`]:
+    /// the focal's first child and the deep branch below it, which is what
+    /// "every node keeps its first child" leaves behind.
+    ///
+    /// Computed rather than guessed, so these tests calibrate against the
+    /// serializer instead of against a number that drifts the first time a field
+    /// is added to a step.
+    fn narrowest_budget(width: usize, deep: usize, pad_chars: usize) -> usize {
+        let mut floor = wide_then_deep_response(width, deep, pad_chars);
+        let survivors: BTreeSet<usize> = std::iter::once(1)
+            .chain((width + 1)..=(width + deep))
+            .collect();
+        floor.chain.retain(|step| survivors.contains(&step.step));
+        floor.total_steps = floor.chain.len();
+        serde_json::to_string_pretty(&floor).map_or(usize::MAX, |json| json.len())
+            + TRACE_DISCLOSURE_RESERVE_CHARS
+    }
+
+    /// FIR-2642. The budget must give up the focal's least relevant neighbours
+    /// before it gives up the end of the chain, because the end of the chain is
+    /// the answer.
+    ///
+    /// Measured on a converted `psf/requests` at the stranger's own settings:
+    /// the suffix cut returned nothing past depth 2 while the walk had reached
+    /// depth 3, so the response said `verify` reaches TLS at `cert_verify` and
+    /// stopped, missing the pool-key path that governs connection reuse.
+    #[test]
+    fn the_budget_narrows_the_fan_out_before_it_amputates_the_chain() {
+        let mut response = wide_then_deep_response(12, 2, 900);
+        response.max_response_chars = narrowest_budget(12, 2, 900);
+        let deepest = response
+            .chain
+            .last()
+            .expect("the fixture has a deep end")
+            .entity
+            .entity_name
+            .clone();
+        assert!(
+            serde_json::to_string_pretty(&response).unwrap().len() > response.max_response_chars,
+            "the fixture must start over budget or this proves nothing"
+        );
+
+        enforce_response_budget(&mut response);
+
+        assert!(
+            step_names(&response).contains(&deepest),
+            "the budget amputated the deep end instead of narrowing the fan-out: {:?}",
+            step_names(&response)
+        );
+        assert!(
+            response.fanout_narrowed > 0,
+            "a narrowed cut must say it narrowed"
+        );
+        assert_eq!(
+            response.fanout_narrowed, response.steps_omitted,
+            "every step this cut dropped went as part of a branch"
+        );
+        // No survivor may name a parent the response no longer carries, which is
+        // the property a prefix cut got for free and this one has to earn.
+        let present: BTreeSet<usize> = response.chain.iter().map(|step| step.step).collect();
+        assert!(
+            response
+                .chain
+                .iter()
+                .all(|step| step.parent_step == 0 || present.contains(&step.parent_step)),
+            "a surviving step names a parent the cut removed: {present:?}"
+        );
+        let cut = response
+            .degradations
+            .iter()
+            .find(|d| d.component == "response_budget")
+            .expect("the cut must be disclosed");
+        assert!(
+            cut.detail.contains("as whole branches"),
+            "the disclosure must say which cut a caller received: {}",
+            cut.detail
+        );
+        assert!(
+            serde_json::to_string_pretty(&response).unwrap().len() <= response.max_response_chars,
+            "the payload must end up inside the budget it reports"
+        );
+    }
+
+    /// The other direction, so the disclosure cannot be a constant. A chain with
+    /// no node wider than one child has no branch to give up, so the suffix cut
+    /// runs, `fanout_narrowed` stays zero, and the wording says end-of-chain.
+    #[test]
+    fn a_chain_with_nothing_to_narrow_still_takes_the_suffix_cut_and_says_so() {
+        let mut response = fat_response(200, 0);
+        response.bodies_included = false;
+        for step in &mut response.chain {
+            step.entity.body = None;
+            step.entity.span_coherence = None;
+            step.entity.signature = Some("s".repeat(400));
+        }
+        response.max_response_chars = 8_000;
+
+        enforce_response_budget(&mut response);
+
+        assert!(response.steps_omitted > 0, "the fixture must reach the cut");
+        assert_eq!(
+            response.fanout_narrowed, 0,
+            "a spine has no branch to give up, so nothing may claim it narrowed one"
+        );
+        let cut = response
+            .degradations
+            .iter()
+            .find(|d| d.component == "response_budget")
+            .expect("the cut must be disclosed");
+        assert!(
+            cut.detail.contains("from the end of the chain"),
+            "the suffix cut must still say so: {}",
+            cut.detail
+        );
+    }
+
+    /// A clip is a pointer into `chain`, and a narrowed chain is no longer a
+    /// prefix, so keeping clips by index would keep pointers to steps that went
+    /// and drop pointers to steps that stayed.
+    #[test]
+    fn a_narrowed_chain_keeps_exactly_the_clips_whose_steps_survived() {
+        let mut response = wide_then_deep_response(12, 2, 900);
+        for step in [1usize, 12, 14] {
+            response.clipped_steps.push(TraceFanoutClip {
+                step,
+                entity_id: format!("clip-{step}"),
+                entity_name: format!("step_{step}"),
+                dropped_callees: 3,
+                dropped_callers: 0,
+                limit_per_step: 12,
+            });
+        }
+        // Calibrated on THIS response, clips included, because the clips are
+        // part of what the budget measures.
+        let mut floor = response.clone();
+        floor.chain.retain(|step| [1, 13, 14].contains(&step.step));
+        floor.total_steps = floor.chain.len();
+        response.max_response_chars =
+            serde_json::to_string_pretty(&floor).unwrap().len() + TRACE_DISCLOSURE_RESERVE_CHARS;
+
+        enforce_response_budget(&mut response);
+
+        let present: BTreeSet<usize> = response.chain.iter().map(|step| step.step).collect();
+        assert!(
+            present.contains(&1) && present.contains(&14),
+            "the fixture must keep the first neighbour and the deep end: {present:?}"
+        );
+        assert!(
+            !present.contains(&12),
+            "the fixture must drop the last neighbour or the clip test proves nothing: \
+             {present:?}"
+        );
+        let clipped: BTreeSet<usize> = response.clipped_steps.iter().map(|c| c.step).collect();
+        assert_eq!(
+            clipped,
+            BTreeSet::from([1, 14]),
+            "a clip must name a step the response still carries, and must not lose one it does"
         );
     }
 
@@ -3353,5 +3719,495 @@ mod tests {
             "its one neighbor is the focal, which the response already carries"
         );
         assert!(!response.truncated);
+    }
+}
+
+#[cfg(test)]
+mod boundary_and_ranking_tests {
+    //! FIR-2642, from the rc0550 brown stranger run. Two halves of one
+    //! contract: Kin must say where the in-repo graph ends and name the
+    //! crossing.
+    //!
+    //! Half one. `trace_data_flow(HTTPAdapter.send, direction=calls, depth=3,
+    //! limit_per_step=12)` spent nine of its twelve depth-1 slots on exception
+    //! classes, which are `raise` targets in `except` blocks and not data flow
+    //! at all. They crowded out the hop that governs connection reuse, and the
+    //! stranger's verdict was that the Kin arm trusted alone writes a wrong
+    //! answer. The edge was in the graph; the failure is ranking.
+    //!
+    //! Half two. `router.handle` is an external node connected to nothing. The
+    //! graph knows a boundary exists and says nothing about the other side, so
+    //! a reader cannot tell an npm package from a builtin from a typo.
+
+    use super::tests::{empty_binding, make_entity, make_external_entity, step_names};
+    use super::*;
+    use kin_db::InMemoryGraph;
+    use kin_model::relation::{Relation, RelationEvidence, RelationOrigin};
+    use kin_model::{EntityKind, GraphNodeId, RelationId, RelationKind};
+
+    /// An ordinary call: the kind of edge a data-flow walk is following.
+    fn call(src: EntityId, dst: EntityId) -> Relation {
+        Relation {
+            id: RelationId::new(),
+            kind: RelationKind::Calls,
+            src: GraphNodeId::Entity(src),
+            dst: GraphNodeId::Entity(dst),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: vec![],
+        }
+    }
+
+    /// A call the parser read as the operand of a `raise`, which is a throw
+    /// site rather than a hop the value travels along.
+    fn raise_call(src: EntityId, dst: EntityId) -> Relation {
+        let mut relation = call(src, dst);
+        relation.evidence = vec![RelationEvidence {
+            parser_rule: Some(kin_index::RAISE_TARGET_CALL_RULE.to_string()),
+            ..RelationEvidence::default()
+        }];
+        relation
+    }
+
+    /// The second call edge a repository with a language server carries for
+    /// every resolved call: it says the call exists and nothing about the
+    /// syntax, because an LSP call hierarchy cannot see a `raise`.
+    fn lsp_call(src: EntityId, dst: EntityId) -> Relation {
+        let mut relation = call(src, dst);
+        relation.origin = RelationOrigin::Lsp;
+        relation.evidence = vec![RelationEvidence {
+            parser_rule: Some("lsp_call_hierarchy".to_string()),
+            ..RelationEvidence::default()
+        }];
+        relation
+    }
+
+    fn exception_class(name: &str, file: &str) -> Entity {
+        let mut entity = make_entity(name, file);
+        entity.kind = EntityKind::Class;
+        entity
+    }
+
+    /// The measured shape: everything in ONE file, as `psf/requests` has it,
+    /// where `HTTPAdapter.send` and the exceptions it throws share
+    /// `adapters.py` and locality decides nothing.
+    ///
+    /// Three candidates, so both terms that matter are exercised. `pool_key` is
+    /// a Function and wins on declaration kind, which is what actually delivers
+    /// "data flow above throw sites" on real bytes. `Retryer` is a Class the
+    /// focal calls ordinarily, and it is the only candidate the raise marker
+    /// itself decides against: alike in every other term, so if the marker goes
+    /// inert, `SSLError` outranks it on name length alone.
+    fn raise_crowding_graph() -> (InMemoryGraph, EntityId) {
+        let graph = InMemoryGraph::new();
+        let focal = make_entity("Adapter.send", "pkg/adapters.py");
+        let ssl_error = exception_class("SSLError", "pkg/adapters.py");
+        let proxy_error = exception_class("ProxyError", "pkg/adapters.py");
+        let retryer = exception_class("Retryer", "pkg/adapters.py");
+        let pool_key = make_entity("build_pool_key", "pkg/adapters.py");
+
+        for entity in [&focal, &ssl_error, &proxy_error, &retryer, &pool_key] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        for relation in [
+            raise_call(focal.id, ssl_error.id),
+            raise_call(focal.id, proxy_error.id),
+            call(focal.id, retryer.id),
+            call(focal.id, pool_key.id),
+        ] {
+            graph.upsert_relation(&relation).unwrap();
+        }
+        (graph, focal.id)
+    }
+
+    /// Where each name landed in the fan-out, so a test can assert an ORDER
+    /// rather than only a membership.
+    fn rank_of(names: &[String], wanted: &str) -> usize {
+        names
+            .iter()
+            .position(|name| name == wanted)
+            .unwrap_or_else(|| panic!("{wanted} is not in the walk: {names:?}"))
+    }
+
+    #[test]
+    fn a_raise_target_does_not_take_a_slot_from_a_data_flow_hop() {
+        let (graph, focal) = raise_crowding_graph();
+        let (_t, binding) = empty_binding();
+
+        let response = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding),
+            &graph,
+            &TraceDataFlowRequest {
+                focal: focal.to_string(),
+                depth: Some(2),
+                direction: Some(TraceDirection::Calls),
+                limit_per_step: Some(2),
+                include_body: Some(false),
+                max_response_chars: None,
+                include_type_edges: None,
+            },
+        )
+        .unwrap();
+
+        let names = step_names(&response);
+        assert_eq!(
+            names,
+            vec!["build_pool_key".to_string(), "Retryer".to_string()],
+            "two slots go to the hop the value travels through and to the \
+             class the focal actually constructs; a throw site takes neither. \
+             Got {names:?}"
+        );
+    }
+
+    #[test]
+    fn a_raise_target_is_still_reported_when_the_budget_allows_it() {
+        // The recall half. Demoting a raise target orders it last; it must
+        // never drop it, because "what does this throw" is a real question and
+        // the edge is real evidence.
+        let (graph, focal) = raise_crowding_graph();
+        let (_t, binding) = empty_binding();
+
+        let response = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding),
+            &graph,
+            &TraceDataFlowRequest {
+                focal: focal.to_string(),
+                depth: Some(2),
+                direction: Some(TraceDirection::Calls),
+                limit_per_step: Some(8),
+                include_body: Some(false),
+                max_response_chars: None,
+                include_type_edges: None,
+            },
+        )
+        .unwrap();
+
+        let names = step_names(&response);
+        for expected in ["build_pool_key", "Retryer", "SSLError", "ProxyError"] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "a wide enough step reports every callee including the throw \
+                 sites; ranking may reorder and must not remove. Missing \
+                 {expected} from {names:?}"
+            );
+        }
+        assert!(
+            rank_of(&names, "Retryer") < rank_of(&names, "SSLError"),
+            "and the throw sites sit below the class the focal constructs, \
+             which is the one comparison the raise marker decides. Got {names:?}"
+        );
+        assert_eq!(
+            names.first().map(String::as_str),
+            Some("build_pool_key"),
+            "and the data-flow hop leads, so a reader who stops at the first \
+             row stops on the one that carries the value. Got {names:?}"
+        );
+    }
+
+    /// A relation that is a mention rather than a call, which is what a real
+    /// store carries beside a call edge and what a hand-built fixture had never
+    /// had.
+    fn reference(src: EntityId, dst: EntityId) -> Relation {
+        let mut relation = call(src, dst);
+        relation.kind = RelationKind::References;
+        relation
+    }
+
+    /// FIR-2642. A reference edge beside the raise must not undo the demotion.
+    ///
+    /// This is the defect a hand-built fixture could not see. The flag was
+    /// folded with `&&` across every edge, so whichever edge happened to create
+    /// the candidate set its starting value and one non-call edge arriving
+    /// first left it false forever. On a converted `psf/requests` that was
+    /// every exception class in `HTTPAdapter.send`'s fan-out: the demotion
+    /// never fired on the corpus it was written from, and inverting the whole
+    /// ranking signal changed the answer not at all, which is the definition of
+    /// a check that cannot fail.
+    #[test]
+    fn a_reference_edge_beside_the_raise_does_not_promote_a_throw_site() {
+        let graph = InMemoryGraph::new();
+        let focal = make_entity("Adapter.send", "pkg/adapters.py");
+        let ssl_error = exception_class("SSLError", "pkg/adapters.py");
+        let retryer = exception_class("Retryer", "pkg/adapters.py");
+        for entity in [&focal, &ssl_error, &retryer] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        // The reference edge is upserted FIRST, which is the order that made
+        // the fold answer wrong.
+        for relation in [
+            reference(focal.id, ssl_error.id),
+            raise_call(focal.id, ssl_error.id),
+            call(focal.id, retryer.id),
+        ] {
+            graph.upsert_relation(&relation).unwrap();
+        }
+        let (_t, binding) = empty_binding();
+
+        let response = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding),
+            &graph,
+            &TraceDataFlowRequest {
+                focal: focal.id.to_string(),
+                depth: Some(2),
+                direction: Some(TraceDirection::Calls),
+                limit_per_step: Some(1),
+                include_body: Some(false),
+                max_response_chars: None,
+                include_type_edges: None,
+            },
+        )
+        .unwrap();
+
+        let names = step_names(&response);
+        assert_eq!(
+            names.first().map(String::as_str),
+            Some("Retryer"),
+            "one slot, and it belongs to the class the focal constructs rather than the one it \
+             throws; a mention of the exception class is not a reason to promote a throw site. \
+             Got {names:?}"
+        );
+    }
+
+    /// FIR-2642, and the reason this whole signal was dead on real bytes. Every
+    /// resolved call on a repository with a language server reaches the graph
+    /// twice, once from the parser and once from the LSP call hierarchy, and
+    /// only the parser can see a `raise`. Letting the LSP edge vote made "every
+    /// call edge is a raise" false for every candidate, so the demotion never
+    /// once fired on the corpus it was written from and inverting the ranking
+    /// changed nothing.
+    ///
+    /// Measured on a converted `psf/requests`: `SSLError` arrived on
+    /// `[Inferred, raise_target_call]` and `[Lsp, lsp_call_hierarchy]`, one of
+    /// two, so the rule read false.
+    #[test]
+    fn a_language_server_edge_does_not_get_a_vote_on_what_a_raise_is() {
+        let graph = InMemoryGraph::new();
+        let focal = make_entity("Adapter.send", "pkg/adapters.py");
+        let ssl_error = exception_class("SSLError", "pkg/adapters.py");
+        let retryer = exception_class("Retryer", "pkg/adapters.py");
+        for entity in [&focal, &ssl_error, &retryer] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        for relation in [
+            raise_call(focal.id, ssl_error.id),
+            lsp_call(focal.id, ssl_error.id),
+            call(focal.id, retryer.id),
+            lsp_call(focal.id, retryer.id),
+        ] {
+            graph.upsert_relation(&relation).unwrap();
+        }
+        let (_t, binding) = empty_binding();
+
+        let response = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding),
+            &graph,
+            &TraceDataFlowRequest {
+                focal: focal.id.to_string(),
+                depth: Some(2),
+                direction: Some(TraceDirection::Calls),
+                limit_per_step: Some(1),
+                include_body: Some(false),
+                max_response_chars: None,
+                include_type_edges: None,
+            },
+        )
+        .unwrap();
+
+        let names = step_names(&response);
+        assert_eq!(
+            names.first().map(String::as_str),
+            Some("Retryer"),
+            "the one slot belongs to the class the focal constructs; an LSP edge that cannot see \
+             a `raise` must not vote the throw site back level with it. Got {names:?}"
+        );
+    }
+
+    /// The other direction, so the rule is about calls and not about counting
+    /// edges. A class the focal both raises AND constructs normally is on the
+    /// data path, and demoting it would cost the recall the marker exists to
+    /// protect.
+    #[test]
+    fn a_class_that_is_also_constructed_normally_is_not_a_throw_site() {
+        let graph = InMemoryGraph::new();
+        let focal = make_entity("Adapter.send", "pkg/adapters.py");
+        let both = exception_class("Retry", "pkg/adapters.py");
+        let elsewhere = make_entity("build_pool_key", "pkg/pool.py");
+        for entity in [&focal, &both, &elsewhere] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        for relation in [
+            raise_call(focal.id, both.id),
+            call(focal.id, both.id),
+            call(focal.id, elsewhere.id),
+        ] {
+            graph.upsert_relation(&relation).unwrap();
+        }
+        let (_t, binding) = empty_binding();
+
+        let response = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding),
+            &graph,
+            &TraceDataFlowRequest {
+                focal: focal.id.to_string(),
+                depth: Some(2),
+                direction: Some(TraceDirection::Calls),
+                limit_per_step: Some(1),
+                include_body: Some(false),
+                max_response_chars: None,
+                include_type_edges: None,
+            },
+        )
+        .unwrap();
+
+        let names = step_names(&response);
+        assert_eq!(
+            names.first().map(String::as_str),
+            Some("Retry"),
+            "same file beats another directory once the throw-site demotion no \
+             longer applies, and it must not apply to a class that is also \
+             called for its value. Got {names:?}"
+        );
+    }
+
+    #[test]
+    fn an_external_step_names_the_module_it_crosses_into() {
+        // Half two. `router.handle` reached through `require('router')` must
+        // say `router`, so a reader can tell an npm package from a builtin
+        // from a typo without leaving the tool.
+        let graph = InMemoryGraph::new();
+        let focal = make_entity("app.handle", "lib/application.js");
+        let external = make_external_entity("router.handle");
+        graph.upsert_entity(&focal).unwrap();
+        graph.upsert_entity(&external).unwrap();
+        let mut relation = call(focal.id, external.id);
+        relation.import_source = Some("router".to_string());
+        graph.upsert_relation(&relation).unwrap();
+        let (_t, binding) = empty_binding();
+
+        let response = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding),
+            &graph,
+            &TraceDataFlowRequest {
+                focal: focal.id.to_string(),
+                depth: Some(1),
+                direction: Some(TraceDirection::Calls),
+                limit_per_step: Some(8),
+                include_body: Some(false),
+                max_response_chars: None,
+                include_type_edges: None,
+            },
+        )
+        .unwrap();
+
+        let step = response
+            .chain
+            .iter()
+            .find(|s| s.entity.entity_name == "router.handle")
+            .expect("the external step is in the chain");
+        assert!(step.entity.external, "the fixture's premise");
+        let crossing = step
+            .entity
+            .crossing
+            .as_ref()
+            .expect("an external record must carry a crossing, known or not");
+        assert_eq!(
+            crossing.specifier.as_deref(),
+            Some("router"),
+            "the graph holds the specifier the importing file named, so the \
+             answer must say it rather than emit a bare external symbol"
+        );
+    }
+
+    #[test]
+    fn an_external_step_the_graph_cannot_place_says_so_rather_than_going_quiet() {
+        // The disclosure half, and the one that matters more. With import
+        // edges absent the graph genuinely does not know what is on the other
+        // side. Saying nothing reads as an in-repo symbol; saying "unknown"
+        // reads as a boundary, which is the truth.
+        let graph = InMemoryGraph::new();
+        let focal = make_entity("app.handle", "lib/application.js");
+        let external = make_external_entity("router.handle");
+        graph.upsert_entity(&focal).unwrap();
+        graph.upsert_entity(&external).unwrap();
+        graph.upsert_relation(&call(focal.id, external.id)).unwrap();
+        let (_t, binding) = empty_binding();
+
+        let response = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding),
+            &graph,
+            &TraceDataFlowRequest {
+                focal: focal.id.to_string(),
+                depth: Some(1),
+                direction: Some(TraceDirection::Calls),
+                limit_per_step: Some(8),
+                include_body: Some(false),
+                max_response_chars: None,
+                include_type_edges: None,
+            },
+        )
+        .unwrap();
+
+        let step = response
+            .chain
+            .iter()
+            .find(|s| s.entity.entity_name == "router.handle")
+            .expect("the external step is in the chain");
+        let crossing = step
+            .entity
+            .crossing
+            .as_ref()
+            .expect("an external record carries a crossing even when unknown");
+        assert_eq!(
+            crossing.specifier, None,
+            "the graph holds no specifier here, so inventing one would be worse \
+             than the silence it replaces"
+        );
+        assert_eq!(
+            crossing.status, "unknown",
+            "and the record must say the boundary is unplaced rather than \
+             leave a bare symbol that reads like an in-repo entity"
+        );
+    }
+
+    #[test]
+    fn an_in_repo_step_carries_no_crossing_at_all() {
+        // The bound. A crossing on a step the repository owns would be a
+        // boundary that is not there, and every reader would learn to ignore
+        // the field.
+        let graph = InMemoryGraph::new();
+        let focal = make_entity("app.handle", "lib/application.js");
+        let local = make_entity("app.route", "lib/application.js");
+        graph.upsert_entity(&focal).unwrap();
+        graph.upsert_entity(&local).unwrap();
+        graph.upsert_relation(&call(focal.id, local.id)).unwrap();
+        let (_t, binding) = empty_binding();
+
+        let response = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding),
+            &graph,
+            &TraceDataFlowRequest {
+                focal: focal.id.to_string(),
+                depth: Some(1),
+                direction: Some(TraceDirection::Calls),
+                limit_per_step: Some(8),
+                include_body: Some(false),
+                max_response_chars: None,
+                include_type_edges: None,
+            },
+        )
+        .unwrap();
+
+        let step = response
+            .chain
+            .iter()
+            .find(|s| s.entity.entity_name == "app.route")
+            .expect("the local step is in the chain");
+        assert!(!step.entity.external, "the fixture's premise");
+        assert!(
+            step.entity.crossing.is_none(),
+            "a step the repository owns crosses nothing"
+        );
     }
 }

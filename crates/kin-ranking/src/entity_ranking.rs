@@ -496,6 +496,7 @@ pub type TraceFanoutScore = (
     bool,
     bool,
     usize,
+    bool,
     u32,
     std::cmp::Reverse<usize>,
 );
@@ -512,8 +513,33 @@ pub type TraceFanoutScore = (
 /// 4. declared in the same FILE as the node being expanded
 /// 5. declared in the same DIRECTORY as it
 /// 6. declaration kind rank (functions and methods over constants)
-/// 7. the edge's own confidence
-/// 8. shorter name, which only ever breaks a tie the seven signals above left
+/// 7. NOT a `raise` target (see below)
+/// 8. the edge's own confidence
+/// 9. shorter name, which only ever breaks a tie the eight signals above left
+///
+/// The raise-target signal sits BELOW declaration kind, where it separates two
+/// otherwise equal candidates and can never evict one in favour of a candidate
+/// of a different kind. That position is measured, not assumed, and the
+/// measurement is the point.
+///
+/// Ranking it second, above locality and kind, is the obvious reading of "a
+/// throw site is not a hop" and it makes the tool's answer WORSE. At a fixed
+/// `limit_per_step`, demoting a candidate promotes whatever ranked next, and on
+/// a converted `psf/requests` what ranked next was `HTTPAdapter` itself,
+/// `Response` and `RequestEncodingMixin._encode_params`. Those are hubs. Six
+/// cheap terminal exception classes came out of `HTTPAdapter.send`'s twelve
+/// depth-1 slots and six expensive ones went in, the walk grew from 129
+/// discovered steps to its 200-step ceiling, and the hop that carries the
+/// answer, `_urllib3_request_context` at depth 3, stopped arriving at the
+/// default budget. Below kind it does not move at all: the walk stays at 129,
+/// the hop comes back, and `SSLError` is still in the answer, still last.
+///
+/// `declaration_kind_rank` is what actually delivers "data flow above throw
+/// sites" on real bytes, because exception classes are Classes and the callees
+/// that carry a value are Functions and Methods. This signal orders throw sites
+/// among their own kind, which is all a fan-out cap ever needed from it. It
+/// demotes rather than filters either way, because "what does this throw" is a
+/// real question and the edge is real evidence.
 ///
 /// `parent_file` and `parent_dir` describe the node whose fan-out is being cut,
 /// not the focal: locality is what makes a chain readable, and at depth 3 the
@@ -527,6 +553,7 @@ pub fn trace_fanout_score(
     parent_file: Option<&str>,
     parent_dir: Option<&str>,
     confidence: f32,
+    raise_target: bool,
 ) -> TraceFanoutScore {
     let same_file = parent_file
         .zip(entity.file_origin.as_ref())
@@ -547,6 +574,7 @@ pub fn trace_fanout_score(
         same_file,
         same_dir,
         declaration_kind_rank(&entity.kind),
+        !raise_target,
         confidence,
         std::cmp::Reverse(entity.name.len()),
     )
@@ -816,13 +844,77 @@ mod tests {
     }
 
     fn score(entity: &Entity) -> TraceFanoutScore {
+        scored(entity, false)
+    }
+
+    /// The same key with the raise-target signal set, so the tests below can
+    /// compare a throw site against the hop it used to outrank.
+    fn scored(entity: &Entity, raise_target: bool) -> TraceFanoutScore {
         trace_fanout_score(
             entity,
             RelationKind::Calls,
             Some("src/requests/sessions.py"),
             Some("src/requests"),
             1.0,
+            raise_target,
         )
+    }
+
+    #[test]
+    fn a_raise_target_loses_to_an_equal_candidate_that_is_not_one() {
+        // FIR-2642. The comparison this signal decides, and the only one it is
+        // allowed to decide: two candidates alike in every other term, one of
+        // them only ever thrown.
+        let thrown = fanout_entity("SSLError", Some("src/requests/sessions.py"));
+        let ordinary = fanout_entity("SSLError2", Some("src/requests/sessions.py"));
+        assert!(
+            scored(&ordinary, false) > scored(&thrown, true),
+            "the candidate that is not a throw site wins"
+        );
+        assert!(
+            scored(&thrown, false) > scored(&ordinary, false),
+            "the fixture's premise: with neither marked, the shorter name wins, \
+             so the signal is what reverses them rather than a tie"
+        );
+    }
+
+    #[test]
+    fn a_raise_target_never_outranks_a_hop_of_a_stronger_kind() {
+        // And the term it must NOT override. Ranking a raise target below a
+        // whole declaration kind was measured on a converted psf/requests and
+        // cost the answer: it evicted six cheap exception classes from the
+        // depth-1 cap and admitted six hubs, the walk grew from 129 steps to
+        // its 200-step ceiling, and the hop at depth 3 stopped arriving.
+        let mut hop = fanout_entity("build_pool_key", Some("src/requests/sessions.py"));
+        hop.kind = EntityKind::Function;
+        let mut thrown = fanout_entity("SSLError", Some("src/requests/sessions.py"));
+        thrown.kind = EntityKind::Class;
+        assert!(
+            scored(&hop, false) > scored(&thrown, true),
+            "a function the value travels through outranks a class that is \
+             only thrown"
+        );
+        let mut other_class = fanout_entity("HTTPAdapter", Some("src/requests/sessions.py"));
+        other_class.kind = EntityKind::Class;
+        assert!(
+            scored(&hop, false) > scored(&other_class, false),
+            "and it outranks an ordinary class too, which is what stops the \
+             raise signal from promoting a hub into a slot a throw site held"
+        );
+    }
+
+    #[test]
+    fn demoting_a_raise_target_orders_it_and_never_removes_it() {
+        // The recall half, at the level the ordering is defined. Two throw
+        // sites still compare against each other by every signal below, so a
+        // step wide enough to hold them reports them in a stable order rather
+        // than collapsing them.
+        let first = fanout_entity("SSLError", Some("src/requests/sessions.py"));
+        let second = fanout_entity("InvalidURL", Some("src/other/exceptions.py"));
+        assert!(
+            scored(&first, true) > scored(&second, true),
+            "same-file still decides between two throw sites"
+        );
     }
 
     #[test]
@@ -860,6 +952,7 @@ mod tests {
             Some("src/requests/sessions.py"),
             Some("src/requests"),
             1.0,
+            false,
         );
         let referenced = trace_fanout_score(
             &entity,
@@ -867,6 +960,7 @@ mod tests {
             Some("src/requests/sessions.py"),
             Some("src/requests"),
             1.0,
+            false,
         );
         assert!(called > referenced);
     }
@@ -880,6 +974,7 @@ mod tests {
             Some("src/requests/sessions.py"),
             Some("src/requests"),
             1.0,
+            false,
         );
         let guessed = trace_fanout_score(
             &entity,
@@ -887,6 +982,7 @@ mod tests {
             Some("src/requests/sessions.py"),
             Some("src/requests"),
             0.4,
+            false,
         );
         assert!(certain > guessed);
     }
