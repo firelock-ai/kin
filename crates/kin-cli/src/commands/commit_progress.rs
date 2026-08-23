@@ -432,6 +432,7 @@ mod tests {
     fn evidence(limit_bytes: u64, oom_kills: Option<u64>) -> crate::capability::MemoryEvidence {
         crate::capability::MemoryEvidence {
             limit_bytes,
+            limit_source: crate::capability::MemoryLimitSource::HostRam,
             cgroup_oom_kills: oom_kills,
         }
     }
