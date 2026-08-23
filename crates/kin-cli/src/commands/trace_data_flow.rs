@@ -938,7 +938,8 @@ pub fn build_trace_data_flow_response_within(
                         // `raise` and also by an ordinary call is on the data
                         // path, and a boundary one edge can name stays named
                         // when a weaker anonymous edge arrives beside it.
-                        candidate.call_edges += usize::from(rel.kind == RelationKind::Calls);
+                        candidate.call_edges +=
+                            usize::from(kin_index::is_raise_classifiable_call_edge(rel));
                         candidate.raise_call_edges +=
                             usize::from(kin_index::is_raise_target_edge(rel));
                         if candidate
@@ -964,7 +965,9 @@ pub fn build_trace_data_flow_response_within(
                         candidate_index.insert((next_id, role), candidates.len());
                         let crossing = kin_index::trace_crossing_for(&entity, Some(rel));
                         candidates.push(FanoutCandidate {
-                            call_edges: usize::from(rel.kind == RelationKind::Calls),
+                            call_edges: usize::from(kin_index::is_raise_classifiable_call_edge(
+                                rel,
+                            )),
                             raise_call_edges: usize::from(kin_index::is_raise_target_edge(rel)),
                             entity,
                             role,
@@ -1444,6 +1447,11 @@ struct FanoutCandidate {
 
 impl FanoutCandidate {
     /// Whether this candidate is only ever thrown, never called for its value.
+    ///
+    /// Only parse-authored call edges vote. An LSP call-hierarchy edge cannot
+    /// see a `raise`, so its silence is not a claim that the call was ordinary,
+    /// and counting it made this answer `false` for every candidate on any
+    /// repository with a language server installed.
     fn is_raise_target(&self) -> bool {
         self.call_edges > 0 && self.raise_call_edges == self.call_edges
     }
@@ -3763,6 +3771,19 @@ mod boundary_and_ranking_tests {
         relation
     }
 
+    /// The second call edge a repository with a language server carries for
+    /// every resolved call: it says the call exists and nothing about the
+    /// syntax, because an LSP call hierarchy cannot see a `raise`.
+    fn lsp_call(src: EntityId, dst: EntityId) -> Relation {
+        let mut relation = call(src, dst);
+        relation.origin = RelationOrigin::Lsp;
+        relation.evidence = vec![RelationEvidence {
+            parser_rule: Some("lsp_call_hierarchy".to_string()),
+            ..RelationEvidence::default()
+        }];
+        relation
+    }
+
     fn exception_class(name: &str, file: &str) -> Entity {
         let mut entity = make_entity(name, file);
         entity.kind = EntityKind::Class;
@@ -3928,6 +3949,59 @@ mod boundary_and_ranking_tests {
             "one slot, and it belongs to the hop the value travels along; a \
              mention of the exception class is not a reason to promote a throw \
              site. Got {names:?}"
+        );
+    }
+
+    /// FIR-2642, and the reason this whole signal was dead on real bytes. Every
+    /// resolved call on a repository with a language server reaches the graph
+    /// twice, once from the parser and once from the LSP call hierarchy, and
+    /// only the parser can see a `raise`. Letting the LSP edge vote made "every
+    /// call edge is a raise" false for every candidate, so the demotion never
+    /// once fired on the corpus it was written from and inverting the ranking
+    /// changed nothing.
+    ///
+    /// Measured on a converted `psf/requests`: `SSLError` arrived on
+    /// `[Inferred, raise_target_call]` and `[Lsp, lsp_call_hierarchy]`, one of
+    /// two, so the rule read false.
+    #[test]
+    fn a_language_server_edge_does_not_get_a_vote_on_what_a_raise_is() {
+        let graph = InMemoryGraph::new();
+        let focal = make_entity("Adapter.send", "pkg/adapters.py");
+        let ssl_error = exception_class("SSLError", "pkg/adapters.py");
+        let pool_key = make_entity("build_pool_key", "pkg/pool.py");
+        for entity in [&focal, &ssl_error, &pool_key] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        for relation in [
+            raise_call(focal.id, ssl_error.id),
+            lsp_call(focal.id, ssl_error.id),
+            call(focal.id, pool_key.id),
+            lsp_call(focal.id, pool_key.id),
+        ] {
+            graph.upsert_relation(&relation).unwrap();
+        }
+        let (_t, binding) = empty_binding();
+
+        let response = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding),
+            &graph,
+            &TraceDataFlowRequest {
+                focal: focal.id.to_string(),
+                depth: Some(2),
+                direction: Some(TraceDirection::Calls),
+                limit_per_step: Some(1),
+                include_body: Some(false),
+                max_response_chars: None,
+                include_type_edges: None,
+            },
+        )
+        .unwrap();
+
+        let names = step_names(&response);
+        assert_eq!(
+            names.first().map(String::as_str),
+            Some("build_pool_key"),
+            "the one slot belongs to the hop the value travels along; an LSP              edge that cannot see a `raise` must not vote the throw site back              onto the data path. Got {names:?}"
         );
     }
 

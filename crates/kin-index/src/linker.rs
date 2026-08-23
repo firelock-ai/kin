@@ -3978,6 +3978,23 @@ pub struct TraceCrossing {
     pub note: String,
 }
 
+/// Whether this call edge came from a parse, so its silence about `raise` is
+/// evidence rather than ignorance.
+///
+/// A resolved call reaches the graph twice on a repository with a language
+/// server: once from the parser, carrying the syntax it read, and once from the
+/// LSP call hierarchy, carrying only that the call exists. Only the parser can
+/// see a `raise`, so an LSP edge that does not mark one is not saying the call
+/// was ordinary; it is saying nothing at all, and letting it vote made the
+/// raise demotion structurally impossible on any repository with a language
+/// server installed. Measured on a converted `psf/requests`: every neighbour of
+/// `HTTPAdapter.send` arrived on two call edges, one `Parsed` or `Inferred` and
+/// one `Lsp`, so "every call edge is a raise" was false for `SSLError` even
+/// though the only edge that could classify it said `raise_target_call`.
+pub fn is_raise_classifiable_call_edge(rel: &Relation) -> bool {
+    rel.kind == RelationKind::Calls && !matches!(rel.origin, RelationOrigin::Lsp)
+}
+
 /// Whether this edge is a call the parser read as the operand of a `raise`.
 ///
 /// Reads the marker the linker persisted on the edge's own evidence, so a

@@ -3377,6 +3377,11 @@ struct TraceFanoutCandidate {
 
 impl TraceFanoutCandidate {
     /// Whether this candidate is only ever thrown, never called for its value.
+    ///
+    /// Only parse-authored call edges vote. An LSP call-hierarchy edge cannot
+    /// see a `raise`, so its silence is not a claim that the call was ordinary,
+    /// and counting it made this answer `false` for every candidate on any
+    /// repository with a language server installed.
     fn is_raise_target(&self) -> bool {
         self.call_edges > 0 && self.raise_call_edges == self.call_edges
     }
@@ -3869,7 +3874,8 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                         }
                         // Accumulated across every edge, not moved with the
                         // strongest one; mirrors the CLI arm exactly.
-                        candidate.call_edges += usize::from(rel.kind == RelationKind::Calls);
+                        candidate.call_edges +=
+                            usize::from(kin_index::is_raise_classifiable_call_edge(rel));
                         candidate.raise_call_edges +=
                             usize::from(kin_index::is_raise_target_edge(rel));
                         if candidate
@@ -3893,7 +3899,9 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                         candidate_index.insert((next_id, role), candidates.len());
                         let crossing = kin_index::trace_crossing_for(&entity, Some(rel));
                         candidates.push(TraceFanoutCandidate {
-                            call_edges: usize::from(rel.kind == RelationKind::Calls),
+                            call_edges: usize::from(kin_index::is_raise_classifiable_call_edge(
+                                rel,
+                            )),
                             raise_call_edges: usize::from(kin_index::is_raise_target_edge(rel)),
                             entity,
                             role,
