@@ -215,6 +215,33 @@ class Suite(object):
             self.fixtures[name] = path
         return self.fixtures[name]
 
+    def stop_daemon(self, repo):
+        """Stop one fixture's daemon so the next call spawns a fresh one.
+
+        A daemon captures its environment at process start from whatever
+        command spawned it, so an env lever set on a later `kin mcp start` never
+        reaches a daemon that is already running. Check 18 learned that the
+        expensive way: its forced-contention call answered normally because the
+        control call before it had already started the daemon without the lever.
+        """
+        pid_file = os.path.join(repo, ".kin", "daemon.pid")
+        if not os.path.exists(pid_file):
+            return False
+        try:
+            with open(pid_file) as handle:
+                pid = int(handle.read().strip())
+            os.kill(pid, 15)
+        except (ValueError, OSError):
+            return False
+        # The next call spawns its own; this only has to be gone before it does.
+        for _ in range(50):
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                return True
+            time.sleep(0.1)
+        return True
+
     def shutdown(self):
         """Stop the per-fixture daemons this run started.
 
@@ -2468,12 +2495,16 @@ def check_18(suite):
 
     contended = dict(suite.env)
     contended["KIN_XREF_FORCE_CONTENTION"] = "1"
+    # The lever reaches the daemon only if the daemon is started with it, so
+    # every call below stops the fixture's daemon first and lets the next one
+    # spawn carrying the environment that call needs.
 
     graded = 0
     for tool, args in XREF_SURFACES:
         # The control first: uncontended, this call answers. Without it a build
         # that refused everything would pass the rule below for the wrong
         # reason, and the fixture would sit on one side of the branch.
+        suite.stop_daemon(repo)
         try:
             suite.mcp(repo, tool, args)
         except McpError as exc:
@@ -2481,6 +2512,7 @@ def check_18(suite):
                         % (tool, exc))
             return res
 
+        suite.stop_daemon(repo)
         try:
             payload = suite.mcp(repo, tool, args, env=contended)
         except McpError as exc:
