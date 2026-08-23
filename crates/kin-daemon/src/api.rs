@@ -24286,6 +24286,111 @@ mod tests {
             .unwrap_or_else(|error| panic!("status is not a valid report: {error}: {result:?}"))
     }
 
+    // ── FIR-2633: an exhausted reference read refuses actionably ────────
+
+    /// The three reference surfaces this loop serves, spelled as the refusal
+    /// spells them, so a surface added later without a refusal is a test that
+    /// grades nothing rather than a silent gap.
+    const XREF_SURFACES: [&str; 3] = ["command xref", "find_references", "bulk_check_references"];
+
+    /// The defect itself. Every one of these answered "retry" only after
+    /// exhausting its own retry budget, so the single thing it told the caller
+    /// to do was the thing it had just finished doing and failing at.
+    /// dg-baseline measured it failing 0 for 8 that way.
+    #[test]
+    fn an_exhausted_reference_read_never_tells_the_caller_to_retry() {
+        for blocked in [
+            XrefBlocked::AuthorityEpochUnavailable,
+            XrefBlocked::SelectedGraphChanging,
+        ] {
+            for surface in XREF_SURFACES {
+                let refusal = blocked.refusal(surface, XREF_STABLE_READ_ATTEMPTS);
+                let lowered = refusal.to_lowercase();
+                assert!(
+                    !lowered.contains("retry") && !lowered.contains("try again"),
+                    "{surface} still instructs the caller to redo the retries it just spent: \
+                     {refusal}"
+                );
+            }
+        }
+    }
+
+    /// What the refusal owes a caller instead: the surface, the budget it
+    /// actually spent, the state that blocked it, and the condition that
+    /// changes the outcome.
+    #[test]
+    fn an_exhausted_reference_read_names_what_it_tried_and_what_would_change_it() {
+        for blocked in [
+            XrefBlocked::AuthorityEpochUnavailable,
+            XrefBlocked::SelectedGraphChanging,
+        ] {
+            for surface in XREF_SURFACES {
+                let refusal = blocked.refusal(surface, XREF_STABLE_READ_ATTEMPTS);
+                assert!(refusal.starts_with(surface), "{refusal}");
+                assert!(
+                    refusal.contains(&format!("{XREF_STABLE_READ_ATTEMPTS} attempts")),
+                    "the refusal must say how many attempts it spent: {refusal}"
+                );
+                assert!(
+                    refusal.contains(blocked.state_sentence()),
+                    "the refusal must name the blocking state: {refusal}"
+                );
+                assert!(
+                    refusal.contains(blocked.what_would_change_it()),
+                    "the refusal must name the condition that clears it: {refusal}"
+                );
+                // Arm 3 alone: these surfaces never replay a stale set, and the
+                // refusal says so rather than leaving a caller to wonder whether
+                // an older answer was available and withheld.
+                assert!(
+                    refusal.contains("as of an earlier instant"),
+                    "the refusal must say why no stale answer is offered: {refusal}"
+                );
+            }
+        }
+    }
+
+    /// The blocked state has to be worth carrying. If both variants rendered
+    /// the same sentence the tracking would be decorative, every fixture would
+    /// sit on one side of it, and a loop that reported the wrong cause would
+    /// pass every test above.
+    #[test]
+    fn the_two_blocking_states_are_told_apart_in_the_answer() {
+        let epoch = XrefBlocked::AuthorityEpochUnavailable;
+        let churn = XrefBlocked::SelectedGraphChanging;
+        assert_ne!(epoch.state_sentence(), churn.state_sentence());
+        assert_ne!(epoch.what_would_change_it(), churn.what_would_change_it());
+        assert_ne!(
+            epoch.refusal("find_references", XREF_STABLE_READ_ATTEMPTS),
+            churn.refusal("find_references", XREF_STABLE_READ_ATTEMPTS)
+        );
+        for blocked in [epoch, churn] {
+            assert!(!blocked.state_sentence().is_empty());
+            assert!(!blocked.what_would_change_it().is_empty());
+        }
+    }
+
+    /// The budget is spent in time, not merely in iterations. Before FIR-2633
+    /// the loop `continue`d with no wait, so three attempts burned in
+    /// microseconds against a writer that needs milliseconds, and the surface
+    /// failed every time rather than intermittently.
+    #[tokio::test]
+    async fn a_contended_reference_read_waits_between_its_attempts() {
+        let started = std::time::Instant::now();
+        for attempt in 0..XREF_STABLE_READ_ATTEMPTS {
+            xref_attempt_backoff(attempt).await;
+        }
+        let waited = started.elapsed();
+        // 25 ms then 50 ms, and nothing after the final attempt, which the loop
+        // exits immediately anyway. Asserted as a floor rather than a window so
+        // a loaded CI box cannot fail it for being slow.
+        let floor = XREF_ATTEMPT_BACKOFF * 3;
+        assert!(
+            waited >= floor,
+            "the budget has to cost the writer real time: waited {waited:?}, floor {floor:?}"
+        );
+    }
+
     /// FIR-2135: a status call that cannot take a live sample answers with the
     /// last settled reading of the same graph, labelled as of that instant,
     /// rather than refusing. The health-reporting tool must be able to report
@@ -29752,7 +29857,25 @@ mod tests {
         .await
         .expect_err("an orphaned session graph must never be certified");
         assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(error.1.contains("changed repeatedly"));
+        // The refusal is the contract, not the wording. It used to read
+        // "changed repeatedly during command xref; retry", which told the
+        // caller to redo the retries this loop had just spent (FIR-2633).
+        assert!(error.1.starts_with("command xref"), "{}", error.1);
+        assert!(
+            error.1.contains(&format!("{XREF_STABLE_READ_ATTEMPTS} attempts")),
+            "{}",
+            error.1
+        );
+        assert!(
+            !error.1.to_lowercase().contains("retry"),
+            "an exhausted read must not prescribe the retrying it just spent: {}",
+            error.1
+        );
+        assert!(
+            error.1.contains("succeeds once"),
+            "the refusal must name the condition that clears it: {}",
+            error.1
+        );
     }
 
     /// Fail-loud contract: when a spine endpoint IS configured but the daemon
