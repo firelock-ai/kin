@@ -140,8 +140,26 @@ impl ReferencedDestinations {
 pub struct CrossFilePass {
     /// Cross-file relations, entity-level and artifact-level, that the pass
     /// resolved. Entity-level relations here always cross a file boundary;
-    /// same-file relations stay the pipeline's business.
+    /// same-file relations travel in [`CrossFilePass::same_file`].
     pub resolved: Vec<Relation>,
+    /// Entity-level relations the pass resolved whose endpoints are both in a
+    /// file it resolved.
+    ///
+    /// These were discarded, on the ground that the pipeline's own per-file
+    /// resolution already carries them. It does not carry all of them.
+    /// `Overrides` has exactly one producer, `kin_index::linker`, and its
+    /// base-class walk resolves a same-file base first, so a class that
+    /// overrides a base declared beside it produces an edge only this linker
+    /// derives. Dropping it here left the reconciler holding a parser-derived
+    /// edge with both endpoints in the file that this pass had not re-derived,
+    /// which is precisely the `parser_authoritative` retire condition, so a
+    /// comment-only edit deleted it (FIR-2644).
+    ///
+    /// Kept separate from `resolved` rather than merged into it because the
+    /// caller reconciles the two against different evidence: a cross-file edge
+    /// is retired on the source file's own text, while a same-file edge is
+    /// governed by the pipeline's per-file authority.
+    pub same_file: Vec<Relation>,
     /// Artifact-level import and include edges the current source of every
     /// file in this pass declares. The complete set for those files, so a
     /// caller that can read an artifact node's existing relations can retire
@@ -422,6 +440,7 @@ impl LiveCrossFileLinker {
         let batched_paths: HashSet<String> = batch.iter().map(|f| f.file_path.clone()).collect();
 
         let mut resolved = Vec::new();
+        let mut same_file: Vec<Relation> = Vec::new();
         let mut artifact_imports: Vec<Relation> = Vec::new();
         for relation in relations {
             match (relation.src, relation.dst) {
@@ -440,14 +459,12 @@ impl LiveCrossFileLinker {
                     let Some(src_file) = self.file_by_entity.get(&src) else {
                         continue;
                     };
-                    // Only edges sourced by a file this pass resolved, and only
-                    // when they actually leave that file: same-file relations
-                    // are already carried by the pipeline's own resolution and
-                    // adding them here would duplicate a delta key.
+                    // Only edges sourced by a file this pass resolved.
                     if !batched_paths.contains(src_file) {
                         continue;
                     }
                     if self.file_by_entity.get(&dst) == Some(src_file) {
+                        same_file.push(relation);
                         continue;
                     }
                     resolved.push(relation);
@@ -488,6 +505,7 @@ impl LiveCrossFileLinker {
 
         CrossFilePass {
             resolved,
+            same_file,
             artifact_imports,
             source_artifacts,
             referenced,

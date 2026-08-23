@@ -24,6 +24,124 @@ use crate::cross_file::LiveCrossFileLinker;
 use crate::error::{ReconcileError, Result};
 use crate::lkg::LkgStore;
 
+/// Whether a relation is one a parse pass could have produced.
+///
+/// The retire rules and the identity-matching below both turn on it, so they
+/// cannot disagree about which edges this pass speaks for.
+fn is_parser_derived(relation: &Relation) -> bool {
+    matches!(
+        relation.origin,
+        kin_model::RelationOrigin::Parsed | kin_model::RelationOrigin::Inferred
+    )
+}
+
+/// The existing relation a freshly derived parser edge keeps the identity of.
+///
+/// One logical edge can be held twice under one `(src, dst, kind)` key with two
+/// ids: the parser's, and the language server's, which `kin-lsp` derives from
+/// the same triple through its own namespace. Taking the lowest id of the
+/// bucket therefore bound a re-derived parser payload onto whichever of the two
+/// happened to sort first, and when that was the language-server edge, the
+/// parser edge went unmatched and survived carrying its pre-edit span. A
+/// comment-only commit then reported one call site at two lines, the stale one
+/// stamped complete (FIR-2644).
+///
+/// So a parser edge only ever takes a parser-derived identity. When the bucket
+/// holds none, the edge is new here even though the key is not: an enrichment
+/// edge is a different fact from the parse that agrees with it, and overwriting
+/// one with the other destroys the stronger of the two.
+fn parser_identity_to_keep(bucket: Option<&Vec<Relation>>) -> Option<&Relation> {
+    bucket?.iter().find(|relation| is_parser_derived(relation))
+}
+
+/// One entity's declaration position before and after this pass.
+type SpanMove = (kin_model::SourceSpan, kin_model::SourceSpan);
+
+/// Re-anchor one evidence span through the declaration that contains it.
+///
+/// A relation this pass preserves rather than re-derives keeps the span the
+/// resolver that minted it recorded, and a line-shifting edit above it makes
+/// that span name a line the call is no longer on. Language-server edges are
+/// the whole of this class in practice: nothing re-derives them on the reconcile
+/// path, they are deliberately never retired here, and `find_references` reports
+/// their spans as reference lines. The rc0550 run read one call site at two
+/// lines because of it, the stale one stamped complete (FIR-2644).
+///
+/// Placement is proven, never guessed. The span is placed through the innermost
+/// declaration whose PRE-EDIT lines contain it, and only when that declaration
+/// merely moved: an equal line extent before and after is what makes the shift a
+/// translation rather than a rewrite whose interior moved by some other amount.
+/// Anything else returns `None`, which the caller turns into an absent span, so
+/// the surface reports `no_evidence_span` instead of a line that may not carry
+/// the call.
+///
+/// Columns are carried through unchanged, and bytes are shifted only when both
+/// the declaration and the span carry real byte offsets: `kin-lsp` records a
+/// position with zero bytes, and adding a delta to those would invent an offset.
+fn reanchor_evidence_span(
+    span: &kin_model::SourceSpan,
+    moves: &[SpanMove],
+) -> Option<kin_model::SourceSpan> {
+    let (old, new) = moves
+        .iter()
+        .filter(|(old, _)| {
+            old.file == span.file
+                && old.start_line <= span.start_line
+                && span.end_line <= old.end_line
+        })
+        .min_by_key(|(old, _)| old.end_line.saturating_sub(old.start_line))?;
+    if old.end_line.saturating_sub(old.start_line) != new.end_line.saturating_sub(new.start_line) {
+        return None;
+    }
+    let line_delta = i64::from(new.start_line) - i64::from(old.start_line);
+    let start_line = u32::try_from(i64::from(span.start_line) + line_delta).ok()?;
+    let end_line = u32::try_from(i64::from(span.end_line) + line_delta).ok()?;
+    let shift_bytes = old.end_byte > old.start_byte && (span.start_byte > 0 || span.end_byte > 0);
+    let byte_delta = new.start_byte as i64 - old.start_byte as i64;
+    let (start_byte, end_byte) = if shift_bytes {
+        (
+            usize::try_from(span.start_byte as i64 + byte_delta).ok()?,
+            usize::try_from(span.end_byte as i64 + byte_delta).ok()?,
+        )
+    } else {
+        (span.start_byte, span.end_byte)
+    };
+    Some(kin_model::SourceSpan {
+        file: span.file.clone(),
+        start_byte,
+        end_byte,
+        start_line,
+        start_col: span.start_col,
+        end_line,
+        end_col: span.end_col,
+    })
+}
+
+/// The same relation with every evidence span that points into `file` placed
+/// where this pass moved it, or `None` when nothing changed.
+fn relation_with_reanchored_evidence(
+    relation: &Relation,
+    file: &FilePathId,
+    moves: &[SpanMove],
+) -> Option<Relation> {
+    let mut updated = relation.clone();
+    let mut changed = false;
+    for evidence in &mut updated.evidence {
+        let Some(span) = evidence.source_span.as_ref() else {
+            continue;
+        };
+        if &span.file != file {
+            continue;
+        }
+        let placed = reanchor_evidence_span(span, moves);
+        if placed.as_ref() != evidence.source_span.as_ref() {
+            evidence.source_span = placed;
+            changed = true;
+        }
+    }
+    changed.then_some(updated)
+}
+
 /// Outcome of reconciling a single file change.
 #[derive(Debug)]
 pub enum ReconcileOutcome {
@@ -614,6 +732,10 @@ impl Reconciler {
         let mut modified = Vec::new();
         let mut removed = Vec::new();
         let mut stable_entity_ids = HashMap::new();
+        // Where each declaration this pass matched sat before and after, which
+        // is what lets a preserved relation's evidence be re-anchored rather
+        // than left naming a pre-edit line.
+        let mut entity_span_moves: Vec<SpanMove> = Vec::new();
         let mut delta = TransactionDelta::default();
         let blob_hash = serde_json::Value::String(indexed.blob_hash.to_string());
 
@@ -698,6 +820,9 @@ impl Reconciler {
                         .extra
                         .insert("blob_hash".into(), blob_hash.clone());
                     stable_entity_ids.insert(new_entity.id, old.id);
+                    if let (Some(was), Some(now)) = (old.span.as_ref(), updated.span.as_ref()) {
+                        entity_span_moves.push((was.clone(), now.clone()));
+                    }
 
                     // Compare the complete enrichment payload, not only the AST
                     // fingerprint. Span and blob provenance must advance even for
@@ -877,10 +1002,7 @@ impl Reconciler {
             stable_relation.src = stable_src;
             stable_relation.dst = stable_dst;
 
-            if let Some(old) = existing_relations
-                .get(&key)
-                .and_then(|relations| relations.first())
-            {
+            if let Some(old) = parser_identity_to_keep(existing_relations.get(&key)) {
                 matched_relation_ids.insert(old.id);
                 stable_relation.id = old.id;
                 stable_relation.created_in = old.created_in;
@@ -897,12 +1019,24 @@ impl Reconciler {
             }
         }
 
-        // Cross-file relations the incremental linker resolved, for this file
-        // and for any file it just unblocked. Same identity and matching rules
-        // as the parsed set above, with one difference: a key the parsed set
-        // already carries is skipped rather than rejected, because a same-file
-        // relation reaching both resolvers is agreement rather than a parser
-        // fault.
+        // Relations the incremental linker resolved, for this file and for any
+        // file it just unblocked. Same identity and matching rules as the
+        // parsed set above, with one difference: a key the parsed set already
+        // carries is skipped rather than rejected, because a relation reaching
+        // both resolvers is agreement rather than a parser fault.
+        //
+        // Both buckets are folded, the edges that leave the file and the ones
+        // that stay inside it. The same-file half used to be dropped by the
+        // linker pass on the ground that the pipeline's own per-file resolution
+        // already carried it, and for `Calls` it does. It does not for
+        // `Overrides`: `kin_index::linker` is the only producer of that kind,
+        // and its base-class walk resolves a same-file base first, so a class
+        // overriding a base declared beside it yields an edge this pass alone
+        // can re-derive. Dropping it left the retire loop below looking at a
+        // parser-derived edge with both endpoints in the file that this pass
+        // had not produced, which is the `parser_authoritative` condition
+        // exactly, so a comment-only edit deleted it and `find_references` lost
+        // the caller it composed through that override (FIR-2644).
         //
         // Every endpoint is checked against graph truth first. The linker's
         // universe is in-memory and the graph is the authority, and the two can
@@ -916,7 +1050,11 @@ impl Reconciler {
             stable_entity_ids.values().any(|stable| *stable == id)
                 || matches!(graph.get_entity(&id), Ok(Some(_)))
         };
-        for relation in &cross_file.resolved {
+        for relation in cross_file
+            .resolved
+            .iter()
+            .chain(cross_file.same_file.iter())
+        {
             let endpoints_admitted =
                 [relation.src, relation.dst]
                     .into_iter()
@@ -938,10 +1076,7 @@ impl Reconciler {
                 continue;
             }
             let mut linked = relation.clone();
-            if let Some(old) = existing_relations
-                .get(&key)
-                .and_then(|relations| relations.first())
-            {
+            if let Some(old) = parser_identity_to_keep(existing_relations.get(&key)) {
                 matched_relation_ids.insert(old.id);
                 linked.id = old.id;
                 linked.created_in = old.created_in;
@@ -966,9 +1101,12 @@ impl Reconciler {
         //      file, and the key is absent from what this pass produced. The
         //      intra-file case: deleting a call between two functions in one file
         //      retires its edge.
-        //   2. `duplicate_parser_relation`. The same, except this pass DID produce
-        //      that key. Retires the surplus copies so one logical edge keeps one
-        //      identity after a resolver or id-derivation change.
+        //   2. `duplicate_parser_relation`. Parser-derived, sourced by an entity of
+        //      this file, and this pass DID produce that key. Retires the surplus
+        //      copies so one logical edge keeps one parser identity after a
+        //      resolver or id-derivation change. The destination may be outside
+        //      the file: the authority is that this pass read this file and
+        //      re-derived that exact edge from it.
         //   3. `cross_file_source_authoritative`. Parser-derived, sourced by an
         //      entity of this file, destination outside it, the cross-file pass ran,
         //      and this file's freshly parsed text no longer names that destination
@@ -981,6 +1119,7 @@ impl Reconciler {
         //      an absent name proves nothing.
         // Everything else is preserved: LSP-enrichment edges, agent-created Manual
         // edges, and any edge this file merely receives rather than sources.
+        let mut retired_relation_ids: HashSet<RelationId> = HashSet::new();
         for ((src, dst, kind), relations) in &existing_relations {
             for relation in relations {
                 if matched_relation_ids.contains(&relation.id) {
@@ -992,15 +1131,23 @@ impl Reconciler {
                     .any(|entity_id| removed_entity_ids.contains(&entity_id));
                 let both_in_file =
                     file_entity_node_ids.contains(src) && file_entity_node_ids.contains(dst);
-                let parser_derived = matches!(
-                    relation.origin,
-                    kin_model::RelationOrigin::Parsed | kin_model::RelationOrigin::Inferred
-                );
+                let parser_derived = is_parser_derived(relation);
                 let parser_authoritative = parser_derived
                     && both_in_file
                     && !new_relation_keys.contains(&(*src, *dst, *kind));
+                // A surplus parser copy of a key this pass just re-derived from
+                // this file's own text, whether or not the destination is in
+                // this file. Scoped to `src` rather than to both endpoints
+                // because that is the half the authority rests on: the pass
+                // read this file and produced that edge, so a second
+                // parser-derived copy of it is an identity left behind by an
+                // earlier resolver, not a second fact. Requiring the
+                // destination to be in the file too is what let a cross-file
+                // copy survive a re-anchor and report its pre-edit line beside
+                // the current one (FIR-2644). Enrichment and Manual edges are
+                // not parser-derived and are never collected here.
                 let duplicate_parser_relation = parser_derived
-                    && both_in_file
+                    && file_entity_node_ids.contains(src)
                     && new_relation_keys.contains(&(*src, *dst, *kind));
                 let cross_file_source_authoritative = parser_derived
                     && !both_in_file
@@ -1018,6 +1165,7 @@ impl Reconciler {
                     || duplicate_parser_relation
                     || cross_file_source_authoritative
                 {
+                    retired_relation_ids.insert(relation.id);
                     delta.relation_deltas.push(RelationDelta::Removed {
                         old: relation.clone(),
                     });
@@ -1027,6 +1175,45 @@ impl Reconciler {
                         dst = %dst,
                         "stale relation removed"
                     );
+                }
+            }
+        }
+
+        // Re-anchor what this pass preserved.
+        //
+        // Everything above either re-derives an edge, which replaces its
+        // evidence outright, or retires it. What is left is the class the
+        // reconcile path deliberately never rebuilds: language-server
+        // enrichment, agent-created Manual edges, and anything else a resolver
+        // outside this pass minted. Those keep the span they were recorded at,
+        // and `find_references` publishes that span as a reference line, so
+        // after a line-shifting edit the answer named a line the call had left.
+        // Placing them through the declaration that contains them is the whole
+        // of re-anchoring for this class; a span that cannot be placed is
+        // cleared rather than carried, because an absent line and a wrong line
+        // are different answers and only one of them is honest (FIR-2644).
+        if !entity_span_moves.is_empty() {
+            for relations in existing_relations.values() {
+                for relation in relations {
+                    if matched_relation_ids.contains(&relation.id)
+                        || retired_relation_ids.contains(&relation.id)
+                    {
+                        continue;
+                    }
+                    let Some(placed) =
+                        relation_with_reanchored_evidence(relation, file_id, &entity_span_moves)
+                    else {
+                        continue;
+                    };
+                    debug!(
+                        relation_id = %relation.id,
+                        kind = ?relation.kind,
+                        "preserved relation re-anchored to the declaration that moved"
+                    );
+                    delta.relation_deltas.push(RelationDelta::Modified {
+                        old: relation.clone(),
+                        new: placed,
+                    });
                 }
             }
         }
@@ -3606,5 +3793,153 @@ mod tests {
             ),
             "stale_entity must have an exact removal (absent from re-parse)"
         );
+    }
+
+    // ------------------------------------------------------- FIR-2644 helpers
+
+    fn span(file: &str, start_line: u32, end_line: u32) -> kin_model::SourceSpan {
+        kin_model::SourceSpan {
+            file: FilePathId::new(file),
+            start_byte: 0,
+            end_byte: 0,
+            start_line,
+            start_col: 0,
+            end_line,
+            end_col: 0,
+        }
+    }
+
+    fn relation_of(origin: kin_model::RelationOrigin) -> Relation {
+        Relation {
+            id: RelationId::new(),
+            kind: RelationKind::Calls,
+            src: GraphNodeId::Entity(EntityId::new()),
+            dst: GraphNodeId::Entity(EntityId::new()),
+            confidence: 1.0,
+            origin,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        }
+    }
+
+    /// A parser edge must never take a language-server edge's identity.
+    ///
+    /// Both are held under one `(src, dst, kind)` key with two ids, and taking
+    /// the lowest id bound the re-derived parser payload onto whichever sorted
+    /// first. When that was the enrichment edge, the parser edge went unmatched
+    /// and survived carrying its pre-edit span (FIR-2644).
+    #[test]
+    fn a_parser_edge_keeps_a_parser_identity_beside_an_enrichment_one() {
+        let enrichment = relation_of(kin_model::RelationOrigin::Lsp);
+        let parsed = relation_of(kin_model::RelationOrigin::Parsed);
+        let bucket = vec![enrichment.clone(), parsed.clone()];
+        assert_eq!(
+            parser_identity_to_keep(Some(&bucket)).map(|relation| relation.id),
+            Some(parsed.id),
+            "the parser edge is the one whose identity a re-derived parse keeps"
+        );
+    }
+
+    /// FALSIFICATION half: a bucket with no parser edge yields no identity, so
+    /// the caller adds rather than overwriting the enrichment edge.
+    #[test]
+    fn an_enrichment_only_bucket_offers_no_identity_to_take_over() {
+        let bucket = vec![
+            relation_of(kin_model::RelationOrigin::Lsp),
+            relation_of(kin_model::RelationOrigin::Manual),
+        ];
+        assert!(parser_identity_to_keep(Some(&bucket)).is_none());
+        assert!(parser_identity_to_keep(None).is_none());
+    }
+
+    /// An `Inferred` edge is parser-derived on the same footing as a `Parsed`
+    /// one, because the retire rules already treat the two as one class and a
+    /// disagreement here would retire an edge the matcher refused to claim.
+    #[test]
+    fn an_inferred_edge_counts_as_a_parser_identity() {
+        let inferred = relation_of(kin_model::RelationOrigin::Inferred);
+        let bucket = vec![
+            relation_of(kin_model::RelationOrigin::Lsp),
+            inferred.clone(),
+        ];
+        assert_eq!(
+            parser_identity_to_keep(Some(&bucket)).map(|relation| relation.id),
+            Some(inferred.id)
+        );
+    }
+
+    /// A declaration that only moved carries its interior with it.
+    #[test]
+    fn a_span_inside_a_declaration_that_moved_is_placed_where_it_moved_to() {
+        let moves = vec![(span("sessions.py", 30, 40), span("sessions.py", 56, 66))];
+        let placed = reanchor_evidence_span(&span("sessions.py", 34, 34), &moves)
+            .expect("a translated declaration can place its interior");
+        assert_eq!((placed.start_line, placed.end_line), (60, 60));
+    }
+
+    /// The innermost declaration decides, so a method inside a class is placed
+    /// by the method rather than by the class it sits in.
+    #[test]
+    fn the_innermost_declaration_places_the_span() {
+        let moves = vec![
+            (span("sessions.py", 0, 80), span("sessions.py", 0, 106)),
+            (span("sessions.py", 30, 40), span("sessions.py", 56, 66)),
+        ];
+        let placed = reanchor_evidence_span(&span("sessions.py", 34, 34), &moves)
+            .expect("the method places it");
+        assert_eq!((placed.start_line, placed.end_line), (60, 60));
+    }
+
+    /// FALSIFICATION: a declaration whose extent changed cannot say where its
+    /// interior went, so the span is refused rather than shifted by a delta the
+    /// interior may not share.
+    #[test]
+    fn a_declaration_that_grew_refuses_to_place_its_interior() {
+        let moves = vec![(span("sessions.py", 30, 40), span("sessions.py", 56, 70))];
+        assert!(reanchor_evidence_span(&span("sessions.py", 34, 34), &moves).is_none());
+    }
+
+    /// FALSIFICATION: a span no declaration contains is refused too. Guessing
+    /// it from the file's overall shift would be a fabricated line.
+    #[test]
+    fn a_span_outside_every_declaration_is_refused() {
+        let moves = vec![(span("sessions.py", 30, 40), span("sessions.py", 56, 66))];
+        assert!(reanchor_evidence_span(&span("sessions.py", 5, 5), &moves).is_none());
+    }
+
+    /// A span in another file is not this pass's business and is left alone.
+    #[test]
+    fn a_span_in_another_file_is_left_untouched() {
+        let moves = vec![(span("sessions.py", 30, 40), span("sessions.py", 56, 66))];
+        let relation = {
+            let mut relation = relation_of(kin_model::RelationOrigin::Lsp);
+            relation.evidence = vec![kin_model::RelationEvidence {
+                source_span: Some(span("adapters.py", 34, 34)),
+                ..kin_model::RelationEvidence::default()
+            }];
+            relation
+        };
+        assert!(
+            relation_with_reanchored_evidence(&relation, &FilePathId::new("sessions.py"), &moves)
+                .is_none(),
+            "a span this pass is not authoritative over must not be rewritten"
+        );
+    }
+
+    /// A span that cannot be placed is cleared, not carried. An absent line and
+    /// a wrong line are different answers and only one of them is honest.
+    #[test]
+    fn an_unplaceable_span_is_cleared_rather_than_carried() {
+        let moves = vec![(span("sessions.py", 30, 40), span("sessions.py", 56, 70))];
+        let mut relation = relation_of(kin_model::RelationOrigin::Lsp);
+        relation.evidence = vec![kin_model::RelationEvidence {
+            source_span: Some(span("sessions.py", 34, 34)),
+            ..kin_model::RelationEvidence::default()
+        }];
+        let updated =
+            relation_with_reanchored_evidence(&relation, &FilePathId::new("sessions.py"), &moves)
+                .expect("the span changed, so a delta is owed");
+        assert!(updated.evidence[0].source_span.is_none());
     }
 }

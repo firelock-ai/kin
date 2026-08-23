@@ -130,9 +130,25 @@ impl LiveRepo {
     /// installs the ones it derives: straight onto the live graph, with `Lsp`
     /// origin, and never through a parse.
     fn enrich(&self, kind: RelationKind, src: EntityId, dst: EntityId) {
+        self.enrich_at(kind, src, dst, None);
+    }
+
+    /// The same, carrying the call-site position a language server reports.
+    ///
+    /// `kin-lsp` records that position with zero byte offsets and real line
+    /// numbers, which is what `find_references` publishes as a reference line,
+    /// so the span shape here is the shape the defect was measured on.
+    fn enrich_at(
+        &self,
+        kind: RelationKind,
+        src: EntityId,
+        dst: EntityId,
+        line: Option<u32>,
+    ) -> RelationId {
+        let id = RelationId::new();
         self.graph
             .upsert_relation(&Relation {
-                id: RelationId::new(),
+                id,
                 kind,
                 src: GraphNodeId::Entity(src),
                 dst: GraphNodeId::Entity(dst),
@@ -140,9 +156,50 @@ impl LiveRepo {
                 origin: RelationOrigin::Lsp,
                 created_in: None,
                 import_source: None,
-                evidence: Vec::new(),
+                evidence: line
+                    .map(|line| {
+                        vec![kin_model::RelationEvidence {
+                            source_span: Some(kin_model::SourceSpan {
+                                file: kin_model::FilePathId::new("sessions.py"),
+                                start_byte: 0,
+                                end_byte: 0,
+                                start_line: line,
+                                start_col: 8,
+                                end_line: line,
+                                end_col: 20,
+                            }),
+                            ..kin_model::RelationEvidence::default()
+                        }]
+                    })
+                    .unwrap_or_default(),
             })
             .expect("install enrichment edge");
+        id
+    }
+
+    /// Every relation the graph holds whose source is `src`, deduplicated.
+    fn edges_from(&self, src: EntityId) -> Vec<Relation> {
+        let mut seen = std::collections::HashSet::new();
+        self.graph
+            .get_all_relations_for_entity(&src)
+            .expect("relations for entity")
+            .into_iter()
+            .filter(|relation| relation.src == GraphNodeId::Entity(src))
+            .filter(|relation| seen.insert(relation.id))
+            .collect()
+    }
+
+    fn relation(&self, id: RelationId) -> Option<Relation> {
+        self.graph
+            .list_all_entities()
+            .expect("list entities")
+            .into_iter()
+            .flat_map(|entity| {
+                self.graph
+                    .get_all_relations_for_entity(&entity.id)
+                    .expect("relations for entity")
+            })
+            .find(|relation| relation.id == id)
     }
 
     /// Every relation in the store, as `(kind, origin)` pairs with a count.
@@ -297,5 +354,266 @@ fn a_comment_only_edit_keeps_every_edge_the_file_already_had() {
         parsed_calls_before,
         "a docstring above the file cost it parser call edges\nbefore: {before:?}\nafter:  \
          {after:?}"
+    );
+}
+
+/// FIR-2644, the half FIR-2598's fixture could not hold.
+///
+/// `Session` overrides `SessionRedirectMixin.send`, both declared in one file.
+/// `kin_index::linker` is the only producer of `Overrides`, and the live
+/// reconcile path threw its same-file output away on the ground that the
+/// pipeline's per-file resolution already carried it. It does not, so the edge
+/// arrived at the retire loop as a parser-derived edge with both endpoints in
+/// the file that this pass had not produced, which is the `parser_authoritative`
+/// condition exactly, and a docstring deleted it. `find_references` composes its
+/// second caller of `Session.send` through that edge, so the answer halved.
+#[test]
+fn a_same_file_override_survives_a_comment_only_edit() {
+    let mut repo = LiveRepo::new();
+    repo.commit("sessions.py", SESSIONS);
+
+    let mixin_send = repo.entity("SessionRedirectMixin.send");
+    let session_send = repo.entity("Session.send");
+    let parsed_override = |repo: &LiveRepo| {
+        repo.edges_from(session_send.id)
+            .into_iter()
+            .filter(|relation| {
+                relation.kind == RelationKind::Overrides
+                    && relation.dst == GraphNodeId::Entity(mixin_send.id)
+                    && relation.origin == RelationOrigin::Parsed
+            })
+            .count()
+    };
+    assert_eq!(
+        parsed_override(&repo),
+        1,
+        "the live path must derive the same-file override at all, or this test cannot fail: {:?}",
+        repo.census()
+    );
+
+    repo.commit("sessions.py", &with_leading_docstring(SESSIONS));
+
+    assert_eq!(
+        parsed_override(&repo),
+        1,
+        "a docstring above the file cost it the same-file override edge: {:?}",
+        repo.census()
+    );
+}
+
+/// A parser edge and the language-server edge that agrees with it are two facts
+/// under one key, and a re-anchor must keep both.
+///
+/// They are held with two ids: the parser derives its id from the triple, and
+/// `kin-lsp` derives its own from the same triple in its own namespace. Matching
+/// the re-derived parse to the lowest id in the bucket wrote the parse onto the
+/// enrichment edge's identity, which destroyed the enrichment edge and left the
+/// real parser edge unmatched and stale.
+#[test]
+fn an_enrichment_edge_and_the_parse_that_agrees_with_it_both_survive_an_edit() {
+    let mut repo = LiveRepo::new();
+    repo.commit("sessions.py", SESSIONS);
+
+    let request = repo.entity("Session.request");
+    let session_send = repo.entity("Session.send");
+    let parsed_call = repo
+        .edges_from(request.id)
+        .into_iter()
+        .find(|relation| {
+            relation.kind == RelationKind::Calls
+                && relation.dst == GraphNodeId::Entity(session_send.id)
+                && relation.origin == RelationOrigin::Parsed
+        })
+        .expect("the fixture must produce the parser call edge this test is about");
+    let enrichment = repo.enrich_at(RelationKind::Calls, request.id, session_send.id, Some(24));
+    assert_ne!(
+        enrichment, parsed_call.id,
+        "the two facts must be held under different ids for this test to mean anything"
+    );
+
+    repo.commit("sessions.py", &with_leading_docstring(SESSIONS));
+
+    let survivors = repo
+        .edges_from(request.id)
+        .into_iter()
+        .filter(|relation| {
+            relation.kind == RelationKind::Calls
+                && relation.dst == GraphNodeId::Entity(session_send.id)
+        })
+        .map(|relation| (relation.id, relation.origin))
+        .collect::<Vec<_>>();
+    assert!(
+        survivors.contains(&(enrichment, RelationOrigin::Lsp)),
+        "the enrichment edge lost its identity to the parse that agrees with it: {survivors:?}"
+    );
+    assert_eq!(
+        survivors
+            .iter()
+            .filter(|(_, origin)| *origin == RelationOrigin::Parsed)
+            .count(),
+        1,
+        "exactly one parser copy of the key may survive: {survivors:?}"
+    );
+}
+
+/// A preserved enrichment span is placed where its declaration moved to.
+///
+/// Nothing on the reconcile path re-derives a language-server edge, so before
+/// this its span stayed where the sweep recorded it and `find_references`
+/// published a pre-edit line as a current call site.
+#[test]
+fn a_preserved_enrichment_span_moves_with_the_declaration_that_holds_it() {
+    let mut repo = LiveRepo::new();
+    repo.commit("sessions.py", SESSIONS);
+
+    let request = repo.entity("Session.request");
+    let session_send = repo.entity("Session.send");
+    let call_line = request
+        .span
+        .as_ref()
+        .expect("the caller carries a span")
+        .start_line
+        + 2;
+    let enrichment = repo.enrich_at(
+        RelationKind::Calls,
+        request.id,
+        session_send.id,
+        Some(call_line),
+    );
+
+    repo.commit("sessions.py", &with_leading_docstring(SESSIONS));
+
+    let placed = repo
+        .relation(enrichment)
+        .expect("the enrichment edge survives the edit");
+    let span = placed.evidence[0]
+        .source_span
+        .as_ref()
+        .expect("the span was placed rather than cleared");
+    assert_eq!(
+        span.start_line,
+        call_line + 26,
+        "the 26-line docstring moved the declaration, so its call site moved with it"
+    );
+    assert_eq!(
+        (span.start_col, span.end_col),
+        (8, 20),
+        "a placement moves lines and invents no columns"
+    );
+}
+
+/// The transport hop, so a call site can leave the file it is written in.
+const ADAPTERS: &str = r#"class BaseAdapter:
+    def send(self, request, **kwargs):
+        raise NotImplementedError
+
+
+class HTTPAdapter(BaseAdapter):
+    def send(self, request, **kwargs):
+        return request
+"#;
+
+/// `sessions.py` again, calling into `adapters.py`.
+const SESSIONS_WITH_ADAPTER: &str = r#"from adapters import HTTPAdapter
+
+
+class Session:
+    def get_adapter(self, url):
+        return HTTPAdapter()
+
+    def send(self, request, **kwargs):
+        adapter = self.get_adapter(request)
+        return adapter.send(request, **kwargs)
+"#;
+
+/// A surplus parser copy of a cross-file key is retired even though its
+/// destination is in another file.
+///
+/// The retire rule asked for both endpoints to be inside the file, so a second
+/// parser-derived copy of an edge leaving it could never be collected: it
+/// survived every later pass carrying whatever span the resolver that minted it
+/// recorded, and `find_references` published that span beside the current one.
+/// The authority is that this pass read this file and re-derived that exact
+/// edge from it, which is a fact about the source half alone.
+#[test]
+fn a_surplus_parser_copy_of_a_cross_file_edge_is_retired() {
+    let mut repo = LiveRepo::new();
+    repo.commit("adapters.py", ADAPTERS);
+    repo.commit("sessions.py", SESSIONS_WITH_ADAPTER);
+
+    let in_adapters = |node: GraphNodeId| {
+        node.as_entity()
+            .and_then(|id| repo.graph.get_entity(&id).ok().flatten())
+            .and_then(|entity| entity.file_origin)
+            .is_some_and(|file| file.0 == "adapters.py")
+    };
+    let sessions_entities: Vec<Entity> = repo
+        .graph
+        .list_all_entities()
+        .expect("list entities")
+        .into_iter()
+        .filter(|entity| {
+            entity
+                .file_origin
+                .as_ref()
+                .is_some_and(|file| file.0 == "sessions.py")
+        })
+        .collect();
+    let original = sessions_entities
+        .iter()
+        .flat_map(|entity| repo.edges_from(entity.id))
+        .find(|relation| {
+            matches!(
+                relation.origin,
+                RelationOrigin::Parsed | RelationOrigin::Inferred
+            ) && in_adapters(relation.dst)
+        })
+        .expect("the fixture must produce a parser edge that leaves the file");
+    let source_entity = original.src.as_entity().expect("an entity-sourced edge");
+
+    // The shape an older resolver left behind: a second parser-derived copy of
+    // the same key, under its own id, carrying the pre-edit line.
+    let surplus = Relation {
+        id: RelationId::new(),
+        ..original.clone()
+    };
+    repo.graph
+        .upsert_relation(&surplus)
+        .expect("seed the surplus copy");
+    assert_ne!(surplus.id, original.id);
+
+    repo.commit(
+        "sessions.py",
+        &with_leading_docstring(SESSIONS_WITH_ADAPTER),
+    );
+
+    let survivors: Vec<RelationId> = repo
+        .edges_from(source_entity)
+        .into_iter()
+        .filter(|relation| relation.kind == original.kind && relation.dst == original.dst)
+        .filter(|relation| {
+            matches!(
+                relation.origin,
+                RelationOrigin::Parsed | RelationOrigin::Inferred
+            )
+        })
+        .map(|relation| relation.id)
+        .collect();
+    // One identity, and the claim is the count rather than which uuid won.
+    // The pass re-derives the edge and binds it to a parser identity from the
+    // bucket; either id is that edge, and both carry the payload this parse
+    // produced. What may not survive is a second copy, because that is the one
+    // still holding the line the call has left.
+    assert_eq!(
+        survivors.len(),
+        1,
+        "a re-anchored cross-file edge must keep one parser identity, not two: {survivors:?}"
+    );
+    let kept = repo
+        .relation(survivors[0])
+        .expect("the surviving edge is readable");
+    assert_eq!(
+        kept.dst, original.dst,
+        "the survivor is the edge this test seeded a copy of"
     );
 }

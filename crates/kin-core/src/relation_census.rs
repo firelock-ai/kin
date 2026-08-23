@@ -682,6 +682,85 @@ pub enum CensusRecordOutcome {
     Failed(String),
 }
 
+/// File name for the durable record that this store is currently below its own
+/// verified-good census.
+pub const CENSUS_HOLD_FILE_NAME: &str = "relation-census-hold.json";
+
+/// Where a `.kin` root keeps it, beside the census it qualifies.
+pub fn census_hold_path(kin_root: &std::path::Path) -> std::path::PathBuf {
+    kin_root.join("kindb").join(CENSUS_HOLD_FILE_NAME)
+}
+
+/// What a store records when a pass lost relation ground.
+///
+/// [`record`] already knew this and only logged it. A warning in a daemon log
+/// nobody is tailing is not a disclosure: on the rc0550 run the relation census
+/// was the one surface that saw a comment-only commit delete twelve edges,
+/// while `find_references` answered from the damaged graph with
+/// `degraded_signals: []` and `edge_coverage.calls: "present"` (FIR-2644). The
+/// query surfaces cannot recompute a census per response, so the pass that
+/// already computed it leaves this behind for them.
+///
+/// Durable and self-clearing on the same terms as the baseline it qualifies:
+/// written whenever `record` refuses a losing census, removed the moment a
+/// census advances, so a store that recovers stops reporting a loss without any
+/// second event to retract it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CensusHold {
+    /// When the baseline the graph is short against was taken.
+    pub held_at: DateTime<Utc>,
+    /// Which pass took it.
+    pub held_source: String,
+    /// One line per kind that lost ground, as [`RelationCensusComparison`]
+    /// renders them.
+    pub losses: Vec<String>,
+}
+
+impl CensusHold {
+    /// What this store records, or `None` when it records nothing.
+    ///
+    /// An unreadable record reads as absent, for the reason the memory-pressure
+    /// record does: this exists to report a degradation and must never become
+    /// one.
+    pub fn read(kin_root: &std::path::Path) -> Option<Self> {
+        let raw = std::fs::read(census_hold_path(kin_root)).ok()?;
+        serde_json::from_slice(&raw).ok()
+    }
+
+    /// One sentence a surface can print without parsing the parts.
+    pub fn summary(&self) -> String {
+        format!(
+            "the graph holds fewer relations than the census recorded at {} ({}): {}",
+            self.held_at.to_rfc3339(),
+            self.held_source,
+            self.losses.join("; ")
+        )
+    }
+}
+
+/// Publish the hold for `layout`, or retire it when the graph has recovered.
+///
+/// A write that fails is dropped. A pass that cannot publish its own disclosure
+/// must not fail the work it was disclosing about, and the direction of that
+/// failure is the safe one for a retire and the unsafe one for a publish, which
+/// is why the publish is attempted before anything depends on it.
+fn publish_hold(layout: &KinLayout, hold: Option<&CensusHold>) {
+    let path = census_hold_path(layout.root());
+    match hold {
+        Some(hold) => {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(body) = serde_json::to_vec(hold) {
+                let _ = std::fs::write(&path, body);
+            }
+        }
+        None => {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 /// Record `census` as the store's baseline, unless it lost ground.
 ///
 /// This is the write half of the rule the module doc states. A baseline is a
@@ -714,15 +793,30 @@ pub fn record(layout: &KinLayout, census: &RelationCensus) -> CensusRecordOutcom
             comparison = comparison.with_current_entities(entities);
         }
         if comparison.reports_loss() {
+            let losses = comparison.loss_lines();
+            publish_hold(
+                layout,
+                Some(&CensusHold {
+                    held_at: recorded.at,
+                    held_source: recorded.source.label().to_string(),
+                    losses: losses.clone(),
+                }),
+            );
             return CensusRecordOutcome::Held {
                 held_at: recorded.at,
                 held_source: recorded.source,
-                losses: comparison.loss_lines(),
+                losses,
             };
         }
     }
     match write(layout, census) {
-        Ok(()) => CensusRecordOutcome::Advanced,
+        Ok(()) => {
+            // Retired only after the advance landed. A cleared hold beside a
+            // baseline that failed to move would report a recovery the store
+            // did not make.
+            publish_hold(layout, None);
+            CensusRecordOutcome::Advanced
+        }
         Err(error) => CensusRecordOutcome::Failed(error.to_string()),
     }
 }
@@ -1410,5 +1504,100 @@ mod tests {
     #[test]
     fn an_environment_with_no_overrides_names_no_cause() {
         assert!(known_causes([("PATH".to_string(), "/usr/bin".to_string())]).is_empty());
+    }
+
+    /// FIR-2644: the hold is what carries a loss to a surface that cannot
+    /// recompute a census.
+    ///
+    /// `record` already reached this verdict and only logged it, so
+    /// `find_references` answered from a graph short of its own baseline with
+    /// an empty degraded list. The record is durable because the process that
+    /// measures is a daemon nobody is watching and every surface that reports
+    /// it runs later.
+    #[test]
+    fn a_refused_census_leaves_a_hold_the_query_surfaces_can_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout_in(dir.path());
+        assert!(
+            CensusHold::read(layout.root()).is_none(),
+            "a store nothing has measured records no hold"
+        );
+
+        let good = RelationCensus::new(
+            at(1_000_000),
+            CensusSource::Sweep,
+            census(&[("Calls", 1279), ("Overrides", 11)]),
+            Vec::new(),
+        )
+        .with_entities(783);
+        assert_eq!(record(&layout, &good), CensusRecordOutcome::Advanced);
+        assert!(
+            CensusHold::read(layout.root()).is_none(),
+            "an advancing census records no hold, or the flag fires on every store"
+        );
+
+        let after_commit = RelationCensus::new(
+            at(1_000_500),
+            CensusSource::Commit,
+            census(&[("Calls", 1269), ("Overrides", 10)]),
+            Vec::new(),
+        )
+        .with_entities(783);
+        assert!(matches!(
+            record(&layout, &after_commit),
+            CensusRecordOutcome::Held { .. }
+        ));
+        let hold = CensusHold::read(layout.root()).expect("the refusal published a hold");
+        assert_eq!(hold.held_at, at(1_000_000));
+        assert_eq!(hold.held_source, CensusSource::Sweep.label());
+        assert!(
+            hold.summary().contains("Calls slipped 1279 to 1269"),
+            "the hold names the kind and both counts: {}",
+            hold.summary()
+        );
+    }
+
+    /// It clears itself. A store that recovers must stop reporting a loss
+    /// without any second event to retract it, or the disclosure becomes a
+    /// permanent warning nobody reads.
+    #[test]
+    fn a_recovered_graph_retires_its_own_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout_in(dir.path());
+        let kinds = census(&[("Calls", 1279), ("Overrides", 11)]);
+        record(
+            &layout,
+            &RelationCensus::new(
+                at(1_000_000),
+                CensusSource::Sweep,
+                kinds.clone(),
+                Vec::new(),
+            )
+            .with_entities(783),
+        );
+        record(
+            &layout,
+            &RelationCensus::new(
+                at(1_000_500),
+                CensusSource::Commit,
+                census(&[("Calls", 1269), ("Overrides", 10)]),
+                Vec::new(),
+            )
+            .with_entities(783),
+        );
+        assert!(CensusHold::read(layout.root()).is_some());
+
+        assert_eq!(
+            record(
+                &layout,
+                &RelationCensus::new(at(1_001_000), CensusSource::Sweep, kinds, Vec::new())
+                    .with_entities(783),
+            ),
+            CensusRecordOutcome::Advanced
+        );
+        assert!(
+            CensusHold::read(layout.root()).is_none(),
+            "a graph that holds what it held again reports no loss"
+        );
     }
 }

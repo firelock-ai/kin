@@ -1275,6 +1275,12 @@ async fn handle_tools_call_daemon(
     // answer it changes the reading of is the one that succeeds and returns
     // nothing.
     base_env = base_env.with_memory_pressure(daemon_delegate::memory_pressure_refusal().as_ref());
+    // Stamped on every answer for the same reason, and it is the one of the
+    // three that qualifies an answer which came back looking complete. A graph
+    // short of its own last verified-good census returns rows that are all true
+    // and a set that is not whole, and nothing in the payload can tell the two
+    // apart.
+    base_env = base_env.with_relation_census_loss(daemon_delegate::relation_census_hold().as_ref());
 
     // `kin_graph_status` already reports the exact graph view selected by the
     // daemon, including temporal-session scope. Generic `/health` is HEAD-only:

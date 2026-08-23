@@ -112,6 +112,7 @@ class Suite(object):
         self.workdir = workdir
         self.verbose = verbose
         self.fixtures = {}
+        self._comment_only_evidence = None
         self.run_id = "r%d" % os.getpid()
         self.env = dict(os.environ)
         self.env["KIN_DAEMON_AUTO_EMBED"] = "0"
@@ -347,6 +348,25 @@ class Suite(object):
         self._kin_init(repo)
         self._kin_commit(repo, "Add the sessions module")
 
+    def _build_mixinadapter(self, repo):
+        """The FIR-2644 shape, built through the path that emits cross-file edges.
+
+        Converted from git rather than committed through Kin, because the
+        cross-file `Calls` edge into `adapters.py` is what carries the reference
+        line the defect left stale, and a store built one commit at a time does
+        not get one at conversion.
+        """
+        self.git(["init", "-q", "."], repo)
+        self._write(repo, ".gitignore", "__pycache__/\n")
+        self._write(repo, "pkg/__init__.py", "")
+        self._write(repo, "pkg/adapters.py", MIXIN_ADAPTERS_PY)
+        self._write(repo, "pkg/sessions.py", MIXIN_SESSIONS_PY)
+        self.git(["add", "-A"], repo)
+        rc, out, err = self.git(["commit", "-q", "-m", "initial mixin adapter fixture"], repo)
+        if rc != 0:
+            raise RuntimeError("git commit failed: %s" % (err or out)[-300:])
+        self._kin_init(repo)
+
     def _build_reexport(self, repo):
         """A store holding a file that legitimately declares nothing.
 
@@ -451,7 +471,7 @@ class Suite(object):
                              "file": match.group(4)})
         return {"raw": text, "rows": rows, "rc": rc}
 
-    def references(self, repo, query, settle=2):
+    def references(self, repo, query, settle=2, relation_kinds=None):
         """find_references, retried once while the graph settles.
 
         A commit's enrichment lands asynchronously, so a probe fired
@@ -459,12 +479,62 @@ class Suite(object):
         resolved the symbol yet. The retry is bounded and a symbol that never
         resolves still reports unresolved rather than absent.
         """
-        payload, _ = self.mcp(repo, "find_references", {"query": query})
+        args = {"query": query}
+        if relation_kinds:
+            args["relation_kinds"] = list(relation_kinds)
+        payload, _ = self.mcp(repo, "find_references", args)
         if (payload.get("focal_entity") or {}).get("id"):
             return payload
         time.sleep(settle)
-        payload, _ = self.mcp(repo, "find_references", {"query": query})
+        payload, _ = self.mcp(repo, "find_references", args)
         return payload
+
+    def comment_only_commit_evidence(self):
+        """The FIR-2644 experiment, run once and read by three checks.
+
+        A `kin commit` of a module docstring and nothing else, with the caller
+        sets and the reference lines recorded on both sides of it. Cached
+        because the experiment is destructive: the second checker to run it
+        would be measuring a store the first one had already edited, and the
+        edit is the whole subject.
+        """
+        if self._comment_only_evidence is not None:
+            return self._comment_only_evidence
+
+        repo = self.fixture("mixinadapter")
+        evidence = {"repo": repo, "error": None}
+        evidence["before_status"] = self.graph_status(repo)
+        evidence["before_send"] = self.references(
+            repo, MIXIN_FOCAL_SEND, relation_kinds=["calls"])
+        evidence["before_adapter"] = self.references(repo, MIXIN_FOCAL_ADAPTER_SEND)
+
+        source = os.path.join(repo, "pkg", "sessions.py")
+        with open(source) as handle:
+            original = handle.read()
+        with open(source, "w") as handle:
+            handle.write(MIXIN_DOCSTRING + original)
+        with open(source) as handle:
+            edited = handle.read()
+        if not edited.endswith(original):
+            evidence["error"] = "the fixture edit did not leave the original bytes intact"
+            self._comment_only_evidence = evidence
+            return evidence
+        evidence["added_lines"] = len(edited.splitlines()) - len(original.splitlines())
+        try:
+            self._kin_commit(repo, "Document the redirect flow in the module docstring")
+        except RuntimeError as exc:
+            evidence["error"] = "the comment-only commit failed: %s" % exc
+            self._comment_only_evidence = evidence
+            return evidence
+
+        evidence["after_status"] = self.graph_status(repo)
+        evidence["after_send"] = self.references(
+            repo, MIXIN_FOCAL_SEND, relation_kinds=["calls"])
+        evidence["after_adapter"] = self.references(repo, MIXIN_FOCAL_ADAPTER_SEND)
+        with open(source) as handle:
+            evidence["source_lines"] = handle.read().splitlines()
+        self._comment_only_evidence = evidence
+        return evidence
 
 
 # ----------------------------------------------------------------- fixture code
@@ -737,6 +807,76 @@ MIXIN_DOCSTRING = ('"""Session and redirect handling.\n'
                    + "".join("Redirect flow note %d.\n" % i for i in range(1, 24))
                    + '"""\n\n')
 
+
+# The FIR-2644 shape: the mixin above, plus the transport hop that makes a call
+# site cross a file. `psf/requests` is the original: `SessionRedirectMixin`
+# declares `send` and calls it through `self`, `Session` overrides `send` and
+# also calls `adapter.send(...)` in `adapters.py`. Both halves are needed. The
+# override carries the caller `find_references` composes, and the cross-file
+# call carries the reference line that went stale.
+MIXIN_ADAPTERS_PY = """\"\"\"Transport adapters.\"\"\"
+
+
+class BaseAdapter:
+    def send(self, request, **kwargs):
+        raise NotImplementedError
+
+    def close(self):
+        return None
+
+
+class HTTPAdapter(BaseAdapter):
+    def send(self, request, **kwargs):
+        return {"status": 200, "request": request}
+
+    def close(self):
+        return None
+"""
+
+MIXIN_SESSIONS_PY = """import time
+
+from .adapters import HTTPAdapter
+
+
+class SessionRedirectMixin:
+    def send(self, request, **kwargs):
+        raise NotImplementedError
+
+    def get_redirect_target(self, resp):
+        return resp.get("location")
+
+    def resolve_redirects(self, resp, req, **kwargs):
+        target = self.get_redirect_target(resp)
+        while target:
+            resp = self.send(req, **kwargs)
+            target = self.get_redirect_target(resp)
+        return resp
+
+    def rebuild_auth(self, prepared, response):
+        return prepared
+
+
+class Session(SessionRedirectMixin):
+    def request(self, method, url):
+        prepared = self.prepare(method, url)
+        return self.send(prepared)
+
+    def prepare(self, method, url):
+        return {"method": method, "url": url}
+
+    def get_adapter(self, url):
+        return HTTPAdapter()
+
+    def send(self, request, **kwargs):
+        time.sleep(0)
+        adapter = self.get_adapter(request)
+        return adapter.send(request, **kwargs)
+"""
+
+# The two symbols the FIR-2644 checks probe. Named once so a check and its
+# failure text cannot drift apart.
+MIXIN_FOCAL_SEND = "Session.send"
+MIXIN_FOCAL_ADAPTER_SEND = "HTTPAdapter.send"
 
 # The fixture behind check 12. `src/prelude.rs` is the whole point: a file that
 # declares nothing and that no adapter failed on. Measured on kin 0.5.48, the
@@ -2434,6 +2574,215 @@ def check_17(suite):
     return res
 
 
+def reference_rows(payload):
+    """The caller rows a find_references payload returned, keyed by name."""
+    rows = {}
+    for row in payload.get("references") or []:
+        name = row.get("name")
+        if name:
+            rows[name] = row
+    return rows
+
+
+def check_18(suite):
+    """FIR-2644: a comment-only commit must keep every caller it had.
+
+    The rc0550 run committed a module docstring on `psf/requests`'
+    `sessions.py` and `find_references(Session.send, [calls])` went from two
+    rows to one. The row it lost was `SessionRedirectMixin.resolve_redirects`,
+    resolved through the override edge `Session.send -> SessionRedirectMixin.send`,
+    and the call it names is still in the file. Nothing in the response said so:
+    `degraded_signals` was empty and `edge_coverage.calls` read `present`.
+
+    The override-resolved row is the one this check exists for. A caller
+    composed through a proven override is the answer a whole-program tool gives
+    and grep does not, and it is carried by an edge with exactly one producer,
+    so it is the first thing a re-anchor that does not re-derive everything
+    loses.
+    """
+    res = Result("18", "FIR-2644",
+                 "a comment-only commit keeps every caller, override-resolved included")
+    evidence = suite.comment_only_commit_evidence()
+    if evidence["error"]:
+        res.unknown(evidence["error"])
+        return res
+    if evidence.get("added_lines") != 26:
+        res.unknown("the fixture edit added %s lines, not the 26 the run made"
+                    % evidence.get("added_lines"))
+        return res
+
+    for label, payload in (("before", evidence["before_send"]),
+                           ("after", evidence["after_send"])):
+        unresolved = resolution_miss(payload, "%s %s" % (label, MIXIN_FOCAL_SEND))
+        if unresolved:
+            res.unknown(unresolved)
+            return res
+
+    before = reference_rows(evidence["before_send"])
+    after = reference_rows(evidence["after_send"])
+    composed = [name for name, row in before.items() if row.get("via_override_of")]
+    if not composed:
+        res.unknown("no caller of %s was composed through an override before the commit, so "
+                    "this fixture cannot hold the shape the check is about: %s"
+                    % (MIXIN_FOCAL_SEND, sorted(before)))
+        return res
+    res.ok("the pre-commit answer composes %s through %s"
+           % (", ".join(sorted(composed)),
+              ", ".join(sorted({before[n]["via_override_of"] for n in composed}))))
+
+    lost = sorted(set(before) - set(after))
+    if lost:
+        res.bad("a comment-only commit lost caller(s) %s from find_references(%s); "
+                "before %s, after %s"
+                % (", ".join(lost), MIXIN_FOCAL_SEND, sorted(before), sorted(after)))
+        return res
+
+    still_composed = [name for name in composed if after.get(name, {}).get("via_override_of")]
+    if sorted(still_composed) != sorted(composed):
+        res.bad("the caller set survived but the override composition did not: %s no longer "
+                "carries via_override_of"
+                % ", ".join(sorted(set(composed) - set(still_composed))))
+        return res
+    res.ok("the caller set is unchanged at %s and every override-resolved row kept its "
+           "composition" % sorted(after))
+    return res
+
+
+def check_19(suite):
+    """FIR-2644: every reported reference line must still carry the call.
+
+    The same commit shifted `sessions.py` by 26 lines and
+    `find_references(HTTPAdapter.send)` came back with the call site at both its
+    old line and its new one, stamped `reference_sites_complete: true`. The old
+    line is not a call any more; on the run that produced this ticket it read
+    `kwargs.setdefault("cert", self.cert)`.
+
+    Graded against the file on disk after the commit, because that is the only
+    thing that can tell a re-anchored line from a remembered one. A row that
+    reports no line at all is not failed here: an absent line is a different
+    answer from a wrong one, and the payload already distinguishes them.
+    """
+    res = Result("19", "FIR-2644", "every reported reference line still carries the call")
+    evidence = suite.comment_only_commit_evidence()
+    if evidence["error"]:
+        res.unknown(evidence["error"])
+        return res
+    lines = evidence.get("source_lines")
+    if not lines:
+        res.unknown("the edited fixture source could not be read back")
+        return res
+
+    graded = 0
+    stale = []
+    for focal, payload in ((MIXIN_FOCAL_SEND, evidence["after_send"]),
+                           (MIXIN_FOCAL_ADAPTER_SEND, evidence["after_adapter"])):
+        unresolved = resolution_miss(payload, focal)
+        if unresolved:
+            res.unknown(unresolved)
+            return res
+        token = "%s(" % focal.rsplit(".", 1)[-1]
+        for name, row in sorted(reference_rows(payload).items()):
+            if (row.get("file_path") or "") != "pkg/sessions.py":
+                continue
+            for line_no in row.get("reference_lines") or []:
+                graded += 1
+                text = lines[line_no - 1] if 0 < line_no <= len(lines) else "<past end of file>"
+                if token not in text:
+                    stale.append("%s -> %s line %d reads %r"
+                                 % (name, focal, line_no, text.strip()))
+    if graded == 0:
+        res.unknown("no caller reported a reference line in pkg/sessions.py after the commit, "
+                    "so there is nothing to grade")
+        return res
+    if stale:
+        res.bad("%d of %d reported reference line(s) no longer carry the call: %s"
+                % (len(stale), graded, "; ".join(stale)))
+    else:
+        res.ok("all %d reported reference line(s) still carry the call they name" % graded)
+    return res
+
+
+def check_20(suite):
+    """FIR-2644: a query answer taken over a short graph must say so.
+
+    Both defects above were silent at the response level. The rows that came
+    back were true, the counts agreed with themselves, and only the relation
+    census, reached through a different command, knew the graph had lost edges.
+    A caller acting on `find_references` cannot run `kin graph status` first and
+    would have no reason to.
+
+    The control runs first and on the same store: a healthy graph must carry no
+    such signal, or the flag is one that fires always and proves nothing. Then
+    the recorded baseline is raised by a single `Calls` edge over an unchanged
+    entity count, which is the state the rc0550 store was in, and a commit
+    offers its census and is refused. The answer taken after that must disclose
+    it.
+    """
+    res = Result("20", "FIR-2644", "find_references discloses a relation-census loss")
+    evidence = suite.comment_only_commit_evidence()
+    if evidence["error"]:
+        res.unknown(evidence["error"])
+        return res
+    repo = evidence["repo"]
+
+    control = suite.references(repo, MIXIN_FOCAL_SEND, relation_kinds=["calls"])
+    control_degraded = ((control.get("_kin") or {}).get("degraded") or {})
+    if control_degraded.get("relation_census_loss"):
+        res.bad("the store reports a census loss before one was introduced, so the signal "
+                "cannot separate a short graph from a whole one: %s" % control_degraded)
+        return res
+    res.ok("the control answer on a whole graph carries no census-loss signal")
+
+    record = os.path.join(repo, ".kin", "kindb", "relation-census")
+    if not os.path.exists(record):
+        res.unknown("no relation census recorded at %s" % record)
+        return res
+    try:
+        with open(record) as handle:
+            recorded = json.load(handle)
+    except (ValueError, IOError) as exc:
+        res.unknown("the recorded census is unreadable: %s" % exc)
+        return res
+    status = suite.graph_status(repo)
+    live = status["relation_kinds"]
+    if not live.get("Calls"):
+        res.unknown("the fixture holds no Calls edges to raise a baseline above: %s" % live)
+        return res
+    raised = dict(recorded)
+    raised["kinds"] = dict(recorded.get("kinds") or {})
+    raised["kinds"]["Calls"] = live["Calls"] + 1
+    raised["total"] = sum(raised["kinds"].values())
+    raised["entities"] = status["entities"]
+    with open(record, "w") as handle:
+        json.dump(raised, handle)
+
+    # A pass that measures the census is what publishes the hold, and a commit
+    # is one. It must be refused as a baseline and must leave the disclosure
+    # behind; check 11 already proves the refusal half on its own fixture.
+    with open(os.path.join(repo, "pkg", "sessions.py"), "a") as handle:
+        handle.write("\n\n# A trailing note.\n")
+    try:
+        suite._kin_commit(repo, "Note the trailing comment")
+    except RuntimeError as exc:
+        res.unknown("the follow-up commit failed: %s" % exc)
+        return res
+
+    after = suite.references(repo, MIXIN_FOCAL_SEND, relation_kinds=["calls"])
+    degraded = ((after.get("_kin") or {}).get("degraded") or {})
+    signals = ((after.get("negative") or {}).get("degraded_signals") or [])
+    if not degraded.get("relation_census_loss"):
+        res.bad("find_references answered over a graph short of its own census with "
+                "_kin.degraded %s and degraded_signals %s, claiming nothing was wrong"
+                % (degraded, signals))
+    elif "relation_census_loss" not in signals:
+        res.bad("the flag is set but the answer's own degraded_signals do not carry it, so a "
+                "reader of the verdict never sees it: %s" % signals)
+    else:
+        res.ok("the answer discloses the loss structurally: _kin.degraded.relation_census_loss "
+               "true and degraded_signals %s" % signals)
+    return res
+
+
 CHECKS = [
     ("0", check_0),
     ("1", check_1),
@@ -2453,6 +2802,9 @@ CHECKS = [
     ("15", check_15),
     ("16", check_16),
     ("17", check_17),
+    ("18", check_18),
+    ("19", check_19),
+    ("20", check_20),
 ]
 
 

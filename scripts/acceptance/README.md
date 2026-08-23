@@ -32,6 +32,12 @@ it had, and the census must be able to see a kind that lost ground once one
 does. Check 11 raises the recorded baseline by one edge over an unchanged entity
 count rather than damaging the graph, because the loss that started the ticket
 was 0.9% of its kind and no magnitude threshold was ever going to reach it.
+Checks 18 through 20 cover what FIR-2644 adds to the same commit: the caller set
+must be unchanged including a caller composed through an override, every
+reference line a caller reports must still carry the call when read against the
+file on disk, and an answer taken over a graph short of its own census must
+disclose that rather than presenting as clean. Each of the three runs its own
+control, and they share one experiment because the experiment is destructive.
 Every check names the ticket it is about, so a failure is attributable without
 reading the code.
 
