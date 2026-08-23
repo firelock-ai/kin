@@ -400,8 +400,8 @@ fn remove_live_control_dir(kin_dir: &std::path::Path) {
                     .unwrap_or_default();
                 panic!(
                     "could not remove {}: {error}. Entries a live daemon rewrote while this \
-                     ran: {survivors:?}"
-                    , kin_dir.display()
+                     ran: {survivors:?}",
+                    kin_dir.display()
                 );
             }
         }
