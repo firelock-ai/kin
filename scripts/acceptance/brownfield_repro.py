@@ -206,6 +206,35 @@ FABRICATED_SEND_CALLERS = {
     "test_redirect_rfc1808_to_non_ascii_location",
 }
 
+# requests, rc0550 brown task 3. The stranger asked where `verify` lands inside
+# HTTPAdapter.send and got an answer one hop short, which would have been WRONG if
+# trusted: `verify` reaches TLS at cert_verify AND at the pool-key path that governs
+# connection reuse, and only the second was missing. These are the stranger's own
+# parameters, not a shape chosen to pass. The defect only appears at this budget.
+TRACE_FOCAL = "HTTPAdapter.send"
+TRACE_DEPTH = 3
+TRACE_LIMIT_PER_STEP = 12
+
+# The hop the answer turns on. build_connection_pool_key_attributes' entire body is
+# `return _urllib3_request_context(request, verify, cert, self.poolmanager)`, and
+# _urllib3_request_context folds verify into the urllib3 pool key, which is what stops
+# a verify=False connection being reused for a verify=True request.
+TRACE_LOAD_BEARING = "_urllib3_request_context"
+TRACE_LOAD_BEARING_PARENT = "build_connection_pool_key_attributes"
+
+# The six exception classes that took nine of the twelve depth-1 slots on the measured
+# run. Every one is a `raise` target inside an `except` block, not data flow. They are
+# the negative control for ordering: they may appear, because "what does this throw" is
+# a real question, but never above a row the value actually travels through.
+TRACE_RAISE_TARGETS = {
+    "SSLError",
+    "InvalidURL",
+    "ProxyError",
+    "RetryError",
+    "ReadTimeout",
+    "InvalidHeader",
+}
+
 # express, task 5. trace_data_flow on app.handle, direction calls, depth 2 returned
 # eleven steps of which the stranger verified nine were fabricated, all descended from
 # bare-name matching the single `this.get('env')` call site against every entity in
@@ -748,6 +777,18 @@ def upstream_rows(payload):
             if isinstance(row, dict):
                 withheld.append(row)
     return counted, withheld
+
+
+def trace_steps(payload):
+    """The step list a trace payload carries, under whichever key this build uses.
+
+    Returns None when no list is present, which is a different fact from an empty
+    walk and is graded UNREADABLE rather than FAIL by every caller.
+    """
+    for key in ("chain", "steps", "flow", "path"):
+        if isinstance(payload.get(key), list):
+            return payload[key]
+    return None
 
 
 def find_row(rows, wanted):
@@ -1677,6 +1718,151 @@ def check_9(suite):
     else:
         res.ok("the re-run reclaimed %s of staging and said so; nothing is "
                "left beside the repository" % reclaimed.group(1))
+
+
+def check_10(suite):
+    """FIR-2642: the trace answers the question, and says where the graph ends.
+
+    This check IS the rc0550 brown stranger's task 3, replayed with the stranger's
+    own parameters. That matters more than it looks: the defect only exists at this
+    budget. Raise limit_per_step or max_chars and the load-bearing hop comes back,
+    which is how a check written for convenience would pass on the broken build.
+
+    What the stranger asked: where does `verify` land inside HTTPAdapter.send. The
+    true answer has TWO landing points, cert_verify (which sets attributes on the
+    connection) and _urllib3_request_context (which folds verify into the urllib3
+    pool key, governing connection reuse). The shipped build returned only the
+    first. Nine of its twelve depth-1 slots went to exception classes, `raise`
+    targets in `except` blocks that are not data flow at all, and they crowded out
+    the hop that mattered. The stranger's verdict, quoted: "If I had trusted the Kin
+    arm alone I would have written a wrong answer."
+
+    Four arms.
+
+    The first is the answer itself: the walk must contain _urllib3_request_context.
+    The second distinguishes the two ways that can fail, because blaming ranking for
+    a missing edge would be a confident wrong finding: when the hop is absent at the
+    stranger's budget, a WIDER probe runs, and only if the wider walk finds it is
+    this a ranking failure. If the wider walk misses it too, the edge is not in the
+    graph and that is a different defect, reported UNREADABLE rather than FAIL.
+
+    The third is the ordering that causes it: no raise target may rank above a row
+    the value actually travels through, at the same depth. It demotes rather than
+    filters, so their presence is fine and their position is not.
+
+    The fourth is half two of the ticket: every external node the answer touches
+    must name its crossing, so a caller can tell an npm package from a builtin from
+    a typo instead of reading a bare symbol.
+    """
+    res = Result("10", "FIR-2642", "the trace reaches the pool-key hop and names "
+                                  "every boundary it touches")
+    repo = suite.fixture("requests")
+    try:
+        suite.sweep_gate("requests")
+        payload = suite.cached(repo, "trace_data_flow",
+                               {"focal": TRACE_FOCAL, "direction": "calls",
+                                "depth": TRACE_DEPTH, "include_body": False,
+                                "limit_per_step": TRACE_LIMIT_PER_STEP})
+    except ProbeError as exc:
+        res.unknown(str(exc))
+        return res
+
+    steps = trace_steps(payload)
+    if steps is None:
+        res.unknown("trace_data_flow payload carries no step list; keys are %s"
+                    % sorted(payload.keys()))
+        return res
+    if not steps:
+        res.unknown("trace_data_flow on %s returned zero steps, so nothing about "
+                    "ranking or boundaries can be judged" % TRACE_FOCAL)
+        return res
+
+    names = [str(step.get("entity_name") or "") for step in steps]
+
+    # Arm one and two: the answer, and which failure it is when the answer is short.
+    if TRACE_LOAD_BEARING in names:
+        res.ok("the walk reaches %s at the stranger's own budget (depth=%d, "
+               "limit_per_step=%d), so the verify-to-TLS answer is complete from "
+               "Kin alone" % (TRACE_LOAD_BEARING, TRACE_DEPTH, TRACE_LIMIT_PER_STEP))
+    else:
+        omitted = payload.get("steps_omitted")
+        try:
+            wider = suite.cached(repo, "trace_data_flow",
+                                 {"focal": TRACE_FOCAL, "direction": "calls",
+                                  "depth": TRACE_DEPTH, "include_body": False,
+                                  "limit_per_step": 40, "max_chars": 400000},
+                                 key=(repo, "trace_wide", TRACE_FOCAL))
+            wider_steps = trace_steps(wider) or []
+        except ProbeError:
+            wider_steps = []
+        wider_names = [str(step.get("entity_name") or "") for step in wider_steps]
+        if TRACE_LOAD_BEARING in wider_names:
+            res.bad("the walk does not reach %s at the stranger's budget but a wider "
+                    "one does, so the edge is in the graph and the ranking spent the "
+                    "budget elsewhere: %r steps omitted, %d returned. Trusted alone "
+                    "this answer says verify reaches TLS at cert_verify and stops, "
+                    "missing the pool-key path that governs connection reuse"
+                    % (TRACE_LOAD_BEARING, omitted, len(steps)))
+        elif not wider_steps:
+            res.unknown("the walk does not reach %s and the wider probe returned "
+                        "nothing, so this cannot be told from a broken probe"
+                        % TRACE_LOAD_BEARING)
+        else:
+            res.unknown("neither the stranger's walk nor a wider one reaches %s, so "
+                        "the edge is absent from the graph rather than outranked; "
+                        "that is a different defect from this one and must not be "
+                        "reported as a ranking failure" % TRACE_LOAD_BEARING)
+
+    # Arm three: ordering. A raise target above a row the value travels through is
+    # the mechanism, and it is what a revert of the ranking change restores.
+    misordered = []
+    by_depth = {}
+    for index, step in enumerate(steps):
+        by_depth.setdefault(step.get("depth"), []).append((index, step))
+    for depth, rows in sorted(by_depth.items(), key=lambda item: (item[0] is None, item[0])):
+        last_flow = None
+        for position, (_index, step) in enumerate(rows):
+            if str(step.get("entity_name") or "") not in TRACE_RAISE_TARGETS:
+                last_flow = position
+        if last_flow is None:
+            continue
+        for position, (_index, step) in enumerate(rows[:last_flow]):
+            name = str(step.get("entity_name") or "")
+            if name in TRACE_RAISE_TARGETS:
+                misordered.append((depth, position, name))
+    if misordered:
+        sample = ", ".join("%s at depth %s position %d" % (name, depth, position)
+                           for depth, position, name in misordered[:6])
+        res.bad("%d raise target(s) rank above a row the value travels through: %s. "
+                "These are `raise` operands in `except` blocks, not data flow, and "
+                "at a bounded budget they take the slots the chain needs"
+                % (len(misordered), sample))
+    else:
+        present = sorted({name for name in names if name in TRACE_RAISE_TARGETS})
+        res.ok("no raise target ranks above a data-flow row%s"
+               % (" (%s present and ranked below)" % ", ".join(present) if present
+                  else "; none appeared in the walk"))
+
+    # Arm four: half two of the ticket. A boundary that stands mute cannot be told
+    # from a typo.
+    external = [step for step in steps if step.get("external") is True]
+    mute = []
+    for step in external:
+        crossing = step.get("crossing")
+        if not isinstance(crossing, dict) or not str(crossing.get("status") or "").strip():
+            mute.append(str(step.get("entity_name") or "?"))
+    if not external:
+        res.ok("the walk touched no external node, so no crossing was owed")
+    elif mute:
+        res.bad("%d of %d external node(s) name no crossing (%s); a bare external "
+                "symbol cannot be told from a package, a builtin or a typo"
+                % (len(mute), len(external), ", ".join(sorted(set(mute))[:6])))
+    else:
+        statuses = sorted({str(step["crossing"].get("status")) for step in external})
+        res.ok("all %d external node(s) name their crossing (status %s)"
+               % (len(external), "/".join(statuses)))
+
+
     return res
 
 
@@ -1691,6 +1877,7 @@ CHECKS = [
     ("7", check_7),
     ("8", check_8),
     ("9", check_9),
+    ("10", check_10),
 ]
 
 
