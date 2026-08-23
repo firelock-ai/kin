@@ -518,6 +518,17 @@ impl DaemonKillRecord {
     pub fn cause_sentence(&self) -> String {
         let since = hhmm_utc(self.first_unix);
         let opening = match (self.memory_kills, self.kills, self.last_cause) {
+            // Signal zero is the record saying it has no signal, not a signal
+            // numbered zero, and it is what an unwatched death carries: nobody
+            // waited on the process, so its exit status is gone. Rendering that
+            // as "killed by signal 0" states a fact about the kernel that no
+            // kernel ever reported, which is the same failure as the idle
+            // window one turn smaller.
+            (0, kills, DaemonKillCause::Unattributed { signal: 0 }) => format!(
+                "the daemon for this store was killed {kills} time(s) since {since} with nothing \
+                 waiting on it, so its exit signal is gone, and this host publishes no memory \
+                 accounting, so nothing here attributes that to memory"
+            ),
             (0, kills, DaemonKillCause::Unattributed { signal }) => format!(
                 "the daemon for this store was killed by signal {signal} {kills} time(s) since \
                  {since}, and this host publishes no memory accounting, so nothing here \
@@ -844,6 +855,56 @@ pub fn settle_unwatched_daemon_death(kin_root: &Path) -> Option<DaemonKillRecord
     if read_daemon_death_note(kin_root).is_some_and(|note| note.pid == serving.pid) {
         return None;
     }
+    let record = accumulate_kill(
+        read_daemon_kill_record(kin_root),
+        grade_unwatched_death(kin_root, &serving),
+    );
+    write_daemon_kill_record(kin_root, &record);
+    Some(record)
+}
+
+/// The same reading [`settle_unwatched_daemon_death`] takes, without taking it.
+///
+/// A surface that has to SAY what happened runs before anything has settled it.
+/// The process that watched `kin init` finish is the one holding the daemon's
+/// silence, and the record it needs is not written until the next daemon
+/// starts, which on that path is never: the run ends. So this answers the same
+/// question read-only, and settlement stays where it belongs, at the next
+/// start, counted once.
+///
+/// It is the serving record and not [`read_daemon_kill_record`] on purpose. The
+/// kill record accumulates and outlives every daemon that follows it, so a
+/// message built from it can blame a kill from last week for an idle exit
+/// today. The serving record cannot: it is overwritten at each start and
+/// retired by a clean exit, so its survival beside a dead pid describes THIS
+/// store's most recent daemon and no other.
+///
+/// The returned record describes that one death, so it reads `kills: 1`. It is
+/// what the store WOULD record, not what the store has recorded, and a caller
+/// wanting the tally reads [`read_daemon_kill_record`] instead.
+pub fn peek_unwatched_daemon_death(kin_root: &Path) -> Option<DaemonKillRecord> {
+    let serving = read_serving_daemon(kin_root)?;
+    if process_is_alive(serving.pid) {
+        return None;
+    }
+    if read_daemon_death_note(kin_root).is_some_and(|note| note.pid == serving.pid) {
+        return None;
+    }
+    Some(grade_unwatched_death(kin_root, &serving))
+}
+
+/// Grade one unwatched death into the record it becomes.
+///
+/// Shared by the settling path and the read-only peek so the two can never
+/// describe one death differently, which is the whole failure this ticket is
+/// about wearing a smaller costume.
+///
+/// The attribution is graded exactly as a watched kill's is: the counter having
+/// moved between the dead daemon's start and now is the kernel's own statement
+/// and becomes `MemoryLimit`; anything else is `Unattributed`, because a
+/// counter that did not move attributes nothing and a host that cannot be asked
+/// attributes nothing either.
+fn grade_unwatched_death(kin_root: &Path, serving: &ServingDaemon) -> DaemonKillRecord {
     let now = cgroup_memory();
     let kernel_oom_kills = match (serving.oom_kills_at_start, now.oom_kills) {
         (Some(before), Some(after)) if after > before => Some(after - before),
@@ -856,7 +917,7 @@ pub fn settle_unwatched_daemon_death(kin_root: &Path) -> Option<DaemonKillRecord
         // signal nobody observed.
         None => (DaemonKillCause::Unattributed { signal: 0 }, 0),
     };
-    let fresh = DaemonKillRecord {
+    DaemonKillRecord {
         kills: 1,
         memory_kills,
         first_unix: unix_now(),
@@ -867,10 +928,7 @@ pub fn settle_unwatched_daemon_death(kin_root: &Path) -> Option<DaemonKillRecord
         last_rss_bytes: read_open_transaction(kin_root)
             .filter(|open| open.pid == serving.pid)
             .and_then(|open| open.peak_rss_bytes.max(open.rss_bytes)),
-    };
-    let record = accumulate_kill(read_daemon_kill_record(kin_root), fresh);
-    write_daemon_kill_record(kin_root, &record);
-    Some(record)
+    }
 }
 
 /// A store whose language-server enrichment has been switched off by the
@@ -7972,6 +8030,114 @@ mod tests {
         assert!(read_daemon_kill_record(dir.path()).is_none());
     }
 
+    /// The peek reads what settling would take, and leaves it there.
+    ///
+    /// FIR-2650's reporting half. The surface that has to SAY a daemon died
+    /// runs before anything has settled the death: `kin init` watched the
+    /// silence and the record is not written until a daemon starts again,
+    /// which on that path never happens. A peek that consumed the evidence
+    /// would fix one surface by blinding the next one.
+    #[test]
+    fn peeking_a_death_names_it_without_taking_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let dead = u32::MAX;
+        fs::write(
+            serving_path(dir.path()),
+            serde_json::to_vec(&ServingDaemon {
+                pid: dead,
+                oom_kills_at_start: Some(0),
+                at_unix: 1_000,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let peeked = peek_unwatched_daemon_death(dir.path())
+            .expect("a serving record whose process is gone is a death this store can name");
+        assert_eq!(peeked.kills, 1);
+        assert_eq!(peeked.last_pid, Some(dead));
+        // Nothing was consumed and nothing was written, so the next start still
+        // settles this death and counts it exactly once.
+        assert!(read_serving_daemon(dir.path()).is_some());
+        assert!(read_daemon_kill_record(dir.path()).is_none());
+        assert!(peek_unwatched_daemon_death(dir.path()).is_some());
+        assert_eq!(
+            settle_unwatched_daemon_death(dir.path()).map(|r| r.kills),
+            Some(1),
+            "the peek left the settling path exactly the work it had before"
+        );
+    }
+
+    /// The peek and the settlement grade one death the same way.
+    ///
+    /// Two readers describing one ending differently is the failure this ticket
+    /// is about at a smaller scale, so the grading is shared and this is what
+    /// holds it shared.
+    #[test]
+    fn the_peek_and_the_settlement_agree_on_one_death() {
+        let dir = tempfile::tempdir().unwrap();
+        let dead = u32::MAX;
+        fs::write(
+            serving_path(dir.path()),
+            serde_json::to_vec(&ServingDaemon {
+                pid: dead,
+                oom_kills_at_start: Some(0),
+                at_unix: 1_000,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let peeked = peek_unwatched_daemon_death(dir.path()).expect("a death to grade");
+        let settled = settle_unwatched_daemon_death(dir.path()).expect("the same death");
+        assert_eq!(peeked.last_cause, settled.last_cause);
+        assert_eq!(peeked.memory_kills, settled.memory_kills);
+        assert_eq!(peeked.last_pid, settled.last_pid);
+        assert_eq!(peeked.limit_bytes, settled.limit_bytes);
+    }
+
+    /// A daemon that is still serving is not a death on the peek either.
+    #[test]
+    fn peeking_a_living_daemon_names_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        publish_serving_daemon(dir.path(), std::process::id());
+        assert!(peek_unwatched_daemon_death(dir.path()).is_none());
+    }
+
+    /// A death its killer explained is not re-explained by the peek.
+    #[test]
+    fn peeking_skips_a_death_its_author_already_explained() {
+        let dir = tempfile::tempdir().unwrap();
+        let dead = u32::MAX;
+        write_daemon_death_note(
+            dir.path(),
+            &DaemonDeathNote {
+                pid: dead,
+                killed_by: "kin-supervisor-reaper".to_string(),
+                reason: "a deliberate reap".to_string(),
+                in_flight: None,
+                at: "2026-08-23T00:00:00Z".to_string(),
+            },
+        );
+        fs::write(
+            serving_path(dir.path()),
+            serde_json::to_vec(&ServingDaemon {
+                pid: dead,
+                oom_kills_at_start: Some(0),
+                at_unix: 1_000,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(peek_unwatched_daemon_death(dir.path()).is_none());
+    }
+
+    /// A store that never served names no death.
+    #[test]
+    fn peeking_a_store_that_never_served_names_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(peek_unwatched_daemon_death(dir.path()).is_none());
+    }
+
     const TWELVE_GIB: u64 = 12 * 1024 * 1024 * 1024;
 
     fn counted(oom_kills: u64) -> CgroupMemory {
@@ -8119,6 +8285,42 @@ mod tests {
             !record.attributed_to_memory(),
             "nothing here attributed it to memory"
         );
+    }
+
+    /// A death nobody waited on has no signal, and must not be given one.
+    ///
+    /// An unwatched kill is recorded with signal zero, which is the record
+    /// saying it has no signal rather than a signal numbered zero. Printed as
+    /// "killed by signal 0" it states something about the kernel that no kernel
+    /// reported, which is the same defect as the idle window one turn smaller.
+    /// Found by running the FIR-2650 surfaces against a real SIGKILL on macOS,
+    /// where nothing can attribute a kill.
+    #[test]
+    fn a_death_with_no_observed_signal_does_not_invent_one() {
+        let record = DaemonKillRecord {
+            kills: 1,
+            memory_kills: 0,
+            first_unix: 1_787_000_000,
+            last_unix: 1_787_000_000,
+            last_pid: Some(4103),
+            last_cause: DaemonKillCause::Unattributed { signal: 0 },
+            limit_bytes: None,
+            last_rss_bytes: None,
+        };
+        let sentence = record.cause_sentence();
+        assert!(
+            !sentence.contains("signal 0"),
+            "signal zero is the absence of a signal, not one: {sentence}"
+        );
+        assert!(
+            sentence.contains("killed"),
+            "it is still a kill and still has to say so: {sentence}"
+        );
+        assert!(
+            sentence.contains("nothing waiting on it"),
+            "why the signal is missing is the whole of what is known: {sentence}"
+        );
+        assert!(sentence.contains("no memory accounting"), "{sentence}");
     }
 
     /// Every action in the remediation is one the caller can perform, and the

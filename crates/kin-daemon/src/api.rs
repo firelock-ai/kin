@@ -3523,6 +3523,10 @@ async fn command_status(
         request.json,
         Some(build),
         Some(&kin_cli::commands::store_footprint::StoreFootprint::measure(&state.layout)),
+        // What this store has recorded about daemons of its own that were
+        // killed. Read from the store rather than remembered by this process,
+        // because the daemon that died is by definition not this one.
+        kin_cli::daemon_death::recorded_for_store(state.layout.root()).as_ref(),
     )
     .map_err(internal_error)?;
     Ok(Json(response))
