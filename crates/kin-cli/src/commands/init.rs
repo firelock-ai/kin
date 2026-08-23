@@ -1318,6 +1318,71 @@ mod tests {
         }
     }
 
+    /// The measured FIR-2650 summary, and the two stores it could not tell
+    /// apart.
+    ///
+    /// `kin init` exited 0 over a 1.1 GB store and summarized the enrichment as
+    /// "present (... ; completion not attested)" while the daemon that would
+    /// have finished it lay OOM-killed. Every word of that is also true of a
+    /// healthy store nobody has certified yet, so the reader had no signal at
+    /// all. This surface prints once per repository, which no scripted check can
+    /// re-ask, so the rendering is pinned here.
+    ///
+    /// The quiet arm is not decoration. A build that named a kill
+    /// unconditionally would pass the killed arm and alarm every ordinary user.
+    #[test]
+    fn a_killed_daemon_changes_the_enrichment_summary_and_nothing_else_does() {
+        let status = enrichment(SemanticEnrichmentPresence::Present, 1058);
+
+        let quiet = render_semantic_enrichment(&status, None);
+        assert!(
+            quiet.contains("completion not attested"),
+            "the caveat is true of every store and stays: {quiet}"
+        );
+        assert!(
+            !quiet.contains("killed"),
+            "a store that lost no daemon must not report one: {quiet}"
+        );
+        assert!(
+            enrichment_kill_warning(None).is_none(),
+            "and it carries no warning line at all"
+        );
+
+        let record = kin_daemon_spawn::DaemonKillRecord {
+            kills: 1,
+            memory_kills: 1,
+            first_unix: 1_787_000_000,
+            last_unix: 1_787_000_000,
+            last_pid: Some(4103),
+            last_cause: kin_daemon_spawn::DaemonKillCause::MemoryLimit {
+                kernel_oom_kills: 1,
+            },
+            limit_bytes: Some(12 * 1024 * 1024 * 1024),
+            last_rss_bytes: Some(11 * 1024 * 1024 * 1024),
+        };
+        let killed = render_semantic_enrichment(&status, Some(&record));
+        assert!(
+            killed.contains("1058 entities"),
+            "the counts are still true and still printed: {killed}"
+        );
+        assert!(
+            killed.contains("completion not attested") && killed.contains("killed"),
+            "the caveat alone was the defect, so both halves are required: {killed}"
+        );
+
+        let warning = enrichment_kill_warning(Some(&record))
+            .expect("a store with a kill on record carries the line that explains it");
+        assert!(warning.contains("memory limit"), "{warning}");
+        assert!(
+            warning.contains("12.0 GiB"),
+            "a kill named without its figure is not actionable: {warning}"
+        );
+        assert!(
+            warning.contains("To recover:"),
+            "and a cause with no remedy is most of the way back to the parenthetical: {warning}"
+        );
+    }
+
     /// The non-empty-directory refusal offers "commit the exact files to Git"
     /// as its first remedy. Measured on a fresh ubuntu:24.04 curl install, that
     /// host has no git at all, so the remedy names a command the reader does
