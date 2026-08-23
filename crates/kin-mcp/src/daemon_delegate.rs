@@ -560,7 +560,13 @@ pub fn is_still_starting_error(message: &str) -> bool {
 /// `kin` command boots a daemon this MCP server then talks to, and a record
 /// only one of them could see would be missing exactly when it is wanted.
 pub(crate) fn recorded_daemon_kill() -> Option<kin_daemon_spawn::DaemonKillRecord> {
-    kin_daemon_spawn::read_daemon_kill_record(&discover_kin_dir()?)
+    let kin_dir = discover_kin_dir()?;
+    // A death this store has not settled yet answers first, because settlement
+    // happens at the next daemon start and the agent reading this error is
+    // being served by a session that may not start one. The tally alone would
+    // have said nothing at exactly the moment a daemon had just been killed.
+    kin_daemon_spawn::peek_unwatched_daemon_death(&kin_dir)
+        .or_else(|| kin_daemon_spawn::read_daemon_kill_record(&kin_dir))
 }
 
 /// Whether this store's enrichment sweeps are currently suspended.

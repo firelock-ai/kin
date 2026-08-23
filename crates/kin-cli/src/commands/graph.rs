@@ -934,7 +934,11 @@ fn build_graph_status_response_for_store(
     // store whose daemon has been killed twenty-five times prints a clean
     // report with an all-clear under it. The store's own record is the only
     // thing that remembers, and this is the page a reader is already on.
-    if let Some(record) = kin_root.and_then(kin_daemon_spawn::read_daemon_kill_record) {
+    // The store's tally OR a death it has not settled yet, for the reason the
+    // `kin doctor` row reads both: settlement happens at the next daemon start,
+    // and a reader asking this page why the numbers stopped moving may not have
+    // started one since the daemon died.
+    if let Some(record) = kin_root.and_then(crate::daemon_death::recorded_for_store) {
         warnings.push(record.summary());
     }
     // A suspended sweep is invisible in the same way, and worse: every counter

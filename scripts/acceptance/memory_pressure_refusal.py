@@ -94,6 +94,10 @@ PASS = "PASS"
 FAIL = "FAIL"
 UNREADABLE = "UNREADABLE"
 TICKET = "FIR-2614"
+# The daemon-death checks are a distinct ticket in the same class, and a CHECK
+# line is the whole of what a reader sees when one fails. Labelling them with
+# the suite's ticket sent that reader to the wrong issue.
+TICKET_DEATH = "FIR-2650"
 
 # The doctor row and the durable record this suite is about.
 ROW_ID = "host_memory_pressure"
@@ -809,7 +813,7 @@ def check_6(suite):
     demanding a promise nobody makes and would stay red against a correct fix.
     """
     result = Result(
-        "6", TICKET,
+        "6", TICKET_DEATH,
         "a killed daemon is reported as a death, not as an idle-window exit",
     )
     repo = suite.fixture("killed")
@@ -890,7 +894,7 @@ def check_7(suite):
     capped container covers end to end.
     """
     result = Result(
-        "7", TICKET,
+        "7", TICKET_DEATH,
         "a kill the kernel attributed to memory is named as one, with the ceiling",
     )
     repo = suite.fixture("oomnamed")
@@ -972,7 +976,7 @@ def check_8(suite):
     did retire.
     """
     result = Result(
-        "8", TICKET,
+        "8", TICKET_DEATH,
         "a request lost to a killed daemon is not explained as an idle-window exit",
     )
 
@@ -1031,6 +1035,40 @@ def check_8(suite):
         result.bad("kin named neither an idle window nor a death for a daemon it had just "
                    "lost, so the reader is left with a socket error. Output: %s"
                    % tail(out, 900))
+
+    # The window check 6 cannot see. Check 6 starts a successor before asking,
+    # which settles the death into the store's tally, so it proves the tally is
+    # read and says nothing about the moment before one exists. A reader who
+    # runs `kin doctor` right after watching a command die has started no
+    # successor, and that reader used to be told no daemon serving this store
+    # had ever been killed.
+    #
+    # The absent tally file is what makes this arm discriminating: with no tally
+    # to read, a row that reports the kill can only have read the unsettled
+    # death, and a build without that reading is left saying "healthy".
+    if os.path.exists(suite.kill_record_path(repo)):
+        result.unknown("something settled the death into %s before this arm ran, so a "
+                       "reported kill no longer proves the unsettled reading"
+                       % suite.kill_record_path(repo))
+        return result
+    rc, out = suite.kin_run(["doctor", "--json"], repo, pressure="nominal",
+                            daemon_url=endpoint)
+    try:
+        report = json.loads(out[out.index("{"):out.rindex("}") + 1])
+    except (ValueError, json.JSONDecodeError):
+        result.unknown("`kin doctor --json` payload was not JSON: %s" % tail(out))
+        return result
+    row = next((r for r in report.get("checks", [])
+                if r.get("id") == "daemon_kill_record"), None)
+    if row is None:
+        result.unknown("this build's doctor report carries no `daemon_kill_record` row")
+    elif row.get("status") == "healthy":
+        result.bad("the doctor row reads healthy on a store whose daemon was killed and "
+                   "whose death nothing has settled yet, which is the state a reader is in "
+                   "the moment a command dies: %s" % json.dumps(row))
+    else:
+        result.ok("the doctor row reports a kill nothing has settled yet (status=%s)"
+                  % row.get("status"))
     return result
 
 
@@ -1059,7 +1097,7 @@ def check_9(suite):
     rendering is covered by unit test in `commands/init.rs` instead.
     """
     result = Result(
-        "9", TICKET,
+        "9", TICKET_DEATH,
         "an unattested enrichment names the daemon kill behind it, or names none",
     )
 
