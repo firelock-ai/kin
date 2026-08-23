@@ -1928,7 +1928,8 @@ enum McpAction {
     /// lands on the default PATH. Name the prefix outright when that is what
     /// you want: `npm install -g --prefix /usr/local @kinlab/kin`.
     Start {
-        /// Run in global mode, serving all registered repos from ~/.kin/registry.toml
+        /// Run in global mode, serving every repo in this home's registry
+        /// (KIN_REGISTRY_PATH, else <KIN_HOME>/registry.toml, else ~/.kin/registry.toml)
         #[arg(long)]
         global: bool,
         /// Bind this server to a specific Kin repository instead of relying on
