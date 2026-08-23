@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::{
     identity::{
         append_canonical_key, append_canonical_object_header, append_canonical_seq,
-        append_canonical_value, canonical_json_bytes,
+        append_canonical_value, canonical_json_bytes, CanonicalSink, CountingSink, HashingSink,
     },
     validate_semantic_change_id, validate_transaction_delta, AuthorId, DefaultRefMutation,
     EffectiveAdmissionPolicyStamp, EntityDelta, ExternalChangeAlias, ExternalObjectKind,
@@ -1240,15 +1240,38 @@ impl<'a> CanonicalTransaction<'a> {
 /// same fields from the same constant rather than from a copy that can drift.
 const HUMAN_READABLE_FIELD_COUNT: usize = 15;
 
+/// Domain separator hashed ahead of a repository transaction's preimage.
+///
+/// Named rather than spelled at the one call site because the streaming hash
+/// writes it through the same sink as the payload, and the buffered reference
+/// the tests keep must write the identical bytes for the comparison to mean
+/// anything.
+const REPOSITORY_TRANSACTION_HASH_DOMAIN: &[u8] = b"kin-repository-transaction-v4\0";
+
 impl CanonicalTransaction<'_> {
-    /// This transaction's canonical preimage, built one field at a time.
+    /// This transaction's canonical preimage, collected into one `Vec`.
+    ///
+    /// Only the tests want this. They compare whole encodings byte for byte and
+    /// pin them by digest, which needs the bytes in hand; production hashes them
+    /// as they are produced and never holds them.
+    #[cfg(test)]
+    fn canonical_preimage(&self) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.write_canonical_preimage(&mut out)?;
+        Ok(out)
+    }
+
+    /// This transaction's canonical preimage, written one field at a time into
+    /// any sink.
     ///
     /// Byte-for-byte what `canonical_json_bytes` over the whole view produces,
     /// and the corpus test asserts exactly that against the whole-tree path. The
-    /// difference is what is resident while it is produced: the whole-tree path
+    /// difference is what is resident while it is produced. The whole-tree path
     /// builds a `serde_json::Value` of the entire transaction, measured at
-    /// eleven times the transaction's own size and 76 percent of the hash's
-    /// peak, where this holds one array element's tree at a time.
+    /// eleven times the transaction's own size, where this holds one array
+    /// element's tree at a time; and writing into a sink rather than returning a
+    /// `Vec` means the caller need not hold the encoding either, which on a
+    /// bootstrap commit is the entire converted history.
     ///
     /// Two obligations come with hand-writing the framing, and both are tested
     /// rather than trusted.
@@ -1264,59 +1287,58 @@ impl CanonicalTransaction<'_> {
     /// independently. `the_preimage_field_set_matches_the_serialized_one` fails
     /// if a field is added to one and not the other, which is the failure that
     /// would otherwise move every identity in every store on disk silently.
-    fn canonical_preimage(&self) -> Result<Vec<u8>> {
+    fn write_canonical_preimage<S: CanonicalSink>(&self, out: &mut S) -> Result<()> {
         let source = self.source;
         let field_count = HUMAN_READABLE_FIELD_COUNT
             + usize::from(source.merge_transaction_delta.is_some())
             + usize::from(source.sealed_observation.is_some());
 
-        let mut out = Vec::new();
-        append_canonical_object_header(&mut out, field_count)?;
+        append_canonical_object_header(out, field_count)?;
 
-        append_canonical_key(&mut out, "actor")?;
-        append_canonical_value(&mut out, &source.actor)?;
-        append_canonical_key(&mut out, "aliases")?;
-        append_canonical_seq(&mut out, &self.aliases)?;
-        append_canonical_key(&mut out, "changes")?;
-        append_canonical_seq(&mut out, &self.changes)?;
-        append_canonical_key(&mut out, "default_ref_mutation")?;
-        append_canonical_value(&mut out, &source.default_ref_mutation)?;
-        append_canonical_key(&mut out, "expected_generation")?;
-        append_canonical_value(&mut out, &source.expected_generation)?;
-        append_canonical_key(&mut out, "expected_roots")?;
-        append_canonical_value(&mut out, &source.expected_roots)?;
-        append_canonical_key(&mut out, "external_objects")?;
-        append_canonical_seq(&mut out, &self.external_objects)?;
-        append_canonical_key(&mut out, "git_authority_delta")?;
-        append_canonical_value(&mut out, &source.git_authority_delta)?;
-        append_canonical_key(&mut out, "local_overlay_delta")?;
-        append_canonical_value(&mut out, &source.local_overlay_delta)?;
+        append_canonical_key(out, "actor")?;
+        append_canonical_value(out, &source.actor)?;
+        append_canonical_key(out, "aliases")?;
+        append_canonical_seq(out, &self.aliases)?;
+        append_canonical_key(out, "changes")?;
+        append_canonical_seq(out, &self.changes)?;
+        append_canonical_key(out, "default_ref_mutation")?;
+        append_canonical_value(out, &source.default_ref_mutation)?;
+        append_canonical_key(out, "expected_generation")?;
+        append_canonical_value(out, &source.expected_generation)?;
+        append_canonical_key(out, "expected_roots")?;
+        append_canonical_value(out, &source.expected_roots)?;
+        append_canonical_key(out, "external_objects")?;
+        append_canonical_seq(out, &self.external_objects)?;
+        append_canonical_key(out, "git_authority_delta")?;
+        append_canonical_value(out, &source.git_authority_delta)?;
+        append_canonical_key(out, "local_overlay_delta")?;
+        append_canonical_value(out, &source.local_overlay_delta)?;
         if source.merge_transaction_delta.is_some() {
-            append_canonical_key(&mut out, "merge_transaction_delta")?;
-            append_canonical_value(&mut out, &source.merge_transaction_delta)?;
+            append_canonical_key(out, "merge_transaction_delta")?;
+            append_canonical_value(out, &source.merge_transaction_delta)?;
         }
-        append_canonical_key(&mut out, "operation_id")?;
-        append_canonical_value(&mut out, &source.operation_id)?;
+        append_canonical_key(out, "operation_id")?;
+        append_canonical_value(out, &source.operation_id)?;
         // "reason" sorts before "ref_mutations": they share "re", and 'a' is
         // below 'f'. Writing them the other way round is the mistake this
         // ordering is easiest to make, and the corpus caught it on the first
         // run.
-        append_canonical_key(&mut out, "reason")?;
-        append_canonical_value(&mut out, &source.reason.as_str())?;
-        append_canonical_key(&mut out, "ref_mutations")?;
-        append_canonical_seq(&mut out, &self.ref_mutations)?;
-        append_canonical_key(&mut out, "repository_id")?;
-        append_canonical_value(&mut out, &source.repository_id)?;
-        append_canonical_key(&mut out, "schema_version")?;
-        append_canonical_value(&mut out, &source.schema_version)?;
+        append_canonical_key(out, "reason")?;
+        append_canonical_value(out, &source.reason.as_str())?;
+        append_canonical_key(out, "ref_mutations")?;
+        append_canonical_seq(out, &self.ref_mutations)?;
+        append_canonical_key(out, "repository_id")?;
+        append_canonical_value(out, &source.repository_id)?;
+        append_canonical_key(out, "schema_version")?;
+        append_canonical_value(out, &source.schema_version)?;
         if source.sealed_observation.is_some() {
-            append_canonical_key(&mut out, "sealed_observation")?;
-            append_canonical_value(&mut out, &source.sealed_observation)?;
+            append_canonical_key(out, "sealed_observation")?;
+            append_canonical_value(out, &source.sealed_observation)?;
         }
-        append_canonical_key(&mut out, "workspace_mutation")?;
-        append_canonical_value(&mut out, &self.workspace_mutation)?;
+        append_canonical_key(out, "workspace_mutation")?;
+        append_canonical_value(out, &self.workspace_mutation)?;
 
-        Ok(out)
+        Ok(())
     }
 }
 
@@ -1778,8 +1800,38 @@ impl RepositoryTransaction {
     /// not satisfy `validate`. Callers outside tests want `transaction_hash`,
     /// which validates first.
     fn canonical_hash(&self) -> Result<Hash256> {
-        let payload = CanonicalTransaction::new(self).canonical_preimage()?;
-        hash_preimage(b"kin-repository-transaction-v4\0", &payload)
+        let view = CanonicalTransaction::new(self);
+
+        // Two passes over the same walk, because the preimage's length is
+        // hashed AHEAD of the preimage and a hasher cannot be told the length
+        // afterwards. The first pass counts and keeps nothing; the second
+        // hashes and keeps nothing. What neither does is hold the encoding,
+        // which on a bootstrap commit is the entire converted history.
+        let mut counter = CountingSink::default();
+        view.write_canonical_preimage(&mut counter)?;
+        let payload_len = counter.len();
+
+        let mut sink = HashingSink::new();
+        sink.write_bytes(REPOSITORY_TRANSACTION_HASH_DOMAIN);
+        sink.write_bytes(&payload_len.to_le_bytes());
+        let header_len = sink.written();
+        view.write_canonical_preimage(&mut sink)?;
+
+        // The two passes walk the same immutable view, so they agree or
+        // something under them is not deterministic. Refuse rather than return
+        // a well-formed hash of a preimage whose length prefix contradicts its
+        // payload, because every transaction identity in every store on disk is
+        // this value.
+        let hashed_payload = sink.written() - header_len;
+        if hashed_payload != payload_len {
+            return Err(ModelError::InvalidOperation(format!(
+                "canonical preimage length pass counted {payload_len} bytes and the \
+                 hashing pass wrote {hashed_payload}; the transaction hash is not \
+                 derivable from a non-deterministic encoding"
+            )));
+        }
+
+        Ok(Hash256::from_bytes(sink.finish()))
     }
 }
 
@@ -1877,6 +1929,7 @@ pub fn compute_resolved_tree_hash(tree: &ResolvedTree) -> Result<Hash256> {
 /// incrementally reaches the same domain separation and the same length prefix
 /// without going back through a whole-document `serde_json::Value`. The bytes
 /// hashed are identical either way; only who built them differs.
+#[cfg(test)]
 fn hash_preimage(domain: &[u8], payload: &[u8]) -> Result<Hash256> {
     let mut hasher = Sha256::new();
     hasher.update(domain);
@@ -4132,6 +4185,158 @@ mod tests {
                 &incremental[from..(at + 24).min(incremental.len())],
             );
         }
+    }
+
+    /// The streamed hash is the buffered hash, and both are the cloning
+    /// reference's hash, for every corpus shape.
+    ///
+    /// This is the acceptance for hashing without holding the preimage. Three
+    /// implementations are compared rather than two: the shipped streaming
+    /// hash, the same preimage buffered whole and then hashed, and the original
+    /// reference that clones the transaction and encodes it as one
+    /// `serde_json::Value` tree. Every transaction identity in every store on
+    /// disk is this value, so the chain has to reach back to the implementation
+    /// those stores were written under, not only to the one it directly
+    /// replaces.
+    #[test]
+    fn the_streamed_hash_is_the_buffered_hash_for_every_corpus_shape() {
+        for (name, transaction) in preimage_corpus() {
+            let payload = CanonicalTransaction::new(&transaction)
+                .canonical_preimage()
+                .unwrap();
+            let buffered = hash_preimage(REPOSITORY_TRANSACTION_HASH_DOMAIN, &payload).unwrap();
+            let streamed = transaction.canonical_hash().unwrap();
+
+            assert_eq!(
+                streamed,
+                buffered,
+                "`{name}` hashes differently streamed than buffered over its \
+                 {}-byte preimage",
+                payload.len()
+            );
+            assert_eq!(
+                streamed,
+                reference_canonical_hash(&transaction).unwrap(),
+                "`{name}` hashes differently than the cloning whole-tree reference \
+                 every store on disk was written under"
+            );
+        }
+    }
+
+    /// A field that moves moves the hash.
+    ///
+    /// Every byte-identity test in this family proves SAMENESS, and a hash that
+    /// returned a constant would satisfy all of them. This is the other
+    /// direction, and it is what makes them mean anything.
+    #[test]
+    fn a_mutated_field_changes_the_streamed_hash() {
+        type Mutation = (&'static str, fn(&mut RepositoryTransaction) -> bool);
+        let mutations: [Mutation; 5] = [
+            ("reason", |transaction| {
+                transaction.reason.push('!');
+                true
+            }),
+            ("expected_generation", |transaction| {
+                transaction.expected_generation += 1;
+                true
+            }),
+            ("a change's message", |transaction| {
+                let Some(change) = transaction.changes.first_mut() else {
+                    return false;
+                };
+                change.message.push('!');
+                true
+            }),
+            ("dropping a change", |transaction| {
+                transaction.changes.pop().is_some()
+            }),
+            ("duplicating a change", |transaction| {
+                let Some(first) = transaction.changes.first().cloned() else {
+                    return false;
+                };
+                transaction.changes.push(first);
+                true
+            }),
+        ];
+
+        let mut exercised = 0_usize;
+        for (name, transaction) in preimage_corpus() {
+            let before = transaction.canonical_hash().unwrap();
+            for (label, mutate) in &mutations {
+                let mut mutated = transaction.clone();
+                if !mutate(&mut mutated) {
+                    continue;
+                }
+                exercised += 1;
+                assert_ne!(
+                    mutated.canonical_hash().unwrap(),
+                    before,
+                    "mutating {label} on `{name}` left the transaction hash unchanged"
+                );
+            }
+        }
+
+        // The corpus carries shapes with no changes at all, whose three
+        // change-shaped mutations do not apply. Without this the loop could
+        // skip every mutation and report success.
+        assert!(
+            exercised >= 20,
+            "only {exercised} mutations actually applied, so this test is not \
+             exercising what it claims to"
+        );
+    }
+
+    /// The hash does not hold its own preimage.
+    ///
+    /// The quantitative half of the streaming change, and the reason the
+    /// fixture is 400 small changes rather than one large one. The term removed
+    /// is the WHOLE encoding; the term kept is one array element's
+    /// `serde_json::Value` tree. A fixture with few, large changes makes those
+    /// two the same size and the guard cannot fail. Spreading the same payload
+    /// across many changes is what separates them.
+    ///
+    /// The threshold is calibrated against the preimage's own measured length
+    /// rather than a constant, so there is nothing here to drift: buffering a
+    /// preimage costs the preimage, and streaming it costs approximately
+    /// nothing, so the saving is approximately the preimage.
+    #[test]
+    fn the_transaction_hash_does_not_hold_its_own_preimage() {
+        let transaction = large_transaction(400);
+
+        // Warm any lazily-initialized state so it is not charged to one arm.
+        transaction.canonical_hash().unwrap();
+
+        let preimage_len = CanonicalTransaction::new(&transaction)
+            .canonical_preimage()
+            .unwrap()
+            .len();
+
+        let buffered = measure_peak_live_bytes(|| {
+            let payload = CanonicalTransaction::new(&transaction)
+                .canonical_preimage()
+                .unwrap();
+            hash_preimage(REPOSITORY_TRANSACTION_HASH_DOMAIN, &payload).unwrap();
+        });
+        let streamed = measure_peak_live_bytes(|| {
+            transaction.canonical_hash().unwrap();
+        });
+        println!(
+            "preimage {preimage_len} buffered {buffered} streamed {streamed} saved {}",
+            buffered.saturating_sub(streamed)
+        );
+
+        assert!(
+            preimage_len > 0 && buffered > 0 && streamed > 0,
+            "the allocation probe measured nothing, so it cannot fail: preimage \
+             {preimage_len}, buffered {buffered}, streamed {streamed}"
+        );
+        let saved = buffered.saturating_sub(streamed);
+        assert!(
+            saved * 4 >= preimage_len * 3,
+            "hashing streamed rather than buffered saved {saved} bytes of a \
+             {preimage_len}-byte preimage ({buffered} buffered against {streamed} \
+             streamed); the hash is holding its own encoding again"
+        );
     }
 
     /// The hand-written field list is the serialized field set, exactly.

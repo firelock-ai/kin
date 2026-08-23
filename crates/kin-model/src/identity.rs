@@ -293,6 +293,99 @@ fn append_len_prefixed_hash_field(hasher: &mut Sha256, value: &[u8]) -> Result<(
 /// Sequence order is a different question and IS preserved: the `Value::Array`
 /// arm encodes elements in the order it receives them. Collections whose order
 /// must not affect identity are sorted by their callers before they arrive.
+/// Where the canonical encoder puts the bytes it produces.
+///
+/// The encoder used to write only into a `Vec<u8>`, which meant every caller
+/// held the whole encoding before doing anything with it. The bytes are
+/// unchanged and the walk that produces them is unchanged; only the destination
+/// is now a choice, so a caller that just wants a digest never has to hold the
+/// document it is digesting.
+pub(crate) trait CanonicalSink {
+    fn push_byte(&mut self, byte: u8);
+    fn write_bytes(&mut self, bytes: &[u8]);
+}
+
+impl CanonicalSink for Vec<u8> {
+    fn push_byte(&mut self, byte: u8) {
+        self.push(byte);
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) {
+        self.extend_from_slice(bytes);
+    }
+}
+
+/// Counts what the encoder would write and keeps none of it.
+///
+/// The length pass of a two-pass hash. The preimage carries its own byte length
+/// ahead of its payload, and a hasher cannot be fed the length after the fact,
+/// so the length is counted first over the same walk that will produce the
+/// bytes second.
+#[derive(Debug, Default)]
+pub(crate) struct CountingSink {
+    len: u64,
+}
+
+impl CountingSink {
+    pub(crate) fn len(&self) -> u64 {
+        self.len
+    }
+}
+
+impl CanonicalSink for CountingSink {
+    fn push_byte(&mut self, _byte: u8) {
+        self.len += 1;
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) {
+        self.len += bytes.len() as u64;
+    }
+}
+
+/// Feeds the encoder's bytes into a hasher as they are produced.
+///
+/// Tracks how many bytes it has taken so the caller can prove the hashing pass
+/// wrote exactly what the counting pass promised. That check is not decoration:
+/// the length is hashed before the payload, so a second pass that disagreed
+/// with the first would produce a well-formed hash of a preimage nothing ever
+/// held, and every transaction identity in every store derives from it.
+pub(crate) struct HashingSink {
+    hasher: Sha256,
+    written: u64,
+}
+
+impl HashingSink {
+    pub(crate) fn new() -> Self {
+        Self {
+            hasher: Sha256::new(),
+            written: 0,
+        }
+    }
+
+    pub(crate) fn written(&self) -> u64 {
+        self.written
+    }
+
+    pub(crate) fn finish(self) -> [u8; 32] {
+        let digest = self.hasher.finalize();
+        let mut bytes = [0_u8; 32];
+        bytes.copy_from_slice(&digest);
+        bytes
+    }
+}
+
+impl CanonicalSink for HashingSink {
+    fn push_byte(&mut self, byte: u8) {
+        self.hasher.update([byte]);
+        self.written += 1;
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) {
+        self.hasher.update(bytes);
+        self.written += bytes.len() as u64;
+    }
+}
+
 pub(crate) fn canonical_json_bytes(value: &impl serde::Serialize) -> Result<Vec<u8>> {
     let value = serde_json::to_value(value).map_err(serialization)?;
     let mut encoded = Vec::new();
@@ -307,8 +400,8 @@ pub(crate) fn canonical_json_bytes(value: &impl serde::Serialize) -> Result<Vec<
 /// the tree built here covers this value alone, so a caller assembling a large
 /// container can build and drop one element's tree at a time instead of holding
 /// the whole document's.
-pub(crate) fn append_canonical_value(
-    output: &mut Vec<u8>,
+pub(crate) fn append_canonical_value<S: CanonicalSink>(
+    output: &mut S,
     value: &impl serde::Serialize,
 ) -> Result<()> {
     let value = serde_json::to_value(value).map_err(serialization)?;
@@ -324,12 +417,12 @@ pub(crate) fn append_canonical_value(
 /// what the whole-tree walk emits, because the framing below is copied from
 /// [`append_canonical_json`]'s array arm and each element goes through the same
 /// walk.
-pub(crate) fn append_canonical_seq<T: serde::Serialize>(
-    output: &mut Vec<u8>,
+pub(crate) fn append_canonical_seq<S: CanonicalSink, T: serde::Serialize>(
+    output: &mut S,
     items: &[T],
 ) -> Result<()> {
-    output.push(4);
-    output.extend_from_slice(
+    output.push_byte(4);
+    output.write_bytes(
         &u64::try_from(items.len())
             .map_err(|_| ModelError::InvalidOperation("canonical array exceeds u64".to_string()))?
             .to_le_bytes(),
@@ -346,9 +439,12 @@ pub(crate) fn append_canonical_seq<T: serde::Serialize>(
 /// own fields is responsible for emitting exactly `fields` of them, in
 /// byte-wise key order, because that is what the whole-tree walk does when it
 /// sorts a `serde_json::Map`.
-pub(crate) fn append_canonical_object_header(output: &mut Vec<u8>, fields: usize) -> Result<()> {
-    output.push(5);
-    output.extend_from_slice(
+pub(crate) fn append_canonical_object_header<S: CanonicalSink>(
+    output: &mut S,
+    fields: usize,
+) -> Result<()> {
+    output.push_byte(5);
+    output.write_bytes(
         &u64::try_from(fields)
             .map_err(|_| ModelError::InvalidOperation("canonical object exceeds u64".to_string()))?
             .to_le_bytes(),
@@ -357,28 +453,31 @@ pub(crate) fn append_canonical_object_header(output: &mut Vec<u8>, fields: usize
 }
 
 /// One object field's key, length-prefixed as the whole-tree walk writes it.
-pub(crate) fn append_canonical_key(output: &mut Vec<u8>, key: &str) -> Result<()> {
+pub(crate) fn append_canonical_key<S: CanonicalSink>(output: &mut S, key: &str) -> Result<()> {
     append_len_prefixed_vec_field(output, key.as_bytes())
 }
 
-fn append_canonical_json(output: &mut Vec<u8>, value: &serde_json::Value) -> Result<()> {
+fn append_canonical_json<S: CanonicalSink>(
+    output: &mut S,
+    value: &serde_json::Value,
+) -> Result<()> {
     match value {
-        serde_json::Value::Null => output.push(0),
+        serde_json::Value::Null => output.push_byte(0),
         serde_json::Value::Bool(value) => {
-            output.push(1);
-            output.push(u8::from(*value));
+            output.push_byte(1);
+            output.push_byte(u8::from(*value));
         }
         serde_json::Value::Number(value) => {
-            output.push(2);
+            output.push_byte(2);
             append_len_prefixed_vec_field(output, value.to_string().as_bytes())?;
         }
         serde_json::Value::String(value) => {
-            output.push(3);
+            output.push_byte(3);
             append_len_prefixed_vec_field(output, value.as_bytes())?;
         }
         serde_json::Value::Array(values) => {
-            output.push(4);
-            output.extend_from_slice(
+            output.push_byte(4);
+            output.write_bytes(
                 &u64::try_from(values.len())
                     .map_err(|_| {
                         ModelError::InvalidOperation("canonical array exceeds u64".to_string())
@@ -390,8 +489,8 @@ fn append_canonical_json(output: &mut Vec<u8>, value: &serde_json::Value) -> Res
             }
         }
         serde_json::Value::Object(values) => {
-            output.push(5);
-            output.extend_from_slice(
+            output.push_byte(5);
+            output.write_bytes(
                 &u64::try_from(values.len())
                     .map_err(|_| {
                         ModelError::InvalidOperation("canonical object exceeds u64".to_string())
@@ -468,13 +567,13 @@ pub(crate) fn canonical_json_bytes_with_one_byte_of_framing_changed(
     Ok(encoded)
 }
 
-fn append_len_prefixed_vec_field(output: &mut Vec<u8>, value: &[u8]) -> Result<()> {
-    output.extend_from_slice(
+fn append_len_prefixed_vec_field<S: CanonicalSink>(output: &mut S, value: &[u8]) -> Result<()> {
+    output.write_bytes(
         &u64::try_from(value.len())
             .map_err(|_| ModelError::InvalidOperation("canonical value exceeds u64".to_string()))?
             .to_le_bytes(),
     );
-    output.extend_from_slice(value);
+    output.write_bytes(value);
     Ok(())
 }
 
