@@ -1718,6 +1718,7 @@ def check_9(suite):
     else:
         res.ok("the re-run reclaimed %s of staging and said so; nothing is "
                "left beside the repository" % reclaimed.group(1))
+    return res
 
 
 def check_10(suite):
@@ -1919,8 +1920,6 @@ def check_10(suite):
             res.ok("on express, all %d external node(s) name their crossing%s"
                    % (len(js_external),
                       " (specifiers %s)" % ", ".join(named[:6]) if named else ""))
-
-
     return res
 
 
@@ -2165,6 +2164,17 @@ def main(argv):
         except Exception as exc:
             res = Result(check_id, "?", "harness failure")
             res.unknown("%s: %s" % (type(exc).__name__, str(exc)[:300]))
+        # A check that falls off its own end returns None, and None then blows up
+        # three stages later on an attribute nobody can trace back to the check
+        # that caused it. Measured: a rebase moved one check's `return res` onto
+        # the next check's tail, `--only 10` ran the surviving one and stayed
+        # green, and the full run died in the reporter with a traceback naming
+        # the reporter. Name the check instead, and never report it as a pass.
+        if res is None:
+            res = Result(check_id, "?", "harness failure")
+            res.unknown("check_%s returned no Result, so it fell off its own "
+                        "end; a check that reports nothing is never a pass"
+                        % check_id)
         results.append(res)
         res.prior = None if prior is None else prior.get(res.id)
         res.trend = trend_of(res.status, res.prior)
