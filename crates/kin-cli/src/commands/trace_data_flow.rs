@@ -378,9 +378,14 @@ pub struct TraceEntityRecord {
     /// Null whenever no body was served, since the pairing is what it describes.
     pub span_coherence: Option<String>,
     /// Where the in-repo graph ends, for a step sitting on the boundary.
-    /// Present on exactly the records `external` is true for; a step the
-    /// repository owns crosses nothing and carries none.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Non-null on exactly the records `external` is true for; a step the
+    /// repository owns crosses nothing and carries an explicit null.
+    ///
+    /// Always serialized, never skipped: this array's keys are uniform by
+    /// contract, and a sometimes-absent key is the shape that broke a
+    /// consumer's parser twice. `every_step_carries_the_same_keys_admitted_or_external`
+    /// caught this field trying to become the third time.
+    #[serde(default)]
     pub crossing: Option<kin_index::TraceCrossing>,
 }
 

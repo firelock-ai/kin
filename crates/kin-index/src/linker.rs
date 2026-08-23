@@ -3821,25 +3821,35 @@ pub(crate) fn relation_evidence(
         return evidence;
     };
     let span = site.to_source_span(caller_file);
-    // The syntactic role the adapter classified, carried onto the persisted
-    // evidence so a consumer that never sees the parse can still tell a throw
-    // site from a hop. `parser_rule` is the field that already exists for
-    // exactly this, and it is what the trace surfaces read.
     let rule = site.syntactic_role.map(|role| match role {
         RelationSyntacticRole::RaiseTarget => RAISE_TARGET_CALL_RULE.to_string(),
     });
     if evidence.is_empty() {
-        return vec![RelationEvidence {
+        let mut only = RelationEvidence {
             source_span: Some(span),
-            parser_rule: rule,
             ..RelationEvidence::default()
-        }];
+        };
+        only.parser_rule = rule;
+        return vec![only];
     }
     for record in &mut evidence {
         record.source_span = Some(span.clone());
-        if record.parser_rule.is_none() {
-            record.parser_rule.clone_from(&rule);
-        }
+    }
+    // The syntactic role the adapter classified, carried onto the persisted
+    // evidence so a consumer that never sees the parse can still tell a throw
+    // site from a hop it should spend a trace slot on.
+    //
+    // A record of its own rather than a field on the shape record, because a
+    // shaped call already spends `parser_rule` on its aggregation certificate
+    // and `rename` matches that string exactly. Deliberately span-free: every
+    // consumer that counts occurrences reads spans, so a marker with none adds
+    // no occurrence, no reference line and no evidence a reader could mistake
+    // for a second call site.
+    if let Some(rule) = rule {
+        evidence.push(RelationEvidence {
+            parser_rule: Some(rule),
+            ..RelationEvidence::default()
+        });
     }
     evidence
 }
@@ -3954,13 +3964,15 @@ pub struct TraceCrossing {
     /// the fact of the boundary.
     pub status: String,
     /// The module specifier the importing file named (`router`, `urllib3`),
-    /// when an edge into this symbol recorded one. Absent under `unknown`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// when an edge into this symbol recorded one. Explicitly null under
+    /// `unknown`, because the keys of this object are uniform for the same
+    /// reason the step's are.
+    #[serde(default)]
     pub specifier: Option<String>,
     /// The receiver the call was written through, when the edge recorded one
     /// and no specifier is available. `this.router` says more than nothing
     /// about where to look without claiming to name a package.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub receiver: Option<String>,
     /// Why the status reads the way it does, in a sentence a caller can act on.
     pub note: String,
