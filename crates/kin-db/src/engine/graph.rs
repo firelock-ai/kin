@@ -3941,6 +3941,44 @@ impl InMemoryGraph {
         let prv = self.provenance.read().clone();
         let ses = self.sessions.read().clone();
 
+        Self::snapshot_from_stores(ent, chg, wrk, rev, ver, prv, ses)
+    }
+
+    /// Export this graph as a snapshot by consuming it.
+    ///
+    /// Identical in value to [`to_snapshot`] and different in cost. That one
+    /// clones every store under its own read lock and then converts the clone,
+    /// so a caller with no further use for the graph paid for a second copy of
+    /// everything the snapshot was about to carry and held both across
+    /// whatever it did next. This moves each store out instead, so the payload
+    /// is rehashed into the snapshot's map type and never duplicated. Use it
+    /// wherever the export is the graph's last reader; use `to_snapshot` where
+    /// the graph goes on being queried.
+    ///
+    /// [`to_snapshot`]: Self::to_snapshot
+    pub(crate) fn into_snapshot(self) -> GraphSnapshot {
+        Self::snapshot_from_stores(
+            self.entities.into_inner(),
+            self.changes.into_inner(),
+            self.work.into_inner(),
+            self.reviews.into_inner(),
+            self.verification.into_inner(),
+            self.provenance.into_inner(),
+            self.sessions.into_inner(),
+        )
+    }
+
+    /// The one place a snapshot is assembled out of the seven stores, so a
+    /// borrowed export and a consuming one cannot describe different graphs.
+    fn snapshot_from_stores(
+        ent: EntityData,
+        chg: ChangeData,
+        wrk: WorkData,
+        rev: ReviewData,
+        ver: VerificationData,
+        prv: ProvenanceData,
+        ses: SessionData,
+    ) -> GraphSnapshot {
         GraphSnapshot {
             version: GraphSnapshot::CURRENT_VERSION,
             entities: ent.entities.into_iter().collect(),
@@ -3977,6 +4015,30 @@ impl InMemoryGraph {
             downstream_warnings: ses.downstream_warnings,
             repository_authority: None,
             external_references: ent.external_references.into_iter().collect(),
+        }
+    }
+
+    /// Export exactly the domains a workspace comparison reads, by consuming
+    /// this graph.
+    ///
+    /// Identical in value to calling [`to_snapshot`] and keeping four of its
+    /// fields, and very different in cost. `to_snapshot` clones every store
+    /// under its own lock, so a caller that wanted entity truth also paid for
+    /// a copy of the whole change map, the work, review, verification,
+    /// provenance and session domains, and every adjacency and secondary index
+    /// on the entity store, and then held all of it beside the four domains it
+    /// actually read. This moves the entity store out and rehashes four of its
+    /// maps into the snapshot's map type, copying no payload at all and
+    /// freeing everything else at the call.
+    ///
+    /// [`to_snapshot`]: Self::to_snapshot
+    pub(crate) fn into_workspace_graph_facts(self) -> crate::storage::format::WorkspaceGraphFacts {
+        let ent = self.entities.into_inner();
+        crate::storage::format::WorkspaceGraphFacts {
+            entities: ent.entities.into_iter().collect(),
+            relations: ent.relations.into_iter().collect(),
+            external_references: ent.external_references.into_iter().collect(),
+            resolved_tree: ent.resolved_tree,
         }
     }
 

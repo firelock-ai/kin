@@ -51,7 +51,7 @@ use crate::storage::backend::{
     MAX_SOURCE_BLOB_BYTES,
 };
 use crate::storage::change_validation::AdmittedChangeMap;
-use crate::storage::format::GraphSnapshot;
+use crate::storage::format::{GraphSnapshot, WorkspaceGraphFacts};
 use crate::storage::history_replay::{validate_first_parent_history, ReplayProgress};
 
 /// Persisted repository-envelope schema.
@@ -3963,7 +3963,18 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
     incremental_delta.tree_deltas = mutation.tree_deltas.clone();
     let desired_graph = InMemoryGraph::from_snapshot_without_text_index(current_graph)?;
     desired_graph.apply_transaction_delta(&incremental_delta)?;
-    let desired = desired_graph.to_snapshot();
+    // The delta is the mutation's own semantic delta plus a copy of its tree
+    // deltas, and the graph has absorbed both. On a conversion that is the
+    // whole published state a second time, held for the rest of a function
+    // that never reads it again.
+    drop(incremental_delta);
+    // Only the four compared domains leave this graph, and the export
+    // consumes it. Exporting a whole snapshot here copied the entire change
+    // map to be read by nobody, because the two steps below consult entities,
+    // relations, external references and the resolved tree and no other
+    // domain, and it then left the graph itself bound for the rest of a
+    // function whose last reader of it is this line.
+    let desired = desired_graph.into_workspace_graph_facts();
 
     let derived_semantic_overlay = derive_workspace_semantic_overlay(&next_base, &desired)?;
     let next = mutation.validate_against(
@@ -3985,7 +3996,12 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
             next.workspace_id
         )));
     }
-    let rematerialized = materialize_workspace_graph_snapshot_from_base(next_base, &next, None)?;
+    // Narrowed at the call for the same reason the desired graph is: the exact
+    // comparison below reads four domains, and holding the rest of a
+    // whole-history snapshot beside them buys nothing.
+    let rematerialized = WorkspaceGraphFacts::from_snapshot(
+        materialize_workspace_graph_snapshot_from_base(next_base, &next, None)?,
+    );
     validate_exact_workspace_graph(&desired, &rematerialized, &next)?;
     validate_workspace_symbolic_head_at_mutation(metadata, &next)?;
     validate_shared_policy_bodies(
@@ -4984,7 +5000,20 @@ fn materialize_workspace_graph_snapshot_from_base(
     let build_graph_ms = timer.lap_ms();
     graph.apply_transaction_delta(&delta)?;
     let apply_delta_ms = timer.lap_ms();
-    let materialized = graph.to_snapshot();
+    // The delta is absorbed and only its shape is reported below, so hold the
+    // three counts and free the payload rather than carrying a second copy of
+    // the workspace's whole overlay through the export and the admission pass.
+    let (entity_delta_count, relation_delta_count, tree_delta_count) = (
+        delta.entity_deltas.len(),
+        delta.relation_deltas.len(),
+        delta.tree_deltas.len(),
+    );
+    drop(delta);
+    // The export is the graph's last reader, so it consumes the graph. Copying
+    // it out instead held a whole second copy of everything `materialized`
+    // carries across the admission pass below, which at repository scale is
+    // one more whole history.
+    let materialized = graph.into_snapshot();
     let to_snapshot_ms = timer.lap_ms();
     if materialized.resolved_tree != workspace.tree {
         return Err(storage(format!(
@@ -5010,9 +5039,9 @@ fn materialize_workspace_graph_snapshot_from_base(
         apply_delta_ms,
         to_snapshot_ms,
         admission_ms,
-        entity_deltas = delta.entity_deltas.len(),
-        relation_deltas = delta.relation_deltas.len(),
-        tree_deltas = delta.tree_deltas.len(),
+        entity_deltas = entity_delta_count,
+        relation_deltas = relation_delta_count,
+        tree_deltas = tree_delta_count,
         "workspace graph materialization"
     );
     #[cfg(test)]
@@ -5242,7 +5271,7 @@ fn resolve_workspace_base_graph_snapshot(
 
 fn derive_workspace_semantic_overlay(
     base: &GraphSnapshot,
-    desired: &GraphSnapshot,
+    desired: &WorkspaceGraphFacts,
 ) -> Result<WorkspaceSemanticOverlay, KinDbError> {
     let entity_deltas = base
         .entities
@@ -5323,8 +5352,8 @@ fn derive_workspace_semantic_overlay(
 }
 
 fn validate_exact_workspace_graph(
-    desired: &GraphSnapshot,
-    rematerialized: &GraphSnapshot,
+    desired: &WorkspaceGraphFacts,
+    rematerialized: &WorkspaceGraphFacts,
     workspace: &WorkspaceState,
 ) -> Result<(), KinDbError> {
     if desired.entities != rematerialized.entities {
@@ -17640,8 +17669,9 @@ mod fir2334_attribution {
         print_phase_log("materialize");
 
         let started = std::time::Instant::now();
+        let materialized_facts = WorkspaceGraphFacts::from_snapshot(materialized.clone());
         let overlay =
-            derive_workspace_semantic_overlay(&base, &materialized).expect("derive overlay");
+            derive_workspace_semantic_overlay(&base, &materialized_facts).expect("derive overlay");
         println!(
             "[TERM] derive_overlay_ms={} entity_deltas={} relation_deltas={}",
             started.elapsed().as_millis(),

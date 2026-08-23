@@ -125,6 +125,45 @@ where
     Option::deserialize(deserializer)
 }
 
+/// The four graph domains a workspace mutation ever compares.
+///
+/// Deriving a workspace's cumulative semantic overlay and proving that overlay
+/// reproduces the desired graph read entities, relations, external references
+/// and the resolved tree, and read nothing else. Carrying those two steps on
+/// whole `GraphSnapshot`s meant each of them also held a copy of every change
+/// in the repository with its full entity, relation and tree delta payload,
+/// plus change children, work items, annotations, reviews, verification runs,
+/// provenance and sessions, none of which any comparison consults. On a
+/// full-history conversion the change map IS the repository, so a snapshot
+/// kept for four fields was a whole extra history.
+///
+/// This is a projection of a `GraphSnapshot`, never a substitute for one:
+/// nothing is validated through it, and every value in it is the value the
+/// snapshot's own field carried.
+#[derive(Debug)]
+pub(crate) struct WorkspaceGraphFacts {
+    pub(crate) entities: HashMap<EntityId, Entity>,
+    pub(crate) relations: HashMap<RelationId, Relation>,
+    pub(crate) external_references: HashMap<ExternalReferenceId, ExternalReference>,
+    pub(crate) resolved_tree: ResolvedTree,
+}
+
+impl WorkspaceGraphFacts {
+    /// Take the compared domains out of a snapshot and drop the rest.
+    ///
+    /// Consuming rather than borrowing is the point: the domains move out and
+    /// everything else is freed at the call, instead of staying alive beside
+    /// the four fields a caller went on to read.
+    pub(crate) fn from_snapshot(snapshot: GraphSnapshot) -> Self {
+        Self {
+            entities: snapshot.entities,
+            relations: snapshot.relations,
+            external_references: snapshot.external_references,
+            resolved_tree: snapshot.resolved_tree,
+        }
+    }
+}
+
 /// Lightweight snapshot view for locate-only cold starts.
 ///
 /// This intentionally decodes only the graph domains that `kin locate`

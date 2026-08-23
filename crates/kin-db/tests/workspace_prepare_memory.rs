@@ -1,0 +1,390 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Firelock, LLC
+
+//! What a workspace mutation holds alive while it prepares a successor.
+//!
+//! A full-history brownfield conversion commits its whole history in one
+//! transaction, and the workspace half of that commit was the largest single
+//! allocation in it. `apply_workspace` resolved a base graph, resolved or
+//! cloned a second one, turned the second into an `InMemoryGraph`, exported
+//! that graph back into a third whole snapshot, and then materialized a fourth
+//! over the first, with every one of them carrying a copy of the repository's
+//! entire change map although the comparisons between them read four domains.
+//!
+//! The guard below prices that. It commits the same synthetic whole history
+//! twice, once with a workspace mutation and once without, and charges the
+//! difference between their peak live heaps to the workspace mutation, in
+//! units of one copy of the history itself. Resident set is deliberately not
+//! the instrument: it keeps counting memory the allocator has freed and not
+//! returned, so it moves with the allocator and the platform, while live heap
+//! moves when and only when the code allocates differently.
+//!
+//! This file is its own test binary and holds one test on purpose. The
+//! counters below are process-global, so a second test running beside this one
+//! would be measured into it.
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use kin_db::{LocalFileBackend, RepositoryAuthorityManager, VersionedAuthorityState};
+use kin_model::{
+    compute_resolved_tree_hash, compute_semantic_change_id, AdmissionCase, AdmissionPolicyDelta,
+    ArtifactId, AuthorId, ChangeOrigin, DefaultRefExpectation, DefaultRefMutation,
+    EffectiveAdmissionPolicyStamp, Entity, EntityDelta, EntityId, EntityKind, EntityMetadata,
+    EntityRole, FilePathId, FingerprintAlgorithm, FrozenLocalOverlay, FrozenLocalOverlayDelta,
+    Hash256, LanguageId, LocatedEntry, OperationId, RefExpectation, RefMutation, RefName,
+    RefTarget, RefUpdatePolicy, RepoPath, RepositoryId, RepositoryTransaction, ResolvedTree,
+    SemanticChange, SemanticChangeId, SemanticFingerprint, SharedAdmissionPolicy, Timestamp,
+    TreeDelta, TreeEntry, Visibility, WorkspaceExpectation, WorkspaceHead, WorkspaceId,
+    WorkspaceMutation, WorkspaceSemanticDelta, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+};
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
+
+// --- the instrument -------------------------------------------------------
+
+static LIVE: AtomicUsize = AtomicUsize::new(0);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+struct CountingAllocator;
+
+fn record_allocation(bytes: usize) {
+    let live = LIVE.fetch_add(bytes, Ordering::Relaxed) + bytes;
+    PEAK.fetch_max(live, Ordering::Relaxed);
+}
+
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let pointer = unsafe { System.alloc(layout) };
+        if !pointer.is_null() {
+            record_allocation(layout.size());
+        }
+        pointer
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let pointer = unsafe { System.alloc_zeroed(layout) };
+        if !pointer.is_null() {
+            record_allocation(layout.size());
+        }
+        pointer
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+        unsafe { System.dealloc(pointer, layout) }
+    }
+
+    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let moved = unsafe { System.realloc(pointer, layout, new_size) };
+        if !moved.is_null() {
+            if new_size >= layout.size() {
+                record_allocation(new_size - layout.size());
+            } else {
+                LIVE.fetch_sub(layout.size() - new_size, Ordering::Relaxed);
+            }
+        }
+        moved
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+fn live_bytes() -> usize {
+    LIVE.load(Ordering::Relaxed)
+}
+
+/// Arm the peak at the current live heap and return that floor.
+///
+/// Peak is a running high-water mark, so it has to be pulled back down to the
+/// live floor before a phase or it reports the previous phase's high point.
+fn arm_peak() -> usize {
+    let floor = LIVE.load(Ordering::Relaxed);
+    PEAK.store(floor, Ordering::Relaxed);
+    floor
+}
+
+fn peak_growth_since(floor: usize) -> usize {
+    PEAK.load(Ordering::Relaxed).saturating_sub(floor)
+}
+
+/// Live bytes that `build` allocates and still holds when it returns.
+fn retained_by<T>(build: impl FnOnce() -> T) -> (T, usize) {
+    let before = live_bytes();
+    let value = build();
+    (value, live_bytes().saturating_sub(before))
+}
+
+// --- the synthetic conversion ---------------------------------------------
+
+/// Bytes of payload per change, so the change map is the dominant term the way
+/// a converted repository's is rather than a rounding error on the fixture.
+const CHANGE_PAYLOAD_BYTES: usize = 8_192;
+const COMMITS: usize = 300;
+const FILES: usize = 60;
+
+fn digest(body: &[u8]) -> Hash256 {
+    Hash256::from_bytes(Sha256::digest(body).into())
+}
+
+fn fixed_timestamp() -> Timestamp {
+    Timestamp(
+        chrono::DateTime::parse_from_rfc3339("2026-08-23T00:00:00Z")
+            .expect("fixed timestamp parses")
+            .with_timezone(&chrono::Utc),
+    )
+}
+
+/// One distinct entity per commit, carrying enough documentation body that the
+/// change holding it is worth measuring.
+fn measurement_entity(index: usize) -> Entity {
+    let path = format!("src/module_{index}.rs");
+    let name = format!("kin_{index}");
+    let byte = (index % 251) as u8;
+    Entity {
+        id: EntityId::from_content(&path, &name, "function", 1),
+        kind: EntityKind::Function,
+        name: name.clone(),
+        language: LanguageId::Rust,
+        fingerprint: SemanticFingerprint {
+            algorithm: FingerprintAlgorithm::V1TreeSitter,
+            ast_hash: Hash256::from_bytes([byte; 32]),
+            signature_hash: Hash256::from_bytes([byte.wrapping_add(1); 32]),
+            behavior_hash: Hash256::from_bytes([byte.wrapping_add(2); 32]),
+            equivalence_hash: Hash256::from_bytes([byte.wrapping_add(3); 32]),
+            stability_score: 1.0,
+        },
+        file_origin: Some(FilePathId::new(&path)),
+        span: None,
+        signature: format!("fn {name}()"),
+        visibility: Visibility::Public,
+        role: EntityRole::Source,
+        doc_summary: Some(format!("{name} ").repeat(CHANGE_PAYLOAD_BYTES / 8)),
+        metadata: EntityMetadata::default(),
+        lineage_parent: None,
+        created_in: None,
+        superseded_by: None,
+    }
+}
+
+/// The head tree a conversion publishes: `files` artifacts and their bodies.
+fn head_tree(files: usize) -> (Vec<TreeDelta>, Vec<(Hash256, Vec<u8>)>) {
+    let mut deltas = Vec::with_capacity(files);
+    let mut blobs = Vec::with_capacity(files);
+    for file in 0..files {
+        let path = format!("src/module_{file}.rs");
+        let body = format!("pub fn kin_{file}() {{}}\n").into_bytes();
+        let hash = digest(&body);
+        deltas.push(TreeDelta::Added {
+            artifact_id: ArtifactId(Uuid::from_u128(1_000_000 + file as u128)),
+            new: LocatedEntry::new(
+                RepoPath::from_bytes(path.into_bytes()).expect("synthetic path is valid"),
+                TreeEntry::blob(hash, false),
+            ),
+        });
+        blobs.push((hash, body));
+    }
+    (deltas, blobs)
+}
+
+/// `commits` chained Native changes, one entity each, head carrying `tree`.
+fn history_chain(
+    commits: usize,
+    shared: &SharedAdmissionPolicy,
+    tree: &[TreeDelta],
+) -> Vec<SemanticChange> {
+    let mut chain: Vec<SemanticChange> = Vec::with_capacity(commits);
+    let mut parent: Option<SemanticChangeId> = None;
+    for index in 0..commits {
+        let mut change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: ChangeOrigin::Native,
+            parents: parent.into_iter().collect(),
+            timestamp: fixed_timestamp(),
+            author: AuthorId::new("fir2648-measurement"),
+            message: format!("synthetic converted commit {index}"),
+            entity_deltas: vec![EntityDelta::Added {
+                new: measurement_entity(index),
+            }],
+            relation_deltas: Vec::new(),
+            tree_deltas: if index + 1 == commits {
+                tree.to_vec()
+            } else {
+                Vec::new()
+            },
+            admission_policy_delta: (index == 0)
+                .then(|| AdmissionPolicyDelta::initialize(shared.clone())),
+            external_reference_deltas: Vec::new(),
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+        };
+        change.id = compute_semantic_change_id(&change).expect("change id computes");
+        parent = Some(change.id);
+        chain.push(change);
+    }
+    chain
+}
+
+/// Commit one whole-history bootstrap and report the peak live heap it reached.
+///
+/// The store, the blobs and the transaction are all built before the peak is
+/// armed, so the number is the commit's own growth and not the fixture's.
+fn peak_growth_of_one_bootstrap(with_workspace: bool) -> usize {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let backend = Arc::new(LocalFileBackend::new(directory.path()));
+    let repository = RepositoryId::new("fir2648-measurement").expect("repository id");
+    let manager = RepositoryAuthorityManager::open(repository.clone(), backend)
+        .expect("open fresh authority");
+
+    let shared = SharedAdmissionPolicy::empty(0);
+    let (tree_deltas, blobs) = if with_workspace {
+        head_tree(FILES)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    for (hash, body) in &blobs {
+        manager.save_source_blob(*hash, body).expect("save blob");
+    }
+    let changes = history_chain(COMMITS, &shared, &tree_deltas);
+    let head_change = changes.last().expect("at least one change").id;
+
+    let lease = manager.read_authority();
+    let mut transaction = RepositoryTransaction {
+        schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+        operation_id: OperationId::from_uuid(Uuid::from_u128(1)),
+        repository_id: repository.clone(),
+        expected_generation: lease.generation(),
+        expected_roots: lease.roots().clone(),
+        actor: AuthorId::new("fir2648-measurement"),
+        reason: "synthetic whole-history bootstrap".to_string(),
+        external_objects: Vec::new(),
+        git_authority_delta: None,
+        changes,
+        aliases: Vec::new(),
+        ref_mutations: Vec::new(),
+        default_ref_mutation: None,
+        workspace_mutation: None,
+        local_overlay_delta: None,
+        merge_transaction_delta: None,
+        sealed_observation: None,
+    };
+    drop(lease);
+
+    if with_workspace {
+        let tree = ResolvedTree::default()
+            .apply(&tree_deltas)
+            .expect("head tree applies");
+        let tree_hash = compute_resolved_tree_hash(&tree).expect("tree hash");
+        let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(20));
+        let overlay =
+            FrozenLocalOverlay::new(workspace_id, 0, AdmissionCase::Sensitive, Vec::new())
+                .expect("frozen overlay");
+        let policy = EffectiveAdmissionPolicyStamp {
+            shared: shared.stamp(),
+            local: overlay.stamp(),
+        };
+        let main = RefName::branch(b"main").expect("branch name");
+        let target = RefTarget::change(head_change);
+        transaction.ref_mutations.push(RefMutation {
+            name: main.clone(),
+            expected: RefExpectation::MustNotExist,
+            new_target: Some(target.clone()),
+            policy: RefUpdatePolicy::FastForwardOnly,
+        });
+        transaction.default_ref_mutation = Some(DefaultRefMutation {
+            expected: DefaultRefExpectation::MustBeUnset,
+            new_default: Some(main.clone()),
+        });
+        transaction.workspace_mutation = Some(WorkspaceMutation {
+            workspace_id,
+            expected: WorkspaceExpectation::MustNotExist,
+            new_generation: 0,
+            new_head: WorkspaceHead::Symbolic { target: main },
+            new_base_target: Some(target),
+            new_base_tree_hash: Some(tree_hash),
+            tree_deltas,
+            new_tree_hash: tree_hash,
+            semantic_delta: WorkspaceSemanticDelta::default(),
+            new_shared_admission_policy: shared,
+            new_admission_policy: policy,
+        });
+        transaction.local_overlay_delta = Some(FrozenLocalOverlayDelta::initialize(overlay));
+    }
+
+    let floor = arm_peak();
+    let receipt = manager
+        .commit_repository_transaction(transaction)
+        .expect("whole-history bootstrap commits");
+    assert_eq!(
+        receipt.generation, 1,
+        "the bootstrap publishes generation 1"
+    );
+    let growth = peak_growth_since(floor);
+
+    drop(manager);
+    drop(directory);
+    growth
+}
+
+// --- the guard ------------------------------------------------------------
+
+/// Peak growth a workspace mutation may add, in copies of the history it
+/// commits.
+///
+/// Set from measurement on this fixture, not from taste. Release, this
+/// fixture, one copy of the history at 2,833,178 bytes: the shape that carried
+/// whole snapshots for four-domain comparisons measured 8.81 copies, and the
+/// shape that replaced it measures 4.56. A ceiling of 6.0 fails the first and
+/// passes the second, with room on both sides for a different allocator and a
+/// different host, since the number is a ratio of two live-heap readings taken
+/// in the same process.
+///
+/// The remaining 4.56 is not slack: `apply_workspace` still resolves two base
+/// graphs that each carry a copy of the authority's change map, and the shared
+/// replay decode is forced while the second of them is alive. Lowering this
+/// ceiling is the way to record that when it is fixed.
+const WORKSPACE_PEAK_HISTORY_COPIES: f64 = 6.0;
+
+/// A workspace mutation must not hold the repository's whole change map more
+/// than about twice while it prepares a successor.
+///
+/// The two arms differ in one thing, whether the transaction carries a
+/// workspace mutation, so the difference between their peaks is what the
+/// mutation costs. Charging that difference against one copy of the history
+/// makes the number readable as what it is: how many whole histories the
+/// preparation is holding at its high point.
+#[test]
+fn a_workspace_mutation_does_not_hold_the_whole_history_four_times() {
+    let shared = SharedAdmissionPolicy::empty(0);
+    let (tree_deltas, _) = head_tree(FILES);
+    let history = history_chain(COMMITS, &shared, &tree_deltas);
+    let (copy, history_bytes) = retained_by(|| history.clone());
+    drop(copy);
+    drop(history);
+    assert!(
+        history_bytes > 1_000_000,
+        "the fixture's history must be large enough to price a copy of it, got {history_bytes} bytes"
+    );
+
+    let without_workspace = peak_growth_of_one_bootstrap(false);
+    let with_workspace = peak_growth_of_one_bootstrap(true);
+    let workspace_cost = with_workspace.saturating_sub(without_workspace);
+    let copies = workspace_cost as f64 / history_bytes as f64;
+
+    println!(
+        "one history copy: {history_bytes} bytes\n\
+         bootstrap peak growth without a workspace mutation: {without_workspace} bytes\n\
+         bootstrap peak growth with a workspace mutation:    {with_workspace} bytes\n\
+         charged to the workspace mutation: {workspace_cost} bytes, {copies:.2} copies of the history"
+    );
+
+    assert!(
+        copies <= WORKSPACE_PEAK_HISTORY_COPIES,
+        "a workspace mutation grew the peak by {workspace_cost} bytes, {copies:.2} copies of the \
+         {history_bytes}-byte history, at or over the {WORKSPACE_PEAK_HISTORY_COPIES} copy ceiling"
+    );
+}
