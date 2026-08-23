@@ -1747,12 +1747,17 @@ def check_10(suite):
     this a ranking failure. If the wider walk misses it too, the edge is not in the
     graph and that is a different defect, reported UNREADABLE rather than FAIL.
 
-    The third is the ordering: no raise target may rank above a row the value
-    actually travels through, in the same node's fan-out. It demotes rather than
-    filters, so their presence is fine and their position is not. Measured on both
-    builds this arm passes, because `declaration_kind_rank` already sorted Class
-    below Function; it is a regression guard rather than the falsifying arm, and
-    saying otherwise would be inventing a result.
+    The third is the ordering, and it is a TRIPWIRE rather than evidence. It says
+    no raise target may rank above a row the value actually travels through, in
+    the same node's fan-out. On this corpus it passes on every build tried,
+    including three built to break it: released bytes with no raise marker at all,
+    a build with the raise term inverted so throw sites outrank data flow, and a
+    build with `declaration_kind_rank` inverted so classes outrank functions. A
+    check that cannot fail is not evidence, so this arm is not offered as any. It
+    is kept because it would still catch a gross regression on a corpus that
+    exposes one, and the ordering it describes IS guarded, at the level where the
+    comparison is decidable: the unit tests in kin-ranking and kin-cli, which do
+    fail when the term is inverted.
 
     The fourth and fifth are half two of the ticket, on both corpora: every external
     node an answer touches must name its crossing, so a caller can tell an npm
@@ -1852,7 +1857,12 @@ def check_10(suite):
                 % (len(misordered), sample))
     else:
         present = sorted({name for name in names if name in TRACE_RAISE_TARGETS})
-        res.ok("no raise target ranks above a data-flow row%s"
+        res.ok("no raise target ranks above a data-flow row%s. TRIPWIRE, not "
+               "evidence: this arm also passed on released bytes carrying no "
+               "raise marker, on a build with the raise term inverted, and on a "
+               "build with declaration_kind_rank inverted, so it has never been "
+               "shown to fail on this corpus; the ordering is guarded by the "
+               "kin-ranking and kin-cli unit tests, which do"
                % (" (%s present and ranked below)" % ", ".join(present) if present
                   else "; none appeared in the walk"))
 
