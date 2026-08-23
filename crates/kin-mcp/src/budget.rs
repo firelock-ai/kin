@@ -24,7 +24,7 @@
 //! a whole answer from a bounded one and knows which parameter recovers the
 //! rest.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use serde_json::{json, Map, Value};
 
@@ -368,6 +368,147 @@ pub fn record_elision_for(
 /// budget for a payload no caller receives.
 pub fn measure(value: &Value) -> usize {
     serde_json::to_string_pretty(value).map_or(usize::MAX, |json| json.len())
+}
+
+/// Give up a chain's least load-bearing branches until it fits, and hand back
+/// what survived.
+///
+/// ## Why a suffix cut alone produced a wrong answer
+///
+/// A budgeted chain used to be cut as a prefix: keep `chain[..k]` and drop the
+/// rest. That is safe, because a discovery-ordered chain lists children after
+/// their parents and removing the end never orphans a surviving `parent_step`.
+/// It is also what produced a wrong answer. Discovery order is breadth-first,
+/// so the tail of the chain is its DEEPEST steps, and a suffix cut therefore
+/// spends the whole budget on the shallow fan-out and amputates the far end,
+/// which is where a trace stops being a list of neighbours and becomes an
+/// answer.
+///
+/// Measured on a converted `psf/requests` at the documented cheap settings
+/// (`depth: 3`, `limit_per_step: 12`, `include_body: false`): 67 of 117 steps
+/// went, and `_urllib3_request_context` was not among the survivors. Read
+/// alone, the response said `verify` reaches TLS at `cert_verify` and stopped,
+/// missing the half that governs connection reuse. The edge was in the graph
+/// the whole time.
+///
+/// ## What this does instead
+///
+/// A branch is one child of one node, taken with everything below it. Children
+/// arrive already ordered by relevance, so a node's LAST child is the one it can
+/// most afford to lose. Wide nodes are shaved first, because a wide fan-out is
+/// where the budget actually went, and narrowing a node from twelve children to
+/// eight costs a caller far less than losing the end of every chain. Every node
+/// keeps its first child, so narrowing can thin a walk and can never sever it,
+/// and a dropped branch takes its descendants with it, so no surviving step
+/// names a parent the caller no longer has.
+///
+/// ## Why it lives here
+///
+/// `trace_data_flow` has two implementations: the CLI one the daemon route
+/// serves and the MCP one the in-process arm serves. A budget rule that
+/// differed by whether a daemon happened to be up is the two-surface divergence
+/// class this codebase keeps paying for, so the rule is written once, generically
+/// over the step type, and both arms call it.
+///
+/// `fits` is called on candidate survivor sets, bisected over the drop order, so
+/// a caller pays a handful of serializations rather than one per branch. It may
+/// mutate whatever it needs to measure and is not required to leave it restored:
+/// callers install the returned chain themselves.
+///
+/// Returns `None` when there is nothing to narrow or when no amount of narrowing
+/// fits, which is the caller's signal to fall back to the suffix cut so a
+/// pathological walk is still answered rather than refused. `Some(kept)` is
+/// always strictly shorter than `steps`.
+pub fn narrow_fanout_to_fit<T: Clone>(
+    steps: &[T],
+    id_of: &dyn Fn(&T) -> u64,
+    parent_of: &dyn Fn(&T) -> Option<u64>,
+    fits: &mut dyn FnMut(&[T]) -> bool,
+) -> Option<Vec<T>> {
+    // Children in the order they were discovered, which is the order relevance
+    // put them in. A step that names itself as its own parent is skipped rather
+    // than trusted: it would make the descendant walk below cyclic.
+    let mut children: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    for step in steps {
+        if let Some(parent) = parent_of(step) {
+            let id = id_of(step);
+            if id != parent {
+                children.entry(parent).or_default().push(id);
+            }
+        }
+    }
+
+    // The drop order: every node's children from least relevant inward, never
+    // its first, widest nodes first so the budget is reclaimed where it was
+    // spent. Ties broken by parent id so the order is deterministic.
+    let mut by_width: Vec<(u64, &Vec<u64>)> = children
+        .iter()
+        .filter(|(_, kids)| kids.len() > 1)
+        .map(|(parent, kids)| (*parent, kids))
+        .collect();
+    by_width.sort_by(|left, right| {
+        right
+            .1
+            .len()
+            .cmp(&left.1.len())
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    let mut drop_order: Vec<u64> = Vec::new();
+    let mut round = 0usize;
+    loop {
+        let mut moved = false;
+        for (_parent, kids) in &by_width {
+            // Keep the first child always; peel from the end inward.
+            if kids.len() > 1 + round {
+                drop_order.push(kids[kids.len() - 1 - round]);
+                moved = true;
+            }
+        }
+        if !moved {
+            break;
+        }
+        round += 1;
+    }
+    if drop_order.is_empty() {
+        return None;
+    }
+
+    let retained = |dropped: usize| -> Vec<T> {
+        let mut condemned: BTreeSet<u64> = drop_order[..dropped].iter().copied().collect();
+        // Breadth-first over the children map rather than one pass over
+        // `steps`, so the closure does not silently depend on children being
+        // listed after their parents.
+        let mut queue: VecDeque<u64> = condemned.iter().copied().collect();
+        while let Some(id) = queue.pop_front() {
+            for kid in children.get(&id).into_iter().flatten() {
+                if condemned.insert(*kid) {
+                    queue.push_back(*kid);
+                }
+            }
+        }
+        steps
+            .iter()
+            .filter(|step| !condemned.contains(&id_of(step)))
+            .cloned()
+            .collect()
+    };
+
+    // Bisected for the FEWEST drops that fit. One drop is the floor: zero drops
+    // is the input, and the input is why this was called.
+    let mut low = 1usize;
+    let mut high = drop_order.len();
+    let mut chosen: Option<Vec<T>> = None;
+    while low <= high {
+        let mid = low + (high - low) / 2;
+        let kept = retained(mid);
+        if fits(&kept) {
+            chosen = Some(kept);
+            high = mid - 1;
+        } else {
+            low = mid + 1;
+        }
+    }
+    chosen
 }
 
 /// One tool's payload shape, in the terms the budget acts on.
@@ -1008,19 +1149,83 @@ fn remove_present(map: &mut Map<String, Value>, key: &str) -> bool {
     }
 }
 
-/// Withhold entries from the tail of one collection until the payload fits,
-/// returning how many were withheld.
+/// Narrow a collection whose entries name a parent, when every entry does.
+///
+/// `None` means this is not a parented collection, or that no amount of
+/// narrowing fits inside `target` and `min_keep`, which is the caller's signal
+/// to take the suffix cut instead. `Some(withheld)` leaves the narrowed array
+/// installed and the withheld counter updated exactly as the suffix path does.
+///
+/// Every entry must carry both keys before this fires. A collection where only
+/// some do is one this rule cannot reason about, and guessing at the rest would
+/// be a cut nobody could predict.
+fn trim_parented_collection(
+    payload: &mut Value,
+    key: &str,
+    target: usize,
+    min_keep: usize,
+    full: &[Value],
+) -> Option<usize> {
+    let parented = full.iter().all(|entry| {
+        entry.get("step").and_then(Value::as_u64).is_some()
+            && entry.get("parent_step").and_then(Value::as_u64).is_some()
+    });
+    if !parented {
+        return None;
+    }
+    let kept = narrow_fanout_to_fit(
+        full,
+        &|entry: &Value| entry["step"].as_u64().unwrap_or(0),
+        &|entry: &Value| entry["parent_step"].as_u64(),
+        &mut |candidate: &[Value]| {
+            payload[key] = Value::Array(candidate.to_vec());
+            measure(payload) <= target
+        },
+    )?;
+    if kept.len() < min_keep {
+        return None;
+    }
+    let withheld = full.len() - kept.len();
+    payload[key] = Value::Array(kept);
+    if withheld > 0 {
+        let prior = payload
+            .get(format!("{key}_withheld"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        payload[format!("{key}_withheld")] = Value::from(prior.saturating_add(withheld));
+    }
+    Some(withheld)
+}
+
+/// Withhold entries from one collection until the payload fits, returning how
+/// many were withheld.
 ///
 /// Bisected rather than popped one at a time: the same answer, in a handful of
-/// serializations instead of one per withheld entry. A suffix is what makes the
-/// cut safe for a walk whose entries reference earlier ones by index, because
-/// removing the end never orphans a surviving entry's parent.
+/// serializations instead of one per withheld entry.
+///
+/// A suffix is what makes the cut safe for a collection whose entries reference
+/// earlier ones by index, because removing the end never orphans a surviving
+/// entry's parent. It is also what makes it wrong for such a collection, and the
+/// two are the same fact: entries that name a parent are a TREE listed
+/// breadth-first, so its tail is its deepest entries and a suffix cut amputates
+/// the far end of every branch. A `trace_data_flow` chain is exactly that, and
+/// on a converted `psf/requests` this stage took the last eight of a chain the
+/// walk's own budget had already shortened, on top of the walk's cut, both from
+/// the deep end.
+///
+/// So a parented collection is narrowed by [`narrow_fanout_to_fit`] first, which
+/// gives up whole branches least relevant first and leaves the depth intact. A
+/// collection that names no parents, or that no amount of narrowing fits, takes
+/// the suffix cut as before.
 fn trim_collection(payload: &mut Value, key: &str, target: usize, min_keep: usize) -> usize {
     let Some(full) = payload.get(key).and_then(Value::as_array).cloned() else {
         return 0;
     };
     if full.len() <= min_keep || measure(payload) <= target {
         return 0;
+    }
+    if let Some(withheld) = trim_parented_collection(payload, key, target, min_keep, &full) {
+        return withheld;
     }
     let mut kept = min_keep;
     let mut low = min_keep;
@@ -1126,6 +1331,133 @@ fn disclose(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The measured shape, in miniature: a focal with a WIDE fan-out and one
+    /// narrow deep branch hanging off its first child.
+    ///
+    /// Steps are numbered in discovery order, which is breadth-first, so the
+    /// deep steps are last. That is the whole reason a suffix cut removes the
+    /// answer: `psf/requests` gave `HTTPAdapter.send` twelve depth-1 children
+    /// and put `_urllib3_request_context` at depth 3, where the tail is.
+    ///
+    /// Returns `(step, parent_step)` pairs. `parent 0` is the focal.
+    fn breadth_first_walk(width: usize, deep: usize) -> Vec<(u64, u64)> {
+        let mut steps: Vec<(u64, u64)> = (1..=width as u64).map(|step| (step, 0)).collect();
+        let mut parent = 1u64;
+        for _ in 0..deep {
+            let step = steps.len() as u64 + 1;
+            steps.push((step, parent));
+            parent = step;
+        }
+        steps
+    }
+
+    fn narrowed(steps: &[(u64, u64)], budget: usize) -> Option<Vec<(u64, u64)>> {
+        narrow_fanout_to_fit(
+            steps,
+            &|step: &(u64, u64)| step.0,
+            &|step: &(u64, u64)| Some(step.1),
+            &mut |kept: &[(u64, u64)]| kept.len() <= budget,
+        )
+    }
+
+    /// FIR-2642, the defect itself. A budget that holds six of fourteen steps
+    /// must spend them on the answer's depth rather than on the focal's widest
+    /// neighbours, because the deep end is where a trace stops being a list of
+    /// neighbours and becomes an answer.
+    #[test]
+    fn narrowing_keeps_the_deep_step_a_suffix_cut_amputates() {
+        let steps = breadth_first_walk(12, 2);
+        let deepest = steps.last().expect("the walk has a deep end").0;
+
+        // The premise, stated as an assertion so the test cannot pass on a
+        // fixture that never had the problem: the suffix cut of the same size
+        // loses the deep step.
+        let suffix: Vec<u64> = steps[..6].iter().map(|step| step.0).collect();
+        assert!(
+            !suffix.contains(&deepest),
+            "the fixture must reproduce the amputation or this proves nothing: {suffix:?}"
+        );
+
+        let kept = narrowed(&steps, 6).expect("narrowing fits inside six steps");
+        let names: Vec<u64> = kept.iter().map(|step| step.0).collect();
+        assert!(
+            names.contains(&deepest),
+            "the budget amputated the deep end instead of narrowing the fan-out: {names:?}"
+        );
+        assert!(kept.len() <= 6, "{names:?}");
+    }
+
+    /// Every surviving step must name a parent the caller still has, or a
+    /// consumer walking `parent_step` lands on a step that is not in the array.
+    #[test]
+    fn a_dropped_branch_takes_its_descendants_with_it() {
+        let mut steps = breadth_first_walk(8, 1);
+        // Hang a child off the LAST depth-1 step, which is the first branch the
+        // drop order gives up. Without the descendant walk it would survive its
+        // own parent.
+        steps.push((100, 8));
+        let kept = narrowed(&steps, 5).expect("narrowing fits inside five steps");
+        let present: BTreeSet<u64> = kept.iter().map(|step| step.0).collect();
+        for (step, parent) in &kept {
+            assert!(
+                *parent == 0 || present.contains(parent),
+                "step {step} names parent {parent}, which the cut removed: {present:?}"
+            );
+        }
+        assert!(
+            !present.contains(&100),
+            "the orphan outlived the branch it hung off: {present:?}"
+        );
+    }
+
+    /// Narrowing thins a walk; it never severs one. Asked for a budget no
+    /// amount of narrowing can meet, it answers `None` so the caller falls back
+    /// to the suffix cut rather than receiving a walk with no first child.
+    #[test]
+    fn narrowing_refuses_rather_than_severing_a_walk_it_cannot_fit() {
+        let steps = breadth_first_walk(12, 2);
+        // The narrowest survivor is the focal's first child and the deep branch
+        // below it: three steps. One is below that floor.
+        assert!(narrowed(&steps, 1).is_none(), "a walk was severed to fit");
+        let floor = narrowed(&steps, 3).expect("three steps is the floor, and it fits");
+        assert_eq!(
+            floor.iter().map(|step| step.0).collect::<Vec<_>>(),
+            vec![1, 13, 14],
+            "the survivor at the floor is the first child and its descendants"
+        );
+    }
+
+    /// A walk with nothing to narrow reports that, rather than returning a
+    /// no-op the caller would read as a cut it did not make.
+    #[test]
+    fn a_walk_with_no_node_wider_than_one_child_has_nothing_to_narrow() {
+        let steps = breadth_first_walk(1, 4);
+        assert!(
+            narrow_fanout_to_fit(
+                &steps,
+                &|step: &(u64, u64)| step.0,
+                &|step: &(u64, u64)| Some(step.1),
+                &mut |_kept: &[(u64, u64)]| false,
+            )
+            .is_none(),
+            "a spine has no branch to give up"
+        );
+    }
+
+    /// The fewest drops that fit, not the first that does. A caller who raises
+    /// `max_response_chars` by a little must get back more of the chain, and a
+    /// greedy cut that overshot would hand back the same short answer.
+    #[test]
+    fn narrowing_gives_up_the_fewest_branches_that_fit() {
+        let steps = breadth_first_walk(12, 2);
+        let roomy = narrowed(&steps, 13).expect("thirteen of fourteen steps fit");
+        assert_eq!(
+            roomy.len(),
+            13,
+            "one branch was enough, so only one may go: {roomy:?}"
+        );
+    }
 
     fn locate_payload(hits: usize, body_chars: usize) -> Value {
         let entities: Vec<Value> = (0..hits)

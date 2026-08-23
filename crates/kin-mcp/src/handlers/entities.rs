@@ -3484,22 +3484,13 @@ fn append_trace_degradation(result: &mut serde_json::Value, disclosure: serde_js
     }
 }
 
-/// Drop the least relevant branches until the chain fits, and report how many
-/// went.
+/// Narrow this arm's chain to fit, and report how many steps went.
 ///
-/// A branch is one child of one node, taken with everything below it. Children
-/// arrive already ordered by relevance, so the LAST child of a node is the one
-/// that node can most afford to lose, and dropping a whole branch is what keeps
-/// every surviving step's `parent_step` pointing at a step the caller still has.
-///
-/// Wide nodes are shaved first, because a wide fan-out is where the budget
-/// actually goes and because narrowing a node from twelve children to eight
-/// costs a caller far less than losing the end of the chain. Every node keeps at
-/// least its first child, so narrowing can thin a walk but can never sever it.
-///
-/// Bisected over the drop order rather than measured once per branch, for the
-/// same reason the suffix cut is: one serialization per step is the cost this
-/// whole function exists to avoid.
+/// The rule itself lives in [`crate::budget::narrow_fanout_to_fit`], written
+/// once and shared with the CLI arm the daemon route serves, because a budget
+/// rule that differed by whether a daemon was up is the two-surface divergence
+/// class this codebase keeps paying for. All this wrapper does is read the two
+/// keys off a JSON step and install the result.
 fn narrow_trace_fanout_to_fit(
     result: &mut serde_json::Value,
     discovered: &[serde_json::Value],
@@ -3508,98 +3499,22 @@ fn narrow_trace_fanout_to_fit(
 ) -> usize {
     let step_of = |value: &serde_json::Value| value["step"].as_u64().unwrap_or(0);
     let parent_of = |value: &serde_json::Value| value["parent_step"].as_u64();
-
-    // Children in the order they were discovered, which is the order relevance
-    // put them in.
-    let mut children: std::collections::BTreeMap<u64, Vec<u64>> = std::collections::BTreeMap::new();
-    for value in discovered {
-        if let Some(parent) = parent_of(value) {
-            if step_of(value) != parent {
-                children.entry(parent).or_default().push(step_of(value));
-            }
-        }
-    }
-
-    // The drop order: every node's children from least relevant inward, never
-    // its first, widest nodes first so the budget is reclaimed where it was
-    // spent.
-    let mut by_width: Vec<(u64, Vec<u64>)> = children
-        .iter()
-        .filter(|(_, kids)| kids.len() > 1)
-        .map(|(parent, kids)| (*parent, kids.clone()))
-        .collect();
-    by_width.sort_by(|left, right| {
-        right
-            .1
-            .len()
-            .cmp(&left.1.len())
-            .then_with(|| left.0.cmp(&right.0))
-    });
-    let mut drop_order: Vec<u64> = Vec::new();
-    let mut round = 0usize;
-    loop {
-        let mut moved = false;
-        for (_parent, kids) in &by_width {
-            // Keep the first child always; peel from the end inward.
-            if kids.len() > 1 + round {
-                drop_order.push(kids[kids.len() - 1 - round]);
-                moved = true;
-            }
-        }
-        if !moved {
-            break;
-        }
-        round += 1;
-    }
-    if drop_order.is_empty() {
-        return 0;
-    }
-
-    let retained = |dropped_count: usize| -> Vec<serde_json::Value> {
-        let mut condemned: std::collections::BTreeSet<u64> =
-            drop_order[..dropped_count].iter().copied().collect();
-        // A dropped branch takes its descendants with it, or their `parent_step`
-        // would name a step the caller no longer has. One forward pass suffices
-        // because children always follow their parents.
-        for value in discovered {
-            if let Some(parent) = parent_of(value) {
-                if condemned.contains(&parent) {
-                    condemned.insert(step_of(value));
-                }
-            }
-        }
-        discovered
-            .iter()
-            .filter(|value| !condemned.contains(&step_of(value)))
-            .cloned()
-            .collect()
-    };
-
-    let mut low = 0usize;
-    let mut high = drop_order.len();
-    let mut chosen: Option<Vec<serde_json::Value>> = None;
-    let mut chosen_drops = 0usize;
-    while low <= high {
-        let mid = (low + high) / 2;
-        let kept = retained(mid);
-        result["chain"] = serde_json::Value::Array(kept.clone());
-        result["total_steps"] = serde_json::Value::from(kept.len());
-        if measure(result) <= target {
-            chosen_drops = discovered.len() - kept.len();
-            chosen = Some(kept);
-            if mid == 0 {
-                break;
-            }
-            high = mid - 1;
-        } else {
-            low = mid + 1;
-        }
-    }
-    match chosen {
-        Some(kept) => {
-            result["chain"] = serde_json::Value::Array(kept.clone());
+    let narrowed = crate::budget::narrow_fanout_to_fit(
+        discovered,
+        &step_of,
+        &parent_of,
+        &mut |kept: &[serde_json::Value]| {
+            result["chain"] = serde_json::Value::Array(kept.to_vec());
             result["total_steps"] = serde_json::Value::from(kept.len());
-            chosen_drops
+            measure(result) <= target
+        },
+    );
+    match narrowed {
+        Some(kept) => {
+            let dropped = discovered.len() - kept.len();
+            result["chain"] = serde_json::Value::Array(kept);
+            result["total_steps"] = serde_json::Value::from(discovered.len() - dropped);
+            dropped
         }
         None => {
             // Nothing narrow enough fits; hand the whole chain back and let the
@@ -3660,9 +3575,10 @@ fn bound_trace_payload(result: &mut serde_json::Value, max_chars: usize) {
         result["chain"].as_array().cloned().unwrap_or_default();
     let narrowed = narrow_trace_fanout_to_fit(result, &discovered, target, measure);
     let full: Vec<serde_json::Value> = result["chain"].as_array().cloned().unwrap_or_default();
-    if narrowed > 0 {
-        result["fanout_narrowed"] = serde_json::Value::from(narrowed);
-    }
+    // Always written, zero included. A count that appears only when it fired
+    // is the sometimes-absent key that broke a consumer's parser twice, and a
+    // reader cannot tell "narrowed nothing" from "this build cannot narrow".
+    result["fanout_narrowed"] = serde_json::Value::from(narrowed);
     if measure(result) <= target {
         result["total_steps"] = serde_json::Value::from(full.len());
         let omitted = discovered.len() - full.len();
@@ -3672,14 +3588,18 @@ fn bound_trace_payload(result: &mut serde_json::Value, max_chars: usize) {
         result["steps_omitted"] = serde_json::Value::from(omitted);
         crate::budget::record_elision(result, "chain", full.len(), omitted);
         result["truncated"] = serde_json::Value::Bool(true);
+        // `steps_omitted` and not a reason of its own: the reason code names
+        // the lever a caller raises, and that lever is `max_response_chars`
+        // whichever way the cut was made. WHICH cut it was belongs in the
+        // detail and in `fanout_narrowed` beside it.
         let disclosure = serde_json::json!({
             "component": "response_budget",
-            "reason": "fanout_narrowed",
+            "reason": "steps_omitted",
             "detail": format!(
-                "the response exceeded its {max_chars}-character budget, so {omitted} of the \
-                 least relevant branches were dropped, narrowest-relevance first, rather than \
-                 the deepest steps of the chain; re-query a node with a smaller limit_per_step, \
-                 or raise max_chars to receive them"
+                "the response exceeded its {max_chars}-character budget, so {omitted} steps were \
+                 dropped as whole branches, least relevant first, rather than from the end of the \
+                 chain; re-query a node with a smaller limit_per_step, or raise \
+                 max_response_chars to receive them"
             ),
         });
         append_trace_degradation(result, disclosure);
@@ -4262,6 +4182,10 @@ pub fn handle_trace_data_flow<G: GraphStore>(
             .map(|value| value as usize),
     );
     result["max_response_chars"] = serde_json::Value::from(max_response_chars);
+    // Set before the bound so it is on every response, not only the cut ones.
+    // The bounder returns at its first line when the payload already fits, and
+    // a key that appears only after a cut cannot be read as a zero.
+    result["fanout_narrowed"] = serde_json::Value::from(0);
     bound_trace_payload(&mut result, max_response_chars);
     // Counted from the chain rather than during the walk, so the numbers
     // describe the steps this payload carries after `bound_trace_payload` has

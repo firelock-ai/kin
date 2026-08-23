@@ -22,7 +22,7 @@ use kin_ranking::entity_ranking::{
     trace_terminal_named, trace_walk_terminal, TraceExpansion, TraceTerminal,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::commands::graph::{graph_source_record_from, GraphSourceRecord};
@@ -516,6 +516,17 @@ pub struct TraceDataFlowResponse {
     pub bodies_omitted: usize,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub steps_omitted: usize,
+    /// How many of `steps_omitted` went as whole branches the budget narrowed
+    /// away, rather than off the end of the chain. Zero — and omitted — when
+    /// the suffix fallback did the cutting or when nothing was cut at all.
+    ///
+    /// Worth its own count because the two losses are different answers. A
+    /// narrowed chain still reaches as deep as the walk did and lists fewer
+    /// neighbours per node; an amputated one is shallower than the walk was,
+    /// and a reader who cannot tell them apart cannot tell whether the far end
+    /// of the answer is missing.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub fanout_narrowed: usize,
     /// Every list the response budget cut, keyed by the field it cut, with what
     /// survived, what was withheld, and why.
     ///
@@ -1162,6 +1173,7 @@ pub fn build_trace_data_flow_response_within(
         clipped_steps,
         bodies_omitted: 0,
         steps_omitted: 0,
+        fanout_narrowed: 0,
         elisions: BTreeMap::new(),
         unproven_steps: 0,
         external_identities_merged,
@@ -1504,8 +1516,33 @@ fn measure_response(response: &TraceDataFlowResponse) -> usize {
 /// still answers "what does this reach"; a chain missing edges answers a
 /// different, smaller question, and a caller cannot tell which question was
 /// answered unless the cut says so. Bodies go first, then the focal's body, then
-/// steps from the tail — a suffix, because the chain is discovery-ordered, so
-/// removing the end never orphans a surviving step's parent.
+/// steps.
+///
+/// ## Why the step cut narrows before it amputates
+///
+/// A suffix cut is safe, because the chain is discovery-ordered and removing
+/// the end never orphans a surviving step's parent. It is also what produced a
+/// wrong answer. Discovery order is breadth-first, so the tail of the chain is
+/// its DEEPEST steps, and cutting a suffix spends the whole budget on the
+/// shallow fan-out and amputates the far end, which is where a trace stops
+/// being a list of neighbours and becomes an answer.
+///
+/// Measured on a converted `psf/requests` by the rc0550 stranger at the
+/// documented cheap settings (`depth: 3`, `limit_per_step: 12`,
+/// `include_body: false`): 67 of 117 steps went, and the survivors did not
+/// include `_urllib3_request_context`, one hop past
+/// `build_connection_pool_key_attributes`, which is the function that folds
+/// `verify` into the urllib3 pool key. Read alone the answer said `verify`
+/// reaches TLS at `cert_verify` and stopped, missing the half that governs
+/// connection reuse. The stranger's words: "If I had trusted the Kin arm alone
+/// I would have written a wrong answer." The edge was in the graph the whole
+/// time.
+///
+/// So the cut now gives up whole branches, least relevant first, and only falls
+/// back to the suffix when nothing is left to narrow, so a pathological walk is
+/// still answered rather than refused. The rule itself is
+/// [`kin_mcp::budget::narrow_fanout_to_fit`], shared with the MCP arm so the
+/// two surfaces cannot drift.
 fn enforce_response_budget(response: &mut TraceDataFlowResponse) {
     let ceiling = response.max_response_chars;
     if measure_response(response) <= ceiling {
@@ -1535,52 +1572,83 @@ fn enforce_response_budget(response: &mut TraceDataFlowResponse) {
 
     let mut steps_omitted = 0usize;
     if measure_response(response) > target {
-        // Bisected rather than popped one step at a time: the same answer, in a
-        // handful of serializations instead of one per dropped step.
-        //
-        // The floor is one step, not zero. A walk that reached 200 steps and
-        // returns `"chain": []` is indistinguishable from a walk that reached
-        // none, and no counter elsewhere in the response outranks the empty
-        // array for a reader. One surviving step plus the elision beside it says
-        // both what was reached and what was withheld.
         let full = std::mem::take(&mut response.chain);
-        let floor = usize::from(!full.is_empty());
-        let mut kept = floor;
-        let mut low = floor;
-        let mut high = full.len();
-        while low <= high {
-            let mid = (low + high) / 2;
-            response.chain = full[..mid].to_vec();
-            response.total_steps = mid;
-            if measure_response(response) <= target {
-                kept = mid;
-                low = mid + 1;
-            } else if mid <= floor {
-                break;
-            } else {
-                high = mid - 1;
+        // Narrow first. Every candidate the shared rule offers is measured the
+        // way this response will be sent, so the arithmetic is the budget's own
+        // rather than an estimate of it.
+        let narrowed = kin_mcp::budget::narrow_fanout_to_fit(
+            &full,
+            &|step: &TraceStep| step.step as u64,
+            &|step: &TraceStep| Some(step.parent_step as u64),
+            &mut |kept: &[TraceStep]| {
+                response.chain = kept.to_vec();
+                response.total_steps = kept.len();
+                measure_response(response) <= target
+            },
+        );
+        let kept_chain = match narrowed {
+            Some(kept) => {
+                response.fanout_narrowed = full.len() - kept.len();
+                kept
             }
-        }
-        steps_omitted = full.len() - kept;
-        response.chain = full[..kept].to_vec();
-        response.total_steps = kept;
+            None => {
+                // Nothing narrow enough fits, so fall back to the suffix, which
+                // always terminates.
+                //
+                // Bisected rather than popped one step at a time: the same
+                // answer, in a handful of serializations instead of one per
+                // dropped step.
+                //
+                // The floor is one step, not zero. A walk that reached 200 steps
+                // and returns `"chain": []` is indistinguishable from a walk
+                // that reached none, and no counter elsewhere in the response
+                // outranks the empty array for a reader. One surviving step plus
+                // the elision beside it says both what was reached and what was
+                // withheld.
+                let floor = usize::from(!full.is_empty());
+                let mut kept = floor;
+                let mut low = floor;
+                let mut high = full.len();
+                while low <= high {
+                    let mid = (low + high) / 2;
+                    response.chain = full[..mid].to_vec();
+                    response.total_steps = mid;
+                    if measure_response(response) <= target {
+                        kept = mid;
+                        low = mid + 1;
+                    } else if mid <= floor {
+                        break;
+                    } else {
+                        high = mid - 1;
+                    }
+                }
+                full[..kept].to_vec()
+            }
+        };
+        steps_omitted = full.len() - kept_chain.len();
+        response.chain = kept_chain;
+        response.total_steps = response.chain.len();
         response.steps_omitted = steps_omitted;
         if steps_omitted > 0 {
             // The same loss in the shape every budgeted list reports it in, so a
             // caller reads one key whether the tool cut a chain or a bucket of
             // tests.
-            response
-                .elisions
-                .insert("chain".to_string(), Elision::budget(kept, steps_omitted));
+            response.elisions.insert(
+                "chain".to_string(),
+                Elision::budget(response.chain.len(), steps_omitted),
+            );
             // Dropped steps are edges the caller did not receive, which is what
             // this flag has always meant. Dropped bodies are not.
             response.truncated = true;
             // A clip recorded against a step that is no longer here would send a
-            // caller re-querying a node the response does not name.
-            let kept_steps = response.chain.len();
+            // caller re-querying a node the response does not name. Membership
+            // rather than `clip.step <= kept`: a narrowed chain is no longer a
+            // prefix, so a bound on the index would keep clips for steps that
+            // went and drop clips for steps that stayed.
+            let surviving: BTreeSet<usize> = response.chain.iter().map(|step| step.step).collect();
             response
                 .clipped_steps
-                .retain(|clip| clip.step <= kept_steps);
+                .retain(|clip| clip.step == 0 || surviving.contains(&clip.step));
         }
     }
 
@@ -1592,15 +1660,24 @@ fn enforce_response_budget(response: &mut TraceDataFlowResponse) {
     } else {
         "bodies_omitted"
     };
+    // Named for HOW the steps went, because "from the end of the chain" and
+    // "as whole branches" leave a caller in different places: the first says
+    // the far end of the answer is missing, the second says every node lists
+    // fewer neighbours and the depth is intact.
+    let how = if response.fanout_narrowed > 0 {
+        "as whole branches, least relevant first"
+    } else {
+        "from the end of the chain"
+    };
     let cut = match (
         bodies_omitted + usize::from(focal_body_omitted),
         steps_omitted,
     ) {
         (bodies, 0) => format!("{bodies} inlined bodies were dropped"),
-        (0, steps) => format!("{steps} steps were dropped from the end of the chain"),
+        (0, steps) => format!("{steps} steps were dropped {how}"),
         (bodies, steps) => format!(
-            "{bodies} inlined bodies were dropped, and {steps} steps after that were dropped from \
-             the end of the chain"
+            "{bodies} inlined bodies were dropped, and {steps} steps after that were dropped \
+             {how}"
         ),
     };
     record_degradation(
@@ -2559,6 +2636,7 @@ mod tests {
             clipped_steps: Vec::new(),
             bodies_omitted: 0,
             steps_omitted: 0,
+            fanout_narrowed: 0,
             elisions: BTreeMap::new(),
             unproven_steps: 0,
             external_identities_merged: 0,
@@ -2658,6 +2736,210 @@ mod tests {
         assert!(
             serde_json::to_string_pretty(&response).unwrap().len() <= response.max_response_chars,
             "the payload must end up inside the budget it reports"
+        );
+    }
+
+    /// The measured shape, in miniature: a focal with a wide fan-out, one deep
+    /// branch hanging off its FIRST child, and steps numbered in discovery
+    /// order, which is breadth-first, so the deep steps are last.
+    ///
+    /// `psf/requests` gave `HTTPAdapter.send` twelve depth-1 children and put
+    /// `_urllib3_request_context` at depth 3, which is where the tail is.
+    fn wide_then_deep_response(
+        width: usize,
+        deep: usize,
+        pad_chars: usize,
+    ) -> TraceDataFlowResponse {
+        let mut response = fat_response(0, 0);
+        let mut chain: Vec<TraceStep> = Vec::new();
+        let push = |chain: &mut Vec<TraceStep>, name: String, parent: usize, depth: usize| {
+            let entity = make_entity(&name, "src/step.rs");
+            let mut record = entity_record(&entity, None, None);
+            record.signature = Some("s".repeat(pad_chars));
+            chain.push(TraceStep {
+                step: chain.len() + 1,
+                role: "callee".to_string(),
+                relation_kind: "Calls".to_string(),
+                resolution: RelationResolution::TypeResolved.as_str().to_string(),
+                parent_step: parent,
+                depth,
+                entity: record,
+                fanout_truncated: false,
+                fanout_dropped: 0,
+                terminal: None,
+            });
+        };
+        for index in 1..=width {
+            push(&mut chain, format!("neighbour_{index}"), 0, 1);
+        }
+        let mut parent = 1usize;
+        for level in 0..deep {
+            push(&mut chain, format!("deep_{level}"), parent, level + 2);
+            parent = chain.len();
+        }
+        response.bodies_included = false;
+        response.total_steps = chain.len();
+        response.chain = chain;
+        response
+    }
+
+    /// The smallest payload narrowing can produce for [`wide_then_deep_response`]:
+    /// the focal's first child and the deep branch below it, which is what
+    /// "every node keeps its first child" leaves behind.
+    ///
+    /// Computed rather than guessed, so these tests calibrate against the
+    /// serializer instead of against a number that drifts the first time a field
+    /// is added to a step.
+    fn narrowest_budget(width: usize, deep: usize, pad_chars: usize) -> usize {
+        let mut floor = wide_then_deep_response(width, deep, pad_chars);
+        let survivors: BTreeSet<usize> = std::iter::once(1)
+            .chain((width + 1)..=(width + deep))
+            .collect();
+        floor.chain.retain(|step| survivors.contains(&step.step));
+        floor.total_steps = floor.chain.len();
+        serde_json::to_string_pretty(&floor).map_or(usize::MAX, |json| json.len())
+            + TRACE_DISCLOSURE_RESERVE_CHARS
+    }
+
+    /// FIR-2642. The budget must give up the focal's least relevant neighbours
+    /// before it gives up the end of the chain, because the end of the chain is
+    /// the answer.
+    ///
+    /// Measured on a converted `psf/requests` at the stranger's own settings:
+    /// the suffix cut returned nothing past depth 2 while the walk had reached
+    /// depth 3, so the response said `verify` reaches TLS at `cert_verify` and
+    /// stopped, missing the pool-key path that governs connection reuse.
+    #[test]
+    fn the_budget_narrows_the_fan_out_before_it_amputates_the_chain() {
+        let mut response = wide_then_deep_response(12, 2, 900);
+        response.max_response_chars = narrowest_budget(12, 2, 900);
+        let deepest = response
+            .chain
+            .last()
+            .expect("the fixture has a deep end")
+            .entity
+            .entity_name
+            .clone();
+        assert!(
+            serde_json::to_string_pretty(&response).unwrap().len() > response.max_response_chars,
+            "the fixture must start over budget or this proves nothing"
+        );
+
+        enforce_response_budget(&mut response);
+
+        assert!(
+            step_names(&response).contains(&deepest),
+            "the budget amputated the deep end instead of narrowing the fan-out: {:?}",
+            step_names(&response)
+        );
+        assert!(
+            response.fanout_narrowed > 0,
+            "a narrowed cut must say it narrowed"
+        );
+        assert_eq!(
+            response.fanout_narrowed, response.steps_omitted,
+            "every step this cut dropped went as part of a branch"
+        );
+        // No survivor may name a parent the response no longer carries, which is
+        // the property a prefix cut got for free and this one has to earn.
+        let present: BTreeSet<usize> = response.chain.iter().map(|step| step.step).collect();
+        assert!(
+            response
+                .chain
+                .iter()
+                .all(|step| step.parent_step == 0 || present.contains(&step.parent_step)),
+            "a surviving step names a parent the cut removed: {present:?}"
+        );
+        let cut = response
+            .degradations
+            .iter()
+            .find(|d| d.component == "response_budget")
+            .expect("the cut must be disclosed");
+        assert!(
+            cut.detail.contains("as whole branches"),
+            "the disclosure must say which cut a caller received: {}",
+            cut.detail
+        );
+        assert!(
+            serde_json::to_string_pretty(&response).unwrap().len() <= response.max_response_chars,
+            "the payload must end up inside the budget it reports"
+        );
+    }
+
+    /// The other direction, so the disclosure cannot be a constant. A chain with
+    /// no node wider than one child has no branch to give up, so the suffix cut
+    /// runs, `fanout_narrowed` stays zero, and the wording says end-of-chain.
+    #[test]
+    fn a_chain_with_nothing_to_narrow_still_takes_the_suffix_cut_and_says_so() {
+        let mut response = fat_response(200, 0);
+        response.bodies_included = false;
+        for step in &mut response.chain {
+            step.entity.body = None;
+            step.entity.span_coherence = None;
+            step.entity.signature = Some("s".repeat(400));
+        }
+        response.max_response_chars = 8_000;
+
+        enforce_response_budget(&mut response);
+
+        assert!(response.steps_omitted > 0, "the fixture must reach the cut");
+        assert_eq!(
+            response.fanout_narrowed, 0,
+            "a spine has no branch to give up, so nothing may claim it narrowed one"
+        );
+        let cut = response
+            .degradations
+            .iter()
+            .find(|d| d.component == "response_budget")
+            .expect("the cut must be disclosed");
+        assert!(
+            cut.detail.contains("from the end of the chain"),
+            "the suffix cut must still say so: {}",
+            cut.detail
+        );
+    }
+
+    /// A clip is a pointer into `chain`, and a narrowed chain is no longer a
+    /// prefix, so keeping clips by index would keep pointers to steps that went
+    /// and drop pointers to steps that stayed.
+    #[test]
+    fn a_narrowed_chain_keeps_exactly_the_clips_whose_steps_survived() {
+        let mut response = wide_then_deep_response(12, 2, 900);
+        for step in [1usize, 12, 14] {
+            response.clipped_steps.push(TraceFanoutClip {
+                step,
+                entity_id: format!("clip-{step}"),
+                entity_name: format!("step_{step}"),
+                dropped_callees: 3,
+                dropped_callers: 0,
+                limit_per_step: 12,
+            });
+        }
+        // Calibrated on THIS response, clips included, because the clips are
+        // part of what the budget measures.
+        let mut floor = response.clone();
+        floor.chain.retain(|step| [1, 13, 14].contains(&step.step));
+        floor.total_steps = floor.chain.len();
+        response.max_response_chars =
+            serde_json::to_string_pretty(&floor).unwrap().len() + TRACE_DISCLOSURE_RESERVE_CHARS;
+
+        enforce_response_budget(&mut response);
+
+        let present: BTreeSet<usize> = response.chain.iter().map(|step| step.step).collect();
+        assert!(
+            present.contains(&1) && present.contains(&14),
+            "the fixture must keep the first neighbour and the deep end: {present:?}"
+        );
+        assert!(
+            !present.contains(&12),
+            "the fixture must drop the last neighbour or the clip test proves nothing: \
+             {present:?}"
+        );
+        let clipped: BTreeSet<usize> = response.clipped_steps.iter().map(|c| c.step).collect();
+        assert_eq!(
+            clipped,
+            BTreeSet::from([1, 14]),
+            "a clip must name a step the response still carries, and must not lose one it does"
         );
     }
 
