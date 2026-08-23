@@ -3025,6 +3025,44 @@ class Response:
     }
 
     #[test]
+    fn a_raise_marks_the_class_it_throws_and_nothing_else() {
+        // FIR-2642. `raise SSLError(...)` is a real call edge and real evidence
+        // that this function can throw, and it is NOT a hop a value travels
+        // along. Only the DIRECT operand is marked: `raise Wrapper(build())`
+        // throws the wrapper, and demoting `build()` for its neighbour's syntax
+        // would cost the recall the marker exists to protect.
+        use crate::extract::RelationSyntacticRole;
+        let adapter = PythonAdapter;
+        let source =
+            b"def go(x):\n    if x:\n        raise Wrapper(build())\n    return SSLError()\n";
+        let tree = adapter.parse(source).unwrap();
+        let output = adapter
+            .extract(&tree, source, &FilePathId::new("m.py"))
+            .unwrap();
+        let mut marked: Vec<(&str, bool)> = output
+            .relations
+            .iter()
+            .filter(|rel| rel.kind == kin_model::RelationKind::Calls)
+            .map(|rel| {
+                (
+                    rel.dst_name.as_str(),
+                    rel.site
+                        .as_ref()
+                        .and_then(|site| site.syntactic_role)
+                        .is_some_and(|role| role == RelationSyntacticRole::RaiseTarget),
+                )
+            })
+            .collect();
+        marked.sort();
+        assert_eq!(
+            marked,
+            vec![("SSLError", false), ("Wrapper", true), ("build", false)],
+            "the raised class is marked, the call inside its arguments is not, \
+             and a constructor called outside a raise is not"
+        );
+    }
+
+    #[test]
     fn a_type_checking_guarded_import_binds_the_name_its_annotation_uses() {
         // PEP 484 says an import that exists only for annotations belongs
         // behind `if TYPE_CHECKING:`, and requests puts
