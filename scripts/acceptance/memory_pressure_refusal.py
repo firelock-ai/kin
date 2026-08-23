@@ -819,7 +819,13 @@ def check_7(suite):
         "first_unix": 1787000000,
         "last_unix": 1787000000,
         "last_pid": 4103,
-        "last_cause": {"MemoryLimit": {"kernel_oom_kills": 1}},
+        # Internally tagged: `#[serde(tag = "kind", rename_all = "snake_case")]`
+        # on DaemonKillCause. The externally-tagged shape this first carried did
+        # not deserialize, the reader returned None, and the surface correctly
+        # said nothing, which read exactly like the product failing to name an
+        # OOM. A planted fixture that cannot be loaded is a check that fails for
+        # its own reason.
+        "last_cause": {"kind": "memory_limit", "kernel_oom_kills": 1},
         "limit_bytes": twelve_gib,
         "last_rss_bytes": twelve_gib - 5 * 1024 * 1024,
     }
@@ -1042,6 +1048,8 @@ def main(argv):
                         help="an opaque run label recorded in the report")
     parser.add_argument("--keep", action="store_true", help="keep the fixtures")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--only", action="append", default=None,
+                        help="run only these check ids (repeatable)")
     parser.add_argument("--self-test", action="store_true",
                         help="falsify this suite's graders and exit")
     args = parser.parse_args(argv)
@@ -1068,7 +1076,12 @@ def main(argv):
     try:
         suite = Suite(kin, workdir, daemon=daemon, verbose=args.verbose)
         results = []
-        for check_id, check in CHECKS:
+        selected = [(cid, fn) for cid, fn in CHECKS
+                    if args.only is None or cid in args.only]
+        if not selected:
+            print("kin-memory-pressure-repro: --only %s matched no check" % args.only)
+            return 3
+        for check_id, check in selected:
             try:
                 results.append(check(suite))
             except Exception as error:  # noqa: BLE001 - a crashed probe is UNREADABLE
