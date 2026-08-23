@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Stop the resource-profile knob from making kin complain about the machine (#1094)
 - Stop three surfaces asserting answers their authority never produced (#1078)
 - Leave a post-mortem when a conversion is killed, and reclaim what it stranded (#1096)
+- Pin kin-db 0.7.51 and the kin-model 0.7.16 it requires (#1100)
+- Hold the enumeration certification honest in both directions (#1097)
 
 
 ## [0.5.50] - 2026-08-22
