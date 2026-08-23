@@ -757,6 +757,122 @@ pub fn sweep_circuit_open(consecutive_fruitless_interruptions: u32) -> bool {
     consecutive_fruitless_interruptions >= SWEEP_INTERRUPTION_LIMIT
 }
 
+/// File a running daemon publishes so its own death can be attributed after the
+/// fact.
+pub const SERVING_FILE_NAME: &str = "daemon.serving";
+
+/// What a daemon records about itself while it is serving.
+///
+/// The problem this exists for. Attributing a kill to memory needs the kernel's
+/// counter from BEFORE the daemon existed, and the only holder of that reading
+/// was [`DaemonWatch`], which lives in the process that spawned the daemon. A
+/// daemon that outlives its spawner and is then killed is therefore observed by
+/// nobody: no record is written, and every surface downstream is free to call
+/// the silence an idle exit. That is FIR-2650's upstream half, and it is why a
+/// measured OOM could be reported as a normal retirement.
+///
+/// So the daemon carries its own before-reading. This is the same shape the
+/// cold sweep already uses for the same reason: everything a sweep says about
+/// itself lives after its last file, so it records that it has begun and the
+/// next start settles what the absence of an ending means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ServingDaemon {
+    /// The daemon's process id.
+    pub pid: u32,
+    /// Kernel OOM kills accounted to this cgroup when the daemon started, or
+    /// `None` where no accounting is readable. `None` is this process being
+    /// unable to ask, never "none had happened".
+    pub oom_kills_at_start: Option<u64>,
+    /// Unix seconds at publication.
+    pub at_unix: u64,
+}
+
+/// Where `kin_root` keeps it.
+pub fn serving_path(kin_root: &Path) -> PathBuf {
+    kin_root.join(SERVING_FILE_NAME)
+}
+
+/// Record that a daemon has begun serving, with the counter as it stands now.
+pub fn publish_serving_daemon(kin_root: &Path, pid: u32) {
+    let record = ServingDaemon {
+        pid,
+        oom_kills_at_start: cgroup_memory().oom_kills,
+        at_unix: unix_now(),
+    };
+    if let Ok(body) = serde_json::to_vec(&record) {
+        let _ = fs::write(serving_path(kin_root), body);
+    }
+}
+
+/// Retire the record, because this daemon is ending on its own terms.
+///
+/// Clearing it is what makes its SURVIVAL mean something: a record left behind
+/// by a process that is gone is a daemon that did not get to say goodbye.
+pub fn retire_serving_daemon(kin_root: &Path) {
+    let _ = fs::remove_file(serving_path(kin_root));
+}
+
+/// What this store says is serving it, or `None`.
+pub fn read_serving_daemon(kin_root: &Path) -> Option<ServingDaemon> {
+    let raw = fs::read_to_string(serving_path(kin_root)).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Settle the previous daemon's death, if it had one nobody watched.
+///
+/// Called at the next daemon start, because the record it takes is the only
+/// trace an unwatched death leaves and a second daemon would otherwise read it
+/// as its own. Taking the record also clears it, so one death is counted once
+/// however many starts follow it.
+///
+/// The attribution is graded exactly as a watched kill's is: the counter having
+/// moved between the dead daemon's start and now is the kernel's own statement
+/// and becomes `MemoryLimit`; anything else is `Unattributed`, because a
+/// counter that did not move attributes nothing and a host that cannot be asked
+/// attributes nothing either.
+///
+/// A daemon whose pid is still alive is not settled: it is serving, and its
+/// record is doing its job.
+pub fn settle_unwatched_daemon_death(kin_root: &Path) -> Option<DaemonKillRecord> {
+    let serving = read_serving_daemon(kin_root)?;
+    if process_is_alive(serving.pid) {
+        return None;
+    }
+    retire_serving_daemon(kin_root);
+    // A daemon that wrote a death note explained itself, and the note's author
+    // owns that story. Counting it again here would double-report one ending.
+    if read_daemon_death_note(kin_root).is_some_and(|note| note.pid == serving.pid) {
+        return None;
+    }
+    let now = cgroup_memory();
+    let kernel_oom_kills = match (serving.oom_kills_at_start, now.oom_kills) {
+        (Some(before), Some(after)) if after > before => Some(after - before),
+        _ => None,
+    };
+    let (last_cause, memory_kills) = match kernel_oom_kills {
+        Some(kernel_oom_kills) => (DaemonKillCause::MemoryLimit { kernel_oom_kills }, 1),
+        // The signal is unknown here, because nobody waited on this process and
+        // its exit status is gone. Zero says exactly that rather than naming a
+        // signal nobody observed.
+        None => (DaemonKillCause::Unattributed { signal: 0 }, 0),
+    };
+    let fresh = DaemonKillRecord {
+        kills: 1,
+        memory_kills,
+        first_unix: unix_now(),
+        last_unix: unix_now(),
+        last_pid: Some(serving.pid),
+        last_cause,
+        limit_bytes: now.limit_bytes,
+        last_rss_bytes: read_open_transaction(kin_root)
+            .filter(|open| open.pid == serving.pid)
+            .and_then(|open| open.peak_rss_bytes.max(open.rss_bytes)),
+    };
+    let record = accumulate_kill(read_daemon_kill_record(kin_root), fresh);
+    write_daemon_kill_record(kin_root, &record);
+    Some(record)
+}
+
 /// A store whose language-server enrichment has been switched off by the
 /// circuit, and the tally that switched it off.
 ///
@@ -7764,6 +7880,93 @@ mod tests {
         assert_eq!(parse_oom_kill_count("low 0\nhigh 0\nmax 0\noom 0\n"), None);
         assert_eq!(parse_oom_kill_count("oom_kill 0\n"), Some(0));
         assert_eq!(parse_oom_kill_count("oom_kill notanumber\n"), None);
+    }
+
+    /// A daemon that outlived its spawner and was then killed leaves a record
+    /// anyway.
+    ///
+    /// FIR-2650's upstream half. The before-reading a memory attribution needs
+    /// lived only in `DaemonWatch`, inside the process that spawned the daemon,
+    /// so a daemon killed after that process exited was observed by nobody and
+    /// every surface downstream was free to call the silence an idle exit.
+    #[test]
+    fn a_death_nobody_watched_is_settled_by_the_next_start() {
+        let dir = tempfile::tempdir().unwrap();
+        // A pid that cannot be alive, so the settlement is deterministic rather
+        // than a race against whatever holds this number today.
+        let dead = u32::MAX;
+        fs::write(
+            serving_path(dir.path()),
+            serde_json::to_vec(&ServingDaemon {
+                pid: dead,
+                oom_kills_at_start: Some(0),
+                at_unix: 1_000,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let settled = settle_unwatched_daemon_death(dir.path())
+            .expect("a serving record whose process is gone is a death nobody counted");
+        assert_eq!(settled.kills, 1);
+        assert_eq!(settled.last_pid, Some(dead));
+        // Taking the record is what stops a second start counting it again.
+        assert!(read_serving_daemon(dir.path()).is_none());
+        assert!(settle_unwatched_daemon_death(dir.path()).is_none());
+        assert_eq!(read_daemon_kill_record(dir.path()).map(|r| r.kills), Some(1));
+    }
+
+    /// A daemon that is still serving is not a death.
+    #[test]
+    fn a_living_daemon_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        publish_serving_daemon(dir.path(), std::process::id());
+        assert!(
+            settle_unwatched_daemon_death(dir.path()).is_none(),
+            "this very process is alive, so its record is doing its job"
+        );
+        assert!(read_serving_daemon(dir.path()).is_some());
+    }
+
+    /// A daemon whose killer explained it is not counted twice.
+    #[test]
+    fn a_death_its_author_already_explained_is_not_counted_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let dead = u32::MAX;
+        write_daemon_death_note(
+            dir.path(),
+            &DaemonDeathNote {
+                pid: dead,
+                killed_by: "kin-supervisor-reaper".to_string(),
+                reason: "a deliberate reap".to_string(),
+                in_flight: None,
+                at: "2026-08-23T00:00:00Z".to_string(),
+            },
+        );
+        fs::write(
+            serving_path(dir.path()),
+            serde_json::to_vec(&ServingDaemon {
+                pid: dead,
+                oom_kills_at_start: Some(0),
+                at_unix: 1_000,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            settle_unwatched_daemon_death(dir.path()).is_none(),
+            "the note's author owns that ending, and counting it here would report one twice"
+        );
+        assert!(read_daemon_kill_record(dir.path()).is_none());
+    }
+
+    /// An empty store settles nothing, which keeps a first-ever start from
+    /// inventing a predecessor.
+    #[test]
+    fn a_store_that_never_served_settles_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(settle_unwatched_daemon_death(dir.path()).is_none());
+        assert!(read_daemon_kill_record(dir.path()).is_none());
     }
 
     const TWELVE_GIB: u64 = 12 * 1024 * 1024 * 1024;

@@ -3339,6 +3339,28 @@ pub async fn run_with_authority_on(
     // the daemon itself. Publishing during the open window would therefore turn
     // "not ready yet" into a failed command on the attach path. Binding early
     // costs nothing here because it advertises nothing; only publication does.
+    // Settle the previous daemon's death before recording this one's life, and
+    // in that order for the reason `decide_sweep_on_start` settles a killed
+    // sweep at startup: the record an unwatched death leaves is the only trace
+    // of it, and a second daemon would otherwise read that trace as its own.
+    //
+    // A daemon killed while nothing watched it used to leave nothing at all.
+    // The before-reading a memory attribution needs lived in `DaemonWatch`,
+    // which lives in the process that spawned the daemon, so a daemon that
+    // outlived its spawner and was then killed was observed by nobody and every
+    // surface downstream was free to call the silence an idle exit. That is
+    // what let a measured OOM be reported as a normal retirement.
+    if let Some(record) =
+        kin_daemon_spawn::settle_unwatched_daemon_death(state.layout.root())
+    {
+        warn!(
+            kills = record.kills,
+            memory_kills = record.memory_kills,
+            "a daemon serving this store died without being watched, and this start counted it: {}",
+            record.cause_sentence()
+        );
+    }
+    kin_daemon_spawn::publish_serving_daemon(state.layout.root(), std::process::id());
     crate::lifecycle::publish_daemon_endpoint(state.layout.root(), bound_port)
         .map_err(DaemonError::Io)?;
     // Recorded so the ordering above is readable off the daemon's own log
