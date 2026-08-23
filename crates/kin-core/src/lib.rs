@@ -25,6 +25,7 @@ pub mod git_init;
 pub mod hooks;
 pub mod identity;
 pub mod init;
+pub mod init_attempt;
 mod init_progress;
 pub use init_progress::report_admission_progress;
 mod init_staging;

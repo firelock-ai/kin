@@ -102,7 +102,7 @@ Options:
     --corpus-cache PATH  pinned upstream clones (default: ~/.cache/kin-brownfield-repro)
     --offline            refuse to fetch; the cache must already carry both pins
     --label NAME         label recorded in the JSON report
-    --only IDS           comma-separated check ids to run, 0 through 8 (default: all)
+    --only IDS           comma-separated check ids to run, 0 through 9 (default: all)
     --json PATH          write machine-readable results here
     --compare PATH       a prior run's --json; a check that passed there and fails
                          here reads REGRESSION rather than plain FAIL
@@ -1433,6 +1433,253 @@ def check_8(suite):
     return res
 
 
+
+# ------------------------------------------------ FIR-2639 interrupted init
+
+# Commits in the throwaway conversion fixture.
+#
+# Large enough that the admission ladder spends seconds past its staging phase,
+# so a poller can land a kill inside a known phase rather than racing a
+# conversion that finished first; small enough that two full conversions cost
+# the suite about ten seconds. Built through `git fast-import` in one process,
+# because 240 `git commit` invocations cost more than both conversions do.
+RESCUE_FIXTURE_COMMITS = 240
+
+# The ladder phase a kill must land at or past.
+#
+# Phase 8 is where init creates the repository stage, so a kill from here on
+# strands BOTH staging directories, which is the shape the rc0550 stranger
+# found on disk. Killing earlier would leave only the capture directory and
+# would not exercise what the fix reclaims.
+RESCUE_KILL_AT_PHASE = 8
+
+RESCUE_PHASE_LINE = re.compile(r"\[\s*(\d+)/17\]")
+
+# What init stages beside the repository, and what a clean disk has none of.
+RESCUE_STAGING_PREFIXES = (".kin.init-", ".kin-git-capture-")
+
+
+def rescue_fixture(suite):
+    """A throwaway many-commit Git repository, built once per run."""
+    root = os.path.join(suite.workdir, "init-rescue-" + suite.run_id)
+    repo = os.path.join(root, "fixture")
+    if os.path.isdir(os.path.join(repo, ".git")):
+        return root, repo
+    os.makedirs(repo)
+    rc, _out, err = suite.git(["init", "-q", "-b", "main", "."], cwd=repo)
+    if rc != 0:
+        raise ProbeError("git init refused the fixture: %s" % err[:400])
+    stream = []
+    for index in range(1, RESCUE_FIXTURE_COMMITS + 1):
+        body = ("def f%d():\n    return %d\n" % (index, index)).encode()
+        stream.append(b"blob\nmark :%d\ndata %d\n%s\n"
+                      % (index, len(body), body))
+        message = b"commit %d" % index
+        stream.append(
+            b"commit refs/heads/main\nmark :%d\n"
+            b"author fixture <fixture@example.invalid> %d +0000\n"
+            b"committer fixture <fixture@example.invalid> %d +0000\n"
+            b"data %d\n%s\nM 100644 :%d mod%d.py\n\n"
+            % (100000 + index, 1700000000 + index, 1700000000 + index,
+               len(message), message, index, index % 12))
+    proc = subprocess.Popen(
+        ["git", "-c", "core.hooksPath=/dev/null", "fast-import", "--quiet"],
+        cwd=repo, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, env=suite.env)
+    _, err = proc.communicate(b"".join(stream))
+    if proc.returncode != 0:
+        raise ProbeError("git fast-import refused the fixture: %s"
+                         % err.decode("utf-8", "replace")[:400])
+    rc, _out, err = suite.git(["reset", "-q", "--hard", "main"], cwd=repo)
+    if rc != 0:
+        raise ProbeError("git reset refused the imported history: %s"
+                         % err[:400])
+    return root, repo
+
+
+def rescue_staging(parent):
+    """Every init staging path sitting beside a repository, sorted."""
+    try:
+        names = sorted(os.listdir(parent))
+    except OSError:
+        return []
+    return [os.path.join(parent, name) for name in names
+            if name.startswith(RESCUE_STAGING_PREFIXES)]
+
+
+def rescue_kill_init_mid_ladder(suite, repo, log_path):
+    """Run one `kin init` and SIGKILL it at or past the staging phase.
+
+    Answers (returncode, highest phase the ladder announced). The kill is
+    triggered off the ladder's own stderr rather than off a timer, so it lands
+    in a known phase on a fast host and a slow one alike, and it is the same
+    trigger on a pre-fix binary as on a fixed one.
+    """
+    with open(log_path, "wb") as log:
+        proc = subprocess.Popen([suite.kin, "init", ".", "--no-enrich"],
+                                cwd=repo, stdout=subprocess.DEVNULL,
+                                stderr=log, env=suite.env)
+        reached = 0
+        deadline = time.time() + 600
+        while time.time() < deadline:
+            try:
+                with open(log_path, "rb") as tail:
+                    seen = RESCUE_PHASE_LINE.findall(
+                        strip_ansi(tail.read().decode("utf-8", "replace")))
+            except OSError:
+                seen = []
+            if seen:
+                reached = max(int(phase) for phase in seen)
+            if reached >= RESCUE_KILL_AT_PHASE:
+                proc.kill()
+                break
+            if proc.poll() is not None:
+                break
+            time.sleep(0.02)
+        else:
+            proc.kill()
+        proc.wait()
+    return proc.returncode, reached
+
+
+def read_text(path):
+    try:
+        with open(path, "rb") as handle:
+            return strip_ansi(handle.read().decode("utf-8", "replace"))
+    except OSError:
+        return ""
+
+
+def check_9(suite):
+    """FIR-2639: a conversion the kernel kills says so afterwards.
+
+    The rc0550 stranger's psf/requests conversion was OOM-killed at step 13 of
+    17. Kin printed nothing, `.kin` did not exist, and 420 MB of staging sat in
+    the parent directory with nothing pointing at it. `SIGKILL` runs no
+    destructor, so no amount of error handling inside the dying process can fix
+    that; only a record written before the kill and read by the next command
+    can.
+
+    This reproduces that with the same signal on a fixture, then asks the three
+    surfaces the stranger had: does the next command name the kill and the
+    phase, does the re-run say whether it resumes or restarts, and is the
+    staging still sitting there unnamed. On a pre-fix binary all three answer
+    with silence.
+    """
+    res = Result("9", "FIR-2639", "a killed kin init leaves a post-mortem, a "
+                                  "named restart and no silent orphan")
+    try:
+        parent, repo = rescue_fixture(suite)
+    except ProbeError as exc:
+        res.unknown(str(exc))
+        return res
+
+    log = os.path.join(parent, "killed-init.err")
+    rc, reached = rescue_kill_init_mid_ladder(suite, repo, log)
+
+    # Preconditions. Each is the defect's own shape, and a run that did not
+    # reproduce it can say nothing about the fix, so these are UNREADABLE
+    # rather than either verdict.
+    if reached < RESCUE_KILL_AT_PHASE:
+        res.unknown("the conversion never announced phase %d, so no kill landed "
+                    "mid-ladder (highest phase seen: %d)"
+                    % (RESCUE_KILL_AT_PHASE, reached))
+        return res
+    if rc == 0:
+        res.unknown("the conversion exited 0, so it finished before the kill "
+                    "and there is no interrupted run to report")
+        return res
+    if os.path.isdir(os.path.join(repo, ".kin")):
+        res.unknown("a repository was published despite the kill, so this is "
+                    "not the stranded case")
+        return res
+    stranded = rescue_staging(parent)
+    if not stranded:
+        res.unknown("the kill left no staging behind, so there is nothing for "
+                    "a post-mortem to be about")
+        return res
+    res.note("killed at phase %d of 17, rc %s, %d staging path(s) stranded: %s"
+             % (reached, rc, len(stranded),
+                ", ".join(os.path.basename(path) for path in stranded)))
+
+    # ARM 1. The next command names the kill and the phase it landed in.
+    _doctor_rc, doctor_out, doctor_err = suite.kin_run(["doctor"], repo,
+                                                       timeout=600)
+    doctor_text = doctor_out + doctor_err
+    row = [line for line in doctor_text.splitlines()
+           if "Interrupted conversion" in line]
+    phase_in_doctor = re.search(r"phase (\d+) of 17", doctor_text)
+    if not row:
+        res.bad("`kin doctor` after the kill carries no interrupted-conversion "
+                "row, so nothing names the %d staging path(s) left behind"
+                % len(stranded))
+    elif not phase_in_doctor:
+        res.bad("the interrupted-conversion row names no phase, so it cannot "
+                "say where the conversion stopped: %s" % row[0].strip())
+    elif int(phase_in_doctor.group(1)) < RESCUE_KILL_AT_PHASE:
+        res.bad("the row reports phase %s, before the kill could have landed "
+                "at phase %d" % (phase_in_doctor.group(1),
+                                 RESCUE_KILL_AT_PHASE))
+    else:
+        res.ok("`kin doctor` names the kill at phase %s of 17: %s"
+               % (phase_in_doctor.group(1), row[0].strip()[:160]))
+
+    # A diagnostic that deletes is one an operator learns not to run, so the
+    # row must report without reaping. Checked here rather than assumed,
+    # because the reclaim path and the reporting path share a module.
+    if rescue_staging(parent) != stranded:
+        res.bad("`kin doctor` changed the staging on disk; a report must not "
+                "reap what it reports")
+    else:
+        res.ok("`kin doctor` left all %d staging path(s) in place"
+               % len(stranded))
+
+    # ARM 2. The re-run says whether it is resuming or restarting, and why.
+    rerun_log = os.path.join(parent, "rerun-init.err")
+    with open(rerun_log, "wb") as handle:
+        rerun = subprocess.Popen([suite.kin, "init", ".", "--no-enrich"],
+                                 cwd=repo, stdout=subprocess.DEVNULL,
+                                 stderr=handle, env=suite.env)
+        rerun.wait()
+    rerun_text = read_text(rerun_log)
+    said_unfinished = "did not finish" in rerun_text
+    said_disposition = re.search(r"\b(restarts|resumes|resuming)\b", rerun_text)
+    phase_in_rerun = re.search(r"phase (\d+) of 17", rerun_text)
+    if not said_unfinished:
+        res.bad("the re-run says nothing about the conversion that did not "
+                "finish, so an operator repeats eleven minutes with no idea "
+                "why")
+    elif not phase_in_rerun:
+        res.bad("the re-run reports a previous failure without naming the "
+                "phase it stopped in")
+    elif not said_disposition:
+        res.bad("the re-run names the previous failure but never says whether "
+                "it resumes from it or starts over, which is the one thing an "
+                "operator has to know before waiting again")
+    else:
+        res.ok("the re-run names phase %s of 17 and says it %s"
+               % (phase_in_rerun.group(1), said_disposition.group(1)))
+
+    # ARM 3. Nothing is orphaned silently.
+    if rerun.returncode != 0:
+        res.unknown("the re-run exited %s, so what it left on disk says "
+                    "nothing about the reclaim" % rerun.returncode)
+        return res
+    left = rescue_staging(parent)
+    reclaimed = re.search(r"reclaimed ([0-9.]+ \w+) of staging", rerun_text)
+    if left:
+        res.bad("%d staging path(s) survived the re-run unreferenced: %s"
+                % (len(left), ", ".join(os.path.basename(p) for p in left)))
+    elif not reclaimed:
+        res.bad("the re-run reclaimed the staging without saying so, so the "
+                "disk comes back silently and an operator watching for it "
+                "cannot tell")
+    else:
+        res.ok("the re-run reclaimed %s of staging and said so; nothing is "
+               "left beside the repository" % reclaimed.group(1))
+    return res
+
+
 CHECKS = [
     ("0", check_0),
     ("1", check_1),
@@ -1443,6 +1690,7 @@ CHECKS = [
     ("6", check_6),
     ("7", check_7),
     ("8", check_8),
+    ("9", check_9),
 ]
 
 
