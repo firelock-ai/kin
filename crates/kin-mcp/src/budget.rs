@@ -908,12 +908,21 @@ fn run_ladder(
             .get(*key)
             .and_then(Value::as_array)
             .map_or(0, Vec::len);
-        let withheld = trim_collection(payload, key, target, 1);
+        let (withheld, narrowed) = trim_collection(payload, key, target, 1);
         if withheld > 0 {
             accounting.bounded = true;
             withheld_any = true;
+            // Which cut, not just how much. A list narrowed by branch still
+            // reaches as deep as the walk did; one cut from the end does not,
+            // and a reader who cannot tell them apart cannot tell whether the
+            // far end of the answer is missing.
+            let how = if narrowed {
+                "as whole branches, least relevant first"
+            } else {
+                "from the end of the list"
+            };
             cuts.push(format!(
-                "{withheld} of {found} entries withheld from the end of `{key}`"
+                "{withheld} of {found} entries withheld from `{key}`, {how}"
             ));
             record_elision(payload, key, found.saturating_sub(withheld), withheld);
             payload["truncated"] = Value::Bool(true);
@@ -1217,15 +1226,24 @@ fn trim_parented_collection(
 /// gives up whole branches least relevant first and leaves the depth intact. A
 /// collection that names no parents, or that no amount of narrowing fits, takes
 /// the suffix cut as before.
-fn trim_collection(payload: &mut Value, key: &str, target: usize, min_keep: usize) -> usize {
+///
+/// Returns the count withheld and whether it was narrowed, so the caller can say
+/// which cut a reader received rather than reporting every cut as an end-of-list
+/// one.
+fn trim_collection(
+    payload: &mut Value,
+    key: &str,
+    target: usize,
+    min_keep: usize,
+) -> (usize, bool) {
     let Some(full) = payload.get(key).and_then(Value::as_array).cloned() else {
-        return 0;
+        return (0, false);
     };
     if full.len() <= min_keep || measure(payload) <= target {
-        return 0;
+        return (0, false);
     }
     if let Some(withheld) = trim_parented_collection(payload, key, target, min_keep, &full) {
-        return withheld;
+        return (withheld, true);
     }
     let mut kept = min_keep;
     let mut low = min_keep;
@@ -1256,7 +1274,7 @@ fn trim_collection(payload: &mut Value, key: &str, target: usize, min_keep: usiz
             .unwrap_or(0) as usize;
         payload[format!("{key}_withheld")] = Value::from(prior.saturating_add(withheld));
     }
-    withheld
+    (withheld, false)
 }
 
 /// Append the cuts to the `degradations` channel the retrieval tools already
@@ -1456,6 +1474,67 @@ mod tests {
             roomy.len(),
             13,
             "one branch was enough, so only one may go: {roomy:?}"
+        );
+    }
+
+    /// The generic trimmer's own half of FIR-2642. A collection whose entries
+    /// name a parent is a tree, and this stage used to take its tail, which on
+    /// a real response landed on top of the walk's own cut and took the deep
+    /// end twice.
+    #[test]
+    fn the_trimmer_narrows_a_parented_collection_and_keeps_its_deep_entry() {
+        let steps = breadth_first_walk(12, 2);
+        let deepest = steps.last().expect("a deep end").0;
+        let entries: Vec<Value> = steps
+            .iter()
+            .map(|(step, parent)| {
+                json!({"step": step, "parent_step": parent, "pad": "p".repeat(400)})
+            })
+            .collect();
+        let mut payload = json!({"chain": entries});
+        let target = measure(&payload) / 2;
+
+        let (withheld, narrowed) = trim_collection(&mut payload, "chain", target, 1);
+
+        assert!(narrowed, "a parented collection must be narrowed, not cut");
+        assert!(withheld > 0, "the fixture must reach the cut");
+        let kept: Vec<u64> = payload["chain"]
+            .as_array()
+            .expect("chain survives")
+            .iter()
+            .map(|entry| entry["step"].as_u64().unwrap_or(0))
+            .collect();
+        assert!(
+            kept.contains(&deepest),
+            "the trimmer amputated the deep end instead of narrowing: {kept:?}"
+        );
+        assert!(measure(&payload) <= target, "{kept:?}");
+        assert_eq!(payload["chain_withheld"], json!(withheld));
+    }
+
+    /// The direction that keeps the branch meaningful: a flat collection has no
+    /// parents to reason about, so it still takes the suffix cut and still says
+    /// so.
+    #[test]
+    fn the_trimmer_still_cuts_a_flat_collection_from_its_tail() {
+        let entries: Vec<Value> = (0..40)
+            .map(|index| json!({"name": format!("hit_{index}"), "pad": "p".repeat(400)}))
+            .collect();
+        let mut payload = json!({"entities": entries});
+        let target = measure(&payload) / 2;
+
+        let (withheld, narrowed) = trim_collection(&mut payload, "entities", target, 1);
+
+        assert!(withheld > 0, "the fixture must reach the cut");
+        assert!(
+            !narrowed,
+            "a collection with no parents cannot be narrowed by branch"
+        );
+        let kept = payload["entities"].as_array().expect("entities survive");
+        assert_eq!(
+            kept.first().and_then(|entry| entry["name"].as_str()),
+            Some("hit_0"),
+            "a suffix cut keeps the front"
         );
     }
 
