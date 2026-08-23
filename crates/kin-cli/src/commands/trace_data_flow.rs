@@ -933,13 +933,14 @@ pub fn build_trace_data_flow_response_within(
                             candidate.confidence = rel.confidence;
                             candidate.resolution = RelationResolution::of(rel);
                         }
-                        // These two fold across EVERY edge rather than moving
-                        // with the strongest one. A class reached by a `raise`
-                        // and also by an ordinary call is on the data path, and
-                        // a boundary one edge can name stays named when a
-                        // weaker anonymous edge arrives beside it.
-                        candidate.raise_target =
-                            candidate.raise_target && kin_index::is_raise_target_edge(rel);
+                        // These two accumulate across EVERY edge rather than
+                        // moving with the strongest one. A class reached by a
+                        // `raise` and also by an ordinary call is on the data
+                        // path, and a boundary one edge can name stays named
+                        // when a weaker anonymous edge arrives beside it.
+                        candidate.call_edges += usize::from(rel.kind == RelationKind::Calls);
+                        candidate.raise_call_edges +=
+                            usize::from(kin_index::is_raise_target_edge(rel));
                         if candidate
                             .crossing
                             .as_ref()
@@ -963,7 +964,8 @@ pub fn build_trace_data_flow_response_within(
                         candidate_index.insert((next_id, role), candidates.len());
                         let crossing = kin_index::trace_crossing_for(&entity, Some(rel));
                         candidates.push(FanoutCandidate {
-                            raise_target: kin_index::is_raise_target_edge(rel),
+                            call_edges: usize::from(rel.kind == RelationKind::Calls),
+                            raise_call_edges: usize::from(kin_index::is_raise_target_edge(rel)),
                             entity,
                             role,
                             relation_kind: rel.kind,
@@ -1423,11 +1425,28 @@ struct FanoutCandidate {
     /// Read off the edge that reached it, because the edge is where the module
     /// pin and the receiver text live; the entity carries only identity.
     crossing: Option<kin_index::TraceCrossing>,
-    /// Every edge into this candidate was the operand of a `raise`, so it is a
-    /// throw site rather than a hop a value travels along. False as soon as one
-    /// ordinary call reaches it: a class that is both raised and constructed is
-    /// on the data path.
-    raise_target: bool,
+    /// Call edges into this candidate, and how many of them were the operand of
+    /// a `raise`. A candidate is a throw site when it has call edges and every
+    /// one of them is a raise: a class that is also constructed normally is on
+    /// the data path and must not be demoted.
+    ///
+    /// Counted rather than folded into a bool, because a bool was order-
+    /// dependent and measurably wrong. Folding with `&&` meant whichever edge
+    /// happened to create the candidate set the starting value, so one
+    /// reference edge arriving first left the flag false for the whole
+    /// candidate. On a converted `psf/requests` that was every exception class
+    /// in `HTTPAdapter.send`'s fan-out, so the demotion this field exists for
+    /// never once fired on the corpus it was written from, and a check that
+    /// inverted the ordering could not tell the difference.
+    call_edges: usize,
+    raise_call_edges: usize,
+}
+
+impl FanoutCandidate {
+    /// Whether this candidate is only ever thrown, never called for its value.
+    fn is_raise_target(&self) -> bool {
+        self.call_edges > 0 && self.raise_call_edges == self.call_edges
+    }
 }
 
 /// Order one side of a node's fan-out by relevance, most relevant first.
@@ -1443,7 +1462,7 @@ fn sort_by_relevance(candidates: &mut [FanoutCandidate], node: &FrontierNode) {
             node.file.as_deref(),
             node.dir.as_deref(),
             left.confidence,
-            left.raise_target,
+            left.is_raise_target(),
         );
         let right_score = kin_ranking::entity_ranking::trace_fanout_score(
             &right.entity,
@@ -1451,7 +1470,7 @@ fn sort_by_relevance(candidates: &mut [FanoutCandidate], node: &FrontierNode) {
             node.file.as_deref(),
             node.dir.as_deref(),
             right.confidence,
-            right.raise_target,
+            right.is_raise_target(),
         );
         right_score
             .cmp(&left_score)
@@ -3845,6 +3864,117 @@ mod boundary_and_ranking_tests {
             Some("build_pool_key"),
             "and the data-flow hop leads, so a reader who stops at the first \
              row stops on the one that carries the value. Got {names:?}"
+        );
+    }
+
+    /// A relation that is a mention rather than a call, which is what a real
+    /// store carries beside a call edge and what a hand-built fixture had never
+    /// had.
+    fn reference(src: EntityId, dst: EntityId) -> Relation {
+        let mut relation = call(src, dst);
+        relation.kind = RelationKind::References;
+        relation
+    }
+
+    /// FIR-2642. A reference edge beside the raise must not undo the demotion.
+    ///
+    /// This is the defect a hand-built fixture could not see. The flag was
+    /// folded with `&&` across every edge, so whichever edge happened to create
+    /// the candidate set its starting value and one non-call edge arriving
+    /// first left it false forever. On a converted `psf/requests` that was
+    /// every exception class in `HTTPAdapter.send`'s fan-out: the demotion
+    /// never fired on the corpus it was written from, and inverting the whole
+    /// ranking signal changed the answer not at all, which is the definition of
+    /// a check that cannot fail.
+    #[test]
+    fn a_reference_edge_beside_the_raise_does_not_promote_a_throw_site() {
+        let graph = InMemoryGraph::new();
+        let focal = make_entity("Adapter.send", "pkg/adapters.py");
+        let ssl_error = exception_class("SSLError", "pkg/adapters.py");
+        let pool_key = make_entity("build_pool_key", "pkg/pool.py");
+        for entity in [&focal, &ssl_error, &pool_key] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        // The reference edge is upserted FIRST, which is the order that made
+        // the fold answer wrong.
+        for relation in [
+            reference(focal.id, ssl_error.id),
+            raise_call(focal.id, ssl_error.id),
+            call(focal.id, pool_key.id),
+        ] {
+            graph.upsert_relation(&relation).unwrap();
+        }
+        let (_t, binding) = empty_binding();
+
+        let response = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding),
+            &graph,
+            &TraceDataFlowRequest {
+                focal: focal.id.to_string(),
+                depth: Some(2),
+                direction: Some(TraceDirection::Calls),
+                limit_per_step: Some(1),
+                include_body: Some(false),
+                max_response_chars: None,
+                include_type_edges: None,
+            },
+        )
+        .unwrap();
+
+        let names = step_names(&response);
+        assert_eq!(
+            names.first().map(String::as_str),
+            Some("build_pool_key"),
+            "one slot, and it belongs to the hop the value travels along; a \
+             mention of the exception class is not a reason to promote a throw \
+             site. Got {names:?}"
+        );
+    }
+
+    /// The other direction, so the rule is about calls and not about counting
+    /// edges. A class the focal both raises AND constructs normally is on the
+    /// data path, and demoting it would cost the recall the marker exists to
+    /// protect.
+    #[test]
+    fn a_class_that_is_also_constructed_normally_is_not_a_throw_site() {
+        let graph = InMemoryGraph::new();
+        let focal = make_entity("Adapter.send", "pkg/adapters.py");
+        let both = exception_class("Retry", "pkg/adapters.py");
+        let elsewhere = make_entity("build_pool_key", "pkg/pool.py");
+        for entity in [&focal, &both, &elsewhere] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        for relation in [
+            raise_call(focal.id, both.id),
+            call(focal.id, both.id),
+            call(focal.id, elsewhere.id),
+        ] {
+            graph.upsert_relation(&relation).unwrap();
+        }
+        let (_t, binding) = empty_binding();
+
+        let response = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding),
+            &graph,
+            &TraceDataFlowRequest {
+                focal: focal.id.to_string(),
+                depth: Some(2),
+                direction: Some(TraceDirection::Calls),
+                limit_per_step: Some(1),
+                include_body: Some(false),
+                max_response_chars: None,
+                include_type_edges: None,
+            },
+        )
+        .unwrap();
+
+        let names = step_names(&response);
+        assert_eq!(
+            names.first().map(String::as_str),
+            Some("Retry"),
+            "same file beats another directory once the throw-site demotion no \
+             longer applies, and it must not apply to a class that is also \
+             called for its value. Got {names:?}"
         );
     }
 

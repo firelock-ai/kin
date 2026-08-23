@@ -3361,13 +3361,25 @@ struct TraceFanoutCandidate {
     confidence: f32,
     /// Where the in-repo graph ends, when this candidate sits on the boundary.
     crossing: Option<kin_index::TraceCrossing>,
-    /// Every edge into this candidate was the operand of a `raise`.
-    raise_target: bool,
+    /// Call edges into this candidate, and how many were the operand of a
+    /// `raise`. Counted rather than folded into a bool, for the reason the CLI
+    /// arm's sibling field records: a fold made the answer depend on which edge
+    /// happened to arrive first, and on a real store that left the flag false
+    /// for every exception class it was written to demote.
+    call_edges: usize,
+    raise_call_edges: usize,
     /// Classification of the edge this candidate is currently described by.
     /// It moves with `relation_kind` and `confidence` when a stronger edge to
     /// the same neighbor replaces them, so the step reports what the edge it
     /// names actually proved.
     resolution: RelationResolution,
+}
+
+impl TraceFanoutCandidate {
+    /// Whether this candidate is only ever thrown, never called for its value.
+    fn is_raise_target(&self) -> bool {
+        self.call_edges > 0 && self.raise_call_edges == self.call_edges
+    }
 }
 
 /// Order one side of a node's fan-out by relevance, most relevant first, with
@@ -3380,7 +3392,7 @@ fn sort_trace_candidates(candidates: &mut [TraceFanoutCandidate], node: &TraceFr
             node.file.as_deref(),
             node.dir.as_deref(),
             left.confidence,
-            left.raise_target,
+            left.is_raise_target(),
         );
         let right_score = trace_fanout_score(
             &right.entity,
@@ -3388,7 +3400,7 @@ fn sort_trace_candidates(candidates: &mut [TraceFanoutCandidate], node: &TraceFr
             node.file.as_deref(),
             node.dir.as_deref(),
             right.confidence,
-            right.raise_target,
+            right.is_raise_target(),
         );
         right_score
             .cmp(&left_score)
@@ -3855,10 +3867,11 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                             candidate.confidence = rel.confidence;
                             candidate.resolution = RelationResolution::of(rel);
                         }
-                        // Folded across every edge, not moved with the
+                        // Accumulated across every edge, not moved with the
                         // strongest one; mirrors the CLI arm exactly.
-                        candidate.raise_target =
-                            candidate.raise_target && kin_index::is_raise_target_edge(rel);
+                        candidate.call_edges += usize::from(rel.kind == RelationKind::Calls);
+                        candidate.raise_call_edges +=
+                            usize::from(kin_index::is_raise_target_edge(rel));
                         if candidate
                             .crossing
                             .as_ref()
@@ -3880,7 +3893,8 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                         candidate_index.insert((next_id, role), candidates.len());
                         let crossing = kin_index::trace_crossing_for(&entity, Some(rel));
                         candidates.push(TraceFanoutCandidate {
-                            raise_target: kin_index::is_raise_target_edge(rel),
+                            call_edges: usize::from(rel.kind == RelationKind::Calls),
+                            raise_call_edges: usize::from(kin_index::is_raise_target_edge(rel)),
                             entity,
                             role,
                             relation_kind: rel.kind,
