@@ -144,16 +144,20 @@ pub fn relation_kind_name(kind: RelationKind) -> &'static str {
 
 // ── Spine Federation Helpers ──────────────────────────────────────────────
 
-fn daemon_url_from_env() -> Result<String> {
-    std::env::var("KIN_DAEMON_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            McpError::Other(
-                "KIN_DAEMON_URL is required; start MCP through `kin mcp start` so the repo daemon is supervisor-routed"
-                    .to_string(),
-            )
-        })
+/// The daemon these helpers federate through: whatever the delegate is
+/// currently routed at, which is the override a revival or an on-demand
+/// re-resolution installed, and otherwise `KIN_DAEMON_URL`.
+///
+/// Reading the environment variable alone made this seam blind to every
+/// endpoint the delegate resolves for itself, so a session that recovered its
+/// daemon still reported its spine as unconfigured.
+fn resolved_daemon_url() -> Result<String> {
+    crate::daemon_delegate::daemon_base_url().ok_or_else(|| {
+        McpError::Other(
+            "no repo daemon is bound; start MCP through `kin mcp start` so the repo daemon is supervisor-routed"
+                .to_string(),
+        )
+    })
 }
 
 /// Query the daemon for federated impact analysis, returning the typed struct.
@@ -166,7 +170,7 @@ pub async fn fetch_spine_impact_typed(
     entity_id: &EntityId,
     depth: u32,
 ) -> SpineQuery<kin_spine::FederatedImpact> {
-    let Ok(daemon_url) = daemon_url_from_env() else {
+    let Ok(daemon_url) = resolved_daemon_url() else {
         return SpineQuery::NotConfigured;
     };
     fetch_spine_impact_typed_at(&daemon_url, repo_id, entity_id, depth).await
@@ -228,7 +232,7 @@ pub async fn fetch_spine_xref(
     repo_id: &str,
     entity_id: &EntityId,
 ) -> SpineQuery<kin_spine::SpineXrefResponse> {
-    let Ok(daemon_url) = daemon_url_from_env() else {
+    let Ok(daemon_url) = resolved_daemon_url() else {
         return SpineQuery::NotConfigured;
     };
     fetch_spine_xref_at(&daemon_url, repo_id, entity_id).await

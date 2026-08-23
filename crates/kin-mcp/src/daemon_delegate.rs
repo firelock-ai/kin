@@ -74,7 +74,13 @@ async fn daemon_is_healthy(base: &str) -> bool {
 ///
 /// Checks the revival-path override first; falls back to the `KIN_DAEMON_URL`
 /// environment variable that `kin mcp start` sets at process startup.
-fn daemon_base_url() -> Option<String> {
+///
+/// `pub(crate)`: the spine federation helpers in `handlers::common` reach the
+/// daemon over their own routes and used to read the environment variable
+/// directly. That made them blind to both the revival override and on-demand
+/// re-resolution, so a session whose delegate had moved kept reporting its
+/// spine as unconfigured while every tool call was being answered.
+pub(crate) fn daemon_base_url() -> Option<String> {
     if let Ok(guard) = DAEMON_URL_OVERRIDE.lock() {
         if let Some(url) = guard.as_ref() {
             return Some(url.clone());
