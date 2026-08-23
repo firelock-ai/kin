@@ -361,6 +361,53 @@ async fn daemon_exits_after_idle_timeout_and_removes_endpoint_files() {
     .await;
 }
 
+/// Delete a control directory out from under a daemon that is still running.
+///
+/// `remove_dir_all` unlinks what it enumerated and then removes the directory,
+/// so a live daemon writing one new file into `.kin` between those two steps
+/// makes the final step fail with `DirectoryNotEmpty` and nothing about the
+/// behaviour under test has gone wrong. The daemon publishes into its own
+/// control directory on a cadence, most recently the memory-footprint standing
+/// FIR-2614 P2 added, so the window is real and it is not this test's subject:
+/// what is under test is that the daemon exits once the directory is gone.
+///
+/// Retrying is therefore the fix rather than serializing against the daemon,
+/// which no caller of `kin eject` can do either. A caller deleting this
+/// directory races the same way and retries the same way.
+///
+/// The final failure names the entries that survived. An `ENOTEMPTY` on its own
+/// says a writer won the race and not which one, and the next person to see
+/// this deserves better than the errno.
+fn remove_live_control_dir(kin_dir: &std::path::Path) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match std::fs::remove_dir_all(kin_dir) {
+            Ok(()) => return,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::DirectoryNotEmpty
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => {
+                let survivors = std::fs::read_dir(kin_dir)
+                    .map(|entries| {
+                        entries
+                            .flatten()
+                            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                panic!(
+                    "could not remove {}: {error}. Entries a live daemon rewrote while this \
+                     ran: {survivors:?}"
+                    , kin_dir.display()
+                );
+            }
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn daemon_exits_after_dirty_repo_control_dir_is_removed() {
     let repo = tempfile::tempdir().unwrap();
@@ -382,7 +429,7 @@ async fn daemon_exits_after_dirty_repo_control_dir_is_removed() {
     wait_for_serving(&mut child, port).await;
     record_graph_mutation(repo.path(), port, "dirty-before-delete").await;
 
-    std::fs::remove_dir_all(repo.path().join(".kin")).unwrap();
+    remove_live_control_dir(&repo.path().join(".kin"));
 
     let exit = match tokio::time::timeout(Duration::from_secs(15), child.wait()).await {
         Ok(result) => result.expect("kin-daemon wait failed"),
