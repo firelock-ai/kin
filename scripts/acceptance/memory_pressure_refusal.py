@@ -302,6 +302,34 @@ def offers_the_idle_window(text):
     return "idle window" in text and "re-run" in text
 
 
+def row_reports_a_kill(row):
+    """Whether the doctor row reports a killed daemon, rather than merely not
+    reporting a healthy one.
+
+    Written as "reports a kill" and not as "is not healthy" on purpose. A row
+    that reads `unsupported`, which is what this build emits outside a Kin
+    repository, is not healthy either, so a check written the negative way
+    passes on a probe that never found a store at all. Both halves are required:
+    the status the row's own contract gives a kill, and a detail that names one.
+    """
+    if not row:
+        return False
+    return row.get("status") == "degraded" and names_a_death(row.get("detail"))
+
+
+def enrichment_warning(text):
+    """The enrichment kill warning out of `kin status`, or None.
+
+    Isolated from the rest of the page so the remedy is graded on the line that
+    names the kill. Asking whether the whole output contains "To recover:" would
+    pass on a page where some other row happened to carry those words.
+    """
+    for line in (text or "").splitlines():
+        if line.lstrip().startswith("⚠") and names_a_death(line):
+            return line
+    return None
+
+
 def enrichment_line(text):
     """The durable enrichment line out of `kin status`, or None.
 
@@ -336,6 +364,7 @@ GRADERS = {
     "status_publishes_the_standing": status_publishes_the_standing,
     "offers_the_idle_window": offers_the_idle_window,
     "enrichment_names_a_kill": enrichment_names_a_kill,
+    "row_reports_a_kill": row_reports_a_kill,
 }
 
 
@@ -1062,13 +1091,13 @@ def check_8(suite):
                 if r.get("id") == "daemon_kill_record"), None)
     if row is None:
         result.unknown("this build's doctor report carries no `daemon_kill_record` row")
-    elif row.get("status") == "healthy":
-        result.bad("the doctor row reads healthy on a store whose daemon was killed and "
-                   "whose death nothing has settled yet, which is the state a reader is in "
-                   "the moment a command dies: %s" % json.dumps(row))
-    else:
+    elif row_reports_a_kill(row):
         result.ok("the doctor row reports a kill nothing has settled yet (status=%s)"
                   % row.get("status"))
+    else:
+        result.bad("the doctor row does not report the kill on a store whose daemon was "
+                   "killed and whose death nothing has settled yet, which is the state a "
+                   "reader is in the moment a command dies: %s" % json.dumps(row))
     return result
 
 
@@ -1145,11 +1174,19 @@ def check_9(suite):
     # The cause and the remedy belong on the page too. A line that says a daemon
     # was killed and stops there tells a reader something happened and nothing
     # about what to do, which is most of the way back to the parenthetical.
-    if "To recover:" in out:
-        result.ok("the page carries the remedy beside the kill")
+    #
+    # Graded on the warning line itself rather than on the whole page, because
+    # a page-wide search for the remedy would pass on a build where some other
+    # row happened to carry those words and this line carried none.
+    warning = enrichment_warning(out)
+    if warning is None:
+        result.bad("the enrichment counts name a kill and no warning line states its cause, "
+                   "so the reader is told something happened and nothing about what. "
+                   "Output: %s" % tail(out, 900))
+    elif "To recover:" in warning:
+        result.ok("the warning line carries the cause and the remedy together")
     else:
-        result.bad("the page names a kill and offers no way out of it. Output: %s"
-                   % tail(out, 900))
+        result.bad("the warning names a kill and offers no way out of it: %s" % warning)
     return result
 
 
@@ -1331,6 +1368,44 @@ def self_test():
         if got != want:
             failures.append("enrichment_names_a_kill(%r) = %s, wanted %s" % (line, got, want))
 
+    kill_row_cases = [
+        (True, {"status": "degraded",
+                "detail": "the daemon for this store was killed 1 time(s) since 04:20Z"}),
+        # The hole a "not healthy" test leaves. Outside a Kin repository the row
+        # reads unsupported, which is not healthy either, so a check written the
+        # negative way passes on a probe that never found a store.
+        (False, {"status": "unsupported",
+                 "detail": "not in a Kin repository, so there is no store whose daemons "
+                           "could have been killed"}),
+        (False, {"status": "healthy",
+                 "detail": "no daemon serving this store has been killed"}),
+        # Degraded for some other reason is not this report.
+        (False, {"status": "degraded", "detail": "the sweep circuit is open"}),
+        (False, None),
+    ]
+    for want, row in kill_row_cases:
+        got = row_reports_a_kill(row)
+        if got != want:
+            failures.append("row_reports_a_kill(%r) = %s, wanted %s" % (row, got, want))
+
+    warning_cases = [
+        ("Refs: 1\n⚠ The daemon for this store was killed 1 time(s). To recover: ...\nX: 2",
+         "⚠ The daemon for this store was killed 1 time(s). To recover: ..."),
+        ("  ⚠ a daemon serving this store was killed", "  ⚠ a daemon serving this store was killed"),
+        # A warning about something else is not this line, and picking it would
+        # grade the remedy of an unrelated row.
+        ("⚠ reconcile loop degraded", None),
+        # The counts line names a kill but is not the warning.
+        ("Durable semantic enrichment: present (1; completion not attested, and a daemon "
+         "serving this store was killed)", None),
+        ("", None),
+        (None, None),
+    ]
+    for text, exact in warning_cases:
+        got = enrichment_warning(text)
+        if got != exact:
+            failures.append("enrichment_warning(%r) = %r, wanted %r" % (text, got, exact))
+
     # The line extractor must find the durable line and only that line.
     line_cases = [
         ("Kin repository-v6 status\nDurable semantic enrichment: present (1)\nRefs: 1",
@@ -1379,7 +1454,8 @@ def self_test():
     total = (len(row_cases) + len(healthy_cases) + len(status_cases)
              + len(budget_cases) + len(standing_cases) + len(death_cases)
              + len(memory_cases) + len(idle_cases) + len(enrichment_cases)
-             + len(line_cases) + len(tail_cases) + len(grade_cases))
+             + len(kill_row_cases) + len(warning_cases) + len(line_cases)
+             + len(tail_cases) + len(grade_cases))
     print("kin-memory-pressure-repro: self-test %d/%d cases"
           % (total - len(failures), total))
     return 1 if failures else 0
