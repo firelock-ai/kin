@@ -101,10 +101,13 @@ const BIND_PHASE: &str = "kin.init.bind_historical_semantics";
 /// invariant: a phase that produces one copy of a structure and keeps it should
 /// not lift the peak by two of them.
 ///
-/// Measured on this fixture, release, one host: 218 percent before this lane
-/// and 133 percent after. The gate sits at 175, which is below the first and
-/// above the second, and there is nothing legitimate in between: either the
-/// derived deltas exist twice at once or they do not.
+/// Measured on this fixture, release, one host: 218 percent with the derived
+/// deltas alive beside the copy, and 118 percent without. The gate sits at 175,
+/// which is below the first and above the second, and there is nothing
+/// legitimate in between: either the derived deltas exist twice at once or they
+/// do not. The 218 figure is from a build of that mutant rather than from an
+/// earlier report, because the earlier report's base carried a different
+/// dependency pin.
 const BIND_PEAK_GROWTH_PERCENT_OF_RETAINED: usize = 175;
 
 /// Backstop on total peak live heap for admitting `COMMITS` commits.
