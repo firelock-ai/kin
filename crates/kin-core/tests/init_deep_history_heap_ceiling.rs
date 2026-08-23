@@ -110,6 +110,31 @@ const BIND_PHASE: &str = "kin.init.bind_historical_semantics";
 /// dependency pin.
 const BIND_PEAK_GROWTH_PERCENT_OF_RETAINED: usize = 175;
 
+/// The phase that gives up the import plan's change bodies.
+///
+/// Proof 1 is the last reader of a change's body. Everything after it reads the
+/// plan's proved facts, so the phase below converts the plan into a closure
+/// carrying those facts and drops the bodies. It exists as a named phase
+/// precisely so this guard can watch the live heap fall across it.
+const RELEASE_PHASE: &str = "kin.init.release_plan_bodies";
+
+/// How much of what the binding phase retained must actually be given back,
+/// in percent.
+///
+/// Calibrated inside the run rather than against a constant, for the reason
+/// `BIND_PEAK_GROWTH_PERCENT_OF_RETAINED` gives: both figures scale with
+/// commits multiplied by per-commit churn, so a byte floor written for this
+/// fixture would say nothing about a repository. The binding phase produces one
+/// copy of every commit's entity, relation and tree deltas and retains it; once
+/// proof 1 has read them for the last time, that copy is what this phase hands
+/// back.
+///
+/// The floor sits at 50 percent, well under what a working release gives back
+/// and far above the zero a build that keeps the bodies produces. There is
+/// nothing legitimate in between: either the plan is consumed into a closure
+/// without the bodies or it is not.
+const RELEASE_DROP_PERCENT_OF_BIND_RETAINED: usize = 50;
+
 /// Backstop on total peak live heap for admitting `COMMITS` commits.
 ///
 /// Deliberately loose, and deliberately NOT the headline. The total is set by
@@ -121,7 +146,15 @@ const BIND_PEAK_GROWTH_PERCENT_OF_RETAINED: usize = 175;
 ///
 /// What this one catches is a gross regression: a new whole-history structure
 /// large enough to move even a bootstrap-dominated total.
-const PEAK_HEAP_CEILING: usize = 1400 * 1024 * 1024;
+///
+/// Tightened from 1400 MiB once two whole-history holders came out of a
+/// conversion. Measured on this fixture, release, one host: 660.9 MiB before
+/// the import plan's change bodies were released after proof 1 and 577.5 MiB
+/// after. 900 MiB stays a loose backstop rather than a discriminator, which is
+/// deliberate: the release floor below is what carries this class, and a total
+/// tuned tight enough to grade it would fail on a different allocator instead
+/// of on a defect.
+const PEAK_HEAP_CEILING: usize = 900 * 1024 * 1024;
 
 fn git(repo: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -211,6 +244,21 @@ fn proving_deep_history_does_not_cost_another_copy_of_it() {
         .iter()
         .find(|(phase, _, _)| *phase == BIND_PHASE)
         .map(|(_, grew, retained)| (*grew, *retained));
+    // The release phase gives memory BACK, and `peak_growth_by_phase` reports
+    // what a phase retained with a saturating subtraction, so a phase that
+    // frees reads zero there and says nothing. Read the entry and exit samples
+    // directly instead, and measure the drop.
+    let release_drop = support::samples()
+        .iter()
+        .position(|sample| sample.phase == RELEASE_PHASE && sample.entering)
+        .and_then(|entered| {
+            let samples = support::samples();
+            let entry = samples[entered];
+            samples[entered + 1..]
+                .iter()
+                .find(|sample| sample.phase == RELEASE_PHASE && !sample.entering)
+                .map(|exit| entry.live.saturating_sub(exit.live))
+        });
 
     println!(
         "peak live heap admitting {COMMITS} commits: {peak} bytes ({:.1} MiB), backstop {} MiB",
@@ -236,6 +284,15 @@ fn proving_deep_history_does_not_cost_another_copy_of_it() {
         bind.map(|(_, retained)| retained.to_string())
             .unwrap_or_else(|| "NO SAMPLE".to_string()),
         BIND_PEAK_GROWTH_PERCENT_OF_RETAINED
+    );
+    println!(
+        "{RELEASE_PHASE} gave back {} bytes of the {} bytes {BIND_PHASE} retained, floor {} percent",
+        release_drop
+            .map(|bytes| bytes.to_string())
+            .unwrap_or_else(|| "NO SAMPLE".to_string()),
+        bind.map(|(_, retained)| retained.to_string())
+            .unwrap_or_else(|| "NO SAMPLE".to_string()),
+        RELEASE_DROP_PERCENT_OF_BIND_RETAINED
     );
 
     // An absent sample is not a pass. If the phase never opened, the guard
@@ -286,6 +343,28 @@ fn proving_deep_history_does_not_cost_another_copy_of_it() {
          ceiling. That phase derives one set of deltas per commit and keeps exactly one copy \
          of them, so growth of about two copies means the derived set and the plan's set are \
          alive at the same time. On a real conversion that is gigabytes.\n\n{}",
+        support::phase_attribution_table()
+    );
+    // Same two refusals as above, for the same reasons: an absent phase measured
+    // nothing, and a zero denominator would let any drop at all pass.
+    let release_drop = release_drop.unwrap_or_else(|| {
+        panic!(
+            "no {RELEASE_PHASE} sample was recorded, so this run proved nothing about \
+             whether the import plan's change bodies are given back after proof 1. Either \
+             the phase span was renamed or the conversion no longer releases them.\n\n{}",
+            support::phase_attribution_table()
+        )
+    });
+    let release_percent = release_drop.saturating_mul(100) / bind_retained;
+    assert!(
+        release_percent >= RELEASE_DROP_PERCENT_OF_BIND_RETAINED,
+        "{RELEASE_PHASE} gave back {release_drop} bytes, {release_percent} percent of the \
+         {bind_retained} bytes {BIND_PHASE} retained, under the \
+         {RELEASE_DROP_PERCENT_OF_BIND_RETAINED} percent floor. Proof 1 is the last reader \
+         of a change's body, so past that point the plan's entity, relation and tree deltas \
+         for every commit in history answer no question and must be released. Holding them \
+         to the end of a conversion is over a gigabyte live across the peak on a mid-size \
+         repository.\n\n{}",
         support::phase_attribution_table()
     );
     assert!(
