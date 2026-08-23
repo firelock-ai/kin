@@ -8,6 +8,7 @@
 //! local ignore overlay are committed together as graph-owned authority before
 //! the staged `.kin` repository is atomically published.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -23,11 +24,11 @@ use kin_git::{
 };
 use kin_model::{
     compute_resolved_tree_hash, AdmissionCase, AuthorId, ChangeStore,
-    EffectiveAdmissionPolicyStamp, ExternalObjectId, ExternalObjectKind, FrozenLocalOverlay,
-    FrozenLocalOverlayDelta, GitExternalAuthorityDelta, GitMaterialHead, Hash256,
-    LocalAdmissionRuleSource, LocalAdmissionRuleSourceKind, LocatedEntry, OperationId,
-    RepositoryId, RepositoryTransaction, TreeDelta, WorkspaceExpectation, WorkspaceMutation,
-    WorkspaceSemanticDelta,
+    EffectiveAdmissionPolicyStamp, EntityId, ExternalObjectId, ExternalObjectKind,
+    FrozenLocalOverlay, FrozenLocalOverlayDelta, GitExternalAuthorityDelta, GitMaterialHead,
+    Hash256, LocalAdmissionRuleSource, LocalAdmissionRuleSourceKind, LocatedEntry, OperationId,
+    RepositoryId, RepositoryTransaction, SemanticChange, SemanticChangeId, TreeDelta,
+    WorkspaceExpectation, WorkspaceMutation, WorkspaceSemanticDelta,
 };
 use tracing::{info, info_span};
 
@@ -903,7 +904,13 @@ fn bind_workspace_authority(
         shared: workspace_policy.stamp(),
         local: local_overlay.stamp(),
     };
-    let semantic_delta = imported_workspace_semantic_delta(transaction, &workspace_seed)?;
+    let semantic_delta = {
+        // Named because it is the largest single term in this phase and was
+        // invisible inside it: the phase read as one opaque number while a
+        // whole second history sat underneath.
+        let _span = info_span!("kin.init.derive_workspace_semantics").entered();
+        imported_workspace_semantic_delta(transaction, &workspace_seed)?
+    };
     transaction.workspace_mutation = Some(WorkspaceMutation {
         workspace_id,
         expected: WorkspaceExpectation::MustNotExist,
@@ -919,6 +926,78 @@ fn bind_workspace_authority(
     });
     transaction.local_overlay_delta = Some(FrozenLocalOverlayDelta::initialize(local_overlay));
     Ok(())
+}
+
+/// Borrowed change-history view over a bootstrap transaction's own changes.
+///
+/// `ChangeStore::resolve_graph_at` is a kin-model default method whose only
+/// store dependency is `get_change`. Deriving the imported workspace's
+/// semantics used to reach it by staging every change in history into a fresh
+/// `InMemoryGraph`, which is the durable authority write path: it copies each
+/// change into the store, appends every entity's revision timeline, plans the
+/// revision vectors, and updates the entity and relation indexes, and all of it
+/// was discarded after one replay. On a mid-size repository that second history
+/// is the largest thing a conversion holds. This view serves the identical
+/// replay from the transaction's own changes, borrowed where they already are.
+///
+/// Nothing is validated less. The graph's `create_change` refused a duplicate
+/// change and called `validate_semantic_change`, which is
+/// `kin_model::validate_semantic_change_id`; `RepositoryTransaction::validate`
+/// runs both of those over the same `changes` before this function is reached
+/// and again after it.
+///
+/// The store methods the replay never reaches fail closed rather than answering
+/// an empty result, which is the shape kin-db's own base-resolution view uses
+/// for the same reason: a future caller that reaches one must be refused, not
+/// silently served nothing.
+struct BootstrapHistoryView<'a> {
+    changes: HashMap<SemanticChangeId, &'a SemanticChange>,
+}
+
+impl<'a> BootstrapHistoryView<'a> {
+    fn new(changes: &'a [SemanticChange]) -> Self {
+        Self {
+            changes: changes.iter().map(|change| (change.id, change)).collect(),
+        }
+    }
+
+    fn unsupported(operation: &str) -> KinError {
+        KinError::Other(format!(
+            "{operation} is unavailable through a bootstrap transaction history view"
+        ))
+    }
+}
+
+impl ChangeStore for BootstrapHistoryView<'_> {
+    type Error = KinError;
+
+    fn get_change(&self, id: &SemanticChangeId) -> Result<Option<SemanticChange>> {
+        Ok(self.changes.get(id).map(|change| (*change).clone()))
+    }
+
+    fn get_entity_history(&self, _id: &EntityId) -> Result<Vec<SemanticChange>> {
+        Err(Self::unsupported("entity history"))
+    }
+
+    fn find_merge_bases(
+        &self,
+        _a: &SemanticChangeId,
+        _b: &SemanticChangeId,
+    ) -> Result<Vec<SemanticChangeId>> {
+        Err(Self::unsupported("merge-base search"))
+    }
+
+    fn create_change(&self, _change: &SemanticChange) -> Result<()> {
+        Err(Self::unsupported("change creation"))
+    }
+
+    fn get_changes_since(
+        &self,
+        _base: &SemanticChangeId,
+        _head: &SemanticChangeId,
+    ) -> Result<Vec<SemanticChange>> {
+        Err(Self::unsupported("change-range listing"))
+    }
 }
 
 fn imported_workspace_semantic_delta(
@@ -949,13 +1028,8 @@ fn imported_workspace_semantic_delta(
         }
     };
 
-    let graph = kin_db::InMemoryGraph::new();
-    for change in &transaction.changes {
-        graph.create_change(change).map_err(|error| {
-            KinError::Other(format!("stage imported semantic history: {error}"))
-        })?;
-    }
-    let target = graph.resolve_graph_at(&change_id).map_err(|error| {
+    let history = BootstrapHistoryView::new(&transaction.changes);
+    let target = history.resolve_graph_at(&change_id).map_err(|error| {
         KinError::Other(format!("resolve imported workspace semantics: {error}"))
     })?;
     crate::diff_workspace_semantics(
