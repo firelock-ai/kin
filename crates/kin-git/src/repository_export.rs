@@ -28,7 +28,7 @@ use crate::lossless::{
     reject_existing_destination, require_anchored_publication_platform,
     GitObjectFormat as LosslessObjectFormat, LosslessGitRepository,
 };
-use crate::semantic_import::plan_semantic_git_import;
+use crate::semantic_import::{plan_semantic_git_import, HistoricalSemanticBinding};
 
 /// Complete graph-owned input needed to project one Kin repository to Git.
 #[derive(Debug, Clone)]
@@ -622,14 +622,14 @@ where
                     "Git export omits imported semantic history for commit {oid}"
                 ))
             })?;
-            Ok((
+            Ok(HistoricalSemanticBinding::borrowed(
                 base_change.id,
-                supplied.entity_deltas.clone(),
-                supplied.relation_deltas.clone(),
+                &supplied.entity_deltas,
+                &supplied.relation_deltas,
             ))
         })
         .collect::<Result<Vec<_>>>()?;
-    let rebuilt = rebuilt.with_historical_semantics(&proof_store, &historical_deltas)?;
+    let rebuilt = rebuilt.with_historical_semantics(&proof_store, historical_deltas)?;
     let rebuilt = admit_semantic_git_import(&rebuilt, &proof_store)?;
     let expected_changes = rebuilt
         .changes

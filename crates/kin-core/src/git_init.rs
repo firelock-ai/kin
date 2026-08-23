@@ -1029,14 +1029,24 @@ fn bind_historical_semantics(
         }
     }
 
+    // Handed over rather than copied. The fold has no further use for what it
+    // derived, and the plan is where those deltas are going, so a whole
+    // history's entity and relation deltas used to exist twice for the length
+    // of this call for no reader.
     let bindings =
         kin_index::derive_historical_semantic_deltas(&plan.changes, &trees, capture_store)
             .map_err(|error| git_boundary_error("derive historical semantics", error))?
             .into_iter()
-            .map(|delta| (delta.change_id, delta.entity_deltas, delta.relation_deltas))
+            .map(|delta| {
+                kin_git::HistoricalSemanticBinding::owned(
+                    delta.change_id,
+                    delta.entity_deltas,
+                    delta.relation_deltas,
+                )
+            })
             .collect::<Vec<_>>();
 
-    plan.with_historical_semantics(capture_store, &bindings)
+    plan.with_historical_semantics(capture_store, bindings)
         .map_err(|error| git_boundary_error("bind historical semantics", error))
 }
 

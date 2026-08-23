@@ -189,11 +189,17 @@ fn admit_repository(dir: &Path, repository_id: &str, files: &[(&str, &str)]) -> 
     let bindings = derive_historical_semantic_deltas(&plan.changes, &trees, &blob_store)
         .unwrap()
         .into_iter()
-        .map(|delta| (delta.change_id, delta.entity_deltas, delta.relation_deltas))
+        .map(|delta| {
+            kin_git::HistoricalSemanticBinding::owned(
+                delta.change_id,
+                delta.entity_deltas,
+                delta.relation_deltas,
+            )
+        })
         .collect::<Vec<_>>();
     let admitted = admit_semantic_git_import(
         &plan
-            .with_historical_semantics(&blob_store, &bindings)
+            .with_historical_semantics(&blob_store, bindings)
             .unwrap(),
         &blob_store,
     )

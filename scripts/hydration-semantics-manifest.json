@@ -75,14 +75,14 @@
     {
       "file": "crates/kin-git/src/semantic_import.rs",
       "function": "apply_historical_semantic_deltas_unchecked",
-      "digest": "sha256:fb52c2fa33c8c43e90a32750ef21d0f11fab01552f9cffaf76bb7cf5aa6709ad",
+      "digest": "sha256:15927de5fd0b8b261b61d13de24fc2f636b00421e3c32484cbac22dd8633aa94",
       "reason": "Writes the derived deltas onto the imported changes and recomputes their identities. This is the step that makes replayed semantics the persisted historical record.",
       "owner": "kin-git"
     },
     {
       "file": "crates/kin-git/src/semantic_import.rs",
       "function": "build_semantic_git_import_plan",
-      "digest": "sha256:cb98f5e26da58c875a7e3427f1c72f910e717ab1d6b54160ddce7243d82cd9b4",
+      "digest": "sha256:b6067ade4b7cf447d8db8040b32da85db5247d544b118df4fd909c67fdab9866",
       "reason": "Builds the parent-first change sequence and tree map replay consumes. Its ordering and tree selection decide the baseline every historical delta is computed against.",
       "owner": "kin-git"
     },

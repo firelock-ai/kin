@@ -2755,7 +2755,7 @@ fn fingerprint_plan(plan: &SemanticGitImportPlan) -> Result<Hash256> {
         hash.bytes(alias.change_id.0.as_bytes());
     }
     hash.u64(plan.commit_trees.len() as u64);
-    for (oid, tree) in &plan.commit_trees {
+    for (oid, tree) in plan.commit_trees.iter() {
         hash.bytes(oid.as_bytes());
         hash.bytes(compute_resolved_tree_hash(tree)?.as_bytes());
     }

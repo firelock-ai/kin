@@ -82,6 +82,31 @@ const PROOF_PHASE: &str = "kin.init.source_proof_staged";
 /// backstop.
 const PROOF_PEAK_GROWTH_CEILING: usize = 16 * 1024 * 1024;
 
+/// The phase that binds every imported change's historical semantics.
+///
+/// It derives one set of entity and relation deltas per commit and writes them
+/// into the plan. Those two are the same values, so the phase legitimately ends
+/// up holding one copy; what it must not do is hold two, which is what it did
+/// while the derived set was collected into owned vectors, copied into the
+/// plan, and then dropped unread.
+const BIND_PHASE: &str = "kin.init.bind_historical_semantics";
+
+/// How far past what it retains the binding phase may push the running peak,
+/// in percent.
+///
+/// Calibrated inside the run rather than against a constant, deliberately.
+/// Both figures scale with commits multiplied by per-commit semantic churn, and
+/// a byte ceiling written for this fixture would say nothing about a repository
+/// and would have to be retuned whenever the fixture moved. The ratio is the
+/// invariant: a phase that produces one copy of a structure and keeps it should
+/// not lift the peak by two of them.
+///
+/// Measured on this fixture, release, one host: 218 percent before this lane
+/// and 133 percent after. The gate sits at 175, which is below the first and
+/// above the second, and there is nothing legitimate in between: either the
+/// derived deltas exist twice at once or they do not.
+const BIND_PEAK_GROWTH_PERCENT_OF_RETAINED: usize = 175;
+
 /// Backstop on total peak live heap for admitting `COMMITS` commits.
 ///
 /// Deliberately loose, and deliberately NOT the headline. The total is set by
@@ -179,6 +204,10 @@ fn proving_deep_history_does_not_cost_another_copy_of_it() {
         .iter()
         .find(|(phase, _, _)| *phase == PROOF_PHASE)
         .map(|(_, grew, _)| *grew);
+    let bind = growth
+        .iter()
+        .find(|(phase, _, _)| *phase == BIND_PHASE)
+        .map(|(_, grew, retained)| (*grew, *retained));
 
     println!(
         "peak live heap admitting {COMMITS} commits: {peak} bytes ({:.1} MiB), backstop {} MiB",
@@ -196,6 +225,14 @@ fn proving_deep_history_does_not_cost_another_copy_of_it() {
             .map(|bytes| bytes.to_string())
             .unwrap_or_else(|| "NO SAMPLE".to_string()),
         PROOF_PEAK_GROWTH_CEILING / 1024 / 1024
+    );
+    println!(
+        "{BIND_PHASE} grew the peak by {} bytes while retaining {} bytes, ceiling {} percent",
+        bind.map(|(grew, _)| grew.to_string())
+            .unwrap_or_else(|| "NO SAMPLE".to_string()),
+        bind.map(|(_, retained)| retained.to_string())
+            .unwrap_or_else(|| "NO SAMPLE".to_string()),
+        BIND_PEAK_GROWTH_PERCENT_OF_RETAINED
     );
 
     // An absent sample is not a pass. If the phase never opened, the guard
@@ -216,6 +253,36 @@ fn proving_deep_history_does_not_cost_another_copy_of_it() {
          and keeps nothing, so anything it adds is a second copy of history built to check \
          the first. This is the defect that put a full-history conversion at the ceiling of \
          a 12 GiB container.\n\n{}",
+        support::phase_attribution_table()
+    );
+    // Two states this refuses to grade, for the same reason the proof sample
+    // does: a phase that never opened measured nothing, and a phase that
+    // retained nothing gives the ratio no denominator, so the comparison would
+    // pass on any growth at all.
+    let (bind_growth, bind_retained) = bind.unwrap_or_else(|| {
+        panic!(
+            "no {BIND_PHASE} sample was recorded, so this run proved nothing about what \
+             binding historical semantics holds. Either the phase span was renamed or the \
+             probe was not installed before the measured call.\n\n{}",
+            support::phase_attribution_table()
+        )
+    });
+    assert!(
+        bind_retained > 0,
+        "{BIND_PHASE} retained nothing, so there is no copy to compare its peak growth \
+         against and this check graded nothing. The phase writes one set of entity and \
+         relation deltas per commit into the plan, so a fixture where it keeps zero bytes \
+         is not exercising it.\n\n{}",
+        support::phase_attribution_table()
+    );
+    let bind_percent = bind_growth.saturating_mul(100) / bind_retained;
+    assert!(
+        bind_percent < BIND_PEAK_GROWTH_PERCENT_OF_RETAINED,
+        "{BIND_PHASE} grew the peak by {bind_growth} bytes while retaining {bind_retained}, \
+         {bind_percent} percent, at or over the {BIND_PEAK_GROWTH_PERCENT_OF_RETAINED} percent \
+         ceiling. That phase derives one set of deltas per commit and keeps exactly one copy \
+         of them, so growth of about two copies means the derived set and the plan's set are \
+         alive at the same time. On a real conversion that is gigabytes.\n\n{}",
         support::phase_attribution_table()
     );
     assert!(
