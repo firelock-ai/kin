@@ -2067,6 +2067,41 @@ def check_14(suite):
     return res
 
 
+# How long a check waits for a conversion's enrichment to land before it believes
+# the reading it was handed.
+ENRICHMENT_SETTLE_SECONDS = 30
+ENRICHMENT_POLL_SECONDS = 3
+
+
+def read_until_enriched(read, rel):
+    """Read `rel` through `read`, waiting out a conversion's asynchronous enrichment.
+
+    A store converted from Git gets its layout facet backfilled by the daemon's
+    reconcile loop after `kin init` has returned, so the first reader of a fresh
+    fixture can be handed `parsed='absent'` for a file an adapter read
+    completely. The retry these checks carried fired only when the call itself
+    failed, which is the one shape this race never takes: the call succeeds, and
+    the answer is simply older than the backfill.
+
+    That is not hypothetical. In acceptance run 32608116193 check 15 read all
+    three Python files as `parsed='absent'` and failed every arm, while check 17
+    read `pkg/parsed.py` on the same store moments later and got
+    `parsed=full tier=entity_source certifies_enumeration=True`. One store, two
+    answers, and the only difference was which check asked first.
+
+    The wait is bounded and the verdict when it expires is the reading itself, so
+    a backfill that never lands still fails the check. This buys latency, never a
+    pass. It is deliberately not used for a file that must STAY uncertified: an
+    expected `absent` is the answer there, not a stale one.
+    """
+    cov, why = read(rel)
+    deadline = time.time() + ENRICHMENT_SETTLE_SECONDS
+    while time.time() < deadline and (cov is None or cov.get("parsed") in (None, "absent")):
+        time.sleep(ENRICHMENT_POLL_SECONDS)
+        cov, why = read(rel)
+    return cov, why
+
+
 def check_15(suite):
     """FIR-2604: parsed, tier and certifies_enumeration must be observations.
 
@@ -2120,12 +2155,10 @@ def check_15(suite):
 
     readings = {}
     for name, rel in sorted(THREE_STATE_FILES.items()):
-        cov, why = coverage(rel)
-        if cov is None:
-            # A conversion's enrichment lands asynchronously, so one bounded
-            # retry separates "not yet" from "never".
-            time.sleep(3)
-            cov, why = coverage(rel)
+        # Every file here is one an adapter reads, so `absent` is either the
+        # backfill not having landed yet or the regression this check exists to
+        # catch. Waiting separates them; the reading decides.
+        cov, why = read_until_enriched(coverage, rel)
         if cov is None:
             res.unknown("%s could not be read through MCP: %s" % (rel, why[:250]))
             return res
@@ -2363,12 +2396,7 @@ def check_17(suite):
     # The positive arm, in the shape the stranger hit: a complete enumeration
     # that must say so.
     parsed_rel = THREE_STATE_FILES["parsed"]
-    cov, why = coverage(parsed_rel)
-    if cov is None:
-        # A conversion's enrichment lands asynchronously, so one bounded retry
-        # separates "not yet" from "never".
-        time.sleep(3)
-        cov, why = coverage(parsed_rel)
+    cov, why = read_until_enriched(coverage, parsed_rel)
     if cov is None:
         res.unknown("%s could not be read through MCP: %s" % (parsed_rel, why[:250]))
         return res
