@@ -71,5 +71,6 @@ pub use sealed_observation::{
     SealedContentObservation, SealedContentSource,
 };
 pub use semantic_import::{
-    plan_semantic_git_import, GitWorkspaceSeed, HistoricalSemanticBinding, SemanticGitImportPlan,
+    plan_semantic_git_import, GitWorkspaceSeed, HistoricalSemanticBinding, ProvedImportClosure,
+    ProvedPlanFacts, SemanticGitImportPlan,
 };

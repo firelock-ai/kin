@@ -43,7 +43,7 @@ use crate::lossless::{
     capture_lossless_git_repository, open_repo, reject_shallow_repository, GitObjectFormat,
     LosslessGitRepository,
 };
-use crate::semantic_import::SemanticGitImportPlan;
+use crate::semantic_import::{ProvedPlanFacts, SemanticGitImportPlan};
 
 /// Successful, point-in-time proof that one Git workspace can be admitted
 /// without flattening index or worktree state into repository authority.
@@ -501,10 +501,10 @@ pub fn reprove_git_migration(
     repo_path: &Path,
     baseline: &GitMigrationPreflightProof,
     snapshot: &LosslessGitRepository,
-    plan: &SemanticGitImportPlan,
+    plan: &impl ProvedPlanFacts,
     blob_store: &BlobStore,
 ) -> Result<GitMigrationPreflightProof> {
-    preflight_git_migration_with_hook(
+    prove_from_plan_facts(
         repo_path,
         snapshot,
         plan,
@@ -545,13 +545,13 @@ pub fn reprove_git_migration_after_publication(
     published_kin_dir: &Path,
     baseline: &GitMigrationPreflightProof,
     snapshot: &LosslessGitRepository,
-    plan: &SemanticGitImportPlan,
+    plan: &impl ProvedPlanFacts,
     blob_store: &BlobStore,
 ) -> Result<GitMigrationPreflightProof> {
     let source_worktree =
         fs::canonicalize(repo_path).map_err(|error| GitError::io(repo_path, error))?;
     let published_kin_dir = canonical_published_kin_dir(&source_worktree, published_kin_dir)?;
-    preflight_git_migration_with_hook(
+    prove_from_plan_facts(
         &source_worktree,
         snapshot,
         plan,
@@ -646,9 +646,42 @@ fn preflight_git_migration_with_hook(
     // Structurally rebuilding the plan is what a baselined re-proof reuses
     // rather than repeats; the binding comparison below is cheap and runs
     // either way. Both halves of the reasoning are at `reprove_git_migration`.
+    //
+    // This is the only step in a source proof that needs a whole plan, which is
+    // why it is the only thing separating this entry point from the shared body
+    // below, and why a re-proof can be handed a closure that never carried the
+    // change bodies.
     if baseline.is_none() {
         plan.validate(blob_store)?;
     }
+    prove_from_plan_facts(
+        repo_path,
+        snapshot,
+        plan,
+        blob_store,
+        published_kin_dir,
+        baseline,
+        after_first_observation,
+    )
+}
+
+/// The observation half of every source proof, over the plan facts alone.
+///
+/// Everything below reads the plan through [`ProvedPlanFacts`], so a proof
+/// taken against a whole plan and one taken against the closure derived from it
+/// cannot compute different bytes: there is one implementation of the
+/// fingerprint, one of the snapshot binding, and one of the index and worktree
+/// observation, and each takes whichever value it is handed.
+#[allow(clippy::too_many_arguments)]
+fn prove_from_plan_facts(
+    repo_path: &Path,
+    snapshot: &LosslessGitRepository,
+    plan: &impl ProvedPlanFacts,
+    blob_store: &BlobStore,
+    published_kin_dir: Option<&Path>,
+    baseline: Option<ProofBaseline<'_>>,
+    after_first_observation: impl FnOnce(),
+) -> Result<GitMigrationPreflightProof> {
     bind_plan_to_snapshot(snapshot, plan)?;
     // A pure function of the plan, which no observation mutates. Derived once
     // per proof rather than once per observation, and still derived rather than
@@ -689,13 +722,13 @@ fn preflight_git_migration_with_hook(
 
 fn bind_plan_to_snapshot(
     snapshot: &LosslessGitRepository,
-    plan: &SemanticGitImportPlan,
+    plan: &impl ProvedPlanFacts,
 ) -> Result<()> {
-    if plan.repository_id != snapshot.repository_id
-        || plan.object_format != snapshot.object_format
-        || plan.external_objects != snapshot.objects
-        || plan.refs != snapshot.refs
-        || plan.head != snapshot.head
+    if plan.proved_repository_id() != &snapshot.repository_id
+        || plan.proved_object_format() != snapshot.object_format
+        || plan.proved_external_objects() != snapshot.objects.as_slice()
+        || plan.proved_refs() != &snapshot.refs
+        || plan.proved_head() != &snapshot.head
     {
         return Err(preflight_error(
             "semantic import plan is not bound to the supplied lossless snapshot",
@@ -707,7 +740,7 @@ fn bind_plan_to_snapshot(
 fn observe(
     repo_path: &Path,
     expected_snapshot: &LosslessGitRepository,
-    plan: &SemanticGitImportPlan,
+    plan: &impl ProvedPlanFacts,
     blob_store: &BlobStore,
     expected_entries: &BTreeMap<RepoPath, ExpectedIndexEntry>,
     published_kin_dir: Option<&Path>,
@@ -773,9 +806,9 @@ fn observe(
 
     let remote_mapping = remote_mapping_facts(&repo)?;
     let absent_index_allowed = matches!(snapshot.head, WorkspaceHead::Symbolic { .. })
-        && plan.workspace_seed.base_target.is_none()
-        && plan.workspace_seed.base_commit_oid.is_none()
-        && plan.workspace_seed.base_tree_hash.is_none()
+        && plan.proved_workspace_seed().base_target.is_none()
+        && plan.proved_workspace_seed().base_commit_oid.is_none()
+        && plan.proved_workspace_seed().base_tree_hash.is_none()
         && expected_entries.is_empty();
     let (index_file, raw_index) = read_strict_index(&repo, absent_index_allowed)?;
     let mut divergence = DivergenceLog::default();
@@ -820,11 +853,11 @@ fn observe(
         source_worktree,
         source_git_dir,
         object_format: snapshot.object_format,
-        head: plan.workspace_seed.head.clone(),
+        head: plan.proved_workspace_seed().head.clone(),
         refs: snapshot.refs.clone(),
-        base_target: plan.workspace_seed.base_target.clone(),
-        base_commit_oid: plan.workspace_seed.base_commit_oid,
-        base_tree_hash: plan.workspace_seed.base_tree_hash,
+        base_target: plan.proved_workspace_seed().base_target.clone(),
+        base_commit_oid: plan.proved_workspace_seed().base_commit_oid,
+        base_tree_hash: plan.proved_workspace_seed().base_tree_hash,
         snapshot_fingerprint,
         semantic_plan_fingerprint,
         index,
@@ -841,7 +874,7 @@ fn observe(
 
 fn expected_index_entries(
     snapshot: &LosslessGitRepository,
-    plan: &SemanticGitImportPlan,
+    plan: &impl ProvedPlanFacts,
 ) -> Result<BTreeMap<RepoPath, ExpectedIndexEntry>> {
     let mut blob_oids = BTreeMap::<Hash256, GitObjectId>::new();
     for record in snapshot
@@ -860,7 +893,7 @@ fn expected_index_entries(
     }
 
     let mut expected = BTreeMap::new();
-    for artifact in plan.workspace_seed.base_tree.artifacts_by_path() {
+    for artifact in plan.proved_workspace_seed().base_tree.artifacts_by_path() {
         let entry = match artifact.entry {
             TreeEntry::Blob { hash, executable } => ExpectedIndexEntry {
                 mode: if executable {
@@ -2733,36 +2766,44 @@ fn fingerprint_snapshot(snapshot: &LosslessGitRepository) -> Hash256 {
     hash.finish()
 }
 
-fn fingerprint_plan(plan: &SemanticGitImportPlan) -> Result<Hash256> {
+/// Fingerprint the proved facts of an import plan.
+///
+/// Reads through [`ProvedPlanFacts`], so the whole plan the first proof holds
+/// and the closure every later proof holds produce the same bytes by
+/// construction rather than by two implementations agreeing.
+fn fingerprint_plan(plan: &impl ProvedPlanFacts) -> Result<Hash256> {
     let mut hash = FramedHash::new(b"kin.git.semantic.import-plan.v1");
     hash.bytes(
         fingerprint_snapshot(&LosslessGitRepository {
-            repository_id: plan.repository_id.clone(),
-            object_format: plan.object_format,
-            objects: plan.external_objects.clone(),
-            refs: plan.refs.clone(),
-            head: plan.head.clone(),
+            repository_id: plan.proved_repository_id().clone(),
+            object_format: plan.proved_object_format(),
+            objects: plan.proved_external_objects().to_vec(),
+            refs: plan.proved_refs().clone(),
+            head: plan.proved_head().clone(),
         })
         .as_bytes(),
     );
-    hash.u64(plan.changes.len() as u64);
-    for change in &plan.changes {
-        hash.bytes(change.id.0.as_bytes());
+    hash.u64(plan.proved_change_count() as u64);
+    for change_id in plan.proved_change_ids() {
+        hash.bytes(change_id.0.as_bytes());
     }
-    hash.u64(plan.aliases.len() as u64);
-    for alias in &plan.aliases {
+    hash.u64(plan.proved_aliases().len() as u64);
+    for alias in plan.proved_aliases() {
         hash.bytes(alias.oid.as_bytes());
         hash.bytes(alias.change_id.0.as_bytes());
     }
-    hash.u64(plan.commit_trees.len() as u64);
-    for (oid, tree) in plan.commit_trees.iter() {
+    hash.u64(plan.proved_commit_trees().len() as u64);
+    for (oid, tree) in plan.proved_commit_trees().iter() {
         hash.bytes(oid.as_bytes());
         hash.bytes(compute_resolved_tree_hash(tree)?.as_bytes());
     }
-    encode_head(&mut hash, &plan.workspace_seed.head);
-    encode_optional_ref_target(&mut hash, plan.workspace_seed.base_target.as_ref());
-    encode_optional_oid(&mut hash, plan.workspace_seed.base_commit_oid.as_ref());
-    match plan.workspace_seed.base_tree_hash {
+    encode_head(&mut hash, &plan.proved_workspace_seed().head);
+    encode_optional_ref_target(&mut hash, plan.proved_workspace_seed().base_target.as_ref());
+    encode_optional_oid(
+        &mut hash,
+        plan.proved_workspace_seed().base_commit_oid.as_ref(),
+    );
+    match plan.proved_workspace_seed().base_tree_hash {
         Some(tree_hash) => {
             hash.u64(1);
             hash.bytes(tree_hash.as_bytes());
