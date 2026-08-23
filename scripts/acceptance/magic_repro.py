@@ -313,6 +313,7 @@ class Suite(object):
         self._write(repo, THREE_STATE_FILES["parsed"], THREE_STATE_PARSED_PY)
         self._write(repo, THREE_STATE_FILES["broken"], THREE_STATE_BROKEN_PY)
         self._write(repo, THREE_STATE_FILES["empty"], THREE_STATE_EMPTY_PY)
+        self._write(repo, NO_ADAPTER_FILE, NO_ADAPTER_BODY)
         self.git(["add", "-A"], repo)
         rc, out, err = self.git(["commit", "-q", "-m", "three parse outcomes"], repo)
         if rc != 0:
@@ -777,6 +778,21 @@ THREE_STATE_FILES = {
     "broken": "pkg/broken.py",
     "empty": "pkg/empty.py",
 }
+
+# A path no language adapter claims, admitted to the same converted store.
+#
+# FIR-2641's negative control, and the reason check 17 can fail in the direction
+# that matters. Every arm of check 15 reads a Python file, so a build that
+# certified everything would satisfy two of its three arms and its
+# not-a-constant arm as well, since `broken.py` supplies the second state on its
+# own. Certification is only worth anything if something is left uncertified,
+# and this is the file that must stay that way.
+NO_ADAPTER_FILE = "docs/notes.md"
+NO_ADAPTER_BODY = """# Notes
+
+This file has no language adapter. Nothing can enumerate it, so nothing may
+certify an enumeration of it.
+"""
 
 REEXPORT_BENIGN_FILE = "src/prelude.rs"
 REEXPORT_DEAD_FUNCTION = "legacy_shim"
@@ -2051,6 +2067,41 @@ def check_14(suite):
     return res
 
 
+# How long a check waits for a conversion's enrichment to land before it believes
+# the reading it was handed.
+ENRICHMENT_SETTLE_SECONDS = 30
+ENRICHMENT_POLL_SECONDS = 3
+
+
+def read_until_enriched(read, rel):
+    """Read `rel` through `read`, waiting out a conversion's asynchronous enrichment.
+
+    A store converted from Git gets its layout facet backfilled by the daemon's
+    reconcile loop after `kin init` has returned, so the first reader of a fresh
+    fixture can be handed `parsed='absent'` for a file an adapter read
+    completely. The retry these checks carried fired only when the call itself
+    failed, which is the one shape this race never takes: the call succeeds, and
+    the answer is simply older than the backfill.
+
+    That is not hypothetical. In acceptance run 32608116193 check 15 read all
+    three Python files as `parsed='absent'` and failed every arm, while check 17
+    read `pkg/parsed.py` on the same store moments later and got
+    `parsed=full tier=entity_source certifies_enumeration=True`. One store, two
+    answers, and the only difference was which check asked first.
+
+    The wait is bounded and the verdict when it expires is the reading itself, so
+    a backfill that never lands still fails the check. This buys latency, never a
+    pass. It is deliberately not used for a file that must STAY uncertified: an
+    expected `absent` is the answer there, not a stale one.
+    """
+    cov, why = read(rel)
+    deadline = time.time() + ENRICHMENT_SETTLE_SECONDS
+    while time.time() < deadline and (cov is None or cov.get("parsed") in (None, "absent")):
+        time.sleep(ENRICHMENT_POLL_SECONDS)
+        cov, why = read(rel)
+    return cov, why
+
+
 def check_15(suite):
     """FIR-2604: parsed, tier and certifies_enumeration must be observations.
 
@@ -2104,12 +2155,10 @@ def check_15(suite):
 
     readings = {}
     for name, rel in sorted(THREE_STATE_FILES.items()):
-        cov, why = coverage(rel)
-        if cov is None:
-            # A conversion's enrichment lands asynchronously, so one bounded
-            # retry separates "not yet" from "never".
-            time.sleep(3)
-            cov, why = coverage(rel)
+        # Every file here is one an adapter reads, so `absent` is either the
+        # backfill not having landed yet or the regression this check exists to
+        # catch. Waiting separates them; the reading decides.
+        cov, why = read_until_enriched(coverage, rel)
         if cov is None:
             res.unknown("%s could not be read through MCP: %s" % (rel, why[:250]))
             return res
@@ -2294,6 +2343,97 @@ def check_16(suite):
     return res
 
 
+def check_17(suite):
+    """FIR-2641: a complete enumeration must certify, and an unparsable one must not.
+
+    The rc0550 brown stranger asked `list_file_entities` for
+    `src/requests/sessions.py`, got all 32 entities with `truncated: false`, and
+    was told in the same payload `parsed: "absent", tier: "none",
+    certifies_enumeration: false`, with `limiting_factor: "file_not_parsed"`.
+    `kin graph status` on that store said `python: 37/37 (100%)`. The identical
+    contradiction appeared on express `lib/application.js`, so it was not
+    adapter-specific. The whole value of this surface over grep is that it can
+    certify completeness, and it was refusing to certify answers that were in
+    fact complete, which sends a reader back to grep for no reason.
+
+    kin#1080 fixed the cause: a store converted from Git never had a layout
+    facet, because the import parses every file and drops the layout it derived.
+    Verified on main at bfda9bab4, `pkg/parsed.py` reads `parsed=full,
+    tier=entity_source, certifies_enumeration=true`.
+
+    So this check exists to hold that fixed, and to close the half the existing
+    FIR-2604 check cannot reach. Every file that check reads is Python, so a
+    build that certified everything would pass it. The ticket's own acceptance
+    names the missing arm: a file with no language adapter must keep
+    `parsed: absent`. Certification means nothing unless something is left
+    uncertified.
+
+    Falsify by breaking the coverage join, which is what the ticket asks for:
+    query the observation under a key the store does not hold, and the positive
+    arm fails while the negative control still passes.
+
+    Numbered 17 because kin#1078 landed FIR-2524 as check 16 while this one was
+    in flight, and a landed number is named by allowance entries, so the free
+    number is taken rather than the one that merely looks next.
+    """
+    res = Result("17", "FIR-2641", "an enumeration certifies only when the file actually parsed")
+    repo = suite.fixture("threestate")
+
+    def coverage(rel):
+        try:
+            payload, _ = suite.mcp(repo, "list_file_entities", {"path": rel})
+        except McpError as exc:
+            return None, str(exc)
+        cov = payload.get("file_coverage")
+        if not isinstance(cov, dict):
+            return None, ("the response carries no file_coverage object; keys were %s"
+                          % sorted(payload.keys())[:12])
+        cov = dict(cov)
+        cov["total_in_file"] = payload.get("total_in_file")
+        cov["truncated"] = payload.get("truncated")
+        return cov, None
+
+    # The positive arm, in the shape the stranger hit: a complete enumeration
+    # that must say so.
+    parsed_rel = THREE_STATE_FILES["parsed"]
+    cov, why = read_until_enriched(coverage, parsed_rel)
+    if cov is None:
+        res.unknown("%s could not be read through MCP: %s" % (parsed_rel, why[:250]))
+        return res
+    if cov.get("certifies_enumeration") is True and cov.get("parsed") not in (None, "absent"):
+        res.ok("%s enumerates %s entities (truncated=%s) and certifies it, reading parsed=%s "
+               "tier=%s" % (parsed_rel, cov.get("total_in_file"), cov.get("truncated"),
+                            cov.get("parsed"), cov.get("tier")))
+    else:
+        res.bad("%s returned an enumeration of %s entities and refuses to certify it: "
+                "parsed=%r tier=%r certifies_enumeration=%r. That is the contradiction the "
+                "stranger hit, and following the envelope's own advice sends a reader back "
+                "to grep over a complete answer"
+                % (parsed_rel, cov.get("total_in_file"), cov.get("parsed"),
+                   cov.get("tier"), cov.get("certifies_enumeration")))
+
+    # The negative control. Without it the arm above is satisfied by a build
+    # that certifies everything, which is the same defect wearing the other
+    # value.
+    control, why = coverage(NO_ADAPTER_FILE)
+    if control is None:
+        # A surface that refuses the call outright is an acceptable answer for a
+        # file it cannot enumerate, and it is certainly not a false
+        # certification, so it is reported rather than failed.
+        res.ok("%s is refused by the surface rather than enumerated (%s), so nothing certifies "
+               "an enumeration of it" % (NO_ADAPTER_FILE, why[:120]))
+    elif control.get("certifies_enumeration") is True:
+        res.bad("%s has no language adapter, yet its enumeration is certified "
+                "(parsed=%r tier=%r). Certification that is unconditional carries no "
+                "information, which is the FIR-2604 constant back wearing the other value"
+                % (NO_ADAPTER_FILE, control.get("parsed"), control.get("tier")))
+    else:
+        res.ok("%s has no language adapter and stays uncertified (parsed=%r tier=%r), so "
+               "certification separates files rather than blessing them"
+               % (NO_ADAPTER_FILE, control.get("parsed"), control.get("tier")))
+    return res
+
+
 CHECKS = [
     ("0", check_0),
     ("1", check_1),
@@ -2312,6 +2452,7 @@ CHECKS = [
     ("14", check_14),
     ("15", check_15),
     ("16", check_16),
+    ("17", check_17),
 ]
 
 
