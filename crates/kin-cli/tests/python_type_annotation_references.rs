@@ -246,6 +246,10 @@ fn refs_lines(graph: &InMemoryGraph, entity: &str) -> String {
             entity: entity.to_string(),
             kind: "all".to_string(),
         },
+        &kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+            "initialized": true, "graph_loaded": true,
+            "graph_entity_count": 4, "graph_generation": 1,
+        })),
     )
     .expect("refs response")
     .lines

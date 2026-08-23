@@ -291,6 +291,13 @@ BOUNDARY_DIRS = [
     "crates/kin-core/src/federation.rs",
     "crates/kin-core/src/git_init.rs",
     "crates/kin-core/src/init.rs",
+    # The post-mortem for an interrupted init, and the same boundary as
+    # init_staging.rs beside it. It reads only the staging directories init
+    # itself minted in the repository's parent, to report where a killed
+    # conversion stopped and how much disk it is holding. It answers no
+    # locate/search/context/trace/review/xref query, reads no repository
+    # content, and runs before any graph exists.
+    "crates/kin-core/src/init_attempt.rs",
     # Init's own staging directories, and nothing else. It runs before any
     # graph exists, on paths init itself minted, and its whole output is
     # whether a directory this process created still needs removing. It

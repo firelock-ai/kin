@@ -3,17 +3,33 @@
 The canonical npm install surface for [Kin](https://github.com/firelock-ai/kin), the
 system of record for AI-written software.
 
+Install it without root, without `sudo`, and without a writable global npm prefix. This
+is the default path because it is the one that works everywhere, including the container
+and locked-down developer box where the global install below is refused outright:
+
+```sh
+npx -y @kinlab/kin --version
+export PATH="$HOME/.kin/bin:$PATH"
+kin --version
+```
+
+The first line downloads the native `kin` and `kin-daemon` for your platform into
+`~/.kin/bin`, verified against their published SHA-256. That install is persistent: `npx`
+provisions the same managed binaries the global install does, so the second and third
+lines are reading a real binary on disk, not re-downloading anything. `kin setup` writes
+the `PATH` line into your shell profile, so you type the `export` once:
+
+```sh
+kin setup --intent agent
+```
+
+If your global npm prefix is writable, or you are root, `npm install -g` puts the
+launcher on `PATH` for you and is the shorter route:
+
 ```sh
 npm install -g @kinlab/kin
 kin --version
 kin setup --intent agent
-```
-
-or zero-install:
-
-```sh
-npx -y @kinlab/kin --version
-npx -y @kinlab/kin setup --intent agent --no-interactive
 ```
 
 Native Windows x86_64 support is early. Repository admission works: `kin init` imports a Git repository and publishes graph authority, and graph, lexical, and daemon-backed queries answer natively. Transparent filesystem projection is not shipped on Windows, and the end-to-end install proof does not yet cover MCP or review workflows there, so WSL2 remains the recommended path for the full Kin experience.
@@ -24,7 +40,8 @@ documented below.
 ## If the global install is refused
 
 On a machine whose global npm prefix is root-owned, and where you are not root and have no
-`sudo`, that first line fails before Kin runs:
+`sudo`, `npm install -g` fails before Kin runs. This is why the install at the top of this
+page leads with `npx`, which never touches that prefix:
 
 ```
 npm error code EACCES
@@ -33,9 +50,12 @@ npm error path /usr/local/lib/node_modules/@kinlab
 npm error Error: EACCES: permission denied, mkdir '/usr/local/lib/node_modules/@kinlab'
 ```
 
-Containers whose default user is not root are the common case. Two ways out. The
-zero-install path above needs no writable prefix and is the shorter one. Or move the prefix
-somewhere you own, and put it on your `PATH`:
+npm fails here before it unpacks anything, so no Kin code has run and nothing in this
+package can catch it or print a fix. Containers whose default user is not root are the
+common case. Two ways out. The `npx` path at the top of this page needs no writable prefix
+and installs the same native binaries under `~/.kin/bin`, which is why it is the default
+rather than a fallback. Or move the npm prefix somewhere you own, and put it on your
+`PATH`:
 
 ```sh
 npm config set prefix ~/.npm-global

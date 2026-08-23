@@ -218,7 +218,7 @@ pub(crate) fn reap_abandoned_git_captures(parent: &Path) -> Result<usize> {
             );
             continue;
         }
-        match abandoned_capture_lease(&candidate) {
+        match capture_lease_is_abandoned(&candidate) {
             Ok(true) => {}
             Ok(false) => continue,
             Err(reason) => {
@@ -250,7 +250,12 @@ pub(crate) fn reap_abandoned_git_captures(parent: &Path) -> Result<usize> {
 ///
 /// `Ok(false)` means a live init holds it. `Err` carries why the question could
 /// not be answered, which the caller discloses rather than acting on.
-fn abandoned_capture_lease(directory: &Path) -> std::result::Result<bool, String> {
+///
+/// Shared with the post-mortem reader in [`crate::init_attempt`] on purpose. A
+/// reader that decided liveness its own way could report a sibling conversion
+/// running right now as a corpse, and reaping and reporting must agree about
+/// what abandoned means or the two surfaces contradict each other.
+pub(crate) fn capture_lease_is_abandoned(directory: &Path) -> std::result::Result<bool, String> {
     let lease_path = directory.join(CAPTURE_LEASE_NAME);
     let mut options = OpenOptions::new();
     options.read(true).write(true);

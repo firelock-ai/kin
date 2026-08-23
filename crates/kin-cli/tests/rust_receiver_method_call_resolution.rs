@@ -376,6 +376,10 @@ fn find_references_on_the_regex_builder_method_lists_only_the_importing_caller()
             entity: entity_id(&files, "RegexMatcherBuilder::multi_line"),
             kind: "all".to_string(),
         },
+        &kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+            "initialized": true, "graph_loaded": true,
+            "graph_entity_count": 4, "graph_generation": 1,
+        })),
     )
     .expect("refs fixture");
     let listing = response.lines.join("\n");

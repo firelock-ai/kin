@@ -192,6 +192,19 @@ pub(crate) fn missing_enrichable_languages() -> Vec<LanguageId> {
         .collect()
 }
 
+/// Every language this build enriches with, whether or not its server is here.
+///
+/// The set [`missing_enrichable_languages`] is a subset of. A run that installed
+/// nothing has to be able to name what was even in scope, because "nothing
+/// happened" and "nothing was ever going to happen here" are different facts and
+/// a reader acts differently on each.
+pub(crate) fn enrichable_languages() -> Vec<LanguageId> {
+    LANGUAGE_SERVERS
+        .iter()
+        .map(|recipe| recipe.language)
+        .collect()
+}
+
 /// The exact commands for languages named by their wire name.
 ///
 /// The coverage report hands out `LanguageId`'s display strings rather than the
@@ -514,6 +527,152 @@ pub(crate) fn is_permission_failure(reason: &str) -> bool {
         .any(|signature| lowered.contains(signature))
 }
 
+/// Whether a failure is the network refusing the installer rather than the
+/// installer refusing the package, and in which of its three shapes.
+///
+/// Matched against the installer's own words, because that is all Kin has: npm
+/// and rustup both exit non-zero with the cause in stderr and nothing in the
+/// status. The signatures are the shapes a proxied or filtered network
+/// produces, split three ways because they are three different fixes. A
+/// connection that never completes is routing, a certificate that will not
+/// verify is a proxy re-signing TLS, and a 403 or 407 from a registry that
+/// answered is an allowlist or proxy credentials.
+///
+/// Deliberately checked AFTER `is_permission_failure`: an EACCES that also
+/// mentions a registry URL is still a permission failure, and its remedy is the
+/// one that moves the prefix. `None` when nothing in the reason looks like the
+/// network.
+pub(crate) fn network_shape(reason: &str) -> Option<&'static str> {
+    const UNREACHABLE: [&str; 12] = [
+        "etimedout",
+        "esockettimedout",
+        "econnrefused",
+        "econnreset",
+        "enotfound",
+        "eai_again",
+        "ehostunreach",
+        "enetunreach",
+        "socket hang up",
+        "network request to",
+        "error network",
+        "could not download",
+    ];
+    const TLS: [&str; 7] = [
+        "self signed certificate",
+        "self-signed certificate",
+        "unable to get local issuer",
+        "unable to verify the first certificate",
+        "cert_",
+        "depth_zero_self_signed_cert",
+        "ssl routines",
+    ];
+    const REFUSED_BY_A_MIDDLEBOX: [&str; 6] = [
+        "e403",
+        "403 forbidden",
+        "e407",
+        "407 proxy",
+        "proxy authentication required",
+        "tunneling socket could not be established",
+    ];
+    let lowered = reason.to_lowercase();
+    let has = |signatures: &[&str]| {
+        signatures
+            .iter()
+            .any(|signature| lowered.contains(signature))
+    };
+    if has(&TLS) {
+        return Some(
+            "a TLS certificate this host would not verify, which is what a proxy that \
+                     re-signs traffic looks like",
+        );
+    }
+    if has(&REFUSED_BY_A_MIDDLEBOX) {
+        return Some(
+            "a server that answered and refused, which is what a proxy or a registry \
+                     allowlist looks like",
+        );
+    }
+    if has(&UNREACHABLE) {
+        return Some(
+            "a connection that never completed, which is what a blocked or unrouted \
+                     network looks like",
+        );
+    }
+    None
+}
+
+/// What Kin still does when a language server is not installed.
+///
+/// The half FIR-2629 found missing. A failed install told an operator what
+/// broke and left them to guess whether Kin was now useless, which it is not:
+/// the parse-derived graph is unaffected, and the loss is bounded and named.
+pub(crate) const WORKS_WITHOUT_LANGUAGE_SERVERS: &str =
+    "Kin runs without this server. Parsing, search, history, review and commits are unaffected; \
+     what is missing is cross-file reference enrichment for that language, which Kin reports as \
+     pending rather than certifying that no reference exists.";
+
+/// Every binary this recipe's language is satisfied by, as a reader would say them.
+///
+/// One name on its own, two joined by "or", and a comma list beyond that. Each
+/// name is wrapped in backticks because these are literal binaries to type, and
+/// a bare pylsp in a sentence reads as a typo rather than as a command.
+fn quoted_or_list(names: &[&str]) -> String {
+    let quoted: Vec<String> = names.iter().map(|name| format!("`{name}`")).collect();
+    match quoted.split_last() {
+        None => String::new(),
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+    }
+}
+
+/// The route to a working server that needs no registry at all.
+///
+/// The other half FIR-2629 asks for by name, beside the degraded mode: the
+/// offline path. Kin has a real one and it is worth stating, because discovery
+/// is `which` over `PATH` and nothing else, so a server carried in from an
+/// internal mirror, baked into an image layer or copied off another machine
+/// counts the moment `PATH` can see it. Named by BINARY rather than by package,
+/// because the binary name is what discovery matches.
+fn offline_install_path(recipe: &LanguageServerRecipe) -> String {
+    format!(
+        "no registry is needed either: Kin looks for {} on PATH and starts whichever it finds, \
+         so a copy from an internal mirror, an image layer or another machine closes this gap \
+         with the network still down",
+        quoted_or_list(recipe.binaries)
+    )
+}
+
+/// The environment every installer here reads to route through a proxy.
+///
+/// Per program, because they do not agree. npm reads its own config keys as
+/// well as the environment, and rustup reads only the lowercase environment
+/// variables. Printing one blanket list would send half of its readers to a
+/// setting their installer ignores.
+fn proxy_environment_lines(program: &str) -> Vec<String> {
+    let mut lines = vec![
+        "    export HTTPS_PROXY=http://proxy.example:3128 HTTP_PROXY=http://proxy.example:3128"
+            .to_string(),
+        "    export NO_PROXY=localhost,127.0.0.1".to_string(),
+    ];
+    if program == "npm" {
+        lines.push(
+            "    npm config set proxy \"$HTTP_PROXY\"; npm config set https-proxy \
+             \"$HTTPS_PROXY\""
+                .to_string(),
+        );
+        lines.push(
+            "    export NODE_EXTRA_CA_CERTS=/path/to/proxy-ca.pem   # when the proxy re-signs TLS"
+                .to_string(),
+        );
+    } else {
+        // rustup reads the lowercase spellings only, and its downloader takes
+        // the certificate bundle from the OS store.
+        lines
+            .push("    export https_proxy=\"$HTTPS_PROXY\" http_proxy=\"$HTTP_PROXY\"".to_string());
+    }
+    lines
+}
+
 /// The installer's own account of the failure, reduced to the lines naming it.
 ///
 /// npm leads with the code, the syscall and the path, which is exactly the
@@ -570,6 +729,25 @@ pub(crate) fn install_failure_remediation(
 ) -> Vec<String> {
     let command = recipe.command_line();
     if !is_permission_failure(reason) {
+        // A network shape is named before the generic advice, because "run it
+        // yourself to see the error" is worthless when the error is the one
+        // already printed and the cause is the environment rather than the
+        // command (FIR-2629).
+        if let Some(shape) = network_shape(reason) {
+            let mut lines = vec![
+                format!(
+                    "this is the network refusing `{command}`, not Kin and not the package: \
+                     {shape}"
+                ),
+                "if this host reaches the internet through a proxy, name it where the installer \
+                 reads it, then run the command again:"
+                    .to_string(),
+            ];
+            lines.extend(proxy_environment_lines(recipe.program));
+            lines.push(offline_install_path(recipe));
+            lines.push(WORKS_WITHOUT_LANGUAGE_SERVERS.to_string());
+            return lines;
+        }
         return vec![format!(
             "run `{command}` yourself to see the installer's own error"
         )];
@@ -873,6 +1051,170 @@ mod tests {
         assert!(!joined.contains("npm config set prefix"), "{joined}");
         assert!(!joined.contains("sudo"), "{joined}");
         assert!(joined.contains("npm install -g pyright"), "{joined}");
+    }
+
+    /// A proxied network gets the environment named, not "run it yourself".
+    ///
+    /// The container the npm0549 stranger worked in reached the registry
+    /// through a proxy, and `kin doctor --fix --install-language-servers` came
+    /// back with four failures whose only advice was to run the same command
+    /// again by hand (FIR-2629). The command was never the problem, so the
+    /// advice could not work: what an operator needs is the suspicion that the
+    /// environment is the cause, the variables their installer actually reads,
+    /// and the size of what they lose by stopping here.
+    ///
+    /// Falsify by deleting the `network_shape` branch in
+    /// `install_failure_remediation`: the reason falls through to the generic
+    /// line and every assertion below fails.
+    #[test]
+    fn a_network_failure_names_the_environment_the_proxy_vars_and_what_still_works() {
+        let recipe = recipe_for(LanguageId::Python).expect("python must have a recipe");
+        let lines = install_failure_remediation(
+            recipe,
+            "`npm install -g pyright` exited with 1: npm error code ECONNREFUSED; npm error \
+             network request to https://registry.npmjs.org/pyright failed, reason: connect \
+             ECONNREFUSED 127.0.0.1:443",
+        );
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("the network refusing"),
+            "the cause must be attributed to the environment: {joined}"
+        );
+        assert!(
+            joined.contains("HTTPS_PROXY") && joined.contains("NO_PROXY"),
+            "the variables that would route it must be named: {joined}"
+        );
+        assert!(
+            joined.contains("npm config set https-proxy"),
+            "npm reads its own config as well as the environment: {joined}"
+        );
+        assert!(
+            joined.contains("NODE_EXTRA_CA_CERTS"),
+            "a proxy that re-signs TLS needs its bundle named: {joined}"
+        );
+        assert!(
+            joined.contains("Kin runs without this server"),
+            "the degraded mode must be stated, not left to be guessed: {joined}"
+        );
+        assert!(
+            joined.contains("no registry is needed either")
+                && joined.contains("pyright-langserver")
+                && joined.contains("pylsp"),
+            "the offline path must be named, by the binaries discovery accepts: {joined}"
+        );
+
+        // Falsification control. A permission remedy here would mean the two
+        // classifiers cannot tell their own cases apart.
+        assert!(
+            !joined.contains("npm config set prefix"),
+            "a network failure must not be handed the permission remedy: {joined}"
+        );
+        assert!(!joined.contains("sudo"), "{joined}");
+    }
+
+    /// Each network shape is named as its own fix, and nothing else matches.
+    ///
+    /// Three shapes because they are three different repairs, and a classifier
+    /// that collapsed them would send a TLS interception to a routing fix. The
+    /// negative cases are the point: a 404, an EACCES and a compiler error must
+    /// all read as not-the-network, or the diagnosis is decoration.
+    #[test]
+    fn the_network_classifier_separates_its_three_shapes_and_refuses_everything_else() {
+        let unreachable = network_shape("npm error network request to https://r/x failed")
+            .expect("an unrouted network must classify");
+        assert!(unreachable.contains("never completed"), "{unreachable}");
+
+        let tls = network_shape(
+            "npm error code SELF_SIGNED_CERT_IN_CHAIN; npm error self signed certificate in \
+             certificate chain",
+        )
+        .expect("an intercepted TLS handshake must classify");
+        assert!(tls.contains("TLS certificate"), "{tls}");
+
+        let refused =
+            network_shape("npm error code E403; npm error 403 Forbidden - GET https://r/x")
+                .expect("a middlebox refusal must classify");
+        assert!(refused.contains("answered and refused"), "{refused}");
+
+        assert_eq!(
+            network_shape("npm error code E404; npm error 404 Not Found - GET https://r/x"),
+            None,
+            "a package that does not exist is not a network failure"
+        );
+        assert_eq!(
+            network_shape(
+                "npm error code EACCES; npm error Error: EACCES: permission denied, mkdir \
+                 '/usr/local/lib/node_modules/pyright'"
+            ),
+            None,
+            "a permission failure must keep its own remedy"
+        );
+        assert_eq!(
+            network_shape("error: could not compile `pyright`"),
+            None,
+            "an unrelated failure must not be dressed as a proxy problem"
+        );
+    }
+
+    /// rustup and npm are told about different variables.
+    ///
+    /// rustup reads only the lowercase environment spellings and takes its
+    /// certificate bundle from the OS store, so quoting npm's config keys at a
+    /// rustup failure is advice that does nothing. One blanket list would be
+    /// wrong for whichever half read it second.
+    #[test]
+    fn the_proxy_advice_matches_the_installer_that_failed() {
+        let rust = recipe_for(LanguageId::Rust).expect("rust must have a recipe");
+        let lines = install_failure_remediation(
+            rust,
+            "`rustup component add rust-analyzer` exited with 1: error: could not download file \
+             from 'https://static.rust-lang.org/x': ETIMEDOUT",
+        );
+        let joined = lines.join("\n");
+        assert!(joined.contains("https_proxy"), "{joined}");
+        assert!(
+            !joined.contains("npm config set"),
+            "rustup does not read npm config: {joined}"
+        );
+        assert!(
+            !joined.contains("NODE_EXTRA_CA_CERTS"),
+            "rustup does not read Node's certificate variable: {joined}"
+        );
+        assert!(joined.contains("Kin runs without this server"), "{joined}");
+        assert!(joined.contains("`rust-analyzer`"), "{joined}");
+        assert!(
+            !joined.contains("pyright-langserver"),
+            "a rustup failure must not be handed npm's binaries: {joined}"
+        );
+    }
+
+    /// The offline path names what discovery matches, and only that.
+    ///
+    /// A language satisfied by two binaries has to say both, because a reader
+    /// who already has `pylsp` should not go looking for pyright. A language
+    /// satisfied by one must not read as a list, which is the case a naive
+    /// join gets wrong.
+    #[test]
+    fn the_offline_path_names_every_binary_discovery_accepts() {
+        let python = recipe_for(LanguageId::Python).expect("python must have a recipe");
+        let listed = offline_install_path(python);
+        assert!(
+            listed.contains("`pyright-langserver` or `pylsp`"),
+            "both binaries must be named: {listed}"
+        );
+
+        let rust = recipe_for(LanguageId::Rust).expect("rust must have a recipe");
+        let single = offline_install_path(rust);
+        assert!(single.contains("`rust-analyzer`"), "{single}");
+        assert!(
+            !single.contains("` or `"),
+            "a one-binary recipe must not read as a list: {single}"
+        );
+
+        // Falsification. An empty recipe would satisfy every `!contains` above,
+        // so the joiner is asserted on directly as well.
+        assert_eq!(quoted_or_list(&[]), "");
+        assert_eq!(quoted_or_list(&["a", "b", "c"]), "`a`, `b` or `c`");
     }
 
     /// The failure reason has to carry the installer's own words.

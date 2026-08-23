@@ -329,19 +329,92 @@ pub const COMMIT_MEMORY_REMEDY: &str =
      the store rather than the size of the edit. Re-run it with more memory available; \
      `kin doctor` reports this headroom before a commit is attempted.";
 
+/// The words both the commit line and `kin commit --help` are built from.
+///
+/// A macro rather than a plain const because `concat!` takes literals, and the
+/// help paragraph has to fold this sentence in at compile time. Two `&str`
+/// consts cannot be joined in const position, and a help surface that restates
+/// the sentence by hand is a surface that drifts.
+macro_rules! authority_not_git_note {
+    () => {
+        "Recorded in Kin authority, not in git. `git status` stays dirty until you run `kin \
+         eject` or push this branch to a Kin remote."
+    };
+}
+
 /// The line a `kin commit` prints after recording a change.
 ///
 /// `kin commit` is not a git commit, and until now nothing said so: the working
 /// tree it just committed from stays dirty forever, `git log` never moves, and
 /// in a brownfield repository whose CI, hooks and reviewers all read git that
 /// reads as a commit that silently did nothing.
-pub const AUTHORITY_NOT_GIT_NOTE: &str = "Recorded in Kin authority, not in git — `git status` \
-                                          stays dirty until you run `kin eject` or push this \
-                                          branch to a Kin remote.";
+pub const AUTHORITY_NOT_GIT_NOTE: &str = authority_not_git_note!();
+
+/// The long help `kin commit --help` prints, ending in the line above.
+///
+/// The commit-time line was the only surface carrying the fact, and a commit is
+/// too late for it: the npm0549 stranger read `kin commit --help`, formed the
+/// write-through assumption there, and only met the correction after running a
+/// commit they had already reasoned about (FIR-2627). Help is where the
+/// assumption forms, so help carries the same sentence, spliced from the same
+/// macro so the two cannot say different things.
+pub const COMMIT_LONG_ABOUT: &str = concat!(
+    "Create an exact semantic and artifact commit.\n\n",
+    "The commit lands in Kin's own authority, not in Git. Nothing is written to `.git`, so ",
+    "`git status` still lists every file this commit recorded and `git log` does not move. ",
+    "That is the design rather than a gap: Kin holds the change, and `kin log`, `kin diff` and ",
+    "`kin review` read it. Hand it back to Git when you want it there, with `kin eject` for the ",
+    "working tree or a push to a Kin remote. Until then, tools that read Git, including CI, ",
+    "hooks and reviewers, see an unchanged repository with a dirty tree.\n\n",
+    authority_not_git_note!(),
+);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The CLI reference carries the same sentence the binary prints.
+    ///
+    /// `docs/cli-reference.md` is written by hand from the clap definitions,
+    /// and its own header says nothing fails the build when the two drift. For
+    /// one sentence that is not good enough: FIR-2627 exists because a fact
+    /// lived on exactly one surface, and a doc page that quotes it and then
+    /// stops matching would rebuild the same defect on a page nobody re-reads.
+    ///
+    /// Falsify by editing either the constant or the quoted line in the page:
+    /// the two stop matching and this fails.
+    #[test]
+    fn the_cli_reference_quotes_the_commit_authority_line_verbatim() {
+        let page =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/cli-reference.md");
+        let text = std::fs::read_to_string(&page)
+            .unwrap_or_else(|error| panic!("{} must be readable: {error}", page.display()));
+
+        // Positive control first: a page that failed to read, or one whose
+        // commit section was renamed, would otherwise be indistinguishable
+        // from a page that dropped the sentence.
+        assert!(
+            text.contains("### `kin commit`"),
+            "the commit section must exist, or this test asserts about nothing"
+        );
+
+        let flat_page = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let flat_note = AUTHORITY_NOT_GIT_NOTE
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            flat_page.contains(&flat_note),
+            "docs/cli-reference.md must quote the commit-time authority line verbatim"
+        );
+
+        // Falsification: a phrase never written must be absent, so a
+        // `contains` that matches anything cannot be what passed above.
+        assert!(
+            !flat_page.contains("Recorded in git authority"),
+            "the check must be able to fail"
+        );
+    }
 
     const GIB: u64 = 1024 * 1024 * 1024;
 

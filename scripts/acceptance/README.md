@@ -1,7 +1,8 @@
 # Product acceptance suites
 
-Four falsifiable suites that ask whether the product still answers correctly.
-`.github/workflows/acceptance.yml` runs all four on every pull request against
+Falsifiable suites that ask whether the product still answers correctly, and one
+that asks whether it still tells the truth before it answers anything.
+`.github/workflows/acceptance.yml` runs them all on every pull request against
 that pull request's own build. None is release proof; all are regression gates.
 
 Each suite prints one line per check:
@@ -91,6 +92,88 @@ does not fit has to say so in `degradations`. A ceiling is not always reachable,
 because every cut list keeps a floor entry, and that case is fine as long as it is
 never quiet.
 
+Checks 5 to 7 carry the same rule to the budget that cuts a context pack first
+(FIR-2482). A pack is bounded twice: its own token budget refuses candidates
+inside the builder, before the response budget sees the payload at all, and only
+the second cut was ever disclosed. A dependency section trimmed from twelve rows
+to six serialized six rows beside `returned: 6`, which is what a focal with six
+dependencies serializes, and `kin context` printed "Dependencies: 6 entries" for
+both. Check 5 packs one focal at a generous token budget and again at a tight
+one, with one identical generous `max_chars` on both so the response budget
+cannot be the cutter, and asserts every group that shrank publishes an elision
+naming `token_budget` rather than `response_budget`, because a caller told the
+wrong cause raises the wrong lever. Check 6 is the same defect one field down: a
+row whose inline source the response budget took used to lose the key outright,
+which is the shape of a `compact` call and of source the graph never had, so it
+now keeps a null `body` beside a marker naming what went. Check 7 drives
+`kin context`, whose rendered lines are the whole of what a reader of that
+surface sees, and asserts the lines and `--json` report the same cut and name the
+lever that recovers it.
+
+`memory_pressure_refusal.py` covers the back-off Kin owes a machine it is
+running on, and the disclosure it owes the person running it. A daemon that
+quietly stopped sweeping would look identical to one that had finished, since
+every counter on every surface keeps reporting the unenriched files as pending
+work, so each check grades the refusal and the disclosure together and pairs
+both with an unpressured control (FIR-2614).
+
+`init_memory_repro.py` covers what a brownfield conversion holds while it runs.
+A full-history `psf/requests` conversion measured 11.72 GiB of resident set
+inside a 12 GiB container, because proving an import plan rebuilt the whole plan
+from raw objects and compared the two, holding several whole histories at once
+(FIR-2539). No functional test can see that class: a re-derivation that
+materializes a second copy returns the same verdict as one that streams it. The
+suite drives the live-heap guard in `crates/kin-core/tests/` and grades what
+proof 1 adds to the running peak, through a counting allocator rather than
+resident set, because RSS keeps counting freed pages and inside a memory-limited
+container both a fixed and an unfixed build report the ceiling rather than their
+demand.
+
+`registry_home_isolation.py` covers the boundary `KIN_HOME` is supposed to draw.
+The cross-repo registry is store state, and it used to sit outside that boundary
+because the registry file's parent doubled as the machine-level supervisor
+directory, so a daemon under a scratch home read the operator's registry and
+pinned sibling authority for every repository on the box (FIR-2467). The suite
+builds two homes, registers repositories into each, and asks `kin deps`, `kin
+registry` and a scratch-home daemon's own log what they can see. Every check
+carries the control that keeps it from passing for the wrong reason, including
+one that requires an unbindable sibling in the scratch home to still draw the pin
+warning, so a sealed reading is a sealed daemon and not a daemon that stopped
+pinning anything. Check 3 asserts the other half: the registry moves with
+`KIN_HOME` and the supervisor does not, because one supervisor holds daemons from
+several managed homes and following `KIN_HOME` would hide from a pinned session
+the daemons it shares the box with. Every probe leaves `KIN_REGISTRY_PATH` unset
+on purpose, since an explicit pin wins on both sides of that fix and a probe that
+kept one could not fail.
+
+`first_contact_honesty.py` covers the three surfaces a stranger meets before the
+graph answers anything, all found by the npm0549 green stranger on shipped
+0.5.49. Check 0 asserts `kin commit --help` carries the same sentence a commit
+prints, that a Kin commit lands in Kin's own authority and `git status` stays
+dirty until `kin eject` or a push, and asserts the CLI reference quotes it too
+(FIR-2627). Check 1 packs `packages/kin`, makes a global npm prefix unwritable,
+proves `npm install -g` is refused there exactly as it is in a container, then
+runs the README's own leading shell block against that machine and requires it to
+reach a working `kin --version` (FIR-2628). Check 2 points a real npm at a port
+nothing listens on and requires the language-server install failure to name the
+environment as the suspected cause, print the proxy variables that would route
+it, name the offline route to a working server, and state that Kin runs
+without the servers (FIR-2629).
+
+Two limits it states rather than hides. Check 1 stubs the archive download with
+`KIN_NO_PROVISION` and a seeded managed binary, so what it proves is that the
+documented first path does not need the prefix that is refused, not that the
+download works; the release install proof owns that half. And check 1 reports
+UNREADABLE rather than PASS when the global install SUCCEEDS against the prefix
+it made unwritable, which is what happens as root, because a probe that cannot
+see its own wall has not passed.
+
+Check 2's network error is npm's own, produced by a real npm against a closed
+port, never a stub printing the words the classifier looks for. When the install
+dies of something that is not the network, the check reports UNREADABLE and says
+which reason it got, because a classifier that was never asked the question has
+not answered it.
+
 `brownfield_repro.py --self-test` and `response_budget_elisions.py --self-test`
 exercise their verdict graders on fixed payloads and need no binary and no
 corpus. Each case is paired with its inverse, so a grader that cannot tell its
@@ -116,6 +199,14 @@ python3 scripts/acceptance/brownfield_repro.py \
 python3 scripts/acceptance/response_budget_elisions.py \
   --kin target/release/kin --daemon target/release/kin-daemon \
   --json acceptance/response_budget.json --verbose
+
+python3 scripts/acceptance/registry_home_isolation.py \
+  --kin target/release/kin --daemon target/release/kin-daemon \
+  --json acceptance/registry_isolation.json --verbose
+
+python3 scripts/acceptance/first_contact_honesty.py \
+  --kin target/release/kin --daemon target/release/kin-daemon \
+  --json acceptance/first_contact.json --verbose
 ```
 
 Release, not debug. Release is what ships, so it is what an acceptance answer
@@ -129,7 +220,9 @@ walked whole (FIR-2593).
 REGRESSION rather than plain FAIL. `brownfield_repro.py` also takes `--offline`,
 which refuses to fetch and requires the corpus cache to already carry both pinned
 commits. `response_budget_elisions.py` builds its own fixture, fetches nothing,
-and takes `--workdir` and `--verbose`.
+and takes `--workdir` and `--verbose`. `registry_home_isolation.py` builds both
+of its homes and all four of its repositories itself, fetches nothing, and takes
+`--keep` and `--verbose`.
 
 The magic suite's fixtures commit through kin, and kin refuses to invent an
 author, so the machine running them needs a git identity. That refusal is

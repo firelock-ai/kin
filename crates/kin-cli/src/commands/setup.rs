@@ -1542,7 +1542,7 @@ pub(crate) fn hook_filename(shell: &str) -> &'static str {
     }
 }
 
-fn hook_content(shell: &str) -> &'static str {
+pub(crate) fn hook_content(shell: &str) -> &'static str {
     match shell {
         "bash" => BASH_HOOK,
         "fish" => FISH_HOOK,
@@ -13364,8 +13364,247 @@ async fn apply_language_server_provisioning(
 // `kin setup doctor`
 // ---------------------------------------------------------------------------
 
+/// What one `doctor` run observed before deciding whether to install a language
+/// server.
+///
+/// Every field is a fact the run already measured rather than a probe this rule
+/// performs, so [`decide_language_server_request`] is testable with no daemon,
+/// no repository and no host. That split is the fix for FIR-2502: the gate used
+/// to decide in the same breath it acted, and every branch that decided "no"
+/// acted by falling through, which at a terminal is indistinguishable from an
+/// install that worked. Two strangers on v0.5.43 read that silence as success
+/// and converted large repositories with no enrichment at all.
+pub(crate) struct LanguageServerRequest {
+    /// `--install-language-servers` was typed.
+    pub(crate) requested: bool,
+    /// `--fix` was typed, so this run is allowed to change the host.
+    pub(crate) fixing: bool,
+    /// A Kin repository was discovered from the working directory.
+    ///
+    /// Read with `KinLayout::discover`, the same test the health report itself
+    /// uses to decide `NotInRepository`, so the two cannot drift apart without
+    /// the shared function changing under both.
+    pub(crate) in_repository: bool,
+    /// The `reference_edge_coverage` row's status, absent when the report
+    /// carried no such row.
+    pub(crate) coverage_status: Option<crate::commands::health::HealthStatus>,
+    /// Languages this build enriches whose server is absent from this HOST.
+    ///
+    /// Host-scoped rather than repository-scoped, because that is what
+    /// [`language_servers::missing_enrichable_languages`] measures and what an
+    /// install would actually change. The gate above it is repository-scoped,
+    /// and every message below keeps the two apart on purpose.
+    pub(crate) missing_on_host: Vec<kin_model::LanguageId>,
+}
+
+/// What the run should do about the request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LanguageServerDecision {
+    /// Install servers for these languages, subject to consent.
+    Install(Vec<kin_model::LanguageId>),
+    /// Install nothing, and print these lines so the no-op is legible.
+    Explain(Vec<String>),
+    /// Install nothing and print nothing, because nobody asked.
+    Silent,
+}
+
+/// Render a language list the way an operator reads it.
+fn language_list(languages: &[kin_model::LanguageId]) -> String {
+    languages
+        .iter()
+        .map(|language| language.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// What this host holds, phrased for the end of a sentence.
+///
+/// Stated from the measurement rather than from the repository, because the
+/// install is host-wide and a reader who is told "nothing is missing" has to be
+/// able to trust that about the machine, not about the directory they happen to
+/// be standing in.
+fn host_language_server_state(missing_on_host: &[kin_model::LanguageId]) -> String {
+    if missing_on_host.is_empty() {
+        "this host already has a server for every one".to_string()
+    } else {
+        format!(
+            "this host is missing a server for {}",
+            language_list(missing_on_host)
+        )
+    }
+}
+
+/// Decide what a run does about `--install-language-servers`, and say so.
+///
+/// Every message this returns is true in the state that produced it, and none
+/// of them names a cause the run did not observe. The two facts that are easy
+/// to conflate are kept apart everywhere: servers install per HOST, and the gap
+/// that asks for them is measured per REPOSITORY.
+pub(crate) fn decide_language_server_request(
+    request: &LanguageServerRequest,
+) -> LanguageServerDecision {
+    use crate::commands::health::HealthStatus;
+
+    // Pending and Stale are exactly the two states the coverage row takes when
+    // a language-server gap was actually OBSERVED. Every other state either
+    // read the graph and found nothing to close, or never read it at all, and
+    // spending a user's bandwidth off the back of an unread row is the prompt
+    // this gate exists to refuse.
+    let gap_observed = matches!(
+        request.coverage_status,
+        Some(HealthStatus::Pending | HealthStatus::Stale)
+    );
+
+    if !request.fixing {
+        // Installing downloads packages into a shared prefix, so it belongs
+        // behind `--fix` with every other repair. What it does not get to do is
+        // stay quiet about that: the flag was simply dead here before, and
+        // `kin doctor --install-language-servers` printed an ordinary report
+        // and exited 0 having installed nothing.
+        if !request.requested {
+            return LanguageServerDecision::Silent;
+        }
+        return LanguageServerDecision::Explain(vec![
+            "Nothing installed. `--install-language-servers` only runs under `--fix`.".to_string(),
+            "Run `kin doctor --fix --install-language-servers` to install them.".to_string(),
+        ]);
+    }
+
+    if gap_observed && !request.missing_on_host.is_empty() {
+        return LanguageServerDecision::Install(request.missing_on_host.clone());
+    }
+
+    // Nothing is going to be installed. Explain that only to a run that asked
+    // for it. A bare `--fix` never raised the subject, and a line about a repair
+    // nobody requested is noise on every healthy install.
+    if !request.requested {
+        return LanguageServerDecision::Silent;
+    }
+
+    if !request.in_repository {
+        return LanguageServerDecision::Explain(vec![
+            "Nothing installed. This directory is not inside a Kin repository, and Kin measures \
+             the language-server gap per repository even though the servers install per host."
+                .to_string(),
+            format!(
+                "Run `kin doctor --fix --install-language-servers` from a Kin repository. It \
+                 checks {}, and {}.",
+                language_list(&language_servers::enrichable_languages()),
+                host_language_server_state(&request.missing_on_host)
+            ),
+        ]);
+    }
+
+    if request.missing_on_host.is_empty() {
+        let mut lines = vec![format!(
+            "Nothing to install. Every language this build enriches already has a server on this \
+             host: {}.",
+            language_list(&language_servers::enrichable_languages())
+        )];
+        if gap_observed {
+            // The row is unhealthy for a reason no install closes. Saying which
+            // way round it is matters: the reader came here to fix the gap, and
+            // the gap is real, so sending them to the row that named it is the
+            // only useful thing this run can do.
+            lines.push(
+                "This repository still reports a reference-edge gap, so read the Reference edge \
+                 coverage row for what it names."
+                    .to_string(),
+            );
+        }
+        return LanguageServerDecision::Explain(lines);
+    }
+
+    // In a repository, servers missing from the host, and no gap to close. The
+    // two ways that happens read differently and are kept apart, because only
+    // one of them means the graph was actually consulted.
+    if matches!(request.coverage_status, Some(HealthStatus::Healthy)) {
+        let mut lines = vec![
+            "Nothing to install. This repository's graph reports no reference-edge gap, and that \
+             gap is what the install closes."
+                .to_string(),
+            format!(
+                "This host is still missing a server for {}. Install by hand, or run this again \
+                 from a repository whose Reference edge coverage row names the gap:",
+                language_list(&request.missing_on_host)
+            ),
+        ];
+        for command in language_servers::install_commands_for(&request.missing_on_host) {
+            lines.push(format!("  {command}"));
+        }
+        return LanguageServerDecision::Explain(lines);
+    }
+
+    // The row exists and reports something other than a verdict from a graph it
+    // read. `Unsupported` is the reachable one, and it is always phrased "n/a"
+    // by the health check, so naming it as unread is the row's own claim rather
+    // than a guess about a cause this run never saw.
+    let headline = if matches!(request.coverage_status, Some(HealthStatus::Unsupported)) {
+        "Nothing to install. Kin could not measure this repository's reference-edge coverage, so \
+         it saw no gap to close."
+    } else {
+        "Nothing to install. This repository's Reference edge coverage row does not report a \
+         language-server gap."
+    };
+    LanguageServerDecision::Explain(vec![
+        headline.to_string(),
+        format!(
+            "Read that row above for what it does report. {}.",
+            host_language_server_state(&request.missing_on_host)
+        ),
+    ])
+}
+
+/// Print an [`LanguageServerDecision::Explain`], and nothing otherwise.
+///
+/// Written to stderr on purpose. `kin doctor --json` promises a parseable
+/// report on stdout, and a notice about a request that did nothing is a
+/// diagnostic, not part of the report. Sending it to stdout would make the fix
+/// for a silent no-op the cause of an unparseable one.
+fn print_language_server_decision(decision: &LanguageServerDecision) {
+    if let LanguageServerDecision::Explain(lines) = decision {
+        for line in lines {
+            eprintln!("{line}");
+        }
+    }
+}
+
+/// Read the facts this run measured about a language-server install request.
+fn observe_language_server_request(
+    fix: bool,
+    install_language_servers: bool,
+    report: &crate::commands::health::HealthReport,
+) -> LanguageServerRequest {
+    let cwd = env::current_dir().unwrap_or_default();
+    LanguageServerRequest {
+        requested: install_language_servers,
+        fixing: fix,
+        in_repository: kin_core::KinLayout::discover(&cwd).is_some(),
+        coverage_status: report
+            .checks
+            .iter()
+            .find(|check| check.id == "reference_edge_coverage")
+            .map(|check| check.status.clone()),
+        missing_on_host: language_servers::missing_enrichable_languages(),
+    }
+}
+
 pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Result<()> {
     let report = crate::commands::health::run_health_checks().await;
+
+    // Decided once, before the report is printed, so the one rule that governs
+    // `--install-language-servers` sees the same facts on both sides of the
+    // `--fix` branch. Skipped entirely when neither flag is present, so a plain
+    // `kin doctor` still probes nothing it does not need (FIR-2502).
+    let language_server_decision = if fix || install_language_servers {
+        decide_language_server_request(&observe_language_server_request(
+            fix,
+            install_language_servers,
+            &report,
+        ))
+    } else {
+        LanguageServerDecision::Silent
+    };
 
     if !fix {
         if json {
@@ -13373,6 +13612,12 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
         } else {
             print_human_report(&report);
         }
+        // Printed last, so a human reads it under the report rather than above
+        // it. Before this, the flag was dead on this path: bound at the
+        // signature, first read well past this return, and so a scripted
+        // `kin doctor --install-language-servers` exited 0 having installed
+        // nothing and said nothing.
+        print_language_server_decision(&language_server_decision);
         return Ok(());
     }
 
@@ -13561,36 +13806,23 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
     // prints the command; `--fix --install-language-servers` runs it, and an
     // interactive `--fix` asks.
     //
-    // The gap comes from the health report rather than from a fresh probe, so
-    // the repair is scoped to the languages the row actually flagged.
-    // Pending and Stale are exactly the two states the coverage row takes when
-    // a language-server gap was actually OBSERVED. `Unsupported` is what it
-    // reports outside a Kin repository, or with no daemon and nothing missing,
-    // and offering an install off the back of that would turn a "nothing to
-    // measure here" row into a prompt to download packages.
-    let language_server_gap = report.checks.iter().any(|c| {
-        c.id == "reference_edge_coverage"
-            && matches!(
-                c.status,
-                crate::commands::health::HealthStatus::Pending
-                    | crate::commands::health::HealthStatus::Stale
-            )
-    });
-    if language_server_gap {
-        let missing = language_servers::missing_enrichable_languages();
-        if missing.is_empty() {
-            // The row is unhealthy for a reason no install closes (an
-            // unsupportable absence, or a graph that could not be read). Saying
-            // nothing here is right: offering an install that changes nothing
-            // is worse than leaving the row's own detail to speak.
-        } else {
+    // The gate itself, and the words for every state it declines to install in,
+    // live in `decide_language_server_request` above. Both silent paths this
+    // replaces (an `if` with no `else`, and an `if missing.is_empty()` whose
+    // body was a comment) reported a no-op exactly the way a success reports
+    // itself, which is FIR-2502.
+    match &language_server_decision {
+        LanguageServerDecision::Install(missing) => {
             let consent = language_servers::InstallConsent::resolve(
                 install_language_servers,
                 !install_language_servers && is_tty(),
             );
-            let outcome = apply_language_server_provisioning(&missing, consent).await;
+            let outcome = apply_language_server_provisioning(missing, consent).await;
             applied.extend(outcome.applied);
             unfinished.extend(outcome.unfinished);
+        }
+        LanguageServerDecision::Explain(_) | LanguageServerDecision::Silent => {
+            print_language_server_decision(&language_server_decision);
         }
     }
 
@@ -15119,6 +15351,7 @@ mod tests {
     use super::projection_mode_to_record;
     use super::{fix_verdict, readiness_line, UnfinishedRepair};
     use crate::commands::health::{HealthCheck, HealthReport, HealthStatus};
+    use kin_model::LanguageId;
 
     fn check(id: &str, label: &str, status: HealthStatus) -> HealthCheck {
         HealthCheck {
@@ -22546,5 +22779,266 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
             .expect_err("wrong gitdir backpointer must fail closed");
         assert!(format!("{error:#}").contains("backpointer"));
         fs::write(reverse, original_reverse).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // `--install-language-servers` says what it did (FIR-2502)
+    // -----------------------------------------------------------------------
+
+    /// A request with nothing observed. Each test names only the facts it is
+    /// about, so no assertion below depends on what this machine has installed.
+    fn request(requested: bool, fixing: bool) -> super::LanguageServerRequest {
+        super::LanguageServerRequest {
+            requested,
+            fixing,
+            in_repository: true,
+            coverage_status: Some(HealthStatus::Healthy),
+            missing_on_host: Vec::new(),
+        }
+    }
+
+    fn explained(request: &super::LanguageServerRequest) -> Vec<String> {
+        match super::decide_language_server_request(request) {
+            super::LanguageServerDecision::Explain(lines) => lines,
+            other => panic!("expected an explanation, got {other:?}"),
+        }
+    }
+
+    /// Hole one. The flag was bound at `doctor`'s signature and first read past
+    /// the `--fix` early return, so a stranger's `kin doctor
+    /// --install-language-servers` printed an ordinary report, installed
+    /// nothing, said nothing about language servers and exited 0.
+    #[test]
+    fn the_flag_without_fix_names_the_command_that_would_work() {
+        let lines = explained(&request(true, false));
+        let text = lines.join("\n");
+        assert!(
+            text.contains("Nothing installed."),
+            "the no-op has to be stated before anything else: {text}"
+        );
+        assert!(
+            text.contains("only runs under `--fix`"),
+            "the reason has to name the missing flag: {text}"
+        );
+        assert!(
+            text.contains("kin doctor --fix --install-language-servers"),
+            "an honest refusal names the command that works: {text}"
+        );
+    }
+
+    /// The other half of hole one: a run that never asked keeps its output.
+    /// A line about a repair nobody requested is noise on every healthy install.
+    #[test]
+    fn a_doctor_run_that_did_not_ask_stays_silent() {
+        assert_eq!(
+            super::decide_language_server_request(&request(false, false)),
+            super::LanguageServerDecision::Silent
+        );
+        assert_eq!(
+            super::decide_language_server_request(&super::LanguageServerRequest {
+                missing_on_host: vec![LanguageId::Python],
+                ..request(false, true)
+            }),
+            super::LanguageServerDecision::Silent
+        );
+    }
+
+    /// Hole two, outside a repository. The coverage row reads `Unsupported`
+    /// there, the gate stays shut, and before this the run downloaded nothing
+    /// and printed not one word.
+    #[test]
+    fn outside_a_repository_the_run_says_where_to_run_it_instead() {
+        let lines = explained(&super::LanguageServerRequest {
+            in_repository: false,
+            coverage_status: Some(HealthStatus::Unsupported),
+            missing_on_host: vec![LanguageId::Python, LanguageId::TypeScript],
+            ..request(true, true)
+        });
+        let text = lines.join("\n");
+        assert!(
+            text.contains("not inside a Kin repository"),
+            "the reader has to be told which state they are in: {text}"
+        );
+        // The scoping nuance the stranger had to reverse-engineer by hand:
+        // servers install per host, the gap is measured per repository.
+        assert!(
+            text.contains("per repository") && text.contains("per host"),
+            "both scopes have to be named or the reader guesses: {text}"
+        );
+        assert!(
+            text.contains("rust, python, typescript, javascript"),
+            "it has to name what it would have checked: {text}"
+        );
+        assert!(
+            text.contains("missing a server for python, typescript"),
+            "it has to name what this host actually lacks: {text}"
+        );
+    }
+
+    /// Hole two, inside a repository with nothing to do. The host being
+    /// complete is a fact about the machine, so it is stated about the machine.
+    #[test]
+    fn a_complete_host_is_reported_as_a_fact_about_the_host() {
+        let lines = explained(&request(true, true));
+        let text = lines.join("\n");
+        assert!(
+            text.contains("Every language this build enriches already has a server on this host"),
+            "{text}"
+        );
+        assert!(
+            text.contains("rust, python, typescript, javascript"),
+            "naming the set is what separates this from a silent exit: {text}"
+        );
+        assert!(
+            !text.contains("reference-edge gap"),
+            "no gap was observed, so none may be asserted: {text}"
+        );
+    }
+
+    /// The second half of hole two, and the state the two strangers were
+    /// actually in: servers missing from the host, and a repository whose graph
+    /// reported no gap for them to close.
+    #[test]
+    fn a_repository_with_no_gap_names_the_missing_servers_and_the_commands() {
+        let lines = explained(&super::LanguageServerRequest {
+            missing_on_host: vec![LanguageId::Python],
+            ..request(true, true)
+        });
+        let text = lines.join("\n");
+        assert!(
+            text.contains("This repository's graph reports no reference-edge gap"),
+            "{text}"
+        );
+        assert!(
+            text.contains("This host is still missing a server for python"),
+            "the host fact and the repository fact are different facts: {text}"
+        );
+        assert!(
+            text.contains("npm install -g pyright"),
+            "the command is the whole value of saying anything here: {text}"
+        );
+    }
+
+    /// A row that never read the graph must not be reported as a row that read
+    /// it and found nothing. Both are non-Pending, and only one of them means
+    /// the repository actually has no gap.
+    #[test]
+    fn an_unread_coverage_row_is_never_reported_as_no_gap() {
+        let lines = explained(&super::LanguageServerRequest {
+            coverage_status: Some(HealthStatus::Unsupported),
+            missing_on_host: vec![LanguageId::Python],
+            ..request(true, true)
+        });
+        let text = lines.join("\n");
+        assert!(
+            text.contains("could not measure this repository's reference-edge coverage"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("reports no reference-edge gap"),
+            "an unread row proves nothing about the gap: {text}"
+        );
+    }
+
+    /// The gate itself still opens on exactly the two observed-gap states, and
+    /// on nothing else. This is the behavior the honesty batch must not spend.
+    #[test]
+    fn only_an_observed_gap_installs_anything() {
+        for status in [HealthStatus::Pending, HealthStatus::Stale] {
+            assert_eq!(
+                super::decide_language_server_request(&super::LanguageServerRequest {
+                    coverage_status: Some(status.clone()),
+                    missing_on_host: vec![LanguageId::Python],
+                    ..request(true, true)
+                }),
+                super::LanguageServerDecision::Install(vec![LanguageId::Python]),
+                "{status:?} is an observed gap"
+            );
+        }
+        for status in [
+            None,
+            Some(HealthStatus::Healthy),
+            Some(HealthStatus::Unsupported),
+            Some(HealthStatus::Missing),
+            Some(HealthStatus::Degraded),
+            Some(HealthStatus::Misconfigured),
+        ] {
+            let decision = super::decide_language_server_request(&super::LanguageServerRequest {
+                coverage_status: status.clone(),
+                missing_on_host: vec![LanguageId::Python],
+                ..request(true, true)
+            });
+            assert!(
+                !matches!(decision, super::LanguageServerDecision::Install(_)),
+                "{status:?} is not an observed gap, so it must not spend bandwidth"
+            );
+        }
+    }
+
+    /// The empty block at the heart of hole two: a real gap that no install
+    /// closes, because the host already has every server. It used to be a
+    /// comment and nothing else.
+    #[test]
+    fn an_observed_gap_a_complete_host_cannot_close_says_so() {
+        let lines = explained(&super::LanguageServerRequest {
+            coverage_status: Some(HealthStatus::Pending),
+            ..request(true, true)
+        });
+        let text = lines.join("\n");
+        assert!(text.contains("already has a server on this host"), "{text}");
+        assert!(
+            text.contains("still reports a reference-edge gap"),
+            "the gap is real and the reader came here to close it: {text}"
+        );
+    }
+
+    /// The founder register, enforced rather than reviewed. Every message this
+    /// rule can produce, in every state it can produce one.
+    #[test]
+    fn no_language_server_message_carries_an_em_dash() {
+        let statuses = [
+            None,
+            Some(HealthStatus::Healthy),
+            Some(HealthStatus::Pending),
+            Some(HealthStatus::Stale),
+            Some(HealthStatus::Unsupported),
+            Some(HealthStatus::Missing),
+            Some(HealthStatus::Degraded),
+            Some(HealthStatus::Misconfigured),
+        ];
+        let mut seen = 0;
+        for fixing in [false, true] {
+            for in_repository in [false, true] {
+                for missing in [
+                    Vec::new(),
+                    vec![LanguageId::Python],
+                    vec![
+                        LanguageId::Rust,
+                        LanguageId::Python,
+                        LanguageId::TypeScript,
+                        LanguageId::JavaScript,
+                    ],
+                ] {
+                    for status in &statuses {
+                        let decision =
+                            super::decide_language_server_request(&super::LanguageServerRequest {
+                                requested: true,
+                                fixing,
+                                in_repository,
+                                coverage_status: status.clone(),
+                                missing_on_host: missing.clone(),
+                            });
+                        if let super::LanguageServerDecision::Explain(lines) = decision {
+                            seen += 1;
+                            for line in lines {
+                                assert!(!line.contains('\u{2014}'), "em dash in: {line}");
+                                assert!(!line.is_empty(), "an empty line explains nothing");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(seen > 0, "the sweep must actually reach an explanation");
     }
 }

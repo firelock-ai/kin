@@ -1047,6 +1047,11 @@ pub fn handle_get_context_pack<G: GraphStore>(
             // pack sees an arriving edge of a class that authority does not
             // read, and when the cap below withholds one.
             "certified_dependents": certified_ids.len(),
+            // The cap's own number, and only the cap's. The top-level
+            // `dependents_withheld` counts every cause together, because a
+            // caller asking "how many rows am I not seeing" wants one answer;
+            // this one stays because a caller already reading it must not have
+            // its meaning changed underneath it.
             "dependents_withheld": dependents_withheld,
             "same_file_candidates": selection.same_file_candidates(),
             "same_file_dropped": selection.same_file_dropped(),
@@ -1092,6 +1097,81 @@ pub fn handle_get_context_pack<G: GraphStore>(
 
     if include_traffic && !pack.traffic.is_empty() {
         result["nearby_traffic"] = serde_json::to_value(&pack.traffic).map_err(McpError::Json)?;
+    }
+
+    // What the pack's own token budget refused, in the map the response budget
+    // already publishes its cuts to.
+    //
+    // Two budgets cut this answer and only one of them was ever visible. The
+    // token budget runs first, inside the builder, and a dependency section it
+    // trimmed from twelve rows to six serialized exactly like a focal with six:
+    // `returned: 6` beside six rows, and nothing anywhere saying a row had been
+    // a candidate. That is the reading kin#1062 removed from the list case and
+    // kin#1068 from the impact case, arriving here through the earlier budget.
+    //
+    // One map, keyed by the group, with the cause named on each entry: a caller
+    // raises `token_budget` for these and `max_chars` for the response budget's,
+    // and being told the wrong lever costs a round trip that cannot help.
+    let recovered = |id: &kin_model::ids::EntityId| packed.contains(id);
+    let mut budget_groups: Vec<&str> = vec![
+        kin_context::group::DEPENDENCIES,
+        kin_context::group::DEPENDENTS,
+    ];
+    if !compact {
+        // A section `compact` never serves cannot be misread as an empty one,
+        // because dropping it is the documented shape of that mode. A section
+        // this mode does serve is absent only when it holds nothing, which is
+        // exactly the reading a budget cut must not produce.
+        budget_groups.extend([
+            kin_context::group::TRANSITIVE_DEPS,
+            kin_context::group::TESTS,
+            kin_context::group::CONTRACTS,
+            kin_context::group::WORK_ITEMS,
+            kin_context::group::ANNOTATIONS,
+        ]);
+    }
+    for group in budget_groups {
+        let elided = selection.budget_elided_unrecovered(group, recovered);
+        if elided == 0 {
+            continue;
+        }
+        let kept = result
+            .get(group)
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len);
+        // The scalar beside the map, written here so the response budget's own
+        // later cut of the same list adds to it rather than replacing it.
+        result[format!("{group}_withheld")] = serde_json::json!(elided);
+        crate::budget::record_elision_for(
+            &mut result,
+            group,
+            kept,
+            elided,
+            crate::budget::ELISION_REASON_TOKEN_BUDGET,
+        );
+    }
+    // The certified-dependents cap is the third cutter on this payload, and it
+    // was disclosed only as a nested counter inside `dependency_selection`,
+    // which is the sibling-counter shape that saved nobody in the stranger
+    // session kin#1062 was filed from. It carries its own reason because no
+    // budget parameter recovers it.
+    if dependents_withheld > 0 {
+        let kept = result
+            .get("dependents")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len);
+        let prior = result
+            .get("dependents_withheld")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize;
+        result["dependents_withheld"] = serde_json::json!(prior + dependents_withheld);
+        crate::budget::record_elision_for(
+            &mut result,
+            "dependents",
+            kept,
+            dependents_withheld,
+            crate::budget::ELISION_REASON_DEPENDENTS_CAP,
+        );
     }
 
     let json = serialize_with_measured_tokens(&mut result)?;
@@ -1967,31 +2047,17 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     // `semantic_search` for the same string returned six. An ambiguity counter
     // pinned at one is worse than no counter: a reader who checks it is handed
     // an explicit assurance that there was nothing to disambiguate (FIR-2475).
-    let (same_name_candidates, other_candidates, matched_by) = match resolution_query.as_deref() {
-        Some(query) if addressed_by_name => {
-            let (count, others) = query_resolution_candidates(store, query, &target.id)?;
-            (count, others, "query_name_pattern")
-        }
-        // A pinned entity_id resolved nothing by name, so there is no query
-        // ambiguity to report. What still applies is the twin question: a name
-        // the graph holds twice (two cfg arms admitted as distinct entities)
-        // means an edge the extractor could not attribute sits on neither.
-        _ => {
-            let count = same_name_entity_count(store, &target.name)?;
-            (count, Vec::new(), "exact_focal_name")
-        }
-    };
-    result["focal_resolution"] = serde_json::json!({
-        "addressed_by": if addressed_by_name { "name" } else { "entity_id" },
-        "same_name_candidates": same_name_candidates,
-        // Which rule produced the number. Without it the same field means two
-        // different things depending on how the call was addressed, and a
-        // reader cannot tell which answer they are holding.
-        "matched": matched_by,
-        // A count alone says the tool guessed and leaves no way to ask again.
-        // These are addressable by id, bounded, and never include the winner.
-        "other_candidates": other_candidates,
-    });
+    let resolution = focal_resolution_for(
+        store,
+        &target,
+        if addressed_by_name {
+            resolution_query.as_deref()
+        } else {
+            None
+        },
+    )?;
+    let same_name_candidates = resolution["same_name_candidates"].as_u64().unwrap_or(1);
+    result["focal_resolution"] = resolution;
     if addressed_by_name && same_name_candidates > 1 {
         let entry = serde_json::json!({
             "component": "focal_resolution",
@@ -4098,6 +4164,54 @@ fn query_resolution_candidates<G: GraphStore>(
         })
         .collect();
     Ok((count, others))
+}
+
+/// The `focal_resolution` block, for every surface that resolves a focal and
+/// then answers about it.
+///
+/// Public and shared because `kin_mcp::negative`'s `focal_resolution_gap`
+/// REFUSES any `find_references` absence whose payload does not carry a
+/// `same_name_candidates`, and a missing block is the refusing arm rather than
+/// an exemption. So a CLI surface routed through that gate has to publish this
+/// block, and the only safe way for it to do that is to call the producer the
+/// MCP handler calls. A second copy in `kin-cli` would let the two surfaces
+/// count ambiguity by different rules and disagree about one store, which is
+/// the drift FIR-2524 exists to end and would arrive by the door its own fix
+/// left open. Same reasoning that made `IMPACT_REFERENCE_KINDS` public.
+///
+/// `query` is the name the CALLER addressed, and `None` means the focal was
+/// pinned by id. Which one it is decides the counting rule, and FIR-2475 is what
+/// happens when the count is taken against the winner's own name instead.
+pub fn focal_resolution_for<G: GraphStore>(
+    store: &G,
+    target: &kin_model::Entity,
+    query: Option<&str>,
+) -> Result<serde_json::Value> {
+    let (same_name_candidates, other_candidates, matched_by) = match query {
+        Some(query) => {
+            let (count, others) = query_resolution_candidates(store, query, &target.id)?;
+            (count, others, "query_name_pattern")
+        }
+        // A pinned entity_id resolved nothing by name, so there is no query
+        // ambiguity to report. What still applies is the twin question: a name
+        // the graph holds twice (two cfg arms admitted as distinct entities)
+        // means an edge the extractor could not attribute sits on neither.
+        None => {
+            let count = same_name_entity_count(store, &target.name)?;
+            (count, Vec::new(), "exact_focal_name")
+        }
+    };
+    Ok(serde_json::json!({
+        "addressed_by": if query.is_some() { "name" } else { "entity_id" },
+        "same_name_candidates": same_name_candidates,
+        // Which rule produced the number. Without it the same field means two
+        // different things depending on how the call was addressed, and a
+        // reader cannot tell which answer they are holding.
+        "matched": matched_by,
+        // A count alone says the tool guessed and leaves no way to ask again.
+        // These are addressable by id, bounded, and never include the winner.
+        "other_candidates": other_candidates,
+    }))
 }
 
 fn same_name_entity_count<G: GraphStore>(store: &G, name: &str) -> Result<usize> {

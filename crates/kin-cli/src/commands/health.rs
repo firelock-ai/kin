@@ -198,6 +198,7 @@ pub async fn run_health_checks() -> HealthReport {
     checks.push(check_embedding_model().await);
     checks.push(check_commit_memory_headroom());
     checks.push(check_daemon_kill_record());
+    checks.push(check_interrupted_init());
     checks.push(check_suspended_sweep());
     checks.push(check_host_memory_pressure());
     checks.push(check_retrieval_profile());
@@ -1161,7 +1162,209 @@ fn check_projection_mode() -> HealthCheck {
         None,
     );
     let outside = probe_outside_repo(home_dir().ok().as_deref(), report.shim.engaged);
-    projection_mode_check_for(&report, env::consts::OS, &outside)
+    let hook = probe_shell_hook(&kin_home, detect_shell(), &report.shim.path);
+    projection_mode_check_for(&report, env::consts::OS, &outside, &hook)
+}
+
+/// Whether Kin's own shell hook is live in the shell that started this process.
+///
+/// This exists because the projection row was asking the one question the hook
+/// guarantees a "no" to. The hook wraps the control plane as
+/// `kin() { DYLD_INSERT_LIBRARIES= LD_PRELOAD= command kin "$@"; }`, which is
+/// correct, since injecting the shim into the binary that serves it is
+/// circular. The row then measured whether the shim was preloaded into `kin
+/// doctor` and told a correctly installed user to start a new shell so the hook
+/// would inject it. It never would (FIR-2501). The question worth asking is
+/// about the OTHER processes in this shell, and it is answerable, because the
+/// two variables the `kin` wrapper does not clear pass straight through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ShellHook {
+    /// Live: this shell runs Kin's hook, so the non-`kin` processes it starts
+    /// are launched under the shim, and this process is unshimmed on purpose.
+    Live(String),
+    /// Not live, and this is why. The container with no hook, the editor
+    /// terminal that never sourced one, and the shell where the kill switch is
+    /// set all land here.
+    Withheld(String),
+}
+
+impl ShellHook {
+    fn is_live(&self) -> bool {
+        matches!(self, Self::Live(_))
+    }
+
+    /// The hook's own words, whatever the verdict, so a row can name the
+    /// evidence it rests on rather than asserting a result.
+    fn evidence(&self) -> &str {
+        match self {
+            Self::Live(text) | Self::Withheld(text) => text,
+        }
+    }
+}
+
+/// Probed facts about the shell hook, separated from the environment that
+/// produced them so both directions of the verdict are testable without a real
+/// `$HOME`, a real shell, or a real shim.
+struct ShellHookFacts<'a> {
+    shell: &'a str,
+    hook_path: &'a Path,
+    /// Whether the hook file is there at all.
+    installed: bool,
+    /// Whether its bytes are the ones this build writes. Existence alone is not
+    /// currency: a hook from an older install is a file that exists and a
+    /// behavior nobody here has read.
+    current: bool,
+    /// Whether the shell's startup file sources it.
+    sourced: bool,
+    /// The shim as classified on disk. The hook exports the preload only when
+    /// the library is present and non-empty (`-f` and `-s` in its own words), so
+    /// a missing or 0-byte shim means the hook injects nothing however well it
+    /// is installed. [`classify_shim`] is strictly stronger, since it also
+    /// rejects a blob the loader would refuse.
+    shim: ShimState,
+    /// `KIN_VFS_DISABLE` as this process sees it. The hook reads the same
+    /// variable as its kill switch and the `kin` wrapper does not clear it, so a
+    /// switched-on value is positive proof the hook injected nothing.
+    disable: Option<String>,
+    /// `KIN_VFS_WORKSPACE` as this process sees it.
+    ///
+    /// Positive proof, and only positive proof. All three POSIX hooks export
+    /// this variable and the preload from the same branch and clear both from
+    /// the other one, so a bound root in `kin`'s environment means the preload
+    /// was exported for everything else this shell starts. Its ABSENCE proves
+    /// nothing: outside a repository the hook deactivates by design, and a shell
+    /// that has simply not entered one yet is not a broken install.
+    bound_root: Option<String>,
+}
+
+/// Read the shell hook's state from this process's environment and `~/.kin`.
+fn probe_shell_hook(kin_home: &Path, shell: &str, shim_path: &Path) -> ShellHook {
+    let hook_path = hook_path_for(kin_home, shell);
+    let installed = hook_path.is_file();
+    let current = std::fs::read(&hook_path)
+        .is_ok_and(|bytes| bytes == crate::commands::setup::hook_content(shell).as_bytes());
+    let rc_content = shell_rc(shell)
+        .ok()
+        .and_then(|rc| std::fs::read_to_string(rc).ok())
+        .unwrap_or_default();
+    let non_empty = |name: &str| env::var(name).ok().filter(|value| !value.trim().is_empty());
+    shell_hook_from(ShellHookFacts {
+        shell,
+        hook_path: &hook_path,
+        installed,
+        current,
+        sourced: rc_sources_hook(&rc_content),
+        shim: classify_shim(shim_path),
+        disable: non_empty("KIN_VFS_DISABLE"),
+        bound_root: non_empty("KIN_VFS_WORKSPACE"),
+    })
+}
+
+/// Whether a `KIN_VFS_DISABLE` value switches the hook off.
+///
+/// The literal spellings all three hooks accept (`1`, `true`, `yes`, `on`,
+/// case-insensitively), rather than the shim's narrower "the literal 1": the
+/// question here is what the HOOK did, and a shell where the hook stood down is
+/// a shell where nothing was injected whatever the shim would have made of the
+/// same value.
+fn vfs_disabled_by(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// Decide whether the hook is live, from probed facts alone.
+fn shell_hook_from(facts: ShellHookFacts<'_>) -> ShellHook {
+    let ShellHookFacts {
+        shell,
+        hook_path,
+        installed,
+        current,
+        sourced,
+        shim,
+        disable,
+        bound_root,
+    } = facts;
+    let where_it_is = hook_path.display();
+
+    if let Some(value) = disable.as_deref().filter(|value| vfs_disabled_by(value)) {
+        return ShellHook::Withheld(format!(
+            "KIN_VFS_DISABLE={value} is set in this shell, which is the hook's own kill switch, so \
+             nothing here is injected with the shim"
+        ));
+    }
+    if !installed {
+        return ShellHook::Withheld(format!(
+            "no {shell} hook is installed at {where_it_is}, so no process this shell starts is \
+             injected with the shim"
+        ));
+    }
+    // The shim's own state decides this before the hook's, because the hook
+    // tests the library before exporting anything and clears the preload when
+    // the test fails. A hook installed over a 0-byte or truncated shim injects
+    // nothing, and saying otherwise would be the reassuring lie this row exists
+    // to remove.
+    let shim_size = match shim {
+        ShimState::Valid(size) => size,
+        ShimState::Missing => {
+            return ShellHook::Withheld(format!(
+                "the {shell} hook at {where_it_is} exports the preload only when the shim library \
+                 is there, and it is not"
+            ));
+        }
+        ShimState::Empty | ShimState::Invalid => {
+            return ShellHook::Withheld(format!(
+                "the {shell} hook at {where_it_is} exports the preload only when the shim library \
+                 is a usable {}, and this one is not",
+                shim_object_kind()
+            ));
+        }
+    };
+
+    // Two ways to answer, and the measured one wins. A bound root is the hook's
+    // activate path having run in THIS shell: every POSIX hook exports
+    // KIN_VFS_WORKSPACE and the preload together, and clears both together, so
+    // the variable `kin`'s own wrapper forgets to strip is a witness to the
+    // preload that wrapper just stripped. Where there is no witness, and
+    // outside a repository the hook stands down by design, the evidence is the
+    // file and the rc line. Currency is required there because nobody has read
+    // this hook's behavior and an older one is a file whose contents are a
+    // guess.
+    match bound_root {
+        Some(root) => ShellHook::Live(format!(
+            "Kin's {shell} hook is live in this shell: it bound {root} as the projection root and \
+             exports the {} shim ({shim_size} bytes) into every process this shell starts except \
+             the kin control plane, which it strips on purpose",
+            shim_object_kind()
+        )),
+        None if current && sourced => ShellHook::Live(format!(
+            "Kin's {shell} hook is installed at {where_it_is}, is the one this build writes, and \
+             is sourced by this shell's startup file, so it injects the shim into the processes \
+             this shell starts and strips it from the kin control plane on purpose"
+        )),
+        None if !current => ShellHook::Withheld(format!(
+            "the {shell} hook at {where_it_is} is not the one this build installs, and no \
+             projection root is bound here to show what it did; run `kin setup` to refresh it"
+        )),
+        None => ShellHook::Withheld(format!(
+            "the {shell} hook at {where_it_is} is installed but this shell's startup file does not \
+             source it, and no projection root is bound here"
+        )),
+    }
+}
+
+/// Where this shell's projection hook lives.
+///
+/// Shared by the shell-integration row and the projection row, which must not
+/// disagree about the same file.
+fn hook_path_for(kin_home: &Path, shell: &str) -> PathBuf {
+    kin_home.join("shell").join(hook_filename(shell))
+}
+
+/// Whether a shell startup file sources the projection hook.
+fn rc_sources_hook(rc_content: &str) -> bool {
+    rc_content.contains("kin-vfs")
 }
 
 /// What a real syscall through the shim says about a path outside the
@@ -1323,6 +1526,7 @@ fn projection_mode_check_for(
     report: &crate::commands::projection::ProjectionReport,
     os: &str,
     outside: &OutsideRepoProbe,
+    hook: &ShellHook,
 ) -> HealthCheck {
     use crate::commands::projection::ProjectionMode;
 
@@ -1389,12 +1593,25 @@ fn projection_mode_check_for(
         // projection that was measured outside the repository from one that was
         // only measured inside it.
         let detail = format!("{detail}; {}", outside.evidence());
-        return HealthCheck::new(
+        let check = HealthCheck::new(
             "projection_mode",
             "Projection in force",
             HealthStatus::Healthy,
             detail,
         );
+        // A working mode can still have a limit, and this is the row where a
+        // silent green would hide it. The shim interposes libc, so a binary
+        // that never calls libc reads the working copy while everything else
+        // reads graph truth; that stays true of a shim mode passing every
+        // probe. Carrying it as a platform note rather than a status keeps the
+        // row green, because the limit is a property of the mode rather than a
+        // defect in the install, and puts it in front of a reader who ran
+        // `kin doctor` and would otherwise have to know to run `kin vfs status`
+        // (FIR-2572).
+        return match live.mode.raw_syscall_note() {
+            Some(note) => check.with_platform_note(note),
+            None => check,
+        };
     }
 
     // A recorded mode that is not the one running, or one that is running and
@@ -1473,6 +1690,57 @@ fn projection_mode_check_for(
     // this branch is about.
     let installed_and_dead =
         report.driver.refusal.is_some() || (report.shim.installed && !shim_usable);
+
+    // FIR-2501. The advisory arm above is right about a shell with no hook and
+    // wrong about a shell with one, and until now it could not tell them apart
+    // because it read the one signal Kin's own hook is built to blank. The hook
+    // wraps the control plane so `kin` never runs under the shim, which is
+    // correct and permanent, and this row then measured `kin doctor`'s own
+    // preload, called a correct install STALE, and printed a fix that could not
+    // work. Since FIR-2547 tightened the readiness line to require zero
+    // attention rows, that denied "First-run ready" on every correctly
+    // hook-installed machine.
+    //
+    // So the arm splits on the question the ticket asks: not whether THIS
+    // process is injected, but whether the hook is live for the processes that
+    // are not `kin`. Three conditions, and all three are load-bearing:
+    //
+    // - `advisory` keeps FIR-2394 intact. It requires a usable shim, so a
+    //   refused driver or a library no probe can open never reaches here, and
+    //   `!installed_and_dead` says the same thing a second time on purpose:
+    //   an installed projection the loader will not run must never borrow a
+    //   softer status, let alone a green one.
+    // - `unengaged_here_only` is the projection's own verdict with the
+    //   engagement question answered yes. Without it this branch would report
+    //   the FIR-2552 machine, a root bound that nothing serves or one that does
+    //   not contain this directory, as healthy, which is the state where
+    //   every path under that root returns EIO for every process the shim IS
+    //   injected into.
+    // - `hook.is_live()` is the hook evidence itself.
+    //
+    // Only the ROW's status moves. `LiveProjection::degraded` stays exactly what
+    // it was, because it answers for the process asking, and `kin vfs status`
+    // reporting "in force" from a `kin` process that is reading raw disk would
+    // be the same false green in a different surface. That is why the machine
+    // row below still reads `degraded=yes` under a green status, and why the
+    // detail explains the difference in words rather than hiding it.
+    if advisory && !installed_and_dead && live.unengaged_here_only && hook.is_live() {
+        return HealthCheck::new(
+            "projection_mode",
+            "Projection in force",
+            HealthStatus::Healthy,
+            format!(
+                "{detail}; the shim is installed and IS injected into the processes this shell \
+                 starts, and is correctly NOT injected into `kin` itself, which is why the row \
+                 above reads degraded=yes: that field is about this process, and Kin's hook wraps \
+                 the control plane so the binary serving the projection never runs under it; \
+                 {}; {}",
+                hook.evidence(),
+                outside.evidence()
+            ),
+        );
+    }
+
     if report.recorded.is_none() && !advisory && !installed_and_dead {
         let engageable = report
             .modes
@@ -1522,8 +1790,26 @@ fn projection_mode_check_for(
     } else {
         HealthStatus::Misconfigured
     };
+    // The advisory arm is the one whose subject is the shell, so it carries the
+    // hook's own words. A reader who lands here is being told something is not
+    // injected, and what the hook did is the first thing they need in order to
+    // know whether that is their shell or their projection.
+    let detail = if advisory {
+        format!("{detail}; {}", hook.evidence())
+    } else {
+        detail
+    };
     HealthCheck::new("projection_mode", "Projection in force", status, detail).with_manual_fix(
-        if advisory {
+        if advisory && hook.is_live() {
+            // The hook is already doing its job, so the old line would send a
+            // reader to open shell after shell against a row that can never
+            // move: what is missing here is the projection, not the shell. It
+            // names `kin vfs status` and not `kin doctor --fix`, which has no
+            // repair for this row and would only loop (FIR-2435).
+            "Kin's shell hook is already live here and runs `kin` without the shim on purpose, so \
+             a new shell will not change this row: run `kin vfs status` for the root this shell \
+             bound, whether it contains this directory, and whether anything is serving it"
+        } else if advisory {
             // Not `exec $SHELL -l`. A stock Debian `~/.bashrc` guards itself on
             // interactivity (`case $- in *i*) ;; *) return;; esac`), not on
             // login, so a login shell does not engage the hook there and the
@@ -1538,6 +1824,58 @@ fn projection_mode_check_for(
              available here"
         },
     )
+}
+
+/// Report staging an interrupted `kin init` left on disk, and where it stopped.
+///
+/// A conversion the kernel kills for memory runs no destructor: the shell gets
+/// exit 137, `.kin` never appears, and hundreds of megabytes of staging sit
+/// beside the repository with nothing pointing at them. The rc0550 stranger met
+/// that and deleted it by hand after guessing what it was. This row is the
+/// answer to the question that operator had no way to ask.
+///
+/// Reports, never reaps. An operator asking what is on their disk has not asked
+/// Kin to delete anything, and the reclaim already happens on the next `kin
+/// init` in that repository, which the fix line names.
+fn check_interrupted_init() -> HealthCheck {
+    let cwd = env::current_dir().unwrap_or_default();
+    interrupted_init_check_for(&interrupted_init_scan_roots(&cwd))
+}
+
+/// Where a doctor run looks for interrupted-conversion staging.
+///
+/// The choice of directories, and the filesystem access it takes to resolve
+/// them, belong to the init boundary in kin-core rather than to a CLI health
+/// row: doctor asks that boundary where to look and reports what it answers.
+fn interrupted_init_scan_roots(cwd: &Path) -> Vec<PathBuf> {
+    kin_core::init_attempt::staging_scan_roots(cwd)
+}
+
+fn interrupted_init_check_for(roots: &[PathBuf]) -> HealthCheck {
+    let mut attempts = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for root in roots {
+        for attempt in kin_core::init_attempt::abandoned_init_attempts(root).unwrap_or_default() {
+            if seen.insert(attempt.capture_path.clone()) {
+                attempts.push(attempt);
+            }
+        }
+    }
+    match kin_core::init_attempt::doctor_row(&attempts) {
+        Some((detail, fix)) => HealthCheck::new(
+            "interrupted_init",
+            "Interrupted conversion",
+            HealthStatus::Degraded,
+            detail,
+        )
+        .with_manual_fix(fix),
+        None => HealthCheck::new(
+            "interrupted_init",
+            "Interrupted conversion",
+            HealthStatus::Healthy,
+            "no `kin init` staging is waiting to be reclaimed here",
+        ),
+    }
 }
 
 fn check_repo_init() -> HealthCheck {
@@ -1683,7 +2021,7 @@ fn check_shell_path() -> HealthCheck {
         .map(|paths| env::split_paths(&paths).any(|p| p == bin_dir))
         .unwrap_or(false);
 
-    let hook_path = kin_home.join("shell").join(hook_filename(shell));
+    let hook_path = hook_path_for(&kin_home, shell);
     let hook_installed = hook_path.exists();
 
     let rc_path = shell_rc(shell).ok();
@@ -1691,7 +2029,7 @@ fn check_shell_path() -> HealthCheck {
         .as_ref()
         .and_then(|rc| std::fs::read_to_string(rc).ok())
         .unwrap_or_default();
-    let rc_sources = rc_content.contains("kin-vfs");
+    let rc_sources = rc_sources_hook(&rc_content);
 
     // The PATH line does not always live beside the hook. zsh's belongs in
     // `.zshenv`, which is the file a non-interactive shell reads, and bash's
@@ -3745,25 +4083,46 @@ fn check_host_memory_pressure() -> HealthCheck {
     };
     host_memory_pressure_check_for(
         kin_core::memory_pressure::PressureRefusal::read(layout.root()).as_ref(),
+        kin_core::memory_pressure::DaemonFootprint::read(layout.root()).as_ref(),
     )
 }
 
-/// Core of [`check_host_memory_pressure`] with the record as its input, so both
-/// branches are testable without a machine that has actually run out of memory.
+/// Core of [`check_host_memory_pressure`] with both records as its input, so
+/// every branch is testable without a machine that has actually run out of
+/// memory.
+///
+/// The healthy branch reports the standing rather than only the absence of a
+/// refusal. "No work has been held back" is true and unusable: a reader whose
+/// daemon is backing off wants to know how close it is, and a reader on a
+/// machine Kin grades wrongly has nothing to look at and no way to know a
+/// threshold needs moving. The numbers are already published, so printing them
+/// costs nothing and turns the row from a bell into a gauge.
 fn host_memory_pressure_check_for(
     refusal: Option<&kin_core::memory_pressure::PressureRefusal>,
+    footprint: Option<&kin_core::memory_pressure::DaemonFootprint>,
 ) -> HealthCheck {
     const ID: &str = "host_memory_pressure";
     const LABEL: &str = "Host memory pressure";
+    let standing = footprint.map(|footprint| {
+        footprint.line(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_secs())
+                .unwrap_or_default(),
+        )
+    });
     let Some(refusal) = refusal else {
-        return HealthCheck::new(
-            ID,
-            LABEL,
-            HealthStatus::Healthy,
-            "no work has been held back on this store for want of memory",
-        );
+        let detail = match standing {
+            Some(standing) => format!("no work has been held back on this store; {standing}"),
+            None => "no work has been held back on this store for want of memory".to_string(),
+        };
+        return HealthCheck::new(ID, LABEL, HealthStatus::Healthy, detail);
     };
-    HealthCheck::new(ID, LABEL, HealthStatus::Degraded, refusal.cause_sentence())
+    let detail = match standing {
+        Some(standing) => format!("{} Also: {standing}", refusal.cause_sentence()),
+        None => refusal.cause_sentence(),
+    };
+    HealthCheck::new(ID, LABEL, HealthStatus::Degraded, detail)
         .with_manual_fix(refusal.remediation())
 }
 
@@ -4148,6 +4507,105 @@ mod tests {
     /// Falsify by comparing against `store.bytes` instead of the measured peak,
     /// or by returning `Healthy` unconditionally: the constrained arm then
     /// passes silently, which is the state this check exists to end.
+    /// The row has to find staging whether doctor is run from the repository
+    /// being converted or from the directory that holds it, because init stages
+    /// beside the repository and an operator stands in either place.
+    #[test]
+    fn the_interrupted_conversion_row_scans_the_working_directory_and_its_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let repo = root.join("requests");
+        std::fs::create_dir(&repo).unwrap();
+
+        let clean = interrupted_init_check_for(&interrupted_init_scan_roots(&repo));
+        assert!(
+            matches!(clean.status, HealthStatus::Healthy),
+            "a disk with no staging on it must not raise a row: {clean:?}"
+        );
+        assert!(clean.manual_fix.is_none());
+
+        // The shape a killed init leaves: a leased capture directory carrying a
+        // phase record, beside the repository rather than inside it.
+        let capture = root.join(".kin-git-capture-abdd7a1c");
+        std::fs::create_dir(&capture).unwrap();
+        std::fs::write(capture.join("capture.lease"), b"").unwrap();
+        std::fs::write(capture.join("body"), vec![0_u8; 4096]).unwrap();
+        let record = serde_json::json!({
+            "version": 1,
+            "source": repo.display().to_string(),
+            "destination": repo.join(".kin").display().to_string(),
+            "pid": 41,
+            "started_unix": 1000,
+            "phase_index": 13,
+            "phase_total": 17,
+            "phase_label": "commit bootstrap transaction",
+            "phase_started_unix": 1707,
+            "memory_limit_bytes": 12884901888_u64,
+            "memory_source": "container",
+            "stage_path": serde_json::Value::Null,
+        });
+        std::fs::write(
+            capture.join("init-attempt.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+
+        for (where_from, cwd) in [("inside the repository", &repo), ("beside it", &root)] {
+            let found = interrupted_init_check_for(&interrupted_init_scan_roots(cwd));
+            assert!(
+                matches!(found.status, HealthStatus::Degraded),
+                "run {where_from}, the row must raise: {found:?}"
+            );
+            assert!(
+                found
+                    .detail
+                    .contains("phase 13 of 17, commit bootstrap transaction"),
+                "run {where_from}, the row must name the phase: {}",
+                found.detail
+            );
+            assert!(
+                found.detail.contains(" KB of staging"),
+                "run {where_from}, the row must name the size in bytes it measured: {}",
+                found.detail
+            );
+            let fix = found
+                .manual_fix
+                .as_deref()
+                .unwrap_or_else(|| panic!("run {where_from}, the row must carry a fix line"));
+            assert!(
+                fix.contains(&capture.display().to_string()),
+                "run {where_from}, the fix must name the path to delete: {fix}"
+            );
+        }
+
+        // One directory, reachable from two scan roots, is one finding.
+        let both = interrupted_init_check_for(&interrupted_init_scan_roots(&repo));
+        assert!(
+            both.detail.contains("from 1 interrupted"),
+            "a capture found through both roots must be counted once: {}",
+            both.detail
+        );
+        assert!(
+            capture.exists(),
+            "doctor reports and must never reap what it reports"
+        );
+    }
+
+    /// A working directory with no parent is the filesystem root, and asking
+    /// for one must not produce a duplicate scan of the same directory.
+    #[test]
+    fn the_scan_roots_never_repeat_a_directory() {
+        let root = interrupted_init_scan_roots(Path::new("/"));
+        assert_eq!(root, vec![PathBuf::from("/")], "the root has no parent");
+        let nested = interrupted_init_scan_roots(Path::new("/tmp"));
+        assert_eq!(
+            nested.len(),
+            2,
+            "an ordinary directory scans itself and its parent: {nested:?}"
+        );
+        assert_ne!(nested[0], nested[1]);
+    }
+
     #[test]
     fn doctor_reads_a_ceiling_below_a_measured_commit_peak_as_degraded() {
         let check =
@@ -5091,7 +5549,7 @@ mod tests {
     fn projection_mode_check_for_macos(
         report: &crate::commands::projection::ProjectionReport,
     ) -> HealthCheck {
-        projection_mode_check_for(report, "macos", &not_probed())
+        projection_mode_check_for(report, "macos", &not_probed(), &no_hook())
     }
 
     /// The neutral probe: no shim injected into this process, so nothing
@@ -5099,6 +5557,19 @@ mod tests {
     /// uses it, which keeps their meaning exactly what it was.
     fn not_probed() -> OutsideRepoProbe {
         OutsideRepoProbe::NotTaken("fixture: no probe taken".to_string())
+    }
+
+    /// No shell hook in this shell. Every fixture that predates FIR-2501 uses
+    /// it, which keeps their meaning exactly what it was: a container or an
+    /// editor terminal, where nothing is injected into anything.
+    fn no_hook() -> ShellHook {
+        ShellHook::Withheld("fixture: no hook is live in this shell".to_string())
+    }
+
+    /// Kin's own shell hook, live in this shell: every process it starts except
+    /// the `kin` control plane is launched under the shim.
+    fn hook_live() -> ShellHook {
+        ShellHook::Live("fixture: the hook is live in this shell".to_string())
     }
 
     fn mode_probe(mode: ProjectionMode, available: bool) -> ModeProbe {
@@ -5185,8 +5656,101 @@ mod tests {
             readable,
             writable: Tri::NotApplicable,
             degraded,
+            unengaged_here_only: false,
             evidence: vec!["fixture evidence".to_string()],
         }
+    }
+
+    /// FIR-2572. A green projection row still names what its mode cannot do.
+    ///
+    /// The shim interposes libc, so a binary that never calls libc reads the
+    /// working copy while everything else reads graph truth, and that stays
+    /// true of a shim passing every probe this row takes. `kin vfs status`
+    /// said so and `kin doctor` did not, so a reader who ran doctor, saw a
+    /// green projection and stopped had no way to learn the limit existed.
+    ///
+    /// The note rides `platform_note`, so it must not move the status: a limit
+    /// that belongs to the mode is not a defect in the install, and a row that
+    /// went red over one would fail every correct shim install.
+    #[test]
+    fn a_green_shim_row_names_the_limit_and_a_green_mount_row_has_none() {
+        let shim = projection_mode_check_for_macos(&report(
+            Some(ProjectionMode::Shim),
+            &[ProjectionMode::Shim],
+            live(
+                ProjectionMode::Shim,
+                ProjectionMode::Shim,
+                Tri::NotApplicable,
+                Tri::Yes,
+                false,
+            ),
+        ));
+        assert!(
+            matches!(shim.status, HealthStatus::Healthy),
+            "naming the limit must not move the status, got {:?}",
+            shim.status
+        );
+        assert!(
+            !blocks_readiness(&shim),
+            "a mode's limit must never block readiness"
+        );
+        let note = shim
+            .platform_note
+            .as_deref()
+            .expect("a green shim row carries the shim's limit");
+        assert!(
+            note.contains("libc") && note.contains("Go"),
+            "the limit must name what it is about: {note}"
+        );
+        assert!(
+            !note.contains("Node is not projected"),
+            "Node is projected under the shim since FIR-2572: {note}"
+        );
+
+        // The control. A mount is served by the kernel and has no such limit,
+        // so an unconditional note would be a false warning on every mount
+        // host and this assertion is what keeps the note attached to the mode
+        // rather than to the row.
+        let mount = projection_mode_check_for_macos(&report(
+            Some(ProjectionMode::Nfs),
+            &[ProjectionMode::Nfs],
+            live(
+                ProjectionMode::Nfs,
+                ProjectionMode::Nfs,
+                Tri::Yes,
+                Tri::Yes,
+                false,
+            ),
+        ));
+        assert!(
+            matches!(mount.status, HealthStatus::Healthy),
+            "the mount fixture must be green for this control to mean anything, got {:?}",
+            mount.status
+        );
+        assert_eq!(
+            mount.platform_note, None,
+            "a mount projects every process on the host and must carry no such limit"
+        );
+    }
+
+    /// The machine FIR-2501 is about: a shim installed and working, in a shell
+    /// running Kin's own hook, so every probe passed except the one asking
+    /// whether THIS process is injected, which is the one the hook's `kin`
+    /// wrapper guarantees a no to, on purpose and permanently.
+    fn correctly_hooked_report() -> ProjectionReport {
+        let mut report = report(
+            Some(ProjectionMode::Shim),
+            &[ProjectionMode::Shim],
+            live(
+                ProjectionMode::Shim,
+                ProjectionMode::Shim,
+                Tri::NotApplicable,
+                Tri::Yes,
+                true,
+            ),
+        );
+        report.live.unengaged_here_only = true;
+        report
     }
 
     /// The three fixtures the row exists to tell apart: everything present, no
@@ -5266,13 +5830,21 @@ mod tests {
         }
     }
 
-    /// A shim installed and not injected is the container case. It must be
-    /// visible and must not be healthy, and it must not fail readiness either:
-    /// running `kin` from an editor terminal without the shell hook is ordinary
-    /// and would otherwise fail every install that works.
+    /// A shim installed and not injected, in a shell with NO hook, is the
+    /// container case. It must be visible and must not be healthy, and it must
+    /// not fail readiness either: running `kin` from an editor terminal without
+    /// the shell hook is ordinary and would otherwise fail every install that
+    /// works.
+    ///
+    /// This test used to make the same assertion with no hook input at all,
+    /// which is what let FIR-2501 through: it pinned STALE to "this process is
+    /// not injected" and so pinned it to the one state Kin's own hook creates on
+    /// purpose. The container is still real and still STALE; the hook fact is
+    /// now stated rather than assumed, and its opposite is asserted in
+    /// [`a_live_shell_hook_makes_the_projection_row_green`].
     #[test]
     fn an_installed_but_unengaged_shim_is_visible_without_failing_readiness() {
-        let check = projection_mode_check_for_macos(&report(
+        let container = report(
             None,
             &[ProjectionMode::Shim],
             live(
@@ -5282,10 +5854,11 @@ mod tests {
                 Tri::Yes,
                 true,
             ),
-        ));
+        );
+        let check = projection_mode_check_for(&container, "macos", &not_probed(), &no_hook());
         assert!(
             matches!(check.status, HealthStatus::Stale),
-            "an unengaged shim is advisory, got {:?}",
+            "an unengaged shim in a shell with no hook is advisory, got {:?}",
             check.status
         );
         assert!(!matches!(check.status, HealthStatus::Healthy));
@@ -5297,6 +5870,227 @@ mod tests {
                 .is_some_and(|fix| fix.contains("new interactive shell")),
             "the fix must still point at a new shell, and say which kind: {check:?}"
         );
+        assert!(
+            check.detail.contains("no hook is live in this shell"),
+            "the row must name what the hook did, which is what tells this apart from a machine \
+             whose hook is working: {}",
+            check.detail
+        );
+    }
+
+    /// FIR-2501, in both directions, over one fixture with one fact flipped.
+    ///
+    /// The defect was a row that measured whether the shim was preloaded into
+    /// `kin doctor`, the one process Kin's hook exists to keep unshimmed, then
+    /// called a correct install STALE and printed a fix that could not work. A
+    /// STALE row denies "First-run ready" since FIR-2547, so this was every
+    /// correctly hook-installed machine.
+    #[test]
+    fn a_live_shell_hook_makes_the_projection_row_green() {
+        let hooked = correctly_hooked_report();
+
+        let green = projection_mode_check_for(&hooked, "macos", &not_probed(), &hook_live());
+        assert!(
+            matches!(green.status, HealthStatus::Healthy),
+            "a shim installed, working, and injected by a live hook into everything but `kin` \
+             itself is a healthy projection, got {:?}: {}",
+            green.status,
+            green.detail
+        );
+        assert!(
+            green.manual_fix.is_none(),
+            "a green row must not ask for a repair: {green:?}"
+        );
+        assert!(
+            !green.fixable,
+            "there is no --fix repair for this row, and claiming one loops (FIR-1880)"
+        );
+
+        // The detail must not claim the doctor process is shimmed. It must say
+        // the opposite, and say that it is correct.
+        assert!(
+            green
+                .detail
+                .contains("IS injected into the processes this shell starts")
+                && green
+                    .detail
+                    .contains("correctly NOT injected into `kin` itself"),
+            "the green detail must say plainly which processes are injected and which are not: {}",
+            green.detail
+        );
+        // And it must keep the machine row intact, degraded and all, because
+        // `LiveProjection::degraded` is deliberately unchanged: it answers for
+        // the process asking, and `kin vfs status` is right to keep saying so.
+        assert!(
+            green.detail.contains("mode=shim") && green.detail.contains("degraded=yes"),
+            "the row shape must survive the new status: {}",
+            green.detail
+        );
+
+        // The other direction, same fixture, one fact flipped: no hook, so
+        // nothing in this shell is injected and the row is advisory again.
+        let stale = projection_mode_check_for(&hooked, "macos", &not_probed(), &no_hook());
+        assert!(
+            matches!(stale.status, HealthStatus::Stale),
+            "without a hook the same machine is not projecting anything, got {:?}",
+            stale.status
+        );
+        assert_ne!(
+            green.detail, stale.detail,
+            "the two readings must not print the same sentence"
+        );
+        assert!(
+            stale
+                .manual_fix
+                .as_deref()
+                .is_some_and(|fix| fix.contains("new interactive shell")),
+            "the no-hook fix is still the shell, and it is still the right one: {stale:?}"
+        );
+    }
+
+    /// The negative controls for the green above. Each one removes a single
+    /// condition from a machine that would otherwise read healthy, and each must
+    /// take the row off green: a hook switched off, a projection that is broken
+    /// for the processes the shim IS injected into (FIR-2552), and a shim the
+    /// loader cannot use (FIR-2394).
+    #[test]
+    fn the_green_hook_row_is_withheld_the_moment_any_condition_fails() {
+        let hooked = correctly_hooked_report();
+        assert!(matches!(
+            projection_mode_check_for(&hooked, "macos", &not_probed(), &hook_live()).status,
+            HealthStatus::Healthy
+        ));
+
+        // The kill switch, as the hook itself reads it. This is what
+        // `KIN_VFS_DISABLE=1` produces, and it must never read green.
+        let disabled = shell_hook_from(ShellHookFacts {
+            shell: "zsh",
+            hook_path: Path::new("/home/u/.kin/shell/kin-vfs.zsh"),
+            installed: true,
+            current: true,
+            sourced: true,
+            shim: ShimState::Valid(4096),
+            disable: Some("1".to_string()),
+            bound_root: Some("/w/repo".to_string()),
+        });
+        assert!(
+            !disabled.is_live(),
+            "KIN_VFS_DISABLE is the hook's own kill switch: {disabled:?}"
+        );
+        let killed = projection_mode_check_for(&hooked, "macos", &not_probed(), &disabled);
+        assert!(
+            !matches!(killed.status, HealthStatus::Healthy),
+            "a shell with the projection switched off has no projection in force, got {:?}",
+            killed.status
+        );
+
+        // FIR-2552, at this row: a live hook over a projection that is broken
+        // for every process the shim IS injected into. `unengaged_here_only` is
+        // the projection's own verdict with the engagement question answered
+        // yes, and a false one means the failure is not about this process.
+        let mut unserved = correctly_hooked_report();
+        unserved.live.unengaged_here_only = false;
+        let check = projection_mode_check_for(&unserved, "macos", &not_probed(), &hook_live());
+        assert!(
+            !matches!(check.status, HealthStatus::Healthy),
+            "a bound root nothing serves is not a healthy projection however good the hook is, \
+             got {:?}",
+            check.status
+        );
+        assert!(
+            check
+                .manual_fix
+                .as_deref()
+                .is_some_and(|fix| fix.contains("kin vfs status") && !fix.contains("kin doctor")),
+            "with the hook already live, the fix must name the projection and not another shell, \
+             and must never name `kin doctor --fix` (FIR-2435): {check:?}"
+        );
+
+        // FIR-2394: an installed shim no probe can use must not borrow the
+        // softer status, and must not borrow the green one either.
+        let mut dead = correctly_hooked_report();
+        dead.modes = dead
+            .modes
+            .iter()
+            .map(|probe| ModeProbe {
+                available: probe.mode != ProjectionMode::Shim && probe.available,
+                ..probe.clone()
+            })
+            .collect();
+        assert!(dead.shim.installed);
+        let check = projection_mode_check_for(&dead, "macos", &not_probed(), &hook_live());
+        assert!(
+            is_failing(&check.status),
+            "an installed shim the loader will not run must still fail, got {:?}",
+            check.status
+        );
+    }
+
+    /// The hook verdict itself, over probed facts alone, in every direction it
+    /// can be decided.
+    #[test]
+    fn the_shell_hook_verdict_reads_the_facts_the_kin_wrapper_cannot_strip() {
+        let facts = |installed, current, sourced, shim, bound_root: Option<&str>| ShellHookFacts {
+            shell: "bash",
+            hook_path: Path::new("/home/u/.kin/shell/kin-vfs.bash"),
+            installed,
+            current,
+            sourced,
+            shim,
+            disable: None,
+            bound_root: bound_root.map(ToOwned::to_owned),
+        };
+
+        // A bound root is the measurement: the hook's activate path exports
+        // KIN_VFS_WORKSPACE and the preload from the same branch, and the `kin`
+        // wrapper clears only the preload. So the variable that survives is a
+        // witness to the one that did not, and currency is not needed for it.
+        let measured = shell_hook_from(facts(
+            true,
+            false,
+            false,
+            ShimState::Valid(4096),
+            Some("/w/repo"),
+        ));
+        assert!(
+            measured.is_live(),
+            "a bound projection root proves the hook ran in this shell: {measured:?}"
+        );
+        assert!(
+            measured.evidence().contains("/w/repo"),
+            "the verdict must name the root it read: {measured:?}"
+        );
+
+        // With no witness, the file and the rc line are the evidence, and both
+        // are required. Outside a repository the hook stands down by design, so
+        // this arm must not go red on a machine that is simply not in a repo.
+        assert!(shell_hook_from(facts(true, true, true, ShimState::Valid(4096), None)).is_live());
+        assert!(!shell_hook_from(facts(true, true, false, ShimState::Valid(4096), None)).is_live());
+        assert!(!shell_hook_from(facts(true, false, true, ShimState::Valid(4096), None)).is_live());
+        assert!(!shell_hook_from(facts(false, true, true, ShimState::Valid(4096), None)).is_live());
+
+        // The shim decides before the hook does, because the hook tests the
+        // library before exporting anything and clears the preload when the test
+        // fails. A witness cannot rescue a shim that is not there.
+        for shim in [ShimState::Missing, ShimState::Empty, ShimState::Invalid] {
+            let verdict = shell_hook_from(facts(true, true, true, shim, Some("/w/repo")));
+            assert!(
+                !verdict.is_live(),
+                "the hook injects nothing over an unusable shim: {verdict:?}"
+            );
+        }
+
+        // The kill switch, in every spelling all three hooks accept, and the
+        // controls that must NOT switch it off.
+        for on in ["1", "true", "TRUE", "Yes", "on", " on "] {
+            assert!(vfs_disabled_by(on), "{on:?} switches the hook off");
+        }
+        for off in ["", "0", "false", "no", "off", "2", "onward"] {
+            assert!(
+                !vfs_disabled_by(off),
+                "{off:?} does not switch the hook off"
+            );
+        }
     }
 
     /// The container case, at the row level. A driver the loader refuses
@@ -5395,7 +6189,7 @@ mod tests {
         );
 
         for os in ["macos", "linux"] {
-            let check = projection_mode_check_for(&bare, os, &not_probed());
+            let check = projection_mode_check_for(&bare, os, &not_probed(), &no_hook());
             assert!(
                 matches!(check.status, HealthStatus::Unsupported),
                 "{os} keeps the sanctioned skip, got {:?}",
@@ -5425,7 +6219,7 @@ mod tests {
                 true,
             ),
         );
-        let windows = projection_mode_check_for(&windows_off, "windows", &not_probed());
+        let windows = projection_mode_check_for(&windows_off, "windows", &not_probed(), &no_hook());
         assert!(
             !is_failing(&windows.status),
             "a mode nobody chose is not a defect, got {:?}",
@@ -5444,7 +6238,8 @@ mod tests {
         for probe in &mut remedyless.modes {
             probe.remedy = None;
         }
-        let bare_windows = projection_mode_check_for(&remedyless, "windows", &not_probed());
+        let bare_windows =
+            projection_mode_check_for(&remedyless, "windows", &not_probed(), &no_hook());
         assert!(
             !bare_windows.detail.contains("fixture remedy for projfs"),
             "the remedy must come from the probes: {}",
@@ -5473,7 +6268,7 @@ mod tests {
                 true,
             ),
         );
-        let check = projection_mode_check_for(&fresh, "windows", &not_probed());
+        let check = projection_mode_check_for(&fresh, "windows", &not_probed(), &no_hook());
         assert!(
             matches!(check.status, HealthStatus::Unsupported),
             "an unconfigured host has no projection in force to report on, got {:?}",
@@ -5493,7 +6288,7 @@ mod tests {
         // report, and it must still fail.
         let mut recorded = fresh.clone();
         recorded.recorded = Some(ProjectionMode::ProjFs);
-        let configured = projection_mode_check_for(&recorded, "windows", &not_probed());
+        let configured = projection_mode_check_for(&recorded, "windows", &not_probed(), &no_hook());
         assert!(
             matches!(configured.status, HealthStatus::Misconfigured),
             "a recorded mode that is not running must still fail, got {:?}",
@@ -5522,7 +6317,7 @@ mod tests {
                 true,
             ),
         );
-        let mac = projection_mode_check_for(&mac_fresh, "macos", &not_probed());
+        let mac = projection_mode_check_for(&mac_fresh, "macos", &not_probed(), &no_hook());
         assert!(
             !is_failing(&mac.status),
             "the same unconfigured state is not a defect on macOS either, got {:?}",
@@ -5558,7 +6353,7 @@ mod tests {
         // The control first: with the same report and no failing probe, this
         // row is green. That is what makes the assertion below about the probe
         // rather than about the fixture.
-        let green = projection_mode_check_for(&healthy, "macos", &not_probed());
+        let green = projection_mode_check_for(&healthy, "macos", &not_probed(), &no_hook());
         assert!(
             matches!(green.status, HealthStatus::Healthy),
             "the fixture must be green without a failing probe, got {:?}",
@@ -5569,7 +6364,7 @@ mod tests {
             "stat of /home/dev/.bashrc through the shim failed: Input/output error (os error 5)"
                 .to_string(),
         );
-        let check = projection_mode_check_for(&healthy, "macos", &broken);
+        let check = projection_mode_check_for(&healthy, "macos", &broken, &no_hook());
         assert!(
             is_failing(&check.status),
             "a shim that cannot serve paths outside the repository must fail this row, got {:?}",
@@ -5617,7 +6412,7 @@ mod tests {
                                      shim succeeded"
                 .to_string(),
         );
-        let check = projection_mode_check_for(&healthy, "macos", &served);
+        let check = projection_mode_check_for(&healthy, "macos", &served, &no_hook());
         assert!(
             matches!(check.status, HealthStatus::Healthy),
             "a shim that serves outside the repository is healthy, got {:?}",
@@ -5724,6 +6519,12 @@ mod tests {
     /// name a login shell, which does not engage the hook on a stock Debian
     /// `~/.bashrc`, and it must ask for the check rather than promise the
     /// result.
+    ///
+    /// It is asserted against a shell with NO hook, which is the only shell that
+    /// line is true of. It used to be asserted with no hook input at all, which
+    /// is how it came to be printed at users whose hook was already live and for
+    /// whom no new shell could ever move the row (FIR-2501). The second half of
+    /// this test is that case, and it must get a different line.
     #[test]
     fn the_stale_fix_line_names_interactivity_and_asks_for_a_recheck() {
         let mut installed_not_engaged = report(
@@ -5738,10 +6539,12 @@ mod tests {
             ),
         );
         installed_not_engaged.shim.engaged = false;
-        let check = projection_mode_check_for(&installed_not_engaged, "macos", &not_probed());
+        let check =
+            projection_mode_check_for(&installed_not_engaged, "macos", &not_probed(), &no_hook());
         assert!(
             matches!(check.status, HealthStatus::Stale),
-            "an installed shim that is not engaged is the advisory case, got {:?}",
+            "an installed shim that is not engaged, in a shell with no hook, is the advisory \
+             case, got {:?}",
             check.status
         );
         let fix = check.manual_fix.as_deref().unwrap_or_default();
@@ -5757,6 +6560,21 @@ mod tests {
         assert!(
             fix.contains("kin doctor"),
             "the fix must ask for the check in the shell it creates: {fix}"
+        );
+
+        // The same machine in a shell whose hook is already live. A new shell
+        // cannot move this row, so the line that asks for one is the wrong
+        // instruction and must not be printed here.
+        let hooked =
+            projection_mode_check_for(&installed_not_engaged, "macos", &not_probed(), &hook_live());
+        let hooked_fix = hooked.manual_fix.as_deref().unwrap_or_default();
+        assert_ne!(
+            hooked_fix, fix,
+            "a shell that already runs the hook must not be told to start another one"
+        );
+        assert!(
+            !hooked_fix.contains("interactive shell") && hooked_fix.contains("kin vfs status"),
+            "with the hook live the fix must name the projection instead: {hooked_fix}"
         );
     }
 
@@ -8815,10 +9633,37 @@ mod tests {
     /// the host rather than over the install.
     #[test]
     fn the_memory_pressure_row_reports_a_refusal_and_never_blocks_readiness() {
-        let quiet = host_memory_pressure_check_for(None);
+        let quiet = host_memory_pressure_check_for(None, None);
         assert!(matches!(quiet.status, HealthStatus::Healthy));
         assert!(quiet.manual_fix.is_none());
         assert!(!blocks_readiness(&quiet));
+
+        // With a standing published, the healthy row is a gauge rather than a
+        // bell: it says how close the daemon is, so a reader on a machine Kin
+        // grades wrongly has something to look at.
+        let published = kin_core::memory_pressure::DaemonFootprint {
+            footprint: kin_core::memory_pressure::TreeFootprint {
+                own_bytes: 2 * 1024 * 1024 * 1024,
+                children_bytes: 512 * 1024 * 1024,
+                child_count: 1,
+            },
+            budget_bytes: 8 * 1024 * 1024 * 1024,
+            budget_is_derived: true,
+            level: "nominal".to_string(),
+            pid: 4103,
+            at_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_secs())
+                .unwrap_or_default(),
+        };
+        let gauge = host_memory_pressure_check_for(None, Some(&published));
+        assert!(matches!(gauge.status, HealthStatus::Healthy));
+        assert!(!blocks_readiness(&gauge));
+        assert!(
+            gauge.detail.contains("it is allowed") && gauge.detail.contains("child processes"),
+            "the healthy row reports the standing and names the children: {}",
+            gauge.detail
+        );
 
         let refusal = kin_core::memory_pressure::PressureRefusal {
             work: "lsp-sweep".to_string(),
@@ -8828,7 +9673,7 @@ mod tests {
                 .to_string(),
             at_unix: 4_800,
         };
-        let reported = host_memory_pressure_check_for(Some(&refusal));
+        let reported = host_memory_pressure_check_for(Some(&refusal), None);
         assert!(matches!(reported.status, HealthStatus::Degraded));
         assert_eq!(reported.detail, refusal.reason);
         assert!(reported

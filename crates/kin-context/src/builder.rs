@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use kin_model::{
     relation::RelationKind, Annotation, AnnotationEntry, ArtifactContextEntry, ArtifactContextKind,
@@ -312,6 +312,29 @@ impl DependencySource {
     }
 }
 
+/// The wire name of a pack group, shared by `kin context` and the
+/// `get_context_pack` MCP tool.
+///
+/// Named here rather than spelled at each call site because the token budget's
+/// elisions are keyed by these, and a group whose count is filed under a name
+/// no surface renders is a disclosure nobody reads.
+pub mod group {
+    /// Rows the focal depends on.
+    pub const DEPENDENCIES: &str = "dependencies";
+    /// Rows that depend on the focal.
+    pub const DEPENDENTS: &str = "dependents";
+    /// Rows reached at more than one hop.
+    pub const TRANSITIVE_DEPS: &str = "transitive_deps";
+    /// Tests covering the focal or its direct dependencies.
+    pub const TESTS: &str = "tests";
+    /// Contracts the focal participates in.
+    pub const CONTRACTS: &str = "contracts";
+    /// Open work items scoped to the focal or its direct dependencies.
+    pub const WORK_ITEMS: &str = "work_items";
+    /// Fresh annotations on the focal or its direct dependencies.
+    pub const ANNOTATIONS: &str = "annotations";
+}
+
 /// How a pack's dependency section was filled, and what filling it left out.
 ///
 /// These are selection facts only the builder holds: whether the same-file
@@ -325,6 +348,11 @@ pub struct DependencySelection {
     same_file_candidates: usize,
     same_file_neighbors: Vec<EntityId>,
     dependents: Vec<EntityId>,
+    /// Candidates the token budget refused, by the group each would have
+    /// joined. Ids rather than counts, because a caller can recover a refused
+    /// row by another route and a row that reached the answer is not one the
+    /// answer lost.
+    budget_elided: BTreeMap<&'static str, Vec<EntityId>>,
 }
 
 impl DependencySelection {
@@ -368,6 +396,48 @@ impl DependencySelection {
     pub fn same_file_dropped(&self) -> usize {
         self.same_file_candidates
             .saturating_sub(self.same_file_neighbors.len())
+    }
+
+    /// Record one candidate the token budget refused.
+    ///
+    /// Work items and annotations are scoped to an entity rather than being
+    /// one, so those groups file the scope's id and can file it more than once.
+    /// The count is still one per refused row, which is what both surfaces
+    /// render; only [`Self::budget_elided_unrecovered`]'s per-id filter is
+    /// meaningless there, and nothing asks it for those groups.
+    fn refuse(&mut self, group: &'static str, entity_id: EntityId) {
+        self.budget_elided.entry(group).or_default().push(entity_id);
+    }
+
+    /// Rows one group lost to the token budget, discounting any the caller
+    /// recovered by another route.
+    ///
+    /// The MCP pack recovers a certified caller this fold refused, from the
+    /// same reference authority `find_references` reads. A row that reached the
+    /// answer is not a row the answer lost, and claiming it in both places
+    /// would be a false report of loss, which is the same defect as silence
+    /// with its sign flipped.
+    pub fn budget_elided_unrecovered(
+        &self,
+        group: &str,
+        recovered: impl Fn(&EntityId) -> bool,
+    ) -> usize {
+        self.budget_elided
+            .get(group)
+            .map_or(0, |ids| ids.iter().filter(|id| !recovered(id)).count())
+    }
+
+    /// Rows one group lost to the token budget.
+    pub fn budget_elided(&self, group: &str) -> usize {
+        self.budget_elided_unrecovered(group, |_| false)
+    }
+
+    /// Every group the token budget took rows from, with its count.
+    pub fn budget_elisions(&self) -> impl Iterator<Item = (&'static str, usize)> + '_ {
+        self.budget_elided
+            .iter()
+            .filter(|(_, ids)| !ids.is_empty())
+            .map(|(group, ids)| (*group, ids.len()))
     }
 }
 
@@ -683,6 +753,9 @@ where
     let mut transitive_entries = Vec::new();
     let mut test_entries = Vec::new();
     let mut contract_entries = Vec::new();
+    // Groups already holding a row, so the never-empty floor below admits a
+    // group's first candidate and only its first.
+    let mut admitted_groups: HashSet<&'static str> = HashSet::new();
 
     // Codex benefits from reserving budget for the focal entity.
     let transitive_budget = match opts.assistant_hint {
@@ -719,49 +792,62 @@ where
             content,
             tokens,
         } = candidate;
-        match section {
-            AssemblySection::Test => {
-                if total_tokens + tokens <= budget_max {
-                    total_tokens += tokens;
-                    test_entries.push(ContextEntry {
-                        entity_id,
-                        projection_level,
-                        content,
-                    });
+        // Which group this candidate would have joined, resolved before the
+        // admission decision so a refusal can be filed under the name the two
+        // surfaces render it by. `relation_for` is answerable here because
+        // `selection.dependents` is populated above and the same-file fallback
+        // has not run yet.
+        let target_group = match section {
+            AssemblySection::Test => group::TESTS,
+            AssemblySection::Contract => group::CONTRACTS,
+            AssemblySection::Transitive => group::TRANSITIVE_DEPS,
+            AssemblySection::DirectDep => match selection.relation_for(&entity_id) {
+                DependencyRelation::DependentEdge => group::DEPENDENTS,
+                DependencyRelation::DependencyEdge | DependencyRelation::SameFileNeighbor => {
+                    group::DEPENDENCIES
                 }
-            }
-            AssemblySection::Contract => {
-                if total_tokens + tokens <= budget_max {
-                    total_tokens += tokens;
-                    contract_entries.push(ContextEntry {
-                        entity_id,
-                        projection_level,
-                        content,
-                    });
-                }
-            }
-            AssemblySection::DirectDep => {
-                if total_tokens + tokens <= budget_max {
-                    total_tokens += tokens;
-                    dep_entries.push(ContextEntry {
-                        entity_id,
-                        projection_level,
-                        content,
-                    });
-                }
-            }
+            },
+        };
+        let fits = match section {
             AssemblySection::Transitive => {
-                if total_tokens + tokens <= budget_max
+                total_tokens + tokens <= budget_max
                     && transitive_tokens + tokens <= transitive_budget
-                {
-                    total_tokens += tokens;
-                    transitive_tokens += tokens;
-                    transitive_entries.push(ContextEntry {
-                        entity_id,
-                        projection_level,
-                        content,
-                    });
-                }
+            }
+            _ => total_tokens + tokens <= budget_max,
+        };
+        // A refusal is the cut this fold makes, and it used to make it in
+        // silence: a dependency section trimmed from twelve rows to six
+        // serializes exactly like a focal that has six. The count is recorded
+        // here, at the only place that knows a row was ever a candidate, so
+        // both surfaces can say what the budget took instead of rendering the
+        // loss as absence.
+        //
+        // Every group that had a candidate keeps one, whatever it costs. A
+        // bound is not a refusal, and a caller handed an empty group cannot
+        // tell it from "the graph found none": that is the reading kin#1062
+        // removed from the response budget's own ladder, and the same reading
+        // arrives here through the earlier budget. Candidates are walked in
+        // weight order, so the row a group keeps is its most important one. The
+        // overshoot this can cost is bounded by one row per group and is
+        // reported, because `actual_tokens` is measured rather than assumed.
+        if !fits && admitted_groups.contains(target_group) {
+            selection.refuse(target_group, entity_id);
+            continue;
+        }
+        admitted_groups.insert(target_group);
+        total_tokens += tokens;
+        let entry = ContextEntry {
+            entity_id,
+            projection_level,
+            content,
+        };
+        match section {
+            AssemblySection::Test => test_entries.push(entry),
+            AssemblySection::Contract => contract_entries.push(entry),
+            AssemblySection::DirectDep => dep_entries.push(entry),
+            AssemblySection::Transitive => {
+                transitive_tokens += tokens;
+                transitive_entries.push(entry);
             }
         }
     }
@@ -780,15 +866,24 @@ where
                 }
             }
             let tokens = estimate_tokens(&content);
-            if total_tokens + tokens <= budget_max {
-                total_tokens += tokens;
-                selection.same_file_neighbors.push(entity.id);
-                dep_entries.push(ContextEntry {
-                    entity_id: entity.id,
-                    projection_level: ProjectionLevel::SignatureOnly,
-                    content,
-                });
+            // Neighbours past `SAME_FILE_FALLBACK_MAX` are never seen by this
+            // loop and stay counted by `same_file_dropped`, which is the cap's
+            // own number. Only a neighbour the budget refused is filed as a
+            // budget elision: a cap and a budget are different causes recovered
+            // by different levers, and `Elision::reason` exists so one cannot
+            // be read as the other.
+            if total_tokens + tokens > budget_max && admitted_groups.contains(group::DEPENDENCIES) {
+                selection.refuse(group::DEPENDENCIES, entity.id);
+                continue;
             }
+            admitted_groups.insert(group::DEPENDENCIES);
+            total_tokens += tokens;
+            selection.same_file_neighbors.push(entity.id);
+            dep_entries.push(ContextEntry {
+                entity_id: entity.id,
+                projection_level: ProjectionLevel::SignatureOnly,
+                content,
+            });
         }
     }
 
@@ -815,13 +910,17 @@ where
                 }
                 let content = format_work_item(&item);
                 let tokens = estimate_tokens(&content);
-                if total_tokens + tokens <= budget_max {
-                    total_tokens += tokens;
-                    work_entries.push(WorkItemEntry {
-                        work_item: item,
-                        content,
-                    });
+                if total_tokens + tokens > budget_max && admitted_groups.contains(group::WORK_ITEMS)
+                {
+                    selection.refuse(group::WORK_ITEMS, *eid);
+                    continue;
                 }
+                admitted_groups.insert(group::WORK_ITEMS);
+                total_tokens += tokens;
+                work_entries.push(WorkItemEntry {
+                    work_item: item,
+                    content,
+                });
             }
         }
     }
@@ -836,13 +935,18 @@ where
                 }
                 let content = format_annotation(&ann);
                 let tokens = estimate_tokens(&content);
-                if total_tokens + tokens <= budget_max {
-                    total_tokens += tokens;
-                    annotation_entries.push(AnnotationEntry {
-                        annotation: ann,
-                        content,
-                    });
+                if total_tokens + tokens > budget_max
+                    && admitted_groups.contains(group::ANNOTATIONS)
+                {
+                    selection.refuse(group::ANNOTATIONS, *eid);
+                    continue;
                 }
+                admitted_groups.insert(group::ANNOTATIONS);
+                total_tokens += tokens;
+                annotation_entries.push(AnnotationEntry {
+                    annotation: ann,
+                    content,
+                });
             }
         }
     }
@@ -3153,5 +3257,150 @@ mod tests {
     #[test]
     fn normalize_preserves_normal_names() {
         assert_eq!(normalize_entity_name("process"), "process");
+    }
+
+    // ── What the token budget refused (FIR-2482) ────────────────────────
+
+    /// A focal calling `deps` entities, so a tight budget has candidates to
+    /// refuse and a generous one admits every last row.
+    fn calling_store(deps: usize) -> (kin_db::InMemoryGraph, Entity) {
+        use kin_model::relation::{Relation, RelationKind, RelationOrigin};
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_entity("focal", EntityKind::Function);
+        store.upsert_entity(&focal).unwrap();
+        for index in 0..deps {
+            let dep = make_entity(&format!("dep_{index:04}"), EntityKind::Function);
+            store.upsert_entity(&dep).unwrap();
+            store
+                .upsert_relation(&Relation {
+                    id: kin_model::ids::RelationId::new(),
+                    kind: RelationKind::Calls,
+                    src: GraphNodeId::Entity(focal.id),
+                    dst: GraphNodeId::Entity(dep.id),
+                    confidence: 1.0,
+                    origin: RelationOrigin::Parsed,
+                    created_in: None,
+                    import_source: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        }
+        (store, focal)
+    }
+
+    #[test]
+    fn a_budget_that_refused_a_row_says_how_many() {
+        let (store, focal) = calling_store(40);
+        let whole = ContextOptions {
+            budget: TokenBudget::Large32k,
+            ..ContextOptions::default()
+        };
+        let (full, full_selection) =
+            build_context_pack_with_provenance(&store, &focal.id, &whole).unwrap();
+        assert_eq!(
+            full_selection.budget_elided(group::DEPENDENCIES),
+            0,
+            "a budget that admitted everything must claim no loss"
+        );
+
+        let tight = ContextOptions {
+            budget: TokenBudget::Custom(full.actual_tokens / 2),
+            ..ContextOptions::default()
+        };
+        let (cut, selection) =
+            build_context_pack_with_provenance(&store, &focal.id, &tight).unwrap();
+        let kept = cut.dependency_signatures.len();
+        assert!(
+            kept > 0 && kept < full.dependency_signatures.len(),
+            "the budget must actually cut for this test to mean anything: kept {kept} of {}",
+            full.dependency_signatures.len()
+        );
+
+        // The count is the whole point: without it, `kept` rows is what a focal
+        // with `kept` dependencies looks like.
+        let elided = selection.budget_elided(group::DEPENDENCIES);
+        assert_eq!(
+            kept + elided,
+            full.dependency_signatures.len(),
+            "kept plus refused must equal what the generous budget admitted"
+        );
+        assert!(
+            selection
+                .budget_elisions()
+                .any(|(name, count)| name == group::DEPENDENCIES && count == elided),
+            "the refused group must appear in the elision listing"
+        );
+    }
+
+    #[test]
+    fn a_row_recovered_by_another_route_is_not_counted_as_lost() {
+        let (store, focal) = calling_store(40);
+        let whole = ContextOptions {
+            budget: TokenBudget::Large32k,
+            ..ContextOptions::default()
+        };
+        let (full, _) = build_context_pack_with_provenance(&store, &focal.id, &whole).unwrap();
+        let tight = ContextOptions {
+            budget: TokenBudget::Custom(full.actual_tokens / 2),
+            ..ContextOptions::default()
+        };
+        let (_, selection) = build_context_pack_with_provenance(&store, &focal.id, &tight).unwrap();
+        let elided = selection.budget_elided(group::DEPENDENCIES);
+        assert!(elided > 0, "the budget must have refused something");
+        assert_eq!(
+            selection.budget_elided_unrecovered(group::DEPENDENCIES, |_| true),
+            0,
+            "a row the caller recovered elsewhere is not a row the answer lost"
+        );
+    }
+
+    #[test]
+    fn a_budget_too_small_for_any_row_still_keeps_one() {
+        let (store, focal) = calling_store(40);
+        // One token. Nothing fits, including the focal, so every candidate is
+        // a refusal and the group would have serialized as `[]`.
+        let opts = ContextOptions {
+            budget: TokenBudget::Custom(1),
+            ..ContextOptions::default()
+        };
+        let (pack, selection) =
+            build_context_pack_with_provenance(&store, &focal.id, &opts).unwrap();
+        assert_eq!(
+            pack.dependency_signatures.len(),
+            1,
+            "a group with candidates keeps one, so an empty group means the graph found none"
+        );
+        assert_eq!(
+            selection.budget_elided(group::DEPENDENCIES),
+            39,
+            "and says how many it could not keep"
+        );
+        assert!(
+            pack.actual_tokens > opts.budget.max_tokens(),
+            "the row it kept costs more than the budget, and the count says so rather \
+             than hiding it: {} against {}",
+            pack.actual_tokens,
+            opts.budget.max_tokens()
+        );
+    }
+
+    #[test]
+    fn a_pack_that_lost_nothing_claims_nothing() {
+        let (store, focal) = calling_store(3);
+        let opts = ContextOptions {
+            budget: TokenBudget::Large32k,
+            ..ContextOptions::default()
+        };
+        let (pack, selection) =
+            build_context_pack_with_provenance(&store, &focal.id, &opts).unwrap();
+        assert!(
+            !pack.dependency_signatures.is_empty(),
+            "the fixture must admit rows, or this asserts nothing"
+        );
+        assert_eq!(
+            selection.budget_elisions().count(),
+            0,
+            "a whole pack must carry no elision at all, so a disclosure means a cut"
+        );
     }
 }

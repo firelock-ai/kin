@@ -2203,7 +2203,7 @@ fn filesystem_entry_exists(path: &Path) -> Result<bool> {
 /// Invalid, ambiguous, replaced, or active candidates are retained. Automatic
 /// orphan recovery is disabled when the platform cannot expose a stable file
 /// identity and current-user ownership.
-fn recover_orphaned_repository_stages(
+pub(crate) fn recover_orphaned_repository_stages(
     staging_parent: &Path,
     final_kin_dir: &Path,
 ) -> Result<usize> {

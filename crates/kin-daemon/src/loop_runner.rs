@@ -2143,6 +2143,164 @@ fn plan_unpublished_enrichment_repair(state: &DaemonState) -> Result<Vec<FileEve
     Ok(events)
 }
 
+/// What one layout backfill pass observed and published.
+///
+/// `parsed` and `skipped` are reported together because the useful number is
+/// the pair: a store that publishes nothing because every file already carried
+/// a layout and a store that publishes nothing because it holds no source read
+/// the same from a bare count, and only one of them is a finding.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct LayoutBackfill {
+    /// Entity-source artifacts in the tree that already carried a layout.
+    pub(crate) already_published: usize,
+    /// Artifacts this pass parsed from graph-owned CAS and published a layout for.
+    pub(crate) published: usize,
+    /// Artifacts whose bytes could not be read or parsed, left with no layout.
+    pub(crate) unreadable: usize,
+    /// Artifacts another facet already owns, which this pass must not touch.
+    pub(crate) other_facet: usize,
+}
+
+impl LayoutBackfill {
+    fn observed(&self) -> usize {
+        self.already_published + self.published + self.unreadable + self.other_facet
+    }
+}
+
+/// Publish the per-file parse observation for every admitted entity-source
+/// artifact whose facet is missing, deriving it from graph-owned CAS.
+///
+/// Why this exists. `parsed`, `tier` and `certifies_enumeration` on
+/// `list_file_entities` are all read from the file's layout facet, and a store
+/// converted from Git never had one. The Git import parses every file, keeps
+/// the parse completeness only long enough to link cross-file references
+/// (`kin_index::derive_historical_semantic_deltas`), and drops the layout on
+/// the floor, because the semantic transaction it builds carries entity and
+/// relation deltas and has nowhere to put a layout. Entities therefore land and
+/// the observation about how they were obtained does not, so every file on a
+/// converted store reads `parsed: absent, tier: none, certifies_enumeration:
+/// false` whether an adapter read it completely, failed on it, or never looked
+/// at it. Those three are the only answers that matter and the store could not
+/// tell them apart.
+///
+/// A store built by `kin commit` does not have the gap, because the reconcile
+/// path publishes the layout it registered
+/// (`DaemonState::persist_projection_truth_from_reconcile`). That asymmetry is
+/// the whole defect: the same tool answered two real stores differently for a
+/// reason that had nothing to do with either repository.
+///
+/// What it reads. The graph's own resolved tree and the CAS bodies that tree
+/// names, never the working copy. A path the tree does not carry is not
+/// considered, and a body that does not match the tree's identity is not
+/// parsed, so this cannot admit host content or repair graph truth from disk.
+///
+/// What it publishes. The parse completeness comes from re-parsing the CAS
+/// bytes; the regions come from the entities the graph already holds, through
+/// [`kin_core::build_entity_file_layout`], so no identity is invented and a
+/// splice or rename reading these regions resolves to entities that exist. A
+/// file the adapter could not read completely gets its `Partial`/`Failed`
+/// completeness and its reason, which is the state that was previously
+/// indistinguishable from never having been parsed.
+///
+/// Cost. One parse per entity-source artifact that has no layout, once per
+/// daemon life. A store whose files were committed through Kin pays a tree walk
+/// and no parses at all.
+pub(crate) fn backfill_missing_file_layouts(state: &DaemonState) -> Result<LayoutBackfill> {
+    let mut report = LayoutBackfill::default();
+    let pipeline = IndexPipeline::new();
+    let tree = state.graph.resolved_tree();
+
+    for artifact in tree.artifacts_by_path() {
+        let Some(path) = artifact.path.as_utf8() else {
+            continue;
+        };
+        // Symlinks and gitlinks are never parsed as source owned by the link
+        // path, which is the same rule the historical rebuild applies.
+        let TreeEntry::Blob { hash, .. } = artifact.entry else {
+            continue;
+        };
+        if !matches!(
+            FileClassifier::classify(Path::new(path)),
+            FileClassification::EntitySource
+        ) {
+            continue;
+        }
+        let file_id = FilePathId::new(path);
+        if state.graph.get_file_layout(&file_id)?.is_some() {
+            report.already_published += 1;
+            continue;
+        }
+        // Another facet already owns this path. The four are mutually exclusive
+        // per file and the watcher seam enforces that
+        // ([`clear_incompatible_facets_in`]), so publishing a layout beside one
+        // would leave the store holding two answers to how the file is tracked.
+        // The gap this pass closes is a path carrying no facet at all, which is
+        // exactly what a Git import leaves behind.
+        if state.graph.get_shallow_file(&file_id)?.is_some()
+            || state.graph.get_structured_artifact(&file_id)?.is_some()
+            || state.graph.get_opaque_artifact(&file_id)?.is_some()
+        {
+            report.other_facet += 1;
+            continue;
+        }
+
+        // `TreeEntry` carries kin-model's hash and the blob store speaks
+        // kin-blobs', so the identity crosses that boundary by bytes, exactly
+        // as the historical rebuild crosses it.
+        let body_hash = kin_blobs::Hash256::from_bytes(*hash.as_bytes());
+        let Ok(content) = state.blobs.read(&body_hash) else {
+            debug!(
+                file = %file_id,
+                "no CAS body for an admitted artifact, so its parse observation stays unpublished"
+            );
+            report.unreadable += 1;
+            continue;
+        };
+        // Content decides the facet, exactly as admission decides it: a path
+        // whose extension says source but whose bytes are opaque belongs to
+        // another facet and must not grow an entity-source layout here.
+        if !matches!(
+            FileClassifier::classify_with_content(Path::new(path), &content),
+            FileClassification::EntitySource
+        ) {
+            continue;
+        }
+
+        let completeness =
+            match pipeline.index_file_content_with_tests(&file_id, &content, body_hash) {
+                Ok(indexed) => indexed.indexed_file.file_layout.parse_completeness,
+                Err(error) => {
+                    debug!(
+                        file = %file_id,
+                        error = %error,
+                        "graph-owned source could not be indexed, so its parse observation stays \
+                         unpublished rather than being guessed"
+                    );
+                    report.unreadable += 1;
+                    continue;
+                }
+            };
+
+        let mut entities = state.graph.query_entities(&EntityFilter {
+            file_path: Some(file_id.clone()),
+            ..Default::default()
+        })?;
+        entities.sort_by_key(|entity| {
+            entity
+                .span
+                .as_ref()
+                .map(|span| span.start_byte)
+                .unwrap_or(usize::MAX)
+        });
+        let layout =
+            kin_core::build_entity_file_layout(&file_id, &entities, content.len(), completeness);
+        state.graph.upsert_file_layout(&layout)?;
+        report.published += 1;
+    }
+
+    Ok(report)
+}
+
 pub async fn run_loop(
     state: Arc<DaemonState>,
     config: LoopConfig,
@@ -2205,6 +2363,11 @@ pub async fn run_loop_armed(
     // paths it recovers are exactly the ones whose host modification time puts
     // them outside that window, which is why the window cannot see them.
     let mut enrichment_repair_owed = true;
+    // Owed once per daemon life for the same reason and on the same schedule:
+    // a store converted from Git carries entities whose parse observation was
+    // computed at import and never published, so every file answers
+    // `certifies_enumeration: false` until this runs.
+    let mut layout_backfill_owed = true;
     if let Some(armed) = armed.as_mut() {
         armed.arm();
     }
@@ -2260,10 +2423,6 @@ pub async fn run_loop_armed(
     // larger than `batch_size` is deferred instead of silently discarded.
     let mut pending_events: VecDeque<FileEvent> = VecDeque::new();
     let mut backlog_warning_active = false;
-    // The pressure level this loop has already spoken about, so a machine that
-    // stays critical is disclosed once instead of on every tick it holds work
-    // back.
-    let mut announced_pressure: Option<kin_core::memory_pressure::PressureLevel> = None;
     // The admission policy the last complete pass planned against, kept so the
     // event filter below costs no authority load of its own. `None` until the
     // first pass resolves one, which is the safe direction: nothing is dropped
@@ -2388,6 +2547,45 @@ pub async fn run_loop_armed(
                         error = %error,
                         "could not plan the unpublished-enrichment repair, so a path missing its \
                          entities stays unqueryable until it is edited"
+                    );
+                }
+            }
+        }
+
+        // The per-file parse observation, owed once per daemon life. A store
+        // built by `kin commit` publishes its layouts as it goes and this pass
+        // finds nothing to do; a store converted from Git has none at all, and
+        // without them `list_file_entities` cannot tell a file an adapter read
+        // completely from one it failed on from one it never looked at.
+        if layout_backfill_owed {
+            layout_backfill_owed = false;
+            match backfill_missing_file_layouts(&state) {
+                Ok(report) if report.published == 0 => {
+                    debug!(
+                        observed = report.observed(),
+                        already_published = report.already_published,
+                        unreadable = report.unreadable,
+                        other_facet = report.other_facet,
+                        "every admitted source file already carries its parse observation"
+                    );
+                }
+                Ok(report) => {
+                    info!(
+                        published = report.published,
+                        already_published = report.already_published,
+                        unreadable = report.unreadable,
+                        other_facet = report.other_facet,
+                        observed = report.observed(),
+                        "published the per-file parse observation for admitted source files that \
+                         carried none, so an enumeration over them can be certified"
+                    );
+                    state.bump_version();
+                }
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "could not publish per-file parse observations, so `list_file_entities` \
+                         cannot certify an enumeration on this store"
                     );
                 }
             }
@@ -2578,40 +2776,35 @@ pub async fn run_loop_armed(
             "processing file events (after dedup)"
         );
 
-        // Ask the machine before walking the working copy. An ambient tick is
-        // a complete scan planned into a tree transition, from a host event
-        // nobody asked for, and it is the one admission that can wait: the
-        // events go back on the queue and nothing about them is lost, because
-        // this tick publishes nothing and the last complete admission stays
-        // where it was, so the startup catch-up window still covers every path
-        // held back here.
+        // Sample what this daemon is holding, and publish it. This loop turns
+        // on its own interval whether or not there is anything to admit, which
+        // makes it the cheapest cadence in the daemon to hang the standing on.
         //
-        // The explicit seams are deliberately not gated. A commit is a command
-        // a person ran, and refusing it would trade a machine Kin might have
-        // saved for work the user asked for and would have to do again.
+        // It does NOT gate admission, and that is FIR-2632's sibling half.
+        // Ambient admission was gated here when the seam landed, on the
+        // reasoning that a tick can wait because its events go back on the
+        // queue. That reasoning holds for one tick and fails for a machine that
+        // stays loaded: the tick that would admit never comes, and a file
+        // somebody wrote stops being queryable for as long as their machine is
+        // busy. On this fleet's own box that is hours.
+        //
+        // Admission is different in kind from the passes this seam exists to
+        // hold. A sweep held costs cross-file relations that the next sweep
+        // restores. An embed batch held costs vectors the next batch restores.
+        // Admission held costs the thing itself: it is the path by which a
+        // written file becomes queryable at all, and withholding it is the
+        // FIR-2606 failure class arriving by a new route, this time with a
+        // warning line nobody reads instead of silence. Neither measured
+        // failure implicated it either: the sweep peaked at 18.2 GB and the
+        // full-history init died in conversion, and an ambient tick is one
+        // bounded walk over a working copy.
+        //
+        // So the machine is measured here and never obeyed here. The passes
+        // that actually spend it, the cold sweep and the embedding batch, keep
+        // their gates.
         let pressure =
             crate::daemon::pressure_verdict(kin_core::memory_pressure::HeavyWork::AmbientAdmission);
-        if let kin_core::memory_pressure::Verdict::Refuse { reason } = &pressure.verdict {
-            if announced_pressure != Some(pressure.level) {
-                crate::daemon::disclose_pressure_refusal(
-                    &state,
-                    kin_core::memory_pressure::HeavyWork::AmbientAdmission,
-                    &pressure,
-                    reason,
-                );
-                announced_pressure = Some(pressure.level);
-            }
-            enqueue_file_events(&mut pending_events, watcher_batch);
-            state
-                .reconciliation_status
-                .store(RECON_IDLE, Ordering::Relaxed);
-            tokio::time::sleep(interval).await;
-            continue;
-        }
-        if announced_pressure.is_some_and(|level| level != pressure.level) {
-            crate::daemon::clear_pressure_refusal(&state);
-        }
-        announced_pressure = Some(pressure.level);
+        crate::daemon::publish_footprint_standing(&state, &pressure);
 
         // Serialize exact-tree admission and semantic enrichment with every
         // other graph-authority mutation, including commit and checkout. The

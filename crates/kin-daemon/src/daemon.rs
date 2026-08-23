@@ -947,13 +947,37 @@ pub(crate) fn auto_embed_enabled() -> bool {
 /// daemon eligible for idle shutdown: a backlog no worker will drain must not
 /// read as work in flight.
 fn start_or_defer_background_embed(state: &DaemonState) -> bool {
-    // Asked before the queue is built rather than after, because building it
+    // The opt-out is asked FIRST, and this order is the whole of FIR-2632.
+    //
+    // Pressure is a question about work somebody wants done. An operator who
+    // turned background embedding off wants none of it, so on a loaded host the
+    // earlier order answered a question nobody had asked: it declined the pass
+    // for memory, wrote a refusal into the store, and put "background embedding
+    // did not start" on `kin doctor`, `kin graph status` and the MCP envelope,
+    // about a pass that was never going to start for a reason that had nothing
+    // to do with memory. The opt-out's own line never printed, so an operator
+    // checking that their opt-out took effect saw a memory complaint instead.
+    //
+    // It hid because it needs a loaded host to appear at all. Quiet CI is never
+    // near the bar, so `a_cli_spawned_daemon_honours_the_background_embed_opt_out`
+    // was green there and red on any busy machine.
+    if !auto_embed_enabled() {
+        state.pause_background_embed();
+        warn!(
+            trigger = AUTO_EMBED_ENV,
+            "background embedding deferred by operator opt-out: no vectors will be generated, and semantic coverage stays as it is until an explicit embed request runs"
+        );
+        return false;
+    }
+    // Now that the pass is genuinely wanted, ask whether the machine has room
+    // for it. Before the queue is built rather than after, because building it
     // walks the graph for everything the index is missing and a machine with no
     // room should not pay for a queue nothing is going to drain. The pass is
-    // deferred exactly the way an operator opt-out defers it, so a daemon that
-    // declines here stays eligible for idle shutdown instead of reading as
-    // work in flight.
+    // deferred exactly the way the opt-out above defers it, so a daemon that
+    // declines here stays eligible for idle shutdown instead of reading as work
+    // in flight.
     let call = pressure_verdict(kin_core::memory_pressure::HeavyWork::EmbedBatch);
+    publish_footprint_standing(state, &call);
     if let kin_core::memory_pressure::Verdict::Refuse { reason } = &call.verdict {
         let reason = reason.clone();
         state.pause_background_embed();
@@ -962,14 +986,6 @@ fn start_or_defer_background_embed(state: &DaemonState) -> bool {
             kin_core::memory_pressure::HeavyWork::EmbedBatch,
             &call,
             &reason,
-        );
-        return false;
-    }
-    if !auto_embed_enabled() {
-        state.pause_background_embed();
-        warn!(
-            trigger = AUTO_EMBED_ENV,
-            "background embedding deferred by operator opt-out: no vectors will be generated, and semantic coverage stays as it is until an explicit embed request runs"
         );
         return false;
     }
@@ -1775,6 +1791,148 @@ fn embed_batch_under_pressure(
     }
 }
 
+/// One row of the host's process table, in the three fields a footprint needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProcessRow {
+    pub(crate) pid: u32,
+    pub(crate) parent: Option<u32>,
+    pub(crate) rss_bytes: u64,
+}
+
+/// Fold a process table into the footprint of the tree rooted at `root`.
+///
+/// Pure over the table, because this is the rule the whole budget rests on and
+/// a rule that can only be exercised by starting a language server is a rule
+/// nobody tests. Descendants at every depth, not just direct children: a
+/// language server that spawns a worker is still Kin's memory, charged to the
+/// same container, and stopping at depth one would reintroduce the blindness
+/// one level down.
+///
+/// A table whose parent links form a cycle is malformed and cannot be walked,
+/// so the visited set is not an optimisation. Without it a two-process loop
+/// hangs the daemon inside its own back-off check, which is the least
+/// forgivable place to hang.
+///
+/// A root absent from the table reports its own bytes as zero rather than
+/// refusing to answer, because the descendants are still real and a caller that
+/// got nothing would fall back to the pre-budget behaviour on a reading that
+/// mostly succeeded.
+pub(crate) fn tree_footprint_from(
+    root: u32,
+    rows: &[ProcessRow],
+) -> kin_core::memory_pressure::TreeFootprint {
+    let mut own_bytes = 0;
+    let mut children_bytes = 0u64;
+    let mut child_count = 0usize;
+    let mut visited = std::collections::HashSet::from([root]);
+    let mut frontier = vec![root];
+    while let Some(pid) = frontier.pop() {
+        if pid == root {
+            own_bytes = rows
+                .iter()
+                .find(|row| row.pid == root)
+                .map_or(0, |row| row.rss_bytes);
+        }
+        for row in rows.iter().filter(|row| row.parent == Some(pid)) {
+            if !visited.insert(row.pid) {
+                continue;
+            }
+            children_bytes = children_bytes.saturating_add(row.rss_bytes);
+            child_count += 1;
+            frontier.push(row.pid);
+        }
+    }
+    kin_core::memory_pressure::TreeFootprint {
+        own_bytes,
+        children_bytes,
+        child_count,
+    }
+}
+
+/// How long a sampled footprint is reused before the process table is walked
+/// again.
+///
+/// The reading behind [`pressure_verdict`] is four small file reads; this one
+/// walks the host's whole process table, which is milliseconds rather than
+/// microseconds and is called from a loop that can turn several times a second.
+/// A footprint two seconds old is exactly as good for deciding whether to start
+/// a bulk pass, and the cache is what keeps a guard against spending the
+/// machine from becoming a way of spending it.
+const FOOTPRINT_SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
+
+/// This daemon's tree footprint, sampled at most once per
+/// [`FOOTPRINT_SAMPLE_INTERVAL`].
+///
+/// `None` when the process table could not be read at all, which keeps the
+/// P1 rule on this axis too: a daemon that cannot measure itself decides
+/// exactly as it did before the budget existed.
+fn sample_tree_footprint() -> Option<kin_core::memory_pressure::TreeFootprint> {
+    static LAST: std::sync::OnceLock<
+        std::sync::Mutex<Option<(Instant, Option<kin_core::memory_pressure::TreeFootprint>)>>,
+    > = std::sync::OnceLock::new();
+    let cell = LAST.get_or_init(|| std::sync::Mutex::new(None));
+    let mut guard = cell.lock().ok()?;
+    if let Some((taken, footprint)) = guard.as_ref() {
+        if taken.elapsed() < FOOTPRINT_SAMPLE_INTERVAL {
+            return *footprint;
+        }
+    }
+    let sampled = walk_process_table();
+    *guard = Some((Instant::now(), sampled));
+    sampled
+}
+
+/// Walk the host's process table and fold this process's tree out of it.
+///
+/// The pid comes from `sysinfo::get_current_pid` rather than from `std`, for
+/// the reason `commit_liveness` gives: the zero-file-search guard reads a
+/// `process::`-prefixed path as a subprocess launch, and the crate's own
+/// accessor states the intent without arguing with a guard that is right to be
+/// blunt.
+fn walk_process_table() -> Option<kin_core::memory_pressure::TreeFootprint> {
+    let me = sysinfo::get_current_pid().ok()?;
+    let mut system = sysinfo::System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::All,
+        true,
+        sysinfo::ProcessRefreshKind::nothing().with_memory(),
+    );
+    let rows = system
+        .processes()
+        .iter()
+        .map(|(pid, process)| ProcessRow {
+            pid: pid.as_u32(),
+            parent: process.parent().map(|parent| parent.as_u32()),
+            rss_bytes: process.memory(),
+        })
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        return None;
+    }
+    Some(tree_footprint_from(me.as_u32(), &rows))
+}
+
+/// This daemon's standing against its own budget, when both halves are readable.
+///
+/// The ceiling comes from the same reading [`pressure_verdict`] takes, so the
+/// derived budget on a capped container is derived from the cap rather than
+/// from the host underneath it.
+fn budget_standing(
+    pressure: &kin_core::memory_pressure::MemoryPressure,
+) -> Option<kin_core::memory_pressure::BudgetStanding> {
+    let footprint = sample_tree_footprint()?;
+    // The reading's own ceiling when it has one, and the machine's otherwise.
+    // A pinned pressure level carries no figures by design, and deriving the
+    // budget from that absence would let the test lever switch the budget off
+    // rather than exercise it.
+    let ceiling = pressure
+        .reading()
+        .map(|reading| reading.limit_bytes)
+        .or_else(kin_core::memory_pressure::ceiling_bytes);
+    let budget = kin_core::memory_pressure::FootprintBudget::resolve(ceiling)?;
+    Some(kin_core::memory_pressure::BudgetStanding { footprint, budget })
+}
+
 /// What host memory pressure says about one piece of heavy work, right now.
 ///
 /// One function so every consultation in this daemon reads the same machine
@@ -1786,10 +1944,20 @@ fn embed_batch_under_pressure(
 pub(crate) fn pressure_verdict(work: kin_core::memory_pressure::HeavyWork) -> PressureCall {
     let pressure = kin_core::memory_pressure::read();
     let thresholds = kin_core::memory_pressure::Thresholds::from_env();
-    let level = pressure.level_under(&thresholds);
+    let standing = budget_standing(&pressure);
+    let host_level = pressure.level_under(&thresholds);
+    let level = standing.as_ref().map_or(host_level, |standing| {
+        host_level.max(standing.level_under(&thresholds))
+    });
     PressureCall {
         level,
-        verdict: kin_core::memory_pressure::Verdict::for_reading(work, &pressure, &thresholds),
+        verdict: kin_core::memory_pressure::Verdict::decide(
+            work,
+            &pressure,
+            standing.as_ref(),
+            &thresholds,
+        ),
+        standing,
     }
 }
 
@@ -1797,6 +1965,55 @@ pub(crate) fn pressure_verdict(work: kin_core::memory_pressure::HeavyWork) -> Pr
 pub(crate) struct PressureCall {
     pub(crate) level: kin_core::memory_pressure::PressureLevel,
     pub(crate) verdict: kin_core::memory_pressure::Verdict,
+    /// What this daemon's own tree was holding when the call was made, when it
+    /// could be measured. Carried so a caller can publish the standing without
+    /// walking the process table a second time.
+    pub(crate) standing: Option<kin_core::memory_pressure::BudgetStanding>,
+}
+
+/// How often this daemon republishes what it is holding.
+///
+/// Slower than it samples, because the record exists so `kin status` and
+/// `kin doctor` can answer without asking a daemon, not so the store has a
+/// time series. Thirty seconds keeps the published standing inside the freshness
+/// window every reader judges it by, at one small write per half minute.
+const FOOTPRINT_PUBLISH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Publish this daemon's standing against its budget, on a cadence.
+///
+/// Called from every point that already took a pressure call, so the standing
+/// keeps up with the daemon's own work without a task of its own to schedule,
+/// idle-shutdown against, or leak. A level change publishes at once: the rung
+/// is the part a reader acts on, and delaying it by up to half a minute would
+/// be the one field worth having promptly.
+pub(crate) fn publish_footprint_standing(state: &DaemonState, call: &PressureCall) {
+    let Some(standing) = call.standing.as_ref() else {
+        return;
+    };
+    static LAST: std::sync::OnceLock<
+        std::sync::Mutex<Option<(Instant, kin_core::memory_pressure::PressureLevel)>>,
+    > = std::sync::OnceLock::new();
+    let cell = LAST.get_or_init(|| std::sync::Mutex::new(None));
+    let Ok(mut guard) = cell.lock() else {
+        return;
+    };
+    let due = match guard.as_ref() {
+        Some((published, level)) => {
+            *level != call.level || published.elapsed() >= FOOTPRINT_PUBLISH_INTERVAL
+        }
+        None => true,
+    };
+    if !due {
+        return;
+    }
+    *guard = Some((Instant::now(), call.level));
+    drop(guard);
+    kin_core::memory_pressure::DaemonFootprint::record(
+        state.layout.root(),
+        standing,
+        call.level,
+        std::process::id(),
+    );
 }
 
 /// Publish a pressure refusal where the surfaces outside this process can read
@@ -1965,6 +2182,7 @@ fn decide_sweep_on_start(state: &DaemonState) -> SweepStartDecision {
     // reboot. A machine with no room today says nothing about a store whose
     // sweeps keep dying.
     let call = pressure_verdict(kin_core::memory_pressure::HeavyWork::LspSweep);
+    publish_footprint_standing(state, &call);
     if let kin_core::memory_pressure::Verdict::Refuse { reason } = &call.verdict {
         let reason = reason.clone();
         disclose_pressure_refusal(
@@ -3714,6 +3932,7 @@ pub async fn run_with_authority_on(
                 // back-off rather than a loss: the work is still owed, and the
                 // next wake takes it when there is room.
                 let call = pressure_verdict(kin_core::memory_pressure::HeavyWork::EmbedBatch);
+                publish_footprint_standing(&embed_state, &call);
                 let pressure_changed = announced_pressure != Some(call.level);
                 if let kin_core::memory_pressure::Verdict::Refuse { reason } = &call.verdict {
                     if pressure_changed {
@@ -6960,6 +7179,28 @@ mod enrichment_marker_tests {
     }
 }
 
+/// A budget no test process can fill, so an arm about host pressure reads host
+/// pressure.
+///
+/// [`pressure_verdict`] takes the worse of two axes: the host's own reading, and
+/// this daemon's standing against its own budget. An arm that pins only the host
+/// still fails when the test binary itself is large. One run of this suite held
+/// 6.1 GiB across a thousand parallel tests, against the 8.0 GiB the budget
+/// derives on this machine, and a `Proceed` control came back `Shrink`. That is
+/// the budget being right about a question the arm was not asking.
+///
+/// The operator value wins outright and is not clamped, so pinning it takes the
+/// second axis out of every arm that is not about it. The budget itself is
+/// proven in `scripts/acceptance/memory_pressure_refusal.py`, where the levers
+/// are the other way round.
+#[cfg(test)]
+fn budget_no_test_can_fill() -> kin_core::test_env::EnvVarGuard {
+    kin_core::test_env::EnvVarGuard::set(
+        kin_core::memory_pressure::FOOTPRINT_BUDGET_ENV,
+        (1024u64 * 1024 * 1024 * 1024).to_string(),
+    )
+}
+
 /// What the daemon does about heavy work when the machine has no room for it.
 ///
 /// Driven through the forced-level override rather than by filling the host,
@@ -6974,8 +7215,15 @@ mod enrichment_marker_tests {
 mod memory_pressure_tests {
     use super::{
         clear_pressure_refusal, decide_sweep_on_start, embed_batch_under_pressure,
-        pressure_verdict, start_or_defer_background_embed, SweepStartDecision,
+        pressure_verdict, sample_tree_footprint, start_or_defer_background_embed,
+        tree_footprint_from, ProcessRow, SweepStartDecision,
     };
+    // Gated exactly like its only caller, the walk test that spawns a real
+    // child. The daemon itself calls this on every platform; it is the test
+    // that cannot, so an ungated import here is dead on Windows and `-D
+    // warnings` makes dead imports fatal.
+    #[cfg(unix)]
+    use super::walk_process_table;
     use crate::state::DaemonState;
     use kin_core::memory_pressure::{HeavyWork, PressureRefusal, Verdict};
     use kin_core::test_env::EnvVarGuard;
@@ -6985,9 +7233,146 @@ mod memory_pressure_tests {
         DaemonState::open(init.layout).unwrap()
     }
 
+    fn row(pid: u32, parent: Option<u32>, rss_bytes: u64) -> ProcessRow {
+        ProcessRow {
+            pid,
+            parent,
+            rss_bytes,
+        }
+    }
+
+    /// The shape the measured failure had: a daemon, a language server it
+    /// started, and an unrelated process that must not be counted.
+    #[test]
+    fn the_fold_counts_the_daemons_own_children_and_nothing_else() {
+        let table = [
+            row(1, None, 8 * 1024 * 1024),
+            row(100, Some(1), 6 * 1024 * 1024 * 1024),
+            row(200, Some(100), 1930 * 1024 * 1024),
+            // Somebody else's browser, on the same host, charged to nobody here.
+            row(300, Some(1), 40 * 1024 * 1024 * 1024),
+        ];
+        let tree = tree_footprint_from(100, &table);
+        assert_eq!(tree.own_bytes, 6 * 1024 * 1024 * 1024);
+        assert_eq!(tree.children_bytes, 1930 * 1024 * 1024);
+        assert_eq!(tree.child_count, 1);
+        assert_eq!(
+            tree.total_bytes(),
+            6 * 1024 * 1024 * 1024 + 1930 * 1024 * 1024
+        );
+    }
+
+    /// A language server that spawns a worker is still Kin's memory. Stopping
+    /// at direct children reintroduces the same blindness one level down.
+    #[test]
+    fn the_fold_reaches_every_depth() {
+        let table = [
+            row(100, Some(1), 1024),
+            row(200, Some(100), 2048),
+            row(300, Some(200), 4096),
+            row(400, Some(300), 8192),
+        ];
+        let tree = tree_footprint_from(100, &table);
+        assert_eq!(tree.child_count, 3);
+        assert_eq!(tree.children_bytes, 2048 + 4096 + 8192);
+    }
+
+    /// A malformed table must not hang the daemon inside its own back-off
+    /// check, which is the least forgivable place to hang.
+    #[test]
+    fn a_parent_cycle_terminates_rather_than_spinning() {
+        let table = [
+            row(100, Some(300), 1024),
+            row(200, Some(100), 2048),
+            row(300, Some(200), 4096),
+        ];
+        let tree = tree_footprint_from(100, &table);
+        assert_eq!(tree.own_bytes, 1024);
+        assert_eq!(tree.child_count, 2, "each process is counted once");
+        assert_eq!(tree.children_bytes, 2048 + 4096);
+    }
+
+    #[test]
+    fn a_root_absent_from_the_table_still_reports_its_descendants() {
+        // The descendants are real. A caller handed nothing would fall back to
+        // the pre-budget behaviour on a reading that mostly succeeded.
+        let table = [row(200, Some(100), 2048), row(300, Some(200), 4096)];
+        let tree = tree_footprint_from(100, &table);
+        assert_eq!(tree.own_bytes, 0);
+        assert_eq!(tree.children_bytes, 2048 + 4096);
+        assert_eq!(tree.child_count, 2);
+    }
+
+    #[test]
+    fn a_lone_process_reports_itself_and_no_children() {
+        let table = [row(100, Some(1), 4096)];
+        let tree = tree_footprint_from(100, &table);
+        assert_eq!(tree.own_bytes, 4096);
+        assert_eq!(tree.children_bytes, 0);
+        assert_eq!(tree.child_count, 0);
+    }
+
+    /// The sampler against this very test process, whatever host it runs on.
+    ///
+    /// Asserting a size here would be asserting on the machine CI happens to
+    /// use. What is assertable is that the walk answers at all and that its own
+    /// figure is the test binary's, which is never zero.
+    #[test]
+    fn the_sampler_measures_this_process() {
+        let sampled = sample_tree_footprint().expect("this host publishes a process table");
+        assert!(
+            sampled.own_bytes > 0,
+            "a running process holds more than nothing"
+        );
+        assert!(sampled.total_bytes() >= sampled.own_bytes);
+    }
+
+    /// A real child, counted through the real process table.
+    ///
+    /// Every test above folds a table this file wrote. This one spawns an
+    /// actual process and asks the host, which is the only way to catch the
+    /// case where the fold is right and the walk that feeds it is not: a
+    /// `parent()` this platform does not populate, or a table this build reads
+    /// per-pid. That is the exact blindness the budget exists to end, so it
+    /// gets a test that talks to the kernel.
+    ///
+    /// `walk_process_table` rather than `sample_tree_footprint`, because the
+    /// sampler caches for two seconds and a test that read a cache primed by
+    /// its neighbours would pass without asking anything.
+    #[test]
+    #[cfg(unix)]
+    fn a_real_child_process_is_counted_by_the_real_walk() {
+        let before = walk_process_table().expect("this host publishes a process table");
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a child");
+        // The child has to be scheduled and carry a resident set before the
+        // table can show one. That wait is this test's whole flake surface, so
+        // it retries rather than sleeping once and hoping.
+        let mut after = before;
+        for _ in 0..40 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            after = walk_process_table().expect("this host publishes a process table");
+            if after.child_count > before.child_count {
+                break;
+            }
+        }
+        let counted = after.child_count > before.child_count;
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            counted,
+            "a process this one started was not counted: before={before:?} after={after:?}. \
+             A daemon that cannot see the language server it spawned is the blindness that \
+             let the sweep run"
+        );
+    }
+
     #[test]
     fn a_critical_machine_refuses_the_cold_sweep_and_says_why() {
         let _lock = crate::test_env_lock();
+        let _budget = super::budget_no_test_can_fill();
         let dir = tempfile::tempdir().unwrap();
         let state = open_store(dir.path());
 
@@ -7025,6 +7410,7 @@ mod memory_pressure_tests {
         // be read has said nothing, and a daemon that stopped enriching over it
         // would have invented a limit nobody measured.
         let _lock = crate::test_env_lock();
+        let _budget = super::budget_no_test_can_fill();
         let dir = tempfile::tempdir().unwrap();
         let state = open_store(dir.path());
         let _forced = EnvVarGuard::set("KIN_MEMORY_PRESSURE", "unknown");
@@ -7035,9 +7421,59 @@ mod memory_pressure_tests {
         );
     }
 
+    /// FIR-2632. An opted-out daemon on a full machine says the opt-out, and
+    /// says nothing about memory.
+    ///
+    /// Pressure is a question about work somebody wants done. Asking it first
+    /// meant an operator who had turned background embedding off got a memory
+    /// refusal written into their store and printed on `kin doctor`,
+    /// `kin graph status` and the MCP envelope, about a pass that was never
+    /// going to run for a reason that had nothing to do with memory, while the
+    /// opt-out's own line never printed at all.
+    ///
+    /// Both halves are asserted, because the disclosure is the part that
+    /// reached three surfaces and the return value alone would have passed
+    /// throughout.
+    #[test]
+    fn an_opted_out_daemon_on_a_full_machine_discloses_no_memory_refusal() {
+        let _lock = crate::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let state = open_store(dir.path());
+        let _forced = EnvVarGuard::set("KIN_MEMORY_PRESSURE", "critical");
+        let _opted_out = EnvVarGuard::set(super::AUTO_EMBED_ENV, "0");
+
+        assert!(
+            !start_or_defer_background_embed(&state),
+            "the pass is deferred either way; what differs is why"
+        );
+        assert!(
+            PressureRefusal::read(state.layout.root()).is_none(),
+            "work nobody asked for must not be reported as work memory prevented: {:?}",
+            PressureRefusal::read(state.layout.root())
+        );
+    }
+
+    /// The same machine with the opt-out absent still refuses for memory, so
+    /// the fix above is a precedence change and not a way of turning the gate
+    /// off.
+    #[test]
+    fn a_wanted_pass_on_the_same_full_machine_still_refuses_for_memory() {
+        let _lock = crate::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let state = open_store(dir.path());
+        let _forced = EnvVarGuard::set("KIN_MEMORY_PRESSURE", "critical");
+        let _wanted = EnvVarGuard::unset(super::AUTO_EMBED_ENV);
+
+        assert!(!start_or_defer_background_embed(&state));
+        let record = PressureRefusal::read(state.layout.root())
+            .expect("a pass somebody wanted, declined for memory, is disclosed");
+        assert_eq!(record.work, "embed-batch");
+    }
+
     #[test]
     fn a_critical_machine_defers_the_background_embedding_pass() {
         let _lock = crate::test_env_lock();
+        let _budget = super::budget_no_test_can_fill();
         let dir = tempfile::tempdir().unwrap();
         let state = open_store(dir.path());
         {
@@ -7061,6 +7497,7 @@ mod memory_pressure_tests {
         // A surface reporting last week's refusal reads exactly like one
         // reporting this second's, so the pass that proceeds clears it.
         let _lock = crate::test_env_lock();
+        let _budget = super::budget_no_test_can_fill();
         let dir = tempfile::tempdir().unwrap();
         let state = open_store(dir.path());
         {
@@ -7078,6 +7515,7 @@ mod memory_pressure_tests {
     #[test]
     fn an_elevated_machine_shrinks_the_batch_rather_than_stopping() {
         let _lock = crate::test_env_lock();
+        let _budget = super::budget_no_test_can_fill();
         let _forced = EnvVarGuard::set("KIN_MEMORY_PRESSURE", "elevated");
         let call = pressure_verdict(HeavyWork::EmbedBatch);
         assert!(
@@ -7093,6 +7531,7 @@ mod memory_pressure_tests {
         // A size knob allowed to reach zero is a silent refusal wearing a
         // shrink's name: the loop would run forever embedding nothing.
         let _lock = crate::test_env_lock();
+        let _budget = super::budget_no_test_can_fill();
         let _forced = EnvVarGuard::set("KIN_MEMORY_PRESSURE", "elevated");
         let call = pressure_verdict(HeavyWork::EmbedBatch);
         assert_eq!(embed_batch_under_pressure(1, &call.verdict), 1);
@@ -7102,26 +7541,37 @@ mod memory_pressure_tests {
     #[test]
     fn a_machine_with_room_leaves_every_batch_at_its_configured_size() {
         let _lock = crate::test_env_lock();
+        let _budget = super::budget_no_test_can_fill();
         let _forced = EnvVarGuard::set("KIN_MEMORY_PRESSURE", "nominal");
         let call = pressure_verdict(HeavyWork::EmbedBatch);
         assert_eq!(call.verdict, Verdict::Proceed);
         assert_eq!(embed_batch_under_pressure(512, &call.verdict), 512);
     }
 
+    /// FIR-2632's sibling half, at the seam the reconcile loop reads.
+    ///
+    /// Admission is measured and never held. It was held when this landed, on
+    /// the reasoning that a tick can wait because its events go back on the
+    /// queue, and that holds for one tick and fails for a machine that stays
+    /// loaded: the tick that would admit never comes and a written file stops
+    /// being queryable for as long as the machine is busy.
     #[test]
-    fn ambient_admission_is_refused_while_the_explicit_seam_is_not_gated_here() {
-        // The ambient tick can wait: its events go back on the queue and the
-        // last complete admission stays where it was. A commit is a command
-        // someone ran, and this module never refuses one.
+    fn ambient_admission_is_measured_and_never_held() {
         let _lock = crate::test_env_lock();
+        let _budget = super::budget_no_test_can_fill();
         let _forced = EnvVarGuard::set("KIN_MEMORY_PRESSURE", "critical");
         let ambient = pressure_verdict(HeavyWork::AmbientAdmission);
-        assert!(matches!(ambient.verdict, Verdict::Refuse { .. }));
-        assert!(ambient
-            .verdict
-            .reason()
-            .expect("refused")
-            .contains("nothing is lost"));
+        assert_eq!(
+            ambient.verdict,
+            Verdict::Proceed,
+            "a file somebody wrote must not wait on a busy machine"
+        );
+        // The call still carries the level, which is what the reconcile loop
+        // publishes the footprint standing from.
+        assert_eq!(
+            ambient.level,
+            kin_core::memory_pressure::PressureLevel::Critical
+        );
     }
 }
 
@@ -7142,11 +7592,33 @@ mod sweep_lifecycle_tests {
         sweep_started, SweepStartDecision, SWEEP_INTERRUPTION_LIMIT,
     };
     use crate::state::DaemonState;
+    use kin_core::test_env::EnvVarGuard;
     use kin_model::EntityStore;
 
     fn open_store(repo_dir: &std::path::Path) -> DaemonState {
         let init = kin_core::init(repo_dir).unwrap();
         DaemonState::open(init.layout).unwrap()
+    }
+
+    /// Hold the pressure lever still for a test that only reads it.
+    ///
+    /// `decide_sweep_on_start` consults host memory pressure, and
+    /// `KIN_MEMORY_PRESSURE` overrides that reading for the whole process. The
+    /// sibling pressure tests set it under `test_env_lock`, whose stated domain
+    /// is every env-mutating test in this binary. These tests mutate nothing,
+    /// so they were never inside it, and a lock serializes only the sessions
+    /// that take it: a reader outside sees whatever a writer is holding
+    /// mid-test. Pinning the no-pressure control under the same lock is what
+    /// makes these assertions about interruption counting rather than about
+    /// what a sibling thread left behind, and it keeps them honest on a box
+    /// that is genuinely short of memory.
+    fn unpressured() -> (EnvVarGuard, EnvVarGuard, std::sync::MutexGuard<'static, ()>) {
+        let lock = crate::test_env_lock();
+        let budget = super::budget_no_test_can_fill();
+        let pressure = EnvVarGuard::set("KIN_MEMORY_PRESSURE", "nominal");
+        // Both pins are released before the lock, so no window exists where the
+        // next holder can observe this test's overrides.
+        (pressure, budget, lock)
     }
 
     /// One language-server relation, so the resume marker is corroborated by the
@@ -7219,6 +7691,7 @@ mod sweep_lifecycle_tests {
     /// it.
     #[test]
     fn a_sweep_killed_before_its_tail_is_counted_once_and_the_successor_still_sweeps() {
+        let _quiet = unpressured();
         let repo_dir = tempfile::tempdir().unwrap();
         let state = open_store(repo_dir.path());
 
@@ -7289,6 +7762,7 @@ mod sweep_lifecycle_tests {
     /// The breaker still turns, so counting kills does not mint an endless loop.
     #[test]
     fn enough_killed_sweeps_open_the_circuit() {
+        let _quiet = unpressured();
         let repo_dir = tempfile::tempdir().unwrap();
         let state = open_store(repo_dir.path());
 
@@ -7313,6 +7787,7 @@ mod sweep_lifecycle_tests {
     /// the next daemon must not re-derive what it already made durable.
     #[test]
     fn a_completed_sweep_is_not_counted_as_an_interruption_and_its_files_are_not_re_swept() {
+        let _quiet = unpressured();
         let repo_dir = tempfile::tempdir().unwrap();
         let files = swept_files();
 

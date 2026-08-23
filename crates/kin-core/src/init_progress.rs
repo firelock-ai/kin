@@ -20,6 +20,8 @@ use std::io::{IsTerminal, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use crate::init_attempt::InitAttemptJournal;
+
 /// Number of phases in the exact Git admission ladder. A ladder that completes
 /// on a different count than this is a drift bug that would print `[16/15]` to
 /// a user, so [`PhaseProgress::finish`] asserts the two agree.
@@ -94,6 +96,11 @@ struct Ladder {
     phase_started: Instant,
     started: Instant,
     in_phase: bool,
+    /// Where each opened phase is stamped so a killed conversion can still say
+    /// where it stopped. A terminal line is gone the moment the terminal is,
+    /// and `SIGKILL` runs no destructor, so the only phase report that survives
+    /// a kill is one already written to disk when it lands.
+    journal: Option<Arc<InitAttemptJournal>>,
 }
 
 impl PhaseProgress {
@@ -113,6 +120,7 @@ impl PhaseProgress {
             phase_started: Instant::now(),
             started: Instant::now(),
             in_phase: false,
+            journal: None,
         }));
         let _ = ACTIVE_LADDER.try_with(|active| {
             if let Ok(mut active) = active.try_borrow_mut() {
@@ -124,6 +132,28 @@ impl PhaseProgress {
 
     fn with<R>(&mut self, act: impl FnOnce(&mut Ladder) -> R) -> Option<R> {
         self.ladder.lock().ok().map(|mut ladder| act(&mut ladder))
+    }
+
+    /// Send every phase this ladder opens to a durable record as well as to the
+    /// terminal.
+    ///
+    /// Attached rather than constructed with, because the record lives inside
+    /// the staging directory the conversion claims after the ladder already
+    /// exists. Whatever phase is open at that moment is stamped immediately, so
+    /// attaching late loses nothing.
+    pub(crate) fn attach_journal(&mut self, journal: Arc<InitAttemptJournal>) {
+        self.with(|ladder| {
+            if ladder.in_phase {
+                journal.enter_phase(ladder.index, ladder.label);
+            }
+            ladder.journal = Some(journal);
+        });
+    }
+
+    /// The record this ladder is stamping, for a caller that has more to add to
+    /// it than the phase.
+    pub(crate) fn journal(&mut self) -> Option<Arc<InitAttemptJournal>> {
+        self.with(|ladder| ladder.journal.clone()).flatten()
     }
 
     /// Enter the next phase. Closes any open phase first, so a caller cannot
@@ -203,6 +233,9 @@ impl Ladder {
         self.detail_updates = 0;
         self.phase_started = Instant::now();
         self.in_phase = true;
+        if let Some(journal) = &self.journal {
+            journal.enter_phase(self.index, self.label);
+        }
         if self.is_tty {
             self.write(format_args!(
                 "{ERASE_LINE}  [{:>2}/{}] {}...",

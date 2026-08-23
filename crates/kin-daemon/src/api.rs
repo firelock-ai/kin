@@ -2029,8 +2029,10 @@ const GRAPH_STATUS_WRITER_SETTLE_FLOOR: Duration = Duration::from_millis(50);
 /// step that is merely between lock-points settles inside a few tens of
 /// milliseconds, and answering live is always better than answering stale. It
 /// is deliberately small because status is what settle loops poll, and it
-/// doubles per attempt, so the total added latency in the contended case is
-/// under a tenth of a second and nothing is held while it elapses.
+/// doubles per attempt, so with three attempts a fully contended call waits
+/// 25 ms then 50 ms, 75 ms in total, and nothing is held while it elapses.
+/// The last attempt does not wait at all: the loop exits immediately after it,
+/// so a backoff there would buy the writer no time and cost the caller 100 ms.
 const GRAPH_STATUS_ATTEMPT_BACKOFF: Duration = Duration::from_millis(25);
 
 /// The last settled `kin_graph_status` observation of one selected graph.
@@ -2315,6 +2317,11 @@ impl GraphStatusBlocked {
 /// progress is the thing that unblocks the sample.
 async fn graph_status_attempt_backoff(attempt: usize) {
     tokio::task::yield_now().await;
+    // Nothing follows the final attempt but the answer, so sleeping after it
+    // delays the caller without giving the writer another chance to finish.
+    if attempt + 1 >= GRAPH_STATUS_STABLE_READ_ATTEMPTS {
+        return;
+    }
     let shift = u32::try_from(attempt).unwrap_or(u32::MAX).min(4);
     tokio::time::sleep(GRAPH_STATUS_ATTEMPT_BACKOFF.saturating_mul(1 << shift)).await;
 }
@@ -3811,9 +3818,15 @@ async fn command_dead_code(
     let repository_authority = state
         .local_repository_authority_binding()
         .map_err(repository_authority_error)?;
+    // The substrate reading the verdict rests on, built here because only the
+    // daemon holds it (FIR-2524). A clean "No dead code found." off a degraded
+    // daemon is the one way that line can lie, and a thinner envelope is exactly
+    // what would hide it.
+    let envelope = kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state));
     let response = kin_cli::commands::dead_code::build_dead_code_response(
         Some(&repository_authority),
         graph.as_ref(),
+        &envelope,
     )
     .map_err(internal_error)?;
     Ok(Json(response))
@@ -3842,9 +3855,13 @@ async fn command_dead_code_seeded(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let response =
-        kin_cli::commands::dead_code::build_dead_code_seeded_response(graph.as_ref(), &request)
-            .map_err(internal_error)?;
+    let envelope = kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state));
+    let response = kin_cli::commands::dead_code::build_dead_code_seeded_response(
+        graph.as_ref(),
+        &request,
+        &envelope,
+    )
+    .map_err(internal_error)?;
     Ok(Json(response))
 }
 
@@ -3972,9 +3989,18 @@ async fn command_refs(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let response =
-        kin_cli::commands::refs::build_refs_response(&state.layout, graph.as_ref(), &request)
-            .map_err(internal_error)?;
+    // The same substrate reading the MCP path gets, for the same reason the
+    // impact route builds one (FIR-2524): only the daemon holds it, and a
+    // thinner envelope is the shortcut that makes the CLI MORE confident than
+    // MCP on exactly the degraded daemon nobody exercises.
+    let envelope = kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state));
+    let response = kin_cli::commands::refs::build_refs_response(
+        &state.layout,
+        graph.as_ref(),
+        &request,
+        &envelope,
+    )
+    .map_err(internal_error)?;
     Ok(Json(response))
 }
 
@@ -8945,9 +8971,13 @@ async fn mcp_tools_call_inner(
             limit,
             name_pattern,
         };
+        // Same substrate reading the CLI route gets, so this MCP path and
+        // `kin dead-code <query>` cannot reach different verdicts on one store.
+        let envelope = kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state));
         let result = match kin_cli::commands::dead_code::build_dead_code_seeded_response(
             graph.as_ref(),
             &req,
+            &envelope,
         ) {
             Ok(response) => match serde_json::to_string_pretty(&response) {
                 Ok(json) => kin_mcp::ToolCallResult::text(json),
@@ -33168,11 +33198,19 @@ mod tests {
             let payload: serde_json::Value =
                 serde_json::from_str(&bounded).expect("a bounded locate response is still JSON");
             let hits = payload["entities"].as_array().expect("hits survive").len();
+            // The value, not the key. A row whose source the budget took
+            // keeps `body` as an explicit null beside a marker naming what
+            // went, so a row that carries nothing still answers `is_some()`.
+            // Counting keys makes every emptied row read as an answer, and the
+            // two arms tie at the hit count no matter what the budget did.
+            let carries = |hit: &serde_json::Value, key: &str| {
+                !matches!(hit.get(key), None | Some(serde_json::Value::Null))
+            };
             let with_source = payload["entities"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .filter(|hit| hit.get("body").is_some() || hit.get("snippet").is_some())
+                .filter(|hit| carries(hit, "body") || carries(hit, "snippet"))
                 .count();
             (raw, bounded.len(), hits, with_source)
         };

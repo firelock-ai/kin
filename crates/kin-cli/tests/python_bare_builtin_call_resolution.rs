@@ -251,6 +251,10 @@ fn find_references_on_the_classmethod_lists_the_importing_caller_and_not_the_par
             entity: entity_id(&files, "NoteStore.open"),
             kind: "all".to_string(),
         },
+        &kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+            "initialized": true, "graph_loaded": true,
+            "graph_entity_count": 4, "graph_generation": 1,
+        })),
     )
     .expect("refs fixture");
     let listing = response.lines.join("\n");

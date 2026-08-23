@@ -100,6 +100,20 @@ unsafe impl GlobalAlloc for Counting {
 /// admission phase under this prefix.
 pub const PHASE_PREFIX: &str = "kin.init.";
 
+/// The other span namespace worth sampling: kin-db's own commit preparation.
+///
+/// `kin.init.commit_bootstrap_transaction` hands the whole history to kin-db and
+/// is where the peak now sits, so a probe that stops at kin's own spans reports
+/// one opaque number for the largest phase in the ladder. kin-db reports its
+/// preparation laps as spans as of kin-db#220, which is in the pinned 0.7.49, so
+/// the laps are already there to be sampled and only this filter kept them out.
+pub const DB_PHASE_PREFIX: &str = "kindb.";
+
+/// Whether a span name belongs to a phase this probe accounts for.
+fn is_sampled_phase(phase: &str) -> bool {
+    phase.starts_with(PHASE_PREFIX) || phase.starts_with(DB_PHASE_PREFIX)
+}
+
 /// One reading of the counters at a phase boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PhaseSample {
@@ -142,7 +156,7 @@ where
     fn on_enter(&self, id: &tracing::span::Id, ctx: Context<'_, S>) {
         if let Some(span) = ctx.span(id) {
             let phase = span.name();
-            if phase.starts_with(PHASE_PREFIX) {
+            if is_sampled_phase(phase) {
                 record(PhaseSample {
                     phase,
                     entering: true,
@@ -156,7 +170,7 @@ where
     fn on_exit(&self, id: &tracing::span::Id, ctx: Context<'_, S>) {
         if let Some(span) = ctx.span(id) {
             let phase = span.name();
-            if phase.starts_with(PHASE_PREFIX) {
+            if is_sampled_phase(phase) {
                 record(PhaseSample {
                     phase,
                     entering: false,

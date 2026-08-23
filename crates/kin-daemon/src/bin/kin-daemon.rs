@@ -262,10 +262,12 @@ fn parse_allowed_repo_ids() -> Option<HashSet<String>> {
 ///
 /// The layout is resolved here rather than reused from `async_main` because the
 /// environment must be mutated before the runtime exists, and `async_main` does
-/// not run until after it is built. `parse_args` is pure over the process
-/// arguments, so calling it twice costs nothing and changes nothing. Every
-/// failure is silent on purpose: an argument or layout problem is reported once,
-/// with its real message, by `async_main`.
+/// not run until after it is built. Calling `parse_args` twice is safe rather
+/// than pure: it reads only the process arguments and the working directory, and
+/// its one side effect, printing usage and exiting on a malformed argument, is
+/// the same action either call site would take. Every failure here is silent on
+/// purpose: an argument or layout problem is reported once, with its real
+/// message, by `async_main`.
 fn apply_repository_resource_profile() {
     let Ok(args) = parse_args() else {
         return;
@@ -273,15 +275,15 @@ fn apply_repository_resource_profile() {
     if args.supervisor || args.compat_json {
         return;
     }
+    // The same helper the CLI calls, so the two processes can never drift apart
+    // on this variable and produce a behavior-env divergence nobody can clear.
+    // `--repo` may name a `.kin` directory directly, which discovery does not
+    // walk up from, so the resolved layout's working directory is what is
+    // handed over rather than the raw argument.
     let Some(layout) = resolve_layout(&args.repo) else {
         return;
     };
-    let Ok(config) = kin_core::KinConfig::load_or_default(&layout.config_path()) else {
-        return;
-    };
-    kin_cli::resource_profile::apply_repository_profile(
-        config.resources.normalized_profile().as_deref(),
-    );
+    kin_cli::resource_profile::apply_repository_profile_at(layout.working_dir());
 }
 
 fn resolve_layout(path: &Path) -> Option<KinLayout> {

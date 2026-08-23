@@ -47,6 +47,7 @@ pub const BEHAVIOR_ENV_VARS: &[&str] = &[
     "KIN_DAEMON_LOCATE_ONLY",
     "KIN_DAEMON_AUTO_EMBED",
     "KIN_MEMORY_PRESSURE",
+    "KIN_DAEMON_MEMORY_BUDGET_BYTES",
     "KIN_COCHANGE_MAX_FAN_OUT",
     "EMBED_MAX_SEQ_LEN",
 ];
@@ -195,6 +196,14 @@ mod tests {
         assert!(
             BEHAVIOR_ENV_VARS.contains(&"KIN_MEMORY_PRESSURE"),
             "daemon health must report the memory-pressure level it is running under"
+        );
+        // The budget is decided in the worker for the same reason and reaches
+        // it the same way, so an operator who raises it on a later command and
+        // watches the daemon keep backing off must be told the daemon never
+        // saw the new number.
+        assert!(
+            BEHAVIOR_ENV_VARS.contains(&"KIN_DAEMON_MEMORY_BUDGET_BYTES"),
+            "daemon health must report the footprint budget it is running under"
         );
     }
 
