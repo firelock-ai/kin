@@ -348,6 +348,97 @@ pub fn plan_semantic_git_import(
     build_semantic_git_import_plan(snapshot, blob_store)
 }
 
+/// What an enriched re-derivation still holds once every commit has been
+/// visited and dropped.
+///
+/// Deliberately not [`DerivedGitHistory`]: that carries the trees the walk had
+/// not finished with, and a caller checking history it already holds has no
+/// reader for them, so they are dropped here rather than handed back.
+pub(crate) struct DerivedEnrichedHistory {
+    pub(crate) workspace_seed: GitWorkspaceSeed,
+    pub(crate) ref_mutations: Vec<RefMutation>,
+    pub(crate) default_ref_mutation: Option<DefaultRefMutation>,
+    /// Commits derived, which a caller compares against what it holds.
+    pub(crate) commits: usize,
+}
+
+/// Re-derive exact semantic history from a lossless snapshot and re-apply the
+/// historical semantics the caller already holds, handing every commit to
+/// `visit` in parent-first order with its parents' object ids and its exact
+/// resolved tree.
+///
+/// This is [`SemanticGitImportPlan::validate`]'s walk with the enrichment
+/// [`SemanticGitImportPlan::with_historical_semantics`] performs folded into
+/// it. A caller that already holds the enriched history can therefore check it
+/// commit by commit rather than build a second complete history to compare
+/// against, which is what made re-proving a plan cost about as much as deriving
+/// one. Only the visitor decides what survives the commit it was handed; this
+/// walk keeps the frontier trees the derivation itself needs, plus one identity
+/// pair per commit, and nothing else.
+pub(crate) fn derive_enriched_semantic_git_history<'held>(
+    snapshot: &LosslessGitRepository,
+    blob_store: &BlobStore,
+    held_semantics: &dyn Fn(GitObjectId) -> Option<(&'held [EntityDelta], &'held [RelationDelta])>,
+    visit: &mut dyn FnMut(
+        GitObjectId,
+        &[GitObjectId],
+        SemanticChange,
+        ExternalChangeAlias,
+        &ResolvedTree,
+    ) -> Result<()>,
+) -> Result<DerivedEnrichedHistory> {
+    // Pre-enrichment identity to (object id, enriched identity). A derived
+    // change names its parents by the identity the unenriched walk computed,
+    // and re-applying held deltas changes every identity, so the walk carries
+    // that mapping rather than a second history. Parent-first order is what
+    // makes one pass enough.
+    let mut resolved = BTreeMap::<SemanticChangeId, (GitObjectId, SemanticChangeId)>::new();
+    let derived = derive_semantic_git_history(
+        snapshot,
+        blob_store,
+        TreeRetention::Frontier,
+        &mut |oid, mut change, _unenriched_alias, tree| {
+            let unenriched_id = change.id;
+            let mut parent_oids = Vec::with_capacity(change.parents.len());
+            let mut parents = Vec::with_capacity(change.parents.len());
+            for parent in &change.parents {
+                let (parent_oid, parent_id) = resolved.get(parent).copied().ok_or_else(|| {
+                    GitError::InvalidSnapshot(format!(
+                        "parent {parent} was not reidentified before change {unenriched_id}"
+                    ))
+                })?;
+                parent_oids.push(parent_oid);
+                parents.push(parent_id);
+            }
+            let Some((entity_deltas, relation_deltas)) = held_semantics(oid) else {
+                return Err(GitError::InvalidSnapshot(format!(
+                    "historical semantic deltas omit Git commit {oid}"
+                )));
+            };
+            change.parents = parents;
+            change.entity_deltas = entity_deltas.to_vec();
+            change.relation_deltas = relation_deltas.to_vec();
+            change.id = placeholder_change_id();
+            change.id = compute_semantic_change_id(&change)?;
+            validate_semantic_change_id(&change)?;
+            let alias = ExternalChangeAlias::new(snapshot.repository_id.clone(), oid, change.id);
+            alias.validate_change(&change)?;
+            if resolved.insert(unenriched_id, (oid, change.id)).is_some() {
+                return Err(GitError::InvalidSnapshot(format!(
+                    "pre-enrichment semantic identity {unenriched_id} maps to more than one Git commit"
+                )));
+            }
+            visit(oid, &parent_oids, change, alias, tree)
+        },
+    )?;
+    Ok(DerivedEnrichedHistory {
+        workspace_seed: derived.workspace_seed,
+        ref_mutations: derived.ref_mutations,
+        default_ref_mutation: derived.default_ref_mutation,
+        commits: derived.commits,
+    })
+}
+
 fn apply_historical_semantic_deltas_unchecked(
     mut plan: SemanticGitImportPlan,
     bindings: Vec<HistoricalSemanticBinding<'_>>,
