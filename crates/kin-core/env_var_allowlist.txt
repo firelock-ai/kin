@@ -24,6 +24,11 @@ KIN_GIT_TEST_NO_SYMLINK_PRIVILEGE
 # controls whether the run also narrates. No runtime behaviour keys on it and
 # nothing an operator sets.
 KIN_HEAP_PHASES
+# Names the real Git clone the reporting-only attribution harness admits. That
+# test is #[ignore]d and asserts no ceiling, so nothing runs without a path here
+# and no runtime behaviour keys on it. It exists because the synthetic fixtures
+# price a shape rather than a repository.
+KIN_HEAP_REPO
 KIN_INIT_INTERRUPTED_TEST_BARRIER
 KIN_INIT_INTERRUPTED_TEST_SOURCE
 KIN_INIT_STAGING_SIGNAL_TEST_PARENT
