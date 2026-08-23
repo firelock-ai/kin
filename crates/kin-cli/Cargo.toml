@@ -61,7 +61,7 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 age = "0.11"
 base64 = "0.23"
-directories = "5"
+directories = "6"
 keyring = { version = "3", features = ["apple-native"] }
 rpassword = "7"
 serde = { workspace = true }

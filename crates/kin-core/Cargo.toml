@@ -39,7 +39,7 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 sha2 = { workspace = true }
 gix = { workspace = true }
-directories = "5"
+directories = "6"
 fs2 = { workspace = true }
 unicode-normalization = "=0.1.25"
 tempfile = { workspace = true }
