@@ -393,14 +393,23 @@ pub fn measure(value: &Value) -> usize {
 ///
 /// ## What this does instead
 ///
-/// A branch is one child of one node, taken with everything below it. Children
-/// arrive already ordered by relevance, so a node's LAST child is the one it can
-/// most afford to lose. Wide nodes are shaved first, because a wide fan-out is
-/// where the budget actually went, and narrowing a node from twelve children to
-/// eight costs a caller far less than losing the end of every chain. Every node
-/// keeps its first child, so narrowing can thin a walk and can never sever it,
-/// and a dropped branch takes its descendants with it, so no surviving step
-/// names a parent the caller no longer has.
+/// A branch is one child of one node, taken with everything below it. Wide nodes
+/// are shaved first, because a wide fan-out is where the budget actually went,
+/// and narrowing a node from twelve children to eight costs a caller far less
+/// than losing the end of every chain. Every node keeps one child, so narrowing
+/// can thin a walk and can never sever it, and a dropped branch takes its
+/// descendants with it, so no surviving step names a parent the caller no longer
+/// has.
+///
+/// Within a node, the SHALLOWEST branches go first, and the one it keeps is the
+/// one that reaches deepest. Relevance breaks ties, which is what children
+/// arrive ordered by. Keeping merely the first child was not enough and the
+/// difference is the whole defect: on the measured `psf/requests` walk the hop
+/// that carries the answer hangs off the focal's FIFTH child, so a rule that
+/// preserves the leftmost spine preserved a branch that ends at depth one and
+/// gave up the branch that reaches depth three. That made the answer depend on
+/// how large the walk happened to be, which is luck rather than a rule: the same
+/// query returned the hop at 129 discovered steps and lost it at 200.
 ///
 /// ## Why it lives here
 ///
@@ -438,13 +447,62 @@ pub fn narrow_fanout_to_fit<T: Clone>(
         }
     }
 
-    // The drop order: every node's children from least relevant inward, never
-    // its first, widest nodes first so the budget is reclaimed where it was
-    // spent. Ties broken by parent id so the order is deterministic.
-    let mut by_width: Vec<(u64, &Vec<u64>)> = children
+    // How far below each node the walk reached. Computed bottom-up over the
+    // children map, memoized, and cycle-safe, because a chain is a tree only by
+    // construction and a malformed one must not hang the bounder.
+    let mut reach: BTreeMap<u64, usize> = BTreeMap::new();
+    let mut order: Vec<u64> = children.keys().copied().collect();
+    for kids in children.values() {
+        order.extend(kids.iter().copied());
+    }
+    for _ in 0..=children.len() {
+        let mut changed = false;
+        for node in &order {
+            let deepest = children
+                .get(node)
+                .map(|kids| {
+                    kids.iter()
+                        .map(|kid| 1 + reach.get(kid).copied().unwrap_or(0))
+                        .max()
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0);
+            if reach.get(node).copied().unwrap_or(0) < deepest {
+                reach.insert(*node, deepest);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // The drop order: within a node, shallowest branch first and least relevant
+    // among equals, so the branch it keeps is the one that reaches deepest.
+    // Across nodes, widest first, so the budget is reclaimed where it was spent.
+    // Ties broken by parent id so the order is deterministic.
+    let mut by_width: Vec<(u64, Vec<u64>)> = children
         .iter()
         .filter(|(_, kids)| kids.len() > 1)
-        .map(|(parent, kids)| (*parent, kids))
+        .map(|(parent, kids)| {
+            let mut ordered: Vec<u64> = kids.clone();
+            // Sorted into GIVE-UP order: shallowest first, and among equally
+            // deep branches the one relevance put last.
+            let rank: BTreeMap<u64, usize> = kids
+                .iter()
+                .enumerate()
+                .map(|(at, kid)| (*kid, at))
+                .collect();
+            ordered.sort_by(|left, right| {
+                reach
+                    .get(left)
+                    .copied()
+                    .unwrap_or(0)
+                    .cmp(&reach.get(right).copied().unwrap_or(0))
+                    .then_with(|| rank[right].cmp(&rank[left]))
+            });
+            (*parent, ordered)
+        })
         .collect();
     by_width.sort_by(|left, right| {
         right
@@ -458,9 +516,9 @@ pub fn narrow_fanout_to_fit<T: Clone>(
     loop {
         let mut moved = false;
         for (_parent, kids) in &by_width {
-            // Keep the first child always; peel from the end inward.
+            // Keep one child always; peel from the give-up end inward.
             if kids.len() > 1 + round {
-                drop_order.push(kids[kids.len() - 1 - round]);
+                drop_order.push(kids[round]);
                 moved = true;
             }
         }
@@ -1411,11 +1469,11 @@ mod tests {
     #[test]
     fn a_dropped_branch_takes_its_descendants_with_it() {
         let mut steps = breadth_first_walk(8, 1);
-        // Hang a child off the LAST depth-1 step, which is the first branch the
-        // drop order gives up. Without the descendant walk it would survive its
-        // own parent.
+        // A SECOND deep branch, off the last depth-1 step. Two branches reach
+        // equally far, so relevance decides which is given up, and the one that
+        // goes has a descendant that must go with it.
         steps.push((100, 8));
-        let kept = narrowed(&steps, 5).expect("narrowing fits inside five steps");
+        let kept = narrowed(&steps, 2).expect("two steps is the floor, and it fits");
         let present: BTreeSet<u64> = kept.iter().map(|step| step.0).collect();
         for (step, parent) in &kept {
             assert!(
@@ -1424,8 +1482,40 @@ mod tests {
             );
         }
         assert!(
+            !present.contains(&8),
+            "the fixture must give up the less relevant of the two deep \
+             branches or nothing is being tested: {present:?}"
+        );
+        assert!(
             !present.contains(&100),
             "the orphan outlived the branch it hung off: {present:?}"
+        );
+    }
+
+    /// FIR-2642, the rule that makes the fix a rule rather than luck. The branch
+    /// a node keeps is the one that reaches deepest, not the one relevance
+    /// happened to list first.
+    ///
+    /// On the measured `psf/requests` walk the hop that carries the answer hangs
+    /// off `HTTPAdapter.send`'s FIFTH child, so keeping the first child kept a
+    /// branch ending at depth one and gave up the branch reaching depth three.
+    /// The same query returned the hop at 129 discovered steps and lost it at
+    /// 200, which is a result that depends on how big the walk happened to be.
+    #[test]
+    fn the_branch_a_node_keeps_is_the_one_that_reaches_deepest() {
+        // Six shallow children first, then a seventh whose branch goes two
+        // deeper. Relevance order puts the deep one last on purpose.
+        let mut steps: Vec<(u64, u64)> = (1..=7).map(|step| (step, 0)).collect();
+        steps.push((8, 7));
+        steps.push((9, 8));
+
+        let kept = narrowed(&steps, 3).expect("three steps fit");
+        let present: BTreeSet<u64> = kept.iter().map(|step| step.0).collect();
+        assert_eq!(
+            present,
+            BTreeSet::from([7, 8, 9]),
+            "the node kept its shallowest branch and amputated its deepest: \
+             {present:?}"
         );
     }
 

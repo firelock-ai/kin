@@ -3790,32 +3790,45 @@ mod boundary_and_ranking_tests {
         entity
     }
 
-    /// The measured shape, reduced to the one comparison that decides it: a
-    /// raise target sitting in the SAME FILE as the focal, against a
-    /// data-flow callee one file away.
+    /// The measured shape: everything in ONE file, as `psf/requests` has it,
+    /// where `HTTPAdapter.send` and the exceptions it throws share
+    /// `adapters.py` and locality decides nothing.
     ///
-    /// Same-file locality outranks declaration kind in the fan-out order, so
-    /// without a raise-target signal the two exception constructors take both
-    /// slots and the hop the question is about is dropped. This is the requests
-    /// shape with the file boundary moved so the fixture needs no store.
+    /// Three candidates, so both terms that matter are exercised. `pool_key` is
+    /// a Function and wins on declaration kind, which is what actually delivers
+    /// "data flow above throw sites" on real bytes. `Retryer` is a Class the
+    /// focal calls ordinarily, and it is the only candidate the raise marker
+    /// itself decides against: alike in every other term, so if the marker goes
+    /// inert, `SSLError` outranks it on name length alone.
     fn raise_crowding_graph() -> (InMemoryGraph, EntityId) {
         let graph = InMemoryGraph::new();
         let focal = make_entity("Adapter.send", "pkg/adapters.py");
         let ssl_error = exception_class("SSLError", "pkg/adapters.py");
         let proxy_error = exception_class("ProxyError", "pkg/adapters.py");
-        let pool_key = make_entity("build_pool_key", "pkg/pool.py");
+        let retryer = exception_class("Retryer", "pkg/adapters.py");
+        let pool_key = make_entity("build_pool_key", "pkg/adapters.py");
 
-        for entity in [&focal, &ssl_error, &proxy_error, &pool_key] {
+        for entity in [&focal, &ssl_error, &proxy_error, &retryer, &pool_key] {
             graph.upsert_entity(entity).unwrap();
         }
         for relation in [
             raise_call(focal.id, ssl_error.id),
             raise_call(focal.id, proxy_error.id),
+            call(focal.id, retryer.id),
             call(focal.id, pool_key.id),
         ] {
             graph.upsert_relation(&relation).unwrap();
         }
         (graph, focal.id)
+    }
+
+    /// Where each name landed in the fan-out, so a test can assert an ORDER
+    /// rather than only a membership.
+    fn rank_of(names: &[String], wanted: &str) -> usize {
+        names
+            .iter()
+            .position(|name| name == wanted)
+            .unwrap_or_else(|| panic!("{wanted} is not in the walk: {names:?}"))
     }
 
     #[test]
@@ -3839,12 +3852,12 @@ mod boundary_and_ranking_tests {
         .unwrap();
 
         let names = step_names(&response);
-        assert!(
-            names.iter().any(|n| n == "build_pool_key"),
-            "a `raise` target is a throw site, not a hop the value travels \
-             along, so it must not spend a scarce fan-out slot on one: the \
-             stranger lost the connection-reuse path exactly this way and \
-             would have written a wrong answer from it. Got {names:?}"
+        assert_eq!(
+            names,
+            vec!["build_pool_key".to_string(), "Retryer".to_string()],
+            "two slots go to the hop the value travels through and to the \
+             class the focal actually constructs; a throw site takes neither. \
+             Got {names:?}"
         );
     }
 
@@ -3872,7 +3885,7 @@ mod boundary_and_ranking_tests {
         .unwrap();
 
         let names = step_names(&response);
-        for expected in ["build_pool_key", "SSLError", "ProxyError"] {
+        for expected in ["build_pool_key", "Retryer", "SSLError", "ProxyError"] {
             assert!(
                 names.iter().any(|n| n == expected),
                 "a wide enough step reports every callee including the throw \
@@ -3880,6 +3893,11 @@ mod boundary_and_ranking_tests {
                  {expected} from {names:?}"
             );
         }
+        assert!(
+            rank_of(&names, "Retryer") < rank_of(&names, "SSLError"),
+            "and the throw sites sit below the class the focal constructs, \
+             which is the one comparison the raise marker decides. Got {names:?}"
+        );
         assert_eq!(
             names.first().map(String::as_str),
             Some("build_pool_key"),
@@ -3912,8 +3930,8 @@ mod boundary_and_ranking_tests {
         let graph = InMemoryGraph::new();
         let focal = make_entity("Adapter.send", "pkg/adapters.py");
         let ssl_error = exception_class("SSLError", "pkg/adapters.py");
-        let pool_key = make_entity("build_pool_key", "pkg/pool.py");
-        for entity in [&focal, &ssl_error, &pool_key] {
+        let retryer = exception_class("Retryer", "pkg/adapters.py");
+        for entity in [&focal, &ssl_error, &retryer] {
             graph.upsert_entity(entity).unwrap();
         }
         // The reference edge is upserted FIRST, which is the order that made
@@ -3921,7 +3939,7 @@ mod boundary_and_ranking_tests {
         for relation in [
             reference(focal.id, ssl_error.id),
             raise_call(focal.id, ssl_error.id),
-            call(focal.id, pool_key.id),
+            call(focal.id, retryer.id),
         ] {
             graph.upsert_relation(&relation).unwrap();
         }
@@ -3945,10 +3963,10 @@ mod boundary_and_ranking_tests {
         let names = step_names(&response);
         assert_eq!(
             names.first().map(String::as_str),
-            Some("build_pool_key"),
-            "one slot, and it belongs to the hop the value travels along; a \
-             mention of the exception class is not a reason to promote a throw \
-             site. Got {names:?}"
+            Some("Retryer"),
+            "one slot, and it belongs to the class the focal constructs rather than the one it \
+             throws; a mention of the exception class is not a reason to promote a throw site. \
+             Got {names:?}"
         );
     }
 
@@ -3968,15 +3986,15 @@ mod boundary_and_ranking_tests {
         let graph = InMemoryGraph::new();
         let focal = make_entity("Adapter.send", "pkg/adapters.py");
         let ssl_error = exception_class("SSLError", "pkg/adapters.py");
-        let pool_key = make_entity("build_pool_key", "pkg/pool.py");
-        for entity in [&focal, &ssl_error, &pool_key] {
+        let retryer = exception_class("Retryer", "pkg/adapters.py");
+        for entity in [&focal, &ssl_error, &retryer] {
             graph.upsert_entity(entity).unwrap();
         }
         for relation in [
             raise_call(focal.id, ssl_error.id),
             lsp_call(focal.id, ssl_error.id),
-            call(focal.id, pool_key.id),
-            lsp_call(focal.id, pool_key.id),
+            call(focal.id, retryer.id),
+            lsp_call(focal.id, retryer.id),
         ] {
             graph.upsert_relation(&relation).unwrap();
         }
@@ -4000,8 +4018,9 @@ mod boundary_and_ranking_tests {
         let names = step_names(&response);
         assert_eq!(
             names.first().map(String::as_str),
-            Some("build_pool_key"),
-            "the one slot belongs to the hop the value travels along; an LSP              edge that cannot see a `raise` must not vote the throw site back              onto the data path. Got {names:?}"
+            Some("Retryer"),
+            "the one slot belongs to the class the focal constructs; an LSP edge that cannot see \
+             a `raise` must not vote the throw site back level with it. Got {names:?}"
         );
     }
 
