@@ -87,15 +87,15 @@ Two decisions, both answered here, and one number to plan around first.
 
 ## Requirements
 
-A commit prepares the whole repository successor in memory, so its peak follows
-the size of the repository rather than the size of the edit, and on a converted
-repository it can reach 16 GB per repository per write. Give the machine or
-container that much free memory before you commit, because a commit that runs
-out of it is killed mid-transaction.
+Give the machine or container 16 GB per repository per write. A commit on a
+converted repository has been observed driving a whole 12 GiB machine to 12.0 GiB
+in total and being killed there, and how much of that total the commit itself
+needed is not modelled, so the figure is a margin over what has been observed
+rather than a prediction from the size of your repository or your edit.
 
-Run \`kin doctor\` inside the repository to see where you stand. It measures your
-store against the commit peaks Kin has recorded and tells you which side of that
-line you are on, before you spend a write finding out.
+Run \`kin doctor\` inside the repository to see where you stand. It compares this
+machine's memory ceiling against the totals Kin has recorded and tells you which
+side of that line you are on, before you spend a write finding out.
 
 ## 1. The executables
 
